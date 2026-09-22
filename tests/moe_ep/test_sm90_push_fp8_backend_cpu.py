@@ -20,10 +20,10 @@ def test_sm90_push_backend_import_defers_kernel_package():
 
         kernel_name = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
         backend_package = importlib.import_module(
-            "flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8"
+            "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda"
         )
         weights_module = importlib.import_module(
-            "flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.weights"
+            "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.weights"
         )
         assert kernel_name not in sys.modules
         hints = typing.get_type_hints(weights_module.preprocess_mega_weights)
@@ -50,7 +50,7 @@ def test_sm90_push_backend_import_defers_kernel_package():
 def test_sm90_push_timeout_requires_supported_setter():
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         _set_process_group_timeout,
     )
 
@@ -64,18 +64,18 @@ def test_sm90_push_timeout_requires_supported_setter():
 
 def test_sm90_push_unfused_intermediate_size_limit():
     from flashinfer.moe_ep import BootstrapConfig, FleetParams, MoEEpConfigError
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8 import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
         backend as backend_module,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushFp8MegaKernelBackend(
-        Sm90PushFp8MegaMoeConfig(
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(
             intermediate_size=16384 + 128,
             top_k=2,
             fuse_fc1_epilogue=False,
@@ -99,26 +99,26 @@ def test_sm90_push_unfused_intermediate_size_limit():
 
 
 def test_sm90_push_fp8_config_defaults_to_unfused_fc1():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
-    config = Sm90PushFp8MegaMoeConfig(intermediate_size=128, top_k=2)
+    config = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
 
     assert config.fuse_fc1_epilogue is False
 
 
 def test_sm90_push_staging_binds_layer_weights_and_records_lease():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
         _Sm90PushFp8Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushFp8MegaKernelBackend(
-        Sm90PushFp8MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -151,16 +151,16 @@ def test_sm90_push_staging_binds_layer_weights_and_records_lease():
 
 
 def test_sm90_push_compute_finishes_round_before_rejecting_different_weights():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
         _Sm90PushFp8Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushFp8MegaKernelBackend(
-        Sm90PushFp8MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -190,16 +190,16 @@ def test_sm90_push_compute_finishes_round_before_rejecting_different_weights():
     [("idle", False), ("poisoned", True)],
 )
 def test_sm90_push_compute_mirrors_runner_poison_state(runner_state, expected_poisoned):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
         _Sm90PushFp8Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
     backend = Sm90PushFp8MegaKernelBackend(
-        Sm90PushFp8MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     transformed = object()
     backend._transformed_weights = transformed
@@ -222,14 +222,14 @@ def test_sm90_push_compute_mirrors_runner_poison_state(runner_state, expected_po
 
 
 def test_sm90_push_workspace_pool_key_covers_construction_state():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
 
-    config = Sm90PushFp8MegaMoeConfig(intermediate_size=256, top_k=2)
+    config = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(intermediate_size=256, top_k=2)
     fleet = SimpleNamespace(
         num_experts=8,
         max_tokens_per_rank=64,
@@ -293,12 +293,12 @@ def test_sm90_push_workspace_pool_key_covers_construction_state():
 
 
 def test_sm90_push_destroy_uses_workspace_pool_refcount(monkeypatch):
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
         _Sm90PushFp8Workspace,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.config import (
-        Sm90PushFp8MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel import workspace_pool
 
@@ -306,10 +306,14 @@ def test_sm90_push_destroy_uses_workspace_pool_refcount(monkeypatch):
     monkeypatch.setattr(workspace_pool, "_KEY_BY_ID", {})
     runner = mock.Mock()
     workspace = _Sm90PushFp8Workspace(pipe=object(), runner=runner)
-    first = workspace_pool.acquire_workspace(("sm90_push_fp8",), lambda: workspace)
-    second = workspace_pool.acquire_workspace(("sm90_push_fp8",), lambda: workspace)
+    first = workspace_pool.acquire_workspace(
+        ("sm90_fp8_fp8_bf16_push_cuda",), lambda: workspace
+    )
+    second = workspace_pool.acquire_workspace(
+        ("sm90_fp8_fp8_bf16_push_cuda",), lambda: workspace
+    )
     backend = Sm90PushFp8MegaKernelBackend(
-        Sm90PushFp8MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
 
     backend.destroy(first)

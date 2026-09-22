@@ -555,6 +555,7 @@ __device__ __forceinline__ void RadixSelectOneRound(
     }
 
     // Barrier: wait for all CTAs to finish atomicAdd and clearing
+    __syncthreads();  // converge the CTA so tx0's release covers every thread's atomicAdds/clears
     AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
     // Read current histogram (after barrier, all atomicAdds are complete)
@@ -734,6 +735,7 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
           next_hist[i] = 0;
         }
       }
+      __syncthreads();  // converge the CTA so tx0's release covers every thread's atomicAdds/clears
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
       for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
@@ -1709,6 +1711,14 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
 
   const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
   const bool single_cta = (ctas_per_group == 1);
+
+  // The multi-CTA path uses a software barrier whose participants must all be
+  // resident concurrently.  Low-SM GPUs cannot provide that guarantee once a
+  // row spans multiple CTAs, so fail before launching instead of risking a
+  // permanent stream hang.  The barrier-free single-CTA path remains enabled.
+  if (!single_cta && num_sms <= 16) {
+    return cudaErrorNotSupported;
+  }
 
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);

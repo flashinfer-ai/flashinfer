@@ -140,7 +140,18 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         out_dtype,
         per_token_alpha,
     ) = cache_key
-    tma = "x" if use_tma_store is None else int(use_tma_store)
+    # On SM107 the use_tma_store slot is repurposed to carry the Rubin kernel
+    # shape (inst_m, inst_n, inst_k, tiler_k, prefetch_dist), so render it as a
+    # symbol-safe joined string; a bare int() would raise on the tuple.
+    if use_tma_store is None:
+        tma = "x"
+    elif isinstance(use_tma_store, tuple):
+        # prefetch_dist is enumerated as (0, 2, None) - None means "auto" and
+        # compiles differently from 0, so render it as its own symbol rather
+        # than letting int(None) raise.
+        tma = "s" + "s".join("x" if v is None else str(int(v)) for v in use_tma_store)
+    else:
+        tma = int(use_tma_store)
     dtype = str(out_dtype).removeprefix("torch.")
     alpha = "x" if per_token_alpha is None else per_token_alpha
     return (

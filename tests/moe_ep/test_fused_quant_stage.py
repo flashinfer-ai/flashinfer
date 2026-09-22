@@ -83,7 +83,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
     hidden_states, topk_ids, topk_weights = batch
     x, sf, idx_out, w_out = buffers
     if quant_type == "nvfp4":
-        from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
 
@@ -98,7 +98,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
             norm_const=norm_const,
         )
     else:
-        from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
 
@@ -180,7 +180,7 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     _require_blackwell()
     pytest.importorskip("deep_gemm")
 
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 

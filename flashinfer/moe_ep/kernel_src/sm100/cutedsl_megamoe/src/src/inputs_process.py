@@ -58,12 +58,7 @@ class DataPreprocess:
     _amax_threads_per_cta: int = 128
     _amax_load_vec: int = 8  # 8 bf16 = 16 B per load
 
-    def __init__(
-        self,
-        topk: int,
-        hidden: int,
-        quant_type: Literal["nvfp4", "mxfp8_e5m2", "mxfp8_e4m3"],
-    ) -> None:
+    def __init__(self, topk: int, hidden: int, quant_type: Literal["nvfp4", "mxfp8_e5m2", "mxfp8_e4m3"]) -> None:
         self.topk = int(topk)
         # The routing repack assigns one lane per topk slot, so topk cannot
         # exceed the CTA width.
@@ -94,6 +89,13 @@ class DataPreprocess:
         else:
             raise ValueError(f"Unsupported quant_type: {quant_type!r}")
 
+        output_alignment_elements = 32 if self.is_nvfp4 else 16
+        if self.hidden % output_alignment_elements != 0:
+            raise ValueError(
+                f"hidden ({self.hidden}) must make each quantized row 16-byte aligned; "
+                f"{quant_type} requires a multiple of {output_alignment_elements} elements."
+            )
+
         # nvfp4 encode constants (see `nvfp4_quant_and_process_impl`):
         #   stored E4M3 block scale = block_amax * rcp_limit * norm_const
         #   norm_const at amax        = (E4M3_max * E2M1_max) / amax_tensor
@@ -114,7 +116,7 @@ class DataPreprocess:
         activation_quant: cute.Tensor,  # (token, hidden) fp4/fp8 elements
         # (cute sees the real fp4 dtype, not
         # torch's pack2 uint8 -> full hidden)
-        activation_sf: cute.Tensor,  # (token, hidden // sf_vec) block scales,
+        activation_sf: cute.Tensor,  # (token, ceil(hidden / sf_vec)) block scales,
         # rebuilt below into a (token, hidden)
         # broadcast view over the block dim
         topk_idx_output: cute.Tensor,  # (token, topk)
@@ -131,21 +133,16 @@ class DataPreprocess:
         # Mode invariants resolve at trace time (the scale args are None-or-not
         # when the kernel is compiled).
         if cutlass.const_expr(self.is_nvfp4):
-            if cutlass.const_expr(
-                (online_norm_const is None) == (offline_norm_const is None)
-            ):
+            if cutlass.const_expr((online_norm_const is None) == (offline_norm_const is None)):
                 raise ValueError(
                     "nvfp4 staging needs exactly one of `online_norm_const` "
                     "(output buffer, staging-zeroed) or `offline_norm_const` "
                     "(calibrated constant); got both or neither."
                 )
         else:
-            if cutlass.const_expr(
-                online_norm_const is not None or offline_norm_const is not None
-            ):
+            if cutlass.const_expr(online_norm_const is not None or offline_norm_const is not None):
                 raise ValueError(
-                    f"{self.quant_type} staging is self-scaled; do not pass "
-                    "`online_norm_const` / `offline_norm_const`."
+                    f"{self.quant_type} staging is self-scaled; do not pass `online_norm_const` / `offline_norm_const`."
                 )
 
         num_tokens = activation_bf16.shape[0]
@@ -156,8 +153,8 @@ class DataPreprocess:
         # they index in the same (token, hidden) space as the data: the inner
         # sf_vec mode carries stride 0, so every element in a block maps to that
         # block's single scale entry.
-        #   (token, hidden // sf_vec) -> (token, (sf_vec, hidden // sf_vec))
-        #                                stride (d_token, (0, d_block))
+        #   (token, ceil(hidden / sf_vec)) -> (token, (sf_vec, ceil(hidden / sf_vec)))
+        #                                    stride (d_token, (0, d_block))
         num_sf_blocks = activation_sf.shape[1]
         activation_sf = cute.make_tensor(
             activation_sf.iterator,
@@ -185,19 +182,9 @@ class DataPreprocess:
         # with no extra workspace); offline reads the caller's constant in one
         # launch. Perf-critical callers should calibrate offline.
         if cutlass.const_expr(online_norm_const is not None):
-            self._init_online_scale_impl(online_norm_const).launch(
-                grid=[1, 1, 1],
-                block=[1, 1, 1],
-                stream=cuda_stream,
-            )
-            self.nvfp4_amax_impl(
-                activation_bf16,
-                token_padding_info,
-                online_norm_const,
-            ).launch(
-                grid=grid,
-                block=[self._amax_threads_per_cta, 1, 1],
-                stream=cuda_stream,
+            self._init_online_scale_impl(online_norm_const).launch(grid=[1, 1, 1], block=[1, 1, 1], stream=cuda_stream)
+            self.nvfp4_amax_impl(activation_bf16, token_padding_info, online_norm_const).launch(
+                grid=grid, block=[self._amax_threads_per_cta, 1, 1], stream=cuda_stream
             )
             norm_const = online_norm_const
         else:
@@ -222,10 +209,7 @@ class DataPreprocess:
         # Re-tag a tensor's pointer with a stronger alignment so vectorized
         # copies are legal (mirrors topk_reduce._mark_alignment).
         p = tensor.iterator
-        return cute.make_tensor(
-            cute.make_ptr(p.dtype, p.toint(), p.memspace, assumed_align=align_bytes),
-            tensor.layout,
-        )
+        return cute.make_tensor(cute.make_ptr(p.dtype, p.toint(), p.memspace, assumed_align=align_bytes), tensor.layout)
 
     @cute.jit
     def _repack_routing(
@@ -246,9 +230,7 @@ class DataPreprocess:
             if cutlass.const_expr(token_padding_info is not None):
                 is_padding = token_padding_info[token_idx] != Int32(0)
             idx = Int64(-1) if is_padding else Int64(topk_idx[token_idx, tid])
-            weight = (
-                Float32(0.0) if is_padding else Float32(topk_weights[token_idx, tid])
-            )
+            weight = Float32(0.0) if is_padding else Float32(topk_weights[token_idx, tid])
             topk_idx_output[token_idx, tid] = idx
             topk_weights_output[token_idx, tid] = weight
 
@@ -262,10 +244,7 @@ class DataPreprocess:
 
     @cute.kernel
     def nvfp4_amax_impl(
-        self,
-        activation_bf16: cute.Tensor,
-        token_padding_info: Optional[cute.Tensor],
-        online_norm_const: cute.Tensor,
+        self, activation_bf16: cute.Tensor, token_padding_info: Optional[cute.Tensor], online_norm_const: cute.Tensor
     ) -> None:
         # One CTA per token reduces its (non-padding) row amax, converts it to a
         # per-token norm_const candidate, and atomic-mins it into the shared
@@ -289,9 +268,7 @@ class DataPreprocess:
             # 16 B vectorized loads: each thread strides over load_vec-wide chunks.
             a_chunks = cute.zipped_divide(activation_bf16[token_idx, None], (load_vec,))
             load_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                cutlass.BFloat16,
-                num_bits_per_copy=load_vec * 16,
+                cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=load_vec * 16
             )
             num_chunks = hidden // load_vec
             # Stay in bf16: max.xorsign.abs.bf16x2 does per-lane abs-max on two
@@ -303,9 +280,7 @@ class DataPreprocess:
                 chunk = cute.make_rmem_tensor((load_vec,), cutlass.BFloat16)
                 # Each chunk starts at c*16 B (16 B aligned); re-tag so the
                 # 128-bit copy's static alignment check passes.
-                cute.copy(
-                    load_atom, self._mark_alignment(a_chunks[(None,), (c,)], 16), chunk
-                )
+                cute.copy(load_atom, self._mark_alignment(a_chunks[(None,), (c,)], 16), chunk)
                 pairs = cute.recast_tensor(chunk, Int32)
                 for p in cutlass.range_constexpr(load_vec // 2):
                     acc_pair = max_abs_bf16x2(acc_pair, pairs[p])
@@ -333,12 +308,8 @@ class DataPreprocess:
                 token_amax = cute.arch.warp_redux_sync(partial, "fmax", abs=True)
                 if lane_idx == Int32(0):
                     # token_amax == 0 -> candidate +inf, harmless under min.
-                    candidate = Float32(self._nvfp4_norm_numer) * cute.arch.rcp_approx(
-                        token_amax
-                    )
-                    red_min_relaxed_gpu_u32_from_f32_raw(
-                        online_norm_const.iterator.toint(), candidate
-                    )
+                    candidate = Float32(self._nvfp4_norm_numer) * cute.arch.rcp_approx(token_amax)
+                    red_min_relaxed_gpu_u32_from_f32_raw(online_norm_const.iterator.toint(), candidate)
 
     @cute.kernel
     def nvfp4_quant_and_process_impl(
@@ -351,9 +322,7 @@ class DataPreprocess:
         activation_sf: cute.Tensor,
         topk_idx_output: cute.Tensor,
         topk_weights_output: cute.Tensor,
-        norm_const: Union[
-            cute.Tensor, cutlass.Float32
-        ],  # online (1,) tensor or offline f32 scalar
+        norm_const: Union[cute.Tensor, cutlass.Float32],  # online (1,) tensor or offline f32 scalar
     ) -> None:
         threads: cutlass.Constexpr[int] = self._threads_per_cta
         sf_vec: cutlass.Constexpr[int] = self.sf_vec
@@ -361,12 +330,8 @@ class DataPreprocess:
         load_vec: cutlass.Constexpr[int] = 8  # 8 bf16 = 16 B per cp.async
         num_blocks: cutlass.Constexpr[int] = hidden // sf_vec
         num_chunks: cutlass.Constexpr[int] = hidden // load_vec
-        chunks_per_thread: cutlass.Constexpr[int] = (
-            num_chunks + threads - 1
-        ) // threads
-        blocks_per_thread: cutlass.Constexpr[int] = (
-            num_blocks + threads - 1
-        ) // threads
+        chunks_per_thread: cutlass.Constexpr[int] = (num_chunks + threads - 1) // threads
+        blocks_per_thread: cutlass.Constexpr[int] = (num_blocks + threads - 1) // threads
         token_idx = cute.arch.block_idx()[0]
         tid = cute.arch.thread_idx()[0]
 
@@ -382,17 +347,12 @@ class DataPreprocess:
         # The swizzle makes the later per-block LDS.128 bank-conflict free.
         smem = cutlass.utils.SmemAllocator()
         smem_row = smem.allocate_tensor(
-            cutlass.BFloat16,
-            cute.make_layout(hidden),
-            1024,
-            swizzle=cute.make_swizzle(1, 4, 3),
+            cutlass.BFloat16, cute.make_layout(hidden), 1024, swizzle=cute.make_swizzle(1, 4, 3)
         )
         g_chunks = cute.zipped_divide(activation_bf16[token_idx, None], (load_vec,))
         s_chunks = cute.zipped_divide(smem_row, (load_vec,))
         g2s_atom = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(),
-            cutlass.BFloat16,
-            num_bits_per_copy=load_vec * 16,
+            cute.nvgpu.cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=load_vec * 16
         )
         # Issue every cp.async up front, committing a group every 2 load rounds
         # (= one quant round's worth of blocks). num_groups == blocks_per_thread
@@ -401,11 +361,7 @@ class DataPreprocess:
         for i in cutlass.range_constexpr(chunks_per_thread):
             c = tid + Int32(i * threads)
             if c < Int32(num_chunks):
-                cute.copy(
-                    g2s_atom,
-                    self._mark_alignment(g_chunks[(None,), (c,)], 16),
-                    s_chunks[(None,), (c,)],
-                )
+                cute.copy(g2s_atom, self._mark_alignment(g_chunks[(None,), (c,)], 16), s_chunks[(None,), (c,)])
             if cutlass.const_expr(i % 2 == 1 or i == chunks_per_thread - 1):
                 cute.arch.cp_async_commit_group()
 
@@ -413,13 +369,9 @@ class DataPreprocess:
         # cross-thread reduce. Read via LDS.128 to benefit from the swizzle.
         s_blk = cute.zipped_divide(smem_row, (sf_vec,))
         q_blk = cute.zipped_divide(activation_quant[token_idx, None], (sf_vec,))
-        lds_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
-        )
+        lds_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
         store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            cutlass.Float4E2M1FN,
-            num_bits_per_copy=sf_vec * 4,
+            cute.nvgpu.CopyUniversalOp(), cutlass.Float4E2M1FN, num_bits_per_copy=sf_vec * 4
         )
         for j in cutlass.range_constexpr(blocks_per_thread):
             # A dummy commit each round keeps the target group a fixed depth from
@@ -446,9 +398,7 @@ class DataPreprocess:
                 # Per-element encode scale; the mask zeros the sfc==0 (all-zero
                 # block) case so its fp4 codes stay 0 instead of NaN.
                 acc_scale = cute.arch.fmin(nc * cute.arch.rcp_approx(sfc_rt), fp32_max)
-                acc_scale = acc_scale * cute.arch.fmin(
-                    sfc_rt * Float32(1.0e30), Float32(1.0)
-                )
+                acc_scale = acc_scale * cute.arch.fmin(sfc_rt * Float32(1.0e30), Float32(1.0))
 
                 scaled = cute.make_rmem_tensor((sf_vec,), Float32)
                 for i in cutlass.range_constexpr(sf_vec):
@@ -456,21 +406,11 @@ class DataPreprocess:
                 fp4 = cute.make_rmem_tensor((sf_vec,), cutlass.Float4E2M1FN)
                 fp4.store(scaled.load().to(cutlass.Float4E2M1FN))
 
-                cute.copy(
-                    store_atom,
-                    fp4,
-                    self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2),
-                )
+                cute.copy(store_atom, fp4, self._mark_alignment(q_blk[(None,), (b,)], sf_vec // 2))
                 activation_sf[token_idx, (0, b)] = sfc_e4m3
 
         self._repack_routing(
-            token_idx,
-            tid,
-            topk_idx,
-            topk_weights,
-            token_padding_info,
-            topk_idx_output,
-            topk_weights_output,
+            token_idx, tid, topk_idx, topk_weights, token_padding_info, topk_idx_output, topk_weights_output
         )
 
     @cute.kernel
@@ -485,25 +425,22 @@ class DataPreprocess:
         topk_idx_output: cute.Tensor,
         topk_weights_output: cute.Tensor,
     ) -> None:
-        # Same cp.async staging + swizzle + block pipeline as the nvfp4 path; the
-        # per-block encode differs: per-32 E8M0 (power-of-2) scale, no global
-        # scale. See nvfp4_quant_and_process_impl for the pipeline commentary.
+        # Adjacent lanes jointly quantize one 32-element scale block. Each lane
+        # owns one contiguous 16-byte output vector, so every STG.128 is
+        # coalesced across the warp. The final scale block may contain only the
+        # even lane's 16 elements.
         threads: cutlass.Constexpr[int] = self._threads_per_cta
-        sf_vec: cutlass.Constexpr[int] = self.sf_vec
         hidden: cutlass.Constexpr[int] = self.hidden
         load_vec: cutlass.Constexpr[int] = 8  # 8 bf16 = 16 B per cp.async
-        rounds_per_group: cutlass.Constexpr[int] = sf_vec // load_vec
-        num_blocks: cutlass.Constexpr[int] = hidden // sf_vec
+        quant_vec: cutlass.Constexpr[int] = 16  # one coalesced 16 B fp8 store per lane
+        load_rounds_per_quant_round: cutlass.Constexpr[int] = quant_vec // load_vec
         num_chunks: cutlass.Constexpr[int] = hidden // load_vec
-        chunks_per_thread: cutlass.Constexpr[int] = (
-            num_chunks + threads - 1
-        ) // threads
-        blocks_per_thread: cutlass.Constexpr[int] = (
-            num_blocks + threads - 1
-        ) // threads
+        num_quant_chunks: cutlass.Constexpr[int] = hidden // quant_vec
+        chunks_per_thread: cutlass.Constexpr[int] = (num_chunks + threads - 1) // threads
+        quant_chunks_per_thread: cutlass.Constexpr[int] = (num_quant_chunks + threads - 1) // threads
         num_groups: cutlass.Constexpr[int] = (
-            chunks_per_thread + rounds_per_group - 1
-        ) // rounds_per_group
+            chunks_per_thread + load_rounds_per_quant_round - 1
+        ) // load_rounds_per_quant_round
         token_idx = cute.arch.block_idx()[0]
         tid = cute.arch.thread_idx()[0]
 
@@ -512,83 +449,61 @@ class DataPreprocess:
 
         smem = cutlass.utils.SmemAllocator()
         smem_row = smem.allocate_tensor(
-            cutlass.BFloat16,
-            cute.make_layout(hidden),
-            1024,
-            swizzle=cute.make_swizzle(1, 4, 3),
+            cutlass.BFloat16, cute.make_layout(hidden), 1024, swizzle=cute.make_swizzle(1, 4, 3)
         )
         g_chunks = cute.zipped_divide(activation_bf16[token_idx, None], (load_vec,))
         s_chunks = cute.zipped_divide(smem_row, (load_vec,))
         g2s_atom = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(),
-            cutlass.BFloat16,
-            num_bits_per_copy=load_vec * 16,
+            cute.nvgpu.cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=load_vec * 16
         )
-        # Issue all cp.async up front, one group per quant round's worth of
-        # blocks (rounds_per_group load rounds == 128 blocks).
+        # At most two load rounds provide one 16-element vector to every lane.
+        # Commit them as one group so group j feeds quant round j.
         for i in cutlass.range_constexpr(chunks_per_thread):
             c = tid + Int32(i * threads)
             if c < Int32(num_chunks):
-                cute.copy(
-                    g2s_atom,
-                    self._mark_alignment(g_chunks[(None,), (c,)], 16),
-                    s_chunks[(None,), (c,)],
-                )
-            if cutlass.const_expr(
-                (i + 1) % rounds_per_group == 0 or i == chunks_per_thread - 1
-            ):
+                cute.copy(g2s_atom, self._mark_alignment(g_chunks[(None,), (c,)], 16), s_chunks[(None,), (c,)])
+            if cutlass.const_expr((i + 1) % load_rounds_per_quant_round == 0 or i == chunks_per_thread - 1):
                 cute.arch.cp_async_commit_group()
 
-        s_blk = cute.zipped_divide(smem_row, (sf_vec,))
-        q_blk = cute.zipped_divide(activation_quant[token_idx, None], (sf_vec,))
-        lds_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
-        )
-        store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.quant_dtype, num_bits_per_copy=128
-        )
-        for j in cutlass.range_constexpr(blocks_per_thread):
+        s_quant_chunk = cute.zipped_divide(smem_row, (quant_vec,))
+        q_quant_chunk = cute.zipped_divide(activation_quant[token_idx, None], (quant_vec,))
+        lds_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.quant_dtype, num_bits_per_copy=128)
+        for j in cutlass.range_constexpr(quant_chunks_per_thread):
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(num_groups)
             cute.arch.sync_threads()
-            b = tid + Int32(j * threads)
-            if b < Int32(num_blocks):
-                block_bf16 = cute.make_rmem_tensor((sf_vec,), cutlass.BFloat16)
-                cute.copy(lds_atom, s_blk[(None,), (b,)], block_bf16)
-                vals = cute.make_rmem_tensor((sf_vec,), Float32)
-                vals.store(block_bf16.load().to(Float32))
+            quant_chunk_idx = tid + Int32(j * threads)
+            values = cute.make_rmem_tensor((quant_vec,), Float32)
+            local_absmax = Float32(0.0)
+            if quant_chunk_idx < Int32(num_quant_chunks):
+                quant_chunk_bf16 = cute.make_rmem_tensor((quant_vec,), cutlass.BFloat16)
+                cute.copy(lds_atom, s_quant_chunk[(None,), (quant_chunk_idx,)], quant_chunk_bf16)
+                values.store(quant_chunk_bf16.load().to(Float32))
+                for i in cutlass.range_constexpr(quant_vec):
+                    local_absmax = cute.arch.fmax(local_absmax, cute.arch.fmax(values[i], -values[i]))
 
-                absmax = Float32(0.0)
-                for i in cutlass.range_constexpr(sf_vec):
-                    absmax = cute.arch.fmax(absmax, cute.arch.fmax(vals[i], -vals[i]))
-
+            paired_absmax = Float32(cute.arch.shuffle_sync_bfly(local_absmax, offset=1))
+            block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
+            if quant_chunk_idx < Int32(num_quant_chunks):
                 # Per-32 E8M0 (power-of-2) scale, rounded up (cvt.rp) so the block
                 # never overflows the fp8 range; rcp is exact for a power of two.
-                scale_f32 = Float32(
-                    cvt_f32_to_f8_to_f32(absmax * data_rcp_limit, cutlass.Float8E8M0FNU)
-                )
+                scale_f32 = Float32(cvt_f32_to_f8_to_f32(block_absmax * data_rcp_limit, cutlass.Float8E8M0FNU))
                 sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
                 acc_scale = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), fp32_max)
 
-                scaled = cute.make_rmem_tensor((sf_vec,), Float32)
-                for i in cutlass.range_constexpr(sf_vec):
-                    scaled[i] = vals[i] * acc_scale
-                data = cute.make_rmem_tensor((sf_vec,), self.quant_dtype)
+                scaled = cute.make_rmem_tensor((quant_vec,), Float32)
+                for i in cutlass.range_constexpr(quant_vec):
+                    scaled[i] = values[i] * acc_scale
+                data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
                 data.store(scaled.load().to(self.quant_dtype))
 
-                cute.copy(
-                    store_atom, data, self._mark_alignment(q_blk[(None,), (b,)], sf_vec)
-                )
-                activation_sf[token_idx, (0, b)] = sf_e8m0
+                cute.copy(store_atom, data, self._mark_alignment(q_quant_chunk[(None,), (quant_chunk_idx,)], quant_vec))
+                if quant_chunk_idx % Int32(2) == Int32(0):
+                    activation_sf[token_idx, (0, quant_chunk_idx // Int32(2))] = sf_e8m0
 
         self._repack_routing(
-            token_idx,
-            tid,
-            topk_idx,
-            topk_weights,
-            token_padding_info,
-            topk_idx_output,
-            topk_weights_output,
+            token_idx, tid, topk_idx, topk_weights, token_padding_info, topk_idx_output, topk_weights_output
         )
 
     # # This might not be needed right now.
@@ -605,46 +520,30 @@ class DataPreprocess:
 # =============================================================================
 
 
-def _run_case(
-    quant_type: str, mode: str, num_tokens: int, hidden: int, topk: int
-) -> bool:
+def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: int) -> bool:
     import torch
     import cuda.bindings.driver as cuda_driver
     from cutlass.torch import from_dlpack
 
-    from moe_nvfp4_swapab.runner_common import (
-        nvfp4_quantize_per_block_16,
-        dequant_block_scale_to_fp32,
-    )
-    from common.host_utils import mxfp8_quantize_per_block_32
+    from moe_nvfp4_swapab.runner_common import nvfp4_quantize_per_block_16, dequant_block_scale_to_fp32
+    from common.host_utils import mxfp8_quantize_per_block_32_row
 
     torch.manual_seed(0)
     is_nvfp4 = quant_type == "nvfp4"
     sf_vec = 16 if is_nvfp4 else 32
-    num_blocks = hidden // sf_vec
-    torch_quant_dtype = {
-        "mxfp8_e4m3": torch.float8_e4m3fn,
-        "mxfp8_e5m2": torch.float8_e5m2,
-    }.get(quant_type)
+    num_blocks = (hidden + sf_vec - 1) // sf_vec
+    torch_quant_dtype = {"mxfp8_e4m3": torch.float8_e4m3fn, "mxfp8_e5m2": torch.float8_e5m2}.get(quant_type)
 
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
-    topk_idx_in = torch.randint(
-        0, 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
-    )
+    topk_idx_in = torch.randint(0, 64, (num_tokens, topk), dtype=torch.int32, device="cuda")
     topk_w_in = torch.rand(num_tokens, topk, dtype=torch.float32, device="cuda")
 
     if is_nvfp4:
-        quant = torch.empty(
-            num_tokens, hidden // 2, dtype=torch.uint8, device="cuda"
-        ).view(torch.float4_e2m1fn_x2)
-        sf = torch.empty(
-            num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda"
-        ).view(torch.float8_e4m3fn)
+        quant = torch.empty(num_tokens, hidden // 2, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+        sf = torch.empty(num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda").view(torch.float8_e4m3fn)
     else:
         quant = torch.empty(num_tokens, hidden, dtype=torch_quant_dtype, device="cuda")
-        sf = torch.empty(
-            num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda"
-        )
+        sf = torch.empty(num_tokens, num_blocks, dtype=torch.float8_e8m0fnu, device="cuda")
     idx_out = torch.empty(num_tokens, topk, dtype=torch.int64, device="cuda")
     w_out = torch.empty(num_tokens, topk, dtype=torch.float32, device="cuda")
 
@@ -687,10 +586,10 @@ def _run_case(
 
     # -- routing (exact) --
     if not torch.equal(idx_out, topk_idx_in.to(torch.int64)):
-        print("  [FAIL] topk_idx mismatch")
+        print(f"  [FAIL] topk_idx mismatch")
         ok = False
     if not torch.equal(w_out, topk_w_in):
-        print("  [FAIL] topk_weights mismatch")
+        print(f"  [FAIL] topk_weights mismatch")
         ok = False
 
     # -- quant vs reference quantizer --
@@ -700,18 +599,21 @@ def _run_case(
             norm_const_used = float(online_t[0].item())
             expected = 2688.0 / x_fp32.abs().amax().item()
             rel = abs(norm_const_used - expected) / expected
-            print(
-                f"  online norm_const={norm_const_used:.4g} expected={expected:.4g} rel={rel:.2e}"
-            )
+            print(f"  online norm_const={norm_const_used:.4g} expected={expected:.4g} rel={rel:.2e}")
             if rel > 1e-2:
-                print("  [FAIL] online norm_const off")
+                print(f"  [FAIL] online norm_const off")
                 ok = False
         ref_q, ref_sf = nvfp4_quantize_per_block_16(x_fp32, norm_const_used)
         deq_ker = dequant_block_scale_to_fp32(quant, sf, sf_vec)
         deq_ref = dequant_block_scale_to_fp32(ref_q, ref_sf, sf_vec)
         sf_exact = torch.equal(sf.view(torch.uint8), ref_sf.view(torch.uint8))
     else:
-        ref_q, ref_sf = mxfp8_quantize_per_block_32(x_fp32, torch_quant_dtype)
+        padded_hidden = num_blocks * sf_vec
+        x_ref = x_fp32
+        if padded_hidden != hidden:
+            x_ref = torch.nn.functional.pad(x_ref, (0, padded_hidden - hidden))
+        ref_q, ref_sf = mxfp8_quantize_per_block_32_row(x_ref, torch_quant_dtype)
+        ref_q = ref_q[:, :hidden]
         deq_ker = dequant_block_scale_to_fp32(quant, sf, sf_vec)
         deq_ref = dequant_block_scale_to_fp32(ref_q, ref_sf, sf_vec)
         sf_exact = torch.equal(sf.view(torch.uint8), ref_sf.view(torch.uint8))
@@ -722,7 +624,7 @@ def _run_case(
     max_abs = (deq_ker - deq_ref).abs().max().item()
     print(f"  sf_exact={sf_exact} quant_snr={snr_db:.1f}dB max_abs_diff={max_abs:.3e}")
     if not sf_exact or snr_db < 40.0:
-        print("  [FAIL] quant vs reference")
+        print(f"  [FAIL] quant vs reference")
         ok = False
 
     return ok
@@ -735,11 +637,7 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--topk", type=int, default=4)
-    parser.add_argument(
-        "--quant_kind",
-        default="all",
-        choices=["all", "nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"],
-    )
+    parser.add_argument("--quant_kind", default="all", choices=["all", "nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
     args = parser.parse_args()
 
     # nvfp4 runs both scale sources; mxfp8 is self-scaled (single mode).
@@ -752,9 +650,7 @@ def main() -> int:
 
     all_ok = True
     for quant_type, mode in cases:
-        print(
-            f"[case] {quant_type} {mode} (tokens={args.tokens} hidden={args.hidden} topk={args.topk})"
-        )
+        print(f"[case] {quant_type} {mode} (tokens={args.tokens} hidden={args.hidden} topk={args.topk})")
         try:
             case_ok = _run_case(quant_type, mode, args.tokens, args.hidden, args.topk)
         except Exception as exc:  # noqa: BLE001 -- smoke harness, report and continue

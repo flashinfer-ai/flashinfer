@@ -33,6 +33,35 @@ Mapping Utilities
 
     Mapping
 
+All-Gather Matmul
+-----------------
+
+``all_gather_matmul`` keeps its architecture-based default routing when
+``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
+the source-built fused backend for contiguous bfloat16 or float16 inputs with
+``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
+memory backend, and a two- or four-rank NCCL process group. The local input may
+be an ordinary contiguous CUDA tensor because Cake uses internal symmetric
+scratch and flags for remote access and synchronization. Unsupported explicit
+Cake requests raise instead of silently falling back.
+The packaged manifest carries the exact dynamic shared-memory requirement
+resolved for every generated main route; the loader validates that value
+against the packaged CUDA source before compiling the host launcher.
+
+``prepare_all_gather_matmul`` prepares the source-built packed-QKV route for
+SM103, bfloat16, four-rank NCCL groups, contiguous ``[M, 8192]`` inputs, and a
+contiguous ``[8192, 2560]`` weight, where ``M`` is a positive multiple of 128.
+It binds the weight and process group once and returns a callable that accepts
+a contiguous input with the same shape, dtype, and device. Both
+``backend="auto"`` and ``backend="cake"`` select this prepared route.
+Unsupported configurations raise during preparation instead of falling back.
+
+.. autosummary::
+    :toctree: ../generated
+
+    all_gather_matmul
+    prepare_all_gather_matmul
+
 TensorRT-LLM AllReduce
 ----------------------
 
@@ -55,7 +84,6 @@ Core Operations
     :toctree: ../generated
 
     trtllm_allreduce_fusion
-    trtllm_custom_all_reduce
     trtllm_moe_allreduce_fusion
     trtllm_moe_finalize_allreduce_fusion
 
@@ -65,7 +93,6 @@ Workspace Management
 .. autosummary::
     :toctree: ../generated
 
-    trtllm_create_ipc_workspace_for_all_reduce
     trtllm_create_ipc_workspace_for_all_reduce_fusion
     trtllm_destroy_ipc_workspace_for_all_reduce
     trtllm_destroy_ipc_workspace_for_all_reduce_fusion
@@ -143,6 +170,91 @@ vLLM AllReduce
     vllm_get_graph_buffer_ipc_meta
     vllm_meta_size
 
+PCIe IPC AllReduce
+------------------
+
+Custom all-reduce for intra-node PCIe machines without NVLink. Admission is a
+capability check — world size, dtype, workspace capacity, and enough payload
+for every rank to own a share — and shapes it rejects fall back to the caller's
+own collective.
+
+.. code-block:: python
+
+    import flashinfer.comm as comm
+
+    # Collective: every rank builds the workspace with identical arguments.
+    # Size max_numel to the real workload -- an oversized one costs latency.
+    ws = comm.PcieIpcAllReduceWorkspace(group=group, max_numel=128 * 6144)
+
+    for x in activations:                     # same shapes, same order, all ranks
+        if ws.supports(x):
+            y = ws.all_reduce(x)              # out-of-place
+        else:
+            y = x.clone()
+            dist.all_reduce(y, group=group)   # unsupported shape: fall back
+
+    ws.destroy()                              # collective; all ranks together
+
+``supports()`` is a pure function of shape and dtype, so every rank reaches the
+same answer without agreeing on one at runtime. It says nothing about speed: a
+supported shape runs a seed launch configuration — one crossover keyed on the
+payload in bytes, no per-machine constants — and warns once per workspace until
+:meth:`~PcieIpcAllReduceWorkspace.tune` has measured the real one and persisted
+it, since the crossovers depend on the fabric.
+:func:`get_pcie_ipc_launch_config` exposes that seed for a
+``(world_size, numel, elem_size)`` triple, and returns ``None`` only for shapes
+the kernels cannot run.
+
+The kernels spin on peer flags with no timeout, so ranks that disagree on
+shape, dtype or call order hang rather than raise. One workspace serves one
+CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
+ordering the two if a move is genuinely needed.
+
+Two data planes
+~~~~~~~~~~~~~~~
+
+Above roughly a megabyte the workspace can move the payload with the copy
+engines instead of with SM load/store. The reason is not that the copy engine
+is faster per hop — in isolation the two are comparable — but that it keeps
+its throughput when every rank transfers at once, where SM peer traffic loses
+bandwidth to the concurrency. So the gap widens with world size, which is what
+makes a second plane worth having at these payload sizes.
+
+It is a second protocol rather than a flag on the existing kernels. The SM path
+encodes readiness in the payload — ``+0.0`` means "not yet written" — which a
+copy engine can neither produce nor observe, so the ring synchronises through
+monotonic flags on side streams instead. Nothing about the SM kernels changes.
+
+Both planes are ordinary tuner candidates, so nothing needs to be declared at
+the call site and there is no notion of a prefill or decode "phase": the
+configuration follows the payload in bytes.
+:class:`PcieIpcVariant` gains ``COPY_ENGINE_RING``, a flat neighbour ring, and
+``COPY_ENGINE_ISLAND``, a 4+4 decomposition offered only at world size 8 and
+only on ``rootcplx-noswitch``, where a ring's two socket-crossing hops would
+otherwise set the pace. On that variant ``blocks`` carries the ring's sub-chunk
+depth rather than a grid size.
+
+.. warning::
+
+    Tuning covers the batch sizes it is given, and shapes above the largest one
+    are served by whatever was measured there. Leave ``tune_batches`` unset and
+    the ladder is derived from ``max_numel``, which covers everything the
+    workspace admits; pass it explicitly and the top of the range is yours to
+    get right. :meth:`~PcieIpcAllReduceWorkspace.tune` warns when an explicit
+    list leaves a gap, and refuses to persist results measured below the
+    default sample counts, since a table that is quietly wrong is worse than
+    one that is missing.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PcieIpcAllReduceWorkspace
+    PcieIpcLaunchConfig
+    PcieIpcVariant
+    get_pcie_ipc_launch_config
+    probe_pcie_ipc_rank_topology
+    resolve_pcie_ipc_profile
+
 Ulysses Context-Parallel All-to-All
 -----------------------------------
 
@@ -211,6 +323,14 @@ run on the current CUDA stream; all ranks must issue the same call sequence
 with consistent shapes, one collective in flight per communicator at a
 time.
 
+**Destination-passing and workspace mode.** Both collectives accept an
+optional preallocated ``out=`` tensor. The NCCL backend additionally accepts
+a reusable :class:`UlyssesWorkspace`, which owns the packed send and receive
+buffers and removes their per-call allocations. Omitting both keywords keeps
+the original allocation path unchanged. The NVLink backend uses ``out=`` but
+does not consume the workspace because its IPC staging allocation is owned by
+the communicator.
+
 **Known limitations.**
 
 - PyTorch builds without ``torch.cuda.get_device_properties(...).uuid``
@@ -240,11 +360,73 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
+Preallocated outputs and NCCL staging can be reused across serialized calls::
+
+    workspace = comm.create_workspace()
+    q_global = torch.empty(B, S_global, H_local, D,
+                           dtype=q.dtype, device=q.device)
+    comm.scatter_heads(q, out=q_global, workspace=workspace)
+
 .. autoclass:: UlyssesCommunicator
     :members:
     :show-inheritance:
 
     .. automethod:: __init__
+
+.. autoclass:: UlyssesWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+Head-Chunk Layout and Transport Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Head-chunk APIs are opt-in building blocks for framework-owned
+communication/compute pipelines. They do not choose a chunk schedule, create
+streams/events or process groups, or alter the ordinary ``scatter_heads`` /
+``gather_heads`` path.
+
+``pack_ulysses_qkv_head_chunk`` accepts independent positive-strided Q/K/V
+views, selects the same destination-local head band from every Ulysses rank's
+head slice, and fuses Q/K/V into the last dimension. The communicator's
+``scatter_qkv_head_chunk`` method combines that transform with one all-to-all.
+After attention, ``gather_output_head_chunk`` performs the reverse all-to-all
+and writes the compact band directly into the full output. A framework that
+overlaps the two communication directions must use separate communicators and
+workspaces::
+
+    schedule = ((0, 3), (3, 8), (11, 3))  # local_heads == 14
+    full_output = torch.empty_like(q)
+    for head_offset, head_count in schedule:
+        qkv = input_comm.scatter_qkv_head_chunk(
+            q, k, v,
+            head_offset=head_offset,
+            head_count=head_count,
+            out=qkv_chunk_buffers[head_count],
+            workspace=input_workspace,
+        )
+        q_chunk, k_chunk, v_chunk = qkv.split(head_dim, dim=-1)
+        o_chunk = attention(q_chunk, k_chunk, v_chunk)
+        output_comm.gather_output_head_chunk(
+            o_chunk,
+            local_heads=14,
+            head_offset=head_offset,
+            out=full_output,
+            workspace=output_workspace,
+        )
+
+Head chunking is not automatically profitable. In particular, tensor
+parallelism reduces the effective local head count to approximately
+``H / (TP * Ulysses)``. Frameworks should enable a schedule only after all
+ranks agree that the attention backend supports every chunk head count and an
+offline benchmark shows a positive result. Small local-head counts, GQA/MLA
+with unequal Q/K/V heads, Ring Attention, and Attention2D should use the
+ordinary path unless separately implemented and measured.
+
+.. autofunction:: pack_ulysses_qkv_head_chunk
+
+.. autofunction:: merge_ulysses_output_head_chunk
 
 Topology Probing and Backend Selection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -361,6 +543,20 @@ DCP All-to-All (Context-Parallel Attention Reduction)
     decode_cp_a2a_allocate_mnnvl_workspace
     decode_cp_a2a_init_workspace
     decode_cp_a2a_alltoall
+
+NCCL LSA DCP All-to-All + LSE Reduce
+-------------------------------------
+
+The fused path uses PyTorch NCCL symmetric memory and requires every context-
+parallel rank to be in one load/store-accessible NVLink domain. It does not use
+the MNNVL workspace accepted by ``decode_cp_a2a_alltoall``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    decode_cp_a2a_lse_reduce_workspace_size
+    decode_cp_a2a_lse_reduce_create_workspace
+    decode_cp_a2a_lse_reduce
 
 Mixed Communication
 -------------------

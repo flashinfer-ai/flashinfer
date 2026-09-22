@@ -11,3 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+__all__ = [
+    "bsa_attn_fwd",
+    "bsa_attn_blk64_fwd",
+]
+
+
+def __getattr__(name):
+    if name == "bsa_attn_fwd":
+        from .bsa_attn_sm100_blk128 import bsa_attn_fwd
+
+        return bsa_attn_fwd
+    if name == "bsa_attn_blk64_fwd":
+        from .bsa_attn_sm100_blk64 import bsa_attn_blk64_fwd
+
+        return bsa_attn_blk64_fwd
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

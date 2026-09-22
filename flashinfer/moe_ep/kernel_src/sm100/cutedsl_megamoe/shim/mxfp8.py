@@ -67,6 +67,7 @@ class MegaMoEMxfp8Config:
     num_sched_stages: Optional[int] = None
     flag_batch: int = 4
     epi_flag_batch: Tuple[int, int] = (1, 1)
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
@@ -103,6 +104,10 @@ class MegaMoEMxfp8Config:
             raise ValueError(
                 "hidden and intermediate must be multiples of 64 "
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
+            )
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce knob selected without enable_in_kernel_fc2_reduce."
             )
         if self.in_kernel_fc2_reduce and self.token_back_by_dispatch:
             raise ValueError(
@@ -808,8 +813,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    in_kernel_fc2_reduce: bool = False,
-    token_back_by_dispatch: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
@@ -847,8 +851,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         intermediate=intermediate,
         kind=kind,
         gate_up_clamp=clamp,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_by_dispatch=token_back_by_dispatch,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
     from .knob_cache import resolve_knobs
     from .tuner import with_knobs
@@ -866,19 +869,17 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             num_experts=num_total_experts,
             topk=num_topk,
             max_tokens=num_max_tokens,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
+    # TODO Add explicit validity checks
     cfg = with_knobs(cfg, knobs)
-    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-        # Caller-owned correctness choice; see the NVFP4 factory. The MXFP8
-        # kernel rejects ikr together with dispatch-warp token-back, so the
-        # restored ikr also forces epi-warps token-back.
-        cfg = dataclasses.replace(
-            cfg,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            token_back_by_dispatch=(
-                False if in_kernel_fc2_reduce else cfg.token_back_by_dispatch
-            ),
-        )
+    # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
+    #   despite the autotuner supporting disabling ikr if it would be faster.
+    #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine
+    #   We have now enabled varying the knobs here, revisit this if we see unexpected behavior
+    assert not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce, (
+        "in_kernel_fc2_reduce is not allowed when enable_in_kernel_fc2_reduce is False"
+    )
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
@@ -979,8 +980,24 @@ def mxfp8_mega_moe(
         raise ValueError(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
-    if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return symm_buffer.output_activation[:0] if y is None else None
+    # n == 0 used to shortcut here without ever calling frontend.run() below.
+    # That's unsafe for in_kernel_fc2_reduce: this session's EP peers rely on
+    # every rank physically launching the kernel every round (its persistent
+    # CTA grid -- get_grid_shape() -- is sized from hardware occupancy, not
+    # num_tokens, so even a 0-token round still runs the warp-specialized
+    # dispatch / token-back / tail-cleanup logic peers' cross-rank REDG
+    # combine depends on). A rank that takes this shortcut instead silently
+    # skips that round's participation, desynchronizing the session's
+    # cross-rank bookkeeping -- peers' subsequent launches then wait on a
+    # signal this rank never posts, deadlocking within tens of rounds under
+    # real (unsynchronized, per-rank-independent) traffic.
+    #
+    # n == 0 needs no special case at all: it's just the degenerate instance
+    # of the padding scheme every other n already uses below (stage_inputs()
+    # already fills topk_idx[:capacity] with -1 -- "no work" -- when
+    # num_tokens=0, exactly like it pads topk_idx[n:capacity] for any other
+    # n), so falling through to the same full-buffer frontend.run() call
+    # every nonzero n takes is correct, not just safe.
     if y is not None:
         if y.shape != (n, symm_buffer.hidden):
             raise ValueError(
@@ -1139,6 +1156,7 @@ def create_dummy_inputs(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    enable_in_kernel_fc2_reduce: bool = False,
     seed: int = 0,
 ) -> tuple[
     torch.Tensor,
@@ -1171,6 +1189,7 @@ def create_dummy_inputs(
         world_size,
         kind=kind,
         gate_up_clamp=clamp,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(

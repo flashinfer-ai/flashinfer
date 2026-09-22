@@ -63,6 +63,7 @@ _check_dsl_perf_floor()
 
 from .comm import (
     bootstrap_dist,
+    ensure_not_capturing,
     finalize_dist,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
@@ -86,6 +87,7 @@ from .kernel_helpers import (
     to_blocked,
 )
 from .nvfp4 import (
+    COMBINE_FORMAT_NAMES,
     MegaMoENvfp4Config,
     MegaMoENvfp4Frontend,
     MegaMoENvfp4Inputs,
@@ -108,21 +110,48 @@ from .mxfp8 import (
     mxfp8_mega_launch_thunk,
     mxfp8_mega_moe,
 )
+from .bf16_mxfp8 import (
+    MegaMoEBf16Mxfp8Config,
+    MegaMoEBf16Mxfp8Frontend,
+    MegaMoEBf16Mxfp8Inputs,
+    MegaMoEBf16Mxfp8SymmBuffer,
+    create_dummy_inputs as create_dummy_bf16_mxfp8_inputs,
+    get_symm_buffer_for_bf16_mxfp8_mega_moe,
+    bf16_mxfp8_mega_launch_thunk,
+    bf16_mxfp8_mega_moe,
+)
+from .bf16 import (
+    MegaMoEBf16Config,
+    MegaMoEBf16Frontend,
+    MegaMoEBf16Inputs,
+    MegaMoEBf16SymmBuffer,
+    bf16_mega_launch_thunk,
+    bf16_mega_moe,
+    create_dummy_inputs as create_dummy_bf16_inputs,
+    get_symm_buffer_for_bf16_mega_moe,
+)
 
 # Kernel tuning knobs (tactic enumeration + config application).
 from . import tuner
 from .tuner import (
     CORRECTNESS_KNOBS,
     PERF_KNOBS,
+    default_knobs,
     iter_candidates,
     with_knobs,
 )
 
 # Online (warmup-time) collective knob autotuning.
 from .autotune import (
+    autotune_bf16_mega_moe,
+    autotune_bf16_mxfp8_mega_moe,
     autotune_knobs,
+    bf16_candidates,
+    bf16_mxfp8_candidates,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
+    mxfp8_candidates,
+    nvfp4_candidates,
 )
 
 # Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
@@ -135,7 +164,7 @@ from .quant_stage import (
 )
 
 # Persistent offline-tuning knob cache (pure-lookup hot path).
-from .knob_cache import lookup_knobs, record_knobs, resolve_knobs
+from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
 __all__ = [
     # paths
@@ -147,11 +176,13 @@ __all__ = [
     "note_staged_tokens",
     "staged_tokens",
     # knob_cache
+    "knob_cache_path",
     "lookup_knobs",
     "record_knobs",
     "resolve_knobs",
     # comm
     "bootstrap_dist",
+    "ensure_not_capturing",
     "finalize_dist",
     "free_sym_tensor",
     "reset_compiled_mega_workspaces",
@@ -169,6 +200,7 @@ __all__ = [
     "round_up",
     "to_blocked",
     # nvfp4
+    "COMBINE_FORMAT_NAMES",
     "MegaMoENvfp4Config",
     "MegaMoENvfp4Frontend",
     "MegaMoENvfp4Inputs",
@@ -189,14 +221,39 @@ __all__ = [
     "get_symm_buffer_for_mxfp8_mega_moe",
     "mxfp8_mega_launch_thunk",
     "mxfp8_mega_moe",
+    # mixed MXFP8-weight/BF16-activation
+    "MegaMoEBf16Mxfp8Config",
+    "MegaMoEBf16Mxfp8Frontend",
+    "MegaMoEBf16Mxfp8Inputs",
+    "MegaMoEBf16Mxfp8SymmBuffer",
+    "create_dummy_bf16_mxfp8_inputs",
+    "get_symm_buffer_for_bf16_mxfp8_mega_moe",
+    "bf16_mxfp8_mega_launch_thunk",
+    "bf16_mxfp8_mega_moe",
+    # bf16
+    "MegaMoEBf16Config",
+    "MegaMoEBf16Frontend",
+    "MegaMoEBf16Inputs",
+    "MegaMoEBf16SymmBuffer",
+    "bf16_mega_launch_thunk",
+    "bf16_mega_moe",
+    "create_dummy_bf16_inputs",
+    "get_symm_buffer_for_bf16_mega_moe",
     # tuner
     "tuner",
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
+    "bf16_candidates",
+    "default_knobs",
     "iter_candidates",
     "with_knobs",
     # autotune
     "autotune_knobs",
+    "autotune_bf16_mega_moe",
+    "autotune_bf16_mxfp8_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
+    "bf16_mxfp8_candidates",
+    "mxfp8_candidates",
+    "nvfp4_candidates",
 ]

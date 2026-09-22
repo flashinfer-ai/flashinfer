@@ -981,7 +981,18 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     beta = _make_gates(total_seqlen, num_heads, 0.99, device)
 
     our_o, our_state = chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=True
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seqlens,
+        True,
+        use_cp=True,
+        max_seqlen=max(seq_lens),
     )
     ref_o, ref_state = chunk_gated_delta_rule(
         q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=False
@@ -995,16 +1006,14 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
 @torch.inference_mode()
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
-def test_sm100_cp_delta_rule_external_state_dtype(
+def test_cp_delta_rule_external_state_dtype(
     qkv_factory,
     state_dtype,
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    device = torch.device("cuda")
-    if not is_sm100a_supported(device):
-        pytest.skip("typed CP state requires SM100/SM103")
     _skip_if_cp_unsupported()
+    device = torch.device("cuda")
     _seed_all(seed)
     dtype = torch.bfloat16
     head_size = 128
@@ -1044,6 +1053,7 @@ def test_sm100_cp_delta_rule_external_state_dtype(
         output=our_o,
         output_state=our_state,
         use_cp=True,
+        max_seqlen=max(seq_lens),
     )
     chunk_gated_delta_rule(
         q,

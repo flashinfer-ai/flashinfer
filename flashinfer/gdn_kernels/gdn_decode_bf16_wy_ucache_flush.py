@@ -115,7 +115,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
-import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -125,8 +124,14 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+try:
+    from .device_target import gdn_compile_options, gdn_device_target
+except ImportError:  # tests and benchmarks load this file by path, outside the package
+    from flashinfer.gdn_kernels.device_target import (
+        gdn_compile_options,
+        gdn_device_target,
+    )
 
-device = torch.device("cuda:0")
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).
 T = 16
@@ -1223,7 +1228,7 @@ class GdnDecodeUCacheFlushKernel:
         # verify kernel consumes nothing we write).
         self._pdl_trigger = bool(pdl_trigger)
 
-    @cute.experimental.jit
+    @cute.jit
     def __call__(
         self,
         gQ: cute.Tensor,
@@ -1305,7 +1310,7 @@ class GdnDecodeUCacheFlushKernel:
             min_blocks_per_mp=self._min_blocks_per_mp,
         )
 
-    @cute.experimental.kernel
+    @cute.kernel
     def kernel(
         self,
         gQ: cute.Tensor,
@@ -3575,7 +3580,8 @@ def gated_delta_rule_mtp_ucache_flush(
                 bb[:, :T].copy_(b)
             q, k, v, a, b = qb, kb, vb, ab, bb
 
-    _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    target = gdn_device_target(device)
+    _num_sms = target.num_sms
     # One CTA per (b, hv) — full V tile per CTA. Per-CTA SMEM ~29.8 KB -> <=7 CTAs/SM.
     _total_ctas = HV * B
     _needed = math.ceil(_total_ctas / _num_sms)
@@ -3609,7 +3615,7 @@ def gated_delta_rule_mtp_ucache_flush(
         str(IO_TORCH),
         str(ST_TORCH),
         str(RING_TORCH),
-        str(device),
+        target.compile_key,
         mbp,
         t_disc,
         n_valid,
@@ -3706,7 +3712,7 @@ def gated_delta_rule_mtp_ucache_flush(
     ]
 
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile(
+        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](
             GdnDecodeUCacheFlushKernel(
                 disable_state_update=True,
                 min_blocks_per_mp=mbp,

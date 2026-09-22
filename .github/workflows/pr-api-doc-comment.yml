@@ -15,7 +15,9 @@ jobs:
     concurrency:
       group: pr-documentation-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_sha }}
       cancel-in-progress: false
-    if: github.event.workflow_run.event == 'pull_request'
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'skipped'
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:

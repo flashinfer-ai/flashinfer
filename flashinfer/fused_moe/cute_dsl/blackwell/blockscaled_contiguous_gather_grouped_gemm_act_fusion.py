@@ -57,6 +57,7 @@ from ..moe_utils import (
 )
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
+    f32_reciprocal,
     fmin,
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
@@ -1914,7 +1915,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         a_predicate_slice = cute.make_rmem_tensor(
                             cute.make_layout((1,)), cutlass.Boolean
                         )
-                        a_predicate_slice[0] = a_predicate_tensor[i]
+                        # Row validity does not guard a partial final K tile.
+                        a_predicate_slice[0] = a_predicate_tensor[i] & (
+                            a_producer_state.count * self.cta_tile_shape_mnk[2]
+                            + A_gmem_thread_offset
+                            < cute.size(mA_mkl, mode=[1])
+                        )
 
                         cute.copy_atom_call(
                             a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
@@ -1945,11 +1951,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             tAsSFA_slice_ptr, cute.make_layout((4,))
                         )
 
+                        sfa_tail_predicate = cute.make_rmem_tensor(
+                            cute.make_layout((1,)), cutlass.Boolean
+                        )
+                        sfa_tail_predicate[0] = sfa_predicate_tensor[0] & (
+                            a_producer_state.count * self.cta_tile_shape_mnk_sfa[2]
+                            + 4 * swizzled_iterator
+                            < cute.size(mSFA_mkl, mode=[1])
+                        )
                         cute.copy_atom_call(
                             sfa_atom_copy,
                             tAgSFA_slice,
                             tAsSFA_slice,
-                            pred=sfa_predicate_tensor,
+                            pred=sfa_tail_predicate,
                         )
 
                     a_pipeline.producer_commit(a_producer_state)
@@ -2802,7 +2816,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         swiglu_limit = cutlass.Float32(self.swiglu_limit)
                         LOG2_E = cutlass.Float32(1.4426950408889634)
                         if cutlass.const_expr(self.situ_beta is not None):
-                            situ_beta = cutlass.Float32(self.situ_beta)
+                            # Keep the Python float so situ_f32 can fold 1/beta.
+                            situ_beta = self.situ_beta
+                            if cutlass.const_expr(self.situ_linear_beta is not None):
+                                linear_beta = cutlass.Float32(self.situ_linear_beta)
+                                inv_linear_beta = cutlass.Float32(
+                                    f32_reciprocal(self.situ_linear_beta)
+                                )
                             if cutlass.const_expr(self.vectorized_f32):
                                 for i in cutlass.range_constexpr(
                                     0, cute.size(tTR_rAcc_up), 2
@@ -2836,18 +2856,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     if cutlass.const_expr(
                                         self.situ_linear_beta is not None
                                     ):
-                                        linear_beta = cutlass.Float32(
-                                            self.situ_linear_beta
-                                        )
                                         acc_vec_up_alpha = (
                                             linear_beta
                                             * tanh_f32(
-                                                acc_vec_up_alpha[0] / linear_beta,
+                                                acc_vec_up_alpha[0] * inv_linear_beta,
                                                 fastmath=True,
                                             ),
                                             linear_beta
                                             * tanh_f32(
-                                                acc_vec_up_alpha[1] / linear_beta,
+                                                acc_vec_up_alpha[1] * inv_linear_beta,
                                                 fastmath=True,
                                             ),
                                         )
@@ -2875,11 +2892,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     if cutlass.const_expr(
                                         self.situ_linear_beta is not None
                                     ):
-                                        linear_beta = cutlass.Float32(
-                                            self.situ_linear_beta
-                                        )
                                         acc_vec_up_alpha = linear_beta * tanh_f32(
-                                            acc_vec_up_alpha / linear_beta,
+                                            acc_vec_up_alpha * inv_linear_beta,
                                             fastmath=True,
                                         )
                                     tCompute[i] = acc_vec_up_alpha * situ_gate_value

@@ -1,9 +1,11 @@
 import pytest
 import torch
 
+import flashinfer.api_logging as api_logging
 from flashinfer.utils import (
     supported_compute_capability,
     backend_requirement,
+    experimental_backend,
     BackendSupportedError,
 )
 
@@ -493,3 +495,42 @@ def test_backend_default_parameter():
     result2 = my_kernel(x, backend="cutlass")
     assert result2.shape == x.shape
     assert torch.allclose(result2, x * 2)
+
+
+def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
+    """@experimental_backend checkers stay out of backend="auto" without the opt-in."""
+    monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
+    # The once-per-(api, backend) registry is module state that outlives a test.
+    # pytest.warns below needs the pair unseen, so start from an empty set rather
+    # than depending on this module never being collected twice in one process.
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
+
+    def _check_stable(x, backend="auto"):
+        return True
+
+    @experimental_backend
+    def _check_risky(x, backend="auto"):
+        return True
+
+    # No tensor inputs here, so capability is None; accept it explicitly.
+    for checker in (_check_stable, _check_risky):
+        checker.is_compute_capability_supported = lambda cc: True
+
+    def _prefer_risky(backends, *args, **kwargs):
+        return [b for b in ("risky", "stable") if b in backends]
+
+    @backend_requirement(
+        {"stable": _check_stable, "risky": _check_risky}, heuristic_func=_prefer_risky
+    )
+    def my_kernel(x, backend="auto"):
+        return my_kernel.suitable_auto_backends[0] if backend == "auto" else backend
+
+    assert my_kernel.experimental_backends == frozenset({"risky"})
+    assert my_kernel(1) == "stable"  # gate off: experimental skipped
+
+    # Explicit selection is always allowed; the first use of the pair warns once.
+    with pytest.warns(UserWarning, match="risky"):
+        assert my_kernel(1, backend="risky") == "risky"
+
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
+    assert my_kernel(1) == "risky"  # gate on: heuristic may pick it

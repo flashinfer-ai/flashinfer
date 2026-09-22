@@ -15,8 +15,103 @@ The two trees are **separate backends**:
   either Hopper or Blackwell, never both, so this is not a practical limit.
 - drops are updated independently; never "sync" shared files across the trees.
 
-Current drop: kernel repo commit `1275b8b` ("Merge branch
-'vincent/hopper_megamoe' into 'main'", 2026-07).
+Current drop: kernel repo commit `c3e2c2a` ("Add token-based launch
+heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
+("Add Green Context execution", reverted by decision — no
+`green_context.py`, no `execution_phase` kwarg, no `split_*` workspace
+regions / token_comm bodies).  Re-exclude that commit's content when
+syncing future drops.
+
+Local extensions pending upstream (re-apply when syncing a drop that has
+not picked them up):
+
+- `moe_hopper_fp8/heuristic_config.py` carries a `token_back_mode` field
+  per bucket (2026-08-23 FI-layer epi-vs-reuse sweep winners).
+- Wire-level top-k dedup (`dedup_dispatch`, 2026-08-24, design in
+  `dedup_topk_design.md`): `src/token_comm.py` (carrier election in
+  `dispatch_prep`, carrier-table rendezvous in `dispatch_pull`,
+  `TokenCommArgs.carrier_row_table`) and
+  `moe_hopper_fp8/megamoe_kernel_fp8.py` (ctor knob + workspace region).
+- Combine dedup + quantized combine wire (`grouped_token_back` /
+  `combine_format`, 2026-08-27, design in `dedup_topk_design.md` §4):
+  `src/token_comm.py` (group table + `grouped_reduce_push` with the
+  in-reduction per-32 e8m0/fp8 encoder), `moe_hopper_fp8/
+  megamoe_kernel_fp8.py` (ctor knobs, group/mask/combine_sf regions,
+  rank-indexed TopkReduce call), and `moe_nvfp4_swapab/topk_reduce.py`
+  (SM90 scalar mxfp8 decode via f16 + bit-math e8m0, `slot_mask`
+  rank-masked reduce -- keep NVFP4-compatible when re-syncing).
+- FC1 store offload + early fc1_done publish (2026-09-01/02):
+  `fc1_store_offload` / `fc1_early_done_publish` knobs in
+  `moe_hopper_fp8/kernel_fp8_glu_fc12{,_swapab}.py` +
+  `epilogue_fp8{,_swapab}.py` (mailbox FIFO + epi_aux-warp store server +
+  register fit, dual-FIFO on the 2-WG kernels).  Synced to the drop tree
+  on 2026-09-02 (5 `src/` files, commit-only diff).
+- `fold_producer_warps` (2026-09-02, default True): `_apply_mega_warp_layout()`
+  in `kernel_fp8_glu_fc12.py` (single source of truth, also called from
+  both kernels' `_setup_attributes`) folds TMA-A/TMA-B/sched into the idle
+  dispatch slots when `active_dispatch_warps == 1` and drops the producer
+  warpgroup; `fit_epi_registers()` returns the freed budget to the
+  epilogue; `megamoe_kernel_fp8.py` gates it and forces early-pub;
+  `heuristic_config.py` blockwise non-swap 512-32768 switched to cooperative
+  M64N256, per_tensor 8 to cooperative swap M256N16 and per_tensor 64 to
+  basic swap M128N64 on the strength of it.  New multirank tests
+  `test_..._fold_producer_warps` and `test_..._blockwise_coop_n256` (the test
+  helpers now take mma_tiler_mnk / pingpong / cluster_shape_mnk).
+  `benchmarks/bench_moe_ep_sm90_mega.py` `--pingpong on/off` now forwards
+  the bucket's full heuristic config (cga / accum / token-back) so the
+  override flips only ping-pong — earlier it leaked drop-driver manual
+  defaults — and `--epi-mode {basic,pingpong,cooperative}` forces every
+  bucket's epilogue mode for twin sweeps (basic: one WG, per-WG-size tile;
+  pingpong: two WGs, per-WG-size tiles alternating; cooperative: two WGs,
+  one doubled tile — the tile is derived from the bucket's entry).  The drop tree has none of this yet.
+- Swap-AB token tile N=8 (2026-09-09/10): `SwapABTokenTileNChoices` / shim
+  `_SWAPAB_TILE_N_CHOICES` / `shim/tuner.py` `_SWAPAB_TILES` + `is_valid`
+  admit 8, bench `--swap-token-tile N`, test `test_..._swapab_token_tile_8`;
+  `heuristic_config.py` per_tensor 32/64/128 now use N=8 (same-node
+  interleaved A/B, see TUNING.md; pt32 moved from non-swap to cooperative
+  swap; pt16 / bw64 gains of ~2% were judged too small), with bit-exact rows in
+  `test_..._recalibrated_heuristic_rows`; bench gained `--cga M,N` for
+  manual-order runs.  Needed a
+  kernel fix: the blockwise token-scale TMA box (n×4 fp32) rode B's cluster-M
+  multicast, and its per-CTA sub-box (n/cluster_m · 16 B = 64 B at n=8)
+  violates TMA's 128 B smem-destination alignment.  `is_sf_mcast` /
+  `num_mcast_ctas_sf` in `kernel_fp8_glu_fc12_swapab.py` now drop the
+  multicast for that box only when the sub-box is not a 128 B multiple, and
+  `_tma_load_b_with_activation_sf_task_tile` in `kernel_fp8_glu_fc12.py`
+  takes the sf box's own CTA coord / layout / mask.  n≥16 configs are
+  byte-for-byte the same TMA traffic as before.  Not in the drop tree.
+- `generate_c` (2026-09-11, training forward; mirrors the Blackwell MXFP8
+  kernel's contract): `Sm90MegaMoE{,SwapAB}Fp8Kernel(generate_c=False)` and
+  `__call__(..., fc1_c, output_activation, ...)` write the raw pre-SwiGLU
+  fc1 gate+up accumulator (BF16, kernel gate/up-interleaved column order,
+  dequantized) to an expert-major pool tensor with 128-row expert segments;
+  both layouts store 16 bytes per lane after a lane transpose
+  (`epilogue_fp8_common.py::bfly_transpose4_u32` / `stg_128b_bf16x8`;
+  non-swap `epilogue_fp8.py::_store_fc1_c_m64_half` = one 64-byte row run
+  per quad, swap-AB `epilogue_fp8_swapab.py::_store_fc1_c_swapab` = 8x8
+  lane-group transpose with `prmt`); GMEM pointers need
+  `make_ptr(..., assumed_align=16)` or autovec emits 16-bit stores; both
+  scale modes; compiled out when off.  Host:
+  `mega_runner.py --generate_c` + `_validate_c_output`, `ImplDesc.generate_c`
+  (works with any launch geometry, heuristic or explicit; no separate
+  training descriptor on Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
+  `run_mega_tests.sh` GC01-03, `run_perf_test.sh` `FP8_GENERATE_C=1`,
+  sweep `--generate-c` / `--training-geometry`.  FlashInfer side: shim
+  `MegaMoEHopperFp8Config.generate_c`, `symm_buffer.fc1_c` /
+  `frontend.fc1_c` read-back, backend config knob, bench `--generate-c`,
+  test `test_..._generate_c`.  Developed in the drop worktree first (branch
+  `hopper_fp8_generate_c`); the vendored `src/` copies match it.
+- `compact_pull_buffer` (2026-09-12, default True; `token_comm.py`
+  `pull_buffer_bytes()`, Mega ctor kwarg, shim config, backend config /
+  pool key, bench `--[no-]compact-pull-buffer`): the dispatch pull buffer
+  holds one slot per *active* dispatch warp instead of four, freeing
+  ~21 KiB of misc SMEM per CTA for AB stages (see TUNING.md).
+- `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
+  (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
+  barrier / pull / reuse token-back all follow it; barrier and grid-sync
+  arrival counts scale with it, and the base kernels route the idle warps
+  straight to kernel_tail).  Touches `kernel_fp8_glu_fc12{,_swapab}.py`
+  (dispatch-body gating) too; the drop tree still hardcodes 4.
 
 ## Layout
 

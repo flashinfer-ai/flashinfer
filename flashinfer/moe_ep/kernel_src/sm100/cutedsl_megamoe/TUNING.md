@@ -22,7 +22,7 @@ runtime sensitivity" below; the MR!27 WAR makes 4.5.2 the perf floor).
 Reproduces the previous reference (2026-07-21, dsl 4.6.1, tip `29e2d2f8`,
 CSV `model_shapes_20260721_111314_deepseek_v3.csv`) within run noise at
 every cell. Default geometry (7168 hidden / 2048 inter / 256 experts /
-top-8), 4x GB200, heuristic knobs, speedup vs `deep_gemm_mega` in parens;
+top-8), 4x GB200, heuristic knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens;
 CSV `moe_ep_benchmark/model_shapes/results/model_shapes_20260722_130237.csv`:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
@@ -44,7 +44,7 @@ between 512 and 1024, win growing to 1.62x at 8192** (1.86x with the fp4
 combine wire).  The small-batch regime is weight-load bound and fp4-vs-fp4
 there is a wash.
 
-The `mxfp8_cutedsl` backend (latest sweep 2026-07-22 on dsl 4.5.2, CSV
+The `sm100_mxfp8_mxfp8_bf16_cutedsl` backend (latest sweep 2026-07-22 on dsl 4.5.2, CSV
 `sweep_20260722_114210_fi_mega.csv`; its >=2048 rows use the re-derived
 dispatch-warp default profile) runs 0.63x / 0.82x / 0.88x / 0.96x vs dg at
 1024 / 2048 / 4096 / 8192 tok/rank — near dg parity at 8192 at a 3x better
@@ -58,7 +58,7 @@ session, and node as the table above; CSVs
 generated tables in that repo's `model_shapes/RESULTS.md`).  Pattern holds
 everywhere: dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens (1.6-1.9x on 7168-hidden shapes).  `e2e_pipelined` p50 µs, speedup
-vs `deep_gemm_mega` in parens.
+vs `sm100_fp8_fp4_bf16_deepgemm` in parens.
 
 **deepseek_v3** — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the table above; matches within run noise):
@@ -131,12 +131,12 @@ distributions fare better — see the e2e GSM8K numbers below):
 
 | variant                | acc loss |
 |------------------------|---------:|
-| deep_gemm_mega         | 20.6%    |
+| sm100_fp8_fp4_bf16_deepgemm         | 20.6%    |
 | nvfp4 (bf16 wire)      | 23.2%    |
 | nvfp4 `+ikr`           | 23.2%    |
 | nvfp4 `+combine_mxfp8` | 23.3%    |
 | nvfp4 `+combine_nvfp4` | 25.0%    |
-| mxfp8_cutedsl          | 6.4%     |
+| sm100_mxfp8_mxfp8_bf16_cutedsl          | 6.4%     |
 
 Note mxfp8's 6.4% vs the fp4-weight backends' ~21-25%: the perf ranking is
 not the whole story.
@@ -179,7 +179,7 @@ path) and `fi_dg` run the mxfp4 checkpoint.
 
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 
-All `nvfp4_cutedsl` measurements taken before 2026-07-15 used a broken
+All `sm100_nvfp4_nvfp4_bf16_cutedsl` measurements taken before 2026-07-15 used a broken
 weight layout and have been removed (raw CSVs archived under
 `moe_ep_benchmark/results/archive_pre20260715_broken_nvfp4_layout/`): the
 FI preprocess materialized fc1/fc2 weights N-stride-1 while the frontend
@@ -188,8 +188,8 @@ runs used a faster-but-wrong load pattern and produced incorrect results
 (the old "uniform 1.5-1.7x at every token count" claim was this artifact).
 Caught by the torch-oracle tests
 (`tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`); fixed in
-`backends/mega/kernel/nvfp4_cutedsl/weights.py` (K-major transpose views).
-`deep_gemm_mega` / `mxfp8_cutedsl` numbers were unaffected.  The corrected
+`backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/weights.py` (K-major transpose views).
+`sm100_fp8_fp4_bf16_deepgemm` / `sm100_mxfp8_mxfp8_bf16_cutedsl` numbers were unaffected.  The corrected
 2026-07-15 full sweep reproduces at the 2026-07-21 branch tip within run
 noise (<= ~4% per cell); the tables above are the current reference.
 
@@ -316,7 +316,25 @@ misses) — both are the right behavior as long as internal drops carry the
   2048 tokens, fb4 + reuse_dispatch_warps at >=2048 (-14.5% at 2048:
   1010.6 vs 1181.6 us kernel-mode; supersedes the 07-14 "dispatch-warp is
   ~5% slower for MXFP8" reading, which conflated it with fb8).
-- Backend configs (`Nvfp4/Mxfp8CutedslMegaMoeConfig.knobs`): explicit dict
+  BF16 has ONE profile: `dtype="bf16"` returns the single validated fixed
+  MMA/cluster geometry regardless of token count (candidate validity via
+  `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.  Its
+  token-back defaults to `epi_warps` when `enable_in_kernel_fc2_reduce=False`,
+  and `reuse_dispatch_warps` when `enable_in_kernel_fc2_reduce=False`.
+  Mixed BF16×MXFP8 has per-size measured profiles.  Three legal impl tuples
+  (`is_valid_bf16_mxfp8`; others fail at kernel construction):
+  - N128/tmem/no-overlap/tk128 + `epi_warps` — recommended <1024 tok/rank
+  - N128/tmem/no-overlap/tk128 + `reuse_dispatch_warps` - recommended 1024-2048 tok/rank
+  - N256/tmem/overlap/tk64 + `epi_warps` — recommended 2048-4096 tok/rank;
+  - N256/tmem/overlap/tk64 + `reuse_dispatch_warps` - recommended >4096 tok/rank
+  - N256/smem/no-overlap/tk128
+  The FI shim default (`dtype="bf16_mxfp8"`) is the N128 small-batch profile;
+  `bf16_mxfp8_candidates()` sweeps all three impl tuples × `flag_batch`
+  {1, 4} × token-back {``epi_warps``, ``reuse_dispatch_warps``}, the
+  dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates, or
+  36 when ikr is permitted; per-size winners above are the measured starting
+  point).
+- Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
 - `autotune.py` — collective online tuner: every EP rank compiles+times the
@@ -324,15 +342,16 @@ misses) — both are the right behavior as long as internal drops carry the
   MAX (slowest rank = collective latency), argmin winner applied
   identically everywhere.  Cost: one `cute.compile` per candidate
   (~1-2 min), once per session.  Candidates mirror the tester sweep
-  restriction; for NVFP4 that now INCLUDES `in_kernel_fc2_reduce`
-  (24 candidates — the symm buffer's output is always sym-heap allocated,
-  so the knob flips per-compile).  ikr is ~par with the bf16 wire at the
-  FI default geometry at >=1024 tok/rank and slower at small batch — see
-  "Measured results" below; it stays a sweep candidate rather than a
-  default because the tuner keeps it only if it wins the live problem.  An ikr winner makes the output accumulation
-  order nondeterministic — pin `in_kernel_fc2_reduce=False` via explicit
-  knobs if bit-reproducibility matters.  MXFP8 keeps ikr config-owned
-  (its kernel rejects ikr + dispatch-warp token-back).
+  restriction; that INCLUDES `in_kernel_fc2_reduce`
+  whenever the config sets `enable_in_kernel_fc2_reduce=True` (NVFP4 24,
+  MXFP8 6, mixed BF16×MXFP8 36, BF16 2 — each session sym-heap allocates all
+  of its combine destinations up front, so the knob flips per-compile).  ikr
+  is ~par with the bf16 wire at the FI default geometry at >=1024 tok/rank
+  and slower at small batch — see "Measured results" below; it stays a sweep
+  candidate rather than a default because the tuner keeps it only if it wins
+  the live problem.  An ikr winner makes the output accumulation order
+  nondeterministic — leave `enable_in_kernel_fc2_reduce=False` if
+  bit-reproducibility matters.
 - The kernel-repo tester remains the wide-sweep tool
   (`torchrun -m tester.tester --mode Perf --sweep --use_knob ...`); winners
   transfer via the `knobs=` dict.  Its problems (`nvfp4_perf.jsonl`) are
@@ -383,7 +402,7 @@ a shape comes in:
 sequenceDiagram
     autonumber
     participant L as MoEEpMegaLayer<br/>(modes/mega_layer)
-    participant B as Backend<br/>(nvfp4_cutedsl)
+    participant B as Backend<br/>(sm100_nvfp4_nvfp4_bf16_cutedsl)
     participant S as get_symm_buffer_for_mega_moe<br/>(shim)
     participant T as tuner.py
     participant F as Frontend<br/>(shim nvfp4/mxfp8)
@@ -391,14 +410,14 @@ sequenceDiagram
 
     Note over L,C: session setup — knobs bind HERE, once,<br/>keyed on num_max_tokens
     L->>B: _allocate_workspace(fleet_params)
-    B->>S: get_symm_buffer_for_mega_moe(..., ikr, combine_dtype, knobs)
+    B->>S: get_symm_buffer_for_mega_moe(..., enable_ikr, combine_dtype, knobs)
     alt knobs is an explicit dict
         S->>T: with_knobs(cfg, knobs) — overrides heuristic ENTIRELY
     else knobs is None (how the backend's auto mode arrives too)
         S->>T: knob-cache lookup (knob_cache.lookup_knobs),<br/>else with_knobs(cfg, default_knobs(num_max_tokens, dtype))
         Note over S,T: a quantized combine_dtype auto-adjusts the default<br/>token_back_mode to reuse_dispatch_warps
     end
-    Note over S: in_kernel_fc2_reduce / combine_dtype are config<br/>params (not knobs) — output_activation always sym-heap
+    Note over S: enable_ikr / combine_dtype are config<br/>params (not knobs) — output_activation always sym-heap
     S-->>B: MegaMoESymmBuffer (frontend + staging tensors)
 
     Note over L,C: every forward (any num_tokens up to capacity)
@@ -420,9 +439,9 @@ sequenceDiagram
 The backend defers tuning to the first `compute()` (weights + staged inputs
 exist there); the symm buffer is built with the heuristic default in the
 meantime.  The default candidate list is session-aware
-(`nvfp4_candidates(combine_format, allow_in_kernel_fc2_reduce)`: 24 for the
-bf16 wire including the ikr axis; quantized wires prune to the valid
-subset).  Candidates are compiled **serially and destructively** — each
+(`nvfp4_candidates(combine_format, enable_in_kernel_fc2_reduce)`: 12 for the
+bf16 wire, 24 with the ikr axis when the config permits it; quantized wires
+prune to the valid subset).  Candidates are compiled **serially and destructively** — each
 `apply_knobs` frees the previous candidate's sym workspace and nulls the
 compiled slot, so nothing accumulates and the winner is recompiled once
 more after the sweep (unless it happened to be timed last).
@@ -511,9 +530,11 @@ before comparing MoE backends.
 
 Imported from TRT-LLM PR #16190, both idea families are
 plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
-(`Nvfp4CutedslMegaMoeConfig`):
+(`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`):
 
-- `in_kernel_fc2_reduce` — in-flight top-k combine via cross-rank REDG
+- `in_kernel_fc2_reduce` (permitted by the config's
+  `enable_in_kernel_fc2_reduce`, selected by the knobs) — in-flight top-k
+  combine via cross-rank REDG
   atomic-add; its main win is that the multi-GB per-topk combine staging
   disappears from `shared_workspace` (latency is geometry-dependent — see
   "Measured results").  Contract:
@@ -572,8 +593,8 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
   default, and in the vLLM e2e runs at DSV4-Flash geometry it lost both
   phases — its value is geometry-dependent (and it deletes the multi-GB
   combine staging region, which can be the point).  An ikr winner makes
-  the output accumulation order nondeterministic — pin
-  `in_kernel_fc2_reduce=False` if bit-reproducibility matters.
+  the output accumulation order nondeterministic — leave
+  `enable_in_kernel_fc2_reduce=False` if bit-reproducibility matters.
 - The quantized wires also did NOT transfer to the vLLM e2e geometry
   (4096 hidden / top-6: the wire-forced dispatch-warp token-back costs
   more than the combine-traffic saving there) — the bf16 wire is the e2e
@@ -600,7 +621,7 @@ editable-installed inside the container
 ranks per (variant, token-count) point — every point pays a fresh
 `cute.compile` (amortized by cute's on-disk cache).  Variants selected
 with the bench env knobs `MEGA_IKR=1` / `MEGA_COMBINE_DTYPE=nvfp4|mxfp8`
-(mapped onto `Nvfp4CutedslMegaMoeConfig`); knobs left at the default
+(mapped onto `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`); knobs left at the default
 per-size heuristic profiles (`tuner.default_knobs`), which the quantized
 wires auto-adjust to dispatch-warp token-back.
 
@@ -621,7 +642,7 @@ activations quantized at staging; random (uneven) routing from
   prestaged once outside the loop, so per-forward activation
   quantize/staging is NOT included (for any backend).
 Reported number = rank-0 median of the 50 iters (p50); min/max in the
-CSVs.  `deep_gemm_mega` has no thunk API, so its "kernel" number loops
+CSVs.  `sm100_fp8_fp4_bf16_deepgemm` has no thunk API, so its "kernel" number loops
 `compute()` (includes its thin FI wrapper).
 
 ### Runbook (rerun the sweep)
@@ -640,18 +661,18 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.5.2
+    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
       export MEGA_TIMING=$MODE
-      MEGA_LIST="deep_gemm_mega nvfp4_cutedsl" \
+      MEGA_LIST="sm100_fp8_fp4_bf16_deepgemm sm100_nvfp4_nvfp4_bf16_cutedsl" \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # baseline
-      MEGA_LIST=nvfp4_cutedsl MEGA_IKR=1 \
+      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_IKR=1 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +ikr
-      MEGA_LIST=nvfp4_cutedsl MEGA_COMBINE_DTYPE=nvfp4 \
+      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_COMBINE_DTYPE=nvfp4 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +combine_nvfp4
-      MEGA_LIST=nvfp4_cutedsl MEGA_COMBINE_DTYPE=mxfp8 \
+      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_COMBINE_DTYPE=mxfp8 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +combine_mxfp8
     done
   '

@@ -80,6 +80,17 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 constexpr int WARP_SIZE = 32;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
+__device__ __forceinline__ float computeSafeFP8QuantScale(float row_amax) {
+  if (!(row_amax > 0.0f)) {
+    return 1.0f;
+  }
+
+  constexpr float FP8_E4M3_MAX = 448.0f;
+  constexpr float MIN_AMAX_FOR_FINITE_SCALE = FP8_E4M3_MAX / FLT_MAX;
+  // A tiny nonzero amax can make FP8_E4M3_MAX / row_amax overflow to infinity.
+  return FP8_E4M3_MAX / fmaxf(row_amax, MIN_AMAX_FOR_FINITE_SCALE);
+}
+
 struct FloatMaxOp {
   __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
 };
@@ -1730,7 +1741,7 @@ __global__ void expandInputRowsKernel(
       float const row_amax =
           BlockReduce(reduce_storage).Reduce(AmaxOp::to_float(thread_amax), FloatMaxOp{});
       if (threadIdx.x == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+        float const quant = computeSafeFP8QuantScale(row_amax);
         float residual = 1.0f;
         if (fp8_expert_residual_scale) {
           int const expert = permuted_token_selected_experts[permuted_row];
@@ -2245,6 +2256,47 @@ struct SwigluStepAdaptor {
   }
 };
 
+// SiTU-GLU (Kimi-K3 / mistral ffn_activations.situ_glu). A gated activation that transforms both
+// branches, evaluated in fp32 (bf16 rounding is visible at the tanh saturation points):
+//   out = (beta * tanh(gate / beta) * sigmoid(gate)) * (linear_beta * tanh(up / linear_beta))
+// Note the sigmoid reads the *uncapped* gate.
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  float beta = 4.0f;
+  float linear_beta = 25.0f;
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    cutlass::epilogue::thread::Sigmoid<T> sigmoid{};
+    // tanh(z) == 2*sigmoid(2z) - 1. CUTLASS's Sigmoid uses ::expf, whereas its Tanh lowers to
+    // tanh.approx.f32 whose 2^-11 absolute error linear_beta=25 would amplify to ~1e-2.
+    // The `+ (-1.0f)` is because cutlass::Array has no operator-(Array, scalar).
+    auto tanh = [&](T const& z) { return sigmoid(z * 2.0f) * 2.0f + (-1.0f); };
+    return (tanh(gate * (1.0f / beta)) * sigmoid(gate) * beta) *
+           (tanh(linear * (1.0f / linear_beta)) * linear_beta);
+  }
+};
+
+__device__ inline bool hasPerExpertActivationParams(ActivationParams const& params) {
+  return params.swiglu_alpha || params.swiglu_beta || params.swiglu_limit || params.situ_beta ||
+         params.situ_linear_beta;
+}
+
+// Only assigns what the caller actually supplied, so each adaptor keeps its compile-time default
+// (e.g. SwigluStepAdaptor::limit == 7.0, SituAdaptor::beta == 4.0).
+template <class ActFn>
+__device__ void setPerExpertActivationParams(ActFn& fn, ActivationParams const& params,
+                                             int64_t expert) {
+  if constexpr (std::is_same_v<ActFn, SituAdaptor>) {
+    if (params.situ_beta) fn.beta = params.situ_beta[expert];
+    if (params.situ_linear_beta) fn.linear_beta = params.situ_linear_beta[expert];
+  } else {
+    if (params.swiglu_alpha) fn.alpha = params.swiglu_alpha[expert];
+    if (params.swiglu_beta) fn.beta = params.swiglu_beta[expert];
+    if (params.swiglu_limit) fn.limit = params.swiglu_limit[expert];
+  }
+}
+
 // ============================== Gated Activation =================================
 constexpr static int MAX_ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2276,26 +2328,12 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
   int64_t const inter_size_vec = inter_size / ACTIVATION_ELEM_PER_THREAD;
 
-  float gate_alpha = 1.0f;
-  float gate_bias = 0.0f;
-  float gate_limit = std::numeric_limits<float>::infinity();
-  if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit) {
-    int expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
-                                             (int64_t)token + 1) -
-                 1;
-    gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
-    gate_bias = activation_type.swiglu_beta ? activation_type.swiglu_beta[expert] : 0.0f;
-    gate_limit = activation_type.swiglu_limit ? activation_type.swiglu_limit[expert]
-                                              : std::numeric_limits<float>::infinity();
-  }
-
   ActFn fn{};
-  fn.alpha = gate_alpha;
-  fn.beta = gate_bias;
-  // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
-  // supplied a per-expert swiglu_limit tensor.
-  if (activation_type.swiglu_limit) {
-    fn.limit = gate_limit;
+  if (hasPerExpertActivationParams(activation_type)) {
+    int64_t const expert = findTotalEltsLessThanTarget(expert_first_token_offset,
+                                                       num_experts_per_node, (int64_t)token + 1) -
+                           1;
+    setPerExpertActivationParams(fn, activation_type, expert);
   }
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
@@ -2328,6 +2366,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
              : activation_type == ActivationType::SwigluStep
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
+             : activation_type == ActivationType::Situ
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2391,22 +2431,13 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     size_t output_offset = token * inter_size;
 
     int64_t expert = 0;
-    float gate_alpha = 1.0f;
-    float gate_beta = 0.0f;
-    float gate_limit = std::numeric_limits<float>::infinity();
     if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale ||
-        activation_params.swiglu_alpha || activation_params.swiglu_beta ||
-        activation_params.swiglu_limit) {
+        hasPerExpertActivationParams(activation_params)) {
       expert = permuted_token_selected_experts
                    ? permuted_token_selected_experts[token]
                    : findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
                                                  token + 1) -
                          1;
-
-      gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
-      gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
-      gate_limit = activation_params.swiglu_limit ? activation_params.swiglu_limit[expert]
-                                                  : std::numeric_limits<float>::infinity();
     }
 
     size_t act_scale_idx = use_per_expert_act_scale ? expert : 0;
@@ -2444,13 +2475,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
     ActFn fn{};
-    fn.alpha = gate_alpha;
-    fn.beta = gate_beta;
-    // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
-    // supplied a per-expert swiglu_limit tensor.
-    if (activation_params.swiglu_limit) {
-      fn.limit = gate_limit;
-    }
+    setPerExpertActivationParams(fn, activation_params, expert);
     auto compute_activation = [&](int64_t elem_index) {
       GemmResultElem fc1_gemm_value;
       cutlass::arch::global_load<GemmResultElem, sizeof(GemmResultElem)>(
@@ -2504,7 +2529,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
       __shared__ float shared_token_quant_scale;
       float const row_amax = BlockReduce(reduce_storage).Reduce(thread_amax, FloatMaxOp{});
       if (tid == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+        float const quant = computeSafeFP8QuantScale(row_amax);
         float residual = 1.0f;
         // The GEMM1 profiler passes no expert map and does not consume the generated FC2 scale.
         if (fp8_expert_residual_scale && permuted_token_selected_experts) {
@@ -2670,7 +2695,11 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Identity
+                              decltype(nvfp4_4over6_config_tag)>,  // Identity
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>  // Situ
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
@@ -4784,6 +4813,8 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   bool is_fp8_act_quant = mDType == nvinfer1::DataType::kFP8;
   bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
   bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
+  // NVFP4 uses the same six quant workspaces as wfp4afp8 (issue #4003).
+  bool const is_native_wfp4afp4_family = isNativeWfp4Afp4Family();
   // This predicate identifies the SM90 FP8 activation x packed-MXFP4 storage
   // family.  Sm90Wfp4Afp8ScaleMode selects Humming/pre-MMA vs future post-MMA
   // semantics; do not infer the semantic path from dtype/layout alone.
@@ -4817,22 +4848,12 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
 
   // FP4 sizes
   bool const use_humming_pre_mma = isHummingPreMmaScaleMode();
-  bool const is_nvfp4_quant =
-      mSM >= 100 && (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   size_t quant_5_size = 0;
   size_t quant_6_size = 0;
-  if (is_nvfp4_quant) {
+  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {
     quant_1_size = sizeof(float);
-    quant_2_size = getOffsetWeightSF(num_experts_per_node, inter_size, hidden_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
-    quant_3_size = num_experts_per_node * sizeof(float);
-    quant_4_size = sizeof(float);
-    quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
-    quant_6_size = num_experts_per_node * sizeof(float);
-  } else if (is_native_wfp4afp8_family) {
-    quant_1_size = sizeof(float);
+    // fc1 scale factors span fc1_out_size rows (2x inter_size when gated),
+    // matching the gemm1_n the profiler consumes them with.
     quant_2_size =
         getOffsetWeightSF(num_experts_per_node, fc1_out_size, hidden_size, mScalingType) *
         sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
@@ -5160,8 +5181,7 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
           static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
           static_cast<float const*>(quant_6));
     }
-  } else if ((mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-             (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64)) {
+  } else if (isNativeWfp4Afp4Family()) {
     // nvllm still uses int64 because torch doesn't have fp4 yet.
     TLLM_CHECK(quant_1 && quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
     mQuantParams = QuantParams::FP4(

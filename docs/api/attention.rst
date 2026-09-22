@@ -7,66 +7,32 @@ FlashInfer Attention Kernels
 Experimental Task-Scheduled Attention
 =====================================
 
-The experimental Blackwell task-scheduled FMHA context, FMHA decode, and MLA
-decode APIs are imported from ``flashinfer.attention.prims_ts``. Scheduling,
-tile selection, and split-KV reduction are automatic implementation details;
-there are no public tuning knobs.
+The experimental Blackwell task-scheduled FMHA context, FMHA decode,
+block-sparse FMHA, and MLA decode APIs are imported from
+``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
+reduction are automatic implementation details; there are no public tuning
+knobs.
 
 See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
 for the public entry points, supported contracts, and examples. Current accuracy
 and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
 but not yet signoff-qualified.
 
-.. currentmodule:: flashinfer.attention.prims_ts
+Calling these APIs is an explicit opt-in and emits an
+``ExperimentalWarning`` once per decorated function. They provide no API
+compatibility guarantee; generated stable API reference entries are deferred
+until graduation. Logging and existing ``fi_trace`` bindings remain available.
 
-FMHA Context/Prefill
---------------------
+QToken-KvBlock-Sparse-Attention
+--------------------------------
 
-.. autosummary::
-    :toctree: ../generated
-
-    batch_prefill
-    batch_prefill_with_paged_kv_cache
-
-.. autoclass:: BatchPrefillTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchPrefillPagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-FMHA Decode
------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_decode_with_paged_kv_cache
-    get_prims_ts_batch_decode_workspace_size
-    prims_ts_batch_decode_with_kv_cache
-
-.. autoclass:: BatchDecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-MLA Decode
-----------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_decode_mla_with_paged_kv_cache
-    get_prims_ts_batch_decode_mla_workspace_size
-    prims_ts_batch_decode_with_kv_cache_mla
-
-.. autoclass:: BatchMLADecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
+QToken-KvBlock-Sparse-Attention consumes per-query
+``indexer_block_ids[total_q, block_topk]`` and a dense physical
+``block_table``. Packed prefill uses ``[total_q, Hq, D]`` with
+``qo_indptr``; fixed MTP decode uses ``[B, Nq, G, Hq, D]``.
+``kv_block_size`` is the semantic sparse K/V atom and currently supports
+only four tokens. The wrapper plans capacity outside CUDA Graph capture and
+runs live route metadata on the hot path.
 
 
 flashinfer.decode
@@ -93,15 +59,40 @@ Batch Decoding
     trtllm_batch_decode_with_kv_cache
     xqa_batch_decode_with_kv_cache
 
+DCP Speculative Decode Workspace
+--------------------------------
+
+The native Cake FMHA DCP speculative route of
+:func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
+scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
+It is also reachable through
+:func:`flashinfer.cake_fmha.cake_batch_decode_with_kv_cache`; the non-null
+``causal_seqlens_kv_global`` argument is the explicit add-on selection key.
+On SM103, the same Cake entrypoint accepts a device ``request_order`` tensor
+for BF16-query, FP8-E4M3 paged decode with head dimension 256.  Precompute an
+optional immutable length-aware schedule with
+:func:`flashinfer.plan_cake_fmha_request_ordered_paged_decode` before graph
+capture.  Page-table rows must be padded to
+``4 * ceil(max_seq_len / 256)`` entries, and the exact tensor/workspace binding
+must be invoked once eagerly to initialize its TMA descriptors before capture.
+After that prewarm, changing only the order tensor contents does not require
+recapture.
+
+.. currentmodule:: flashinfer
+
+.. autosummary::
+    :toctree: ../generated
+
+    get_dcp_spec_workspace_size_bytes
+    get_dcp_spec_counter_bytes
+    plan_cake_fmha_request_ordered_paged_decode
+    CakeFmhaRequestOrderedDecodePlan
+
+.. currentmodule:: flashinfer.decode
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchDecodeMlaWithPagedKVCacheWrapper
-    :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
@@ -150,16 +141,36 @@ Batch Prefill/Append Attention
     trtllm_ragged_attention_deepseek
     fmha_v2_prefill_deepseek
     trtllm_fmha_v2_prefill
+    fmha_v2_prefill_sm120
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
+
+    .. automethod:: __init__
+
+
+Causal + Bidirectional Ranges Prefill
+-------------------------------------
+
+.. currentmodule:: flashinfer.attention
+
+A batch-prefill wrapper whose fa2 attention variant owns the whole mask:
+causal, plus an inclusive per-query key span attended in both directions. The
+spans are handed to :meth:`BatchPrefillWithCausalBidirectionalRangesWrapper.run`
+as a compact ``int32 [total_q, 2]`` tensor and no mask is materialized, so
+nothing scales with ``qo_len * kv_len``. The JIT module is specialized in the
+constructor, and the inherited options the variant makes meaningless are
+rejected rather than ignored.
+
+.. autoclass:: BatchPrefillWithCausalBidirectionalRangesWrapper
+    :members:
 
     .. automethod:: __init__
 
@@ -213,10 +224,18 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
+    trtllm_prefill_with_kv_cache_mla
     trtllm_batch_decode_sparse_mla_dsv4
+    nvfp4_quantize_pack_sparse_mla_cache
+    nvfp4_quantize_append_sparse_mla_cache
+    dsv41_fp4_quantize_pack_sparse_mla_cache
+    dsv41_fp4_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
+    supported_sparse_mla_sm120_configs
+    SparseMLASm120DecodeConfig
+    SparseMLASm120Wrapper
 
 .. note::
 

@@ -3572,15 +3572,15 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE variants (precomputed routing, NvFP4 weights on SM100+)
+# CuteDSL MoE variants (precomputed routing, FP4 weights on SM100+)
 # ---------------------------------------------------------------------------
 
-cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
+cute_dsl_fused_moe_trace = TraceTemplate(
     op_type="moe",
-    name_prefix="cute_dsl_fused_moe_nvfp4",
+    name_prefix="cute_dsl_fused_moe",
     description=(
-        "CuteDSL NVFP4 fused MoE (SM100/SM103). Runs explicit W4A4 or W4A16 "
-        "compute with precomputed top-k routing and per-expert alpha scales."
+        "CuteDSL fused MoE on SM100, SM103, or SM107 (W4A8 excludes SM107). "
+        "Runs W4A4, W4A8, or W4A16 with precomputed top-k routing."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -3590,18 +3590,26 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
         "input_width": Var(
-            description="hidden_size // 2 for NVFP4 input or hidden_size for BF16."
+            description="hidden_size // 2 for W4A4 or hidden_size for W4A8/W4A16."
         ),
-        "num_packed_hidden": Var(description="hidden_size // 2 (NvFP4 packed)."),
+        "num_packed_hidden": Var(description="hidden_size // 2 (packed FP4)."),
         "num_packed_intermediate": Var(
-            description="intermediate_size // 2 (NvFP4 packed)."
+            description="intermediate_size // 2 (packed FP4)."
         ),
         "num_fp4_hidden_blocks": Var(
-            description="NvFP4 scale-factor count along hidden_size."
+            description="Scale-factor count along hidden_size (x_sf)."
         ),
-        "num_fp4_intermediate_blocks": Var(
-            description="NvFP4 scale-factor count along intermediate_size."
+        "sf_atom_m": Const(abbrev="", value=32, description="MMA SF atom rows."),
+        "sf_atom_m_inner": Const(
+            abbrev="", value=4, description="MMA SF atom inner-row count."
         ),
+        "sf_atom_k": Const(
+            abbrev="", value=4, description="MMA SF atom inner-K count."
+        ),
+        "w1_sf_m_tiles": Var(description="ceil(gemm1_out_size / 128)."),
+        "w1_sf_k_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_m_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_k_tiles": Var(description="ceil(intermediate_size / 128)."),
         "gemm1_out_size": Const(
             abbrev="",
             description=(
@@ -3613,12 +3621,12 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
     inputs={
         "x": Tensor(
             ["num_tokens", "input_width"],
-            description="Packed NVFP4 input for W4A4 or BF16 input for W4A16.",
+            description="Packed W4A4, MXFP8 W4A8, or BF16 W4A16 input.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
             optional=True,
-            description="NVFP4 activation scales for W4A4; omitted for W4A16.",
+            description="Activation scales for W4A4/W4A8; omitted for W4A16.",
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -3632,11 +3640,21 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
-            description="FC1 weights, NvFP4-packed.",
+            description="Packed FP4 FC1 weights.",
         ),
         "w1_weight_sf": Tensor(
-            ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
-            description="FC1 NvFP4 scales.",
+            [
+                "sf_atom_m",
+                "sf_atom_m_inner",
+                "w1_sf_m_tiles",
+                "sf_atom_k",
+                "w1_sf_k_tiles",
+                "num_local_experts",
+            ],
+            description=(
+                "FC1 weight scales in the 6D MMA layout emitted by "
+                "convert_sf_to_mma_layout."
+            ),
         ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
@@ -3648,16 +3666,26 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             dtype="float32",
             optional=True,
             description=(
-                "Global scale for W4A4 FC2 input quantization; omitted for W4A16."
+                "Global scale for W4A4 FC2 input quantization; omitted for W4A8/W4A16."
             ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
-            description="FC2 weights, NvFP4-packed.",
+            description="Packed FP4 FC2 weights.",
         ),
         "w2_weight_sf": Tensor(
-            ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
-            description="FC2 NvFP4 scales.",
+            [
+                "sf_atom_m",
+                "sf_atom_m_inner",
+                "w2_sf_m_tiles",
+                "sf_atom_k",
+                "w2_sf_k_tiles",
+                "num_local_experts",
+            ],
+            description=(
+                "FC2 weight scales in the 6D MMA layout emitted by "
+                "convert_sf_to_mma_layout."
+            ),
         ),
         "w2_alpha": Tensor(
             ["num_local_experts"],
@@ -3673,7 +3701,7 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'nvfp4'/'w4a4' or 'w4a16'.",
+            description="Compute mode: 'w4a4', 'w4a8', or 'w4a16'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -3724,13 +3752,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             description="MoE output.",
         ),
     },
-    tags=["status:experimental", "backend:cute-dsl", "quantization:nvfp4"],
+    tags=["status:experimental", "backend:cute-dsl", "quantization:block-scaled"],
 )
-cute_dsl_fused_moe_nvfp4_trace.axes["one"] = Var(
+cute_dsl_fused_moe_trace.axes["one"] = Var(
     description="Placeholder for shape [1] scalars."
 )
 
-_cute_dsl_wrapper_inputs = dict(cute_dsl_fused_moe_nvfp4_trace.inputs)
+_cute_dsl_wrapper_inputs = dict(cute_dsl_fused_moe_trace.inputs)
 # num_experts / top_k live on the wrapper instance (set in __init__), not on run().
 _cute_dsl_wrapper_inputs["num_experts"] = Scalar(
     "int32",
@@ -3778,7 +3806,7 @@ _cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     description="Set at wrapper __init__, not passed to run().",
 )
 
-_cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_nvfp4_trace.axes)
+_cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_trace.axes)
 # num_experts / top_k are set at __init__ time — no tensor on run() has a
 # num_experts dim, so the axis must be a Var here.
 _cute_dsl_wrapper_axes["num_experts"] = Var(description="Total number of experts.")
@@ -3788,18 +3816,20 @@ cute_dsl_moe_wrapper_run_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_moe_wrapper",
     description=(
-        "CuteDslMoEWrapper.run(): stateful version of cute_dsl_fused_moe_nvfp4 "
+        "CuteDslMoEWrapper.run(): stateful version of cute_dsl_fused_moe "
         "(same schema; wrapper persists autotuning state across calls)."
     ),
     axes=_cute_dsl_wrapper_axes,
     inputs=_cute_dsl_wrapper_inputs,
-    outputs=dict(cute_dsl_fused_moe_nvfp4_trace.outputs),
-    tags=cute_dsl_fused_moe_nvfp4_trace.tags,
+    outputs=dict(cute_dsl_fused_moe_trace.outputs),
+    tags=cute_dsl_fused_moe_trace.tags,
 )
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE, MXFP8 activations x MXFP4 weights (SM100+)
+# Deprecated dtype-specific CuteDSL MoE (MXFP8 x MXFP4 / W4A8).
+# Kept so the deprecated cute_dsl_fused_moe_mxfp8_mxfp4 entry points keep
+# their own fi_trace() schema until they are removed at release.
 # ---------------------------------------------------------------------------
 
 cute_dsl_fused_moe_mxfp8_mxfp4_trace = TraceTemplate(
@@ -4139,7 +4169,7 @@ _b12x_wrapper_axes["top_k"] = Var(description="Experts per token.")
 
 
 @torch.no_grad()
-def _cute_dsl_fused_moe_nvfp4_reference(
+def _cute_dsl_fused_moe_reference(
     x,
     x_sf,
     token_selected_experts,
@@ -4163,9 +4193,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     per_token_scale=None,
     **_unused,
 ):
-    """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
-    block-scale kernel with alpha scales folded into the dequantized
-    weights."""
+    """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     quant_mode = quant_mode.lower()
@@ -4173,14 +4201,35 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         if x_sf is None:
             raise ValueError("x_sf is required when quant_mode='w4a4'")
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    elif quant_mode == "w4a8":
+        if x_sf is None:
+            raise ValueError("x_sf is required when quant_mode='w4a8'")
+        hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
     elif quant_mode == "w4a16":
         if x_sf is not None:
             raise ValueError("x_sf must be None when quant_mode='w4a16'")
         hs_deq = x.to(torch.float32)
     else:
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
+    is_mxfp4 = quant_mode == "w4a8"
+    if is_mxfp4:
+
+        def mma_scales_to_logical(scales, rows, columns):
+            groups = scales.shape[5]
+            return (
+                scales.permute(5, 2, 1, 0, 4, 3)
+                .contiguous()
+                .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
+            )
+
+        w1_weight_sf = mma_scales_to_logical(
+            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * 2
+        )
+        w2_weight_sf = mma_scales_to_logical(
+            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
+        )
+    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
+    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
@@ -4373,8 +4422,8 @@ def _b12x_fused_moe_reference(
     )
 
 
-cute_dsl_fused_moe_nvfp4_trace.reference = _cute_dsl_fused_moe_nvfp4_reference
-cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_nvfp4_reference
+cute_dsl_fused_moe_trace.reference = _cute_dsl_fused_moe_reference
+cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_reference
 b12x_fused_moe_trace.reference = _b12x_fused_moe_reference
 
 
@@ -4499,4 +4548,311 @@ hash_topk_trace = TraceTemplate(
     tags=["status:verified", "moe"],
     reference=_hash_topk_reference,
     init=_hash_topk_init,
+)
+
+
+# ---------------------------------------------------------------------------
+# Standalone trtllm-gen routing stage
+# ---------------------------------------------------------------------------
+
+
+def _trtllm_gen_routing_init(
+    *,
+    num_tokens: int,
+    num_experts: int = 256,
+    top_k: int = 8,
+    tile_tokens_dim: int = 8,
+    # Derived from the axes above by Routing::getMaxNumCtasInBatchDim /
+    # getMaxPermutedPaddedCount; accepted only so the signature carries every
+    # Var axis, and recomputed rather than used.
+    max_num_ctas: int = 0,
+    max_num_padded_tokens: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the standalone trtllm-gen routing stage.
+
+    Uses Renormalize (TopK -> Softmax), the method with no bias/group
+    parameters, so the bundle is valid for any ``num_experts``/``top_k``.
+    """
+    torch.manual_seed(seed)
+    top_k = min(int(top_k), int(num_experts))
+    routing_logits = torch.randn(
+        num_tokens, num_experts, dtype=torch.float32, device=device
+    )
+    return {
+        "routing_logits": routing_logits,
+        "routing_bias": None,
+        # Plain int rather than RoutingMethodType.Renormalize: this source is
+        # rendered into the dumped JSON and must exec standalone, without
+        # flashinfer imports (see tests/trace/test_rendered_source_standalone.py).
+        "routing_method": 1,  # RoutingMethodType.Renormalize
+        "top_k": top_k,
+        "num_fused_shared_experts": 0,
+        "n_group": 0,
+        "topk_group": 0,
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_experts),
+        "routed_scaling_factor": 1.0,
+        "tile_tokens_dim": int(tile_tokens_dim),
+        "norm_topk_prob": True,
+    }
+
+
+trtllm_gen_routing_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="trtllm_gen_routing",
+    description=(
+        "Standalone trtllm-gen MoE routing stage: expert selection plus the "
+        "permutation/padding bookkeeping the fused MoE kernels consume. "
+        "topk_ids is reconstructed from the permutation (the kernels emit no "
+        "direct id output in from-logits mode) and is -1 for slots whose "
+        "expert falls outside the local expert-parallel shard. The "
+        "permutation outputs are sized by upper bounds; entries beyond "
+        "total_num_padded_tokens are undefined. No reference is attached: "
+        "the kernel's ordering within an expert's padded segment is not part "
+        "of the contract, so the outputs are only defined up to a "
+        "per-expert permutation (tests/moe/test_trtllm_gen_routing.py checks "
+        "them by invariant instead)."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_experts": Const(abbrev="e"),
+        "top_k": Const(abbrev="k"),
+        "tile_tokens_dim": Const(abbrev="t"),
+        "max_num_ctas": Var(description="Routing::getMaxNumCtasInBatchDim bound."),
+        "max_num_padded_tokens": Var(
+            description="Routing::getMaxPermutedPaddedCount bound."
+        ),
+        "one": Var(description="Placeholder for shape [1] output tensors."),
+    },
+    inputs={
+        "routing_logits": Tensor(
+            ["num_tokens", "num_experts"], description="Router logits."
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"],
+            optional=True,
+            description="Per-expert bias (DeepSeekV3/MiniMax2-style methods).",
+        ),
+        "routing_method": Scalar("int32", description="RoutingMethodType value."),
+        "top_k": Scalar("int32"),
+        "num_fused_shared_experts": Scalar("int32"),
+        "n_group": Scalar("int32", description="Expert groups; 0 disables grouping."),
+        "topk_group": Scalar("int32"),
+        "local_expert_offset": Scalar("int32", description="Expert-parallel shard."),
+        "local_num_experts": Scalar(
+            "int32", optional=True, description="Defaults to num_experts."
+        ),
+        "routed_scaling_factor": Scalar("float32"),
+        "tile_tokens_dim": Scalar("int32"),
+        "norm_topk_prob": Scalar("bool"),
+    },
+    outputs={
+        "topk_ids": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "topk_weights": Tensor(["num_tokens", "top_k"], dtype="bfloat16"),
+        "total_num_padded_tokens": Tensor(["one"], dtype="int32"),
+        "expanded_idx_to_permuted_idx": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "permuted_idx_to_token_idx": Tensor(["max_num_padded_tokens"], dtype="int32"),
+        "cta_idx_xy_to_batch_idx": Tensor(["max_num_ctas"], dtype="int32"),
+        "cta_idx_xy_to_mn_limit": Tensor(["max_num_ctas"], dtype="int32"),
+        "num_non_exiting_ctas": Tensor(["one"], dtype="int32"),
+    },
+    # The declared output shapes assume no fused shared experts; with
+    # num_fused_shared_experts > 0 the per-token extent becomes
+    # top_k + num_fused_shared_experts.
+    constraints=["num_fused_shared_experts == 0"],
+    tags=["status:verified", "moe", "moe:routing"],
+    init=_trtllm_gen_routing_init,
+)
+
+
+# ---------------------------------------------------------------------------
+# SM90 (Hopper) CuTe-DSL unquantized fused MoE
+# ---------------------------------------------------------------------------
+
+cute_dsl_fused_moe_bf16_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_fused_moe_bf16",
+    description=(
+        "SM90 (Hopper) CuTe-DSL unquantized (bf16/fp16) fused MoE: moe_sort "
+        "routing maps + gather-fused grouped GEMM1 with the activation in its "
+        "epilogue (SwiGLU/OAI/SiTU, GeGLU-tanh, or non-gated ReLU^2) "
+        "+ grouped GEMM2 with fused finalize. Pre-routed "
+        "(token_selected_experts + token_final_scales)."
+    ),
+    axes={
+        "num_tokens": Var(description="Total tokens across the batch."),
+        "hidden_size": Const(abbrev="h"),
+        "gemm1_out_size": Var(
+            description=(
+                "FC1 output rows: 2 * intermediate_size for gated activations, "
+                "intermediate_size for Relu2."
+            )
+        ),
+        "intermediate_size": Var(description="MoE intermediate size per rank."),
+        "num_local_experts": Const(abbrev="e"),
+        "top_k": Const(abbrev="topk"),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "hidden_size"],
+            description="Input activations (bfloat16 or float16).",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k GLOBAL expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "w1_weight": Tensor(
+            ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            description=(
+                "FC1 weights. Gated activations: up/gate interleaved at 32 "
+                "columns (reference repack: interleave_up_gate_sm90; frameworks "
+                "keep their own copy, the SM100 convention). Relu2: a plain "
+                "[E, I, hidden] projection."
+            ),
+        ),
+        "w2_weight": Tensor(
+            ["num_local_experts", "hidden_size", "intermediate_size"],
+            description="FC2 (down-projection) weights.",
+        ),
+        "num_experts": Scalar("int32", description="Total (global) expert count."),
+        "top_k": Scalar("int32", description="Experts per token."),
+        "num_local_experts": Scalar(
+            "int32", optional=True, description="Experts held by this rank (EP)."
+        ),
+        "local_expert_offset": Scalar(
+            "int32", optional=True, description="Global id of the first local expert."
+        ),
+        "activation_type": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "GEMM1 activation type: ActivationType.Swiglu for gated "
+                "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
+                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
+                "non-gated ReLU^2. Determines gemm1_out_size."
+            ),
+        ),
+        "swiglu_alpha": Scalar(
+            "float32", optional=True, description="SwiGLU sigmoid multiplier."
+        ),
+        "swiglu_beta": Scalar(
+            "float32", optional=True, description="SwiGLU up-projection bias."
+        ),
+        "swiglu_limit": Scalar(
+            "float32", optional=True, description="SwiGLU clamp limit."
+        ),
+        "situ_beta": Scalar(
+            "float32",
+            optional=True,
+            description="SiTU gate tanh-clamp beta; enables SiTU when set.",
+        ),
+        "situ_linear_beta": Scalar(
+            "float32",
+            optional=True,
+            description="Optional SiTU up-branch tanh-clamp beta.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype_from="x",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
+)
+
+
+def _alphamoe_fused_router_init(
+    *,
+    num_tokens: int,
+    max_route_blocks: int,
+    max_padded_pairs: int,
+    num_experts_plus_one: int,
+    one: int,
+    num_experts: int = 512,
+    top_k: int = 8,
+    block_m: int = 16,
+    has_shared_expert: bool = False,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build finite FP32 logits for the standalone AlphaMoE router API."""
+
+    del max_route_blocks, max_padded_pairs, num_experts_plus_one, one
+    torch.manual_seed(seed)
+    return {
+        "logits": torch.randn(
+            num_tokens, num_experts, dtype=torch.float32, device=device
+        ),
+        "top_k": int(top_k),
+        "block_m": int(block_m),
+        "has_shared_expert": bool(has_shared_expert),
+    }
+
+
+alphamoe_fused_router_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="alphamoe_fused_router",
+    description=(
+        "AlphaMoE logits-to-plan frontend: top-k (exact-tie order unspecified), "
+        "selected-logit softmax, per-expert block padding, and expert-grouped "
+        "route scatter in one cooperative SM100/SM103 kernel."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of routed tokens."),
+        "num_experts": Const(abbrev="e", description="Number of experts."),
+        "top_k": Const(abbrev="k", description="Routes per token."),
+        "block_m": Const(abbrev="bm", description="Per-expert plan alignment."),
+        "has_shared_expert": Const(
+            abbrev="shared", description="Whether the last expert is forced."
+        ),
+        "max_route_blocks": Var(description="Allocated route-block capacity."),
+        "max_padded_pairs": Var(description="Allocated padded-pair capacity."),
+        "num_experts_plus_one": Var(description="num_experts + 1."),
+        "one": Var(description="Singleton device-scalar extent."),
+    },
+    inputs={
+        "logits": Tensor(
+            ["num_tokens", "num_experts"],
+            dtype="float32",
+            description="Finite contiguous FP32 router logits.",
+        ),
+        "top_k": Scalar("int32"),
+        "block_m": Scalar("int32"),
+        "has_shared_expert": Scalar("bool"),
+    },
+    outputs={
+        "topk_weights": Tensor(["num_tokens", "top_k"], dtype="float32"),
+        "topk_ids": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "sorted_token_ids": Tensor(["max_padded_pairs"], dtype="int32"),
+        "expert_ids": Tensor(["max_route_blocks"], dtype="int32"),
+        "num_tokens_post_padded": Tensor(["one"], dtype="int32"),
+        "expert_counts": Tensor(["num_experts"], dtype="int32"),
+        "expert_offsets": Tensor(["num_experts_plus_one"], dtype="int32"),
+        "expert_scatter_offsets": Tensor(["num_experts"], dtype="int32"),
+    },
+    constraints=[
+        "num_tokens > 0",
+        "1 <= num_experts <= 512",
+        "1 <= top_k <= min(num_experts, 16)",
+        "1 <= block_m <= 16",
+        "not has_shared_expert or top_k >= 2",
+        "max_route_blocks == min(num_experts, num_tokens * top_k) + "
+        "(num_tokens * top_k - min(num_experts, num_tokens * top_k)) // block_m",
+        "max_padded_pairs == max_route_blocks * block_m",
+        "num_experts_plus_one == num_experts + 1",
+        "one == 1",
+    ],
+    tags=["status:experimental", "moe", "sm100", "sm103"],
+    init=_alphamoe_fused_router_init,
 )

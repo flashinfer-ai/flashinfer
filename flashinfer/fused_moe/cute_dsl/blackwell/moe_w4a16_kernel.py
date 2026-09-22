@@ -55,12 +55,17 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 
+from ..moe_utils import validate_cute_dsl_moe_situ_config
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
+    f32_reciprocal,
     fmin,
+    gelu_tanh_f32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
+    situ_f32,
+    tanh_f32,
 )
 
 
@@ -84,11 +89,14 @@ class Sm100W4A16GroupedGemmKernel:
         swiglu_alpha: float,
         swiglu_beta: float,
         swiglu_limit: float,
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
         use_fused_finalize: bool,
         enable_pdl: bool,
         use_clc_scheduler: bool,
         raster_along_m: bool,
         transform_fragment_size: int,
+        m_cluster_aligned: bool,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -99,6 +107,7 @@ class Sm100W4A16GroupedGemmKernel:
         if activation_type not in (
             None,
             ActivationType.Swiglu.value,
+            ActivationType.GegluTanh.value,
             ActivationType.Relu2.value,
         ):
             raise ValueError(
@@ -108,10 +117,24 @@ class Sm100W4A16GroupedGemmKernel:
         self.use_clc_scheduler = use_clc_scheduler
         self.raster_along_m = raster_along_m
         self.transform_fragment_size = transform_fragment_size
-        self.gated = activation_type == ActivationType.Swiglu.value
+        self.m_cluster_aligned = m_cluster_aligned
+        if activation_type is None:
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError("SiTU parameters require an activation")
+        else:
+            validate_cute_dsl_moe_situ_config(
+                ActivationType(activation_type), situ_beta, situ_linear_beta
+            )
+        self.activation_type = activation_type
+        self.gated = activation_type in (
+            ActivationType.Swiglu.value,
+            ActivationType.GegluTanh.value,
+        )
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.parameterized_swiglu = (
             swiglu_alpha != DEFAULT_SWIGLU_ALPHA
             or swiglu_beta != DEFAULT_SWIGLU_BETA
@@ -549,7 +572,7 @@ class Sm100W4A16GroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         num_tokens: cutlass.Int64,
-        top_k: cutlass.Int64,
+        top_k: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -1963,47 +1986,92 @@ class Sm100W4A16GroupedGemmKernel:
                                 (gate[i], gate[i + 1]),
                                 (gated_alpha_f32, gated_alpha_f32),
                             )
-                            if cutlass.const_expr(self.parameterized_swiglu):
-                                gate_pair = (
-                                    fmin(gate_pair[0], swiglu_limit, nan=True),
-                                    fmin(gate_pair[1], swiglu_limit, nan=True),
+                            if cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                                and self.situ_beta is not None
+                            ):
+                                # Keep the Python float so situ_f32 can fold
+                                # 1 / beta at trace time instead of emitting a
+                                # per-element div.rn.f32.
+                                situ_beta = self.situ_beta
+                                situ_gate_pair = (
+                                    situ_f32(gate_pair[0], situ_beta, fastmath=True),
+                                    situ_f32(gate_pair[1], situ_beta, fastmath=True),
                                 )
-                                up_pair = (
-                                    -fmin(
-                                        -fmin(up_pair[0], swiglu_limit, nan=True),
-                                        swiglu_limit,
-                                        nan=True,
+                                if cutlass.const_expr(
+                                    self.situ_linear_beta is not None
+                                ):
+                                    linear_beta = cutlass.Float32(self.situ_linear_beta)
+                                    inv_linear_beta = cutlass.Float32(
+                                        f32_reciprocal(self.situ_linear_beta)
+                                    )
+                                    up_pair = (
+                                        linear_beta
+                                        * tanh_f32(
+                                            up_pair[0] * inv_linear_beta, fastmath=True
+                                        ),
+                                        linear_beta
+                                        * tanh_f32(
+                                            up_pair[1] * inv_linear_beta, fastmath=True
+                                        ),
+                                    )
+                                result = cute.arch.mul_packed_f32x2(
+                                    up_pair, situ_gate_pair
+                                )
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.GegluTanh.value
+                            ):
+                                result = cute.arch.mul_packed_f32x2(
+                                    up_pair,
+                                    (
+                                        gelu_tanh_f32(gate_pair[0], fastmath=True),
+                                        gelu_tanh_f32(gate_pair[1], fastmath=True),
                                     ),
-                                    -fmin(
-                                        -fmin(up_pair[1], swiglu_limit, nan=True),
-                                        swiglu_limit,
-                                        nan=True,
+                                )
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                            ):
+                                if cutlass.const_expr(self.parameterized_swiglu):
+                                    gate_pair = (
+                                        fmin(gate_pair[0], swiglu_limit, nan=True),
+                                        fmin(gate_pair[1], swiglu_limit, nan=True),
+                                    )
+                                    up_pair = (
+                                        -fmin(
+                                            -fmin(up_pair[0], swiglu_limit, nan=True),
+                                            swiglu_limit,
+                                            nan=True,
+                                        ),
+                                        -fmin(
+                                            -fmin(up_pair[1], swiglu_limit, nan=True),
+                                            swiglu_limit,
+                                            nan=True,
+                                        ),
+                                    )
+                                gate_log2e = cute.arch.mul_packed_f32x2(
+                                    gate_pair,
+                                    (
+                                        neg_swiglu_alpha_log2_e,
+                                        neg_swiglu_alpha_log2_e,
                                     ),
                                 )
-                            gate_log2e = cute.arch.mul_packed_f32x2(
-                                gate_pair,
-                                (
-                                    neg_swiglu_alpha_log2_e,
-                                    neg_swiglu_alpha_log2_e,
-                                ),
-                            )
-                            sigmoid = cute.arch.add_packed_f32x2(
-                                (
-                                    cute.math.exp2(gate_log2e[0], fastmath=True),
-                                    cute.math.exp2(gate_log2e[1], fastmath=True),
-                                ),
-                                (1.0, 1.0),
-                            )
-                            sigmoid = (
-                                cute.arch.rcp_approx(sigmoid[0]),
-                                cute.arch.rcp_approx(sigmoid[1]),
-                            )
-                            silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
-                            if cutlass.const_expr(self.parameterized_swiglu):
-                                up_pair = cute.arch.add_packed_f32x2(
-                                    up_pair, (swiglu_beta, swiglu_beta)
+                                sigmoid = cute.arch.add_packed_f32x2(
+                                    (
+                                        cute.math.exp2(gate_log2e[0], fastmath=True),
+                                        cute.math.exp2(gate_log2e[1], fastmath=True),
+                                    ),
+                                    (1.0, 1.0),
                                 )
-                            result = cute.arch.mul_packed_f32x2(up_pair, silu)
+                                sigmoid = (
+                                    cute.arch.rcp_approx(sigmoid[0]),
+                                    cute.arch.rcp_approx(sigmoid[1]),
+                                )
+                                silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
+                                if cutlass.const_expr(self.parameterized_swiglu):
+                                    up_pair = cute.arch.add_packed_f32x2(
+                                        up_pair, (swiglu_beta, swiglu_beta)
+                                    )
+                                result = cute.arch.mul_packed_f32x2(up_pair, silu)
 
                             coord_0 = up_coords[i]
                             coord_1 = up_coords[i + 1]
@@ -2145,19 +2213,28 @@ class Sm100W4A16GroupedGemmKernel:
                             hidden_base = (
                                 work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                             )
-                            valid_elements = (
-                                cutlass.Int64(final_output.shape[0]) - hidden_base
-                            )
-                            if valid_elements > 0:
+                            valid_elements = cutlass.Int64(self.cta_tile_shape_mnk[0])
+                            if cutlass.const_expr(not self.m_cluster_aligned):
+                                valid_elements = (
+                                    cutlass.Int64(final_output.shape[0]) - hidden_base
+                                )
+                            if (
+                                cutlass.const_expr(self.m_cluster_aligned)
+                                or valid_elements > 0
+                            ):
                                 scatter_out = cute.domain_offset(
                                     (hidden_base, reduce_token_idx, 0), final_output
                                 )
                                 copy_elements = cutlass.Int32(
-                                    cutlass.min(
-                                        cutlass.Int64(self.cta_tile_shape_mnk[0]),
-                                        valid_elements,
-                                    )
+                                    self.cta_tile_shape_mnk[0]
                                 )
+                                if cutlass.const_expr(not self.m_cluster_aligned):
+                                    copy_elements = cutlass.Int32(
+                                        cutlass.min(
+                                            cutlass.Int64(self.cta_tile_shape_mnk[0]),
+                                            valid_elements,
+                                        )
+                                    )
                                 blk_reduce_bf16(
                                     scatter_out,
                                     sFinalize[(reduce_route, None)],
@@ -2167,7 +2244,9 @@ class Sm100W4A16GroupedGemmKernel:
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         self.epilog_sync_barrier.arrive_and_wait()
-                    elif tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    elif (
+                        tma_distance_to_boundary >= (subtile_idx + 1) * self.epi_tile_n
+                    ):
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         if cutlass.const_expr(not self.fuse_activation):
@@ -2213,10 +2292,15 @@ class Sm100W4A16GroupedGemmKernel:
                         m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
                         for i in cutlass.range(cute.size(tCpC), unroll_full=True):
                             tCpC[i] = (
-                                m_thr_slice[(i)][0]
-                                + work_tile.cta_coord_m * self.cta_tile_shape_mnk_c[0]
-                                < cute.size(tensor_c.shape[0])
-                            ) and (m_thr_slice[(i)][1] < work_tile.distance_to_boundary)
+                                m_thr_slice[(i)][1] < work_tile.distance_to_boundary
+                            )
+                            if cutlass.const_expr(not self.m_cluster_aligned):
+                                tCpC[i] = (
+                                    m_thr_slice[(i)][0]
+                                    + work_tile.cta_coord_m
+                                    * self.cta_tile_shape_mnk_c[0]
+                                    < cute.size(tensor_c.shape[0])
+                                ) and tCpC[i]
                         # Store C to global memory
                         cute.copy(
                             simt_atom,

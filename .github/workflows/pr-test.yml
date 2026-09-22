@@ -6,7 +6,7 @@
 # - Push to main: Always runs
 # - PRs: run only when the 'run-ci' label is applied, for every contributor.
 #   Applying the label is the trigger, so new commits need a new trigger:
-#   @flashinfer-bot run. Only users with write access can apply labels.
+#   @flashinfer-bot run.
 #
 # Instance Purchasing:
 # - All runners are on-demand. Spot was removed.
@@ -45,6 +45,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  statuses: read # reads the ci/test-scope status published by ci-bot-commands.yml
   actions: read
 
 env:
@@ -77,8 +78,7 @@ jobs:
 
           # Authorize on run-ci being applied, not on it being present: presence
           # would re-authorize every later push, which is the auto-trigger this
-          # gate removes. Applying a label needs write access, so this also holds
-          # on fork PRs, where secrets are unavailable.
+          # gate removes.
           if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_NAME" == "run-ci" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "run-ci label applied, authorized"
@@ -101,11 +101,16 @@ jobs:
       skip_build: ${{ steps.check.outputs.skip }}
       test_matrix: ${{ steps.matrix.outputs.matrix }}
       test_count: ${{ steps.matrix.outputs.count }}
+      # Surfaced so the required check can say a green result was scoped.
+      test_scope: ${{ steps.scope.outputs.test_path }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Validate CUDA configuration
+        run: python3 ci/validate_cuda_versions.py
 
       - name: Get Docker Tag
         id: get-tag
@@ -117,6 +122,10 @@ jobs:
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Docker tag: $TAG"
+
+      - name: Load runtime CUDA matrix
+        id: cuda-versions
+        run: echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
       - name: Check Skip Conditions
         id: check
@@ -147,6 +156,38 @@ jobs:
           fi
 
       # Built here rather than written inline in the test job because the
+      # `@flashinfer-bot run <paths>` publishes the requested scope as a `ci/test-scope`
+      # commit status on this SHA (see ci-bot-commands.yml). Read it verbatim - the
+      # comment was parsed once, there, and nothing is re-parsed here.
+      #
+      # Statuses come back newest-first, so the newest for this context is the last
+      # command issued. No status means nobody asked for a scope: run the full suite.
+      # Because the status is keyed to the SHA, a scope cannot outlive the commit it was
+      # requested for.
+      - name: Read requested test scope
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # The combined endpoint (/status, not /statuses) returns one entry per
+          # context, already the latest. Using it means re-triggering overwrites
+          # cleanly without this step deduplicating by hand, and without depending on
+          # the raw list's ordering, which is not a documented guarantee.
+          SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" --jq '
+              .statuses
+              | map(select(.context | test("^ci/test-scope-[0-9]+$")))
+              | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
+                     d: (.description // "")})
+              | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")')
+          if [ -z "$SCOPE" ]; then
+            echo "No requested scope for ${HEAD_SHA}; running the full suite"
+          else
+            echo "Requested scope: ${SCOPE}"
+          fi
+          echo "test_path=${SCOPE}" >> "$GITHUB_OUTPUT"
+
       # skip_aot / skip_gpu dispatch inputs have to drop entries before the
       # matrix expands - a job-level `if` cannot see the matrix context, and
       # skipping inside the job would still claim a runner first.
@@ -155,11 +196,15 @@ jobs:
         env:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
+          RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
+          # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
+          # already validated in the step above. Empty for an unparameterised run.
+          REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
         run: |
           {
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
-                for cuda in cu126 cu128 cu129 cu130; do
+                for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
                   jq -nc --arg arch "$arch" --arg cuda "$cuda" '{
                     name: "AOT Build Import (\($arch), \($cuda))",
                     kind: "aot",
@@ -172,7 +217,7 @@ jobs:
               done
             fi
 
-            if [ "$SKIP_GPU" != "true" ]; then
+            if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
               for shard in 1 2 3 4 5; do
                 jq -nc --arg shard "$shard" '{
                   name: "JIT Unittest \($shard) (A10G)",
@@ -199,6 +244,49 @@ jobs:
                 runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
                 cuda: "cu129",
                 script: "task_run_unit_tests.sh",
+                timeout: 480
+              }'
+            elif [ "$SKIP_GPU" != "true" ]; then
+              # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
+              # paths. There is deliberately no arch selection: tests carry their own
+              # arch guards (is_sm90a_supported() and friends) and skip themselves where
+              # unsupported, so the targets can run across the whole GPU matrix and the
+              # right subset executes per runner. Narrowing the scope reduces what runs
+              # in each cell, not which cells run - and nobody has to keep a
+              # path-to-arch mapping in sync with the tests.
+              #
+              # The default shards (task_jit_run_tests_part*.sh) are fixed pytest lists
+              # and take no arguments, so a targeted run uses task_run_unit_tests.sh --
+              # the script that forwards "$@" into TEST_PATH -- on every GPU runner.
+              #
+              # This step does NOT parse the PR body. Turning a declared scope into paths
+              # happens once, in whoever issues the trigger (a reviewer, or the screening
+              # watcher posting under its own identity). CI runs what it is told.
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (A10G)",
+                kind: "gpu",
+                runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
+                timeout: 360
+              }'
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (T4)",
+                kind: "gpu",
+                runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
+                timeout: 360
+              }'
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (H100)",
+                kind: "h100",
+                runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
                 timeout: 480
               }'
             fi
@@ -230,6 +318,12 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.test_matrix) }}
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+      MATRIX_ARCH: ${{ matrix.runner[2] }}
+      MATRIX_CUDA: ${{ matrix.cuda }}
+      TEST_SCRIPT: ${{ matrix.script }}
+      # Empty for every lane except the experimental one. Quoted at the use site and
+      # never interpolated into script text - it originates from the PR body.
+      TEST_PATH_ARG: ${{ matrix.test_path }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -286,16 +380,93 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
+          if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
+            echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
+            exit 1
+          fi
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
           bash ci/bash.sh "${DOCKER_IMAGE}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
-            --no-gpu ./scripts/${{ matrix.script }}
+            -e SCCACHE_STATS_DIR /workspace/sccache-stats \
+            --no-gpu "./scripts/${TEST_SCRIPT}"
+
+      - name: Display sccache stats
+        if: always() && matrix.kind == 'aot'
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always() && matrix.kind == 'aot'
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
+            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always() && matrix.kind == 'aot'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-stats-${{ matrix.cuda }}-${{ matrix.runner[2] }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run Test
         if: matrix.kind != 'aot'
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/${{ matrix.script }}
+        run: |
+          case "${TEST_SCRIPT}" in
+            task_jit_run_tests_part[1-5].sh|task_run_unit_tests.sh) ;;
+            *)
+              echo "::error::Unexpected GPU test script: ${TEST_SCRIPT}"
+              exit 1
+              ;;
+          esac
+          if [ -n "${TEST_PATH_ARG:-}" ]; then
+            # Read into an array and expand quoted, rather than relying on word
+            # splitting: this keeps the shell safe on its own terms instead of
+            # inheriting the validator's charset guarantee. Globbing is off for the
+            # same reason.
+            set -f
+            read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
+            set +f
+            # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
+            # to unit_test_runner.py, whose parser takes the scope as an option (or the
+            # TEST_PATH env var, which ci/bash.sh does not forward into the container).
+            # Bare paths fail argument-preflight with "unrecognized arguments".
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
+          else
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+          fi
+
+      - name: Make JUnit XML readable
+        if: ${{ always() && matrix.kind == 'h100' }}
+        run: |
+          if [ -d junit ]; then
+            sudo chmod -R a+rX junit
+          fi
+
+      - name: Upload JUnit XML
+        if: ${{ always() && matrix.kind == 'h100' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-h100-${{ github.run_id }}-${{ github.run_attempt }}
+          path: junit/**/*.xml
+          if-no-files-found: warn
+          retention-days: 30
 
 
   # ---------------------------------------------------------------------------
@@ -372,14 +543,84 @@ jobs:
             exit 0
           fi
 
+          # Failing while another run tests this commit would turn the required
+          # check red under it, so report what that run reports. Older runs only,
+          # so two label events cannot wait on each other.
+          ACTIVE=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "${{ github.workflow }}" \
+            --commit "$HEAD_SHA" \
+            --limit 50 \
+            --json databaseId,status \
+            --jq '[.[] | select(.databaseId < (env.GITHUB_RUN_ID | tonumber))
+                       | select(.status == "in_progress" or .status == "queued")]
+                  | min_by(.databaseId) | .databaseId // empty' 2>/dev/null) || ACTIVE=""
+
+          if [ -n "$ACTIVE" ]; then
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/$ACTIVE"
+            echo "Tests for this commit are running in [run $ACTIVE]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+
+            # The summary lands only when this job ends, so the annotation is
+            # what carries the link on the PR meanwhile.
+            echo "::notice title=Tests are already running for this commit::$RUN_URL"
+
+            # No wait limit, because any number here would guess at test duration
+            # and guessing low fails a healthy run. The wait ends when the
+            # followed run concludes, or when it stops being readable.
+            CONCLUSION=""
+            UNREADABLE=0
+            while true; do
+              INFO=$(gh run view "$ACTIVE" --repo "${{ github.repository }}" \
+                --json status,conclusion,jobs \
+                --jq '.status + "|" + (.conclusion // "") + "|"
+                      + ([.jobs[] | select(.status == "completed")] | length | tostring) + " done, "
+                      + ([.jobs[] | select(.status == "in_progress")] | length | tostring) + " running, "
+                      + ([.jobs[] | select(.status == "queued")] | length | tostring) + " waiting for a runner, of "
+                      + (.jobs | length | tostring) + " jobs"' 2>/dev/null) || INFO=""
+              IFS='|' read -r STATUS CONCLUSION PROGRESS <<< "$INFO"
+
+              if [ "$STATUS" == "completed" ]; then
+                break
+              fi
+
+              # Transient errors retry; 5 minutes unreadable means the run is
+              # gone and no conclusion is coming.
+              if [ -z "$STATUS" ]; then
+                UNREADABLE=$((UNREADABLE + 1))
+                if [ "$UNREADABLE" -ge 10 ]; then
+                  echo "Result: run $ACTIVE is no longer readable" >> $GITHUB_STEP_SUMMARY
+                  exit 1
+                fi
+              else
+                UNREADABLE=0
+              fi
+
+              echo "run $ACTIVE after $((SECONDS / 60))m: ${PROGRESS:-progress unavailable} - $RUN_URL"
+              sleep 30
+            done
+
+            if [ "$CONCLUSION" == "success" ] || [ "$CONCLUSION" == "skipped" ]; then
+              echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+            echo "Result: run $ACTIVE ended as '${CONCLUSION:-still running}'" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
           echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-          echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
+          echo "A contributor who can label the PR, or a \`ci-users\` member, can comment \`@flashinfer-bot run\` to start CI." >> $GITHUB_STEP_SUMMARY
           echo "This is also needed after pushing new commits, since CI no longer starts on its own." >> $GITHUB_STEP_SUMMARY
           echo "::warning::CI skipped — pending authorization"
           exit 1
 
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
+        env:
+          # Bound, not interpolated into the script body. The value originates from a
+          # commit status description, which anything holding statuses:write can set;
+          # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
+          # in another file and must not be what keeps this step from being injectable.
+          TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -404,6 +645,18 @@ jobs:
           RESULT="${{ needs.test.result }}"
           echo "Tests: ${{ needs.setup.outputs.test_count }}, result: $RESULT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # A scope is sticky per SHA: re-applying run-ci by hand on a commit that
+          # once had a scoped bot run silently reuses it, so this required check can
+          # go green having run three narrow lanes. The job names change from "JIT
+          # Unittest" to "Targeted Unittest", but that is easy to miss on a check
+          # list -- say it outright on the check a merge decision actually reads.
+          if [ -n "${TEST_SCOPE:-}" ]; then
+            echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
 
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
             echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY

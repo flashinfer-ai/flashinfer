@@ -282,3 +282,188 @@ decode_cp_a2a_alltoall_trace = TraceTemplate(
     reference=_decode_cp_a2a_alltoall_reference,
     init=_decode_cp_a2a_alltoall_init,
 )
+
+
+# ── PCIe IPC all-reduce (intra-node, no NVLink) ──────────────────────────────
+
+
+@torch.no_grad()
+def _pcie_ipc_all_reduce_reference(
+    inp: torch.Tensor,
+    *,
+    out: torch.Tensor = None,
+    config=None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Single-rank reference: an all-reduce over one rank is the identity.
+
+    Same modelling choice as ``allreduce_fusion`` above -- the trace runs in a
+    single process, so the cross-rank reduction cannot be exercised here.
+    Multi-rank correctness is covered by
+    ``tests/comm/test_pcie_ipc_all_reduce.py``, which compares against NCCL at
+    zero tolerance.
+    """
+    return inp.clone() if out is None else out.copy_(inp)
+
+
+def _pcie_ipc_all_reduce_init(
+    *,
+    num_tokens: int,
+    hidden_dim: int = 6144,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build this rank's input for ``PcieIpcAllReduceWorkspace.all_reduce``.
+
+    The workspace itself is an opaque multi-rank IPC handle bound to ``self``
+    and is not built here; see ``tests/comm/test_pcie_ipc_all_reduce.py``.
+    """
+    generator = torch.Generator(device=device).manual_seed(seed)
+    return {
+        "inp": torch.randn(
+            num_tokens,
+            hidden_dim,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+    }
+
+
+pcie_ipc_all_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="pcie_ipc_all_reduce",
+    description=(
+        "Custom all-reduce for intra-node PCIe machines without NVLink. The "
+        "launch configuration follows the payload in bytes -- a seed default "
+        "until the workspace is tuned on the machine it runs on -- so the "
+        "traced axes are the ones that select it."
+    ),
+    axes={
+        "num_tokens": Var(description="Token count along dim 0."),
+        "hidden_dim": Const(abbrev="h"),
+    },
+    inputs={
+        "inp": Tensor(
+            ["num_tokens", "hidden_dim"],
+            description="Pre-reduction token activations (this rank's shard).",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_dim"],
+            dtype_from="inp",
+            description="Reduced activations.",
+        ),
+    },
+    tags=["status:verified", "stage:comm"],
+    reference=_pcie_ipc_all_reduce_reference,
+    init=_pcie_ipc_all_reduce_init,
+)
+
+
+# ── Fused NCCL-LSA DCP all-to-all + LSE reduce ───────────────────────────────
+
+
+@torch.no_grad()
+def _decode_cp_a2a_lse_reduce_reference(
+    partial_o: torch.Tensor,
+    partial_lse: torch.Tensor,
+    workspace,
+    cp_rank: int,
+    cp_size: int,
+    lse_mode: str = "base2",
+    **_unused,
+):
+    """Local LSE merge reference; multi-rank exchange is tested under tests/comm."""
+    lse = torch.where(
+        torch.isnan(partial_lse) | torch.isposinf(partial_lse),
+        torch.full_like(partial_lse, float("-inf")),
+        partial_lse,
+    )
+    lse_max = lse.amax(dim=-1, keepdim=True)
+    lse_max = torch.where(torch.isneginf(lse_max), 0, lse_max)
+    weights = (
+        torch.exp(lse - lse_max) if lse_mode == "basee" else torch.exp2(lse - lse_max)
+    )
+    denom = weights.sum(dim=-1, keepdim=True)
+    output = (partial_o.float() * weights.unsqueeze(-1)).sum(dim=-2)
+    output = output / denom.clamp_min(1e-20)
+    output = torch.where(denom == 0, torch.zeros_like(output), output)
+    return output.to(partial_o.dtype)
+
+
+def _decode_cp_a2a_lse_reduce_init(
+    *,
+    batch_dim: int,
+    cp_size: int,
+    head_dim: int = 128,
+    workspace_bytes: int = 16,
+    cp_rank: int = 0,
+    lse_mode: str = "base2",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build schema inputs; the real workspace must be rendezvoused collectively."""
+    torch.manual_seed(seed)
+    return {
+        "partial_o": torch.randn(
+            batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "partial_lse": torch.randn(
+            batch_dim, cp_size, dtype=torch.float32, device=device
+        ),
+        "workspace": torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+        "lse_mode": lse_mode,
+    }
+
+
+decode_cp_a2a_lse_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="decode_cp_a2a_lse_reduce",
+    description=(
+        "Fused context-parallel NCCL-LSA all-to-all and LSE-weighted "
+        "attention-output reduction. The trace reference models the local "
+        "LSE merge; multi-rank exchange correctness is exercised by tests/comm."
+    ),
+    axes={
+        "batch_dim": Var(
+            description=(
+                "Flattened batch and head dimensions (batch * heads); heads may "
+                "be local or total."
+            )
+        ),
+        "cp_size": Var(description="Context-parallel group size."),
+        "head_dim": Const(abbrev="d"),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "partial_o": Tensor(
+            ["batch_dim", "cp_size", "head_dim"],
+            description=(
+                "Per-rank partial attention outputs [batch, heads, cp_size, head_dim]."
+            ),
+        ),
+        "partial_lse": Tensor(
+            ["batch_dim", "cp_size"],
+            dtype="float32",
+            description="Per-rank log-sum-exp values [batch, heads, cp_size].",
+        ),
+        "workspace": Tensor(["workspace_bytes"], dtype="uint8"),
+        "cp_rank": Scalar("int32"),
+        "cp_size": Scalar("int32"),
+        "lse_mode": Scalar("str"),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_dim", "head_dim"],
+            dtype_from="partial_o",
+            description="Reduced output [batch, heads, head_dim].",
+        ),
+    },
+    tags=["status:experimental", "stage:comm"],
+    reference=_decode_cp_a2a_lse_reduce_reference,
+    init=_decode_cp_a2a_lse_reduce_init,
+)

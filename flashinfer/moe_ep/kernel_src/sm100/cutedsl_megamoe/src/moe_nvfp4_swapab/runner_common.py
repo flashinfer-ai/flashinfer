@@ -495,8 +495,10 @@ def swiglu_fold_interleave_16(
     return swiglu_fold_interleave(c_fp32, 16, gate_up_clamp=gate_up_clamp)
 
 
-# The flat-index Triton helpers below compute ``program_id * BLOCK + arange``
-# in int32, so any launch with >= 2**31 elements would silently wrap.
+# The int32-indexed Triton helpers below (_rcp_approx_kernel,
+# _swiglu_pair_kernel) compute ``program_id * BLOCK + arange`` in int32, so
+# any launch with >= 2**31 elements would silently wrap. _pack_fp4_kernel is
+# exempt: it widens to int64 for the billion-element combine round-trip.
 _TRITON_FLAT_INDEX_LIMIT = 2**31
 
 
@@ -566,7 +568,8 @@ def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     n_pairs = flat.numel() // 2
     out = torch.empty(n_pairs, dtype=torch.uint8, device=fp32.device)
     if n_pairs > 0:
-        _check_triton_flat_index(n_pairs, "_pack_f32_to_fp4")
+        # No _check_triton_flat_index here: _pack_fp4_kernel indexes in int64
+        # precisely so the combine round-trip can pack > 2**31 elements.
         triton, kernel = _get_pack_fp4_triton_kernel()
         block = 1024
         grid = (triton.cdiv(n_pairs, block),)

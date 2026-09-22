@@ -1,0 +1,1570 @@
+{
+  "schema_version": 1,
+  "operation": "blackwell_msa",
+  "attention_topk": 16,
+  "reachable_specialization_count": 36,
+  "family_predicates": {
+    "topk_select": "public top-k selection with topk=16",
+    "union_prefill": "prefill not selected by the M64 override or long-context reverse route; BF16 GQA8/GQA16 and paged causal GQA16 use dedicated source retraces",
+    "m64_prefill_override": "FLASHINFER_MSA_PREFILL_SCHEDULE=m64, flat BF16 GQA16, eager execution, and maximum KV length at most 8192",
+    "long_bf16_reverse_prefill": "batch 1 BF16 causal TopK16 prefill, total_q at least 8192, default query offset, and either flat GQA16 KV length at least 8192, paged GQA8 max_pages at least 64, or paged GQA16 max_pages greater than 64",
+    "direct_m16_decode": "decode not selected by a direct FP8 Q1 or uniform-FP8 override; TopK16 uses one selected-block persistent M16 kernel, while the frozen paged BF16 TopK32 and TopK4 coordinates use dedicated exact units",
+    "fp8_kv_q1_exact_override": "BF16-query FP8-KV causal Q1 exact serving shapes selected by the explicit exact schedule",
+    "fp8_kv_q1_xform2": "BF16-query FP8-KV causal Q1 serving shapes selected by the explicit xform2 schedule",
+    "uniform_fp8_qkv_decode": "paged causal uniform FP8 Q/K/V, Q1 through Q32, force_fused=True, and default query offset",
+    "exact_reverse_prefill": "shape-exact causal non-TopK16 reverse prefill for the flat BF16-query FP8-KV TopK8 and paged BF16 TopK4 serving coordinates"
+  },
+  "reachable_specializations": [
+    {
+      "id": "topk_select.topk16",
+      "family": "topk_select",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "topk"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_flat",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_flat"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_paged",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_paged"
+      ]
+    },
+    {
+      "id": "union_prefill.fp16_flat",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_fp16_flat"
+      ]
+    },
+    {
+      "id": "union_prefill.fp16_paged",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_fp16_paged"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_query_fp8_kv_flat",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_query_fp8_kv_flat"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_query_fp8_kv_paged",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_query_fp8_kv_paged"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_gqa8_flat",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_gqa8_flat"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_gqa8_paged",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_gqa8_paged"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_gqa16_flat",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_gqa16_flat"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_gqa16_paged_noncausal",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_gqa16_paged_noncausal"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_gqa16_paged_causal_mask64",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_gqa16_paged_causal_mask64"
+      ]
+    },
+    {
+      "id": "union_prefill.bf16_gqa16_paged_causal_large",
+      "family": "union_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_union_bf16_gqa16_paged_causal_large"
+      ]
+    },
+    {
+      "id": "m64_prefill_override.bf16_gqa16_flat",
+      "family": "m64_prefill_override",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "prefill_m64_bf16_gqa16_flat"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.flat_gqa16_sm100",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm100"
+      ],
+      "source_units": [
+        "long_prefill_flat_bf16_gqa16_sm100",
+        "long_prefill_reduce_flat_bf16_gqa16"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.flat_gqa16_sm103",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm103"
+      ],
+      "source_units": [
+        "long_prefill_flat_bf16_gqa16_sm103",
+        "long_prefill_reduce_flat_bf16_gqa16"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.paged_gqa8_sm100",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm100"
+      ],
+      "source_units": [
+        "long_prefill_paged_bf16_gqa8_sm100",
+        "long_prefill_reduce_paged_bf16_gqa8"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.paged_gqa8_sm103",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm103"
+      ],
+      "source_units": [
+        "long_prefill_paged_bf16_gqa8_sm103",
+        "long_prefill_reduce_paged_bf16_gqa8"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.paged_gqa16_sm100",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm100"
+      ],
+      "source_units": [
+        "long_prefill_paged_bf16_gqa16_sm100",
+        "long_prefill_reduce_paged_bf16_gqa16"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.paged_gqa16_direct_group_sm100",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm100"
+      ],
+      "source_units": [
+        "long_prefill_paged_bf16_gqa16_direct_group_sm100",
+        "long_prefill_reduce_paged_bf16_gqa16"
+      ]
+    },
+    {
+      "id": "long_bf16_reverse_prefill.paged_gqa16_sm103",
+      "family": "long_bf16_reverse_prefill",
+      "architectures": [
+        "sm103"
+      ],
+      "source_units": [
+        "long_prefill_paged_bf16_gqa16_sm103",
+        "long_prefill_reduce_paged_bf16_gqa16"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_flat",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_flat"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_paged",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_paged"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_paged_topk32_exact",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_paged_topk32"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_paged_topk4_exact512",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_paged_topk4_exact512"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.fp16_flat",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_fp16_flat"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.fp16_paged",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_fp16_paged"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_query_fp8_kv_flat",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_query_fp8_kv_flat"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_query_fp8_kv_paged",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_query_fp8_kv_paged"
+      ]
+    },
+    {
+      "id": "fp8_kv_q1_exact_override.flat",
+      "family": "fp8_kv_q1_exact_override",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_q1_bf16_query_fp8_kv_exact_flat"
+      ]
+    },
+    {
+      "id": "fp8_kv_q1_exact_override.paged",
+      "family": "fp8_kv_q1_exact_override",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_q1_bf16_query_fp8_kv_exact_paged"
+      ]
+    },
+    {
+      "id": "fp8_kv_q1_xform2.flat",
+      "family": "fp8_kv_q1_xform2",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_q1_bf16_query_fp8_kv_xform2_flat"
+      ]
+    },
+    {
+      "id": "fp8_kv_q1_xform2.paged",
+      "family": "fp8_kv_q1_xform2",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_q1_bf16_query_fp8_kv_xform2_paged"
+      ]
+    },
+    {
+      "id": "uniform_fp8_qkv_decode.paged",
+      "family": "uniform_fp8_qkv_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_uniform_fp8_qkv_paged"
+      ]
+    },
+    {
+      "id": "exact_reverse_prefill.bf16_query_fp8_kv_flat_topk8",
+      "family": "exact_reverse_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+        "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce"
+      ]
+    },
+    {
+      "id": "exact_reverse_prefill.bf16_paged_topk4",
+      "family": "exact_reverse_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "reverse_prefill_bf16_paged_topk4_qload4",
+        "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce"
+      ]
+    }
+  ],
+  "excluded_unreachable_helpers": [
+    {
+      "id": "reverse_prefill_qagg_pdl",
+      "reason": "no production dispatcher callsite"
+    },
+    {
+      "id": "reverse_prefill_j21",
+      "reason": "no production dispatcher callsite"
+    },
+    {
+      "id": "reverse_prefill_atomic",
+      "reason": "no production dispatcher callsite"
+    },
+    {
+      "id": "paged_bf16_qload4_exact_graph",
+      "reason": "no production dispatcher callsite"
+    }
+  ],
+  "source_inventory": {
+    "schema_version": 1,
+    "normalization_schema": "blackwell-msa-identifiers-v1",
+    "targets": {
+      "sm100a": "compute capability 10.0",
+      "sm103a": "compute capability 10.3"
+    },
+    "entries": [
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "7f0864b03cb4539e3110f23bb8f58fcca95b715aa529d5a39e6e9d1de7fb501a",
+        "vendored_sha256": "5ac7f9d571a33a990d063aaf46324992f50bde7783265cd80c8d373024142e22",
+        "binding_sha256": "d19dac7d7736c3e6cae85347278bc30ac2e544ad447f06896da9840849e303b4",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "08b5c1e2d09606c835d348b4ee67b93d5c890622c0ec83f49b91eb03fcf93b72",
+        "vendored_sha256": "edfb071e0cb65ca13a5a86e912062ccc2b898eed15b5c90e8c8f0db172875086",
+        "binding_sha256": "f5ea39679a3a1dabc5b9a720f88aedf6ee30fc3a83abf7e9e6671841de450b61",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_paged_topk32",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ee22d3485d663e55fa3f13365c8b48f923b254572d2bcd80ef570c208078a560",
+        "vendored_sha256": "203511178d5041a0811b73fcc5529056da8c5a545ce3160f129bb0dd72104746",
+        "binding_sha256": "a595cfa8ffbed839b9780140bb07f9b85ffdab731b3adbf40171b7627ceffd41",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_runtime_topk_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_paged_topk4_exact512",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2fb46ddcef07f38ae98a4a19008f48259502baf2ced6aaada309f5efa29c98ea",
+        "vendored_sha256": "7c74a61867fc7d3ee6c6bae9c15f448438519b8831cb0b2a4de328a3226df924",
+        "binding_sha256": "3a2b086a0146e4099199d6cd7e6db96ebc3bb15d2e0fdbab0f9240eb53fb827a",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_b2_q1_kv257_h8_hkv1_k4_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_query_fp8_kv_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "8d8d991cccc464b2047cf0a056d3c0224978112ad6d06ab20524e42c13b67998",
+        "vendored_sha256": "fc165e545c33ac685126e64c6bc35b73a5a530e0bfa7f3dba6af615cf1783b99",
+        "binding_sha256": "89ca7c15031064e00856e766cb8618b5368bfbc88ae7fe39786c2beda6b3615f",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp8_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_query_fp8_kv_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "63a112027fba3b2b6edb9c10b2898b6388e8713a0a0b605db6b74b0995f626e5",
+        "vendored_sha256": "a5d6a3947f37213d291b3b6c4aae0f3320bfa17b875d2d38e504f00ff45f0966",
+        "binding_sha256": "109fc1f689f35d3a2c7cf65ef0b2abc2a74548432f1f38948bcf3612da7773f5",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp8_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_fp16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "b4670cf719649062c751485d89fe76d9f2391f9df192a2ee0fa860dc43290fbc",
+        "vendored_sha256": "becc848d30d0b7521773f89d747bb222279534f35d614eac4f1989e2c171376a",
+        "binding_sha256": "1ec5c2175321d8429afc3d9e87fdb261e6a3389e6db012c938cd97d454a9dcd9",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_fp16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "1f695657b7c31ea72c2f1a46d7c8be1232b4806795e10d0634d4a94bdc3704f2",
+        "vendored_sha256": "424347b9325d789dfa903273899d76ea67c3819627a5c1a6df583e4033c101f5",
+        "binding_sha256": "32c7f8fc6f2278936587b6921c7b73982e7ec9152d08662da9b0660dded14db5",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_exact_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "677fc068699db235602ed66c77fd99b0c10cc14a15d29762b13edcd4391ff3b9",
+        "vendored_sha256": "dc840aa00ee6ed096bf8f15e58d25dd13df51c349a109ed4ef593ec62767a1f0",
+        "binding_sha256": "065403cab715cb8c0478065b7b64fdcf6fa2747957ecfe08851e8c6917ecec8b",
+        "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 8
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_exact_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "f6a1205b0e1dd74872dbbe8ddc40a66dfc66160fd62728271f3d72d63eb45af7",
+        "vendored_sha256": "6223b5ea834cee69935fa5f62a1dfe463f735a7b61590e48b336a641c404c333",
+        "binding_sha256": "43838e2491ba8df6473231e436edfe6c583978132638539b44b31c6e8923256b",
+        "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 8
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_xform2_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "0b7ba07d62078c2c0c5f7e25c1af581d8aa9eacd3545a7d3ba7c2735449f68a2",
+        "vendored_sha256": "1a87b07dd79501176b2ac2e5077aee92e77a31207e46980dd8248d44df462d68",
+        "binding_sha256": "113462d8fe4e104880261ba6c832bb66e94f1b5185373e1e43091bf1647a826d",
+        "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_flat_xform2_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 8
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_xform2_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "6db2d8d4f86d5f86ff8ed6e914d75d799258b9de7b99e689d92e525bc3ccfd25",
+        "vendored_sha256": "51a92ebabd161ecf179a84abc13164b9872e778b45864e229e2817d2af50e1da",
+        "binding_sha256": "9200369c7d90c1aa63118d7059719b3f7e6de0163ee0ab0b9f678703ecb34a48",
+        "arg_plan_sha256": "40a85cea99189b5ae55903941e728268b1f04ca17567f3531183a912bc3630cc",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_paged_xform2_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 9
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_uniform_fp8_qkv_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "17923e99f86181a47096b602f5ce008f6c0bb49e22f598bf30190b1daffa7ecd",
+        "vendored_sha256": "6e180a15405eb3beaf08512066eccf615381780519c02f4664a456844e79b0a3",
+        "binding_sha256": "353410b94ea95ac1921938327b7a1ac4b39d86a7f312d7fde4c8e3cd41ce8afe",
+        "arg_plan_sha256": "706df10fe82c59904254a8c183386490f441067f2987881fd2cffdadc730560a",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_flat_bf16_gqa16_sm100",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "e3cb196f82b1a21bf74b5d41b05873f3e6a020c36f04f1708f8a703daccae16c",
+        "vendored_sha256": "cb587f06a01ec47b5adec1097fc94439866adf0108cd1489b349f4b00d39ae04",
+        "binding_sha256": "bf03d4c074e1901680ab67d4537b1b37de6de794443da6cd8df17dc63407a06b",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 31
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_paged_bf16_gqa16_direct_group_sm100",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "495c0340f2f02bc5d9eb9a3f0be0068faaa85fca56f32f3025ee0fe37789826c",
+        "vendored_sha256": "95751076c63d9a875c140013fba44851180eecb7454434e8ad8e232522c5983b",
+        "binding_sha256": "6ec4f0ebe1912a5469318155fed11d1d95e0dc1e6a5959297455bcd4c52b8835",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_paged_bf16_gqa16_sm100",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "75e25466802b6699501a0ffd26da6cf9d8b57a37a7fb9427eb8e3f96668041c9",
+        "vendored_sha256": "ee70d2c6ca8ccc941f60e91e35111b739f8d1ee3bed5301ccaaebbde0baccec8",
+        "binding_sha256": "2eee94b4df8213730ee3520f0d978a194abc33933b8aa8e8cad5b292ff770956",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_paged_bf16_gqa8_sm100",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "33556791b2fe1818aee075ae123754493991180f5c7b1b36f9e00f6d4005b255",
+        "vendored_sha256": "a6fc6a11d7bcc2c909aeed376957efdb5883a56d02c5ac406e69a351527019f6",
+        "binding_sha256": "c191b81ec1dfe939f1e26c6b91c6d594c9321bf194b6410a659d9db23040f578",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_reduce_flat_bf16_gqa16",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "c4e6e5636b4d701a59c6fd17035700c6aa20b11401fb82fefcfa00d0679145f7",
+        "vendored_sha256": "374e3424d343e30b1ff74118523084e3e4b12bf2564bdc41a3752195de5c58fb",
+        "binding_sha256": "c5b8cb32691c87d7d122996b7ff750cb25f4792519890ec4ea15e6003ff5ce1c",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_reduce_paged_bf16_gqa16",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "f63aaa23dbcc81dcdce10da3366b367a950f3d724478af176b1ecdd6348efa78",
+        "vendored_sha256": "9ba2c96e17c6f1b5b1e5cbe4638497389b53bf34b90826b496039246c7e0291e",
+        "binding_sha256": "0dfeefb191893d1df52b747422274d6cceb4acb51b17831acfbdc7750423849c",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "long_prefill_reduce_paged_bf16_gqa8",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "9f5b86f62babe31e5c8d01769015f838b0bbb05393ba44ccaa32c1546c57494a",
+        "vendored_sha256": "07052ab845135f807b22aaa2a9d5baf371c4b8f394e49fd9d910a2e4842d4c70",
+        "binding_sha256": "ad1f764043d642e6078b40cd17050c4c757db71aba4db53e0eabdeb91b4b9b2b",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_m64_bf16_gqa16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ace762b860d6a5116e3a646e2a06ad0759546687abb5fbdbe0bef3caa144e409",
+        "vendored_sha256": "c635c319626d23e8e3936c177ca610e4f2eb840296f3368dd42d7b72dc501025",
+        "binding_sha256": "433fdbf5331ae28ee882015c31f362b2b0dfbecc9257e0667cc97943889a127a",
+        "arg_plan_sha256": "2684230e58fb9fa6d49190e33718a7d57e739f5efecec393e3cec68d2b36c4fb",
+        "kernel_entry": "kernel_minimax_sparse_prefill_exact_union_m64_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 16
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2a532fbdbdfc84e0b258d0fe46409b6fe91d4aff344303b4b8fac15be91e4f95",
+        "vendored_sha256": "55b4099894616b2f0cac2ab4fa26ecd3ec67a37e2a90ae5ba61e7682c5472782",
+        "binding_sha256": "9092b15b9e49b9fdc91dfe85065bbd9b606ddfb6a044365283c9fc046b7eaedd",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_gqa16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "9c743e9770e7566c681dd7f8375a4cbb3fe244ce7dda523d79a7693e22ec463d",
+        "vendored_sha256": "36b7e6c1011600c846f22e8b389d7792592a7c186aa33d6929ad8082435e5eb4",
+        "binding_sha256": "219768301a73f2c18628f2213c8dc48b9b30f9f87432e8a1efe69a4c1de5651a",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_gqa16_paged_causal_large",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2dd65d9409579f648cf177ecda9d63a4e99aa1d7b83d157e5905d96e55b48c14",
+        "vendored_sha256": "28f9ec99267181325f6307b8b6620913d754cb60f0672f5eb8e93eef2334f4d6",
+        "binding_sha256": "4e75081698f59e0cdb4c0e910efefa8fc02a78ff9b10c14403a318a3aef9588d",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_gqa16_paged_causal_mask64",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ca73d7e7176fe4a539cbbc14d5c5a6962bb1018742d4f1ea5373c9ffa6aa4224",
+        "vendored_sha256": "742d2a0f537fdf7b697930475e0852c09d5099813d6e418c66e6a398f3280689",
+        "binding_sha256": "66e4311804de34749807254e48d0f9b7b498512d412e18ba868002e3f6e8e430",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_gqa16_paged_noncausal",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "4372761745671e271743511e405552d7621da7cd019904b3e26197786ef6b98f",
+        "vendored_sha256": "61d9cdaf596f6a5ddc4cedbdfa2496d028d3466031e6e24fb7e49f23679f0a56",
+        "binding_sha256": "4eb19971fe5697145da92dd0720cf02c70b25b988cf8c4e8ef886e92701392d0",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_gqa8_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "796b573ccba934683a121cbeb8798f4425f061d91f5e4a70518205890908a76f",
+        "vendored_sha256": "bcbe4d5c39954ac992702283d28d86e4763766e89f4a0beebd8a2b1afec23baa",
+        "binding_sha256": "f22af4c05ff27ac22d0b4b92a82eaf8408b74f14f1a4a1d7fb2e8b05fb39e774",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_gqa8_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "1333a4093a39a000479f4d4040ecf8cd1a994819637fe7425fb54c15d4c23fd6",
+        "vendored_sha256": "fd6d70a06b12fc459cb5e21d1158224d34fd7f4033576c752ea677a198b7ace1",
+        "binding_sha256": "bee8429f6b77848fa17d43c3c0cf7443229cce12e7029cfe16cc36b19ce0cbcd",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "16435314928b04827a2d89709b9e9d365e8c97bc5b542dfaf8306884253fbf5b",
+        "vendored_sha256": "e1fe67dd134d420101628fdbf7ba88ee5d659306f869eb6ac0edf3ef0e3177b0",
+        "binding_sha256": "ead18a0973d5ff6a4f5930e7aab88c55dbc101606b0f2b284fbb7edc5045b3d2",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_query_fp8_kv_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "71405a0c9f3b69551d4b870189bf2213f4eba472d0e8eb0d2f73d0ed0f4bb788",
+        "vendored_sha256": "d3e95ddacd87ccb8aa8a07717044e7c2d5a409e53162c4b77940e55ce943f48a",
+        "binding_sha256": "08a30a277558ac551b996f37ad941fc7d7162762da03049055c7ae55e459bdb3",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_bf16_query_fp8_kv_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "4a6741da13da0471b9aea494c1c77c2575887b3cb7d815e0627fe3014d199ec9",
+        "vendored_sha256": "47502f3572f866c8269e8caddb6a364a8364f47e96b3bd9fe7712bc837895bba",
+        "binding_sha256": "b4fca10348c95b664c92b3bae9f2178ef0694c286e03e815a786392b9ce41328",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_fp16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "bf317349c841527d4c6b1a182df4d50caae3b0bca52186abc20a29dabb95bf3f",
+        "vendored_sha256": "553795f551a996caff20760045b412826c11c68a159f79685b8986e26f06cdc8",
+        "binding_sha256": "9165db9d93a913db073b3a69c3f6af35c5983832d8825942b80bd47bcb645db1",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "prefill_union_fp16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "7d6f36857be12e07d4fbe29f46ef37e29cc75a8adc88147e096aecf518540b90",
+        "vendored_sha256": "6afcff4bf464f48f60c9961ff7e3346dcf4bd067994f28279de9dab3e019dbe9",
+        "binding_sha256": "b7c0f2e3c4e53457eb66a1eae13d60219fdb332d98a7c2113a5cc1f177596c71",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "0f9992b0fe4e36c7d6f87fb9f4a40b6c362ba27a204ddc512c8faf7e93998841",
+        "vendored_sha256": "7beb023b5549012282284bc542fede7719db35f91942f27e7fadd7a9e9f57bcd",
+        "binding_sha256": "1c5df744b683065686dfbc4349c0b674e739bc7b083d002e08c14aa1fa9d1fe5",
+        "arg_plan_sha256": "8f141ecaac0df32d9132f7d6f86c775999ffc126cbab75698cfe5f53341d0f49",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "aed1a024d38666c5a17dc17521009fe00016869861b1e27d68ac7ecdb7acc4ba",
+        "vendored_sha256": "42f28e0ba061b664109cd29de614c8769d4d038e4e583af12b9457a24636b138",
+        "binding_sha256": "264aa76d3f3fc23992b44c7a90fba37aabca81f543f58cfcc11bab040b1d56e0",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk4_eighthwarp16_metaparallel_const4_qload4fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 6
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "b460009599b408ed8829f95c3ebf23b16b9fcdbbcb16436d139fd370c88821dc",
+        "vendored_sha256": "abad0c7aa281c85bc828a8122e5c35cae0d36a27ab5603712ae3e61ed5d92482",
+        "binding_sha256": "c8680e03ec8703b8aced3965c88209f0a7059108e1dddabc745c771794299a0b",
+        "arg_plan_sha256": "4ef1f904499e6c684526d703ab834a24874e664f1d4ccf459b4dde24f5895150",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "952aa39f0fe7879cd93c1d9c2da8824ed04634c07435922b18ddc3ddc867a9bb",
+        "vendored_sha256": "467c952cac2f9074ead0c3420f03164c763569c6c1c17f7c6eb3a8c404b2a6ed",
+        "binding_sha256": "980b34fdfc5050659e17bdcfda55b8d96563caaba275a81c7faf9472baf9aae4",
+        "arg_plan_sha256": "5669d6f9ae746f0c1b71d7978233e29b753cdd3915849924aa74ae14ce022fe1",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_unscaled_fp8_qagg_pdl_dualcohort_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 9
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "topk",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "9dd70a7e7df4815e0bdf3654bb9b976e9b4a25fecacf15b1cdf2fcdea4b21841",
+        "vendored_sha256": "f574ea9f4f5420b9cb37b4a15b8c5a4d6eadbfc6745d2fcf8aa7616092fd29ae",
+        "binding_sha256": "58d072b2a92ad14100139636cd09dc3ef09efb1de4537536e7fe42bff8c355d7",
+        "arg_plan_sha256": "3dbb795bed3c8211b09ad86be746671bd9d287b78b5f1dd7712b1e492794ae31",
+        "kernel_entry": "kernel_minimax_sparse_topk_select_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 3
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "7f0864b03cb4539e3110f23bb8f58fcca95b715aa529d5a39e6e9d1de7fb501a",
+        "vendored_sha256": "5ac7f9d571a33a990d063aaf46324992f50bde7783265cd80c8d373024142e22",
+        "binding_sha256": "d19dac7d7736c3e6cae85347278bc30ac2e544ad447f06896da9840849e303b4",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "08b5c1e2d09606c835d348b4ee67b93d5c890622c0ec83f49b91eb03fcf93b72",
+        "vendored_sha256": "edfb071e0cb65ca13a5a86e912062ccc2b898eed15b5c90e8c8f0db172875086",
+        "binding_sha256": "f5ea39679a3a1dabc5b9a720f88aedf6ee30fc3a83abf7e9e6671841de450b61",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_paged_topk32",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ee22d3485d663e55fa3f13365c8b48f923b254572d2bcd80ef570c208078a560",
+        "vendored_sha256": "203511178d5041a0811b73fcc5529056da8c5a545ce3160f129bb0dd72104746",
+        "binding_sha256": "a595cfa8ffbed839b9780140bb07f9b85ffdab731b3adbf40171b7627ceffd41",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_runtime_topk_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_paged_topk4_exact512",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2fb46ddcef07f38ae98a4a19008f48259502baf2ced6aaada309f5efa29c98ea",
+        "vendored_sha256": "7c74a61867fc7d3ee6c6bae9c15f448438519b8831cb0b2a4de328a3226df924",
+        "binding_sha256": "3a2b086a0146e4099199d6cd7e6db96ebc3bb15d2e0fdbab0f9240eb53fb827a",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_b2_q1_kv257_h8_hkv1_k4_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_query_fp8_kv_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "8d8d991cccc464b2047cf0a056d3c0224978112ad6d06ab20524e42c13b67998",
+        "vendored_sha256": "fc165e545c33ac685126e64c6bc35b73a5a530e0bfa7f3dba6af615cf1783b99",
+        "binding_sha256": "89ca7c15031064e00856e766cb8618b5368bfbc88ae7fe39786c2beda6b3615f",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp8_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_query_fp8_kv_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "63a112027fba3b2b6edb9c10b2898b6388e8713a0a0b605db6b74b0995f626e5",
+        "vendored_sha256": "a5d6a3947f37213d291b3b6c4aae0f3320bfa17b875d2d38e504f00ff45f0966",
+        "binding_sha256": "109fc1f689f35d3a2c7cf65ef0b2abc2a74548432f1f38948bcf3612da7773f5",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp8_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_fp16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "b4670cf719649062c751485d89fe76d9f2391f9df192a2ee0fa860dc43290fbc",
+        "vendored_sha256": "becc848d30d0b7521773f89d747bb222279534f35d614eac4f1989e2c171376a",
+        "binding_sha256": "1ec5c2175321d8429afc3d9e87fdb261e6a3389e6db012c938cd97d454a9dcd9",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_flat_fp16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_fp16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "1f695657b7c31ea72c2f1a46d7c8be1232b4806795e10d0634d4a94bdc3704f2",
+        "vendored_sha256": "424347b9325d789dfa903273899d76ea67c3819627a5c1a6df583e4033c101f5",
+        "binding_sha256": "32c7f8fc6f2278936587b6921c7b73982e7ec9152d08662da9b0660dded14db5",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_fp16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_exact_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "677fc068699db235602ed66c77fd99b0c10cc14a15d29762b13edcd4391ff3b9",
+        "vendored_sha256": "dc840aa00ee6ed096bf8f15e58d25dd13df51c349a109ed4ef593ec62767a1f0",
+        "binding_sha256": "065403cab715cb8c0478065b7b64fdcf6fa2747957ecfe08851e8c6917ecec8b",
+        "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 8
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_exact_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "f6a1205b0e1dd74872dbbe8ddc40a66dfc66160fd62728271f3d72d63eb45af7",
+        "vendored_sha256": "6223b5ea834cee69935fa5f62a1dfe463f735a7b61590e48b336a641c404c333",
+        "binding_sha256": "43838e2491ba8df6473231e436edfe6c583978132638539b44b31c6e8923256b",
+        "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 8
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_xform2_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "0b7ba07d62078c2c0c5f7e25c1af581d8aa9eacd3545a7d3ba7c2735449f68a2",
+        "vendored_sha256": "1a87b07dd79501176b2ac2e5077aee92e77a31207e46980dd8248d44df462d68",
+        "binding_sha256": "113462d8fe4e104880261ba6c832bb66e94f1b5185373e1e43091bf1647a826d",
+        "arg_plan_sha256": "22bc4d96d5de041c38388225964a15e6715ddb5b443a82aa11a85cabe9b5c39c",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_flat_xform2_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 8
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_q1_bf16_query_fp8_kv_xform2_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "6db2d8d4f86d5f86ff8ed6e914d75d799258b9de7b99e689d92e525bc3ccfd25",
+        "vendored_sha256": "51a92ebabd161ecf179a84abc13164b9872e778b45864e229e2817d2af50e1da",
+        "binding_sha256": "9200369c7d90c1aa63118d7059719b3f7e6de0163ee0ab0b9f678703ecb34a48",
+        "arg_plan_sha256": "40a85cea99189b5ae55903941e728268b1f04ca17567f3531183a912bc3630cc",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_q1_fp8_paged_xform2_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 9
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_uniform_fp8_qkv_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "17923e99f86181a47096b602f5ce008f6c0bb49e22f598bf30190b1daffa7ecd",
+        "vendored_sha256": "6e180a15405eb3beaf08512066eccf615381780519c02f4664a456844e79b0a3",
+        "binding_sha256": "353410b94ea95ac1921938327b7a1ac4b39d86a7f312d7fde4c8e3cd41ce8afe",
+        "arg_plan_sha256": "706df10fe82c59904254a8c183386490f441067f2987881fd2cffdadc730560a",
+        "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "long_prefill_flat_bf16_gqa16_sm103",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "7c8aa364b98face6dead72484df270051419ee09946464da65789cca317e14b1",
+        "vendored_sha256": "3af9f5ea4c0c99708b5b5dfcfe4c7acf2e834ba08964c7f71add1c89c73d895d",
+        "binding_sha256": "3325b6498c15c8cc37ddbbc2444b921efd6145f3ab323248940ec2bf145a5561",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 31
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "long_prefill_paged_bf16_gqa16_sm103",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "bf7c035e6e2c48c454459ad6cffe3517d800b3ecd2aec600b86740c9a21eb761",
+        "vendored_sha256": "fbf7ee0f6c9eccd175f3b8fa130924926f502c7a8e6603913b2490906496cc98",
+        "binding_sha256": "d069b0910964d25a1e84dec7d61fadf8b89fc1265556508e92af24b38a9d2d94",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 25
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "long_prefill_paged_bf16_gqa8_sm103",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "acec3cb3f9531bbedf1d2ac70674272bce18749a1da69a6e4f40892be4e6bfce",
+        "vendored_sha256": "9ac785478d9ea08112c963f99778ae8ac1b6f40667b86e6d79ef11eaabdb71cb",
+        "binding_sha256": "33de25c80f1fe78f9945e2bde66a446e7efb7a91af55e985686557c5ab20ffab",
+        "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 25
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "long_prefill_reduce_flat_bf16_gqa16",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "c4e6e5636b4d701a59c6fd17035700c6aa20b11401fb82fefcfa00d0679145f7",
+        "vendored_sha256": "374e3424d343e30b1ff74118523084e3e4b12bf2564bdc41a3752195de5c58fb",
+        "binding_sha256": "c5b8cb32691c87d7d122996b7ff750cb25f4792519890ec4ea15e6003ff5ce1c",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "long_prefill_reduce_paged_bf16_gqa16",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "f63aaa23dbcc81dcdce10da3366b367a950f3d724478af176b1ecdd6348efa78",
+        "vendored_sha256": "9ba2c96e17c6f1b5b1e5cbe4638497389b53bf34b90826b496039246c7e0291e",
+        "binding_sha256": "0dfeefb191893d1df52b747422274d6cceb4acb51b17831acfbdc7750423849c",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "long_prefill_reduce_paged_bf16_gqa8",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "9f5b86f62babe31e5c8d01769015f838b0bbb05393ba44ccaa32c1546c57494a",
+        "vendored_sha256": "07052ab845135f807b22aaa2a9d5baf371c4b8f394e49fd9d910a2e4842d4c70",
+        "binding_sha256": "ad1f764043d642e6078b40cd17050c4c757db71aba4db53e0eabdeb91b4b9b2b",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk16_fp8partial_bf16_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 13
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_m64_bf16_gqa16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ace762b860d6a5116e3a646e2a06ad0759546687abb5fbdbe0bef3caa144e409",
+        "vendored_sha256": "c635c319626d23e8e3936c177ca610e4f2eb840296f3368dd42d7b72dc501025",
+        "binding_sha256": "433fdbf5331ae28ee882015c31f362b2b0dfbecc9257e0667cc97943889a127a",
+        "arg_plan_sha256": "2684230e58fb9fa6d49190e33718a7d57e739f5efecec393e3cec68d2b36c4fb",
+        "kernel_entry": "kernel_minimax_sparse_prefill_exact_union_m64_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 16
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2a532fbdbdfc84e0b258d0fe46409b6fe91d4aff344303b4b8fac15be91e4f95",
+        "vendored_sha256": "55b4099894616b2f0cac2ab4fa26ecd3ec67a37e2a90ae5ba61e7682c5472782",
+        "binding_sha256": "9092b15b9e49b9fdc91dfe85065bbd9b606ddfb6a044365283c9fc046b7eaedd",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_gqa16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "9c743e9770e7566c681dd7f8375a4cbb3fe244ce7dda523d79a7693e22ec463d",
+        "vendored_sha256": "36b7e6c1011600c846f22e8b389d7792592a7c186aa33d6929ad8082435e5eb4",
+        "binding_sha256": "219768301a73f2c18628f2213c8dc48b9b30f9f87432e8a1efe69a4c1de5651a",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_gqa16_paged_causal_large",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2dd65d9409579f648cf177ecda9d63a4e99aa1d7b83d157e5905d96e55b48c14",
+        "vendored_sha256": "28f9ec99267181325f6307b8b6620913d754cb60f0672f5eb8e93eef2334f4d6",
+        "binding_sha256": "4e75081698f59e0cdb4c0e910efefa8fc02a78ff9b10c14403a318a3aef9588d",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_gqa16_paged_causal_mask64",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ca73d7e7176fe4a539cbbc14d5c5a6962bb1018742d4f1ea5373c9ffa6aa4224",
+        "vendored_sha256": "742d2a0f537fdf7b697930475e0852c09d5099813d6e418c66e6a398f3280689",
+        "binding_sha256": "66e4311804de34749807254e48d0f9b7b498512d412e18ba868002e3f6e8e430",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_gqa16_paged_noncausal",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "4372761745671e271743511e405552d7621da7cd019904b3e26197786ef6b98f",
+        "vendored_sha256": "61d9cdaf596f6a5ddc4cedbdfa2496d028d3466031e6e24fb7e49f23679f0a56",
+        "binding_sha256": "4eb19971fe5697145da92dd0720cf02c70b25b988cf8c4e8ef886e92701392d0",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_gqa8_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "796b573ccba934683a121cbeb8798f4425f061d91f5e4a70518205890908a76f",
+        "vendored_sha256": "bcbe4d5c39954ac992702283d28d86e4763766e89f4a0beebd8a2b1afec23baa",
+        "binding_sha256": "f22af4c05ff27ac22d0b4b92a82eaf8408b74f14f1a4a1d7fb2e8b05fb39e774",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_gqa8_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "1333a4093a39a000479f4d4040ecf8cd1a994819637fe7425fb54c15d4c23fd6",
+        "vendored_sha256": "fd6d70a06b12fc459cb5e21d1158224d34fd7f4033576c752ea677a198b7ace1",
+        "binding_sha256": "bee8429f6b77848fa17d43c3c0cf7443229cce12e7029cfe16cc36b19ce0cbcd",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "16435314928b04827a2d89709b9e9d365e8c97bc5b542dfaf8306884253fbf5b",
+        "vendored_sha256": "e1fe67dd134d420101628fdbf7ba88ee5d659306f869eb6ac0edf3ef0e3177b0",
+        "binding_sha256": "ead18a0973d5ff6a4f5930e7aab88c55dbc101606b0f2b284fbb7edc5045b3d2",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_query_fp8_kv_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "71405a0c9f3b69551d4b870189bf2213f4eba472d0e8eb0d2f73d0ed0f4bb788",
+        "vendored_sha256": "d3e95ddacd87ccb8aa8a07717044e7c2d5a409e53162c4b77940e55ce943f48a",
+        "binding_sha256": "08a30a277558ac551b996f37ad941fc7d7162762da03049055c7ae55e459bdb3",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_bf16_query_fp8_kv_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "4a6741da13da0471b9aea494c1c77c2575887b3cb7d815e0627fe3014d199ec9",
+        "vendored_sha256": "47502f3572f866c8269e8caddb6a364a8364f47e96b3bd9fe7712bc837895bba",
+        "binding_sha256": "b4fca10348c95b664c92b3bae9f2178ef0694c286e03e815a786392b9ce41328",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_fp16_flat",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "bf317349c841527d4c6b1a182df4d50caae3b0bca52186abc20a29dabb95bf3f",
+        "vendored_sha256": "553795f551a996caff20760045b412826c11c68a159f79685b8986e26f06cdc8",
+        "binding_sha256": "9165db9d93a913db073b3a69c3f6af35c5983832d8825942b80bd47bcb645db1",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "prefill_union_fp16_paged",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "7d6f36857be12e07d4fbe29f46ef37e29cc75a8adc88147e096aecf518540b90",
+        "vendored_sha256": "6afcff4bf464f48f60c9961ff7e3346dcf4bd067994f28279de9dab3e019dbe9",
+        "binding_sha256": "b7c0f2e3c4e53457eb66a1eae13d60219fdb332d98a7c2113a5cc1f177596c71",
+        "arg_plan_sha256": "0092f8f72c77cc3e0081de0e047fb082a9a756db15d5a34cf36a156a23c324bc",
+        "kernel_entry": "kernel_minimax_sparse_prefill_union_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 23
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "0f9992b0fe4e36c7d6f87fb9f4a40b6c362ba27a204ddc512c8faf7e93998841",
+        "vendored_sha256": "7beb023b5549012282284bc542fede7719db35f91942f27e7fadd7a9e9f57bcd",
+        "binding_sha256": "1c5df744b683065686dfbc4349c0b674e739bc7b083d002e08c14aa1fa9d1fe5",
+        "arg_plan_sha256": "8f141ecaac0df32d9132f7d6f86c775999ffc126cbab75698cfe5f53341d0f49",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "aed1a024d38666c5a17dc17521009fe00016869861b1e27d68ac7ecdb7acc4ba",
+        "vendored_sha256": "42f28e0ba061b664109cd29de614c8769d4d038e4e583af12b9457a24636b138",
+        "binding_sha256": "264aa76d3f3fc23992b44c7a90fba37aabca81f543f58cfcc11bab040b1d56e0",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk4_eighthwarp16_metaparallel_const4_qload4fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 6
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "b460009599b408ed8829f95c3ebf23b16b9fcdbbcb16436d139fd370c88821dc",
+        "vendored_sha256": "abad0c7aa281c85bc828a8122e5c35cae0d36a27ab5603712ae3e61ed5d92482",
+        "binding_sha256": "c8680e03ec8703b8aced3965c88209f0a7059108e1dddabc745c771794299a0b",
+        "arg_plan_sha256": "4ef1f904499e6c684526d703ab834a24874e664f1d4ccf459b4dde24f5895150",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "952aa39f0fe7879cd93c1d9c2da8824ed04634c07435922b18ddc3ddc867a9bb",
+        "vendored_sha256": "467c952cac2f9074ead0c3420f03164c763569c6c1c17f7c6eb3a8c404b2a6ed",
+        "binding_sha256": "980b34fdfc5050659e17bdcfda55b8d96563caaba275a81c7faf9472baf9aae4",
+        "arg_plan_sha256": "5669d6f9ae746f0c1b71d7978233e29b753cdd3915849924aa74ae14ce022fe1",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_unscaled_fp8_qagg_pdl_dualcohort_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 9
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "topk",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "9dd70a7e7df4815e0bdf3654bb9b976e9b4a25fecacf15b1cdf2fcdea4b21841",
+        "vendored_sha256": "f574ea9f4f5420b9cb37b4a15b8c5a4d6eadbfc6745d2fcf8aa7616092fd29ae",
+        "binding_sha256": "58d072b2a92ad14100139636cd09dc3ef09efb1de4537536e7fe42bff8c355d7",
+        "arg_plan_sha256": "3dbb795bed3c8211b09ad86be746671bd9d287b78b5f1dd7712b1e492794ae31",
+        "kernel_entry": "kernel_minimax_sparse_topk_select_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 3
+        },
+        "programmatic_stream_serialization": false
+      }
+    ]
+  }
+}

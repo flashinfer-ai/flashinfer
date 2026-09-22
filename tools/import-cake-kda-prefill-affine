@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Import sealed Cake KDA affine device receipts into public CUDA sources.
+
+The producer supplies exactly one generated device body for each target/role
+pair. It does not supply public bindings. This importer verifies every receipt
+field and source byte, deterministically publicizes the device bodies,
+generates target/role selector bindings over checked-in shared C++ headers, and
+writes the complete public manifest consumed by JIT and AOT.
+
+No producer checkout identity is copied into public output.
+The immutable exported/raw source digests are retained as byte provenance.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import sys
+from typing import Any
+
+
+MANIFEST_NAME = "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
+SCHEMA_VERSION = 1
+STATUS_COMPLETE = "complete"
+TARGETS = ("sm100a", "sm103a")
+ROLES = ("main", "map", "scan", "correction")
+ROLE_ALIASES = {role: role for role in ROLES} | {
+    f"affine_{role}": role for role in ROLES
+}
+ROLE_MACROS = {
+    "main": "FLASHINFER_CAKE_KDA_AFFINE_ROLE_MAIN",
+    "map": "FLASHINFER_CAKE_KDA_AFFINE_ROLE_MAP",
+    "scan": "FLASHINFER_CAKE_KDA_AFFINE_ROLE_SCAN",
+    "correction": "FLASHINFER_CAKE_KDA_AFFINE_ROLE_CORRECTION",
+}
+DIRECT_HEADER = "cake_kda_affine_direct_m128_binding.cuh"
+SCAN_HEADER = "cake_kda_affine_scan_binding.cuh"
+COMMON_HEADER = "cake_kda_affine_binding_common.cuh"
+EXPECTED_CONTRACT = {
+    "batch_size": 1,
+    "beta_layout": "contiguous",
+    "checkpoint_mode": "none",
+    "dtype": "bfloat16",
+    "gate_kind": "unbounded_softplus",
+    "head_dim": 128,
+    "head_relationship": "equal_q_kv",
+    "initial_state": "indexed_bfloat16_pool",
+    "max_local_heads": 32,
+    "min_parts": 2,
+    "min_tokens": 8192,
+    "state_publication": "final_only",
+    "targets": list(TARGETS),
+    "token_multiple": 32,
+}
+
+DIRECT_ARG_PLAN = (
+    ("buffer", "q"),
+    ("tma_buffer", "q_tma"),
+    ("buffer", "k"),
+    ("tma_buffer", "k_tma"),
+    ("buffer", "v"),
+    ("tma_buffer", "v_tma"),
+    ("buffer", "g"),
+    ("tma_buffer", "g_tma"),
+    ("buffer", "beta"),
+    ("tma_buffer", "beta_tma"),
+    ("buffer", "A_log"),
+    ("buffer", "dt_bias"),
+    ("buffer", "cu_seqlens"),
+    ("buffer", "seq_order"),
+    ("buffer", "initial_state"),
+    ("buffer", "out"),
+    ("tma_buffer", "out_tma"),
+    ("buffer", "final_state"),
+    ("parameter", "num_heads"),
+    ("parameter", "use_initial_state"),
+    ("parameter", "store_final_state"),
+    ("parameter", "scale"),
+    ("parameter", "lower_bound"),
+    ("parameter", "state_indices_addr"),
+    ("parameter", "state_checkpoints_addr"),
+    ("parameter", "checkpoint_cu_starts_addr"),
+    ("parameter", "beta_token_stride"),
+    ("parameter", "state_slot_stride"),
+    ("parameter", "use_state_indices"),
+    ("parameter", "checkpoint_every_n_tokens"),
+    ("buffer", "cu_chunk_offsets"),
+    ("buffer", "chunk_state"),
+    ("buffer", "state_checkpoint_needed"),
+    ("buffer", "tape_qd"),
+    ("buffer", "tape_kd"),
+    ("buffer", "tape_kr"),
+    ("buffer", "tape_j"),
+    ("buffer", "tape_restore_factor"),
+    ("buffer", "tape_e"),
+    ("buffer", "tape_x"),
+    ("buffer", "tape_r"),
+    ("buffer", "norm_inv_out"),
+    ("buffer", "decay_out"),
+    ("buffer", "beta_active_out"),
+    ("buffer", "initial_state_f32"),
+    ("buffer", "zero_workspace"),
+    ("parameter", "zero_words"),
+    ("parameter", "num_sequences"),
+    ("tma_buffer", "state_checkpoints_tma"),
+    ("buffer", "final_state_f32"),
+    ("grid", "grid_x"),
+    ("grid", "grid_y"),
+    ("grid", "grid_z"),
+)
+SCAN_ARG_PLAN = (
+    ("buffer", "split_state"),
+    ("buffer", "map_state_bf16"),
+    ("buffer", "carry"),
+    ("parameter", "num_heads"),
+    ("parameter", "num_parts"),
+    ("grid", "grid_x"),
+    ("grid", "grid_y"),
+    ("grid", "grid_z"),
+)
+
+LICENSE_HEADER = """/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+"""
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_SOURCE_MODULE_IDENT_RE = re.compile(r"flashkda_[a-z0-9_]+")
+_SOURCE_KERNEL_RE = re.compile(r"kernel_flashkda_[a-z0-9_]+")
+_PUBLIC_KERNEL_RE = re.compile(r"kernel_cake_kda_[a-z0-9_]+")
+
+
+@dataclass(frozen=True)
+class ProducerModule:
+    target: str
+    role: str
+    source_path: str
+    exported_sha256: str
+    exported_bytes: int
+    raw_sha256: str
+    source_module_ident: str
+    arg_plan: tuple[tuple[str, str], ...]
+    arg_plan_sha256: str
+    source_kernel_symbol: str
+    public_kernel_symbol: str
+    threads: int
+    smem_bytes: int
+    use_pdl: bool
+    public_body: bytes
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    _require(isinstance(payload, dict), f"{path} must contain a JSON object")
+    return payload
+
+
+def _full_sha256(value: object, label: str) -> str:
+    _require(
+        isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None,
+        f"{label} must be one full lowercase SHA-256",
+    )
+    return value
+
+
+def _positive_int(value: object, label: str, *, maximum: int | None = None) -> int:
+    _require(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0,
+        f"{label} must be a positive integer",
+    )
+    if maximum is not None:
+        _require(value <= maximum, f"{label} must be <= {maximum}")
+    return value
+
+
+def _relative_source(input_dir: Path, value: object, label: str) -> tuple[str, bytes]:
+    _require(isinstance(value, str) and value, f"{label} must be a relative path")
+    relative = PurePosixPath(value)
+    _require(
+        not relative.is_absolute() and ".." not in relative.parts,
+        f"{label} escapes the input directory: {value!r}",
+    )
+    path = input_dir.joinpath(*relative.parts)
+    _require(path.is_file(), f"{label} does not exist: {path}")
+    return relative.as_posix(), path.read_bytes()
+
+
+def _canonical_arg_plan(value: object, label: str) -> tuple[tuple[str, str], ...]:
+    _require(isinstance(value, list), f"{label} must be a list")
+    plan: list[tuple[str, str]] = []
+    for index, item in enumerate(value):
+        _require(
+            isinstance(item, list)
+            and len(item) == 2
+            and item[0] in ("buffer", "tma_buffer", "parameter", "grid")
+            and isinstance(item[1], str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item[1]) is not None,
+            f"{label}[{index}] must be one [kind, name] pair",
+        )
+        plan.append((item[0], item[1]))
+    _require(len({name for _, name in plan}) == len(plan), f"{label} names repeat")
+    return tuple(plan)
+
+
+def _arg_plan_sha256(plan: tuple[tuple[str, str], ...]) -> str:
+    canonical = json.dumps(plan, separators=(",", ":"), ensure_ascii=True).encode()
+    return _sha256(canonical)
+
+
+def _publicize_body(
+    source: bytes,
+    *,
+    role: str,
+    source_kernel_symbol: str,
+    exported_sha256: str,
+) -> tuple[str, bytes]:
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{role} exported source is not UTF-8") from exc
+    _require(text.endswith("\n"), f"{role} exported source must end with a newline")
+    _require(
+        text.count(source_kernel_symbol) == 1,
+        f"{role} exported source must contain exactly one {source_kernel_symbol}",
+    )
+    public_kernel_symbol = f"kernel_cake_kda_affine_unbounded_softplus_{role}"
+    _require(
+        _PUBLIC_KERNEL_RE.fullmatch(public_kernel_symbol) is not None,
+        f"invalid public kernel symbol for {role}",
+    )
+    text = text.replace(source_kernel_symbol, public_kernel_symbol)
+    _require(
+        "flashkda" not in text.lower(),
+        f"{role} public body retains source symbols",
+    )
+    provenance = (
+        "// Frozen generated Cake export; do not edit by hand.\n"
+        f"// Exported source SHA-256: {exported_sha256}.\n"
+    )
+    public = (
+        LICENSE_HEADER
+        + "\n"
+        + provenance
+        + "// clang-format off\n"
+        + text
+        + "// clang-format on\n"
+    ).encode()
+    return public_kernel_symbol, public
+
+
+def _normalize_module(item: object, input_dir: Path, index: int) -> ProducerModule:
+    label = f"modules[{index}]"
+    _require(isinstance(item, dict), f"{label} must be an object")
+    target = item.get("target")
+    role_value = item.get("role")
+    _require(target in TARGETS, f"{label}.target must be one of {TARGETS}")
+    _require(role_value in ROLE_ALIASES, f"{label}.role is unsupported")
+    role = ROLE_ALIASES[role_value]
+
+    source_path, source = _relative_source(
+        input_dir, item.get("source_path"), f"{label}.source_path"
+    )
+    exported_sha256 = _full_sha256(
+        item.get("exported_sha256"), f"{label}.exported_sha256"
+    )
+    exported_bytes = _positive_int(
+        item.get("exported_bytes"), f"{label}.exported_bytes"
+    )
+    _require(len(source) == exported_bytes, f"{label}.exported_bytes mismatch")
+    actual_exported_sha256 = _sha256(source)
+    _require(
+        actual_exported_sha256 == exported_sha256,
+        f"{label}.exported_sha256 mismatch: "
+        f"{actual_exported_sha256} != {exported_sha256}",
+    )
+    raw_sha256 = _full_sha256(item.get("raw_sha256"), f"{label}.raw_sha256")
+    source_module_ident = item.get("source_module_ident")
+    _require(
+        isinstance(source_module_ident, str)
+        and _SOURCE_MODULE_IDENT_RE.fullmatch(source_module_ident) is not None,
+        f"{label}.source_module_ident must be one source module identity",
+    )
+    _require(
+        PurePosixPath(source_path).stem == source_module_ident,
+        f"{label}.source_path stem must equal source_module_ident",
+    )
+    source_kernel_symbol = item.get("kernel_symbol")
+    _require(
+        isinstance(source_kernel_symbol, str)
+        and _SOURCE_KERNEL_RE.fullmatch(source_kernel_symbol) is not None,
+        f"{label}.kernel_symbol must be one source kernel symbol",
+    )
+    threads = _positive_int(item.get("threads"), f"{label}.threads", maximum=1024)
+    smem_bytes = _positive_int(item.get("smem_bytes"), f"{label}.smem_bytes")
+    use_pdl = item.get("use_pdl")
+    _require(isinstance(use_pdl, bool), f"{label}.use_pdl must be boolean")
+    arg_plan = _canonical_arg_plan(item.get("arg_plan"), f"{label}.arg_plan")
+    expected_plan = SCAN_ARG_PLAN if role == "scan" else DIRECT_ARG_PLAN
+    _require(
+        arg_plan == expected_plan,
+        f"{label}.arg_plan does not match the exact {role} binding ABI; "
+        f"expected {len(expected_plan) - 3} kernel arguments plus 3 grid arguments",
+    )
+
+    try:
+        source_text = source.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} exported source is not UTF-8") from exc
+    _require(
+        re.search(rf"__launch_bounds__\(\s*{threads}\s*(?:,|\))", source_text)
+        is not None,
+        f"{label}.threads does not match generated launch bounds",
+    )
+    _require(
+        re.search(rf"#define\s+SMEM_TOTAL\s+{smem_bytes}(?:\s|$)", source_text)
+        is not None,
+        f"{label}.smem_bytes does not match generated SMEM_TOTAL",
+    )
+    public_kernel_symbol, public_body = _publicize_body(
+        source,
+        role=role,
+        source_kernel_symbol=source_kernel_symbol,
+        exported_sha256=exported_sha256,
+    )
+    return ProducerModule(
+        target=target,
+        role=role,
+        source_path=source_path,
+        exported_sha256=exported_sha256,
+        exported_bytes=exported_bytes,
+        raw_sha256=raw_sha256,
+        source_module_ident=source_module_ident,
+        arg_plan=arg_plan,
+        arg_plan_sha256=_arg_plan_sha256(arg_plan),
+        source_kernel_symbol=source_kernel_symbol,
+        public_kernel_symbol=public_kernel_symbol,
+        threads=threads,
+        smem_bytes=smem_bytes,
+        use_pdl=use_pdl,
+        public_body=public_body,
+    )
+
+
+def _public_body_names(modules: list[ProducerModule]) -> dict[tuple[str, str], str]:
+    names: dict[tuple[str, str], str] = {}
+    for role in ROLES:
+        by_target = {module.target: module for module in modules if module.role == role}
+        _require(set(by_target) == set(TARGETS), f"missing target body for {role}")
+        shared = by_target[TARGETS[0]].public_body == by_target[TARGETS[1]].public_body
+        for target in TARGETS:
+            stem = "cake_kda_affine_unbounded_softplus_"
+            names[(target, role)] = (
+                f"{stem}{role}.cu" if shared else f"{stem}{target}_{role}.cu"
+            )
+    return names
+
+
+def _selector_binding_names(
+    modules: list[ProducerModule],
+    body_names: dict[tuple[str, str], str],
+) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], bytes]]:
+    names: dict[tuple[str, str], str] = {}
+    bindings = {
+        (module.target, module.role): _selector_binding(
+            module, body_names[(module.target, module.role)]
+        )
+        for module in modules
+    }
+    for role in ROLES:
+        first_key = (TARGETS[0], role)
+        second_key = (TARGETS[1], role)
+        shared = bindings[first_key] == bindings[second_key]
+        for target in TARGETS:
+            stem = "cake_kda_affine_unbounded_softplus_"
+            names[(target, role)] = (
+                f"{stem}{role}_binding.cu"
+                if shared
+                else f"{stem}{target}_{role}_binding.cu"
+            )
+    return names, bindings
+
+
+def _selector_binding(module: ProducerModule, body_name: str) -> bytes:
+    header = SCAN_HEADER if module.role == "scan" else DIRECT_HEADER
+    return (
+        LICENSE_HEADER
+        + "\n"
+        + f'#define FLASHINFER_CAKE_KDA_AFFINE_BODY_FILE "{body_name}"\n'
+        + f"#define FLASHINFER_CAKE_KDA_AFFINE_KERNEL {module.public_kernel_symbol}\n"
+        + f"#define FLASHINFER_CAKE_KDA_AFFINE_THREADS {module.threads}\n"
+        + f"#define FLASHINFER_CAKE_KDA_AFFINE_SMEM_BYTES {module.smem_bytes}\n"
+        + f"#define FLASHINFER_CAKE_KDA_AFFINE_USE_PDL {int(module.use_pdl)}\n"
+        + f"#define FLASHINFER_CAKE_KDA_AFFINE_ROLE {ROLE_MACROS[module.role]}\n"
+        + "#define FLASHINFER_CAKE_KDA_AFFINE_ARG_PLAN_SHA256 \\\n"
+        + f'  "{module.arg_plan_sha256}"\n'
+        + f'#include "{header}"\n'
+    ).encode()
+
+
+def _verified_header(output_dir: Path, name: str) -> tuple[bytes, str]:
+    path = output_dir / name
+    _require(path.is_file(), f"shared affine binding header is missing: {path}")
+    data = path.read_bytes()
+    _require(data, f"shared affine binding header is empty: {path}")
+    return data, _sha256(data)
+
+
+def _module_ident(
+    module: ProducerModule,
+    *,
+    body_sha256: str,
+    binding_sha256: str,
+    common_header_sha256: str,
+    role_header_sha256: str,
+) -> str:
+    closure = json.dumps(
+        {
+            "arg_plan_sha256": module.arg_plan_sha256,
+            "binding_sha256": binding_sha256,
+            "body_sha256": body_sha256,
+            "common_header_sha256": common_header_sha256,
+            "role": module.role,
+            "role_header_sha256": role_header_sha256,
+            "smem_bytes": module.smem_bytes,
+            "target": module.target,
+            "threads": module.threads,
+            "use_pdl": module.use_pdl,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return f"cake_kda_affine_unbounded_softplus_{module.role}_{_sha256(closure)[:10]}"
+
+
+def _normalize_bundle(
+    payload: dict[str, Any], input_dir: Path, output_dir: Path
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    _require(payload.get("schema_version") == SCHEMA_VERSION, "unsupported schema")
+    _require(payload.get("status") == STATUS_COMPLETE, "bundle status is not complete")
+    _require(payload.get("contract") == EXPECTED_CONTRACT, "bundle contract mismatch")
+    module_items = payload.get("modules")
+    _require(isinstance(module_items, list), "bundle modules must be a list")
+    _require(len(module_items) == 8, "bundle must contain exactly eight modules")
+
+    modules = [
+        _normalize_module(item, input_dir, index)
+        for index, item in enumerate(module_items)
+    ]
+    expected_keys = {(target, role) for target in TARGETS for role in ROLES}
+    observed_keys = {(module.target, module.role) for module in modules}
+    _require(
+        len(observed_keys) == len(modules),
+        "bundle contains a duplicate target/role module",
+    )
+    _require(
+        observed_keys == expected_keys,
+        "bundle target/role set mismatch: "
+        f"missing={sorted(expected_keys - observed_keys)}, "
+        f"extra={sorted(observed_keys - expected_keys)}",
+    )
+    modules.sort(
+        key=lambda module: (
+            TARGETS.index(module.target),
+            ROLES.index(module.role),
+        )
+    )
+
+    for role in ROLES:
+        role_modules = [module for module in modules if module.role == role]
+        _require(
+            len({module.arg_plan for module in role_modules}) == 1,
+            f"{role} argument plan differs across targets",
+        )
+
+    header_data = {
+        DIRECT_HEADER: _verified_header(output_dir, DIRECT_HEADER),
+        SCAN_HEADER: _verified_header(output_dir, SCAN_HEADER),
+        COMMON_HEADER: _verified_header(output_dir, COMMON_HEADER),
+    }
+    body_names = _public_body_names(modules)
+    binding_names, bindings = _selector_binding_names(modules, body_names)
+    outputs: dict[str, bytes] = {}
+    public_modules: list[dict[str, Any]] = []
+    for module in modules:
+        body_name = body_names[(module.target, module.role)]
+        previous = outputs.get(body_name)
+        _require(
+            previous is None or previous == module.public_body,
+            f"shared public body differs for {body_name}",
+        )
+        outputs[body_name] = module.public_body
+        body_sha256 = _sha256(module.public_body)
+
+        binding_name = binding_names[(module.target, module.role)]
+        binding = bindings[(module.target, module.role)]
+        binding_sha256 = _sha256(binding)
+        previous = outputs.get(binding_name)
+        _require(
+            previous is None or previous == binding,
+            f"shared selector binding differs for {binding_name}",
+        )
+        outputs[binding_name] = binding
+        header_name = SCAN_HEADER if module.role == "scan" else DIRECT_HEADER
+        _, role_header_sha256 = header_data[header_name]
+        _, common_header_sha256 = header_data[COMMON_HEADER]
+        module_ident = _module_ident(
+            module,
+            body_sha256=body_sha256,
+            binding_sha256=binding_sha256,
+            common_header_sha256=common_header_sha256,
+            role_header_sha256=role_header_sha256,
+        )
+        public_modules.append(
+            {
+                "arg_plan_sha256": module.arg_plan_sha256,
+                "binding_path": f"csrc/kda/{binding_name}",
+                "binding_sha256": binding_sha256,
+                "kernel_symbol": module.public_kernel_symbol,
+                "module_ident": module_ident,
+                "role": module.role,
+                "smem_bytes": module.smem_bytes,
+                "source_exported_bytes": module.exported_bytes,
+                "source_exported_sha256": module.exported_sha256,
+                "source_raw_sha256": module.raw_sha256,
+                "sources": [
+                    {
+                        "path": f"csrc/kda/{body_name}",
+                        "sha256": body_sha256,
+                    },
+                    {
+                        "path": f"csrc/kda/{header_name}",
+                        "sha256": role_header_sha256,
+                    },
+                    {
+                        "path": f"csrc/kda/{COMMON_HEADER}",
+                        "sha256": common_header_sha256,
+                    },
+                ],
+                "target": module.target,
+                "threads": module.threads,
+                "use_pdl": module.use_pdl,
+            }
+        )
+
+    manifest = {
+        "contract": EXPECTED_CONTRACT,
+        "modules": public_modules,
+        "schema_version": SCHEMA_VERSION,
+        "status": STATUS_COMPLETE,
+    }
+    return manifest, outputs
+
+
+def _manifest_bytes(payload: dict[str, Any]) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _write_or_check(path: Path, expected: bytes, check: bool) -> bool:
+    if check:
+        if not path.is_file() or path.read_bytes() != expected:
+            print(f"out of date: {path}", file=sys.stderr)
+            return False
+        print(f"verified: {path}")
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(expected)
+    print(f"wrote: {path}")
+    return True
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle-manifest", type=Path, required=True)
+    parser.add_argument("--input-dir", type=Path)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "csrc" / "kda",
+    )
+    parser.add_argument("--check", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    input_dir = (
+        args.bundle_manifest.parent if args.input_dir is None else args.input_dir
+    ).resolve()
+    output_dir = args.output_dir.resolve()
+    manifest, outputs = _normalize_bundle(
+        _load_json(args.bundle_manifest), input_dir, output_dir
+    )
+    outputs[MANIFEST_NAME] = _manifest_bytes(manifest)
+    matched = True
+    for relative_path, data in sorted(outputs.items()):
+        matched = (
+            _write_or_check(output_dir / relative_path, data, args.check) and matched
+        )
+    return 0 if matched else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
