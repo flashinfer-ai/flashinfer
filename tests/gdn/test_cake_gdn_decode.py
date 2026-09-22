@@ -61,11 +61,11 @@ def _decode(**overrides):
 
 def test_manifest_is_frozen_and_source_only() -> None:
     manifest = cake_gdn._manifest()
-    assert manifest["contract_row_count"] == 1779
-    assert manifest["architecture_row_count"] == 3558
-    assert manifest["admitted_architecture_rows"] == 3504
+    assert manifest["contract_row_count"] == 1799
+    assert manifest["architecture_row_count"] == 3598
+    assert manifest["admitted_architecture_rows"] == 3544
     assert manifest["fail_closed_architecture_rows"] == 54
-    assert manifest["variant_count"] == len(manifest["variants"]) == 104
+    assert manifest["variant_count"] == len(manifest["variants"]) == 108
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 
