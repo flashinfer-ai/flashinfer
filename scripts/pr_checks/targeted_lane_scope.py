@@ -23,12 +23,13 @@ Prints the narrowed scope, space-separated, on one line (an empty line when no
 target is covered). Targets are paths under ``tests/``, files or directories, as
 validated by ``experimental_test_scope.py``; ``::`` selectors are not accepted.
 
-An empty *intersection* is normal (the lane is not scheduled). Empty *coverage* --
-the shard scripts parsing to zero ``pytest`` lines -- is always parser drift (a
-script switched to ``python -m pytest``, a loop over a list variable, ...) and
-would otherwise silently turn every later targeted run into "lane not scheduled",
-so it exits non-zero. ``pr-test.yml`` also runs ``--coverage-only`` on every
-setup so drift fails the PR that introduces it.
+An empty *intersection* is normal (the lane is not scheduled). A shard script
+parsing to zero ``pytest`` lines is always parser drift (a script switched to
+``python -m pytest``, a loop over a list variable, ...) and would otherwise
+silently drop that shard's files from the lane's coverage, so it exits non-zero
+-- checked per script, not in aggregate, so one drifted shard among five is
+caught. ``pr-test.yml`` also runs ``--coverage-only`` on every setup so drift
+fails the PR that introduces it.
 """
 
 from __future__ import annotations
@@ -54,13 +55,28 @@ def _under(path: str, directory: str) -> bool:
 
 
 def coverage(scripts: list[Path]) -> list[str]:
-    """Test files a set of shard scripts run, in stable order."""
+    """Test files a set of shard scripts run, in stable order.
+
+    Every script must contribute at least one ``pytest`` target. Checking per
+    script rather than in aggregate matters: with five A10G shards, one shard
+    drifting to an unparsed invocation would leave the aggregate non-empty and
+    silently drop that shard's files from targeted A10G coverage.
+    """
     seen: dict[str, None] = {}
+    drifted: list[str] = []
     for script in scripts:
+        found = False
         for line in script.read_text().splitlines():
             match = _PYTEST_LINE.match(line)
             if match:
                 seen.setdefault(_norm(match.group(1)), None)
+                found = True
+        if not found:
+            drifted.append(str(script))
+    if drifted:
+        raise ValueError(
+            "no pytest targets parsed from " + ", ".join(drifted) + " -- parser drift?"
+        )
     return list(seen)
 
 
@@ -150,6 +166,20 @@ def _selftest() -> int:
 
         drifted = Path(td) / "drifted.sh"
         drifted.write_text("#!/bin/bash\npython -m pytest tests/attention/test_a.py\n")
+        try:
+            coverage([part, drifted])
+            check("mixed valid+drifted shards rejected", "returned", "ValueError")
+        except ValueError as exc:
+            check(
+                "mixed rejection names the drifted script",
+                str(drifted) in str(exc),
+                True,
+            )
+            check(
+                "mixed rejection does not blame the valid script",
+                str(part) in str(exc),
+                False,
+            )
         argv = sys.argv
         try:
             sys.argv = [
@@ -206,12 +236,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    covered = coverage(args.scripts)
-    if not covered:
-        names = ", ".join(map(str, args.scripts))
-        sys.exit(
-            f"targeted_lane_scope: no pytest targets parsed from {names} -- parser drift?"
-        )
+    try:
+        covered = coverage(args.scripts)
+    except ValueError as exc:
+        sys.exit(f"targeted_lane_scope: {exc}")
     result = covered if args.coverage_only else intersect(args.targets.split(), covered)
     print(" ".join(result))
     return 0
