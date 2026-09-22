@@ -48,6 +48,12 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     }
     case execution::Implementation::SG:
     case execution::Implementation::MixedCache: {
+      if (mt == ModelType::GLM53_NOPE && plan.numeric == execution::NumericRoute::QkBF16PvFP8) {
+        // The resolver limits the strict BF16-QK route to this single-group
+        // specialization, including short queries that normally use split-K.
+        return launch_prefill_sg<ModelType::GLM53_NOPE, QkComputeMode::BF16, 16, 64>(
+            p.q, p.kv, p.indices, p.attn_sink, p.output, p.out_lse, stream, cold);
+      }
       if (mt == ModelType::DSV4_1) {
         if (plan.implementation == execution::Implementation::MixedCache)
           return dispatch_dsv41_sg<Dsv41MixedCachePrefillSchedule>(SINGLE_ARGS, cold);

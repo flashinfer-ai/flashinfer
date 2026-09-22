@@ -838,7 +838,7 @@ class _SparseMLAPagedAttentionRunner:
         When True, the extra (compressed) cache of a dual-cache call holds
         288-byte V41_FP4 rows. The numerical route decodes them on chip.
         Requires ``kv_cache_format="fp8"`` and ``kv_scale_format="ue8m0_g32"``.
-    compute_precision : {"default", "fp8", "bf16", "nvfp4"}
+    compute_precision : {"default", "fp8", "bf16", "bf16_qk", "nvfp4"}
         Fixed for this Wrapper. Default retains the legacy family/shape hybrid
         and DSV4 NVFP4 cache routes. Explicit DSV4.1 FP8 uses decode where eligible
         (T<=64, H=1..128), otherwise the existing FP8 prefill (H=8/16/32/64,
@@ -855,6 +855,11 @@ class _SparseMLAPagedAttentionRunner:
         and PV use BF16 operands with FP32 accumulation/softmax, never the legacy
         BF16-QK/FP8-PV mode. Warm up each
         captured shape; live graph buffers are retained across shape changes.
+        ``bf16_qk`` selects BF16 QK with FP8 PV and the compact FP8 cache for
+        GLM53 NoPE only: T>0, H=16, PBS=64, table width 2112 or 2176, single
+        cache, and ``prefill_impl`` None/auto. It uses the SG kernel even for
+        short queries, with no split-K scratch or phase/CPB calibration.
+        This precision choice can cost latency relative to default dispatch.
         NVFP4 requires DSV4 384-byte storage, not DSV4.1: H=16/32/64/128,
         main topk=128/512 and PBS=64; extra topk>0 with PBS=2/64. It retains
         NVFP4 Q/P quantization and V requantization, BF16 RoPE, and the separately
@@ -897,8 +902,18 @@ class _SparseMLAPagedAttentionRunner:
         # d_v is validated against the compiled format table on the first
         # plan/run; construction stays free of JIT module loading.
         self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
-        if compute_precision not in ("default", "fp8", "bf16", "nvfp4"):
-            raise ValueError("compute_precision must be default, fp8, bf16, or nvfp4")
+        if compute_precision not in ("default", "fp8", "bf16", "bf16_qk", "nvfp4"):
+            raise ValueError(
+                "compute_precision must be default, fp8, bf16, bf16_qk, or nvfp4"
+            )
+        if compute_precision == "bf16_qk" and (
+            kv_cache_format != "fp8"
+            or self._kv_scale_format != "arbitrary_fp32"
+            or d_v != 512
+        ):
+            raise ValueError(
+                "bf16_qk requires GLM53 NoPE FP8 storage (arbitrary_fp32, d_v=512)"
+            )
         if compute_precision in ("fp8", "bf16") and (
             kv_cache_format != "fp8"
             or self._kv_scale_format != "ue8m0_g32"

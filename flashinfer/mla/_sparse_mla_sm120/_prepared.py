@@ -381,6 +381,8 @@ def wrapper_run(
     if q.ndim != 3:
         raise ValueError("q must be [T,H,D] or [T,1,H,D]")
     t, h, _ = q.shape
+    if wrapper._compute_precision == "bf16_qk" and t == 0:
+        raise ValueError("bf16_qk requires T>0")
     if q.device != wrapper._device:
         raise ValueError("tensors must be on the Wrapper device")
     if (wrapper._max_num_tokens is not None and t > wrapper._max_num_tokens) or (
