@@ -63,6 +63,9 @@ from .cake_fmha import (
     cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
 )
 from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_sampling import (
+    top_k_top_p_sampling_from_probs as cake_top_k_top_p_sampling_from_probs,
+)
 from .cake_fmha import (
     CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
 )
