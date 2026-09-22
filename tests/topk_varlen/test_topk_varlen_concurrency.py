@@ -16,7 +16,9 @@
 The shape suites run one launch at a time on one stream from one thread, so
 they cannot see the class of defect that review round 1 of PR #4986 found:
 lazily created resources shared across launches that may overlap (the gvr_2
-SPLIT workspace slab and the hint-free anchor table). Every test here drives
+SPLIT workspace slab; the hint-free anchor table this file also covered was
+removed when the hint-free compiled engines of TRT-LLM #18410 were ported —
+hint-free launches now hold no per-batch host state). Every test here drives
 the API the way a serving engine does — several host threads, several CUDA
 streams, CUDA graphs replayed while other work is in flight — and asserts the
 invariant directly (exactness per row, or the contents of the shared object),
@@ -73,15 +75,6 @@ def _barrier(parties):
     """Barrier with a timeout: a thread that fails before reaching it must not
     hang the whole test (the others then see BrokenBarrierError and report)."""
     return threading.Barrier(parties, timeout=120)
-
-
-def _forget_table(k):
-    """Drop the cached hint-free anchor table for k (cold start for a test)."""
-    key = (torch.cuda.current_device(), k)
-    # getattr: lets the file run against a host without the growth lock (the
-    # teeth check runs these tests on the pre-fix tree)
-    with getattr(_host, "_HINT_FREE_LOCK", None) or threading.Lock():
-        _host._HINT_FREE.pop(key, None)
 
 
 def _slab_key(stream):
@@ -311,206 +304,14 @@ def test_gvr2_same_stream_graphs_share_a_slab_and_replay_sequentially():
 
 
 # ---------------------------------------------------------------------------
-# 2. the hint-free anchor table under growth, cross-stream use and capture
-# ---------------------------------------------------------------------------
-
-
-@requires_gvr2
-def test_gvr2_hint_free_graph_survives_table_growth_by_others():
-    """A hint-free graph captured against the anchor table at capacity C keeps
-    replaying exactly after other callers grow the table past C (the graph
-    holds the OLD table's address, which must stay alive and intact)."""
-    k, n = 512, 8192
-    key = (torch.cuda.current_device(), k)
-    _forget_table(k)
-    gen = torch.Generator(device=_DEV).manual_seed(51)
-    logits = torch.randn(8, n, generator=gen, device=_DEV)
-    seq = torch.randint(600, n, (8,), generator=gen, device=_DEV, dtype=torch.int32)
-    out = torch.full((8, k), -7, dtype=torch.int32, device=_DEV)
-    torch.cuda.synchronize()  # default-stream initialisation before the side-stream launch
-    s = torch.cuda.Stream()
-    with torch.cuda.stream(s):
-        _launch((logits, seq, None, out), k, hint=False)
-    torch.cuda.synchronize()
-    old = _host._HINT_FREE[key]
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
-        _launch((logits, seq, None, out), k, hint=False)
-    torch.cuda.synchronize()
-    # grow the table well past the captured capacity, several times, from
-    # another stream
-    big_logits = torch.randn(1024, n, generator=gen, device=_DEV)
-    big_seq = torch.full((1024,), n, dtype=torch.int32, device=_DEV)
-    big_out = torch.empty(1024, k, dtype=torch.int32, device=_DEV)
-    torch.cuda.synchronize()  # default-stream initialisation before the side-stream launches
-    other = torch.cuda.Stream()
-    for b in (100, 300, 1024):
-        with torch.cuda.stream(other):
-            _launch((big_logits[:b], big_seq[:b], None, big_out[:b]), k, hint=False)
-    torch.cuda.synchronize()
-    assert _host._HINT_FREE[key] is not old and _host._HINT_FREE[key].shape[0] >= 1024
-    assert any(t is old for t in _host._HINT_FREE_KEEP), (
-        "superseded table not kept alive"
-    )
-    assert bool((old == torch.arange(k, dtype=torch.int32, device=_DEV)).all())
-    for _ in range(3):
-        with torch.cuda.stream(s):  # the fill is ordered before the replay on s
-            out.fill_(-7)
-            g.replay()
-        torch.cuda.synchronize()
-        _exact(logits, seq, out, k, who="graph on the superseded table")
-
-
-@requires_gvr2
-def test_gvr2_hint_free_table_grown_on_one_stream_is_complete_when_published():
-    """Publication ordering of the anchor table: the producer on stream A queues
-    a long busy-wait kernel and then grows the table (the arange fill sits
-    behind the busy-wait in A's queue); the consumer on stream B, without any
-    synchronization with A, snapshots the published table the moment the
-    pointer is visible. The snapshot must equal arange(k): the host must
-    synchronize the producing stream before publishing. (Exactness of the
-    consumer's top-k is NOT the observable — gvr_2 is exact for any hint
-    contents — so the table itself is compared.) Fails on a host that
-    publishes before the fill completes."""
-    k, n = 1024, 8192
-    key = (torch.cuda.current_device(), k)
-    gen = torch.Generator(device=_DEV).manual_seed(61)
-    logits = torch.randn(512, n, generator=gen, device=_DEV)
-    seq = torch.full((512,), n, dtype=torch.int32, device=_DEV)
-    outs = [torch.full((512, k), -7, dtype=torch.int32, device=_DEV) for _ in range(2)]
-    torch.cuda.synchronize()  # default-stream initialisation before the side-stream launch
-    a, b = torch.cuda.Stream(), torch.cuda.Stream()
-    with torch.cuda.stream(b):  # compile the launcher for 512 rows on B, hinted
-        _launch(
-            (logits, seq, torch.zeros(512, k, dtype=torch.int32, device=_DEV), outs[1]),
-            k,
-        )
-    torch.cuda.synchronize()
-    _forget_table(k)  # the hinted call pre-sized it; go cold again
-    # the freed table's block would be handed back by the caching allocator
-    # with arange(k) still in it, which would mask a publish-before-fill bug:
-    # release cached blocks, then poison a same-sized block ON STREAM A (the
-    # allocator reuses blocks per stream) so the new table's memory does not
-    # start out holding the right answer
-    torch.cuda.empty_cache()
-    with torch.cuda.stream(a):
-        # Walk the growth's exact allocation path once on stream A and free the
-        # result, so the real growth reuses cached blocks: any cudaMalloc
-        # inside the growth would block the host behind the busy-wait and make
-        # even a publish-before-fill host look ordered (measured). The block
-        # is left holding -1, so a table published before its fill reads -1.
-        warm = (
-            torch.arange(k, dtype=torch.int32, device=_DEV)
-            .unsqueeze(0)
-            .expand(512, k)
-            .contiguous()
-        )
-        warm.fill_(-1)
-    torch.cuda.synchronize()
-    del warm
-    ref = torch.arange(k, dtype=torch.int32, device=_DEV)
-    grown = threading.Event()
-    snapshot = {}
-    errors = []
-
-    orig_arange = torch.arange
-
-    def slow_arange(*args, **kwargs):
-        # The growth builds the table as arange(k).expand(...).contiguous():
-        # queue a ~2 s GPU busy-wait on the producing stream right AFTER the
-        # arange and BEFORE the expand/contiguous copy, so the fill sits behind
-        # the busy-wait in stream A's queue. (Queuing the busy-wait before the
-        # growth does not work: torch.arange itself blocks the host until the
-        # stream drains, which closes the window even on a publish-early host.)
-        t = orig_arange(*args, **kwargs)
-        torch.cuda._sleep(4_000_000_000)
-        return t
-
-    def producer():
-        try:
-            with torch.cuda.stream(a):
-                torch.arange = slow_arange
-                try:
-                    _host._hint_free_pre_idx(
-                        512, k, torch.device(_DEV)
-                    )  # grows 0 -> 512
-                finally:
-                    torch.arange = orig_arange
-                grown.set()
-                _launch((logits, seq, None, outs[0]), k, hint=False)
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-            grown.set()
-
-    def consumer():
-        try:
-            grown.wait()
-            with torch.cuda.stream(b):  # no synchronization with A
-                snapshot["table"] = _host._HINT_FREE[key].clone()
-                _launch((logits, seq, None, outs[1]), k, hint=False)
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-
-    ts = [threading.Thread(target=producer), threading.Thread(target=consumer)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    torch.cuda.synchronize()
-    assert not errors, errors
-    snap = snapshot["table"]
-    bad_rows = int((snap != ref).any(dim=1).sum())
-    assert bad_rows == 0, (
-        f"{bad_rows}/{snap.shape[0]} table rows were not arange(k) when published"
-    )
-    _exact(logits, seq, outs[0], k, who="producer stream")
-    _exact(logits, seq, outs[1], k, who="consumer stream")
-
-
-@requires_gvr2
-def test_gvr2_hint_free_tables_for_different_k_grow_independently():
-    """Interleaved growth of the k=512 and k=2048 tables from two threads keeps
-    each table's rows equal to arange(k) and its capacity monotonic."""
-    dev = torch.cuda.current_device()
-    for k in (512, 2048):
-        _forget_table(k)
-    seen = {512: [], 2048: []}
-    errors = []
-    barrier = _barrier(2)
-
-    def grow(k):
-        try:
-            barrier.wait()
-            for b in (8, 70, 20, 300, 9, 600):
-                t = _host._hint_free_pre_idx(b, k, torch.device(_DEV))
-                seen[k].append(_host._HINT_FREE[(dev, k)].shape[0])
-                assert t.shape == (b, k)
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-
-    ts = [threading.Thread(target=grow, args=(k,)) for k in (512, 2048)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    assert not errors, errors
-    for k in (512, 2048):
-        caps = seen[k]
-        assert caps == sorted(caps), f"k={k}: capacity shrank: {caps}"
-        table = _host._HINT_FREE[(dev, k)]
-        assert table.shape[0] >= 600
-        assert bool((table == torch.arange(k, dtype=torch.int32, device=_DEV)).all())
-
-
-# ---------------------------------------------------------------------------
 # 3. warm-up on one stream, capture on another: loud, not silent
 # ---------------------------------------------------------------------------
 
 
 @requires_gvr2
 def test_gvr2_warmup_varlen_on_stream_enables_capture_on_that_stream_only():
-    """warmup_varlen run on stream A creates A's slab and sizes the anchor
-    table; a hint-free slab-using capture on A then succeeds, while the same
+    """warmup_varlen run on stream A creates A's slab and compiles both hint
+    modes; a hint-free slab-using capture on A then succeeds, while the same
     capture on a stream with no slab raises (never allocates from the graph
     pool). The 'no slab' precondition is established explicitly, since
     stream B's pooled raw handle may have been given a slab by an earlier
@@ -549,10 +350,9 @@ def test_gvr2_release_between_quiescent_multithreaded_phases_is_exact():
     """`release_gvr2_resources` under its documented contract in a threaded
     program: eight threads launch on eight streams, all of them park at a
     barrier (quiescent: nothing in flight, nothing being issued), the main
-    thread releases the device's slabs and anchor tables, and the threads
-    resume with hint-free launches on the same streams. Every result stays
-    exact, every slab and the table are recreated, and a second release frees
-    at least the same number of slabs."""
+    thread releases the device's slabs, and the threads resume with hint-free
+    launches on the same streams. Every result stays exact, every slab is
+    recreated, and a second release frees at least the same number of slabs."""
     from flashinfer.topk_varlen import release_gvr2_resources
 
     threads_n = 8
@@ -567,11 +367,11 @@ def test_gvr2_release_between_quiescent_multithreaded_phases_is_exact():
     def worker(i):
         try:
             with torch.cuda.stream(streams[i]):
-                _launch(work[i], k, False, out=outs[i][0])  # slab + table
+                _launch(work[i], k, False, out=outs[i][0])  # creates the slab
                 streams[i].synchronize()
                 b_quiet.wait()  # main releases while everyone is parked here
                 b_resume.wait()
-                _launch(work[i], k, False, out=outs[i][1])  # recreates them
+                _launch(work[i], k, False, out=outs[i][1])  # recreates it
                 streams[i].synchronize()
         except Exception as e:  # noqa: BLE001
             errors.append(e)
@@ -585,14 +385,12 @@ def test_gvr2_release_between_quiescent_multithreaded_phases_is_exact():
     freed = release_gvr2_resources()
     assert freed >= threads_n * _host.workspace_bytes(), (freed, n_slabs)
     assert not any(key[0] == dev for key in _host._ws_keep)
-    assert (dev, k) not in _host._HINT_FREE
     b_resume.wait()
     for t in ts:
         t.join()
     torch.cuda.synchronize()
     assert not errors, errors
     assert sum(1 for key in _host._ws_keep if key[0] == dev) >= threads_n
-    assert (dev, k) in _host._HINT_FREE
     for i, w in enumerate(work):
         for j in range(2):
             _exact(w[0], w[1], outs[i][j], k, who=f"stream {i} phase {j}")
@@ -615,7 +413,8 @@ def test_gvr2_register_family_capture_needs_no_slab_on_a_fresh_stream():
     seq = torch.randint(600, n, (rows,), generator=gen, device=_DEV, dtype=torch.int32)
     pre = torch.zeros(rows, k, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    _launch((logits, seq, pre, out), k)  # default stream, hinted (also sizes the table)
+    for hint in (True, False):  # default stream: compile both hint modes' launchers
+        _launch((logits, seq, pre, out), k, hint=hint)
     torch.cuda.synchronize()
     for hint in (True, False):
         fresh = torch.cuda.Stream()

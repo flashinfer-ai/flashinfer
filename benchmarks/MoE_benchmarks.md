@@ -42,7 +42,7 @@ srun -N1 --container-image=nvcr.io/nvidia/pytorch:26.05-py3 \
   bash -lc 'bash /host/flashinfer/docker/install/build_flashinfer_ep_pytorch.sh'
 ```
 
-**Runtime requirements** (B200/Pre-Nyx): NCCL-EP's GIN transport needs the GDAKI/GPUDirect
+**Runtime requirements** (B200): NCCL-EP's GIN transport needs the GDAKI/GPUDirect
 stack even single-node; **NCCL ≥ 2.30.7** (2.27/2.29 fail group-create at `nccl_ep.cc:1438`
 on B200) bound **first** on `LD_LIBRARY_PATH`; and **`NCCL_MNNVL_ENABLE=1` for multi-node**
 (single-node intra-tray NVLink works without it). The PyTorch image + the pinned wheels
@@ -60,8 +60,9 @@ Standalone — needs only FlashInfer (EP is in the default install), torch, and 
 so `scripts/parse_results.py` parses both. The 28-case driver issues one `srun` per config:
 
 ```bash
-# inside an salloc (-N 8); JOBID set; RW holds the checkout + the .sqsh
-ssh prenyx "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
+# inside an salloc (-N 8); JOBID set; RW holds the checkout + the .sqsh;
+# LOGIN_HOST is your cluster login node
+ssh "$LOGIN_HOST" "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
   IMAGE=$RW/flashinfer-ep-pt2605.sqsh ONE_SCRIPT=run_ep_matrix_one_pt.sh \
   bash $RW/flashinfer/benchmarks/run_ep_matrix.sh"
 ```
@@ -98,7 +99,7 @@ autotunes the trtllm bf16 kernel (~12–15 min).
 
 ## 3. Results — comm matrix vs ep_bench
 
-All µs/call, BF16, hidden 7168 / top-k 8 / 256 experts, Pre-Nyx B200 (8 GPU/node, NDR IB).
+All µs/call, BF16, hidden 7168 / top-k 8 / 256 experts, B200 (8 GPU/node, NDR IB).
 `kernel` = pure GPU device time (ep: CUPTI; FI: Nsight Systems `cuda_gpu_kern_sum`).
 `event measured` = the per-call `cudaEvent`-bracketed host-call (ep_bench "total"; FI bench
 "kernel-only"). FI columns use `NV_FI_EP_FAST_PATH=1` (§3.1). Cross-node confirmed to 64 GPU.
@@ -163,7 +164,7 @@ host-sync readback is now removed unconditionally — `DispatchOutput` no longer
 Per-stage median µs (compute = grouped bf16 GEMM via `flashinfer.fused_moe` `TrtllmBf16Config`,
 EP-local `top_k=1`). Compute-bound throughout; tok/s ~linear in GPU count.
 
-**LL EXPERT_MAJOR — Pre-Nyx B200, reference config, bf16:**
+**LL EXPERT_MAJOR — B200, reference config, bf16:**
 
 | GPUs | nodes | MNNVL | dispatch | compute | combine | e2e | tok/s |
 |---:|---:|:--:|---:|---:|---:|---:|---:|
@@ -178,7 +179,7 @@ EP-local `top_k=1`). Compute-bound throughout; tok/s ~linear in GPU count.
 (1.47 vs 3.53 ms compute) but slower past 32. HT FLAT runs single-node (8 GPU: 4096 tok/rank
 → 1.15 M tok/s; 8192 → 1.21 M); cross-node HT is blocked by the library bug above.
 
-(Validated bf16 end-to-end on GB200/SM100, GB300/SM103, GB200-NVL36/Ptyche, and Pre-Nyx
+(Validated bf16 end-to-end on GB200/SM100, GB300/SM103, GB200-NVL36, and
 B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/MoE_EP_impl.md`.)
 
 ---

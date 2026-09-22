@@ -100,6 +100,7 @@ from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
+    gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -152,7 +153,6 @@ from .jit.cake_minimax_h3_mxfp8 import (
 )
 from .jit.mla import (
     gen_mla_module,
-    gen_sparse_mla_nvfp4_sm120_module,
     gen_sparse_mla_sm120_module,
 )
 from .jit.api_log_stats import gen_api_log_stats_module
@@ -782,6 +782,8 @@ def gen_all_modules(
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
             jit_specs.append(gen_moe_utils_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
         jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
@@ -820,6 +822,7 @@ def gen_all_modules(
         from .jit.comm import (
             gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
+            gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
             gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
@@ -846,6 +849,18 @@ def gen_all_modules(
             # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm107
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
+            jit_specs.append(gen_dcp_lse_reduce_module())
         if has_sm100a_exact:
             jit_specs.append(gen_moe_alltoall_module("sm100a"))
         if has_sm103a_exact:
@@ -1007,7 +1022,6 @@ def gen_all_modules(
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
-        jit_specs.append(gen_sparse_mla_nvfp4_sm120_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())

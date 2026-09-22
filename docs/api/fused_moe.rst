@@ -79,6 +79,22 @@ The E8M0 range-clamping, residual-scale factorization, and FP4 payload-rewrite
 scheme used by ``preprocess_moe_weights_for_sm90_mixed_gemm_humming`` is adapted
 from `Humming <https://github.com/inclusionAI/humming>`_.
 
+AlphaMoE Router (SM100/SM103)
+-----------------------------
+
+The standalone AlphaMoE frontend converts FP32 logits into top-k weights and an
+expert-grouped, block-aligned route plan. Selection and ordering among exactly
+equal routed logits are unspecified. The resulting plan can feed either the
+AlphaMoE W8A8 or NVFP4 compute path and can be reused across launches to avoid
+steady-state allocation.
+
+.. autosummary::
+    :toctree: ../generated
+
+    AlphaMoERoutePlan
+    allocate_alphamoe_route_plan
+    alphamoe_fused_router
+
 Multi-LoRA MoE (BGMV)
 ---------------------
 
@@ -112,6 +128,12 @@ cuTile Fused MoE
 
     CuTileBf16Config
     CuTileBf16Runner
+    CuTileMxfp4Bf16Config
+    CuTileMxfp4Bf16Runner
+    CuTileMxfp4Config
+    CuTileMxfp4Runner
+    CuTileNvfp4Bf16Config
+    CuTileNvfp4Bf16Runner
     CuTileNvfp4Config
     CuTileNvfp4Runner
 
@@ -304,6 +326,13 @@ The CuteDSL backends are conditionally available when the
     b12x_fused_moe
 
 .. autoclass:: CuteDslMoEWrapper
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+.. autoclass:: CuteDslBf16MoEWrapper
     :members:
     :inherited-members:
     :show-inheritance:

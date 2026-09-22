@@ -52,7 +52,6 @@ else
     tests/comm/test_pcie_ipc_reduce_scatter.py
 fi
 # trtllm ar + fusion
-pytest -s tests/comm/test_trtllm_allreduce.py
 pytest -s tests/comm/test_trtllm_allreduce_fusion.py
 pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion.py

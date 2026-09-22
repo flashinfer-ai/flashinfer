@@ -12,12 +12,8 @@ from .trtllm_ar import (
 from .trtllm_ar import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .trtllm_ar import trtllm_allreduce_fusion as trtllm_allreduce_fusion
 from .trtllm_ar import (
-    trtllm_create_ipc_workspace_for_all_reduce as trtllm_create_ipc_workspace_for_all_reduce,
-)
-from .trtllm_ar import (
     trtllm_create_ipc_workspace_for_all_reduce_fusion as trtllm_create_ipc_workspace_for_all_reduce_fusion,
 )
-from .trtllm_ar import trtllm_custom_all_reduce as trtllm_custom_all_reduce
 from .trtllm_ar import (
     trtllm_destroy_ipc_workspace_for_all_reduce as trtllm_destroy_ipc_workspace_for_all_reduce,
 )
@@ -137,6 +133,13 @@ from .dcp_alltoall import (
 )
 from .dcp_alltoall import decode_cp_a2a_init_workspace as decode_cp_a2a_init_workspace
 from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspace_size
+from .dcp_lse_reduce import decode_cp_a2a_lse_reduce as decode_cp_a2a_lse_reduce
+from .dcp_lse_reduce import (
+    decode_cp_a2a_lse_reduce_create_workspace as decode_cp_a2a_lse_reduce_create_workspace,
+)
+from .dcp_lse_reduce import (
+    decode_cp_a2a_lse_reduce_workspace_size as decode_cp_a2a_lse_reduce_workspace_size,
+)
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 

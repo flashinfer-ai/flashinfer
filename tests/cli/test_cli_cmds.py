@@ -40,6 +40,79 @@ def _mock_jit_cache_provider_inventory(monkeypatch, *provider_tags):
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_pip_installer(monkeypatch):
+    monkeypatch.setattr("flashinfer.__main__.which", lambda _name: None)
+
+
+@pytest.mark.parametrize(
+    "config,pip_available,uv_available,use_uv",
+    [
+        ("uv = 0.11.16\n", True, True, True),
+        ("uv = 0.11.16\n", False, True, True),
+        ("uv = 0.11.16\n", True, False, False),
+        ("virtualenv = 20.0\n", True, True, False),
+        (None, True, True, False),
+        (None, False, True, True),
+        (b"\xff", True, True, False),
+    ],
+)
+def test_pip_install_cmd_selects_installer_without_execution(
+    monkeypatch, tmp_path, config, pip_available, uv_available, use_uv
+):
+    import flashinfer.__main__ as main
+
+    if config is not None:
+        (tmp_path / "pyvenv.cfg").write_bytes(
+            config if isinstance(config, bytes) else config.encode()
+        )
+    monkeypatch.setattr(main.sys, "prefix", str(tmp_path))
+    monkeypatch.setenv("VIRTUAL_ENV", "/another/environment")
+    monkeypatch.setattr(
+        main, "find_spec", lambda _name: object() if pip_available else None
+    )
+    monkeypatch.setattr(
+        main, "which", lambda _name: "/tools/uv" if uv_available else None
+    )
+
+    def fail_run(*_args, **_kwargs):
+        pytest.fail("Installer discovery must not execute subprocesses")
+
+    monkeypatch.setattr(main.subprocess, "run", fail_run)
+    cmd = main._build_pip_install_cmd(
+        "flashinfer-cubin==0.6.18", "https://flashinfer.ai/whl", True
+    )
+    prefix = (
+        ["/tools/uv", "pip", "install", "--python", sys.executable]
+        if use_uv
+        else [sys.executable, "-m", "pip", "install"]
+    )
+    assert cmd == [
+        *prefix,
+        "--upgrade",
+        "--no-deps",
+        "--pre",
+        "--index-url",
+        "https://flashinfer.ai/whl",
+        "flashinfer-cubin==0.6.18",
+    ]
+
+
+def test_pip_install_cmd_does_not_import_pip(monkeypatch, tmp_path):
+    import flashinfer.__main__ as main
+
+    (tmp_path / "pip.py").write_text(
+        "raise AssertionError('pip must not be imported')\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "pip", raising=False)
+    monkeypatch.setattr(main.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(main, "which", lambda _name: "/tools/uv")
+
+    assert main._get_pip_install_cmd() == [sys.executable, "-m", "pip", "install"]
+    assert "pip" not in sys.modules
+
+
 def test_show_config_cmd_real():
     """
     Test that show-config command works as expected
