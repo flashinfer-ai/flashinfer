@@ -84,6 +84,9 @@ from .decode import (
 from .decode import (
     launch_sm110_gqa_decode_prepared as launch_sm110_gqa_decode_prepared,
 )
+from .decode import (
+    prepare_balanced_batch_decode_with_kv_cache as prepare_balanced_batch_decode_with_kv_cache,
+)
 from .decode import prepare_sm110_gqa_decode as prepare_sm110_gqa_decode
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
