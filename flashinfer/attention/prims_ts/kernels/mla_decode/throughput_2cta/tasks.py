@@ -515,7 +515,8 @@ def create_load_k_task(
     """Create the FP8 Q/K TMA task (warp 9).
 
     Q is loaded once before the loop. K uses one whole-tile pipeline stage per
-    logical K tile and reads page offsets directly from GMEM.
+    logical K tile. Sparse indices are prefetched through the shared offset
+    ring; ordinary paged inputs read page offsets directly from GMEM.
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
@@ -537,7 +538,7 @@ def create_load_k_task(
                 smem_k.commit()
             else:
                 smem_k.acquire()
-                smem_k.tma_load_direct()
+                smem_k.tma_load_paged()
                 smem_k.commit()
         work_queue_tail(work_queue, advance_label="advance_tile")
 
@@ -599,7 +600,7 @@ def create_load_v_task(
                 smem_v.commit()
             else:
                 smem_v.acquire()
-                smem_v.tma_load_direct()
+                smem_v.tma_load_paged()
                 smem_v.commit()
         work_queue_tail(work_queue, advance_label="advance_tile")
 

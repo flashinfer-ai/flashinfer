@@ -903,7 +903,9 @@ def create_throughput_latency_correction_task(
                     tail_o_stage_idx_0,
                     tail_o_stage_idx_1,
                 ) = work_tile_state
-            if not (cfg.short_merged_softmax):
+            # With only one tile per stream there is no correction loop;
+            # consume only final statistics, published after both P tiles.
+            if not cfg.short_merged_softmax:
                 local0_state = load_initial_local_stats(
                     tmem_softmax_local0, local0_state
                 )
@@ -1827,7 +1829,7 @@ def create_single_kv_pipe_mma_task(
     smem_q,
     smem_kv,
     tmem_s,
-    tmem_p,
+    p_resource,
     tmem_o,
     work_queue: WorkQueue | None,
     cfg,
@@ -1843,7 +1845,7 @@ def create_single_kv_pipe_mma_task(
     """
 
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
-    swap = cfg.single_stream_swap
+    swap = cfg.one_insts_kv_swap
     pv_mma = staged_pv_mma if swap else staged_pv_mma_tmem_p
     pv_loop = "pv_mma_loop_0" if swap else "pv_mma_loop_tmem_p"
     pv_tail = "pv_mma_tail_0" if swap else "pv_mma_tail_tmem_p"
@@ -1861,7 +1863,7 @@ def create_single_kv_pipe_mma_task(
         smem_q,
         smem_kv,
         tmem_s,
-        tmem_p,
+        p_resource,
         tmem_o,
         work_queue=None,
     ):
@@ -1870,15 +1872,15 @@ def create_single_kv_pipe_mma_task(
         smem_kv.init_descriptor_state()
         tmem_o.init_mma_state()
         if swap:
-            tmem_p.init_descriptor_state()
+            p_resource.init_descriptor_state()
         else:
-            tmem_p.init_stage_state()
+            p_resource.init_stage_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             if work_queue is not None:
                 tmem_s.reset_softmax_work_tile_state()
                 if not swap:
-                    tmem_p.init_stage_work_tile_state()
+                    p_resource.init_stage_work_tile_state()
             smem_q.wait()
             q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
@@ -1893,7 +1895,7 @@ def create_single_kv_pipe_mma_task(
                 if pv_before_qk:
                     pv_mma(
                         smem_kv,
-                        tmem_p,
+                        p_resource,
                         tmem_o,
                         head_dim_stages=cfg.v_head_dim_stages,
                         consumer_label=v_desc,
@@ -1910,7 +1912,7 @@ def create_single_kv_pipe_mma_task(
                 if not pv_before_qk:
                     pv_mma(
                         smem_kv,
-                        tmem_p,
+                        p_resource,
                         tmem_o,
                         head_dim_stages=cfg.v_head_dim_stages,
                         consumer_label=v_desc,
@@ -1919,7 +1921,7 @@ def create_single_kv_pipe_mma_task(
                     )
             pv_mma(
                 smem_kv,
-                tmem_p,
+                p_resource,
                 tmem_o,
                 head_dim_stages=cfg.v_head_dim_stages,
                 consumer_label=v_desc,
@@ -1929,11 +1931,11 @@ def create_single_kv_pipe_mma_task(
             smem_q.release()
 
     schedule_result = (
-        mma_schedule(smem_q, smem_kv, tmem_s, tmem_p, tmem_o)
+        mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o)
         if work_queue is None
-        else mma_schedule(smem_q, smem_kv, tmem_s, tmem_p, tmem_o, work_queue)
+        else mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o, work_queue)
     )
-    src = [smem_q, smem_kv, tmem_p]
+    src = [smem_q, smem_kv, p_resource]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(

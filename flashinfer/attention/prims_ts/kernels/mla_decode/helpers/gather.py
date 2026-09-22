@@ -22,6 +22,8 @@ from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
+from .constants import TMA_GATHER_ROWS
+
 
 @dsl_user_op
 def _address(pointer, dtype, *, loc=None, ip=None):
@@ -81,15 +83,38 @@ def load_sparse_quad(routes, request, offset):
 
 
 @cute.jit
+def broadcast_sparse_quad(cached_rows, owner):
+    """Broadcast one lane's four cached rows; all warp lanes must participate."""
+    raw = cutlass.Array(Int32, TMA_GATHER_ROWS, space=cutlass.AddressSpace.rmem)
+    for j in cutlass.range_constexpr(TMA_GATHER_ROWS):
+        raw[j] = cute.arch.make_warp_uniform(
+            prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=cached_rows[j],
+                offset=Int32(owner),
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.IDX,
+            )
+        )
+    return raw
+
+
+@cute.jit
+def decode_sparse_quad(primary, extra, raw):
+    """Select a source and map masked row sentinels to TMA zero-fill rows."""
+    rows = cutlass.Array(Int32, TMA_GATHER_ROWS, space=cutlass.AddressSpace.rmem)
+    for j in cutlass.range_constexpr(TMA_GATHER_ROWS):
+        value = raw[j] & Int32(0x7FFFFFFF)
+        rows[j] = value if value != Int32(0x7FFFFFFF) else Int32(-1)
+    return select_gather_map(primary, extra, raw[0] < 0), rows
+
+
+@cute.jit
 def gather4_quad(
     dst, primary, extra, column, raw, barrier, *, cta_group: cutlass.Constexpr[int] = 1
 ):
     """Issue a quad from the owning lane, without election or warp shuffles."""
-    rows = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-    for j in cutlass.range_constexpr(4):
-        value = raw[j] & Int32(0x7FFFFFFF)
-        rows[j] = value if value != Int32(0x7FFFFFFF) else Int32(-1)
-    descriptor = select_gather_map(primary, extra, raw[0] < 0)
+    descriptor, rows = decode_sparse_quad(primary, extra, raw)
     gather4(
         dst,
         descriptor,
@@ -368,11 +393,7 @@ def gather4_uniform_quad_slices(
     issues all copies; dst_stride is bytes and col_stride is source elements.
     The caller accounts for all copied bytes in the completion barrier.
     """
-    rows = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-    for j in cutlass.range_constexpr(4):
-        value = raw[j] & Int32(0x7FFFFFFF)
-        rows[j] = value if value != Int32(0x7FFFFFFF) else Int32(-1)
-    descriptor = select_gather_map(primary, extra, raw[0] < 0)
+    descriptor, rows = decode_sparse_quad(primary, extra, raw)
     _gather4_slices(
         dst,
         descriptor,

@@ -2,9 +2,16 @@
 # Licensed under the Apache License, Version 2.0.
 """Sparse MLA policy: choose a schedule, size buffers, then fill the SM grid.
 
-Selection uses planned rows/heads/KV capacity and hardware limits only.
-Datatype-specific rules put constrained schedules first; the base rules cover
-small grids.
+``rows`` is planned B*Q, ``query_length`` is planned Q, and ``capacity`` counts
+selected slots (each source rounded to 128, at least 256 in total), not raw KV
+context. Live lengths and indices remain runtime inputs. A query/head grid has
+rows*ceil(heads/tile_Q) work tiles; a 2CTA tile consumes two CTAs.
+
+Selection tries qualified schedules before the small-grid defaults, then
+sizes buffers and fills the remaining grid with KV/V partitions. Row-to-SM
+ratios estimate available work, not achieved occupancy. Head/capacity/Q and
+wave cutoffs are measured GB300 crossovers, not hardware or model limits;
+resource and layout eligibility is checked separately by the kernel config.
 """
 
 from dataclasses import dataclass, replace
@@ -37,6 +44,8 @@ class SparseMlaProfile:
 
 def _base_fp8(rows, heads, capacity, sm_count):
     """Small-grid tile and split selection for FP8."""
+    # M64 shares KV across more heads but can leave a small grid underfilled.
+    # M16 exposes more tasks at the cost of repeating KV work for head tiles.
     throughput_h32 = heads == 32 and rows * 2 >= sm_count and (capacity >= 512)
     long_list = capacity >= 8192
     m16_work = rows * ((heads + 15) // 16)
@@ -69,6 +78,8 @@ def _base_fp8(rows, heads, capacity, sm_count):
     m8_work = rows * ((heads + 7) // 8)
     one_tile_splits = (capacity + 127) // 128
     if heads == 32 and capacity >= 512 and rows >= sm_count:
+        # Enough query rows amortize padded M64 work. Retaining two FP8 K
+        # tiles saves V reloads; uniform coordinates amortize repeated D slices.
         return SparseMlaProfile(
             family="keep",
             direct_inputs=False,
@@ -82,10 +93,14 @@ def _base_fp8(rows, heads, capacity, sm_count):
         and 512 <= capacity <= 1024
         and (sm_count // 2 <= keep_work * one_tile_splits <= sm_count)
     ):
+        # One K tile per split fills about half to one device wave. Further
+        # splitting cannot shorten the tile and only increases merge traffic.
         return SparseMlaProfile(
             family="keep", split_kv=one_tile_splits, reuse_kv=True, reuse_kv_stages=10
         )
     if heads == 32 and 32 <= rows <= sm_count // 2 and (capacity >= 512):
+        # This intermediate grid favors M64 reuse, with a second split only
+        # for longer lists; additional splits lose to their merge overhead.
         return SparseMlaProfile(
             family="keep",
             split_kv=1 if capacity <= 1024 else 2,
@@ -93,6 +108,8 @@ def _base_fp8(rows, heads, capacity, sm_count):
             reuse_kv_stages=10,
         )
     if heads <= 16 and rows * 4 >= sm_count and (capacity >= 512):
+        # Narrow Q tiles avoid padded heads; twelve stages retain two FP8
+        # tiles plus four prefetched D slices (four slices per D512 tile).
         return SparseMlaProfile(
             family="swap",
             tile_size_q=8 if heads <= 8 else 16,
@@ -102,6 +119,8 @@ def _base_fp8(rows, heads, capacity, sm_count):
             reuse_kv_stages=12,
         )
     if capacity <= 256 and heads >= 16 and (m8_work * 4 <= sm_count // 2):
+        # Short lists offer little KV parallelism. V partitions expose work
+        # despite repeating QK/softmax, while M8 limits padded arithmetic.
         return SparseMlaProfile(
             family="swap", tile_size_q=8, head_dim_ctas=4, balanced_registers=True
         )
@@ -113,6 +132,8 @@ def _base_fp8(rows, heads, capacity, sm_count):
         and heads % 16 == 0
         and (m16_work * cluster_splits <= sm_count // 2)
     ):
+        # A small two/four-split cluster avoids a standalone GMEM finisher.
+        # Its coordination/residency cost loses for larger grids or split sets.
         return SparseMlaProfile(
             family="swap",
             split_kv=cluster_splits,
@@ -126,6 +147,8 @@ def _base_fp8(rows, heads, capacity, sm_count):
         and (rows >= 8)
         and (base_clusters * 2 <= sm_count // 2)
     ):
+        # Wide heads amortize the 2CTA layout; long lists provide enough KV
+        # work to split when the query grid alone is small.
         return SparseMlaProfile(family="2cta", split_kv=0, gather_issue_warps=1)
     elif heads >= 128 and capacity >= 512 and (base_clusters * 2 >= sm_count // 2):
         return SparseMlaProfile(family="2cta", gather_issue_warps=1)
@@ -141,6 +164,9 @@ def _base_fp8(rows, heads, capacity, sm_count):
 
 def _base_bf16(rows, heads, capacity, sm_count):
     """Small-grid tile and split selection for BF16."""
+    # BF16 BK128 cannot retain two complete D512 tiles in SMEM. A narrow
+    # grid favors more small-Q tasks; a large grid amortizes M64's padding
+    # and benefits from retaining one tile instead of reloading V.
     throughput_h32 = heads == 32 and rows * 2 >= sm_count and capacity >= 512
     throughput_bf16 = (
         heads >= 32 and (rows >= sm_count or throughput_h32) and (capacity >= 512)
@@ -174,12 +200,17 @@ def _base_bf16(rows, heads, capacity, sm_count):
         and (heads % 16 == 0)
         and (m16_work * cluster_splits <= sm_count // 2)
     ):
+        # Same small-grid tradeoff as FP8: cluster fusion saves a launch, but
+        # only the qualified two/four-split M16 layouts justify its overhead.
         profile = replace(profile, split_kv=cluster_splits, reduction="cluster")
     return profile
 
 
 def _choose_fp8(rows, heads, query_length, capacity, sm_count):
     """Prefer resident split grids or sustained-throughput schedules when eligible."""
+    # These short-Q regions favor one KV stream with retained tiles and a
+    # split grid near one device wave. The Q<=8 cutoff is empirical; the
+    # kernel also supports prefill. Powers of two are policy, not a KV ABI.
     if (
         query_length <= 8
         and capacity >= 512
@@ -207,11 +238,15 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
         and (capacity >= 512)
         and (16 <= rows <= sm_count // 4)
     ):
+        # Two CTAs cover H128 without repeating KV loads across M64 tiles.
+        # Four splits help only the small, long-list grid measured here.
         small_long_grid = capacity >= 2048 and rows <= sm_count // 8
         return SparseMlaProfile(
             family="2cta", split_kv=4 if small_long_grid else 1, gather_issue_warps=1
         )
     if heads == 64 and capacity >= 512 and (rows * 2 >= sm_count):
+        # Sustained M64 work amortizes eight issuers, expanded coordinate
+        # registers and CLC setup. Paired correction reduces stats traffic.
         return SparseMlaProfile(
             family="keep",
             gather_issue_warps=8,
@@ -223,6 +258,8 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
             paired_correction=True,
         )
     if heads == 128 and capacity >= 512 and (rows * 2 >= sm_count):
+        # The FP8 2CTA family uses its qualified static persistent scheduler;
+        # BF16's CLC choice below is a separate measured schedule.
         return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
     if (
         heads <= 16
@@ -233,6 +270,8 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
             or rows >= 8 * sm_count
         )
     ):
+        # At high row counts, saved KV traffic outweighs M64 head padding.
+        # Smaller grids retain M8/M16 to preserve independent work.
         return SparseMlaProfile(
             family="keep",
             direct_inputs=False,
@@ -246,6 +285,9 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
 
 def _choose_bf16(rows, heads, query_length, capacity, sm_count):
     """Prefer resident split grids or sustained-throughput schedules when eligible."""
+    # Small-head workloads can retain one BK128 tile with five/six 32-KiB
+    # stages: four hold D512, the rest prefetch. PV must release that tile
+    # before next QK; this favors a single stream in the measured regions.
     if (
         heads <= 16
         and capacity >= 512
@@ -278,6 +320,8 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
         and (query_length >= 128)
         and (rows >= 8 * sm_count)
     ):
+        # Long-Q grids have ample tasks. Static persistence amortizes CTA
+        # setup here; wider heads favor M64 reuse, narrow heads avoid padding.
         keep = heads >= 32
         return SparseMlaProfile(
             family="keep" if keep else "swap",
@@ -295,6 +339,8 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
         and (query_length <= 8)
         and (capacity >= 512)
     ):
+        # Decode with enough rows favors M64 reuse. Buffer sizing below
+        # supplies its qualified gather/cache budget and scheduler crossover.
         return SparseMlaProfile(
             family="keep",
             reuse_kv=True,
@@ -313,6 +359,8 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
             reuse_kv_stages=6,
         )
     if heads == 128 and 2 <= sm_count // (2 * rows) <= 4 and (capacity >= 512):
+        # Two M64 head tiles with BK64 reuse and a few KV splits fill this
+        # small H128 grid. Larger grids favor the wide 2CTA path below.
         wave_splits = max(1, sm_count // 2 // rows)
         return SparseMlaProfile(
             family="keep",
@@ -330,6 +378,9 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
         and rows * 4 >= sm_count
         and (heads == 128 or (heads in (32, 64) and rows * 2 <= sm_count))
     ):
+        # BF16 2CTA amortizes wide-head work once enough clusters are present.
+        # More K/V stages overlap gathers; coordinate caching costs registers,
+        # so it is enabled only for the qualified H128 configuration.
         return SparseMlaProfile(
             family="2cta",
             kv_pipeline_stages=8,
@@ -341,6 +392,9 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
 
 
 def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_count):
+    # These are coupled measured budgets, not independent universal wins:
+    # issuer/cache registers compete with softmax/correction, and extra KV
+    # stages compete with Q, P, metadata and scheduler SMEM.
     if (
         dtype == "fp8"
         and heads == 128
@@ -370,6 +424,9 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
             and (rows >= 4 * sm_count)
             and (capacity >= 1024)
         ):
+            # BK64 halves each BF16 stage to 16 KiB: ten stages retain two
+            # four-slice K tiles plus two slices ahead. This restores QK/PV
+            # overlap, at the cost of twice as many token-tile iterations.
             profile = replace(
                 profile, kv_tile_size=64, reuse_kv_stages=10, page_pipeline_stages=2
             )
@@ -381,6 +438,9 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
         and (capacity >= 512)
         and (profile.split_kv == 1)
     ):
+        # The qualified H64 BK64 schedule serves both prefill and decode.
+        # Two metadata stages let preparation advance while issuers reuse
+        # current coordinates. The bounded maximum update is BF16-only.
         profile = replace(
             profile,
             kv_tile_size=64,
@@ -414,6 +474,8 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
     splits = profile.split_kv
     if splits == 0:
         # Fill a resident wave using instruction-aligned KV partitions.
+        # More splits shorten each CTA's work but increase partial-O/LSE merge
+        # traffic. Two-CTA work targets half as many cluster tasks as SMs.
         step = 128 if tile >= 64 else 256
         steps = max(1, ceil(capacity / step))
         target = sm_count // 2 if profile.family == "2cta" else sm_count
@@ -421,6 +483,8 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
         splits = ceil(steps / ceil(steps / partitions))
     v_ctas = profile.head_dim_ctas
     if v_ctas == 0:
+        # V partitioning exposes more tasks but repeats QK/softmax across them.
+        # Prefer it only while the query/KV grid still lacks enough work.
         remaining = work * splits
         v_ctas = (
             1

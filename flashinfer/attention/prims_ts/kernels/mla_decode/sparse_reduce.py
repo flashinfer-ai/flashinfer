@@ -11,6 +11,8 @@
 
 """Finish split-KV or independently scaled source outputs, including sinks/LSE."""
 
+from .helpers.constants import LN_2, LOG2_E
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
@@ -58,9 +60,9 @@ class FinishSparseMla:
                     l1 - maximum, approx=True
                 )
                 public_lse = (maximum + cute.math.log2(total, approx=True)) * Float32(
-                    0.6931471805599453
+                    LN_2
                 )
-                sink = Float32(sinks[h]) * Float32(1.4426950408889634)
+                sink = Float32(sinks[h]) * Float32(LOG2_E)
                 if sink != Float32(Float32.inf):
                     normalizer_max = cute.math.max(maximum, sink)
                     a = cute.math.exp2(l0 - normalizer_max, approx=True)
@@ -172,9 +174,9 @@ class FinishSparseMlaSplit:
                         )
                     )
                 public_lse = (max_val + cute.math.log2(total, approx=True)) * Float32(
-                    0.6931471805599453
+                    LN_2
                 )
-                sink = Float32(sinks[head]) * Float32(1.4426950408889634)
+                sink = Float32(sinks[head]) * Float32(LOG2_E)
                 if sink == Float32(Float32.inf):
                     for chunk in cutlass.range_constexpr((self.splits + 31) // 32):
                         values[chunk] = Float32(0)

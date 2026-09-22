@@ -25,9 +25,6 @@ from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
-# Softmax converts natural-scale scores to exp2 with log2(e).
-LOG2_E = 1.4426950408889634074
-
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One
 # 512-thread CTA owns eight D512 rows, with each thread moving one 16-byte

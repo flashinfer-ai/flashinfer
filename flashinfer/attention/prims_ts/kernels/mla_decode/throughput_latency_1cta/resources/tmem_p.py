@@ -72,7 +72,7 @@ from .common import (
 class TmemPResource(MlaResource):
     """TMEM probability tile exchanged from softmax to PV MMA.
 
-    The keeps-MMA-AB schedule uses one P pipe: softmax writes BF16 P directly
+    The keeps-MMA-AB schedule uses one P pipe: softmax writes native BF16/FP8 P directly
     into the score TMEM stage, and MmaTask consumes that TMEM stage with
     ``tcgen05.mma`` A-from-TMEM.
     """

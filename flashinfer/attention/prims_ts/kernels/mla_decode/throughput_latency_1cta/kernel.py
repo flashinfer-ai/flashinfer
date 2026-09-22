@@ -94,7 +94,7 @@ from .parallel_reduction import (
     supports_parallel_gmem_reduction,
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
-from ..helpers.constants import TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
+from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
     runtime_query_tile_is_active,
@@ -107,10 +107,6 @@ from ..parallel_reduction_topology import (
     make_balanced_parallel_reduction_topology,
     validate_parallel_reduction_workspace,
 )
-
-
-# Softmax uses exp2, so natural-scale scores are multiplied by log2(e).
-LOG2_E = 1.4426950408889634
 
 
 @cute.jit
@@ -370,6 +366,19 @@ def _default_scales(scale_softmax_log2, output_scale):
     if output_scale is None:
         output_scale = Float32(1.0)
     return scale_softmax_log2, output_scale
+
+
+def _atten_sinks_view(cfg, epilogue_params):
+    """Bind only sinks; packed scale/count metadata remains a separate input."""
+    if epilogue_params is None or not (
+        cfg.fuse_sparse_epilogue or cfg.fuse_sparse_cluster_epilogue
+    ):
+        return None
+    if cfg.sparse_direct:
+        return epilogue_params
+    return cute.make_tensor(
+        epilogue_params.iterator + 2, cute.make_layout(cfg.logical_num_heads_q)
+    )
 
 
 def _check_persistent_scheduler_modes(
@@ -821,6 +830,7 @@ def build_throughput_latency_mla_task_manager(
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
+        atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
@@ -840,6 +850,7 @@ def build_throughput_latency_mla_task_manager(
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
+        atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
@@ -1259,8 +1270,8 @@ def _make_single_kv_pipe_task_graph(
         consumer_group=corr_group,
         cta_layout_vmnk=cta_layout_vmnk,
     )
-    tmem_p_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
-        num_stages=1 if cfg.single_stream_swap else 2,
+    p_pipeline_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
+        num_stages=1 if cfg.one_insts_kv_swap else 2,
         producer_group=softmax_group,
         consumer_group=umma_group,
         cta_layout_vmnk=cta_layout_vmnk,
@@ -1341,7 +1352,7 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_head_dim_v=cta_idx_head_dim_v,
         name="ll_mla_q64_smem_kv",
     )
-    tmem_s = (TmemSResource if cfg.single_stream_swap else TmemSKeepsResource)(
+    tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
         page_offsets=page_offsets,
         pipeline_config=tmem_s_cfg,
@@ -1356,30 +1367,33 @@ def _make_single_kv_pipe_task_graph(
         sync_barrier_id=0,
         name="ll_mla_q64_tmem_s",
     )
-    if cfg.single_stream_swap:
-        tmem_p = SmemPResource(
+    # Both one- and two-instance Swap-AB read P as the SMEM B operand.
+    # This builder's other branch is one-instance Keep-AB: P is the TMEM A
+    # operand. Stream count alone does not determine probability storage.
+    if cfg.one_insts_kv_swap:
+        p_resource = SmemPResource(
             cfg=cfg,
-            pipeline_config=tmem_p_cfg,
+            pipeline_config=p_pipeline_cfg,
             inst_id=0,
             scale_softmax_log2=scale_softmax_log2,
             tmem_s_ref=tmem_s,
             name="ll_mla_single_smem_p",
         )
     else:
-        tmem_p = TmemPResource(
+        p_resource = TmemPResource(
             cfg=cfg,
-            pipeline_config=tmem_p_cfg,
+            pipeline_config=p_pipeline_cfg,
             inst_id=0,
             scale_softmax_log2=scale_softmax_log2,
             tmem_alias_ref=tmem_s,
             name="ll_mla_q64_tmem_p",
         )
-    tmem_s.p_ref = tmem_p
+    tmem_s.p_ref = p_resource
     tmem_o = TmemOResource(
         cfg=cfg,
         pipeline_config=tmem_o_cfg,
-        p_tmem_ref=None if cfg.single_stream_swap else tmem_p,
-        p0_ref=tmem_p if cfg.single_stream_swap else None,
+        p_tmem_ref=None if cfg.one_insts_kv_swap else p_resource,
+        p0_ref=p_resource if cfg.one_insts_kv_swap else None,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         batch_idx=batch_idx,
@@ -1409,6 +1423,7 @@ def _make_single_kv_pipe_task_graph(
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
+        atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
@@ -1458,12 +1473,12 @@ def _make_single_kv_pipe_task_graph(
             ),
             (
                 create_throughput_latency_softmax0_task
-                if cfg.single_stream_swap
+                if cfg.one_insts_kv_swap
                 else create_keeps_mma_ab_softmax_task
             )(
                 tmem_s,
                 local,
-                tmem_p,
+                p_resource,
                 global_softmax,
                 work_queue,
                 cfg,
@@ -1486,7 +1501,7 @@ def _make_single_kv_pipe_task_graph(
                 smem_q,
                 smem_kv,
                 tmem_s,
-                tmem_p,
+                p_resource,
                 tmem_o,
                 work_queue,
                 cfg,
@@ -1549,8 +1564,8 @@ def _make_single_kv_pipe_task_graph(
         tmem_s: [smem_q, smem_kv],
         local: [tmem_s],
         global_softmax: [tmem_s],
-        tmem_p: [tmem_s],
-        tmem_o: [tmem_p, smem_kv],
+        p_resource: [tmem_s],
+        tmem_o: [p_resource, smem_kv],
         corr: [local, tmem_o],
     }
     if use_page_offsets:
@@ -1563,8 +1578,8 @@ def _make_single_kv_pipe_task_graph(
             tmem_s: [smem_q, smem_kv, work_queue],
             local: [tmem_s, work_queue],
             global_softmax: [tmem_s, work_queue],
-            tmem_p: [tmem_s, work_queue],
-            tmem_o: [tmem_p, smem_kv, work_queue],
+            p_resource: [tmem_s, work_queue],
+            tmem_o: [p_resource, smem_kv, work_queue],
             corr: [local, tmem_o, work_queue],
             work_queue: (
                 [work_queue, schedule_token_throttle]
@@ -1581,14 +1596,14 @@ def _make_single_kv_pipe_task_graph(
     dma_release_labels = {
         (smem_kv, tmem_s): {
             (
-                ("v_desc_reused_0" if cfg.single_stream_swap else "v_desc_reused")
+                ("v_desc_reused_0" if cfg.one_insts_kv_swap else "v_desc_reused")
                 if cfg.sparse_reuse_kv
                 else "k_desc_0"
             )
         },
         (smem_kv, tmem_o): {
             (
-                ("v_desc_reused_0" if cfg.single_stream_swap else "v_desc_reused")
+                ("v_desc_reused_0" if cfg.one_insts_kv_swap else "v_desc_reused")
                 if cfg.sparse_reuse_kv
                 else "v_desc_0"
             )
@@ -1604,7 +1619,7 @@ def _make_single_kv_pipe_task_graph(
     smem_allocator.add_resource(smem_q)
     if use_page_offsets:
         smem_allocator.add_resource(smem_page_offsets)
-    for resource in (smem_kv, tmem_s, local, global_softmax, tmem_p, tmem_o, corr):
+    for resource in (smem_kv, tmem_s, local, global_softmax, p_resource, tmem_o, corr):
         smem_allocator.add_resource(resource)
     smem_allocator.add_tmem_ptr(
         SmemAllocation("ll_mla_q64_tmem_ptr_i32", dtype=Int32, alignment=4)
@@ -2069,7 +2084,6 @@ class ThroughputLatencyMlaDecodeTs:
                 )
             cfg = dataclass_replace(
                 cfg,
-                single_stream_swap=True,
                 # Issuers cache the current tile's coordinates in registers.
                 # One shared metadata slot leaves room for six BF16 KV stages.
                 page_offsets_stages=(

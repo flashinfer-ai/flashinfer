@@ -168,7 +168,6 @@ class MlaConfig:
     sparse_offset_cache: str = "strided"
     sparse_reuse_kv: bool = False
     paired_sparse_correction: bool = False
-    single_stream_swap: bool = False
     defer_sparse_max_update: bool = False
     cache_uniform_sparse_quads: bool = False
     fuse_sparse_epilogue: bool = False
@@ -206,16 +205,27 @@ class MlaConfig:
     attention_window_size: int = 0
 
     @property
+    def one_insts_kv_swap(self) -> bool:
+        """One KV stream with swapped MMA operands (P remains in SMEM)."""
+        return self.num_insts_kv == 1 and self.kernel_variant == "swaps_mma_ab"
+
+    @property
     def single_kv_pipe(self) -> bool:
         """Use one softmax/P stream while retaining two score stages."""
-        return self.kernel_variant == "keeps_mma_ab" or self.single_stream_swap
+        return self.num_insts_kv == 1
 
     @property
     def short_merged_softmax(self) -> bool:
-        """Use one softmax group when a sparse split has no steady-state loop."""
+        """Process two independent KV streams with one softmax warp group.
+
+        Each planned split fits one two-tile group, so no online-correction
+        loop runs. Keep both streams' final statistics and PV accumulators;
+        live lengths still mask partial/empty tiles. This is num_insts_kv=2,
+        not the one-stream schedule selected by one_insts_kv_swap.
+        """
         return (
             self.sparse_direct
-            and not self.single_stream_swap
+            and not self.one_insts_kv_swap
             and self.kernel_variant == "swaps_mma_ab"
             and self.fixed_sparse_kv_tiles > 0
         )

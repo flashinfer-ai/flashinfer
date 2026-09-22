@@ -19,6 +19,8 @@ from typing import Optional
 
 from cutlass.experimental import primitives as prims
 
+from ...helpers.constants import LN_2, LOG2_E
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int32, Int64
@@ -115,6 +117,7 @@ class TmemCorrResource(MlaResource):
     scale_softmax_log2: Float32 = None
     output_scale: Float32 = None
     sparse_epilogue_params: object = None
+    atten_sinks: object = None
     o_tensor: object = None
     lse_tensor: object = None
     acc_o_tensor: object = None
@@ -569,7 +572,7 @@ class TmemCorrResource(MlaResource):
                             ]
                         )
                     lse_val = (
-                        lse_val * Float32(0.6931471805599453)
+                        lse_val * Float32(LN_2)
                         if count > Float32(0)
                         else Float32(-Float32.inf)
                     )
@@ -849,12 +852,10 @@ class TmemCorrResource(MlaResource):
                                 head = storage_flat_query_row % Int32(
                                     cfg.logical_num_heads_q
                                 )
-                                sink = Float32(self.sparse_epilogue_params[head])
+                                sink = Float32(self.atten_sinks[head])
                                 sink_scale = Float32(0)
                                 if has_finite_mass and sink != Float32(Float32.inf):
-                                    delta = (
-                                        sink * Float32(1.4426950408889634) - global_lse
-                                    )
+                                    delta = sink * Float32(LOG2_E) - global_lse
                                     z = cute.math.exp2(
                                         -cute.math.abs(delta), fastmath=True
                                     )
@@ -862,7 +863,7 @@ class TmemCorrResource(MlaResource):
                                     sink_scale = (
                                         z * inverse if delta > Float32(0) else inverse
                                     )
-                                published_lse *= Float32(0.6931471805599453)
+                                published_lse *= Float32(LN_2)
 
                             if (
                                 valid_output_row
@@ -1349,12 +1350,12 @@ class TmemCorrResource(MlaResource):
                 inst0_max = inst0_new_max_arr[scale_idx]
                 inst1_sum = (
                     Float32(0.0)
-                    if cutlass.const_expr(cfg.single_stream_swap)
+                    if cutlass.const_expr(cfg.one_insts_kv_swap)
                     else inst1_sum_arr[scale_idx]
                 )
                 inst1_max = (
                     inst0_max
-                    if cutlass.const_expr(cfg.single_stream_swap)
+                    if cutlass.const_expr(cfg.one_insts_kv_swap)
                     else inst1_new_max_arr[scale_idx]
                 )
                 final_max[scale_idx] = cute.math.max(inst0_max, inst1_max, ftz=True)
@@ -1366,7 +1367,7 @@ class TmemCorrResource(MlaResource):
                     self.scale_softmax_log2 * (inst1_max - final_max[scale_idx]),
                     fastmath=True,
                 )
-                if cutlass.const_expr(cfg.single_stream_swap):
+                if cutlass.const_expr(cfg.one_insts_kv_swap):
                     exp_scale1[scale_idx] = Float32(0.0)
                 final_sum[scale_idx] = (
                     inst0_sum * exp_scale0[scale_idx]
@@ -1473,16 +1474,12 @@ class TmemCorrResource(MlaResource):
                         )
                     norm_scale = Float32(0)
                     if logical_head < cfg.logical_num_heads_q and count > Float32(0):
-                        sink = Float32(
-                            self.sparse_epilogue_params[
-                                logical_head if cfg.sparse_direct else 2 + logical_head
-                            ]
-                        )
+                        sink = Float32(self.atten_sinks[logical_head])
                         if sink == Float32(-Float32.inf):
                             norm_scale = self.output_scale / reduced_sum[scale_idx]
                         elif sink != Float32(Float32.inf):
                             delta = (
-                                sink * Float32(1.4426950408889634)
+                                sink * Float32(LOG2_E)
                                 - self.scale_softmax_log2 * final_max[scale_idx]
                             )
                             attention_rescale = cute.math.exp2(
@@ -1860,7 +1857,7 @@ class TmemCorrResource(MlaResource):
                     ),
                     num=1,
                 )
-                if cutlass.const_expr(cfg.single_stream_swap):
+                if cutlass.const_expr(cfg.one_insts_kv_swap):
                     o1_loaded_lo = o0_loaded_lo
                 else:
                     o1_loaded_lo = prims.tcgen05_ld(
@@ -1880,7 +1877,7 @@ class TmemCorrResource(MlaResource):
                     ),
                     num=1,
                 )
-                if cutlass.const_expr(cfg.single_stream_swap):
+                if cutlass.const_expr(cfg.one_insts_kv_swap):
                     o1_loaded_hi = o0_loaded_hi
                 else:
                     o1_loaded_hi = prims.tcgen05_ld(
@@ -1901,7 +1898,7 @@ class TmemCorrResource(MlaResource):
                     ),
                     num=q_repeats,
                 )
-                if cutlass.const_expr(cfg.single_stream_swap):
+                if cutlass.const_expr(cfg.one_insts_kv_swap):
                     o1_loaded = o0_loaded
                 else:
                     o1_loaded = prims.tcgen05_ld(
@@ -1944,7 +1941,7 @@ class TmemCorrResource(MlaResource):
                         o1_loaded[reg_base],
                         o1_loaded[reg_base + 1],
                     )
-                if cutlass.const_expr(cfg.single_stream_swap):
+                if cutlass.const_expr(cfg.one_insts_kv_swap):
                     # Only O0 exists: normalize it directly, without a second
                     # TMEM load or the two-stream weighted merge.
                     final_pair = fmul2(

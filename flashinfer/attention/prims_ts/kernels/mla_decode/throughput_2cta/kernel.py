@@ -50,14 +50,13 @@ from ...tensor_map import (
 )
 
 from .config import (
-    LOG2_E,
     REDUCTION_ROWS_PER_CTA,
     REDUCTION_THREADS_PER_ROW,
     V_TMA_LATENT_ELEMENTS,
     MlaDecodeConfig,
     make_mla_decode_config,
 )
-from ..helpers.constants import MAX_MLA_SPLITS_KV, TMEM_DEALLOC_MBAR_THREADS
+from ..helpers.constants import LOG2_E, MAX_MLA_SPLITS_KV, TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
@@ -133,7 +132,7 @@ def build_mla_decode_task_manager(
     smem_kc_arr=None,
     smem_vc_arr=None,
     smem_p_arr=None,
-    sparse_offsets_arr=None,
+    sparse_offsets_smem=None,
     # TMA descriptors (None for validate-only)
     tma_desc_q_latent=None,
     tma_desc_q_rope=None,
@@ -147,7 +146,8 @@ def build_mla_decode_task_manager(
     tidx=None,
     # GMEM output tensors
     output=None,
-    sparse_sinks=None,
+    atten_sinks=None,
+    lse_in_natural_log=False,
     acc_output=None,
     lse=None,
     acc_lse=None,
@@ -374,7 +374,7 @@ def build_mla_decode_task_manager(
         )
     page_offset_window = PageOffsetWindowResource(
         page_offsets=page_offsets,
-        smem_sparse_offsets=sparse_offsets_arr,
+        smem_sparse_offsets=sparse_offsets_smem,
         cfg=cfg,
         pipeline_config=offsets_cfg,
         name="page_offset_window",
@@ -475,7 +475,8 @@ def build_mla_decode_task_manager(
         partial_lse=acc_lse,
         tmem_o_ref=tmem_o,
         tmem_corr_ref=tmem_corr,
-        sparse_sinks=sparse_sinks,
+        atten_sinks=atten_sinks,
+        lse_in_natural_log=lse_in_natural_log,
         output_scale=None,  # set at runtime
         softmax_scale_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
@@ -1065,10 +1066,10 @@ class MlaDecodeTs:
                     "external sparse reduction requires fixed, nonpersistent split-KV"
                 )
         if cutlass.const_expr(self.fuse_sparse_epilogue):
-            if cutlass.const_expr(self.static_split_kv != 1 or not self.device_scales):
-                raise ValueError(
-                    "2CTA fused epilogue requires device scales and one split"
-                )
+            # This CTA can finalize only an unsplit output. Split partials
+            # must first merge their statistics; this is not a gather4 limit.
+            if cutlass.const_expr(self.static_split_kv != 1):
+                raise ValueError("2CTA fused epilogue requires one split")
         if cutlass.const_expr(self.direct_sparse):
             if cutlass.const_expr(
                 not (self.external_sparse_reduction or self.fuse_sparse_epilogue)
@@ -1076,7 +1077,6 @@ class MlaDecodeTs:
                 or self.page_size != 1
                 or self.rope_dim != 0
                 or self.seq_len_q != 1
-                or not self.device_scales
             ):
                 raise ValueError(
                     "direct sparse 2CTA requires native FP8/BF16 D512 and fused output"
@@ -1506,12 +1506,17 @@ class MlaDecodeTs:
                     Float32(sm[0]) * Float32(qs[0]) * Float32(ss[0]) * LOG2_E
                 )
                 output_scale = Float32(os[0]) * Float32(ss[0])
-        elif cutlass.const_expr(self.device_scales):
-            softmax_scale_log2 = cutlass.Float32(block_split_kvs[0]) * LOG2_E
-            output_scale = cutlass.Float32(block_split_kvs[1])
+        else:
+            if cutlass.const_expr(self.device_scales):
+                softmax_scale_log2 = cutlass.Float32(block_split_kvs[0]) * LOG2_E
+                output_scale = cutlass.Float32(block_split_kvs[1])
             if cutlass.const_expr(self.fuse_sparse_epilogue):
+                # A host-scale caller can bind sinks alone. Device-scale
+                # metadata starts with QK/PV scales, followed by sinks.
+                sink_offset = 2 if self.device_scales else 0
                 sinks = cute.make_tensor(
-                    block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
+                    block_split_kvs.iterator + sink_offset,
+                    cute.make_layout(self.num_heads),
                 )
         cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
@@ -1576,11 +1581,14 @@ class MlaDecodeTs:
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        sparse_offsets_arr = None
+        # One shared metadata ring feeds both K/V issuers. Each copies its
+        # offsets to registers before releasing the stage; TMA payloads have
+        # separate lifetimes. Reuse this ring for either sparse input format.
+        sparse_offsets_smem = None
         if cutlass.const_expr(cfg.page_size == 1 and cfg.use_fp8_split_mma_schedule):
-            sparse_offsets_arr = cutlass.Array(
+            sparse_offsets_smem = cutlass.Array(
                 Int32,
-                cfg.sparse_offset_stages * 128,
+                cfg.sparse_offset_stages * cfg.tokens_per_k_tile,
                 space=cutlass.AddressSpace.smem,
                 alignment=128,
             )
@@ -1878,7 +1886,7 @@ class MlaDecodeTs:
                 smem_kc_arr=smem_kc_arr,
                 smem_vc_arr=smem_vc_arr,
                 smem_p_arr=smem_p_arr,
-                sparse_offsets_arr=sparse_offsets_arr,
+                sparse_offsets_smem=sparse_offsets_smem,
                 tma_desc_q_latent=tma_desc_q_latent.get_ptr(),
                 tma_desc_q_rope=tma_desc_q_rope.get_ptr(),
                 tma_desc_c_latent=tma_desc_c_latent.get_ptr(),
@@ -1888,7 +1896,8 @@ class MlaDecodeTs:
                 blk_coord=blk_coord,
                 tidx=tidx,
                 output=o,
-                sparse_sinks=sinks if self.fuse_sparse_epilogue else None,
+                atten_sinks=sinks if self.fuse_sparse_epilogue else None,
+                lse_in_natural_log=self.fuse_sparse_epilogue,
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,
