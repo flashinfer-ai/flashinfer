@@ -6,8 +6,8 @@ Mirrors the SM100 package's shim layer
 (``kernel_src/sm100/cutedsl_megamoe/shim``): all adaptation over the verbatim
 ``src/`` drop lives here, and the package ``__init__`` re-exports only from
 this layer.  ``comm`` holds dist / symmetric-heap / compile helpers;
-``hopper_fp8`` holds the SM90 FP8 lazy-compile frontend plus the
-symmetric-buffer + fused-launch wrappers.
+``hopper_fp8`` and ``hopper_mxfp4`` hold format-specific lazy-compile
+frontends plus their symmetric-buffer + fused-launch wrappers.
 """
 
 from __future__ import annotations
@@ -30,9 +30,11 @@ from .comm import (
 )
 from .autotune import (
     autotune_hopper_fp8_mega_moe,
+    autotune_hopper_mxfp4_mega_moe,
     autotune_knobs,
     hopper_fp8_candidates,
 )
+from .mxfp4_optimization import hopper_mxfp4_optimization_candidates
 from .knob_cache import (
     knob_cache_path,
     lookup_knobs,
@@ -45,17 +47,57 @@ from .tuner import (
     iter_candidates,
     with_knobs,
 )
+from .mxfp4_tuner import (
+    MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+    MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE,
+    MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
+    MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
+    MXFP4_TUNING_PROVENANCE,
+    MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE,
+    MXFP4_TUNING_ROUTING_PROFILES,
+    MXFP4_TUNING_TOKEN_BUCKETS,
+    Mxfp4RoutingProfile,
+    hopper_mxfp4_candidate_records,
+    hopper_mxfp4_candidates,
+    hopper_mxfp4_candidates_for_shape,
+    hopper_mxfp4_default_tactic,
+    hopper_mxfp4_ordered_candidates,
+    hopper_mxfp4_runtime_candidates,
+    hopper_mxfp4_runtime_candidates_for_shape,
+    hopper_mxfp4_tuning_manifest,
+    hopper_mxfp4_tuning_provenance,
+    is_hopper_mxfp4_tactic_shape_compatible,
+    is_valid_hopper_mxfp4_tactic,
+    normalize_hopper_mxfp4_routing_profile,
+    require_hopper_mxfp4_fused_tuning_device,
+    validate_hopper_mxfp4_tactic,
+)
 from .hopper_fp8 import (
     MegaMoEHopperFp8Config,
     MegaMoEHopperFp8Frontend,
     MegaMoEHopperFp8Inputs,
     MegaMoEHopperFp8SymmBuffer,
     TransformedFp8Weights,
+    _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config,
     create_dummy_inputs as create_dummy_hopper_fp8_inputs,
     get_symm_buffer_for_hopper_fp8_mega_moe,
     hopper_fp8_mega_launch_thunk,
     hopper_fp8_mega_moe,
     init_dist,
+    resolve_hopper_fp8_mega_moe_config,
+)
+from .hopper_mxfp4 import (
+    MegaMoEHopperMxfp4Config,
+    MegaMoEHopperMxfp4Frontend,
+    MegaMoEHopperMxfp4Inputs,
+    MegaMoEHopperMxfp4SymmBuffer,
+    TransformedMxfp4Weights,
+    _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config,
+    _resolve_hopper_mxfp4_mega_moe_config,
+    get_symm_buffer_for_hopper_mxfp4_mega_moe,
+    hopper_mxfp4_mega_launch_thunk,
+    hopper_mxfp4_mega_moe,
+    resolve_hopper_mxfp4_knobs,
 )
 
 __all__ = [
@@ -70,6 +112,7 @@ __all__ = [
     "sym_zeros",
     # tuner / knob cache / autotune
     "autotune_hopper_fp8_mega_moe",
+    "autotune_hopper_mxfp4_mega_moe",
     "autotune_knobs",
     "default_knobs",
     "hopper_fp8_candidates",
@@ -80,15 +123,53 @@ __all__ = [
     "record_knobs",
     "resolve_knobs",
     "with_knobs",
+    # MXFP4 offline winners / bounded online candidates
+    "MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE",
+    "MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE",
+    "MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256",
+    "MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE",
+    "MXFP4_TUNING_PROVENANCE",
+    "MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE",
+    "MXFP4_TUNING_ROUTING_PROFILES",
+    "MXFP4_TUNING_TOKEN_BUCKETS",
+    "Mxfp4RoutingProfile",
+    "hopper_mxfp4_candidate_records",
+    "hopper_mxfp4_candidates",
+    "hopper_mxfp4_candidates_for_shape",
+    "hopper_mxfp4_default_tactic",
+    "hopper_mxfp4_ordered_candidates",
+    "hopper_mxfp4_runtime_candidates",
+    "hopper_mxfp4_runtime_candidates_for_shape",
+    "hopper_mxfp4_tuning_manifest",
+    "hopper_mxfp4_tuning_provenance",
+    "is_hopper_mxfp4_tactic_shape_compatible",
+    "is_valid_hopper_mxfp4_tactic",
+    "normalize_hopper_mxfp4_routing_profile",
+    "require_hopper_mxfp4_fused_tuning_device",
+    "validate_hopper_mxfp4_tactic",
     # hopper_fp8
     "MegaMoEHopperFp8Config",
     "MegaMoEHopperFp8Frontend",
     "MegaMoEHopperFp8Inputs",
     "MegaMoEHopperFp8SymmBuffer",
     "TransformedFp8Weights",
+    "_get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config",
     "create_dummy_hopper_fp8_inputs",
     "get_symm_buffer_for_hopper_fp8_mega_moe",
     "hopper_fp8_mega_launch_thunk",
     "hopper_fp8_mega_moe",
     "init_dist",
+    "resolve_hopper_fp8_mega_moe_config",
+    # hopper_mxfp4
+    "MegaMoEHopperMxfp4Config",
+    "MegaMoEHopperMxfp4Frontend",
+    "MegaMoEHopperMxfp4Inputs",
+    "MegaMoEHopperMxfp4SymmBuffer",
+    "TransformedMxfp4Weights",
+    "_get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config",
+    "_resolve_hopper_mxfp4_mega_moe_config",
+    "get_symm_buffer_for_hopper_mxfp4_mega_moe",
+    "hopper_mxfp4_mega_launch_thunk",
+    "hopper_mxfp4_mega_moe",
+    "resolve_hopper_mxfp4_knobs",
 ]

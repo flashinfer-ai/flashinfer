@@ -113,11 +113,25 @@ not picked them up):
   straight to kernel_tail).  Touches `kernel_fp8_glu_fc12{,_swapab}.py`
   (dispatch-body gating) too; the drop tree still hardcodes 4.
 
+## MXFP4 local overlay
+
+The fused Humming MXFP4-weight/FP8-activation backend is layered on the FP8
+implementation merged by #4688. `VENDOR_PROVENANCE.md` records its historical
+source snapshots and subsequent local changes; those hashes do not describe
+the current edited tree. Preserve the FP8 extensions above when updating it.
+
+MXFP4 adds packed weights, safe tiny-value quantization, guarded communication
+optimizations, and dedicated tuning/cache identities. FP8 and MXFP4 share the
+communication capability checks, with FP8's new optimizations disabled by
+default. Green Context split execution is excluded. Ordinary library CUDA
+Graph support remains; the shared benchmark uses direct CUDA-event launches.
+See `TUNING.md` for the supported domains and current commands.
+
 ## Layout
 
 ```
 kernel_src/sm90/pull_style_cutedsl_megakernel/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
+├── src/                    ← kernel snapshot plus documented local overlays
 │   ├── common/             ← shared constants/host utils (SM90-drop revision)
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
 │   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,
@@ -129,13 +143,16 @@ kernel_src/sm90/pull_style_cutedsl_megakernel/
 │   ├── _paths.py           ← adds sibling src/ to sys.path + sibling-tree exclusivity guard
 │   ├── comm.py             ← dist/NVSHMEM bootstrap, sym heap, launch-cache state
 │   ├── hopper_fp8.py       ← SM90 FP8 frontend (config, symm buffer, compute entry)
+│   ├── hopper_mxfp4.py     ← fused Humming MXFP4 frontend
 │   └── kernel_helpers.py   ← lazy re-export point for raw-kernel helpers/reference
 ├── SKILL.md                ← this file (drop-update workflow)
+├── VENDOR_PROVENANCE.md    ← historical source identities and local overlays
 └── TUNING.md               ← measured perf vs the kernel drop's reference sweep,
                               benchmark methodology, knob surface, next levers
 ```
 
-The kernel classes are `Sm90MegaMoEFp8Kernel` and `Sm90MegaMoESwapABFp8Kernel`
+The kernel classes are `Sm90MegaMoEFp8Kernel`, `Sm90MegaMoESwapABFp8Kernel`,
+and `Sm90MegaMoESwapABMxfp4Fp8Kernel`
 in `src/moe_hopper_fp8/megamoe_kernel_fp8.py` (FP8 E4M3/E5M2, per-tensor or
 blockwise scaling, native or swap-A/B layouts).
 
@@ -147,7 +164,8 @@ for kernel construct/launch kwargs (`run_kernel()`) when writing the shim.
 ## When the kernel team drops a new version of src/
 
 Same workflow as `kernel_src/sm100/cutedsl_megamoe/SKILL.md`, with this tree's
-package set:
+package set. Reapply the documented local overlays and validate FP8 and MXFP4
+correctness, ordinary Graph replay, tuning, and cache isolation:
 
 ```bash
 rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/{common,src,moe_nvfp4_swapab,moe_hopper_fp8}

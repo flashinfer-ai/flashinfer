@@ -1,4 +1,4 @@
-# SM90 pull-style FP8 MegaMoE tuning + performance notes
+# SM90 pull-style FP8/MXFP4 MegaMoE tuning + performance notes
 
 This document collects the performance work on the `sm90_fp8_fp8_bf16_pull_cutedsl` mega
 backend: the measured microbenchmark results, the benchmark methodology
@@ -36,7 +36,10 @@ tail-split / group_hint / token-back retunes — see the knob list below).
 Raw rows: `benchmark_data/20260919/20260919_064746_mega_sm90_heuristic_both.csv`
 (local archive, not committed).
 
-## Microbenchmark results (2026-09-19, heuristic launch configs, max-rank µs)
+## Upstream FP8 microbenchmark results (2026-09-19, heuristic launch configs, max-rank µs)
+
+These tables are the upstream #5338 measurements, not a rerun of this MXFP4
+integration. New integration measurements are reported separately.
 
 Two timed series per point — the difference is WHAT each call includes:
 
@@ -470,6 +473,164 @@ token-back modes — 38 candidates.
   `dedup_topk_design.md`.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
+## Humming MXFP4 tuning and cache
+
+The MXFP4 backend supports fused execution only and reuses the shared
+collective scorer and persistent JSON cache. `knobs="auto"` times compatible
+candidates with three warmups and ten synchronized `perf_counter` samples:
+each rank takes its median, then `MAX` across ranks determines the score. `knobs=None` does
+no timing; it resolves the cache and then the routing/token-bucket heuristic.
+An explicit complete tactic bypasses both.
+
+Inputs are contiguous CUDA `uint8` `PrequantizedMoEWeights`. For `E` local
+experts, hidden `H`, and post-SwiGLU width `I`, packed E2M1 payloads have shapes
+`w13[E,2I,H/2]`, `w2[E,H,I/2]`; raw K32 E8M0 scales have shapes
+`w13_scale[E,2I,H/32]`, `w2_scale[E,H,I/32]`. H and I must be multiples of 128.
+Activations use E4M3 and one FP32 scale per routed row, replicated into the
+four-column communication layout. No BF16-weight fallback or persistent FP8
+weight conversion is performed.
+
+The geometry union has 17 deduplicated tactics from the block-permutation and
+published-exact winners plus two H20-derived anchors. Eligible optional
+strategies originally expanded it to 23 candidates for H7168/I3072/E384/EP4.
+For that model/EP domain, the live union now retains those 23 and adds three
+measured large-token configurations plus 12 distinct tail-pair neighbors: 38
+candidates total. Each neighbor retains the original tile, communication and
+group/stage settings, changes the cluster to `(1,2,1)` and uses whole-tile
+readiness. Existing N8 selection is retained where legal. This initial tuning
+coverage is not a kernel restriction: other models retain the original tuning
+domain and can still use explicit legal tail-pair tactics. The frozen default
+buckets are unchanged.
+
+Online and offline tuning call the same
+`hopper_mxfp4_optimization_candidates`; token capacity changes ordering, not
+the union. Only the complete canonical ordered
+list may write a production cache entry. A subset, reordered list or
+`--max-candidates` run still applies its measured winner without persisting it
+under the complete-union identity.
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+  --dtype sm90_mxfp4 --routing-profile block_permutation_v1 \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6 \
+  --max-tokens 8 32 64 128 256 512 1024 2048 \
+  --gate-up-clamp 10 --warmup-iters 3 --timed-iters 10 --seed 0
+```
+
+Use a fresh `FLASHINFER_MOE_EP_KNOB_CACHE` path for tuning and retain it for
+replay. Omit `--live-tokens`, or set it equal to every listed capacity: the
+cache has no independent live-token axis. The MXFP4 CLI defaults clamp to 10;
+a runtime `gate_up_clamp=None` has a separate identity and can be tuned online.
+
+Schema-v1 cache rows match device, precision/scale mode, EP size, model shape,
+top-k and clamp. MXFP4 additionally requires exact routing profile, compute
+capability, SM count, and tuning provenance. Provenance binds the fused format,
+shipped manifests and live candidate union. Missing/stale identity fields
+cause a miss. Token capacity selects an exact bucket, otherwise the smallest
+bucket above the request, otherwise the largest below. Ordinary FP8 matching
+is unchanged. Tactics must satisfy the current field, type and geometry
+validation before use.
+
+### Guarded implementation and optional strategies
+
+`mxfp4_policy.py` owns the MXFP4 domain; `fused_comm_policy.py` owns the shared
+BF16 output-layout and dispatch-count capabilities:
+
+- Paired FC2 BF16 stores and row-address reuse require M256/N64, complete
+  channel clusters (`H > 0`, `H % (256 * cluster_m) == 0`), BF16 combine and
+  direct epilogue token-back without deduplication or in-kernel reduction.
+  MXFP4 retains its K256 domain. GPU qualification includes H4096/6144/7168/8192
+  with CGA2x1x1; other aligned shapes are a layout rule, not exhaustive GPU
+  coverage. Other layouts retain scalar stores.
+- Contiguous 512-byte auxiliary-offset copies retain the existing stage
+  completion protocol for non-pingpong K256. K128 keeps its original path.
+- Zero-count elision skips zero local contributions without removing the grid
+  rendezvous, empty-expert/rank completion broadcasts, system fence or reset.
+  MXFP4 enables it only without dispatch deduplication.
+
+FP8 keeps paired stores and zero-count elision **disabled by default**:
+measured benefits were workload-dependent. Independent internal diagnostic
+controls exercise all four combinations; they add no public tuning axis.
+The shared compiled identity includes `fused_comm_v1`. MXFP4's defaults remain
+unchanged. Its compact pull buffer and training `generate_c` paths remain off;
+FP8 retains main's settings. Per-tensor FP8 has no corresponding weight-offset
+payload; blockwise FP8 uses a Float32 scale per warpgroup/K128. Tail-N8 and
+segmented readiness also require different FP8 layout/scale handling and are
+not enabled for FP8.
+
+Two optional MXFP4 strategies expand the tuning domain:
+
+- `fc2_tail_n8=False`: within the original H7168 M256N64K256 domain, use N8
+  math for an FC2 task with at most eight valid tokens. Physical N64 staging
+  and output layout do not change; the public frontend does not gain tile N8.
+- `fc1_ready_mode="tile"`: `"k256"` additionally requires
+  H7168/I3072/E384/EP4, CGA2x1x1, effective early FC1 publication and no store
+  offload. It publishes 48 K64 completion bits after both post-SwiGLU data and
+  scales store; FC2 acquires four bits per K256 segment. Int64 counter slots,
+  workspace reset and compile identity change together.
+
+MXFP4 also supports main's `tail_split_pairs` through the existing complete
+`knobs` mapping. It requires swap-AB with `cluster_shape_mnk=(1, 2, 1)` and
+`fc1_ready_mode="tile"`; packed weights and their auxiliary offsets follow the
+same task mapping. This is scheduling inside one fused kernel, unrelated to
+removed Green Context execution. The bounded normal tuning union above can
+select it through existing `knobs="auto"` or offline tuning; no new public
+flag is required. An untuned heuristic still defaults to `False`. An explicit
+two-candidate comparison is a subset experiment, not a full 38-candidate tune,
+and cannot populate the production cache under its complete-union identity.
+
+A historical 17-field tactic resets all three strategies to their defaults.
+The older 19-field form preserves its N8/readiness values and adds
+`tail_split_pairs=False`; normalized tactics have 20 fields. N8 and readiness
+must still appear together, while `tail_split_pairs` is independently optional.
+Unsupported combinations reject before allocation. Applying a legacy tactic
+releases the old workspace. Benchmark spellings remain `--mxfp4-fc2-tail-n8`
+and `--mxfp4-fc1-ready-mode k256`; no additional tail-pair CLI option is added.
+Actual strategies enter the runtime and compiled identities. The cache
+provenance records the normal candidate union's tail-pair domain, exact
+extension strategies and initial model scope separately. Previous 23-candidate
+cache rows miss after this extension; frozen manifests remain unchanged.
+`fused_local_v2` invalidates earlier fused winners after
+correcting the bulk weight-offset completion notification. Bulk copies retain
+their transaction-byte tracking and use ordinary producer barrier arrivals;
+non-bulk `cp.async` copies retain their existing completion tracking.
+
+### Tiny-value quantization
+
+The fused Mega input and post-SwiGLU quantizers preserve normal/zero arithmetic.
+For `0 < amax < 448e-30`, use the finite FP32 multiplier
+`q = 448 / max(amax, FP32(448 / FLT_MAX))` and separately round `d = RN(1/q)`.
+Quantize with retained q: recomputing it from subnormal d may overflow. The
+smallest d is `2**-128`; unrepresentable output may still round to zero.
+This correction is MXFP4-only and requires Mega token communication in the
+shared epilogue. It keeps the Torch amax reduction and uses a cached CuTe
+quantizer on the current stream; warm it eagerly before ordinary Graph capture.
+
+Safe-quantization and multirank tests cover normal byte equality, FP32 boundary
+values, separate q/d references, empty batches, stream/Graph replay and complete
+tiny outputs. References use effective Humming weights, not original
+unquantized weights. Policy/config/tuner tests cover strategy and cache guards.
+
+### Direct benchmark replay
+
+```bash
+torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py \
+  --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --scale-mode mxfp4_hybrid \
+  --mxfp4-tactic-source cache_or_heuristic --tokens 32,2048 \
+  --routing-mode block_permutation --no-sparse-data --warmup 10 --iters 50
+```
+
+Check the resolved tactic: a cache miss uses the heuristic. FP8 and MXFP4 use
+the same direct CUDA-event timing and compute/E2E boundaries; CSV rows carry
+`compute_launch_mode=direct`. MMA overrides use `--mma-tiler M,N[,K]`;
+omitting K preserves the historical K128 behavior. MXFP4 accepts K128/K256;
+the FP8 benchmark keeps K128. Cluster overrides use `--cga M,N`, with K=1,
+for explicit MXFP4 and manual FP8 layouts. FP8 tuner candidates can be passed
+as `--fp8-knobs-json` objects, including their boolean `tail_split_pairs` field.
+Historical tables above belong to
+their recorded source/session; the PR reports new measurements separately.
+Requested clocks alone do not establish a fixed observed clock.
+
 ## Sweep methodology + environment (reproduce recipe)
 
 **Hardware / software.**  One H200 node, 4x NVIDIA H200 141GB (sm_90,
@@ -484,7 +645,8 @@ the drop pins `4.5.0dev0`, and 4.6.0 compiles and runs this SM90 tree.  Whether 
 tree's ">=4.6.1 perf floor" finding applies to the SM90 kernels is
 UNTESTED — worth one A/B run.
 
-**Harness.**  `benchmarks/bench_moe_ep_sm90_mega.py`, one torchrun process
+**Harness.**  `benchmarks/bench_moe_ep_sm90_mega.py`, direct launch for both
+FP8 and MXFP4, with one torchrun process
 per GPU:
 
 ```bash
@@ -507,6 +669,12 @@ switches to dense quantized-randn model data).
 per_tensor activation scales are static config scalars identical on every
 rank.  Env parity with the drop harness: `NCCL_NVLS_ENABLE=0`,
 `NVSHMEM_DISABLE_NVLS=1`.
+
+The shared benchmark timer performs warmup, synchronization, and CUDA-event
+timing without graph
+capture or replay. Ordinary library CUDA Graph support remains available and
+has separate functional regression tests. Historical Graph timings are a
+different launch protocol and must not be mixed with direct-launch results.
 
 **Timed regions** (both barrier+sync-fenced per iteration, per-rank CUDA
 events, warmup 3 + 20 timed iters, matching the drop's counts):

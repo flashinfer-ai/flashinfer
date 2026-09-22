@@ -8,12 +8,15 @@
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
+#   bash tests/moe_ep/run_tests.sh unit_sm90_mxfp4    # host-only Hopper MXFP4/drop tests in an isolated process
+#   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4    # 4-GPU Hopper MXFP4 fused/autotune multirank
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh oracle_sm90   # 1-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl vs drop reference
+#   bash tests/moe_ep/run_tests.sh oracle_sm90_mxfp4  # 1-GPU Hopper MXFP4 vs independent reference
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #   bash tests/moe_ep/run_tests.sh ft            # 4-GPU fault tolerance (kills a rank)
 #
@@ -122,6 +125,12 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_cudagraph_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
+    --ignore-glob=tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_\*.py \
+    --ignore-glob=tests/moe_ep/test_sm90_mxfp4_\*.py \
+    --ignore-glob=tests/moe_ep/test_sm90_pull_mxfp4_\*.py \
+    --ignore=tests/moe_ep/test_sm90_fused_comm_policy.py \
+    --ignore=tests/moe_ep/test_sm90_pull_autotune_score.py \
+    --ignore=tests/moe_ep/test_sm90_pull_knob_cache_robustness.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
@@ -153,6 +162,23 @@ run_unit() {
   # their own interpreter.
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm90_pull_fp8_tuner.py
+}
+
+# Host-only SM90 pull-drop contracts run separately because the Hopper and
+# Blackwell drops intentionally share top-level vendored module names. Loading
+# both trees in one Python process makes test order select the implementation.
+run_unit_sm90_mxfp4() {
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_mxfp4_local_layout.py \
+    tests/moe_ep/test_sm90_fused_comm_policy.py \
+    tests/moe_ep/test_sm90_pull_autotune_score.py \
+    tests/moe_ep/test_sm90_pull_knob_cache_robustness.py \
+    tests/moe_ep/test_sm90_pull_mxfp4_backend.py \
+    tests/moe_ep/test_sm90_pull_mxfp4_config.py \
+    tests/moe_ep/test_sm90_pull_mxfp4_offline_tune_cli.py \
+    tests/moe_ep/test_sm90_pull_mxfp4_staging.py \
+    tests/moe_ep/test_sm90_pull_mxfp4_tuner.py \
+    tests/moe_ep/test_sm90_pull_mxfp4_weights.py
 }
 
 run_multirank() {
@@ -277,6 +303,14 @@ run_oracle_sm90() {
     -m arch_hopper
 }
 
+run_oracle_sm90_mxfp4() {
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py \
+    tests/moe_ep/test_sm90_mxfp4_safe_quantization.py -v \
+    -m arch_hopper
+}
+
 run_mega() {
   local rc=0
 
@@ -334,6 +368,22 @@ run_mega_sm90() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py -v \
     -m "gpu_4 and arch_hopper"
+}
+
+# MXFP4 fused correctness, repeated calls and ordinary CUDA Graph replay.
+NPROC_SM90_MXFP4="${NPROC_SM90_MXFP4:-4}"
+run_mega_sm90_mxfp4() {
+  local rc=0
+
+  for test_file in \
+    tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py
+  do
+    "${TORCHRUN}" --standalone --nproc_per_node="${NPROC_SM90_MXFP4}" \
+      -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" "${test_file}" -v \
+      -m arch_hopper || rc=1
+  done
+
+  return "${rc}"
 }
 
 # 2-GPU Hopper push-style FP8 (sm90_fp8_fp8_bf16_push_cuda) kernel + backend.
@@ -436,6 +486,7 @@ print_summary() {
 
 run_all() {
   run_section "unit + mock (no multirank)" run_unit
+  run_section "isolated SM90 pull host contracts" run_unit_sm90_mxfp4
   run_section "torch-oracle correctness (1 GPU)" run_oracle
   run_section "split-path multirank (NCCL-EP)" run_multirank
   run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16
@@ -450,8 +501,10 @@ run_all() {
 # non-zero if any section failed) so CI callers see a real exit code.
 case "${1:-all}" in
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
+  unit_sm90_mxfp4) run_section "isolated SM90 pull MXFP4/FP8 host contracts" run_unit_sm90_mxfp4; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
   oracle_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
+  oracle_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90_mxfp4; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
@@ -459,13 +512,14 @@ case "${1:-all}" in
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200 GPUs)" run_bf16_rank_major; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
+  mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl fused multirank (Hopper)" run_mega_sm90_mxfp4; print_summary ;;
   mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm120|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|unit_sm90_mxfp4|oracle|oracle_sm90|oracle_sm90_mxfp4|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm120|smoke|ft|all]" >&2
     exit 1
     ;;
 esac
