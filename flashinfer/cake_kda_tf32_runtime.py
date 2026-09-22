@@ -2069,8 +2069,14 @@ class FlashKDABlackwellBF16FusedLaunch:
         # the FP32 external state pool without a checkpoint request: its final
         # state resumes decode, and the BF16 carrier drifts to 0.02-0.05 rel L2
         # on real 8K activations (Triton 0.002).
+        # BF16 checkpoint rows keep the legacy BF16 carrier: the body's
+        # CHECKPOINT_DTYPE_IS_FP32 specialization also types the checkpoint
+        # rows, so the FP32 carrier is only legal without rows or with FP32 rows.
         fp32_carrier_request = fp32_checkpoint_request or (
-            unbounded_softplus and self._state_dtype_is_fp32 and compute_dtype == "bf16"
+            unbounded_softplus
+            and self._state_dtype_is_fp32
+            and compute_dtype == "bf16"
+            and state_checkpoints is None
         )
         force_direct_m128_n32 = self._force_direct_m128_n32 or fp32_carrier_request
         needs_direct_m128 = (
@@ -2903,6 +2909,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             and self._state_dtype_is_fp32
             and compute_dtype == "bf16"
             and uses_default_fused_m128
+            and state_checkpoints is None
         )
         if backend != "cuda_cpp" and (
             compute_dtype == "tf32"

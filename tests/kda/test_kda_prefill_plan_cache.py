@@ -240,3 +240,13 @@ def test_fp32_checkpoint_probe_is_per_gate_kind():
     call = _run(d)
     assert "fp32_checkpoint" in str(call.schedule)
     assert torch.isfinite(d["state_checkpoints"]).all()
+
+
+def test_bf16_checkpoint_rows_keep_the_bf16_carrier_on_fp32_state():
+    # BF16 checkpoint rows are typed by the same specialization as the chunk
+    # carrier, so an unbounded FP32-state call with BF16 rows must not select
+    # the FP32-carrier body (whose FP32 row stores would overflow the rows).
+    d = _inputs([64] * 4, 12, seed=8)
+    call = _run(d)
+    assert "fp32" not in str(call.schedule)
+    assert torch.isfinite(d["out"]).all() and torch.isfinite(d["state_checkpoints"]).all()
