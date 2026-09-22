@@ -511,6 +511,12 @@ def _ulysses_lowp_k_sum_v_amax_init(
     return {"k": k, "v": torch.randn_like(k)}
 
 
+cast(Any, _ulysses_lowp_k_sum_v_amax_init)._trace_init_const_axes = (
+    "num_heads",
+    "head_dim",
+)
+
+
 ulysses_lowp_k_sum_v_amax_trace = TraceTemplate(
     op_type="comm",
     name_prefix="ulysses_lowp_k_sum_v_amax",
@@ -591,6 +597,13 @@ def _ulysses_lowp_q_grouped_amax_init(
         batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     return {"q": q, "rank": int(rank), "world_size": int(world_size)}
+
+
+cast(Any, _ulysses_lowp_q_grouped_amax_init)._trace_init_const_axes = (
+    "num_heads",
+    "head_dim",
+    "world_size",
+)
 
 
 ulysses_lowp_q_grouped_amax_trace = TraceTemplate(
@@ -689,6 +702,13 @@ def _ulysses_lowp_k_grouped_amax_init(
         "rank": int(rank),
         "world_size": int(world_size),
     }
+
+
+cast(Any, _ulysses_lowp_k_grouped_amax_init)._trace_init_const_axes = (
+    "num_heads",
+    "head_dim",
+    "world_size",
+)
 
 
 ulysses_lowp_k_grouped_amax_trace = TraceTemplate(

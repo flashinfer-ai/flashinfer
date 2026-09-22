@@ -1494,7 +1494,7 @@ def test_ulysses_lowp_trace_json_init_is_self_contained(head_dim, op):
     namespace = {}
     exec(definition["init"], namespace)
     inputs = namespace[f"_ulysses_lowp_{op}_init"](
-        batch=1, local_sequence=65, num_heads=8, head_dim=head_dim, device="cpu"
+        batch=1, local_sequence=65, device="cpu"
     )
     tensor = inputs["q" if op == "q_grouped_amax" else "k"]
     assert tensor.shape == (1, 65, 8, head_dim)
@@ -1503,6 +1503,56 @@ def test_ulysses_lowp_trace_json_init_is_self_contained(head_dim, op):
 
     regenerated = getattr(lowp, op).fi_trace(**inputs)
     assert regenerated["init"] == definition["init"]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads,world_size", [(8, 2), (16, 4)])
+@pytest.mark.parametrize("op", ["k_sum_v_amax", "q_grouped_amax", "k_grouped_amax"])
+def test_ulysses_lowp_trace_init_binds_const_axes(op, head_dim, num_heads, world_size):
+    from flashinfer.comm import _ulysses_lowp as lowp
+    from flashinfer.trace.templates import comm
+
+    init = getattr(comm, f"_ulysses_lowp_{op}_init")
+    original_defaults = dict(init.__kwdefaults__)
+    template = getattr(comm, f"ulysses_lowp_{op}_trace")
+    api = getattr(lowp, op)
+    source_inputs = init(
+        batch=1,
+        local_sequence=65,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        device="cpu",
+    )
+    if op != "k_sum_v_amax":
+        source_inputs["world_size"] = world_size
+    definition = api.fi_trace(**source_inputs)
+    namespace = {}
+    exec(definition["init"], namespace)
+    # Change the Var axes; the definition's Const axes must remain bound.
+    replay_inputs = namespace[init.__name__](batch=2, local_sequence=97, device="cpu")
+    tensor = replay_inputs["q" if op == "q_grouped_amax" else "k"]
+    assert tensor.shape == (2, 97, num_heads, head_dim)
+    if op != "k_sum_v_amax":
+        assert replay_inputs["world_size"] == world_size
+    if op == "k_grouped_amax":
+        assert replay_inputs["k_mean_global"].shape == (2, num_heads, head_dim)
+    regenerated = api.fi_trace(**replay_inputs)
+    assert regenerated["axes"] == definition["axes"]
+    assert regenerated["init"] == definition["init"]
+    assert init.__kwdefaults__ == original_defaults
+    assert template.init is init
+
+
+def test_trace_init_const_binding_is_opt_in():
+    import inspect
+
+    from flashinfer.trace.template import _render_init_source
+    from flashinfer.trace.templates.comm import _pcie_ipc_all_reduce_init
+
+    init = _pcie_ipc_all_reduce_init
+    original_source = _render_init_source(init)
+    assert original_source.endswith(inspect.getsource(init))
+    assert _render_init_source(init, {"hidden_dim": 64}) == original_source
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])

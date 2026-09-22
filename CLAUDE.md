@@ -429,6 +429,11 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
 7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
 
+For an init shared by multiple Const shapes, list the keyword-only parameters in
+`init._trace_init_const_axes` to bind their defaults to each dumped definition's
+resolved Const values. Test the exported snippet with only Var axes supplied so
+standalone replay does not depend on callers overriding Const defaults.
+
 **Example implementations:**
 - **Simple**: `flashinfer/norm/__init__.py` (RMSNorm) - no Jinja, good starting point
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
