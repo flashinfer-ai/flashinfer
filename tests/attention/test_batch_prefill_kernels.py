@@ -17,15 +17,26 @@ limitations under the License.
 import math
 
 import numpy
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
-from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from flashinfer.jit.attention.modules import (
+    _gen_batch_prefill_independent_paged_module,
+    _gen_batch_prefill_primary_module,
+)
+from flashinfer.quantization.fp4_quantization import gen_fp4_quantization_sm90_module
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 
 def _reset_workspace_for_plan(wrapper, *plan_args, **plan_kwargs):
@@ -95,22 +106,80 @@ def _assert_no_ref_mismatch(mismatch_counts):
     scope="module",
 )
 def warmup_jit():
-    flashinfer.jit.build_jit_specs(
-        gen_prefill_attention_modules(
-            [torch.float16],  # q_dtypes
-            [
-                torch.float16,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            ],  # kv_dtypes
-            [128, 256],  # head_dims
-            [0, 1],  # pos_encoding_modes
-            [False],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
-            [False],  # use_fp16_qk_reductions
-        ),
-        verbose=False,
-    )
+    """Prebuild, in parallel, exactly the FA2 modules this file loads.
+
+    Every wrapper in this file resolves to FA2. The batch path loads the
+    primary (equal K/V stride) module, and the unequal-stride tests load the
+    independent paged module, so those are the variants listed here (the same
+    generators aot.py uses). Without this, ~30 modules compile lazily, one per
+    first-touching test, for roughly 700 s on a cold H100 cache.
+
+    Specs already in the AOT cache are skipped. Each spec is built with its own
+    ninja (in parallel) rather than through flashinfer.jit.build_jit_specs:
+    that helper's combined ninja logs to the cached_ops root, so the per-module
+    ninja that build_and_load() later runs finds no record of the outputs and
+    recompiles them.
+    """
+    cc = get_compute_capability(torch.device("cuda:0"))
+    f16, bf16, i32 = torch.float16, torch.bfloat16, torch.int32
+    NONE, ROPE_LLAMA, ALIBI = 0, 1, 2
+
+    def primary(q, kv, qk, vo, pe, cap=False):
+        return _gen_batch_prefill_primary_module(
+            "fa2", q, kv, q, i32, qk, vo, pe, False, cap, False
+        )
+
+    def independent(q, kv, qk, vo, pe=NONE):
+        return _gen_batch_prefill_independent_paged_module(
+            "fa2", q, kv, q, i32, qk, vo, pe, False, False, False
+        )
+
+    specs = []
+    # 16-bit paged/tuple/ragged/custom-mask grids: head_dim 128/256 across all
+    # position encodings, with and without logits soft cap; head_dim 64 needs
+    # only the ROPE variant (the NONE variant ships in the AOT cache).
+    for head_dim in (128, 256):
+        for pe in (NONE, ROPE_LLAMA, ALIBI):
+            for cap in (False, True):
+                specs.append(primary(f16, f16, head_dim, head_dim, pe, cap))
+    specs.append(primary(f16, f16, 64, 64, ROPE_LLAMA))
+    # bf16 grids (cuda-graph padding, stride-router plan reuse).
+    for head_dim in (64, 128):
+        specs.append(primary(bf16, bf16, head_dim, head_dim, NONE))
+        specs.append(independent(bf16, bf16, head_dim, head_dim))
+    if head_dim_512_supported():
+        # head_dim 512 and the qk448/vo256 smem probe.
+        specs.append(primary(f16, f16, 512, 512, NONE))
+        specs.append(primary(f16, f16, 512, 512, ROPE_LLAMA))
+        specs.append(independent(f16, f16, 512, 512))
+        specs.append(primary(f16, f16, 448, 256, NONE))
+        specs.append(independent(f16, f16, 448, 256))
+    if cc[0] >= 9:
+        # NVFP4 KV cache tests.
+        fp4 = torch.float4_e2m1fn_x2
+        for q in (f16, bf16):
+            specs.append(primary(q, fp4, 128, 128, NONE))
+            specs.append(primary(q, fp4, 256, 256, NONE))
+            specs.append(primary(q, fp4, 512, 512, NONE))
+            specs.append(primary(q, fp4, 512, 512, ROPE_LLAMA))
+        specs.append(independent(f16, fp4, 128, 128))
+        if cc == (9, 0):
+            specs.append(gen_fp4_quantization_sm90_module())
+        if is_sm90a_supported(torch.device("cuda:0")):
+            # bf16 reference for the NVFP4 head_dim 256 test resolves to FA3.
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa3", bf16, bf16, bf16, 256, 256, NONE, False, False, False
+                )
+            )
+
+    to_build = [spec for spec in specs if not spec.is_aot]
+    if to_build:
+        # Each ninja spawns at most a handful of nvcc processes (one per TU),
+        # so cap concurrent ninjas by core count rather than running all at once.
+        workers = min(len(to_build), max(1, (os.cpu_count() or 8) // 8))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda spec: spec.build(need_lock=True), to_build))
     yield
 
 

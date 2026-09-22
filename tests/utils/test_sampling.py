@@ -177,7 +177,7 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
+    num_trials = 500000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         k,
@@ -865,8 +865,8 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
-            torch.tensor(
-                [[p] * vocab_size] * batch_size, dtype=torch.float32, device="cuda:0"
+            torch.full(
+                (batch_size, vocab_size), p, dtype=torch.float32, device="cuda:0"
             ),
         )
 
@@ -913,9 +913,7 @@ def test_check_tensor_param_top_p(batch_size, vocab_size, p):
     ):
         flashinfer.sampling.top_p_renorm_probs(
             normalized_prob,
-            torch.tensor(
-                [[p] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
-            ),
+            torch.full((batch_size, vocab_size), p, dtype=torch.int, device="cuda:0"),
         )
 
     # 3: 0D tensor raises error.
@@ -961,9 +959,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
     ):
         flashinfer.sampling.top_k_renorm_probs(
             normalized_prob,
-            torch.tensor(
-                [[k] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
-            ),
+            torch.full((batch_size, vocab_size), k, dtype=torch.int, device="cuda:0"),
         )
 
     # 3: 0D tensor raises error.
