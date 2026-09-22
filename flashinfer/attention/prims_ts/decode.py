@@ -4105,7 +4105,9 @@ def batch_decode_with_paged_kv_cache(
     q : torch.Tensor
         Fixed or packed query tensor.
     paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        Combined or separate paged K/V storage.
+        Combined or separate paged K/V storage. K and V dtypes are taken from
+        the tensors; a ``torch.float8_e4m3fn`` V with ``torch.bfloat16`` Q/K
+        requires the separate ``(K, V)`` form.
     block_tables : torch.Tensor
         Fixed row-strided ``[B, C]`` page table. Rows may have padding between
         them, but each row must be contiguous.

@@ -1506,6 +1506,7 @@ def _run_standalone(
             max_seq_len_q=max_seq_len_q,
             q_dtype=case.q.dtype,
             k_dtype=case.k_cache.dtype,
+            v_dtype=case.v_cache.dtype,
             out_dtype=case.output_dtype,
             mask_type=case.mask_type,
             window_left=case.window_left,
@@ -3997,17 +3998,19 @@ def test_attention_ts_decode_runtime_kv_ceil_div_covers_int32_domain() -> None:
 
 @pytest.mark.parametrize("split_kv", (False, True))
 @pytest.mark.parametrize("workspace_mode", ("owned", "validated", "trusted"))
+@pytest.mark.parametrize("v_dtype", (torch.bfloat16, _FP8))
 def test_attention_ts_decode_one_shot_forwards_split_kv(
-    monkeypatch, split_kv, workspace_mode
+    monkeypatch, split_kv, workspace_mode, v_dtype
 ):
-    """Workspace sizing and planning must select the same split policy."""
+    """Workspace sizing and planning must share the split policy and K/V dtypes."""
 
     from unittest.mock import Mock
 
     from flashinfer.attention.prims_ts import decode as decode_module
 
-    q = torch.empty((1, 8, 64), dtype=torch.float16)
+    q = torch.empty((1, 8, 64), dtype=torch.bfloat16)
     cache = torch.empty((1, 1, 32, 64), dtype=q.dtype)
+    v_cache = torch.empty_like(cache, dtype=v_dtype)
     seq_lens = torch.tensor([32], dtype=torch.int32)
     block_tables = torch.zeros((1, 1), dtype=torch.int32)
     workspace = torch.empty(128, dtype=torch.int8)
@@ -4027,12 +4030,12 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
     monkeypatch.setattr(
         decode_module,
         "_normalize_paged_kv_cache_views",
-        lambda *_, **__: (cache, cache, 1, 1, 32, 64),
+        lambda *_, **__: (cache, v_cache, 1, 1, 32, 64),
     )
 
     output = batch_decode_with_paged_kv_cache(
         q,
-        (cache, cache),
+        (cache, v_cache),
         block_tables,
         seq_lens,
         split_kv=split_kv,
@@ -4044,9 +4047,13 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
     assert output is wrapper.run.return_value
     wrapper.plan.assert_called_once()
     assert wrapper.plan.call_args.kwargs["split_kv"] is split_kv
+    assert wrapper.plan.call_args.kwargs["k_data_type"] is cache.dtype
+    assert wrapper.plan.call_args.kwargs["v_data_type"] is v_dtype
     if workspace_mode == "owned":
         workspace_size.assert_called_once()
         assert workspace_size.call_args.kwargs["split_kv"] is split_kv
+        assert workspace_size.call_args.kwargs["k_dtype"] is cache.dtype
+        assert workspace_size.call_args.kwargs["v_dtype"] is v_dtype
     else:
         workspace_size.assert_not_called()
         assert wrapper.plan.call_args.kwargs["workspace_buffer"] is workspace
@@ -5985,7 +5992,7 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     _resolve_decode_launch_spec.cache_clear()
     _get_compiled_decode.cache_clear()
     try:
-        _exercise_auto_case(case)
+        _exercise_auto_case(case, exercise_all_paths=True)
     finally:
         _resolve_decode_launch_spec.cache_clear()
         _get_compiled_decode.cache_clear()
