@@ -7335,11 +7335,16 @@ def prepare_bf16_kda_prefill(
     checkpoint_cu_starts=None,
     checkpoint_every_n_tokens=0,
     beta_is_logit=True,
+    plan_cache=None,
 ):
     """Prepare a BF16 KDA inference call on SM100a or SM103a.
 
-    Q/K/V and output are BF16; external initial/final state is FP32 and
-    checkpoints are BF16. Packed calls require host ``sequence_lengths``
+    Q/K/V and output are BF16; external initial/final state is FP32.
+    Checkpoints are BF16 observations or, when ``state_checkpoints`` is FP32,
+    exact FP32 intermediate states: the fused direct M128 body then keeps its
+    recurrent carrier FP32 across every chunk boundary and stores the rows at
+    full precision (see :func:`kda_prefill_supports_fp32_checkpoints`). Packed calls
+    require host ``sequence_lengths``
     matching ``cu_seqlens``; checkpoint offsets are canonical chunk-count
     prefix sums. Tensor storage must remain alive and at the same addresses.
 
@@ -7351,6 +7356,14 @@ def prepare_bf16_kda_prefill(
     Preparation allocates workspace and compiles on first use. The returned
     object's ``launch()`` submits the complete operation on the current stream
     and supports caller-owned CUDA graph capture. Training is unsupported.
+
+    With ``plan_cache`` (a :class:`KDAPrefillPlanCache`), a previously prepared
+    launch with the same structural signature (shapes, strides, dtypes,
+    alignment, aliasing, ``sequence_lengths`` and checkpoint plan) is rebound
+    to the new tensor addresses instead of being prepared again; only the TMA
+    descriptors are re-encoded and uploaded on the current stream.  Cached
+    launches are owned by the cache: do not ``close()`` them, and do not use
+    the same cache concurrently from several streams.
     """
     return _prepare_kda_prefill(
         q,
@@ -7373,7 +7386,114 @@ def prepare_bf16_kda_prefill(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         beta_is_logit=beta_is_logit,
         compute_dtype="bf16",
+        plan_cache=plan_cache,
     )
+
+
+def kda_prefill_supports_fp32_checkpoints(device=None) -> bool:
+    """Whether this build exports FP32 intermediate states for ``device``.
+
+    FP32 ``state_checkpoints`` select the FP32-carrier specialization of the
+    fused direct M128 body.  The check inspects the exported module registry
+    for the device's architecture, so an installation whose registry predates
+    that export reports ``False`` and callers keep BF16 checkpoint rows.
+    """
+    from .jit.cake_kda_tf32 import FACTORIES, device_arch
+
+    try:
+        arch = device_arch(device)
+    except Exception:  # noqa: BLE001 - no CUDA device or unsupported arch
+        return False
+    variants = FACTORIES.get(arch, {}).get("compiled_bf16_fused_m128", {})
+    return any(
+        ("checkpoint_dtype_is_fp32", True) in key[1] for key in variants
+    )
+
+
+class KDAPrefillPlanCache:
+    """Bounded LRU of prepared KDA launches keyed by structural signature.
+
+    Serving calls the prepared export once per layer per forward batch with a
+    fresh output, fresh checkpoint rows and a per-layer state pool, but the
+    same token shape and ``sequence_lengths`` as the other layers of the same
+    batch.  Preparation (host validation, route selection, bin packing,
+    metadata upload, workspace allocation) is address-independent, so the
+    cache keeps one prepared launch per signature and rebinds its
+    pointer-bearing arguments on a hit.  Hits perform only host view
+    construction plus one descriptor upload kernel: no device synchronization
+    and no data-dependent host branch, so a hit is CUDA-graph capturable.
+    """
+
+    def __init__(self, capacity: int = 64):
+        from collections import OrderedDict
+
+        if capacity <= 0:
+            raise ValueError("plan cache capacity must be positive")
+        self.capacity = int(capacity)
+        self._entries = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.uncacheable = 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    def clear(self):
+        for prepared, _ in self._entries.values():
+            close = getattr(prepared, "close", None)
+            if callable(close):
+                close()
+        self._entries.clear()
+
+    @staticmethod
+    def _key(inputs, **scalars):
+        from .cake_kda_tf32_runtime import rebind_signature
+
+        return (rebind_signature(inputs), tuple(sorted(scalars.items())))
+
+    def get(self, inputs, **scalars):
+        """Return a prepared launch rebound to ``inputs`` or ``None`` on a miss.
+
+        Descriptor re-encoding is deferred into the launch's stream context
+        and skipped when no TMA-described tensor moved, except while a CUDA
+        graph is being captured: a captured launch always re-encodes so the
+        graph replays with self-contained descriptor contents.
+        """
+        import torch
+        from .cake_kda_tf32_runtime import rebind_prepared_launch
+
+        key = self._key(inputs, **scalars)
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._entries.move_to_end(key)
+        prepared, plan = entry
+        owner = getattr(prepared, "_impl", prepared)
+        tma_moved = rebind_prepared_launch(owner, plan, inputs, signature=key[0])
+        if tma_moved or torch.cuda.is_current_stream_capturing():
+            owner._descriptors_stale = True
+        self.hits += 1
+        return prepared
+
+    def put(self, prepared, inputs, **scalars):
+        """Record a freshly prepared launch; returns False when not cacheable."""
+        from .cake_kda_tf32_runtime import capture_rebind_plan
+
+        owner = getattr(prepared, "_impl", prepared)
+        if hasattr(owner, "_main") or not hasattr(owner, "args"):
+            self.uncacheable += 1
+            return False
+        plan = capture_rebind_plan(owner, inputs)
+        key = self._key(inputs, **scalars)
+        self._entries[key] = (prepared, plan)
+        self._entries.move_to_end(key)
+        self.misses += 1
+        while len(self._entries) > self.capacity:
+            _, (evicted, _) = self._entries.popitem(last=False)
+            close = getattr(evicted, "close", None)
+            if callable(close):
+                close()
+        return True
 
 
 def _prepare_kda_prefill(
@@ -7398,6 +7518,7 @@ def _prepare_kda_prefill(
     checkpoint_every_n_tokens,
     beta_is_logit,
     compute_dtype,
+    plan_cache=None,
 ):
     from .cake_kda_tf32_runtime import (
         FlashKDABlackwellLaunch,
@@ -7405,6 +7526,45 @@ def _prepare_kda_prefill(
         prepare_active_beta_fwd,
     )
     import torch
+
+    cache_inputs = None
+    cache_scalars = None
+    if plan_cache is not None and beta_is_logit:
+        if q.ndim == 4 and cu_seqlens is None:
+            resolved_lengths = (int(q.shape[1]),) * int(q.shape[0])
+        elif sequence_lengths is not None:
+            resolved_lengths = tuple(int(n) for n in sequence_lengths)
+        else:
+            resolved_lengths = None
+        if resolved_lengths is not None:
+            cache_inputs = dict(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                out=out,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+                state_indices=state_indices,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+            )
+            cache_scalars = dict(
+                compute_dtype=compute_dtype,
+                scale=None if scale is None else float(scale),
+                lower_bound=None if lower_bound is None else float(lower_bound),
+                sequence_lengths=resolved_lengths,
+                checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+                in_place_state=initial_state is final_state,
+            )
+            with torch.cuda.device(q.device):
+                cached = plan_cache.get(cache_inputs, **cache_scalars)
+            if cached is not None:
+                return cached
 
     if any(
         t is not None and t.requires_grad
@@ -7460,4 +7620,6 @@ def _prepare_kda_prefill(
                 )
             prepared = prepare_active_beta_fwd(*args, **kwargs)
         prepare_descriptors(getattr(prepared, "prepared", prepared))
+        if cache_inputs is not None:
+            plan_cache.put(prepared, cache_inputs, **cache_scalars)
     return prepared

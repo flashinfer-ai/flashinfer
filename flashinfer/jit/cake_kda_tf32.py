@@ -9420,6 +9420,7 @@ def prepare_descriptors(prepared):
                     grid=owner.prepare_grid, **owner.prepare_args
                 )
             owner.module.prepare(grid=owner.grid, **owner.args)
+            owner._descriptors_stale = False
 
 
 def _factory(name, *args, **kwargs):

@@ -964,6 +964,40 @@ def _uniform_persistent_worker_count(total_tasks: int, *, worker_cap: int) -> in
     return worker_cap
 
 
+def _upload_int32_batch(device, host_lists: dict[str, list[int]]):
+    """Upload several host int32 lists with one pinned, stream-ordered copy.
+
+    Preparation used to issue one pageable ``torch.tensor(..., device=cuda)``
+    per metadata list; each pageable copy stages through the driver and
+    synchronizes the host.  Packing every list into one pinned buffer and
+    issuing one non-blocking copy keeps preparation asynchronous and
+    capturable.  The pinned source stays alive through PyTorch's caching host
+    allocator until the copy completes.
+    """
+    import torch
+    from array import array
+
+    names = list(host_lists)
+    lengths = [len(host_lists[name]) for name in names]
+    total = sum(lengths)
+    if total == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        return {name: empty for name in names}
+    flat: list[int] = []
+    for name in names:
+        flat.extend(host_lists[name])
+    host = torch.frombuffer(array("i", flat), dtype=torch.int32).pin_memory()
+    device_flat = host.to(device, non_blocking=True)
+    # The pinned source is kept alive by the returned dict so that a copy
+    # captured into a CUDA graph replays from stable host memory.
+    uploads = {"_host_pinned": host}
+    offset = 0
+    for name, length in zip(names, lengths, strict=False):
+        uploads[name] = device_flat[offset : offset + length]
+        offset += length
+    return uploads
+
+
 def _make_lpt_task_bins(
     ordered_seq_lens: tuple[int, ...], *, num_heads: int, worker_count: int
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -973,14 +1007,16 @@ def _make_lpt_task_bins(
         raise ValueError("LPT bins require positive sequence/head/task counts")
     bins: list[list[int]] = [[] for _ in range(worker_count)]
     loads = [0] * worker_count
+    # Least-loaded worker with the lowest index; a heap keyed on
+    # (load, index) reproduces the linear-scan argmin in O(log W) per task.
+    heap = [(0, index) for index in range(worker_count)]
     for ordered_seq_idx, seq_len in enumerate(ordered_seq_lens):
         chunk_count = (seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
         for head_idx in range(num_heads):
-            worker_idx = min(
-                range(worker_count), key=lambda index: (loads[index], index)
-            )
+            load, worker_idx = heapq.heappop(heap)
             bins[worker_idx].append(ordered_seq_idx * num_heads + head_idx)
-            loads[worker_idx] += chunk_count
+            loads[worker_idx] = load + chunk_count
+            heapq.heappush(heap, (load + chunk_count, worker_idx))
     task_ids: list[int] = []
     task_offsets = [0]
     for worker_tasks in bins:
@@ -1047,8 +1083,10 @@ def _make_uniform_piece_task_bins(
     chunk_count = (seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
     bins: list[list[tuple[int, int, int, int, int]]] = [[] for _ in range(worker_count)]
     loads = [0] * worker_count
+    # Uniform whole-chain LPT: task t lands on worker t % W (least loaded,
+    # lowest index), which is exactly the linear-scan argmin result.
     for task_idx in range(total_tasks):
-        worker_idx = min(range(worker_count), key=lambda index: (loads[index], index))
+        worker_idx = task_idx % worker_count
         bins[worker_idx].append((task_idx, 0, seq_len, -1, -1))
         loads[worker_idx] += chunk_count
     base_tasks, extra_tasks = divmod(total_tasks, worker_count)
@@ -2378,7 +2416,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                     chunk_tokens=direct_chunk_tokens,
                 )
             )
-        seq_order = torch.tensor(ordered_sequences, dtype=torch.int32, device=q.device)
+        host_uploads: dict[str, list[int]] = {"seq_order": list(ordered_sequences)}
         persistent_worker_count = _uniform_persistent_worker_count(
             total_tasks, worker_cap=sm_count
         )
@@ -2479,15 +2517,28 @@ class FlashKDABlackwellBF16FusedLaunch:
             raise ValueError(
                 "BF16 fused M64 checkpoint interval must be a multiple of 32"
             )
+        # BF16 checkpoints are the legacy observation contract.  FP32
+        # checkpoints (the intermediate-state contract that resumes
+        # recurrences from them) require FP32 external state I/O, and only
+        # the fused M128 body carries the FP32 chunk carrier.
+        fp32_checkpoints = bool(
+            checkpoint_every_n_tokens
+            and state_checkpoints is not None
+            and state_checkpoints.dtype == torch.float32
+        )
         if checkpoint_every_n_tokens:
             if state_checkpoints is None or checkpoint_cu_starts is None:
                 raise ValueError(
                     "state_checkpoints and checkpoint_cu_starts are required when checkpointing"
                 )
+            if fp32_checkpoints and not self._state_dtype_is_fp32:
+                raise ValueError(
+                    "FP32 state_checkpoints require FP32 initial/final state"
+                )
             _require_tensor(
                 state_checkpoints,
                 name="state_checkpoints",
-                dtype=torch.bfloat16,
+                dtype=torch.float32 if fp32_checkpoints else torch.bfloat16,
                 ndim=4,
             )
             _require_tensor(
@@ -2666,16 +2717,8 @@ class FlashKDABlackwellBF16FusedLaunch:
             if final_state is not None and self._state_dtype_is_fp32
             else empty_f32
         )
-        task_ids = seq_order
-        task_offsets = seq_order
-        task_token_starts = seq_order
-        task_token_counts = seq_order
-        task_state_sources = seq_order
-        task_state_destinations = seq_order
         mid_state = empty_state
         mid_state_ready = empty_u32
-        scalar_chunk_schedule = empty_i32
-        scalar_chunk_schedule_counts = empty_i32
         scalar_chunk_schedule_stride = 1
         if use_scalar_chunk_lpt_m128:
             (
@@ -2687,29 +2730,19 @@ class FlashKDABlackwellBF16FusedLaunch:
                 num_heads,
                 sm_count,
             )
-            scalar_chunk_schedule = torch.tensor(
-                host_scalar_chunk_schedule, dtype=torch.int32, device=q.device
-            )
-            scalar_chunk_schedule_counts = torch.tensor(
-                host_scalar_chunk_schedule_counts, dtype=torch.int32, device=q.device
+            host_uploads["scalar_chunk_schedule"] = list(host_scalar_chunk_schedule)
+            host_uploads["scalar_chunk_schedule_counts"] = list(
+                host_scalar_chunk_schedule_counts
             )
         if use_persistent_m128:
-            task_ids = torch.tensor(host_task_ids, dtype=torch.int32, device=q.device)
-            task_offsets = torch.tensor(
-                host_task_offsets, dtype=torch.int32, device=q.device
-            )
+            host_uploads["task_ids"] = list(host_task_ids)
+            host_uploads["task_offsets"] = list(host_task_offsets)
         if use_piece_persistent_m128:
-            task_token_starts = torch.tensor(
-                host_task_token_starts, dtype=torch.int32, device=q.device
-            )
-            task_token_counts = torch.tensor(
-                host_task_token_counts, dtype=torch.int32, device=q.device
-            )
-            task_state_sources = torch.tensor(
-                host_task_state_sources, dtype=torch.int32, device=q.device
-            )
-            task_state_destinations = torch.tensor(
-                host_task_state_destinations, dtype=torch.int32, device=q.device
+            host_uploads["task_token_starts"] = list(host_task_token_starts)
+            host_uploads["task_token_counts"] = list(host_task_token_counts)
+            host_uploads["task_state_sources"] = list(host_task_state_sources)
+            host_uploads["task_state_destinations"] = list(
+                host_task_state_destinations
             )
             mid_state = torch.empty(
                 (handoff_count, HEAD_DIM, HEAD_DIM),
@@ -2719,8 +2752,6 @@ class FlashKDABlackwellBF16FusedLaunch:
             mid_state_ready = torch.zeros(
                 handoff_count, dtype=torch.uint32, device=q.device
             )
-        bt16_cu_chunks = empty_i32
-        bt16_chunk_to_seq = empty_i32
         bt16_qd = empty_state
         bt16_kd = empty_state
         bt16_w = empty_state
@@ -2773,12 +2804,8 @@ class FlashKDABlackwellBF16FusedLaunch:
                 bt16_prepare_total_ctas = min(
                     num_heads * bt16_total_chunks, BT16_DENSE_PREP_WAVES * sm_count
                 )
-            bt16_cu_chunks = torch.tensor(
-                host_cu_chunks, dtype=torch.int32, device=q.device
-            )
-            bt16_chunk_to_seq = torch.tensor(
-                host_chunk_to_seq, dtype=torch.int32, device=q.device
-            )
+            host_uploads["bt16_cu_chunks"] = list(host_cu_chunks)
+            host_uploads["bt16_chunk_to_seq"] = list(host_chunk_to_seq)
             padded_tokens = bt16_total_chunks * BT16_CHUNK
             factor_shape = (1, num_heads, padded_tokens, HEAD_DIM)
             factor_dtype = torch.float32 if compute_dtype == "tf32" else torch.bfloat16
@@ -2803,6 +2830,21 @@ class FlashKDABlackwellBF16FusedLaunch:
                 dtype=torch.float32,
                 device=q.device,
             )
+        uploaded = _upload_int32_batch(q.device, host_uploads)
+        seq_order = uploaded["seq_order"]
+        task_ids = uploaded.get("task_ids", seq_order)
+        task_offsets = uploaded.get("task_offsets", seq_order)
+        task_token_starts = uploaded.get("task_token_starts", seq_order)
+        task_token_counts = uploaded.get("task_token_counts", seq_order)
+        task_state_sources = uploaded.get("task_state_sources", seq_order)
+        task_state_destinations = uploaded.get("task_state_destinations", seq_order)
+        scalar_chunk_schedule = uploaded.get("scalar_chunk_schedule", empty_i32)
+        scalar_chunk_schedule_counts = uploaded.get(
+            "scalar_chunk_schedule_counts", empty_i32
+        )
+        bt16_cu_chunks = uploaded.get("bt16_cu_chunks", empty_i32)
+        bt16_chunk_to_seq = uploaded.get("bt16_chunk_to_seq", empty_i32)
+        self._metadata_host = uploaded.get("_host_pinned")
         serving_native_abi = (
             self._active_beta_f32
             or state_indices is not None
@@ -2832,6 +2874,11 @@ class FlashKDABlackwellBF16FusedLaunch:
             or use_scalar_chunk_lpt_m128
             or use_persistent_m128
         )
+        if fp32_checkpoints and not uses_default_fused_m128:
+            raise NotImplementedError(
+                "FP32 intermediate states are only carried by the fused direct M128 body; "
+                f"route {route!r} writes BF16 checkpoints"
+            )
         if backend != "cuda_cpp" and (
             compute_dtype == "tf32"
             or not (uses_default_fused_m128 or use_persistent_m128)
@@ -2922,12 +2969,18 @@ class FlashKDABlackwellBF16FusedLaunch:
             not (use_tf32_direct_m128 or use_tf32_owner_helper)
             and not use_independent_dvsplit
         ):
+            if fp32_checkpoints and use_direct_m128_n16:
+                raise NotImplementedError(
+                    "FP32 intermediate states require the N32 direct M128 body; "
+                    "the N16 checkpoint-TMA body only writes BF16 rows"
+                )
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
+                **({"checkpoint_dtype_is_fp32": True} if fp32_checkpoints else {}),
                 pair_packed_beta=use_pair_packed_beta,
                 scalar_beta=use_scalar_beta,
                 active_beta_f32=self._active_beta_f32,
@@ -2970,6 +3023,8 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if use_n32_tensor_state_decay
                 else "fused_direct_m128"
             )
+            if fp32_checkpoints:
+                self.schedule += "_fp32_checkpoints"
         if use_tf32_owner_helper:
             n32_value_rows = (
                 64 if 2 * SMALL_BH_GROUP_SIZE * total_tasks <= sm_count else 128
@@ -3454,7 +3509,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 zero_words=0,
                 num_sequences=num_seqs,
                 state_checkpoints_tma=state_checkpoints
-                if state_checkpoints is not None
+                if state_checkpoints is not None and not fp32_checkpoints
                 else empty_checkpoint_tma,
             )
         if use_small_bh_owner_helper:
@@ -3630,10 +3685,23 @@ class FlashKDABlackwellBF16FusedLaunch:
         self._cuda_graph_capture_stream = None
         self._cuda_graph_warmed = False
 
+    _descriptors_stale = False
+
+    def _prepare_descriptors_in_stream(self) -> None:
+        """Encode and upload every TMA descriptor on the current stream."""
+        if self.prepare_module is not None:
+            self.prepare_module.prepare(grid=self.prepare_grid, **self.prepare_args)
+        self.module.prepare(grid=self.grid, **self.args)
+        self._descriptors_stale = False
+
     def _launch_uncaptured(self) -> None:
         import tvm_ffi
 
         with tvm_ffi.use_torch_stream():
+            if self._descriptors_stale:
+                # A plan-cache rebind moved a descriptor source; re-encode in
+                # the same stream context as the launch it precedes.
+                self._prepare_descriptors_in_stream()
             for destination, source in self._token_storage_refreshes:
                 destination.copy_(source)
             if self._beta_tma_valid is not None:
@@ -3971,11 +4039,16 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 raise ValueError(
                     "affine checkpoints require output, offsets and interval64"
                 )
-            if (
-                state_checkpoints.dtype != torch.bfloat16
-                or not state_checkpoints.is_contiguous()
+            if not state_checkpoints.is_contiguous() or state_checkpoints.dtype not in (
+                torch.bfloat16,
+                torch.float32,
             ):
-                raise TypeError("affine checkpoint output must be contiguous BF16")
+                raise TypeError("affine checkpoint output must be contiguous BF16 or FP32")
+            if (
+                state_checkpoints.dtype == torch.float32
+                and initial_state.dtype != torch.float32
+            ):
+                raise TypeError("FP32 affine checkpoints require an FP32 state pool")
             if state_checkpoints.ndim != 4 or state_checkpoints.shape[1:] != (
                 q.shape[2],
                 HEAD_DIM,
@@ -4081,14 +4154,16 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             correction_cp_offsets = [
                 offset - first_cp_count for offset in main_cp_offsets[1:]
             ]
+            # Window checkpoints follow the output contract: FP32 rows keep the
+            # main and correction windows exact before their merge.
             self._checkpoint_main = torch.empty(
                 (cp_count, heads, HEAD_DIM, HEAD_DIM),
-                dtype=torch.bfloat16,
+                dtype=state_checkpoints.dtype,
                 device=q.device,
             )
             self._checkpoint_correction = torch.empty(
                 (cp_count - first_cp_count, heads, HEAD_DIM, HEAD_DIM),
-                dtype=torch.bfloat16,
+                dtype=state_checkpoints.dtype,
                 device=q.device,
             )
             self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
@@ -4607,6 +4682,289 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         )
         >= 2
     )
+
+
+REBIND_INPUT_NAMES = (
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "out",
+    "A_log",
+    "dt_bias",
+    "initial_state",
+    "final_state",
+    "cu_seqlens",
+    "state_indices",
+    "state_checkpoints",
+    "checkpoint_cu_starts",
+)
+
+
+def _rebind_tensor_signature(tensor) -> tuple | None:
+    """Layout facts a prepared launch depends on, excluding the base address.
+
+    The low address bits are kept because preparation branches on 16-byte
+    alignment (pair-packed beta TMA, checkpoint TMA) and TMA descriptors
+    require 16-byte aligned bases.
+    """
+    if tensor is None:
+        return None
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.data_ptr() & 0xFF,
+        tensor.device.index,
+    )
+
+
+def _storage_base_address(tensor) -> int:
+    """Byte address of the tensor's storage start without materializing a Storage."""
+    return tensor.data_ptr() - tensor.storage_offset() * tensor.element_size()
+
+
+def rebind_signature(inputs: dict) -> tuple:
+    """Structural key under which a prepared launch can be rebound to new inputs.
+
+    Two calls share a signature when every caller tensor has the same shape,
+    strides, dtype, device and 256-byte alignment, and the same tensors alias
+    each other (``initial_state is final_state`` for an in-place pool,
+    packed ``q``/``k``/``v`` slices of one projection buffer, ...).
+    """
+    storage_groups: dict[int, int] = {}
+    facts = []
+    aliases = []
+    for name in REBIND_INPUT_NAMES:
+        tensor = inputs.get(name)
+        if tensor is None:
+            facts.append(None)
+            aliases.append(None)
+            continue
+        pointer = tensor.data_ptr()
+        facts.append(
+            (
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+                pointer & 0xFF,
+                tensor.device.index,
+            )
+        )
+        base = pointer - tensor.storage_offset() * tensor.element_size()
+        aliases.append(storage_groups.setdefault(base, len(storage_groups)))
+    return (tuple(facts), tuple(aliases))
+
+
+@dataclass(frozen=True)
+class _RebindView:
+    container: str
+    key: Any
+    input_name: str
+    byte_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: Any
+
+
+@dataclass(frozen=True)
+class _RebindAddress:
+    container: str
+    key: Any
+    input_name: str
+    byte_offset: int
+
+
+@dataclass
+class RebindPlan:
+    """Address-relative record of every prepared argument aliasing a caller tensor."""
+
+    signature: tuple
+    views: tuple[_RebindView, ...]
+    addresses: tuple[_RebindAddress, ...]
+    owned_keepalive: tuple[Any, ...]
+
+
+def _rebind_containers(impl) -> dict[str, Any]:
+    containers: dict[str, Any] = {"args": impl.args}
+    prepare_args = getattr(impl, "prepare_args", None)
+    if prepare_args:
+        containers["prepare_args"] = prepare_args
+    refreshes = getattr(impl, "_token_storage_refreshes", ())
+    if refreshes:
+        # Sources are logical views of the caller's g/beta storage; the
+        # destinations are launch-owned staging buffers.
+        containers["refresh_sources"] = {
+            index: source for index, (_, source) in enumerate(refreshes)
+        }
+    attributes = {}
+    for name in ("_beta_tma_source", "_beta_tma_valid"):
+        value = getattr(impl, name, None)
+        if value is not None:
+            attributes[name] = value
+    if attributes:
+        containers["attributes"] = attributes
+    return containers
+
+
+def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
+    """Record how a freshly prepared launch aliases its caller tensors.
+
+    Every tensor argument that shares storage with a caller tensor is stored
+    as (input name, byte offset from that input's data pointer, view shape,
+    view stride, dtype); every ``*_addr`` integer inside a caller storage is
+    stored as (input name, byte offset).  Launch-owned buffers (dummies,
+    staging copies, persistent-task metadata, TMA workspace) are not aliased
+    and are left untouched by :func:`rebind_prepared_launch`.
+    """
+    import torch
+
+    if hasattr(impl, "_main"):
+        raise TypeError("split-sequence affine launches are not rebindable")
+    storages: dict[int, tuple[str, Any, int]] = {}
+    for name in REBIND_INPUT_NAMES:
+        tensor = inputs.get(name)
+        if tensor is None:
+            continue
+        storage = tensor.untyped_storage()
+        storages.setdefault(storage.data_ptr(), (name, tensor, storage.nbytes()))
+
+    def classify(tensor):
+        hit = storages.get(_storage_base_address(tensor))
+        if hit is None:
+            return None
+        name, source, _ = hit
+        return name, tensor.data_ptr() - source.data_ptr()
+
+    views: list[_RebindView] = []
+    addresses: list[_RebindAddress] = []
+    for container_name, container in _rebind_containers(impl).items():
+        for key, value in container.items():
+            if isinstance(value, torch.Tensor):
+                hit = classify(value)
+                if hit is not None:
+                    views.append(
+                        _RebindView(
+                            container_name,
+                            key,
+                            hit[0],
+                            hit[1],
+                            tuple(value.shape),
+                            tuple(value.stride()),
+                            value.dtype,
+                        )
+                    )
+            elif (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and isinstance(key, str)
+                and key.endswith("_addr")
+            ):
+                for base, (name, source, nbytes) in storages.items():
+                    if base <= value < base + nbytes:
+                        addresses.append(
+                            _RebindAddress(
+                                container_name, key, name, value - source.data_ptr()
+                            )
+                        )
+                        break
+    owned = tuple(
+        item
+        for item in getattr(impl, "_keepalive", ())
+        if not (isinstance(item, torch.Tensor) and classify(item) is not None)
+    )
+    return RebindPlan(
+        signature=rebind_signature(inputs),
+        views=tuple(views),
+        addresses=tuple(addresses),
+        owned_keepalive=owned,
+    )
+
+
+def rebind_prepared_launch(
+    impl, plan: RebindPlan, inputs: dict, *, signature: tuple | None = None
+) -> bool:
+    """Point a prepared launch at new caller tensors with the recorded layout.
+
+    ``signature`` is the precomputed ``rebind_signature(inputs)``; when omitted
+    it is recomputed and checked here.  Only host-side view construction
+    happens in this call.  The return value reports whether any TMA-described
+    argument (``*_tma`` keys) moved, in which case the caller must re-encode
+    the descriptors (``prepare_descriptors``): one stream-ordered upload
+    kernel, and therefore CUDA-graph capturable.  Unchanged descriptor
+    sources may keep the workspace contents.
+    """
+    import torch
+
+    if signature is None:
+        signature = rebind_signature(inputs)
+    if signature != plan.signature:
+        raise ValueError("prepared launch signature does not match the new inputs")
+    containers = _rebind_containers(impl)
+    tma_moved = False
+    resolved: dict[tuple, Any] = {}
+
+    def view_for(spec: _RebindView):
+        cache_key = (spec.input_name, spec.byte_offset, spec.shape, spec.stride, spec.dtype)
+        tensor = resolved.get(cache_key)
+        if tensor is not None:
+            return tensor
+        source = inputs[spec.input_name]
+        if (
+            spec.byte_offset == 0
+            and source.dtype == spec.dtype
+            and tuple(source.shape) == spec.shape
+            and tuple(source.stride()) == spec.stride
+        ):
+            tensor = source
+        elif source.dtype == spec.dtype and spec.byte_offset % source.element_size() == 0:
+            tensor = source.as_strided(
+                spec.shape,
+                spec.stride,
+                source.storage_offset() + spec.byte_offset // source.element_size(),
+            )
+        else:
+            tensor = torch.empty(0, dtype=spec.dtype, device=source.device)
+            base_bytes = source.data_ptr() - source.untyped_storage().data_ptr()
+            if (base_bytes + spec.byte_offset) % tensor.element_size():
+                raise ValueError("rebound view is not aligned to its element size")
+            tensor.set_(
+                source.untyped_storage(),
+                (base_bytes + spec.byte_offset) // tensor.element_size(),
+                spec.shape,
+                spec.stride,
+            )
+        resolved[cache_key] = tensor
+        return tensor
+
+    for spec in plan.views:
+        container = containers[spec.container]
+        replacement = view_for(spec)
+        if (
+            not tma_moved
+            and isinstance(spec.key, str)
+            and spec.key.endswith("_tma")
+            and container[spec.key].data_ptr() != replacement.data_ptr()
+        ):
+            tma_moved = True
+        container[spec.key] = replacement
+    for spec in plan.addresses:
+        containers[spec.container][spec.key] = (
+            inputs[spec.input_name].data_ptr() + spec.byte_offset
+        )
+    refresh_sources = containers.get("refresh_sources")
+    if refresh_sources is not None:
+        impl._token_storage_refreshes = tuple(
+            (destination, refresh_sources[index])
+            for index, (destination, _) in enumerate(impl._token_storage_refreshes)
+        )
+    for name, value in containers.get("attributes", {}).items():
+        setattr(impl, name, value)
+    impl._keepalive = plan.owned_keepalive + tuple(
+        inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
+    )
+    return tma_moved
 
 
 class FlashKDABlackwellLaunch:
