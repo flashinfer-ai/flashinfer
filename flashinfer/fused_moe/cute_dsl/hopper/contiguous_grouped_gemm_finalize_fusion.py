@@ -99,8 +99,8 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
         :param cluster_shape_mn: (1, 1) or (1, 2)
         :param m: permuted rows, a multiple of the M tile (``moe_sort`` pads
             every expert to whole tiles)
-        :param n: hidden size, a multiple of the N tile (the finalize scatter
-            copies full N-tile rows); (1, 2) also needs an even N-tile count
+        :param n: hidden size; each output row must be a multiple of 16 B
+            (the scatter is a bulk copy); (1, 2) also needs an even N-tile count
             so that every CTA pair is complete
         :param k: per-rank intermediate size; a partial last K tile is
             zero-filled by TMA, so it only has to keep 16 B rows
@@ -117,12 +117,13 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
         tile_m, tile_n = tile_shape_mn
         if (
             m % tile_m != 0
-            or n % tile_n != 0
+            or (n * c_dtype.width) % 128 != 0
             or (k * a_dtype.width) % 128 != 0
             or l < 1
         ):
             return False
-        if cluster_shape_mn == (1, 2) and (n // tile_n) % 2 != 0:
+        n_tiles = (n + tile_n - 1) // tile_n
+        if cluster_shape_mn == (1, 2) and n_tiles % 2 != 0:
             return False
         return True
 
@@ -725,7 +726,7 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
             k_pipe_mmas = 1
             prologue_mma_cnt = cutlass.min(k_pipe_mmas, k_tile_cnt)
 
-            copy_bytes = cutlass.Int32(self.tile_shape_mnk[1] * self.c_dtype.width // 8)
+            n_total = cutlass.Int32(cute.size(mOut, mode=[1]))
             epi_tidx = tidx - self.num_dma_warp_groups * self.num_threads_per_warp_group
 
             while work_tile.is_valid_tile:
@@ -830,6 +831,14 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
                         if row_global < mn_limit:
                             out_row = sMetaTokenIdx[(epi_tidx, meta_stage_idx)]
                             coord_n = tile_coord_mnl[1] * self.tile_shape_mnk[1]
+                            # A partial last N tile scatters only the columns
+                            # inside N; TMA zero-filled the matching B rows, so
+                            # the accumulator columns past N are zero and are
+                            # simply not written.
+                            copy_bytes = cutlass.Int32(
+                                cutlass.min(self.tile_shape_mnk[1], n_total - coord_n)
+                                * (self.c_dtype.width // 8)
+                            )
                             dst = cute.domain_offset((out_row, coord_n, 0), mOut)
                             src_row = sC[(epi_tidx, None, 0)]
                             if cutlass.const_expr(self.use_fused_finalize):

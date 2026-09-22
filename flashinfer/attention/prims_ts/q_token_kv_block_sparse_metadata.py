@@ -17,14 +17,14 @@
 The public attention kernel consumes dense sparse-page indices and, for
 grouped routes, a parallel packed-membership table. Q1 rows map their compact
 selected logical blocks directly to encoded physical
-subpage locators. Q2/Q4/Q5 rows additionally union the selected blocks of
+subpage locators. Q2--Q8 rows additionally union the selected blocks of
 every adjacent query and write per-page query-membership masks into a separate
 dense table, packed four 8-bit masks per Int32 word. The public API names the
-sparse block size explicitly; the current kernel specialization supports size
-four.
+sparse block size explicitly: 4, 8, 16, 32, 64, or 128 tokens.
+Patterns can be shared across KV heads or supplied independently for each head.
 
 Construction uses one CUDA C++ CTA per route. Q1 maps selected and tail blocks
-directly. Q2/Q4/Q5 radix-sort at most ``G * (topk + 1)`` selected/tail IDs,
+directly. Q2--Q8 radix-sort at most ``G * (topk + 1)`` selected/tail IDs,
 segmented-OR equal-key memberships, and emit only unique pages; work and
 temporary storage are independent of the model context length. On SM90 and
 newer, the metadata grid releases the prepared attention grid through
@@ -34,22 +34,25 @@ programmatic dependent launch (PDL).
 from __future__ import annotations
 
 import functools
+import math
 import threading
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 import torch
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
+from ._block_sparse.common import _num_sparse_pattern_heads
 
-_Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE = 4
+_Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
+_Q_TOKEN_KV_BLOCK_SPARSE_BLOCK_SIZES = (4, 8, 16, 32, 64, 128)
 _Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK = 512
 # Reserve three high key bits for grouped-query membership tags and retain an
 # out-of-range radix sentinel in the CUDA/CUB touched-union representation.
 _Q_TOKEN_KV_BLOCK_SPARSE_MAX_SEQ_LEN_KV = (
     (1 << 29) - 1
-) * _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE
+) * _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE
 _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD = 4
 _Q_TOKEN_KV_BLOCK_SPARSE_INT32_LOCATOR_CAPACITY = 1 << 31
 _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
@@ -151,10 +154,9 @@ def _validate_q_token_kv_block_sparse_locator_capacity(
     """Keep every valid encoded cache locator nonnegative in Int32."""
 
     storage_page_size = int(k_cache.shape[2])
-    _validate_storage_page_size(storage_page_size, sparse_block_size)
-    num_encoded_locators = (
-        int(k_cache.shape[0]) * storage_page_size // sparse_block_size
-    )
+    _validate_storage_page_size(storage_page_size)
+    fragment_size = math.gcd(storage_page_size, sparse_block_size)
+    num_encoded_locators = int(k_cache.shape[0]) * storage_page_size // fragment_size
     if num_encoded_locators > _Q_TOKEN_KV_BLOCK_SPARSE_INT32_LOCATOR_CAPACITY:
         raise NotImplementedError(
             "the encoded QToken-KvBlock-Sparse-Attention cache-locator extent must fit in nonnegative "
@@ -294,7 +296,9 @@ class _PrimsTSQTokenKvBlockSparsePlan:
     Eager calls may pass new input storage with the same shapes, strides,
     devices, and dtypes; CUDA graph replay retains its usual stable-address
     requirement. The hot path performs synchronization-free replacement-storage
-    checks followed by metadata and already-prepared attention launches. The
+    checks followed by already-prepared launches. G1 resolves logical blocks
+    directly inside attention, without launching the metadata kernel; grouped
+    routes first build their union. The
     original tensors are validated during preparation. Callers must keep all
     replacement tensors alive and disjoint, and must not mutate them
     concurrently with a launch or CUDA-graph replay that reads them. Call
@@ -352,12 +356,21 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         _validate_16byte_alignment(query, "query")
         _validate_16byte_alignment(out, "out")
 
-        self._metadata_plan.run(
-            block_indices,
-            block_table,
-            token_to_request,
-            query_positions,
-        )
+        direct_q1_inputs = None
+        if self._attention_plan._direct_q1_inputs:
+            direct_q1_inputs = (
+                block_indices,
+                block_table,
+                token_to_request,
+                query_positions,
+            )
+        else:
+            self._metadata_plan.run(
+                block_indices,
+                block_table,
+                token_to_request,
+                query_positions,
+            )
         attention_query = _flatten_fixed_q_token_kv_block_sparse_groups(
             query, self._fixed_query_group_size
         )
@@ -379,6 +392,7 @@ class _PrimsTSQTokenKvBlockSparsePlan:
             attention_out,
             scale_qk,
             scale_v,
+            direct_q1_inputs,
         )
         return out
 
@@ -399,6 +413,8 @@ class _QTokenKvBlockSparsePlanConfig:
     device: torch.device
     workspace_buffer: torch.Tensor
     use_packed_q: bool
+    split_kv: bool
+    share_pattern_across_kv_heads: bool
     q_data_type: torch.dtype
     kv_data_type: torch.dtype
     o_data_type: torch.dtype
@@ -463,6 +479,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
         device: torch.device | str | int,
         workspace_buffer: torch.Tensor,
         use_packed_q: bool = False,
+        split_kv: bool = True,
+        share_pattern_across_kv_heads: bool = True,
         mask_type: Literal["causal"] = "causal",
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: Optional[torch.dtype] = None,
@@ -474,7 +492,18 @@ class QTokenKvBlockSparsePagedTSWrapper:
         packed Q, or ``B * Nq`` for fixed ``[B, Nq, G, Hq, D]`` Q. The planned
         ``seq_len_q`` is the maximum packed route length or fixed group size
         ``G``. ``kv_block_size`` is the indexer's sparse K/V atom and currently
-        supports only four tokens; ``page_size`` is the physical cache page.
+        supports 4/8/16/32/64/128 tokens; ``page_size`` is the physical cache
+        page. Blocks may cross cache pages. The loader uses fragments of size
+        gcd(kv_block_size, page_size), resolving every fragment independently.
+
+        ``share_pattern_across_kv_heads=True`` preserves the existing shared
+        top-k ``[T,K]`` input. False requires ``[T,Hkv,K]`` and prepares one
+        union per group and KV head. Q, K, V and output layouts are unchanged.
+
+        ``split_kv=True`` permits automatic useful split fanout; False forces
+        one KV partition and omits split scratch. Pass False for prefill and
+        True for decode, independently of ``use_packed_q``. Workspace sizing
+        must use the same value. Change it only by replanning outside capture.
         """
 
         from .decode import (
@@ -492,7 +521,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         head_dim = _validate_head_dim(head_dim)
         _validate_head_geometry(num_qo_heads, num_kv_heads)
         kv_block_size = _validate_sparse_block_size(kv_block_size)
-        _validate_storage_page_size(page_size, kv_block_size)
+        _validate_storage_page_size(page_size)
         _validate_shape_parameters(batch_size * seq_len_q, block_topk, seq_len_q)
         if mask_type != "causal":
             raise ValueError(
@@ -535,6 +564,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
             num_query_groups=batch_size,
             use_packed_q=use_packed_q,
             sparse_block_size=kv_block_size,
+            split_kv=split_kv,
+            share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         )
         _validate_q_token_kv_block_sparse_attention_workspace(
             workspace_buffer, layout.total_bytes
@@ -558,6 +589,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
             device=planned_device,
             workspace_buffer=workspace_buffer,
             use_packed_q=use_packed_q,
+            split_kv=split_kv,
+            share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
             o_data_type=o_data_type,
@@ -574,7 +607,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             raise RuntimeError("plan() must be called before run()")
         return config
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
@@ -593,9 +626,10 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
         Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``. Fixed Q is
         ``[B, Nq, G, Hq, D]`` without ``qo_indptr``. ``indexer_block_ids`` is
-        contiguous Int32 ``[total_q, block_topk]`` and never uses the BSR name
-        ``block_indices``. The paged K/V tensors are separate HND caches shaped
-        ``[num_pages, Hkv, page_size, D]``.
+        Int32 ``[total_q, block_topk]`` for shared patterns or
+        ``[total_q, Hkv, block_topk]`` for independent patterns, with a
+        contiguous last dimension. It never uses the BSR name ``block_indices``.
+        K/V are separate HND caches shaped ``[num_pages, Hkv, page_size, D]``.
 
         For every valid query at zero-based position ``p``, the first
         ``min(block_topk, (p + 1) // kv_block_size)`` indexer entries must be
@@ -604,6 +638,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
         Q1 does not compact missing entries or arbitrary ``-1`` holes inside
         this required prefix. The incomplete causal tail is derived from
         ``query_positions`` and must not be inserted into the selected prefix.
+
+        The KV-cache writer must zero-fill unused token slots in allocated
+        pages before attention. TMA loads complete fragments, including the
+        partial causal tail; score masking does not sanitize NaN/Inf padding
+        in V. Attention does not clear cache padding itself.
 
         Run once eagerly after :meth:`plan`; capture only subsequent calls with
         stable tensor storage. A changed packed extent or retained K/V/offset
@@ -623,10 +662,10 @@ class QTokenKvBlockSparsePagedTSWrapper:
             Dense CUDA Int32 physical-page table
             ``[num_requests, max_storage_pages]``.
         indexer_block_ids : torch.Tensor
-            Contiguous CUDA Int32 logical block IDs
-            ``[num_query_tokens, block_topk]``, including the distinct
-            completed-block prefix described above. The causal tail is added
-            by the metadata builder.
+            CUDA Int32 logical block IDs ``[T, block_topk]`` when the plan
+            shares patterns, otherwise ``[T, Hkv, block_topk]``. The last
+            dimension must be contiguous; each row supplies the distinct
+            completed-block prefix above. The causal tail is added internally.
         token_to_request : torch.Tensor
             CUDA Int32 request ID for each flattened query token.
         query_positions : torch.Tensor
@@ -685,12 +724,16 @@ class QTokenKvBlockSparsePagedTSWrapper:
             if config.use_packed_q
             else (config.batch_size * config.seq_len_q)
         )
-        if not isinstance(
-            indexer_block_ids, torch.Tensor
-        ) or indexer_block_ids.shape != (num_query_tokens, config.block_topk):
-            raise ValueError(
-                "indexer_block_ids must have shape [num_query_tokens, block_topk]"
-            )
+        expected_ids_shape = (
+            (num_query_tokens, config.block_topk)
+            if config.share_pattern_across_kv_heads
+            else (num_query_tokens, config.num_kv_heads, config.block_topk)
+        )
+        if (
+            not isinstance(indexer_block_ids, torch.Tensor)
+            or indexer_block_ids.shape != expected_ids_shape
+        ):
+            raise ValueError(f"indexer_block_ids must have shape {expected_ids_shape}")
         for tensor, name in (
             (token_to_request, "token_to_request"),
             (query_positions, "query_positions"),
@@ -776,6 +819,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
                             config.seq_len_q if config.use_packed_q else None
                         ),
                         sparse_block_size=config.kv_block_size,
+                        split_kv=config.split_kv,
+                        share_pattern_across_kv_heads=config.share_pattern_across_kv_heads,
                     )
                     self._prepared_key = prepared_key
         assert self._prepared_plan is not None
@@ -810,13 +855,15 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     *,
     num_query_groups: Optional[int] = None,
     sparse_block_size: int = 4,
+    storage_page_size: Optional[int] = None,
+    num_pattern_heads: int = 1,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
     """Return ``(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)`` shapes.
 
-    ``sparse_block_size`` must be a positive power of two; only four is
-    implemented today. Grouped membership masks use four packed bytes per
-    Int32 word. Q1 does not consume membership metadata and therefore returns
-    a zero-width membership shape.
+    Physical fragments have size gcd(sparse_block_size, storage_page_size).
+    Metadata has one row per query group and pattern head. Grouped masks use
+    four packed bytes per Int32 word. Q1 does not consume membership metadata
+    and returns a zero-width membership shape.
 
     Parameters
     ----------
@@ -831,8 +878,13 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
         partitioned into fixed groups and ``num_query_tokens`` must be
         divisible by ``group_size``.
     sparse_block_size : int
-        Logical sparse-block size in tokens. It must be a positive power of
-        two; only four is currently implemented.
+        Logical sparse-block size in tokens: 4, 8, 16, 32, 64, or 128.
+    storage_page_size : int, optional
+        Physical storage-page size; defaults to sparse_block_size. A block
+        contains sparse_block_size / gcd(sparse_block_size, storage_page_size)
+        independently addressable fragments.
+    num_pattern_heads : int
+        One for shared patterns, otherwise the number of KV heads.
 
     Returns
     -------
@@ -848,7 +900,14 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
         group_size,
         num_query_groups,
     )
-    page_capacity = group_size * (block_topk + 1)
+    if storage_page_size is None:
+        storage_page_size = sparse_block_size
+    _validate_storage_page_size(storage_page_size)
+    fragments_per_block = sparse_block_size // math.gcd(
+        sparse_block_size, storage_page_size
+    )
+    page_capacity = group_size * (block_topk + 1) * fragments_per_block
+    groups *= num_pattern_heads
     membership_words = (
         0
         if group_size == 1
@@ -876,6 +935,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     num_query_groups: Optional[int] = None,
     use_packed_q: bool = False,
     sparse_block_size: int = 4,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
 ) -> _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
     """Return the unified allocation layout for QToken-KvBlock-Sparse-Attention metadata and attention.
 
@@ -884,9 +945,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     to provide the model block table, request mappings, and query positions as
     explicit semantic inputs.
 
-    Metadata and attention use disjoint regions. Direct prefill policies have
-    no split-KV storage; decode policies that select split-KV own dedicated
-    partial-output, statistics, and completion-counter storage.
+    Metadata and attention use disjoint regions. The caller controls whether
+    split-KV may be selected, independently of query layout. Split launches
+    own dedicated partial-output, statistics and completion-counter storage.
     """
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
@@ -895,13 +956,15 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         raise ValueError(
             "num_query_tokens must be positive for QToken-KvBlock-Sparse-Attention attention"
         )
+    if not isinstance(split_kv, bool):
+        raise TypeError("split_kv must be a bool")
     if not isinstance(max_num_storage_pages, int) or isinstance(
         max_num_storage_pages, bool
     ):
         raise TypeError("max_num_storage_pages must be an integer")
     if max_num_storage_pages <= 0:
         raise ValueError("max_num_storage_pages must be positive")
-    _validate_storage_page_size(storage_page_size, sparse_block_size)
+    _validate_storage_page_size(storage_page_size)
     max_seq_len_kv = _validate_q_token_kv_block_sparse_max_seq_len_kv(
         max_seq_len_kv,
         block_table_token_capacity=max_num_storage_pages * storage_page_size,
@@ -923,33 +986,47 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         group_size,
         num_query_groups,
     )
-    page_capacity = group_size * (block_topk + 1)
+    if not isinstance(share_pattern_across_kv_heads, bool):
+        raise TypeError("share_pattern_across_kv_heads must be a bool")
+    pattern_heads = _num_sparse_pattern_heads(
+        num_kv_heads, share_pattern_across_kv_heads
+    )
+    metadata_rows = groups * pattern_heads
+    fragment_size = math.gcd(sparse_block_size, storage_page_size)
+    block_capacity = min(
+        group_size * (block_topk + 1),
+        (max_seq_len_kv + sparse_block_size - 1) // sparse_block_size,
+    )
+    page_capacity = block_capacity * (sparse_block_size // fragment_size)
     membership_words = (
         0
         if group_size == 1
         else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
         // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
     )
-    q_token_kv_block_sparse_page_indices_shape = (groups, page_capacity)
-    q_token_kv_block_sparse_page_indices_bytes = groups * page_capacity * 4
-    q_token_kv_block_sparse_page_memberships_shape = (groups, membership_words)
+    q_token_kv_block_sparse_page_indices_shape = (metadata_rows, page_capacity)
+    q_token_kv_block_sparse_page_indices_bytes = metadata_rows * page_capacity * 4
+    q_token_kv_block_sparse_page_memberships_shape = (metadata_rows, membership_words)
     q_token_kv_block_sparse_page_memberships_byte_offset = (
         _align_up_q_token_kv_block_sparse_workspace(
             q_token_kv_block_sparse_page_indices_bytes
         )
     )
-    q_token_kv_block_sparse_page_memberships_bytes = groups * membership_words * 4
+    q_token_kv_block_sparse_page_memberships_bytes = (
+        metadata_rows * membership_words * 4
+    )
     seq_lens_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
         q_token_kv_block_sparse_page_memberships_byte_offset
         + q_token_kv_block_sparse_page_memberships_bytes
     )
-    seq_lens_numel = groups
+    seq_lens_numel = metadata_rows
     seq_lens_bytes = seq_lens_numel * 4
     max_seq_len = (
         block_topk * sparse_block_size + (sparse_block_size - 1)
         if group_size == 1
-        else page_capacity * sparse_block_size
+        else page_capacity * fragment_size
     )
+    max_seq_len = min(max_seq_len, max_seq_len_kv)
     if kv_dtype is None:
         kv_dtype = q_dtype
     if out_dtype is None:
@@ -959,10 +1036,11 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         num_qo_heads,
         num_kv_heads,
         head_dim,
-        sparse_block_size,
+        fragment_size,
         max_seq_len,
         group_size,
         q_dtype,
+        kv_dtype,
         kv_dtype,
         out_dtype,
         "HND",
@@ -973,6 +1051,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         device,
         use_q_token_kv_block_sparse_route=True,
         use_pdl=True,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     attention_scratch_bytes = attention_layout.total_bytes
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
@@ -994,7 +1074,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def get_q_token_kv_block_sparse_workspace_size(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1006,6 +1086,8 @@ def get_q_token_kv_block_sparse_workspace_size(
     qo_indptr: Optional[torch.Tensor] = None,
     seq_len_q: Optional[int] = None,
     kv_block_size: int = 4,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
 ) -> int:
     """Return bytes for QToken-KvBlock-Sparse-Attention workspace storage.
 
@@ -1023,8 +1105,10 @@ def get_q_token_kv_block_sparse_workspace_size(
     The attention region contains split-KV partials, statistics, and counters
     only when the resolved policy uses split-KV; direct prefill retains only
     small uniform-ABI placeholders.
-    ``kv_block_size`` must be a positive power of two; only four is
-    implemented today.
+    ``kv_block_size`` supports 4/8/16/32/64/128 tokens. Shared patterns use
+    one metadata row per query group; independent patterns use one per group
+    and KV head. Storage-page crossings increase the number of physical
+    fragments, not the number of logical candidates sorted.
 
     Parameters
     ----------
@@ -1052,8 +1136,16 @@ def get_q_token_kv_block_sparse_workspace_size(
         Maximum packed-route length and QToken-KvBlock-Sparse-Attention group size. It is required when
         ``qo_indptr`` is supplied.
     kv_block_size : int
-        Logical sparse-block size in tokens. It must be a positive power of
-        two; only four is currently implemented.
+        Logical sparse-block size in tokens: 4, 8, 16, 32, 64, or 128.
+    split_kv : bool
+        Allow automatic split-KV selection (default True), independently of
+        query layout. Use False for prefill and True for decode. Pass the same
+        value to attention planning; False omits split-KV scratch.
+
+    share_pattern_across_kv_heads : bool
+        True (default) uses one pattern per query, shared by KV heads.
+        False uses independent per-KV-head patterns. Match this setting in
+        workspace sizing and planning; it does not change the attention grid.
 
     Returns
     -------
@@ -1072,6 +1164,8 @@ def get_q_token_kv_block_sparse_workspace_size(
         qo_indptr=qo_indptr,
         max_seq_len_q=seq_len_q,
         sparse_block_size=kv_block_size,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     ).total_bytes
 
 
@@ -1086,6 +1180,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     sparse_block_size: int = 4,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
 ) -> _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     if not isinstance(query, torch.Tensor):
@@ -1157,6 +1253,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         num_query_groups=groups,
         use_packed_q=use_packed_q,
         sparse_block_size=sparse_block_size,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
 
 
@@ -1173,11 +1271,13 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     qo_indptr: Optional[torch.Tensor] = None,
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     release_attention_pdl: bool = False,
+    share_pattern_across_kv_heads: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build dense QToken-KvBlock-Sparse-Attention indices and memberships from compact sparse-block IDs.
 
-    ``block_indices`` contains compact logical four-token block IDs with shape
-    ``[num_query_tokens, block_topk]``.  Adjacent Q2/Q4/Q5 rows must belong to
+    ``block_indices`` contains logical sparse-block IDs with shape
+    ``[num_query_tokens, block_topk]`` when shared, or ``[num_query_tokens,
+    Hkv, block_topk]`` for per-head selections.  Adjacent Q2--Q8 rows must belong to
     the same request and have consecutive positions.  Q1 output locators are
     ordinary encoded subpage locators. Grouped routes return the same plain
     locators plus a separate Int32 table containing four 8-bit membership masks
@@ -1188,11 +1288,13 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
 
     Pass preallocated ``out`` tensors for CUDA graph capture. The page-index
     table has a fixed row width of
-    ``group_size * (block_topk + 1)``; ``seq_lens`` selects the live prefix.
+    ``group_size * (block_topk + 1) * fragments_per_block``; ``seq_lens``
+    selects the live token prefix. Fragments divide both logical blocks and
+    storage pages, so physical page IDs never imply logical adjacency.
     The membership output has one Int32 word per four page slots, or zero
     columns for Q1.
     Q1 uses one CUDA C++ CTA per route to map its selected blocks and causal
-    tail directly. Q2/Q4/Q5 use one CUDA C++ CTA per route to radix-sort the
+    tail directly. Q2--Q8 use one CUDA C++ CTA per route to radix-sort the
     bounded ``group_size * (block_topk + 1)`` candidates, unique them while
     OR-reducing membership bits, and map the resulting logical pages through
     the dense block table. The terminal metadata grid releases a following
@@ -1211,8 +1313,10 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
         storage_page_size,
         max_seq_len_kv,
         sparse_block_size,
+        share_pattern_across_kv_heads,
     )
-    rows, block_topk = block_indices.shape
+    rows, block_topk = block_indices.shape[0], block_indices.shape[-1]
+    pattern_heads = block_indices.shape[1] if block_indices.ndim == 3 else 1
     use_packed_q = qo_indptr is not None
     if use_packed_q:
         _validate_q_token_kv_block_sparse_qo_indptr_tensor(
@@ -1226,6 +1330,8 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
         group_size,
         num_query_groups=groups,
         sparse_block_size=sparse_block_size,
+        storage_page_size=storage_page_size,
+        num_pattern_heads=pattern_heads,
     )
     if out is None:
         outputs = tuple(
@@ -1307,20 +1413,19 @@ def _build_q_token_kv_block_sparse_metadata(
     sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    share_pattern_across_kv_heads: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build dense QToken-KvBlock-Sparse-Attention page indices and memberships from sparse-block IDs.
 
-    ``block_indices`` is ``[num_query_tokens, block_topk]`` and contains
-    selected logical sparse-block IDs. ``block_table`` is the model's dense
-    ``[num_requests, max_storage_pages]`` physical storage-page table. The
-    returned ``q_token_kv_block_sparse_page_indices`` has shape
-    ``[num_query_groups, group_size * (block_topk + 1)]``; ``seq_lens`` gives
-    each row's live token prefix. ``q_token_kv_block_sparse_page_memberships`` stores four 8-bit
-    per-page masks in each Int32 word for grouped routes and has shape
-    ``[num_query_groups, 0]`` for Q1. Page-index entries are plain encoded cache
-    locators for every group size.
+    ``block_indices`` is ``[T,K]`` when shared, otherwise ``[T,Hkv,K]``.
+    ``block_table`` remains the dense ``[requests, max_storage_pages]`` physical
+    table. Let F = gcd(sparse_block_size, storage_page_size). Output rows number
+    groups * pattern_heads, with width G * (K+1) * (sparse_block_size/F).
+    ``seq_lens`` gives each row's live token prefix. Memberships pack four
+    fragment bytes per Int32; G1 has zero membership columns. Every locator is
+    physical_page * (storage_page_size/F) + subpage. No CSR conversion is needed.
 
-    Q1 uses one CUDA C++ direct-mapping kernel. Q2/Q4/Q5 use one CUDA C++
+    Q1 uses one CUDA C++ direct-mapping kernel. Q2--Q8 use one CUDA C++
     radix-sort and union kernel per route. Neither path requires
     caller-provided scratch. Advanced callers that capture this raw path must
     preallocate ``out``, warm the same metadata geometry once before capture,
@@ -1330,14 +1435,14 @@ def _build_q_token_kv_block_sparse_metadata(
     offsets and is checked structurally without a host-side value read.
 
     ``sparse_block_size`` defaults to four. The API validates power-of-two
-    values so future kernel specializations can use the same interface; only
-    block size four is implemented today.
+    values in {4,8,16,32,64,128}. Logical blocks may cross physical cache
+    pages; metadata emits only the physical fragments the loader needs.
 
     Parameters
     ----------
     block_indices : torch.Tensor
-        CUDA Int32 selected logical sparse-block IDs shaped
-        ``[num_query_tokens, block_topk]`` with contiguous rows.
+        CUDA Int32 selected logical sparse-block IDs shaped ``[T,K]`` or
+        ``[T,Hkv,K]``, with a contiguous K dimension.
     block_table : torch.Tensor
         Dense CUDA Int32 physical-page table shaped
         ``[num_requests, max_storage_pages]`` with contiguous rows.
@@ -1355,8 +1460,7 @@ def _build_q_token_kv_block_sparse_metadata(
         Static maximum visible logical K/V length in tokens, including current
         query or MTP tokens. It must fit within each dense block-table row.
     sparse_block_size : int
-        Logical sparse-block size in tokens. It must be a positive power of
-        two; only four is currently implemented.
+        Logical sparse-block size in tokens: 4, 8, 16, 32, 64, or 128.
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative route offsets for packed queries. If
         omitted, adjacent rows form fixed groups of exactly ``group_size``.
@@ -1365,6 +1469,11 @@ def _build_q_token_kv_block_sparse_metadata(
         memberships, and live sequence lengths. Their shapes must match
         :func:`_get_q_token_kv_block_sparse_metadata_output_shapes`. If omitted, the three
         outputs are allocated internally.
+
+    share_pattern_across_kv_heads : bool
+        True (default) uses one pattern per query, shared by KV heads.
+        False uses independent per-KV-head patterns. Match this setting in
+        workspace sizing and planning; it does not change the attention grid.
 
     Returns
     -------
@@ -1385,6 +1494,7 @@ def _build_q_token_kv_block_sparse_metadata(
         sparse_block_size=sparse_block_size,
         qo_indptr=qo_indptr,
         out=out,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
 
 
@@ -1453,10 +1563,12 @@ def _prepare_q_token_kv_block_sparse_attention(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     sparse_block_size: int = 4,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
 ) -> _PrimsTSQTokenKvBlockSparsePlan:
     """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
-    Packed Q/output use ``[num_query_tokens, Hq, D]`` and describe Q1/Q2/Q4/Q5
+    Packed Q/output use ``[num_query_tokens, Hq, D]`` and describe Q1--Q8
     routes with ``qo_indptr`` and ``max_seq_len_q``. A request's final route
     may be shorter than the maximum group size. Fixed Q/output use
     ``[B, Nq, G, Hq, D]`` and omit ``qo_indptr``; ``B * Nq`` becomes the
@@ -1467,17 +1579,20 @@ def _prepare_q_token_kv_block_sparse_attention(
     membership words, and compact sequence lengths inside ``workspace_buffer``
     and resolves metadata geometry and the PrimTS attention launch only once.
     Packed ``qo_indptr`` must be an
-    Int32 device copy of
-    CPU-validated route offsets, such as those from
-        :func:`make_q_token_kv_block_sparse_qo_indptr`. Preparation checks only its structural
-    tensor contract and does not materialize its values on the host.
+    Int32 device copy of CPU-validated route offsets, such as those from
+    :func:`make_q_token_kv_block_sparse_qo_indptr`. Preparation checks only the
+    structural tensor contract and does not materialize values on the host.
 
     Call ``run`` once outside CUDA graph capture to compile and initialize the
     plan, then capture with all semantic inputs, output, and workspace storage
     kept at stable addresses.
 
-    ``sparse_block_size`` defaults to four and is reserved for kernel
-    specialization. Other positive power-of-two sizes are not implemented.
+    G1 reads the raw indexer inputs directly inside attention and does not
+    materialize the workspace's page-index or sequence-length views. The
+    workspace size remains a conservative capacity, shared with grouped routes.
+
+    ``sparse_block_size`` defaults to four and selects the semantic block
+    specialization in {4, 8, 16, 32, 64, 128}.
 
     Parameters
     ----------
@@ -1489,8 +1604,8 @@ def _prepare_q_token_kv_block_sparse_attention(
         ``[num_pages, Hkv, storage_page_size, D]`` with matching shape, dtype,
         and device.
     block_indices : torch.Tensor
-        CUDA Int32 selected logical sparse-block IDs shaped
-        ``[num_query_tokens, block_topk]``.
+        CUDA Int32 logical sparse-block IDs shaped ``[T, block_topk]`` when
+        shared, otherwise ``[T, Hkv, block_topk]``, with a contiguous last dimension.
     block_table : torch.Tensor
         Dense CUDA Int32 physical-page table shaped
         ``[num_requests, max_storage_pages]``.
@@ -1520,8 +1635,12 @@ def _prepare_q_token_kv_block_sparse_attention(
         Maximum packed-route length and QToken-KvBlock-Sparse-Attention group size. It is required when
         ``qo_indptr`` is supplied.
     sparse_block_size : int
-        Logical sparse-block size in tokens. It must be a positive power of
-        two; only four is currently implemented.
+        Logical sparse-block size in tokens: 4, 8, 16, 32, 64, or 128.
+
+    share_pattern_across_kv_heads : bool
+        True (default) uses one pattern per query, shared by KV heads.
+        False uses independent per-KV-head patterns. Match this setting in
+        workspace sizing and planning; it does not change the attention grid.
 
     Returns
     -------
@@ -1587,7 +1706,10 @@ def _prepare_q_token_kv_block_sparse_attention(
         int(k_cache.shape[2]),
         max_seq_len_kv,
         sparse_block_size,
+        share_pattern_across_kv_heads,
     )
+    if not share_pattern_across_kv_heads and block_indices.shape[1] != k_cache.shape[1]:
+        raise ValueError("block_indices pattern head count must match the KV cache")
     if block_indices.shape[0] != num_query_tokens:
         raise ValueError("block_indices must have one row per flattened query token")
 
@@ -1595,12 +1717,14 @@ def _prepare_q_token_kv_block_sparse_attention(
         query,
         k_cache,
         block_table,
-        int(block_indices.shape[1]),
+        int(block_indices.shape[-1]),
         max_seq_len_kv=max_seq_len_kv,
         out_dtype=out.dtype,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
         sparse_block_size=sparse_block_size,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     views = layout.bind(workspace_buffer)
     metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
@@ -1639,12 +1763,21 @@ def _prepare_q_token_kv_block_sparse_attention(
         mask_type="causal",
         window_left=-1,
         kv_layout="HND",
-        page_size=sparse_block_size,
+        page_size=math.gcd(sparse_block_size, int(k_cache.shape[2])),
+        direct_q1_sparse_block_size=sparse_block_size,
         use_q_token_kv_block_sparse_route=True,
         use_pdl=True,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         q_token_kv_block_sparse_page_memberships=(
             views.q_token_kv_block_sparse_page_memberships if group_size > 1 else None
         ),
+        direct_q1_inputs=(
+            (block_indices, block_table, token_to_request, query_positions)
+            if group_size == 1
+            else ()
+        ),
+        direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
     )
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,
@@ -1661,7 +1794,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -1680,6 +1813,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     out: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
 ) -> torch.Tensor:
     """Plan and run one QToken-KvBlock-Sparse-Attention launch.
 
@@ -1694,7 +1829,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     ``qo_indptr``, and ``G`` determines ``seq_len_q``. The indexer
     output is named ``indexer_block_ids`` to distinguish it from BSR
     ``block_indices``. ``kv_block_size`` is the semantic indexer atom
-    (currently four), while the physical cache extent is inferred from
+    (4/8/16/32/64/128), while the physical cache extent is inferred from
     ``paged_kv_cache``.
 
     Parameters
@@ -1703,14 +1838,16 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Packed ``[total_q, Hq, D]`` or fixed ``[B, Nq, G, Hq, D]`` query.
     paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
         Separate HND K/V cache tensors shaped
-        ``[num_pages, Hkv, page_size, D]``.
+        ``[num_pages, Hkv, page_size, D]``. The cache writer must zero-fill
+        unused token slots in allocated pages, as required by
+        :meth:`QTokenKvBlockSparsePagedTSWrapper.run`.
     block_table : torch.Tensor
         Dense CUDA Int32 physical-page table
         ``[num_requests, max_storage_pages]``.
     indexer_block_ids : torch.Tensor
-        CUDA Int32 indexer-selected logical K/V blocks
-        ``[num_query_tokens, block_topk]``. Each valid row must provide the
-        distinct completed-block prefix described by
+        CUDA Int32 indexer-selected logical K/V blocks ``[T, block_topk]``
+        when shared, otherwise ``[T, Hkv, block_topk]``, with a contiguous last
+        dimension. Each valid row provides the completed-block prefix described by
         :meth:`QTokenKvBlockSparsePagedTSWrapper.run`; Q1 does not compact
         missing entries inside that prefix. Tail tokens are derived separately.
     token_to_request : torch.Tensor
@@ -1725,7 +1862,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     seq_len_q : int, optional
         Maximum packed route length. Fixed Q derives it from ``G``.
     kv_block_size : int
-        Semantic sparse K/V block size; only four is implemented.
+        Semantic sparse K/V block size: 4/8/16/32/64/128, default four.
     mask_type : {"causal"}
         QToken-KvBlock-Sparse-Attention currently supports causal masking only.
     sm_scale : float, optional
@@ -1742,6 +1879,15 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Output dtype, defaulting to ``out.dtype`` or ``q.dtype``.
     qo_indptr : torch.Tensor, optional
         CUDA Int32 packed-route offsets.
+    split_kv : bool
+        Allow automatic split-KV selection (default True), independently of
+        query layout. Pass False for prefill and True for decode, matching
+        the value used to size ``workspace_buffer``.
+
+    share_pattern_across_kv_heads : bool
+        True (default) uses one pattern per query, shared by KV heads.
+        False uses independent per-KV-head patterns. Match this setting in
+        workspace sizing and planning; it does not change the attention grid.
 
     Returns
     -------
@@ -1752,8 +1898,14 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(paged_kv_cache)
     if not isinstance(q, torch.Tensor):
         raise TypeError("q must be a torch.Tensor")
-    if not isinstance(indexer_block_ids, torch.Tensor) or indexer_block_ids.ndim != 2:
-        raise ValueError("indexer_block_ids must be a rank-two tensor")
+    pattern_rank = 2 if share_pattern_across_kv_heads else 3
+    if (
+        not isinstance(indexer_block_ids, torch.Tensor)
+        or indexer_block_ids.ndim != pattern_rank
+    ):
+        raise ValueError(
+            "indexer_block_ids must be [T,K] when shared or [T,Hkv,K] otherwise"
+        )
     if out is not None and not isinstance(out, torch.Tensor):
         raise TypeError("out must be a torch.Tensor")
     if o_data_type is None:
@@ -1786,12 +1938,14 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         int(q.shape[-1]),
         kv_block_size,
         int(k_cache.shape[2]),
-        int(indexer_block_ids.shape[1]),
+        int(indexer_block_ids.shape[-1]),
         max_seq_len_kv,
         device=q.device,
         workspace_buffer=workspace_buffer,
         use_packed_q=use_packed_q,
         mask_type=mask_type,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         q_data_type=q.dtype,
         kv_data_type=k_cache.dtype,
         o_data_type=o_data_type,
@@ -1895,23 +2049,16 @@ def _validate_sparse_block_size(sparse_block_size: int) -> int:
         raise TypeError("sparse_block_size must be an integer")
     if sparse_block_size <= 0 or sparse_block_size & (sparse_block_size - 1):
         raise ValueError("sparse_block_size must be a positive power of two")
-    if sparse_block_size != _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE:
-        raise NotImplementedError(
-            "PrimTS QToken-KvBlock-Sparse-Attention currently supports only sparse_block_size=4"
-        )
+    if sparse_block_size not in _Q_TOKEN_KV_BLOCK_SPARSE_BLOCK_SIZES:
+        raise NotImplementedError("sparse_block_size must be 4, 8, 16, 32, 64, or 128")
     return sparse_block_size
 
 
-def _validate_storage_page_size(
-    storage_page_size: int,
-    sparse_block_size: int,
-) -> None:
+def _validate_storage_page_size(storage_page_size: int) -> None:
     if not isinstance(storage_page_size, int) or isinstance(storage_page_size, bool):
         raise TypeError("storage_page_size must be an integer")
-    if storage_page_size < sparse_block_size or storage_page_size % sparse_block_size:
-        raise ValueError(
-            "storage_page_size must be a positive multiple of sparse_block_size"
-        )
+    if storage_page_size < 4 or storage_page_size % 4:
+        raise ValueError("storage_page_size must be a positive multiple of four")
 
 
 def _validate_q_token_kv_block_sparse_max_seq_len_kv(
@@ -1958,6 +2105,7 @@ def _validate_inputs(
     storage_page_size: int,
     max_seq_len_kv: int,
     sparse_block_size: int,
+    share_pattern_across_kv_heads: bool = True,
 ) -> None:
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     for name, tensor in (
@@ -1972,15 +2120,21 @@ def _validate_inputs(
         raise ValueError(
             "QToken-KvBlock-Sparse-Attention metadata inputs must be CUDA tensors"
         )
-    if block_indices.ndim != 2 or block_indices.dtype != torch.int32:
-        raise ValueError("block_indices must be a rank-two int32 tensor")
-    rows, block_topk = block_indices.shape
+    if not isinstance(share_pattern_across_kv_heads, bool):
+        raise TypeError("share_pattern_across_kv_heads must be a bool")
+    rank = 2 if share_pattern_across_kv_heads else 3
+    if block_indices.ndim != rank or block_indices.dtype != torch.int32:
+        shape = "[T,K]" if share_pattern_across_kv_heads else "[T,Hkv,K]"
+        raise ValueError(f"block_indices must be a rank-{rank} int32 tensor {shape}")
+    if rank == 3 and block_indices.shape[1] <= 0:
+        raise ValueError("block_indices must have a positive pattern head count")
+    rows, block_topk = block_indices.shape[0], block_indices.shape[-1]
     _validate_shape_parameters(rows, block_topk, group_size)
     if block_topk > _Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK:
         raise NotImplementedError(
             f"PrimTS QToken-KvBlock-Sparse-Attention currently supports block_topk <= {_Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK}"
         )
-    _validate_storage_page_size(storage_page_size, sparse_block_size)
+    _validate_storage_page_size(storage_page_size)
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("block_table must be a nonempty rank-two int32 tensor")
     if not all(block_table.shape):
@@ -2001,7 +2155,7 @@ def _validate_inputs(
         raise ValueError(
             "QToken-KvBlock-Sparse-Attention metadata inputs must share one CUDA device"
         )
-    if block_indices.stride(1) != 1 or block_table.stride(1) != 1:
+    if block_indices.stride(-1) != 1 or block_table.stride(1) != 1:
         raise ValueError("block_indices and block_table rows must be contiguous")
     if block_table.stride(0) < block_table.shape[1]:
         raise ValueError(

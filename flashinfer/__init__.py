@@ -38,6 +38,7 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
 from .autotune_cache import autotune_v2 as autotune_v2
@@ -77,6 +78,10 @@ from .decode import (
 from .decode import (
     fast_decode_plan as fast_decode_plan,
 )
+from .decode import (
+    launch_sm110_gqa_decode_prepared as launch_sm110_gqa_decode_prepared,
+)
+from .decode import prepare_sm110_gqa_decode as prepare_sm110_gqa_decode
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .decode import sm110_gqa_decode as sm110_gqa_decode
@@ -402,3 +407,6 @@ def _log_import_version() -> None:
 
 _log_import_version()
 del _log_import_version
+
+from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
+from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill

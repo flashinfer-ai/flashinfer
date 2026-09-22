@@ -9,16 +9,20 @@ The contiguous-grouped implementation is exposed through the Python API
 
 - Dtypes: BF16 and FP16 activations/weights, f32 accumulation. No
   quantization. Output dtype = input dtype.
-- Activation: gated SiLU (SwiGLU), fused into GEMM1's epilogue.
+- Activation, fused into GEMM1's epilogue: gated SwiGLU (default; the OAI
+  variant through `swiglu_alpha`/`swiglu_beta`/`swiglu_limit`, SiTU through
+  `situ_beta`/`situ_linear_beta`), gated GeGLU-tanh, and the non-gated
+  ReLU² (`w1` is then a plain `[E, I, hidden]` projection). Selected with
+  `activation_type` (`ActivationType.Swiglu`, `GegluTanh`, `Relu2`; any
+  other value is rejected) plus the SwiGLU/SiTU constants.
 - Routing: pre-routed only (`token_selected_experts` int32 global ids +
   caller-normalized `token_final_scales` fp32); no in-kernel router;
   `top_k` is a compile-time constant.
 - EP: `num_local_experts` + `local_expert_offset` select the local expert
   shard (tokens routed entirely outside it contribute zeros). TP is
   shape-only (callers pass per-rank weight shards).
-- Shapes: `hidden % 64 == 0` (GEMM1's reduction moves whole 64-element K
-  tiles), `2I % 64 == 0`, `I % 32 == 0` (interleave granularity; GEMM2's K
-  tail is zero-filled by TMA); `num_tokens == 0` supported.
+- Shapes: `hidden % 8 == 0`; `I % 32 == 0` for gated activations (32-column
+  up/gate interleave), `I % 8 == 0` for ReLU²; `num_tokens == 0` supported.
 - Execution: CUDA-graph capturable; PDL on by default (`enable_pdl`);
   fused finalize (default) is atomic and not bitwise-reproducible,
   `use_fused_finalize=False` selects the deterministic two-stage path.
@@ -27,8 +31,8 @@ The contiguous-grouped implementation is exposed through the Python API
 
 ```
 moe_sort (C++ JIT routing)  ->  index maps only, no data movement
-GEMM1: gather + grouped GEMM + SwiGLU  ->  intermediate [permuted_m, I]
-GEMM2: grouped GEMM + fused finalize   ->  out [num_tokens, hidden]
+GEMM1: gather + grouped GEMM + activation  ->  intermediate [permuted_m, I]
+GEMM2: grouped GEMM + fused finalize       ->  out [num_tokens, hidden]
 ```
 
 The expert dimension is flattened into M: rows are expert-sorted and each
@@ -69,11 +73,13 @@ and the auxiliary-stream output initialization remain ordered.
 
 ## 3. GEMM1 — `Sm90ContiguousGatherGroupedGemmActFusionKernel`
 
-`C[r, 0:I] = silu(gate) * up` where `[up | gate] = x[token(r)] @ w1[e].T`.
+`C[r, 0:I] = act(gate) * up` where `[up | gate] = x[token(r)] @ w1[e].T`.
 `w1[e] [2I, hidden]` is the expert's fc1 pack: the model's two separate
 projection matrices (gate and up — w1/w3 in Llama-style naming), row-
 concatenated and 32-column interleaved (§6), so one GEMM with N = 2I
-produces both projections and the epilogue gates them in registers.
+produces both projections and the epilogue gates them in registers. For
+the non-gated ReLU² the pack is the single projection `w1[e] [I, hidden]`,
+N = I, and the epilogue writes every accumulator column.
 
 Warp specialization (persistent, `StaticPersistentTileScheduler` per
 warpgroup — no scheduler warp; the tile maps are read directly from GMEM):
@@ -83,7 +89,7 @@ warpgroup — no scheduler warp; the tile maps are read directly from GMEM):
   16 B chunk `t%8`; rows past `mn_limit` predicated off); warp 0's elected
   lane TMA-loads B with the expert index as L-coordinate.
 - **1–2 consumer warpgroups (232 regs)**: WGMMA `MmaF16BF16Op`
-  (m64·n·k16, f32 accumulators) + the gated epilogue. Two consumer
+  (m64·n·k16, f32 accumulators) + the activation epilogue. Two consumer
   warpgroups iff `tile_m > 64 and tile_n > 128`.
 
 Pipelines: A on `PipelineCpAsync`, B on `PipelineTmaAsync` (consumers wait
@@ -93,8 +99,9 @@ epilogue ring (~6 stages at 128x128, 4 at 128x256).
 
 Gated epilogue: w1 is pre-interleaved at **32-column up/gate granularity**
 (`[up 0:32 | gate 0:32 | up 32:64 | ...]`), so an even accumulator subtile
-is always "up" and the following odd subtile its "gate"; the epilogue emits
-`silu(gate)*up` in f32 and TMA-stores `N/2` output columns. Requires
+is always "up" and the following odd subtile its "gate"; the epilogue applies
+the formula selected by `activation_type` to each pair in f32 (`silu(gate)*up`
+for the default SwiGLU) and TMA-stores `N/2` output columns. Requires
 `tile_n % 64 == 0`: the 32-column interleave makes each complete up/gate
 pair 64 columns.
 
@@ -181,9 +188,10 @@ is explicitly selected. Tactic validation belongs to candidate selection,
 keeping dispatch lightweight: a persisted winner of another tactic schema
 fails at its first dispatch with a `ValueError` naming the expected
 structure, so tuning caches are re-tuned after a schema change rather
-than validated on every call. Candidate lists depend only on the problem
-shapes and the global expert count, so expert-parallel ranks that tune
-together profile identical sequences.
+than validated on every call. Candidate lists depend on the problem
+shapes and the global expert count; the local shard enters only through
+the padded row bound, so expert-parallel ranks that tune together profile
+identical sequences.
 
 Compiled kernels are reused within a process. Loading saved tuning results
 still requires compiling the selected kernels, so applications must warm

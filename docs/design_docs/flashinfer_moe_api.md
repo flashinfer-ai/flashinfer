@@ -42,7 +42,6 @@ config = MoEConfig(
     ),
     quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    # NVFP4 activation packs are backend-native; choose one candidate set.
     backends=[TrtllmFp4Config(extra_backend_params...)],
 )
 # --- Find possible backends ---
@@ -122,11 +121,9 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 ```
 # Single backend
 backends = [TrtllmFp4Config()]
-# Multiple candidates are valid only when they consume the same activation
-# pack contract. NVFP4 TRT-LLM and CUTLASS require different packs, so select
-# either singleton candidate set explicitly.
-backends = [TrtllmFp4Config()]
-# or: backends = [CutlassNvfp4Config()]
+# Multiple candidates share one MoEActivationPack: for each MMA pair every
+# backend consumes the TRT-LLM canonical pack (see MoEActivationPack).
+backends = [TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
 ```
 
@@ -725,7 +722,9 @@ out = layer(act, weights)            # subsequent calls: cached winner dispatch
 Key mechanisms (and where they live):
 
 - **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
-- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path. CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **One activation pack per MMA pair.** For NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale` (formats per pair: `MoEActivationPack` docstring), so a mixed candidate set such as `(TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config())` runs on one pack and the `prepare_activations` helpers of different backends for one pair are interchangeable. Per-tensor FP8 carries no pack scale: the static `hidden_states_scale_global` / `intermediate_scale_global` are `prepare_weights` inputs of both `TrtllmFp8PerTensorConfig` and `CutlassFp8PerTensorConfig`, and CUTLASS folds its flat `quant_scales` from them at load time. Exceptions: b12x / cuTile NVFP4 take BF16 and quantize in-kernel, so they do not share candidate sets with the pre-quantized NVFP4 backends; the opt-in `QuantConfig(swizzled_scale_factors=True)` selects the flat swizzled MXFP8 `input_sf` that only the CUTLASS MXFP8 runners consume (every other runner rejects the flag in `check_support`); CUTLASS runners reject `QuantConfig(per_token_scale=True)`. Routing is matched separately: `routing_input_mode` support is per runner (`supported_routing_modes`) and `MoELayer.__call__` filters on it.
+- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). Weight views are backend-native: CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path, and CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. The quantized activation payload is shared: for NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale`, so the `prepare_activations` helpers of different backends for one pair are interchangeable (see "One activation pack per MMA pair" below). Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **One canonical source order.** Every `prepare_weights` takes gated `w1` as `[E, 2I, H]` with rows `[up, gate]` (first `I` rows are the linear half, last `I` the gate); backends that need `[gate, up]` swap halves in their prepare helper, never in `MoEConfig`. A caller holding `[gate, up]` checkpoints does one `chunk`/`cat` at load. The fuzz references read this order for every backend; `tests/moe/test_unified_moe.py::test_bf16_gate_up_row_order_is_up_then_gate` additionally runs asymmetric halves through the TRT-LLM and CUTLASS BF16 runners so a kernel and reference that share a swap cannot both pass.
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
@@ -1041,7 +1040,10 @@ exercised end-to-end):
   global-scale field, so calibrated-checkpoint scales are silently dropped
   (~2400× output inflation). This is roadmap item #5 below (a standardized
   intermediate-scale **QuantSpec** policy), not a quick fix; quick mitigation is
-  to make `prepare_*` fail **loud** on a non-default scale.
+  to make `prepare_*` fail **loud** on a non-default scale. Partially resolved
+  for per-tensor FP8: `trtllm_fp8_per_tensor` and `cutlass_fp8_per_tensor`
+  take the calibrated `hidden_states_scale_global` / `intermediate_scale_global`
+  as `prepare_weights` inputs (see "First-class prep" above).
 
 **Roadmap (ranked, from the 2026-06-09 audit of 51 past MoE issues):** (1) a
 Blackwell/SM120 **PR-CI runner** — highest leverage, since PR-gating CI tops out

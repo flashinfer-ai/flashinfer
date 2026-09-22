@@ -69,10 +69,10 @@ meant to compare against the reference tables.
 
 History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
 every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
-`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on prenyx B200). The
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
 root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
 activation-quant staging (`DataPreprocess` in
-`kernel_src/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
+`kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
 staging path — fixed by the upstream `50117315d` sync recorded in that drop's
 VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
 their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
@@ -288,7 +288,7 @@ tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
 below only as a parity *reference*: the MR!27 mainloop WAR brings 4.5.2 to
 4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
 unsupported (4.5.0 fails at `cute.compile`) — see
-[`../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
@@ -500,7 +500,7 @@ A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
 under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
 vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
-- `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
   (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
@@ -541,7 +541,8 @@ def get_symm_buffer_for_<name>_mega_moe(
     world_size: int,            # self.ep_world_size
     *,
     kind=...,                   # dtype selector, if applicable
-    # ... kernel knobs: clamps, in_kernel_fc2_reduce, token_back_by_dispatch, ...
+    # ... session params: clamps, enable_in_kernel_fc2_reduce, ...
+    knobs=...,                  # tile/schedule/token-back tactics, or None
 ) -> <Name>SymmBuffer: ...
 ```
 
@@ -571,7 +572,7 @@ caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
 Add both functions under the owning tree's `shim/` — e.g.
-`kernel_src/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
+`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
 `nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
 for Hopper — and re-export them from that package's `__init__.py` (or point at
 your own kernel module). Raw kernel sources live under the tree's `src/` — see

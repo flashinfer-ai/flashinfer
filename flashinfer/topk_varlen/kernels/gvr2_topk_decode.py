@@ -1132,17 +1132,39 @@ def merge_scan0(
 # ===========================================================================
 @cute.jit
 def gather_hint(
-    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk: cutlass.Constexpr, kpt: cutlass.Constexpr
+    x_addr,
+    p_addr,
+    k,
+    n,
+    tidx,
+    s_wmn,
+    s_wmx,
+    blk: cutlass.Constexpr,
+    kpt: cutlass.Constexpr,
+    identity: cutlass.Constexpr = False,
 ):
+    """Hint bracket [GMIN, GMAX] over the k hinted row positions (block-uniform).
+
+    ``identity`` (hint-free engines): the hint is the identity sample — row
+    positions 0..k-1 — computed in registers, so the k coalesced ``pre_idx``
+    loads are compiled out and the bracket is the min/max of the first k row
+    values. FlashInfer-local: upstream (TRT-LLM #18410) compiles the whole
+    gather out and lets the degenerate-sample / floor-retry paths run with the
+    sentinel bracket; the identity gather keeps those paths as tight as the
+    hinted engine's (measured: the sentinel form costs up to 5% on the main
+    family at wide batches, see the hint-free A/B in the port notes)."""
     NW = blk // 32
     lane = tidx & cutlass.Int32(31)
-    # batch A: KPT coalesced pre_idx loads, predicated flat
+    # batch A: KPT coalesced pre_idx loads, predicated flat (identity: pv = j)
     pvs = []
     for t in cutlass.range_constexpr(kpt):
         pv = cutlass.Int32(-1)
         j = tidx + cutlass.Int32(t * blk)
         if j < k:
-            pv = ld_g_i32(p_addr, j)
+            if cutlass.const_expr(identity):
+                pv = j
+            else:
+                pv = ld_g_i32(p_addr, j)
         pvs.append(pv)
     # batch B: KPT scattered read-only gathers, predicated flat
     xs = []
@@ -1405,6 +1427,7 @@ class GvrMainKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         r_const: int = 1,
+        hint_free: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1415,6 +1438,9 @@ class GvrMainKernel:
         self.nbs = nbs
         self.kpt = kpt
         self.split = bool(split)
+        # hint-free: gather_hint sites compiled out (sentinel pass-through);
+        # upstream PR NVIDIA/TensorRT-LLM#18410
+        self.hint_free = bool(hint_free)
         # ---- per-row varlen mode (production heuristicTopKDecode contract) --
         # n and the sampling-ladder scalars are re-derived PER ROW inside the
         # kernel from a device kv_lens tensor (route_dynamic formula mirror);
@@ -2059,7 +2085,7 @@ class GvrMainKernel:
             needg = cutlass.Int32(0)
         if needg != cutlass.Int32(0):
             GMIN, GMAX = C.gather_hint(
-                x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
+                x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT, identity=self.hint_free
             )  # 2 barriers inside
             T = GMIN
         if sok != cutlass.Int32(0):  # HIC tighten
@@ -2459,7 +2485,16 @@ class GvrMainKernel:
                             # LAZY GATHER (sentinel equality flag)
                             if GMIN == cutlass.Float32(C.SENT_LO):
                                 GMIN, GMAX = C.gather_hint(
-                                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
+                                    x_addr,
+                                    p_addr,
+                                    k,
+                                    n,
+                                    tidx,
+                                    s_wmn,
+                                    s_wmx,
+                                    blk=BLK,
+                                    kpt=KPT,
+                                    identity=self.hint_free,
                                 )
                             floorhit = cutlass.Int32(1)
                             if T > GMIN:
@@ -3045,19 +3080,22 @@ class GvrMainKernel:
 _COMPILE_CACHE = {}
 
 
-def get_compiled(tpl, options_extra: str = ""):
+def get_compiled(tpl, options_extra: str = "", hint_free: bool = False):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
     — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
-    machinery in whenever SPLIT and gates it per row at runtime)."""
-    key = (tuple(tpl), options_extra, C._compile_arch_token())
+    machinery in whenever SPLIT and gates it per row at runtime).
+    ``hint_free`` compiles the hint-gather sites out (part of the key)."""
+    key = (tuple(tpl), options_extra, bool(hint_free), C._compile_arch_token())
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
     if len(tpl) == 7:
         blk, u, minb, nbs, kpt, split, tshg = tpl
-        kern = GvrMainKernel(blk, u, minb, nbs, kpt, bool(split), bool(tshg))
+        kern = GvrMainKernel(
+            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free)
+        )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
         kern = GvrMainKernel(
@@ -3072,6 +3110,7 @@ def get_compiled(tpl, options_extra: str = ""):
             next_n=next_n,
             cr_shift=cr_shift,
             r_const=r_const,
+            hint_free=bool(hint_free),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3112,6 +3151,8 @@ def get_compiled(tpl, options_extra: str = ""):
     name = "main_" + "_".join(str(x) for x in tuple(tpl))
     if options_extra:
         name += "_opt_" + options_extra
+    if hint_free:
+        name += "_hf"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -3401,6 +3442,7 @@ class GvrTopkRegKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
+        hint_free: bool = False,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -3426,8 +3468,20 @@ class GvrTopkRegKernel:
         # derived compile-time constants
         self.S = vpt * 4
         self.lnbh = {256: 8, 512: 9, 2048: 11}.get(nbh, 10)
-        self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1
-        self.use_img = img and vpt == 1
+        # hint-free: bracket = min/max fold of the first k row values
+        # (already in registers); the hint-gather bracket arms are forced off
+        # (upstream PR NVIDIA/TensorRT-LLM#18410)
+        self.hint_free = bool(hint_free)
+        self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hint_free)
+        self.use_img = img and vpt == 1 and (not hint_free)
+        # hint-free bracket policy (FlashInfer-local refinement of TRT-LLM
+        # #18410, which always folds): VPT == 1 folds the single register
+        # float4 (no smem image / bitmap staging: measured ~5% faster than the
+        # hinted rung); VPT >= 2 keeps the hinted rung's gather arm on the
+        # identity positions (pvs = j, no pre_idx loads), because the fold over
+        # 8-16 register values serializes the bracket behind every row load and
+        # measured 4-5% slower than the gather at n = 16K
+        self.hf_fold = self.hint_free and (not deg) and vpt == 1
         self.brl = (minb * blk <= 1024) or (vpt == 1)
 
     # ------------------------------------------------------------------
@@ -3638,12 +3692,15 @@ class GvrTopkRegKernel:
             # ---- hint prefetch: KPT coalesced pre_idx words BEFORE any
             # dependent gather; compiled out under DEG.
             pvs = []
-            if cutlass.const_expr(not self.deg):
+            if cutlass.const_expr(not (self.deg or self.hf_fold)):
                 for t in cutlass.range_constexpr(KPT):
                     pv = cutlass.Int32(-1)
                     j = tid + cutlass.Int32(t * self.blk)
                     if j < k:
-                        pv = ld_g_i32(p_addr, j)
+                        if cutlass.const_expr(self.hint_free):
+                            pv = j  # identity hint: positions 0..k-1, no load
+                        else:
+                            pv = ld_g_i32(p_addr, j)
                     pvs.append(pv)
 
             # ---- row load: exact-fit peel + float4[VPT] register batch
@@ -3733,6 +3790,25 @@ class GvrTopkRegKernel:
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)  # monotone
                 cute.arch.barrier()  # bm dies
+            elif cutlass.const_expr(self.hf_fold):
+                # hint-free bracket (VPT == 1): min/max over the first k row
+                # values this thread already holds in its register float4
+                # (upstream PR NVIDIA/TensorRT-LLM#18410) — the bracket an
+                # identity hint would produce, without hint loads or gather.
+                # VPT >= 2 hint-free rungs take the default gather arm below on
+                # identity positions (see ``hf_fold`` in the ctor).
+                lmn = cutlass.Float32(_POS_INF)
+                lmx = cutlass.Float32(_NEG_INF__reg)
+                for s in cutlass.range_constexpr(S):
+                    pos = (
+                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                    ) + cutlass.Int32(s % 4)
+                    if pos < k:
+                        v = _val(frags, s)
+                        lmn = fmin_f32(lmn, v)
+                        lmx = fmax_f32(lmx, v)
+                lmin = fkey(lmn)
+                lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
                 lmn = cutlass.Float32(_POS_INF)
                 lmx = cutlass.Float32(_NEG_INF__reg)
@@ -4365,10 +4441,27 @@ class GvrTopkRegKernel:
 _COMPILE_CACHE__reg: dict = {}
 
 
-def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
+def get_compiled__reg(
+    tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, hint_free=False
+):
     """Compile (or fetch) the variant for constexpr tuple
-    (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token())
+    (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
+
+    ``hint_free`` is normalized away for DEG plans: the degenerate-sample
+    kernel never reads the hint (no prefetch, no gather arm), so the hinted and
+    hint-free launchers share one compiled object instead of two byte-identical
+    ones."""
+    if bool(tpl[5]):  # DEG
+        hint_free = False
+    key = (
+        tuple(tpl),
+        bool(pdl),
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        bool(hint_free),
+        C._compile_arch_token(),
+    )
     compiled = _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
@@ -4387,6 +4480,7 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
             varlen=varlen,
             next_n=next_n,
             cr_shift=cr_shift,
+            hint_free=hint_free,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -4432,6 +4526,7 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
             name = (
                 "reg_" + "_".join(str(x) for x in tuple(tpl))
                 + f"_pdl{int(bool(pdl))}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
+                + ("_hf" if hint_free else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__reg[key] = compiled
@@ -4547,6 +4642,7 @@ class GvrClusKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
+        hint_free: bool = False,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
@@ -4562,6 +4658,7 @@ class GvrClusKernel:
         self.cr_shift = int(cr_shift)
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
+        self.hint_free = bool(hint_free)  # hint-free: gather_hint sites compiled out
         self.lcs = cs.bit_length() - 1  # log2(CS) for the per-row Q shift
         self.blk = blk
         self.u = u
@@ -5118,7 +5215,7 @@ class GvrClusKernel:
             if needg != cutlass.Int32(0):
                 # degenerate sample: identical on every rank of the cluster
                 GMIN, GMAX = C.gather_hint(
-                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1
+                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1, identity=self.hint_free
                 )  # 2 barriers
                 T = GMIN
             if sok != cutlass.Int32(0):  # HIC tighten
@@ -5349,7 +5446,16 @@ class GvrClusKernel:
                             # LAZY GATHER — every rank computes identical GMIN
                             if GMIN == cutlass.Float32(C.SENT_LO):
                                 GMIN, GMAX = C.gather_hint(
-                                    x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=1
+                                    x_addr,
+                                    p_addr,
+                                    k,
+                                    n,
+                                    tidx,
+                                    s_wmn,
+                                    s_wmx,
+                                    blk=BLK,
+                                    kpt=1,
+                                    identity=self.hint_free,
                                 )  # 2 barriers inside
                             floorhit = cutlass.Int32(1)
                             if T > GMIN:
@@ -5729,6 +5835,7 @@ def get_compiled__clus(
     varlen: bool = False,
     next_n: int = 1,
     cr_shift: int = 0,
+    hint_free: bool = False,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -5741,6 +5848,7 @@ def get_compiled__clus(
         bool(varlen),
         int(next_n),
         int(cr_shift),
+        bool(hint_free),
         C._compile_arch_token(),
     )
     hit = _COMPILE_CACHE__clus.get(key)
@@ -5748,7 +5856,17 @@ def get_compiled__clus(
         return hit
     blk, u, minb, nbs, cs = tpl
     kern = GvrClusKernel(
-        blk, u, minb, nbs, cs, scap=scap, cmp_=cmp_, varlen=varlen, next_n=next_n, cr_shift=cr_shift
+        blk,
+        u,
+        minb,
+        nbs,
+        cs,
+        scap=scap,
+        cmp_=cmp_,
+        varlen=varlen,
+        next_n=next_n,
+        cr_shift=cr_shift,
+        hint_free=hint_free,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -5783,6 +5901,7 @@ def get_compiled__clus(
     name = (
         "clus_" + "_".join(str(x) for x in tuple(tpl))
         + f"_scap{int(scap)}_cmp{int(cmp_)}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
+        + ("_hf" if hint_free else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
@@ -5976,6 +6095,7 @@ class GvrRegClusKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
+        hint_free: bool = False,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
@@ -5992,6 +6112,8 @@ class GvrRegClusKernel:
         self.cr_shift = int(cr_shift)
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
+        # hint-free: P0 samples the first k row elements (coalesced) instead of the hint
+        self.hint_free = bool(hint_free)
         self.S = vpt * 4
         self.span = blk * vpt  # float4 per CTA
 
@@ -6146,9 +6268,15 @@ class GvrRegClusKernel:
 
             # ---- P0: redundant hint gather, EVERY CTA (k<=BLK by dispatch
             # gate). One coalesced word per thread, NO cluster barrier —
-            # GMIN/GMAX identical everywhere by construction.
-            if tid < k:
-                pv0 = ld_g_i32(p_addr, tid)
+            # GMIN/GMAX identical everywhere by construction. hint-free: the
+            # first k row positions stand in for the hint (identity sample),
+            # no pre_idx load (upstream PR NVIDIA/TensorRT-LLM#18410).
+            if cutlass.const_expr(self.hint_free):
+                if tid < k:
+                    pv0 = tid
+            else:
+                if tid < k:
+                    pv0 = ld_g_i32(p_addr, tid)
 
             # ---- P1: row load — predicated flat float4[VPT] batch (the CUDA
             # has NO exact-fit peel here, guard is per-load). Issue all loads
@@ -6659,16 +6787,33 @@ class GvrRegClusKernel:
 _COMPILE_CACHE__regclus: dict = {}
 
 
-def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
+def get_compiled__regclus(
+    tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, hint_free=False
+):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token())
+    key = (
+        tuple(tpl),
+        bool(pdl),
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        bool(hint_free),
+        C._compile_arch_token(),
+    )
     compiled = _COMPILE_CACHE__regclus.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
         blk, vpt, cs = tpl
         kernel = GvrRegClusKernel(
-            blk, vpt, cs, pdl=pdl, varlen=varlen, next_n=next_n, cr_shift=cr_shift
+            blk,
+            vpt,
+            cs,
+            pdl=pdl,
+            varlen=varlen,
+            next_n=next_n,
+            cr_shift=cr_shift,
+            hint_free=hint_free,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -6710,6 +6855,7 @@ def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1,
             name = (
                 "regclus_" + "_".join(str(x) for x in tuple(tpl))
                 + f"_pdl{int(bool(pdl))}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
+                + ("_hf" if hint_free else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__regclus[key] = compiled
