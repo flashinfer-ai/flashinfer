@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.cuh>
 #include <limits>
+#include <numeric>
 
 #include "tvm_ffi_utils.h"
 
@@ -24,7 +26,6 @@ namespace {
 
 using flashinfer::attention::prims_ts::kQTokenKvBlockSparseMaxBlockTopK;
 using flashinfer::attention::prims_ts::kQTokenKvBlockSparseMembershipsPerWord;
-using flashinfer::attention::prims_ts::kQTokenKvBlockSparseSparseBlockSize;
 using flashinfer::attention::prims_ts::LaunchQTokenKvBlockSparseTouchedMetadata;
 using flashinfer::attention::prims_ts::QTokenKvBlockSparseTouchedMetadataParams;
 
@@ -40,6 +41,9 @@ struct QTokenKvBlockSparseMetadataGeometry {
   int32_t max_seq_len_kv;
   int32_t model_block_bound;
   int32_t model_radix_end_bit;
+  int32_t sparse_block_size;
+  int32_t fragment_size;
+  int32_t pattern_heads;
 };
 
 void CheckInt32CUDA(const TensorView& tensor, const char* name) {
@@ -98,31 +102,35 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
     CheckSameDevice(block_indices, *qo_indptr, "qo_indptr");
   }
 
-  TVM_FFI_ICHECK(group_size == 1 || group_size == 2 || group_size == 4 || group_size == 5)
-      << "group_size must be 1, 2, 4, or 5";
-  TVM_FFI_ICHECK_EQ(sparse_block_size, kQTokenKvBlockSparseSparseBlockSize)
-      << "the touched-ID QToken-KvBlock-Sparse-Attention metadata kernel currently supports "
-         "sparse_block_size=4";
-  TVM_FFI_ICHECK(storage_page_size >= sparse_block_size &&
-                 storage_page_size % sparse_block_size == 0 &&
+  TVM_FFI_ICHECK(group_size >= 1 && group_size <= 8) << "group_size must be in [1, 8]";
+  TVM_FFI_ICHECK(sparse_block_size >= 4 && sparse_block_size <= 128 &&
+                 (sparse_block_size & (sparse_block_size - 1)) == 0)
+      << "sparse_block_size must be 4, 8, 16, 32, 64, or 128";
+  TVM_FFI_ICHECK(storage_page_size >= 4 && storage_page_size % 4 == 0 &&
                  storage_page_size <= std::numeric_limits<int32_t>::max())
-      << "storage_page_size must be an int32 multiple of sparse_block_size";
+      << "storage_page_size must be an int32 positive multiple of four";
+  const int64_t fragment_size = std::gcd(storage_page_size, sparse_block_size);
   TVM_FFI_ICHECK(max_seq_len_kv > 0 && max_seq_len_kv <= std::numeric_limits<int32_t>::max())
       << "max_seq_len_kv must fit positive int32";
   const int64_t expected_model_block_bound =
       (max_seq_len_kv + sparse_block_size - 1) / sparse_block_size;
 
-  TVM_FFI_ICHECK_EQ(block_indices.ndim(), 2) << "block_indices must be rank two";
+  TVM_FFI_ICHECK(block_indices.ndim() == 2 || block_indices.ndim() == 3)
+      << "block_indices must be [T,K] or [T,Hkv,K]";
+  const int topk_axis = block_indices.ndim() - 1;
+  const int64_t pattern_heads = block_indices.ndim() == 3 ? block_indices.size(1) : 1;
+  TVM_FFI_ICHECK(pattern_heads > 0 && pattern_heads <= std::numeric_limits<int32_t>::max())
+      << "pattern head count must fit positive int32";
   TVM_FFI_ICHECK(block_indices.size(0) >= 0 &&
                  block_indices.size(0) <= std::numeric_limits<int32_t>::max())
       << "block_indices row count must fit int32";
-  TVM_FFI_ICHECK(block_indices.size(1) > 0 &&
-                 block_indices.size(1) <= kQTokenKvBlockSparseMaxBlockTopK)
+  TVM_FFI_ICHECK(block_indices.size(topk_axis) > 0 &&
+                 block_indices.size(topk_axis) <= kQTokenKvBlockSparseMaxBlockTopK)
       << "block_indices topk must be in [1, 512]";
-  TVM_FFI_ICHECK_EQ(block_indices.stride(1), 1) << "block_indices rows must be contiguous";
+  TVM_FFI_ICHECK_EQ(block_indices.stride(topk_axis), 1) << "block_indices rows must be contiguous";
 
   const int64_t rows = block_indices.size(0);
-  const int64_t block_topk = block_indices.size(1);
+  const int64_t block_topk = block_indices.size(topk_axis);
   TVM_FFI_ICHECK_EQ(token_to_request.ndim(), 1) << "token_to_request must be rank one";
   TVM_FFI_ICHECK_EQ(token_to_request.size(0), rows)
       << "token_to_request must have one entry per query row";
@@ -146,7 +154,10 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
   TVM_FFI_ICHECK(seq_lens.size(0) >= 0 && seq_lens.size(0) <= std::numeric_limits<int32_t>::max())
       << "query-group count must fit int32";
   TVM_FFI_ICHECK(seq_lens.IsContiguous()) << "seq_lens must be contiguous";
-  const int64_t groups = seq_lens.size(0);
+  TVM_FFI_ICHECK_EQ(seq_lens.size(0) % pattern_heads, 0)
+      << "metadata rows must be divisible by pattern head count";
+  const int64_t groups = seq_lens.size(0) / pattern_heads;
+  const int64_t metadata_rows = groups * pattern_heads;
   if constexpr (PackedQuery) {
     TVM_FFI_ICHECK_EQ(qo_indptr->ndim(), 1) << "qo_indptr must be rank one";
     TVM_FFI_ICHECK_EQ(qo_indptr->size(0), groups + 1) << "qo_indptr must have groups + 1 entries";
@@ -157,24 +168,27 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
     TVM_FFI_ICHECK_EQ(rows, groups * group_size)
         << "fixed QToken-KvBlock-Sparse-Attention rows must equal groups * group_size";
   }
-  const int64_t page_capacity = group_size * (block_topk + 1);
+  const int64_t max_block_capacity = group_size * (block_topk + 1);
+  const int64_t min_block_capacity = std::min(max_block_capacity, expected_model_block_bound);
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.ndim(), 2)
+      << "q_token_kv_block_sparse_page_indices must be rank two";
+  const int64_t page_capacity = q_token_kv_block_sparse_page_indices.size(1);
+  TVM_FFI_ICHECK(page_capacity >= min_block_capacity * (sparse_block_size / fragment_size) &&
+                 page_capacity <= max_block_capacity * (sparse_block_size / fragment_size))
+      << "sparse fragment capacity must cover the logical union bound";
   const int64_t membership_words =
       group_size == 1 ? 0
                       : (page_capacity + kQTokenKvBlockSparseMembershipsPerWord - 1) /
                             kQTokenKvBlockSparseMembershipsPerWord;
   TVM_FFI_ICHECK(page_capacity <= std::numeric_limits<int32_t>::max())
       << "QToken-KvBlock-Sparse-Attention page capacity must fit int32";
-  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.ndim(), 2)
-      << "q_token_kv_block_sparse_page_indices must be rank two";
-  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.size(0), groups)
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.size(0), metadata_rows)
       << "q_token_kv_block_sparse_page_indices group count mismatch";
-  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.size(1), page_capacity)
-      << "q_token_kv_block_sparse_page_indices width must be group_size * (topk + 1)";
   TVM_FFI_ICHECK(q_token_kv_block_sparse_page_indices.IsContiguous())
       << "q_token_kv_block_sparse_page_indices must be contiguous";
   TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.ndim(), 2)
       << "q_token_kv_block_sparse_page_memberships must be rank two";
-  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.size(0), groups)
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.size(0), metadata_rows)
       << "q_token_kv_block_sparse_page_memberships group count mismatch";
   TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.size(1), membership_words)
       << "q_token_kv_block_sparse_page_memberships must pack four membership bytes per int32 word";
@@ -185,9 +199,7 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
   TVM_FFI_ICHECK(membership_words == 0 || q_token_kv_block_sparse_page_memberships.IsContiguous())
       << "q_token_kv_block_sparse_page_memberships must be contiguous";
 
-  const int64_t subpages_per_storage_page = storage_page_size / sparse_block_size;
-  const int64_t addressable_model_blocks = block_table.size(1) * subpages_per_storage_page;
-  TVM_FFI_ICHECK_LE(expected_model_block_bound, addressable_model_blocks)
+  TVM_FFI_ICHECK_LE(max_seq_len_kv, block_table.size(1) * storage_page_size)
       << "the dense block table does not address max_seq_len_kv";
   const int32_t model_radix_end_bit = BitWidth(static_cast<uint32_t>(expected_model_block_bound));
   // The sorted key retains a three-bit query tag above the radix-sorted
@@ -205,7 +217,10 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
           static_cast<int32_t>(storage_page_size),
           static_cast<int32_t>(max_seq_len_kv),
           static_cast<int32_t>(expected_model_block_bound),
-          model_radix_end_bit};
+          model_radix_end_bit,
+          static_cast<int32_t>(sparse_block_size),
+          static_cast<int32_t>(fragment_size),
+          static_cast<int32_t>(pattern_heads)};
 }
 
 template <typename PositionType, bool PackedQuery>
@@ -215,6 +230,7 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
             TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
             const QTokenKvBlockSparseMetadataGeometry& geometry, int32_t group_size,
             bool release_pdl) {
+  const int topk_axis = block_indices.ndim() - 1;
   QTokenKvBlockSparseTouchedMetadataParams<PositionType> params{
       static_cast<const int32_t*>(block_indices.data_ptr()),
       static_cast<const int32_t*>(block_table.data_ptr()),
@@ -225,7 +241,8 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
       static_cast<int32_t*>(q_token_kv_block_sparse_page_memberships.data_ptr()),
       static_cast<int32_t*>(seq_lens.data_ptr()),
       block_indices.stride(0),
-      block_indices.stride(1),
+      block_indices.stride(topk_axis),
+      block_indices.ndim() == 3 ? block_indices.stride(1) : 0,
       block_table.stride(0),
       block_table.stride(1),
       geometry.rows,
@@ -238,9 +255,14 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
       geometry.max_seq_len_kv,
       geometry.model_block_bound,
       geometry.model_radix_end_bit,
+      geometry.sparse_block_size,
+      BitWidth(geometry.sparse_block_size) - 1,
+      geometry.fragment_size,
+      geometry.sparse_block_size / geometry.fragment_size,
       flashinfer::uint_fastdiv(static_cast<uint32_t>(geometry.block_topk + 1)),
       flashinfer::uint_fastdiv(
-          static_cast<uint32_t>(geometry.storage_page_size / kQTokenKvBlockSparseSparseBlockSize)),
+          static_cast<uint32_t>(geometry.storage_page_size / geometry.fragment_size)),
+      flashinfer::uint_fastdiv(static_cast<uint32_t>(geometry.pattern_heads)),
       release_pdl};
 
   ffi::CUDADeviceGuard device_guard(block_indices.device().device_id);

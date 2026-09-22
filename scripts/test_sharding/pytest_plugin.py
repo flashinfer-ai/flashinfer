@@ -48,13 +48,15 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "long_running: dispatch every unit from this source before normal work",
     )
-    config._flashinfer_sharding = {  # type: ignore[attr-defined]
-        "session_start": time.time(),
+    session_start = time.time()
+    state = {
+        "session_start": session_start,
         "collection_complete": None,
         "first_case_start": None,
         "report_complete": None,
         "nodes": {},
     }
+    config._flashinfer_sharding = state  # type: ignore[attr-defined]
 
 
 def _marker_name(item: pytest.Item) -> str | None:
