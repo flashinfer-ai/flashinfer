@@ -310,7 +310,31 @@ def test_tp_workspace_size_follows_intermediate_shard():
     for tokens in (1, 16, 512, 4096):
         assert tp.get_workspace_size(tokens) == single_shard.get_workspace_size(tokens)
         assert tp.get_workspace_size(tokens) < ep.get_workspace_size(tokens)
-    # Documented sizes; expert parallelism keeps the original layout.
+    # The swap-AB decode path (T <= 16) needs less workspace than the 128-row
+    # token-tile layout it replaces.
+    ep_legacy = mx.CuteDslMxfp4MoEWrapper(
+        896,
+        16,
+        7168,
+        3072,
+        parallel_layout=layout("expert_parallel", 8, 3),
+        swapab_max_tokens=0,
+    )
+    for tokens in (1, 16):
+        assert ep.get_workspace_size(tokens) < ep_legacy.get_workspace_size(tokens)
+    assert ep.get_workspace_size(17) == ep_legacy.get_workspace_size(17)
+    tp, ep = (
+        mx.CuteDslMxfp4MoEWrapper(
+            896,
+            16,
+            7168,
+            3072,
+            parallel_layout=layout(mode, 8, rank),
+            swapab_max_tokens=0,
+        )
+        for mode, rank in (("moe_tensor_parallel", 1), ("expert_parallel", 3))
+    )
+    # Documented sizes of the 128-row layout; expert parallelism keeps it.
     assert [ep.get_workspace_size(t) for t in (1, 16, 4096)] == [
         6499072,
         45885440,

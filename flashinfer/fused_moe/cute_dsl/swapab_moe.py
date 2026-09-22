@@ -13,6 +13,7 @@ compile cache and the launch sequence.
 """
 
 import os
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -30,8 +31,42 @@ from .moe_utils import get_max_num_tiles, moe_sort
 # Rows of routed activations per MMA-N tile. SWAPAB_NTILE overrides for
 # experiments (8, 16, 32, 64 or 128).
 SWAP_ROW_TILE = int(os.environ.get("SWAPAB_NTILE", "32"))
-# 4 K-blocks (128 K elements) per stage: one 128-byte swizzle atom per FP8 row.
-SWAP_K_BLOCKS_PER_STAGE = 4
+# K-blocks (of 32 elements) per mainloop stage: 4, 8 or 16 (SWAPAB_KBLOCKS).
+SWAP_K_BLOCKS_PER_STAGE = int(os.environ.get("SWAPAB_KBLOCKS", "4"))
+# Pipeline depth knobs (SWAPAB_STAGES / SWAPAB_ACC_STAGES override for tuning).
+SWAP_MAX_AB_STAGES = int(os.environ.get("SWAPAB_STAGES", "12"))
+SWAP_ACC_STAGES = int(os.environ.get("SWAPAB_ACC_STAGES", "2"))
+# bit 0: tile-major W1 (GEMM1), bit 1: tile-major W2 (GEMM2). Default: both.
+# Each 128x128 MMA tile becomes one contiguous 8 KB block so the weight TMA
+# streams whole DRAM pages (B300: GEMM1 -2%, GEMM2 -2.5% at T=16 balanced).
+SWAP_TILED_WEIGHTS = int(os.environ.get("SWAPAB_TILED_W", "3"))
+
+_tiled_weight_cache: "OrderedDict[Tuple, Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+_TILED_WEIGHT_CACHE_MAX = 64
+
+
+def tile_major_weights(w: torch.Tensor) -> torch.Tensor:
+    """One-time relayout of packed MXFP4 weights ``(E, M, K/2)`` uint8 into
+    tile-major ``(E, M/128, K/128, 128, 64)`` so every 128x128 MMA tile is a
+    contiguous 8 KB block.
+
+    Cached per source tensor. The entry keeps a reference to the source so its
+    address cannot be recycled by the allocator while the entry is alive (the
+    key includes the address); weights are treated as immutable.
+    """
+    key = (w.data_ptr(), tuple(w.shape), w.dtype, w.device)
+    hit = _tiled_weight_cache.get(key)
+    if hit is not None and hit[0] is w or (hit is not None and hit[0].data_ptr() == w.data_ptr()):
+        _tiled_weight_cache.move_to_end(key)
+        return hit[1]
+    e, m, kb = w.shape
+    if m % 128 or kb % 64:
+        raise ValueError("tile-major weights need M % 128 == 0 and K % 128 == 0")
+    t = w.view(e, m // 128, 128, kb // 64, 64).permute(0, 1, 3, 2, 4).contiguous()
+    _tiled_weight_cache[key] = (w, t)
+    while len(_tiled_weight_cache) > _TILED_WEIGHT_CACHE_MAX:
+        _tiled_weight_cache.popitem(last=False)
+    return t
 
 _swapab_kernel_cache: Dict[Tuple, Any] = {}
 
@@ -65,6 +100,7 @@ def _get_compiled_swapab_kernel(
     compile_args: Tuple,
     max_active_clusters: int,
     stream: cuda.CUstream,
+    tiled_a: bool = False,
 ):
     import os
     import sys
@@ -78,6 +114,9 @@ def _get_compiled_swapab_kernel(
         linear_beta_count,
         use_linear_beta,
         enable_pdl,
+        SWAP_MAX_AB_STAGES,
+        SWAP_ACC_STAGES,
+        tiled_a,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -89,6 +128,8 @@ def _get_compiled_swapab_kernel(
             epilogue_kind=epilogue_kind,
             enable_pdl=enable_pdl,
             use_linear_beta=use_linear_beta,
+            max_ab_stages=SWAP_MAX_AB_STAGES,
+            num_acc_stages=SWAP_ACC_STAGES,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -97,6 +138,7 @@ def _get_compiled_swapab_kernel(
             beta_count=beta_count,
             linear_beta_count=linear_beta_count,
             max_active_clusters=max_active_clusters,
+            tiled_a=tiled_a,
             stream=stream,
         )
         if os.environ.get("SWAPAB_DEBUG"):
@@ -155,7 +197,11 @@ def swapab_gemm1_situ(
     max_active_clusters = get_max_active_clusters(1)
     use_linear_beta = linear_beta is not None
     args = (
-        _gmem_ptr(cutlass.Float4E2M1FN, w1, 32),
+        _gmem_ptr(
+            cutlass.Float4E2M1FN,
+            tile_major_weights(w1) if (SWAP_TILED_WEIGHTS & 1) else w1,
+            32,
+        ),
         _gmem_ptr(cutlass.Float8E4M3FN, x, 16),
         _gmem_ptr(cutlass.Float8E8M0FNU, w1_sf, 16),
         _gmem_ptr(cutlass.Float8E8M0FNU, x_sf, 4),
@@ -193,6 +239,7 @@ def swapab_gemm1_situ(
         compile_args=args,
         max_active_clusters=max_active_clusters,
         stream=stream,
+        tiled_a=bool(SWAP_TILED_WEIGHTS & 1),
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -247,7 +294,11 @@ def swapab_gemm2(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(1)
     args = (
-        _gmem_ptr(cutlass.Float4E2M1FN, w2, 32),
+        _gmem_ptr(
+            cutlass.Float4E2M1FN,
+            tile_major_weights(w2) if (SWAP_TILED_WEIGHTS & 2) else w2,
+            32,
+        ),
         _gmem_ptr(cutlass.Float8E4M3FN, act, 16),
         _gmem_ptr(cutlass.Float8E8M0FNU, w2_sf, 16),
         _gmem_ptr(cutlass.Float8E8M0FNU, act_sf, 4),
@@ -285,6 +336,7 @@ def swapab_gemm2(
         compile_args=args,
         max_active_clusters=max_active_clusters,
         stream=stream,
+        tiled_a=bool(SWAP_TILED_WEIGHTS & 2),
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)

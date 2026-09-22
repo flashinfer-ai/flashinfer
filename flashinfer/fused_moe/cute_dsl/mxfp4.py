@@ -27,11 +27,12 @@ from math import prod
 from typing import Optional
 
 import cuda.bindings.driver as cuda
+import os
 import torch
 
 from ...tllm_enums import ActivationType
 from .fused_moe import _moe_core_impl, validate_w4a8_inputs
-from .moe_utils import get_max_num_tiles
+from .moe_utils import get_max_num_tiles, moe_sort
 from .mxfp4_routing import _plan_route_preprocess
 from .swapab_moe import SWAP_ROW_TILE, swapab_gemm1_situ, swapab_gemm2
 from .tuner import DEFAULT_BLACKWELL_MOE_TACTIC, canonicalize_w4a8_tactic
@@ -432,6 +433,19 @@ class Mxfp4MoESwapAbPlan:
         self._inputs = (x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf)
         self._beta = beta
         self._linear_beta = linear_beta
+        # Same private surface as Mxfp4MoEPlan (tests poke these buffers).
+        self._topk_ids = topk_ids
+        self._topk_weights = topk_weights
+        self._kwargs = {
+            "gemm1_out": buffers["gemm1_out"],
+            "gemm1_out_scale": buffers["gemm1_out_scale"],
+            "moe_output": output,
+            "moe_sort_buffers": {
+                name: value
+                for name, value in buffers.items()
+                if name.startswith("out_")
+            },
+        }
         self._route_ids = buffers["route_ids"] if topk_weights is None else topk_ids
         self._route_weights = (
             topk_weights
@@ -439,28 +453,61 @@ class Mxfp4MoESwapAbPlan:
             else buffers["route_weights"]
         )
 
+    def _prepare_routing(self):
+        if self._topk_weights is None:
+            torch.bitwise_right_shift(self._topk_ids, 16, out=self._route_ids)
+            self._route_weights.copy_(self._packed_weight_view)
+        elif self._route_weights is not self._topk_weights:
+            self._route_weights.copy_(self._topk_weights)
+
     def _prepare(self):
         w = self._wrapper
         x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf = self._inputs
         b = self._buffers
         num_tokens = x.shape[0]
+        self._route_preprocess = None
+        self._sort = None
+        self._packed_weight_view = (
+            topk_ids.view(torch.bfloat16)[:, ::2] if topk_weights is None else None
+        )
+        sort_buffers = {
+            name: value for name, value in b.items() if name.startswith("out_")
+        }
+        launches = {}
         with torch.cuda.device(self.device):
-            self._route_preprocess = _plan_route_preprocess(
-                topk_ids,
-                topk_weights,
-                route_ids=self._route_ids,
-                route_weights=self._route_weights,
-                output=self.output,
-                moe_sort_buffers={
-                    name: value for name, value in b.items() if name.startswith("out_")
-                },
-                num_experts=w.num_experts,
-                num_local_experts=w.num_local_experts,
-                local_expert_offset=w.local_expert_offset,
-                tile_size=self.n_tile,
-                _single_tile_per_expert=self.n_tile >= num_tokens,
-            )
-            launches = {}
+            if num_tokens <= 16:
+                # Fused decode routing: ID unpack, FP32 weights, n_tile-row
+                # groups and the output zero-fill in one launch.
+                self._route_preprocess = _plan_route_preprocess(
+                    topk_ids,
+                    topk_weights,
+                    route_ids=self._route_ids,
+                    route_weights=self._route_weights,
+                    output=self.output,
+                    moe_sort_buffers=sort_buffers,
+                    num_experts=w.num_experts,
+                    num_local_experts=w.num_local_experts,
+                    local_expert_offset=w.local_expert_offset,
+                    tile_size=self.n_tile,
+                    _single_tile_per_expert=self.n_tile >= num_tokens,
+                )
+            else:
+                # Generic routing: torch unpack + moe_sort with n_tile-row
+                # groups; GEMM1 zero-fills the output in-kernel.
+                self._prepare_routing()
+                moe_sort(
+                    token_selected_experts=self._route_ids,
+                    token_final_scales=self._route_weights,
+                    num_experts=w.num_experts,
+                    top_k=w.top_k,
+                    local_expert_offset=w.local_expert_offset,
+                    num_local_experts=w.num_local_experts,
+                    tile_tokens_dim=self.n_tile,
+                    enable_pdl=w.enable_pdl,
+                    _prepared_launches=launches,
+                    **sort_buffers,
+                )
+                self._sort, self._sort_args = launches["sort"]
             swapab_gemm1_situ(
                 w1=w1,
                 w1_sf=w1_sf,
@@ -476,7 +523,7 @@ class Mxfp4MoESwapAbPlan:
                 beta=self._beta,
                 linear_beta=self._linear_beta,
                 top_k=w.top_k,
-                zero_output=None,
+                zero_output=None if self._route_preprocess is not None else self.output,
                 n_tile=self.n_tile,
                 enable_pdl=w.enable_pdl,
                 _prepared_launches=launches,
@@ -505,8 +552,13 @@ class Mxfp4MoESwapAbPlan:
     def run(self) -> torch.Tensor:
         """Enqueue three launches on the caller's current stream."""
         with torch.cuda.device(self.device):
-            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-            self._route_preprocess.run(stream)
+            stream_ptr = torch.cuda.current_stream().cuda_stream
+            stream = cuda.CUstream(stream_ptr)
+            if self._route_preprocess is not None:
+                self._route_preprocess.run(stream)
+            else:
+                self._prepare_routing()
+                self._sort(*self._sort_args, stream_ptr)
             self._gemm1(*self._gemm1_args, stream=stream)
             self._gemm2(*self._gemm2_args, stream=stream)
         return self.output
@@ -549,6 +601,7 @@ class CuteDslMxfp4MoEWrapper:
         offline_tactics: Optional[dict] = None,
         swapab_max_tokens: int = 16,
         swapab_n_tile: int = SWAP_ROW_TILE,
+        swapab_tile_policy=None,
     ):
         self.num_experts = num_experts
         self.top_k = top_k
@@ -560,12 +613,32 @@ class CuteDslMxfp4MoEWrapper:
         # Swap-AB decode path: token counts up to ``swapab_max_tokens`` (0
         # disables) run weights-as-M grouped GEMMs with ``swapab_n_tile``-row
         # expert groups; the fused route preprocess bounds it to T <= 16.
-        if not 0 <= swapab_max_tokens <= 16:
-            raise ValueError("swapab_max_tokens must be in [0, 16]")
+        if swapab_max_tokens < 0:
+            raise ValueError("swapab_max_tokens must be >= 0")
         if swapab_n_tile not in (8, 16, 32, 64, 128):
             raise ValueError("swapab_n_tile must be 8, 16, 32, 64 or 128")
         self.swapab_max_tokens = swapab_max_tokens
         self.swapab_n_tile = swapab_n_tile
+        # (max_tokens, rows per expert group) buckets for T > 16; T <= 16 uses
+        # ``swapab_n_tile``. Weights are re-streamed once per group, so the
+        # group width grows with the expected rows per local expert.
+        policy = swapab_tile_policy
+        if policy is None:
+            env_policy = os.environ.get("SWAPAB_TILE_POLICY")
+            if env_policy:
+                # "256:8,1024:16,2048:32,0:64" (0 = no upper bound)
+                policy = tuple(
+                    (int(t) if int(t) > 0 else (1 << 62), int(n))
+                    for t, n in (item.split(":") for item in env_policy.split(","))
+                )
+            else:
+                policy = ((256, 8), (1024, 16), (2048, 32), (1 << 62, 64))
+        policy = tuple((int(t), int(n)) for t, n in policy)
+        if any(n not in (8, 16, 32, 64, 128) for _, n in policy) or any(
+            policy[i][0] >= policy[i + 1][0] for i in range(len(policy) - 1)
+        ):
+            raise ValueError("swapab_tile_policy must be ascending (max_tokens, tile in {8..128})")
+        self.swapab_tile_policy = policy
         supported = mxfp4_moe_capability(
             gpu_arch=103,
             hidden_size=hidden_size,
@@ -622,11 +695,19 @@ class CuteDslMxfp4MoEWrapper:
             and not self.enable_pdl
         )
 
+    def _swap_tile(self, num_tokens):
+        if num_tokens <= 16:
+            return self.swapab_n_tile
+        for max_tokens, tile in self.swapab_tile_policy:
+            if num_tokens <= max_tokens:
+                return tile
+        return self.swapab_tile_policy[-1][1]
+
     def _workspace_fields(self, num_tokens):
         if num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
         if self._use_swapab(num_tokens):
-            tile = self.swapab_n_tile
+            tile = self._swap_tile(num_tokens)
             tiles = get_max_num_tiles(
                 num_tokens, self.top_k, self.num_local_experts, tile
             )
@@ -634,6 +715,8 @@ class CuteDslMxfp4MoEWrapper:
             specs = [
                 ("out_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
                 ("out_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
+                # moe_sort scratch (T > 16 path; used by the sort for T > 1024)
+                ("out_expert_counts", (2 * 4096,), torch.int32, 4),
                 (
                     "out_expanded_idx_to_permuted_idx",
                     (num_tokens, self.top_k),
@@ -910,7 +993,7 @@ class CuteDslMxfp4MoEWrapper:
                     beta=beta,
                     linear_beta=linear_beta,
                     output=output,
-                    n_tile=self.swapab_n_tile,
+                    n_tile=self._swap_tile(num_tokens),
                 )
                 swap_plan._prepare()
                 return swap_plan
