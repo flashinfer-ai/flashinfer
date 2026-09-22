@@ -322,13 +322,17 @@ def _get_compiled_gather_kernel(
 
     if cache_key not in _gather_kernel_cache:
         if is_rubin:
-            # The Rubin (SM107) kernel currently only implements the gated
-            # (SwiGLU) activation path with the default SwiGLU constants.
-            if normalized_activation_type != ActivationType.Swiglu:
+            # The Rubin (SM107) kernel implements SwiGLU (plus its SiTU variant,
+            # selected by situ_beta) and Relu2, with the default SwiGLU
+            # constants. GeGLU-tanh is not implemented.
+            if normalized_activation_type not in (
+                ActivationType.Swiglu,
+                ActivationType.Relu2,
+            ):
                 raise NotImplementedError(
                     f"activation_type {normalized_activation_type!r} is not supported by "
                     "the Rubin (SM107) gather grouped GEMM kernel yet "
-                    "(SwiGLU only)."
+                    "(SwiGLU, SiTU and Relu2 only)."
                 )
             if (swiglu_alpha, swiglu_beta, swiglu_limit) != (
                 DEFAULT_SWIGLU_ALPHA,
@@ -356,6 +360,9 @@ def _get_compiled_gather_kernel(
                 topk=topk,
                 raster_along_m=raster_along_m,
                 enable_pdl=enable_pdl,
+                activation_type=normalized_activation_type.value,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         else:
             # Create kernel instance
