@@ -3619,18 +3619,8 @@ def _apply_auto_grouped_q_mma_config(
     SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
     caller-provided MMA fields retain the existing path. Explicit fanout
     controls bypass this selector together with explicit launch and MMA fields.
-    The compact H64 paged mixed-precision profile shares this selection path,
-    but considers only SwapsMmaAb because transform-KV does not support Keeps.
+    Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
     """
-    is_h64_paged_mixed_q_len = (
-        cfg.headdim == 64
-        and seq_len_q > 1
-        and cfg.use_transform_kv
-        and cfg.use_paged_kv
-    )
-    is_default_grouped_q_profile = (
-        cfg.use_paged_kv and cfg.num_tokens_per_page == 32 and cfg.mask_type == CAUSAL
-    )
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
@@ -3638,7 +3628,8 @@ def _apply_auto_grouped_q_mma_config(
         or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or not (is_default_grouped_q_profile or is_h64_paged_mixed_q_len)
+        or cfg.num_tokens_per_page != 32
+        or cfg.mask_type != CAUSAL
         or cfg.use_sliding_window_causal
         or cfg.use_attention_sinks
         or bool(_MMA_SELECTION_FIELDS & explicit_fields)
