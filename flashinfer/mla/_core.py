@@ -21,7 +21,7 @@ from typing import List, Literal, Optional, Sequence, Tuple, Union, cast
 
 import torch
 
-from ..api_logging import flashinfer_api
+from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from flashinfer.autotuner import (
     AutoTuner,
     TunableRunner,
@@ -4351,6 +4351,67 @@ def trtllm_batch_decode_with_kv_cache_mla(
 trtllm_batch_decode_with_kv_cache_mla.__doc__ = (
     _trtllm_batch_decode_with_kv_cache_mla_impl.__doc__
 )
+
+
+@flashinfer_experimental_api
+def prepare_nvfp4_batch_decode_with_kv_cache_mla(
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    sm_scale: float,
+    sinks: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
+    backend: str = "cake",
+):
+    """Prepare NVFP4 DeepSeek-V4 paged MQA decode attention.
+
+    The experimental Cake backend serves ``[batch * 6, num_heads, 512]``
+    queries against a shared paged K/V cache of 64-token pages, both stored
+    as packed E2M1 bytes (256 per row) with UE4M3 block-16 scales (32 per
+    row), with a causal mask inside the six-token query block, optional
+    per-head attention sinks, BF16 output and natural-log FP32 LSE. It
+    requires compute capability 10.0 or 10.3.
+
+    Preparation validates inputs, builds the host work plan from the
+    sequence lengths (one device-to-host copy unless ``seq_lens_cpu`` is
+    given), carves split partials out of ``workspace_buffer`` and returns an
+    ``NVFP4MLADecodeRunner``. Calling the runner launches the decode kernel
+    and, when planned, the split-KV combine kernel without CUDA allocation and
+    returns ``out`` (or ``(out, lse)`` with ``return_lse=True``). Prepare a
+    new runner after changing sequence lengths, bindings or input values.
+    CUDA Graph ownership remains with the caller. See
+    ``flashinfer/experimental/nvfp4_mla_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("NVFP4 MLA decode currently supports backend='cake'")
+    from ..experimental.nvfp4_mla_decode.cake_backend import (
+        prepare_nvfp4_batch_decode_with_kv_cache_mla as prepare,
+    )
+
+    return prepare(
+        query,
+        query_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        sm_scale=sm_scale,
+        sinks=sinks,
+        out=out,
+        lse=lse,
+        return_lse=return_lse,
+        seq_lens_cpu=seq_lens_cpu,
+        backend="cake",
+    )
 
 
 @flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
