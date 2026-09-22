@@ -4628,6 +4628,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         # no launch kwargs are needed for tactic enumeration.
         return self._inner.get_valid_tactics(inputs, profile)
 
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple[Any, ...]:
+        return self._inner.get_cache_key_extras(inputs)
+
     def forward(
         self,
         inputs: List[torch.Tensor],
@@ -5743,6 +5746,9 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
     ) -> List[Any]:
         self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple[Any, ...]:
+        return self._inner.get_cache_key_extras(inputs)
 
     def forward(
         self,
