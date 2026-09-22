@@ -46,13 +46,16 @@ from flashinfer.attention.prims_ts.decode import (
     _DECODE_MAX_KV_LEN,
     _DECODE_MAX_KV_TILE_SIZE,
     _DecodePlanState,
+    _get_compiled_decode,
     _make_decode_workspace_layout,
     _planned_kv_domain_has_unpaired_tail,
+    _resolve_decode_launch_spec,
     _validate_prims_ts_q_token_kv_block_sparse_group_layout,
     _validate_q_token_kv_block_sparse_route_offsets_cpu,
     _validate_decode_query_head_extent,
     _validate_decode_policy_kv_tile_size,
     _validate_decode_run_metadata_values,
+    _validate_dtype_pair,
     _validate_block_table_metadata,
     _validate_head_geometry,
     _validate_max_kv_len,
@@ -63,6 +66,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
 )
+from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
     FmhaDecodeConfig,
     make_decode_config,
@@ -1601,7 +1605,8 @@ def _plan_case(
         max_seq_len_q=(seq_len_q if max_seq_len_q is None else max_seq_len_q),
         packed_query=qo_indptr is not None,
         q_data_type=case.q.dtype,
-        kv_data_type=case.k_cache.dtype,
+        k_data_type=case.k_cache.dtype,
+        v_data_type=case.v_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
         window_left=case.window_left,
@@ -1699,7 +1704,7 @@ def _run_standalone(
             qo_indptr=qo_indptr,
             max_seq_len_q=max_seq_len_q,
             q_dtype=case.q.dtype,
-            kv_dtype=case.k_cache.dtype,
+            k_dtype=case.k_cache.dtype,
             out_dtype=case.output_dtype,
             mask_type=case.mask_type,
             window_left=case.window_left,
@@ -2110,7 +2115,8 @@ def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(
     cfg = FmhaDecodeConfig(
         headdim=256,
         q_dtype=Float8E4M3FN,
-        kv_dtype=Float8E4M3FN,
+        k_dtype=Float8E4M3FN,
+        v_dtype=Float8E4M3FN,
         out_dtype=BFloat16,
         use_paged_kv=True,
         num_tokens_per_page=page_size,
@@ -2121,6 +2127,43 @@ def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(
         tile_size_q=64,
     )
     assert cfg.supports_reduction_dtypes is sparse
+
+
+def test_attention_ts_decode_dtype_pair_guards() -> None:
+    """Reject unsupported mixes while allowing transformed KV and FP8 PV."""
+
+    _validate_dtype_pair(
+        torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16
+    )
+    with pytest.raises(NotImplementedError, match=r"attention-ts decode supports"):
+        _validate_dtype_pair(
+            torch.float16, torch.float8_e4m3fn, torch.float16, torch.float16
+        )
+    for q_dtype, v_dtype in (
+        (torch.float16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+    ):
+        with pytest.raises(NotImplementedError, match=r"attention-ts decode supports"):
+            _validate_dtype_pair(q_dtype, q_dtype, v_dtype, torch.float16)
+
+
+@pytest.mark.parametrize("kv_dtype", (torch.float8_e4m3fn, torch.uint8))
+def test_attention_ts_decode_common_kv_dtype_alias(kv_dtype):
+    from flashinfer.attention.prims_ts.decode import _resolve_kv_dtypes
+
+    assert _resolve_kv_dtypes(torch.bfloat16, None, None, kv_dtype) == (
+        kv_dtype,
+        kv_dtype,
+    )
+    assert _resolve_kv_dtypes(torch.bfloat16, kv_dtype, kv_dtype, kv_dtype) == (
+        kv_dtype,
+        kv_dtype,
+    )
+    with pytest.raises(ValueError, match="must agree"):
+        _resolve_kv_dtypes(torch.bfloat16, torch.bfloat16, None, kv_dtype)
+    with pytest.raises(ValueError, match="must agree"):
+        _resolve_kv_dtypes(torch.bfloat16, None, torch.bfloat16, kv_dtype)
 
 
 def test_attention_ts_decode_public_query_geometry_guards() -> None:
@@ -2213,6 +2256,7 @@ def test_attention_ts_decode_fp8_head_ratio_buckets(
             32,
             4096,
             1,
+            "float8_e4m3fn",
             "float8_e4m3fn",
             "float8_e4m3fn",
             "float8_e4m3fn",
@@ -2541,6 +2585,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "max_seq_len_q",
         "packed_query",
         "q_data_type",
+        "k_data_type",
+        "v_data_type",
         "kv_data_type",
         "o_data_type",
         "mask_type",
@@ -2771,7 +2817,9 @@ def _make_contiguous_keeps_config(*, dtype, tile_size_q: int, headdim: int = 128
         batch_size=8,
         num_heads_q=4 * tile_size_q,
         num_heads_kv=4,
-        qkv_dtype=dtype,
+        q_dtype=dtype,
+        k_dtype=dtype,
+        v_dtype=dtype,
         o_dtype=Float16 if dtype == Float8E4M3FN else dtype,
         qkv_layout="contiguousKv",
         split_kv_mode="disabled",
@@ -2809,7 +2857,9 @@ def _make_contiguous_kv256_config(
         batch_size=1,
         num_heads_q=32,
         num_heads_kv=32,
-        qkv_dtype=dtype,
+        q_dtype=dtype,
+        k_dtype=dtype,
+        v_dtype=dtype,
         o_dtype=dtype,
         qkv_layout="contiguousKv",
         split_kv_mode=split_kv_mode,
@@ -2836,7 +2886,9 @@ def _make_paged_window_crossing_config(*, page_size: int):
         batch_size=1,
         num_heads_q=64,
         num_heads_kv=1,
-        qkv_dtype=BFloat16,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
         o_dtype=BFloat16,
         qkv_layout="pagedKv",
         num_tokens_per_page=page_size,
@@ -2993,7 +3045,8 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
         4,
         2051,
         q_dtype=case.q.dtype,
-        kv_dtype=packed_cache[0].dtype,
+        k_dtype=packed_cache[0].dtype,
+        v_dtype=packed_cache[1].dtype,
         out_dtype=case.output_dtype,
         mask_type="causal",
         storage_page_size=storage_page_size,
@@ -3127,7 +3180,8 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
         4,
         2051,
         q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
         mask_type="causal",
         storage_page_size=storage_page_size,
@@ -3208,7 +3262,9 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         batch_size=1,
         num_heads_q=12,
         num_heads_kv=1,
-        qkv_dtype=BFloat16,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
         o_dtype=BFloat16,
         qkv_layout="pagedKv",
         num_tokens_per_page=4,
@@ -3272,7 +3328,8 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         kv_tokens,
         seq_len_q=group_size,
         q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
         mask_type="causal",
         storage_page_size=storage_page_size,
@@ -3364,7 +3421,9 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         batch_size=batch_size,
         num_heads_q=12,
         num_heads_kv=1,
-        qkv_dtype=BFloat16,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
         o_dtype=BFloat16,
         qkv_layout="pagedKv",
         num_tokens_per_page=4,
@@ -3474,7 +3533,8 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         kv_tokens,
         seq_len_q=4,
         q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
         mask_type="causal",
         storage_page_size=storage_page_size,
@@ -3594,7 +3654,8 @@ def test_attention_ts_decode_page4_inert_block_table_row_is_zero() -> None:
         semantic_page_size,
         max_seq_len,
         q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
+        k_dtype=k_cache.dtype,
+        v_dtype=v_cache.dtype,
         out_dtype=q.dtype,
         mask_type="causal",
         storage_page_size=storage_page_size,
@@ -3976,7 +4037,9 @@ def test_attention_ts_decode_kv256_register_budget_matches_launch_bound() -> Non
         batch_size=1,
         num_heads_q=32,
         num_heads_kv=32,
-        qkv_dtype=BFloat16,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
         o_dtype=BFloat16,
         qkv_layout="contiguousKv",
         split_kv_mode="disabled",
@@ -4124,7 +4187,7 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
 def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):
     from flashinfer.attention.prims_ts import decode as decode_module
 
-    decode_module._validate_dtype_pair(q_dtype, kv_dtype, output_dtype)
+    decode_module._validate_dtype_pair(q_dtype, kv_dtype, kv_dtype, output_dtype)
 
 
 def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
@@ -4133,6 +4196,7 @@ def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
     with pytest.raises(NotImplementedError, match=r"BF16 Q \+ FP8 K/V"):
         decode_module._validate_dtype_pair(
             torch.float16,
+            torch.float8_e4m3fn,
             torch.float8_e4m3fn,
             torch.float16,
         )
@@ -5256,7 +5320,9 @@ def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
         batch_size=1,
         num_heads_q=8,
         num_heads_kv=1,
-        qkv_dtype=BFloat16,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
         o_dtype=BFloat16,
         qkv_layout="pagedKv",
         num_tokens_per_page=32,
@@ -5288,7 +5354,9 @@ def test_attention_ts_decode_config_requires_positive_head_counts(
             batch_size=1,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
-            qkv_dtype=BFloat16,
+            q_dtype=BFloat16,
+            k_dtype=BFloat16,
+            v_dtype=BFloat16,
             o_dtype=BFloat16,
             qkv_layout="pagedKv",
             num_tokens_per_page=16,
@@ -5318,7 +5386,9 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
         "batch_size": 1,
         "num_heads_q": 32,
         "num_heads_kv": 32,
-        "qkv_dtype": BFloat16,
+        "q_dtype": BFloat16,
+        "k_dtype": BFloat16,
+        "v_dtype": BFloat16,
         "o_dtype": BFloat16,
         "qkv_layout": "pagedKv",
         "num_tokens_per_page": 16,
@@ -5336,7 +5406,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
         "seq_len_q": 64,
         "num_heads_q": 128,
         "num_heads_kv": 4,
-        "qkv_dtype": dtype,
+        "q_dtype": dtype,
+        "k_dtype": dtype,
+        "v_dtype": dtype,
         "o_dtype": dtype,
         "num_tokens_per_page": 32,
         "mask_type": "causal",
@@ -5380,7 +5452,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
                 "seq_len_q": 1,
                 "num_heads_q": 32,
                 "num_heads_kv": 4,
-                "qkv_dtype": Float16,
+                "q_dtype": Float16,
+                "k_dtype": Float16,
+                "v_dtype": Float16,
                 "o_dtype": Float16,
                 "num_tokens_per_page": 32,
                 "mask_type": "causal",
@@ -5429,7 +5503,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
                 "seq_len_q": 1,
                 "num_heads_q": 64,
                 "num_heads_kv": 4,
-                "qkv_dtype": Float16,
+                "q_dtype": Float16,
+                "k_dtype": Float16,
+                "v_dtype": Float16,
                 "o_dtype": Float16,
                 "num_tokens_per_page": 32,
                 "mask_type": "causal",
@@ -5449,7 +5525,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
                 "seq_len_kv": 512,
                 "num_heads_q": 16,
                 "num_heads_kv": 1,
-                "qkv_dtype": Float8E4M3FN,
+                "q_dtype": Float8E4M3FN,
+                "k_dtype": Float8E4M3FN,
+                "v_dtype": Float8E4M3FN,
                 "o_dtype": Float16,
                 "num_tokens_per_page": 32,
                 "mask_type": "causal",
@@ -5794,6 +5872,7 @@ def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> No
             "float16",
             "float16",
             "float16",
+            "float16",
             "HND",
             "causal",
             False,
@@ -5857,6 +5936,7 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
             page_size,
             max_kv_len,
             group_size,
+            qkv_dtype,
             qkv_dtype,
             qkv_dtype,
             output_dtype,
@@ -6034,6 +6114,7 @@ def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_q_token_kv_bloc
             "bfloat16",
             "bfloat16",
             "bfloat16",
+            "bfloat16",
             "HND",
             "causal",
             False,
@@ -6086,6 +6167,7 @@ def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
             "float16",
             "float16",
             "float16",
+            "float16",
             "HND",
             "causal",
             False,
@@ -6131,7 +6213,9 @@ def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
         batch_size=1,
         num_heads_q=16,
         num_heads_kv=1,
-        qkv_dtype=Float16,
+        q_dtype=Float16,
+        k_dtype=Float16,
+        v_dtype=Float16,
         o_dtype=Float16,
         qkv_layout="pagedKv",
         num_tokens_per_page=16,
@@ -6150,12 +6234,408 @@ def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
 
 
 @pytest.mark.parametrize(
+    (
+        "q_dtype",
+        "k_dtype",
+        "v_dtype",
+        "pv_dtype",
+        "qk_step",
+        "pv_step",
+        "p_bytes",
+        "p_regs",
+    ),
+    (
+        pytest.param(Float16, Float16, Float16, Float16, 16, 16, 2048, 4, id="fp16"),
+        pytest.param(
+            BFloat16, BFloat16, BFloat16, BFloat16, 16, 16, 2048, 4, id="bf16"
+        ),
+        pytest.param(
+            Float8E4M3FN,
+            Float8E4M3FN,
+            Float8E4M3FN,
+            Float8E4M3FN,
+            32,
+            32,
+            1024,
+            2,
+            id="fp8",
+        ),
+        pytest.param(
+            BFloat16,
+            Float8E4M3FN,
+            Float8E4M3FN,
+            BFloat16,
+            16,
+            16,
+            2048,
+            4,
+            id="bf16q-fp8kv",
+        ),
+        pytest.param(
+            BFloat16,
+            Float4E2M1FN,
+            Float4E2M1FN,
+            BFloat16,
+            16,
+            16,
+            2048,
+            4,
+            id="bf16q-nvfp4kv",
+        ),
+        pytest.param(
+            Float8E4M3FN,
+            Float4E2M1FN,
+            Float4E2M1FN,
+            Float8E4M3FN,
+            32,
+            32,
+            1024,
+            2,
+            id="fp8q-nvfp4kv",
+        ),
+        pytest.param(
+            BFloat16,
+            BFloat16,
+            Float8E4M3FN,
+            Float8E4M3FN,
+            16,
+            32,
+            1024,
+            2,
+            id="bf16qk-fp8v",
+        ),
+    ),
+)
+def test_attention_ts_decode_effective_mma_precision(
+    q_dtype, k_dtype, v_dtype, pv_dtype, qk_step, pv_step, p_bytes, p_regs
+):
+    """KV storage width must not select transformed MMA or P precision."""
+    from cutlass.experimental import primitives as prims
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_common import (
+        _mma_k_step_pv,
+        _mma_k_step_qk,
+        _mma_kind_for_pv,
+        _mma_kind_for_qk,
+    )
+
+    cfg = FmhaDecodeConfig(
+        headdim=128,
+        q_dtype=q_dtype,
+        k_dtype=k_dtype,
+        v_dtype=v_dtype,
+        out_dtype=q_dtype,
+        use_keeps_mma_ab=False,
+        tile_size_q=8,
+    )
+    assert cfg.qk_dtype == q_dtype
+    assert cfg.pv_dtype == pv_dtype
+    assert _mma_k_step_qk(cfg) == qk_step
+    assert _mma_k_step_pv(cfg) == pv_step
+    assert _mma_kind_for_qk(cfg) == (
+        prims.Tcgen05MMAKind.F8F6F4 if qk_step == 32 else prims.Tcgen05MMAKind.F16
+    )
+    assert _mma_kind_for_pv(cfg) == (
+        prims.Tcgen05MMAKind.F8F6F4 if pv_step == 32 else prims.Tcgen05MMAKind.F16
+    )
+    assert cfg.smem_p_tile_bytes == p_bytes
+    assert cfg.num_packed_p_regs == p_regs
+
+
+def _make_mixed_kv_dtype_config(
+    *,
+    tile_size_q: int = 64,
+    v_dtype: type = Float8E4M3FN,
+    config_args: dict[str, object] | None = None,
+):
+    """qk=BF16 and v=FP8 config for exercising the mixed-dtype profile gate."""
+
+    args = {
+        "use_keeps_mma_ab": True,
+        "tile_size_kv": 128,
+        "tile_size_q": tile_size_q,
+        "num_insts_kv": 2,
+        "groups_tokens_heads_q": False,
+    }
+    if config_args is not None:
+        args.update(config_args)
+    return make_decode_config(
+        headdim=128,
+        args=args,
+        seq_len_q=1,
+        seq_len_kv=1024,
+        batch_size=1,
+        num_heads_q=tile_size_q,
+        num_heads_kv=1,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=v_dtype,
+        o_dtype=BFloat16,
+        qkv_layout="contiguousKv",
+        mask_type="dense",
+        auto_tuner=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tile_size_q", "config_args", "via_static_path", "expected_error"),
+    (
+        pytest.param(64, None, False, None, id="keeps-kv128-q64"),
+        pytest.param(128, None, False, None, id="keeps-kv128-q128"),
+        pytest.param(8, {"use_keeps_mma_ab": False}, False, None, id="swaps-kv128-q8"),
+        pytest.param(
+            16, {"use_keeps_mma_ab": False}, False, None, id="swaps-kv128-q16"
+        ),
+        pytest.param(
+            32, {"use_keeps_mma_ab": False}, False, None, id="swaps-kv128-q32"
+        ),
+        pytest.param(
+            64,
+            {"tile_size_kv": 256},
+            False,
+            "k_dtype != v_dtype requires",
+            id="kv256",
+        ),
+        pytest.param(
+            64,
+            {"use_block_sparse": True},
+            False,
+            "k_dtype != v_dtype requires",
+            id="block-sparse",
+        ),
+        pytest.param(
+            8,
+            {"use_keeps_mma_ab": False},
+            True,
+            None,
+            id="swaps-no-shape-args",
+        ),
+    ),
+)
+def test_attention_ts_decode_config_mixed_kv_dtype_profile_gate(
+    tile_size_q: int,
+    config_args: dict[str, object] | None,
+    via_static_path: bool,
+    expected_error: str | None,
+) -> None:
+    """k_dtype != v_dtype builds on KV128 + non-block-sparse, either MMA layout."""
+
+    if via_static_path:
+        static_args = {
+            "q_dtype": BFloat16,
+            "k_dtype": BFloat16,
+            "v_dtype": Float8E4M3FN,
+            "out_dtype": BFloat16,
+            **config_args,
+        }
+        if expected_error is not None:
+            with pytest.raises(ValueError, match=expected_error):
+                make_decode_config(headdim=128, args=static_args)
+            return
+        cfg = make_decode_config(headdim=128, args=static_args)
+        assert cfg.k_dtype != cfg.v_dtype
+        assert cfg.use_keeps_mma_ab is False
+        return
+
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            _make_mixed_kv_dtype_config(
+                tile_size_q=tile_size_q, config_args=config_args
+            )
+        return
+
+    cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, config_args=config_args)
+    assert cfg.k_dtype != cfg.v_dtype
+    assert cfg.use_fp8_qkv is False
+
+    bf16_cfg = _make_mixed_kv_dtype_config(
+        tile_size_q=tile_size_q, v_dtype=BFloat16, config_args=config_args
+    )
+    assert cfg.smem_p_tile_bytes == bf16_cfg.smem_p_tile_bytes // 2
+
+
+@pytest.mark.parametrize(
+    ("tile_size_q", "config_args"),
+    (
+        pytest.param(64, None, id="keeps-q64"),
+        pytest.param(128, None, id="keeps-q128"),
+        pytest.param(8, {"use_keeps_mma_ab": False}, id="swaps-q8"),
+        pytest.param(16, {"use_keeps_mma_ab": False}, id="swaps-q16"),
+        pytest.param(32, {"use_keeps_mma_ab": False}, id="swaps-q32"),
+    ),
+)
+def test_attention_ts_decode_mixed_kv_dtype_resources_build(
+    tile_size_q: int, config_args: dict[str, object] | None
+) -> None:
+    """Build K/V SMEM resources and pipelines for k_dtype != v_dtype case."""
+
+    cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, config_args=config_args)
+    resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+
+    # Mixed k_dtype != v_dtype shares one K ring and one V ring across both
+    # K/V instances rather than allocating separate rings per instance.
+    assert {"smemK0", "smemV0"} <= resources.keys()
+    assert "smemK1" not in resources
+    assert "smemV1" not in resources
+    assert cfg.smem_k_tile_bytes == cfg.smem_v_tile_bytes * 2
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads",
+    (
+        pytest.param(8, 1, id="mqa"),
+        pytest.param(32, 8, id="gqa"),
+    ),
+)
+@pytest.mark.parametrize(
+    "use_keeps_mma_ab,tile_size_q",
+    (
+        pytest.param(True, 64, id="keeps"),
+        pytest.param(False, 8, id="swaps"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_mixed_kv_dtype_accuracy(
+    monkeypatch: pytest.MonkeyPatch,
+    use_keeps_mma_ab: bool,
+    tile_size_q: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> None:
+    """Grouped KV128 kernel compile and run stays accurate for QK-BF16/PV-FP8, either MMA layout."""
+
+    case = _make_decode_case(
+        kv_lens=(200, 300),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=2026090301 + num_qo_heads,
+    )
+    v_scale = 0.75
+    v_cache = _stored(case.v_cache.float(), _FP8, v_scale)
+    case = _with_reference(
+        replace(
+            case,
+            v_cache=v_cache,
+            paged_kv_cache=(case.k_cache, v_cache),
+            v_scale=v_scale,
+            bmm2_scale=v_scale / case.o_scale,
+        )
+    )
+
+    original_make_decode_config = fmha_decode_config.make_decode_config
+    explicit_profile = {
+        "use_keeps_mma_ab": use_keeps_mma_ab,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": 128,
+        "groups_tokens_heads_q": True,
+    }
+
+    def _make_explicit_config(*args, **kwargs):
+        source = kwargs.get("args")
+        kwargs["args"] = (
+            explicit_profile if source is None else (source, explicit_profile)
+        )
+        return original_make_decode_config(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", _make_explicit_config)
+    _resolve_decode_launch_spec.cache_clear()
+    _get_compiled_decode.cache_clear()
+    try:
+        _exercise_auto_case(case)
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+        _get_compiled_decode.cache_clear()
+
+
+@pytest.mark.parametrize(
+    (
+        "batch_size",
+        "seq_len_kv",
+        "seq_len_q",
+        "expected_use_keeps_mma_ab",
+        "expected_tile_size_q",
+    ),
+    (
+        pytest.param(4, 1024, 8, False, 16, id="baseline"),
+        pytest.param(1, 1024, 8, False, 8, id="batch-1"),
+        pytest.param(4, 512, 8, False, 8, id="skv-512"),
+        pytest.param(4, 1024, 16, False, 32, id="sqo-16-batch-4"),
+        pytest.param(16, 1024, 16, True, 64, id="sqo-16-batch-16"),
+        pytest.param(64, 1024, 16, True, 64, id="sqo-16-batch-64"),
+    ),
+)
+def test_attention_ts_decode_mixed_kv_dtype_auto_selects_mma_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    seq_len_kv: int,
+    seq_len_q: int,
+    expected_use_keeps_mma_ab: bool,
+    expected_tile_size_q: int,
+) -> None:
+    """auto_tuner picks SwapsMmaAb by default, KeepsMmaAb once draft length/batch grow enough."""
+
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        spec = _resolve_decode_launch_spec(
+            0,
+            batch_size,
+            32,
+            8,
+            128,
+            32,
+            seq_len_kv,
+            seq_len_q,
+            "bfloat16",
+            "bfloat16",
+            "float8_e4m3fn",
+            "bfloat16",
+            "HND",
+            "causal",
+            False,
+            -1,
+        )
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+
+    assert spec.config.use_keeps_mma_ab is expected_use_keeps_mma_ab
+    assert spec.config.tile_size_q == expected_tile_size_q
+
+
+@pytest.mark.parametrize(
     "overrides",
     (
         pytest.param({"headdim": 64}, id="head-dim-64"),
         pytest.param({"args": {"tile_size_kv": 128}}, id="explicit-kv128"),
         pytest.param(
-            {"qkv_dtype": Float16, "o_dtype": BFloat16},
+            {
+                "q_dtype": Float16,
+                "k_dtype": Float16,
+                "v_dtype": Float16,
+                "o_dtype": BFloat16,
+            },
             id="mixed-16-bit-io",
         ),
     ),
@@ -6170,7 +6650,9 @@ def test_attention_ts_decode_auto_config_falls_back_to_kv128(
         "seq_len_q": 64,
         "num_heads_q": 128,
         "num_heads_kv": 4,
-        "qkv_dtype": Float16,
+        "q_dtype": Float16,
+        "k_dtype": Float16,
+        "v_dtype": Float16,
         "o_dtype": Float16,
         "num_tokens_per_page": 32,
         "mask_type": "causal",
@@ -6221,7 +6703,9 @@ def test_attention_ts_decode_q_cost_uses_kv128_with_explicit_kv256(
             seq_len_kv=4096,
             num_heads_q=32,
             num_heads_kv=4,
-            qkv_dtype=Float16,
+            q_dtype=Float16,
+            k_dtype=Float16,
+            v_dtype=Float16,
             o_dtype=Float16,
             num_tokens_per_page=32,
             mask_type="causal",
@@ -6269,7 +6753,9 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
         seq_len_kv=257,
         num_heads_q=8,
         num_heads_kv=1,
-        qkv_dtype=BFloat16,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
         o_dtype=BFloat16,
         qkv_layout="pagedKv",
         num_tokens_per_page=32,
@@ -6477,7 +6963,7 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
         q_dtype=case.q.dtype,
-        kv_dtype=case.k_cache.dtype,
+        k_dtype=case.k_cache.dtype,
         out_dtype=case.output_dtype,
         mask_type=case.mask_type,
         kv_layout="HND",

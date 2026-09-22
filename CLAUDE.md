@@ -13,7 +13,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Install for development | `pip install --no-build-isolation -e . -v` |
 | Initialize submodules | `git submodule update --init --recursive` |
 | Install CUPTI for benchmarking | `pip install -U cupti-python` |
-| Run all tests | `pytest tests/` |
+| Run regular tests | `pytest tests/` |
+| Run full parameter matrices | `pytest tests/ --full` |
 | Run specific test | `pytest tests/path/test_file.py::test_function` |
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
@@ -95,10 +96,16 @@ FlashInfer provides optional pre-compiled packages for users who want faster ini
 
 ## Testing
 
-Run all tests:
+Run the regular test suite:
 
 ```bash
 pytest tests/
+```
+
+Run full parameter matrices (used by nightly testing):
+
+```bash
+pytest tests/ --full
 ```
 
 Run specific test file:
@@ -201,6 +208,14 @@ Concurrent misses share one compilation; warm hits do not acquire the compile lo
 The standalone API's optional `validate_indices=True` checks expert-index values
 and synchronizes with the CPU. Validate new routing data before CUDA graph
 capture; the default path assumes valid indices and performs metadata checks only.
+
+Prims-TS decode keeps raw storage dtypes (`q_dtype`, `k_dtype`, `v_dtype`)
+separate from effective MMA dtypes (`qk_dtype`, `pv_dtype`). Transformed
+FP8/NVFP4 K/V uses Q's compute dtype; BF16 Q/K with FP8 V uses FP8 PV without
+that transform. Kernel predicates, P packing, and attention-sink scaling must
+follow effective compute precision; TMA descriptors and raw allocations must
+follow storage precision. The public plan accepts separate `k_data_type` and
+`v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
 
 ## Code Linting
 
@@ -582,6 +597,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
+| `FLASHINFER_JIT_PREBUILD_MAX_JOBS` | unset (uses `MAX_JOBS`) | `flashinfer/jit/core.py` | Maximum parallel Ninja jobs for a bulk `build_jit_specs()` prebuild. This does not control ordinary on-demand module builds. The sharded test runner sets it to the host-wide automatic build budget before reducing each worker's `MAX_JOBS`; an explicit value is preserved. |
 | `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
 | `FLASHINFER_NVCC_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
 | `FLASHINFER_CXX_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |

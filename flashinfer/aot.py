@@ -822,6 +822,7 @@ def gen_all_modules(
         from .jit.comm import (
             gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
+            gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
@@ -847,6 +848,18 @@ def gen_all_modules(
             # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm107
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
+            jit_specs.append(gen_dcp_lse_reduce_module())
         if has_sm100a_exact:
             jit_specs.append(gen_moe_alltoall_module("sm100a"))
         if has_sm103a_exact:

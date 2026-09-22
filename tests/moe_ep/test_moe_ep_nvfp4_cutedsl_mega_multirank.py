@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
+``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -32,9 +32,9 @@ import os
 import pytest
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -80,7 +80,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         make_dummy_epilogue_params,
     )
 
@@ -220,7 +220,7 @@ def _reference_nvfp4_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -292,7 +292,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -452,7 +452,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
                 get_symm_buffer_for_mega_moe,
             )
 
@@ -746,7 +746,7 @@ def _run_mega_layer_zero_token_ikr_regression(
     occupancy, never from num_tokens), so the same fix -- fall through to the
     same full-buffer frontend.run() call every nonzero num_tokens already
     takes -- applies unchanged. See
-    kernel_src/cutedsl_megamoe/shim/nvfp4.py::nvfp4_mega_moe.
+    kernel_src/sm100/cutedsl_megamoe/shim/nvfp4.py::nvfp4_mega_moe.
 
     Shapes/scale intentionally match the real repro (hidden=2048,
     intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384),
@@ -1015,7 +1015,7 @@ def _run_mega_torch_oracle(
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -1131,7 +1131,7 @@ def _run_mega_torch_oracle(
             # combine encoder + topk_reduce do.
             term_transform = None
             if combine_dtype != "bf16":
-                from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
                     CombineFormat,
                     combine_roundtrip_to_fp32,
                 )
@@ -1368,7 +1368,7 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         MegaMoENvfp4Config,
     )
 
@@ -1405,7 +1405,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
 
 
 def test_tuner_is_valid_quantized_combine_rules():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
 
     # quantized combine excludes the in-kernel REDG reduce ...
     assert not tuner.is_valid(
@@ -1428,7 +1428,7 @@ def test_tuner_is_valid_quantized_combine_rules():
 
 
 def test_autotune_nvfp4_candidates_cover_ikr():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         nvfp4_candidates,
     )
 

@@ -218,6 +218,7 @@ class PreparedCall:
         mid=None,
         mlse=None,
         lse=None,
+        lse_scale=1.0,
     ):
         self.execute_fn(
             self.plan,
@@ -234,6 +235,7 @@ class PreparedCall:
             extra,
             extra_indices,
             extra_lengths,
+            lse_scale,
         )
 
 
@@ -360,6 +362,7 @@ def wrapper_run(
     mid_lse=None,
     prefill_impl=None,
     return_lse=False,
+    lse_scale=1.0,
 ):
     from ._execution import resolve_model_type as _resolve_model_type
 
@@ -467,6 +470,7 @@ def wrapper_run(
         mid_out,
         mid_lse,
         result_lse,
+        lse_scale,
     )
     return result_lse if return_lse else None
 
@@ -550,6 +554,7 @@ def caller_run(
     mlse,
     extra_fp4,
     decode_only=False,
+    lse_scale=1.0,
 ):
     indices = (
         indices.squeeze(1) if indices.ndim == 3 and indices.shape[1] == 1 else indices
@@ -603,6 +608,7 @@ def caller_run(
         mid,
         mlse,
         lse[: q.shape[0], : q.shape[1]],
+        lse_scale,
     )
 
 
@@ -623,6 +629,7 @@ def functional_run(
     kv_scale_format="auto",
     is_dsv4_nvfp4=False,
     extra_fp4=False,
+    lse_scale=1.0,
 ):
     from ._execution import resolve_model_type as _resolve_model_type
 
@@ -675,5 +682,6 @@ def functional_run(
         mid,
         mlse,
         result,
+        lse_scale,
     )
     return result

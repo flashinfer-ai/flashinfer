@@ -68,6 +68,7 @@ def get_sparse_mla_nvfp4_sm120_module():
         extra_topk_length: torch.Tensor | None,
         use_prefill: bool,
         chunks_per_block_override: int,
+        lse_scale: float = 1.0,
     ) -> None:
         if not use_prefill:
             if mid_out is None or mid_lse is None:
@@ -92,6 +93,7 @@ def get_sparse_mla_nvfp4_sm120_module():
                 extra_topk_length,
                 chunks_per_block_override,
                 False,
+                lse_scale,
             )
         else:
             module.sparse_mla_sm120_nvfp4_prefill(
@@ -106,6 +108,7 @@ def get_sparse_mla_nvfp4_sm120_module():
                 extra_kv_cache,
                 extra_indices,
                 extra_topk_length,
+                lse_scale,
             )
 
     @register_fake_op("flashinfer::sparse_mla_nvfp4_sm120_paged_attention")
@@ -139,6 +142,7 @@ def _sparse_mla_nvfp4_sm120_paged_attention(
     mid_lse: torch.Tensor | None = None,
     use_prefill: bool,
     chunks_per_block_override: int = 0,
+    lse_scale: float = 1.0,
 ) -> None:
     """Run the allocation-free NVFP4 sparse-MLA custom op."""
     get_sparse_mla_nvfp4_sm120_module().paged_attention(
@@ -157,6 +161,7 @@ def _sparse_mla_nvfp4_sm120_paged_attention(
         extra_topk_length,
         use_prefill,
         chunks_per_block_override,
+        lse_scale,
     )
 
 
@@ -389,10 +394,13 @@ def _nvfp4_sparse_mla_decode(
     extra_topk_length: torch.Tensor | None = None,
     chunks_per_block_override: int = 0,
     stage1_only: bool = False,
+    lse_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return final output and LSE from DeepSeek-V4 NVFP4 sparse-MLA decode.
 
-    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+    ``lse_scale`` multiplies final base-2 LSE only; split-K scratch stays
+    base-2. Empty-KV output/LSE and sink semantics follow
+    :meth:`SparseMLASm120Wrapper.run`.
     """
     if stage1_only:
         raise ValueError(
@@ -444,6 +452,7 @@ def _nvfp4_sparse_mla_decode(
         extra_topk_length,
         chunks_per_block_override,
         stage1_only,
+        lse_scale,
     )
     return output, out_lse
 
@@ -460,10 +469,13 @@ def _nvfp4_sparse_mla_prefill(
     extra_kv_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_topk_length: torch.Tensor | None = None,
+    lse_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the single-launch streaming DeepSeek-V4 NVFP4 prefill kernel.
 
-    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+    ``lse_scale`` multiplies final base-2 LSE only; split-K scratch stays
+    base-2. Empty-KV output/LSE and sink semantics follow
+    :meth:`SparseMLASm120Wrapper.run`.
     """
     if q.ndim != 3 or q.shape[-1] != dsv4_nvfp4_format_info()["query_dim"]:
         raise ValueError(
@@ -492,6 +504,7 @@ def _nvfp4_sparse_mla_prefill(
         extra_kv_cache,
         extra_indices,
         extra_topk_length,
+        lse_scale,
     )
     return output, out_lse
 

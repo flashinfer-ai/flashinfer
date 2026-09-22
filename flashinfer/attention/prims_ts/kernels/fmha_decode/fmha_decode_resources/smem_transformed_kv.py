@@ -184,8 +184,8 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         """Create placeholder state for the shared K/V SMEM ring."""
         num_stages = self.pipeline_config.num_stages
         self._smem_base_kv = _placeholder_smem_array(
-            self.cfg.q_dtype,
-            (self.cfg.smem_transformed_kv_tile_bytes // self.cfg.q_dtype_bytes)
+            self.cfg.qk_dtype,
+            (self.cfg.smem_transformed_kv_tile_bytes // self.cfg.qk_dtype_bytes)
             * num_stages,
         )
         self._k_desc_base = prims.Tcgen05SmemDesc(0)
@@ -218,27 +218,27 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         if cutlass.const_expr(context is not None and context.smem_base is not None):
             num_stages = self.pipeline_config.num_stages
             stage_elems = (
-                self.cfg.smem_transformed_kv_tile_bytes // self.cfg.q_dtype_bytes
+                self.cfg.smem_transformed_kv_tile_bytes // self.cfg.qk_dtype_bytes
             )
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
-                dtype=self.cfg.q_dtype,
+                dtype=self.cfg.qk_dtype,
                 shape=(stage_elems * num_stages,),
                 addrspace=3,
             )
             kv_tile_bytes = Int32(self.cfg.smem_transformed_kv_tile_bytes)
             k_leading_byte_offset = Int32(16384)
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_q):
+            if cutlass.const_expr(self.cfg.use_fp8_qk):
                 k_leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(
-                        self.cfg.q_dtype_bytes, self.cfg.head_dim_kv_stage
+                        self.cfg.qk_dtype_bytes, self.cfg.head_dim_kv_stage
                     )
                 )
             v_leading_byte_offset = k_leading_byte_offset
             if cutlass.const_expr(
-                self.cfg.use_fp8_q or self.cfg.head_dim_kv_stage == 64
+                self.cfg.use_fp8_qk or self.cfg.head_dim_kv_stage == 64
             ):
                 v_leading_byte_offset = Int32(0)
             self._k_desc_base = prims.Tcgen05SmemDesc.build(
@@ -293,18 +293,18 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         cfg = self.cfg
         tile_row_idx = elem_idx // Int32(cfg.head_dim_kv_stage)
         tile_col_idx = elem_idx % Int32(cfg.head_dim_kv_stage)
-        if cutlass.const_expr(cfg.use_fp8_q and cfg.head_dim_kv_stage == 64):
+        if cutlass.const_expr(cfg.use_fp8_qk and cfg.head_dim_kv_stage == 64):
             swizzle_bytes = 64
         else:
             swizzle_bytes = 128
-        q_elems_per_smem_row = swizzle_bytes // cfg.q_dtype_bytes
+        q_elems_per_smem_row = swizzle_bytes // cfg.qk_dtype_bytes
         smem_slice_idx = tile_col_idx // Int32(q_elems_per_smem_row)
         smem_col_idx = tile_col_idx % Int32(q_elems_per_smem_row)
         smem_row_idx = smem_slice_idx * Int32(cfg.tile_size_kv) + tile_row_idx
         dst_byte_offset = smem_row_idx * Int32(swizzle_bytes) + smem_col_idx * Int32(
-            cfg.q_dtype_bytes
+            cfg.qk_dtype_bytes
         )
-        if cutlass.const_expr(cfg.use_fp8_q and cfg.head_dim_kv_stage == 64):
+        if cutlass.const_expr(cfg.use_fp8_qk and cfg.head_dim_kv_stage == 64):
             return dst_byte_offset ^ (
                 ((dst_byte_offset >> Int32(7)) & Int32(3)) << Int32(4)
             )
@@ -397,14 +397,14 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         dst_word_base: cutlass.Array,
         dst_pair_base: cutlass.Array,
     ) -> None:
-        """Dequantize one eight-element NVFP4 chunk to the Q-side SMEM dtype."""
+        """Dequantize one eight-element NVFP4 chunk to the effective MMA dtype."""
         cfg = self.cfg
         packed_word = src_word_base[chunk_idx]
         sf_byte = self._load_nvfp4_scale_byte(
             src_sf_base, head_dim_stage_idx, is_v, elem_idx
         )
         dst_word_idx = self._dst_q_smem_byte_offset(elem_idx) >> Int32(2)
-        if cutlass.const_expr(cfg.use_fp8_q):
+        if cutlass.const_expr(cfg.use_fp8_qk):
             fp8_word0, fp8_word1 = _cvt_e2m1_word_to_e4m3_words(packed_word, sf_byte)
             dst_word_base[dst_word_idx] = fp8_word0
             dst_word_base[dst_word_idx + Int32(1)] = fp8_word1
@@ -434,7 +434,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             (cfg.transform_kv_warp_idx % 4) * 32
         )
 
-        dst_stage_elems = cfg.smem_transformed_kv_tile_bytes // cfg.q_dtype_bytes
+        dst_stage_elems = cfg.smem_transformed_kv_tile_bytes // cfg.qk_dtype_bytes
         dst_base = self._smem_base_kv.subview(stage_info.stage_idx * dst_stage_elems)
         dst_word_base = cutlass.Array(
             dst_base.data_ptr(),
@@ -457,12 +457,12 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                 src = self.src_smem_k0 if inst_id == KV_INST0 else self.src_smem_k1
         assert src is not None
         src_stage_idx = src.state_src.consumer_work_stage
-        src_stage_elems = cfg.smem_kv_tile_bytes // cfg.kv_dtype_bytes
+        src_stage_elems = cfg.smem_kv_tile_elements
         src_base = src._smem_base_kv.subview(src_stage_idx * src_stage_elems)
         src_word_base = cutlass.Array(
             src_base.data_ptr(),
             dtype=Int32,
-            shape=(cfg.smem_kv_tile_bytes // 4,),
+            shape=(cfg.smem_kv_storage_tile_bytes // 4,),
             addrspace=3,
         )
         # SF for this raw-KV stage, staged into SmemKv's SF ring by the loader.

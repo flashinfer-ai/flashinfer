@@ -155,25 +155,28 @@ def _swaps_routed_coordinate(
     return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
-    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_q else prims.Tcgen05MMAKind.F16
+def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA opcode family for the QK GEMM."""
+    if cfg.use_fp8_qk:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
 
 
-def _mma_input_format_for_qkv(
-    cfg: FmhaDecodeConfig,
-) -> prims.Tcgen05InputFormat:
-    """Select the tcgen05 descriptor input format for Q/K/V SMEM tiles."""
-    if cfg.use_fp8_q:
-        return prims.Tcgen05InputFormat.E4M3
-    if cfg.use_bf16_q:
-        return prims.Tcgen05InputFormat.BF16
-    return prims.Tcgen05InputFormat.F16
+def _mma_k_step_qk(cfg: FmhaDecodeConfig) -> int:
+    """Return the K dimension advanced by one QK-GEMM MMA instruction."""
+    return 32 if cfg.use_fp8_qk else 16
 
 
-def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
-    """Return the K dimension advanced by one tcgen05 MMA instruction."""
-    return 32 if cfg.use_fp8_q else 16
+def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA opcode family for the PV GEMM."""
+    if cfg.use_fp8_pv:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _mma_k_step_pv(cfg: FmhaDecodeConfig) -> int:
+    """Return the K dimension advanced by one PV-GEMM MMA instruction."""
+    return 32 if cfg.use_fp8_pv else 16
 
 
 @cute.jit

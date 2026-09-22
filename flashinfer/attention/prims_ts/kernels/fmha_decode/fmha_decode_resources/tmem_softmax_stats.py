@@ -764,7 +764,7 @@ class TmemSoftmaxGlobalResource(DecodeGenResourceBase):
     ) -> None:
         """Apply FP8 P-quantization denominator correction through TmemS."""
         cfg = self.cfg
-        if cutlass.const_expr(not cfg.use_fp8_q):
+        if cutlass.const_expr(not cfg.use_fp8_pv):
             return
 
         num_scale_groups = cfg.num_softmax_scale_groups
