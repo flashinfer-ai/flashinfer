@@ -75,7 +75,7 @@ copied into a padded table inside the workspace at preparation (the runner
 reports this as `block_tables_padded=True`); pass a width that is a multiple
 of eight to read the caller's table in place at every launch.
 
-`plan.py` is an exact host mirror of the device planner. The kernel never
+`cake_plan.py` is an exact host mirror of the device planner. The kernel never
 calls it; tests use it to check the device-published plan (`runner.device_plan()`)
 and the workspace bounds, and it documents the scheduling rule.
 

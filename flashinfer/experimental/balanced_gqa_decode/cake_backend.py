@@ -29,7 +29,7 @@ KV-length distribution written into ``seq_lens`` later.  See
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 import tvm_ffi
@@ -39,7 +39,7 @@ from .cake_jit import (
     load_cake_balanced_gqa_decode_module,
     select_module,
 )
-from .plan import (
+from .cake_plan import (
     BLOCK_N,
     MAX_REQUESTS,
     max_items_bound,
@@ -171,7 +171,7 @@ class BalancedGQADecodeRunner:
     module_name: str
     main_kwargs: dict
     out: torch.Tensor
-    entry: object
+    entry: Callable[..., Any]
     arguments: tuple
     block_tables_padded: bool
 
@@ -206,7 +206,7 @@ def bind_decode_payload(
     module_name = select_module(arch)
     record = MODULES[module_name]
     physical = record["main"]
-    grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"]))
+    grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
     arguments = tuple(
         grid[name] if kind == "grid" else main_kwargs[name]
         for kind, name in physical["arg_plan"]
@@ -305,7 +305,8 @@ def validate_balanced_gqa_decode_inputs(
     if seq_lens.shape != (batch,) or seq_lens.dtype != torch.int32:
         raise ValueError("seq_lens must be an int32 [batch] tensor")
     if out is not None and (
-        tuple(out.shape) != (total_q, num_q_heads, HEAD_DIM) or out.dtype != torch.bfloat16
+        tuple(out.shape) != (total_q, num_q_heads, HEAD_DIM)
+        or out.dtype != torch.bfloat16
     ):
         raise ValueError(
             f"out must be a bfloat16 [batch * q_len, num_q_heads, {HEAD_DIM}] tensor"
@@ -385,13 +386,25 @@ def prepare_balanced_batch_decode_with_kv_cache(
 
     max_split_items, max_split_tiles = workspace_bounds(num_ctas)
     partial_o = _carve(
-        flat, layout, "partial_o", torch.float32, (max_split_items * PARTIAL_O_PER_SLOT,)
+        flat,
+        layout,
+        "partial_o",
+        torch.float32,
+        (max_split_items * PARTIAL_O_PER_SLOT,),
     )
     partial_stats = _carve(
-        flat, layout, "partial_stats", torch.float32, (max_split_items * STATS_PER_SLOT,)
+        flat,
+        layout,
+        "partial_stats",
+        torch.float32,
+        (max_split_items * STATS_PER_SLOT,),
     )
-    tile_counters = _carve(flat, layout, "tile_counters", torch.uint32, (max_split_tiles,))
-    queue_counters = _carve(flat, layout, "queue_counters", torch.uint32, (QUEUE_COUNTERS,))
+    tile_counters = _carve(
+        flat, layout, "tile_counters", torch.uint32, (max_split_tiles,)
+    )
+    queue_counters = _carve(
+        flat, layout, "queue_counters", torch.uint32, (QUEUE_COUNTERS,)
+    )
     # The kernel resets its ticket, done and tile counters at the end of every
     # launch; they must start at zero once.  The partial slots need no
     # initial value (each is written before it is read) but start clean.
@@ -404,7 +417,9 @@ def prepare_balanced_batch_decode_with_kv_cache(
         # The loader fetches page ids in groups of eight per KV block; widen the
         # table so every group stays inside its own request row.  Padding
         # pages are never used for valid tokens (they are masked by seq_lens).
-        page_table = _carve(flat, layout, "page_table", torch.int32, (batch, padded_pages))
+        page_table = _carve(
+            flat, layout, "page_table", torch.int32, (batch, padded_pages)
+        )
         page_table.zero_()
         page_table[:, :max_pages].copy_(block_tables)
 

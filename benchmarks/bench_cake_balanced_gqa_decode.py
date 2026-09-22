@@ -202,21 +202,27 @@ def main():
             torch.cuda.synchronize()
             max_diff = (trtllm_out.float() - out.float()).abs().max().item()
             trtllm_ms = _median_ms(_trtllm)
-            row.update(trtllm_gen_ms=trtllm_ms, speedup=trtllm_ms / ms, max_abs_diff_vs_trtllm=max_diff)
+            row.update(
+                trtllm_gen_ms=trtllm_ms,
+                speedup=trtllm_ms / ms,
+                max_abs_diff_vs_trtllm=max_diff,
+            )
             line += f"{trtllm_ms:>15.4f}{trtllm_ms / ms:>9.3f}"
-            del kv_cache, trtllm_out
         print(line)
         results.append(row)
-        del query, k_cache, v_cache, block_tables, seq_lens_dev, out, runner
         torch.cuda.empty_cache()
     if args.json:
         with open(args.json, "w") as handle:
             json.dump(
-                dict(device=torch.cuda.get_device_name(device), rows=results), handle, indent=2
+                dict(device=torch.cuda.get_device_name(device), rows=results),
+                handle,
+                indent=2,
             )
     if args.with_trtllm:
         speedups = [r["speedup"] for r in results]
-        print(f"geomean speedup vs trtllm-gen: {math.exp(sum(map(math.log, speedups)) / len(speedups)):.3f}")
+        print(
+            f"geomean speedup vs trtllm-gen: {math.exp(sum(map(math.log, speedups)) / len(speedups)):.3f}"
+        )
 
 
 if __name__ == "__main__":

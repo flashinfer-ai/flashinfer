@@ -246,7 +246,7 @@ def plan_balanced_work(
     pairs = [_ceil_div(s - (q_len - 1), PAIR_TOKENS) for s in lens]
     n_chunks = [_ceil_div(p, chunk_pairs) for p in pairs]
     full_chunks = [p // chunk_pairs for p in pairs]
-    remainder = [p - f * chunk_pairs for p, f in zip(pairs, full_chunks)]
+    remainder = [p - f * chunk_pairs for p, f in zip(pairs, full_chunks, strict=True)]
 
     split_item_prefix: list[int] = []
     split_tile_prefix: list[int] = []
@@ -308,7 +308,9 @@ def plan_balanced_work(
             if bucket == 0:
                 for c in range(full_chunks[b]):
                     items.extend(make_item(len(items), bucket, b, c))
-            elif remainder[b] > 0 and length_bucket(remainder[b], chunk_pairs) == bucket:
+            elif (
+                remainder[b] > 0 and length_bucket(remainder[b], chunk_pairs) == bucket
+            ):
                 items.extend(make_item(len(items), bucket, b, full_chunks[b]))
         bucket_ends.append(len(items))
 

@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from flashinfer.decode import prepare_balanced_batch_decode_with_kv_cache
-from flashinfer.experimental.balanced_gqa_decode import cake_backend, plan
+from flashinfer.experimental.balanced_gqa_decode import cake_backend, cake_plan
 from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
     GROUP_RATIO,
     HEAD_DIM,
@@ -30,7 +30,7 @@ from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
     validate_balanced_gqa_decode_inputs,
     workspace_layout,
 )
-from flashinfer.experimental.balanced_gqa_decode.plan import (
+from flashinfer.experimental.balanced_gqa_decode.cake_plan import (
     MAX_BALANCE_FACTOR,
     MAX_REQUESTS,
     NUM_BUCKETS,
@@ -89,7 +89,7 @@ def _check_plan_invariants(seq_lens, work_plan):
         lo = work_plan.bucket_ends[item.bucket - 1] if item.bucket else 0
         assert lo <= ticket < work_plan.bucket_ends[item.bucket]
         assert item.block_begin < item.block_end
-        assert item.block_end == _ceil_div(item.seqlen_row, plan.BLOCK_N) or (
+        assert item.block_end == _ceil_div(item.seqlen_row, cake_plan.BLOCK_N) or (
             item.block_end - item.block_begin == 2 * work_plan.chunk_pairs
         )
         assert (item.slot >= 0) == item.is_split
@@ -103,9 +103,11 @@ def _check_plan_invariants(seq_lens, work_plan):
         for j in range(work_plan.q_len):
             for h in range(work_plan.num_kv_heads):
                 spans = sorted(coverage[(b, j, h)])
-                expected_end = _ceil_div(seq_len - (work_plan.q_len - 1 - j), plan.BLOCK_N)
+                expected_end = _ceil_div(
+                    seq_len - (work_plan.q_len - 1 - j), cake_plan.BLOCK_N
+                )
                 assert spans[0][0] == 0 and spans[-1][1] == expected_end
-                for (_, e0), (s1, _) in zip(spans, spans[1:]):
+                for (_, e0), (s1, _) in zip(spans, spans[1:], strict=False):
                     assert e0 == s1
     # Split slots and counters are unique.
     slots = [item.slot for item in work_plan.items if item.is_split]
@@ -143,7 +145,9 @@ def test_random_plans(balance_factor):
         q_len = rng.choice([1, 1, 2, 7])
         num_kv_heads = rng.choice([1, 2, 8])
         num_ctas = rng.choice([132, 148, 160])
-        seq_lens = [rng.randint(q_len, rng.choice([600, 9000, 70000])) for _ in range(batch)]
+        seq_lens = [
+            rng.randint(q_len, rng.choice([600, 9000, 70000])) for _ in range(batch)
+        ]
         work_plan = plan_balanced_work(
             seq_lens,
             q_len=q_len,
@@ -195,7 +199,7 @@ def test_length_bucket_edges():
 
 def test_chunk_pairs_respects_minimum():
     chunk_pairs, k = chunk_pairs_for([1] * 3, q_len=1, num_kv_heads=1, num_ctas=160)
-    assert chunk_pairs >= plan.DEFAULT_PAIRS_MIN
+    assert chunk_pairs >= cake_plan.DEFAULT_PAIRS_MIN
     assert k >= 0
 
 
@@ -220,7 +224,9 @@ def test_workspace_layout_is_shape_independent():
     assert layout["page_table"] == (layout["page_table"][0], 0)
     total = balanced_gqa_decode_workspace_size(num_sms=160)
     assert total == layout["total"]
-    assert total == balanced_gqa_decode_workspace_size(num_sms=160, batch=1024, max_pages=64)
+    assert total == balanced_gqa_decode_workspace_size(
+        num_sms=160, batch=1024, max_pages=64
+    )
     padded = balanced_gqa_decode_workspace_size(num_sms=160, batch=4, max_pages=9)
     assert padded == total + cake_backend._align(4 * 16 * 4)
     for name in ("partial_o", "partial_stats", "tile_counters", "queue_counters"):
@@ -230,7 +236,9 @@ def test_workspace_layout_is_shape_independent():
 def _host_tensors(batch=2, num_kv_heads=1, q_len=1, num_pages=64, max_pages=16):
     num_q_heads = GROUP_RATIO * num_kv_heads
     query = torch.zeros(batch * q_len, num_q_heads, HEAD_DIM, dtype=torch.bfloat16)
-    k_cache = torch.zeros(num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16)
+    k_cache = torch.zeros(
+        num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16
+    )
     v_cache = torch.zeros_like(k_cache)
     block_tables = torch.zeros(batch, max_pages, dtype=torch.int32)
     seq_lens = torch.ones(batch, dtype=torch.int32)
@@ -291,7 +299,9 @@ def _require_program():
         pytest.skip(f"no generated balanced GQA decode program registered for {arch}")
 
 
-def reference_decode(query, k_cache, v_cache, block_tables, seq_lens, *, q_len, sm_scale):
+def reference_decode(
+    query, k_cache, v_cache, block_tables, seq_lens, *, q_len, sm_scale
+):
     """FP32 paged GQA reference: ``[batch * q_len, num_q_heads, 128]`` bf16."""
     batch = int(block_tables.shape[0])
     num_q_heads = int(query.shape[1])
@@ -301,11 +311,21 @@ def reference_decode(query, k_cache, v_cache, block_tables, seq_lens, *, q_len, 
     for b in range(batch):
         seq_len = int(lens[b])
         pages = block_tables[b, : _ceil_div(seq_len, PAGE_SIZE)].long()
-        k = k_cache[pages].permute(1, 0, 2, 3).reshape(num_kv_heads, -1, HEAD_DIM)[:, :seq_len]
-        v = v_cache[pages].permute(1, 0, 2, 3).reshape(num_kv_heads, -1, HEAD_DIM)[:, :seq_len]
+        k = (
+            k_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_kv_heads, -1, HEAD_DIM)[:, :seq_len]
+        )
+        v = (
+            v_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_kv_heads, -1, HEAD_DIM)[:, :seq_len]
+        )
         k = k.float().repeat_interleave(GROUP_RATIO, dim=0)  # [Hq, S, D]
         v = v.float().repeat_interleave(GROUP_RATIO, dim=0)
-        q = query[b * q_len : (b + 1) * q_len].float().permute(1, 0, 2)  # [Hq, q_len, D]
+        q = (
+            query[b * q_len : (b + 1) * q_len].float().permute(1, 0, 2)
+        )  # [Hq, q_len, D]
         scores = torch.einsum("hqd,hkd->hqk", q, k) * sm_scale
         positions = torch.arange(seq_len, device=query.device)
         row_limit = seq_len - q_len + 1 + torch.arange(q_len, device=query.device)
@@ -317,7 +337,9 @@ def reference_decode(query, k_cache, v_cache, block_tables, seq_lens, *, q_len, 
     return out.to(torch.bfloat16)
 
 
-def make_inputs(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True, device="cuda"):
+def make_inputs(
+    seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True, device="cuda"
+):
     """Deterministic BF16 paged inputs with a shuffled page table."""
     gen = torch.Generator(device=device).manual_seed(seed)
     batch = len(seq_lens)
@@ -336,7 +358,9 @@ def make_inputs(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True, devi
         (num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM), generator=gen, device=device
     ).to(torch.bfloat16)
     block_tables = (
-        torch.randperm(num_pages, generator=gen, device=device).to(torch.int32).view(batch, max_pages)
+        torch.randperm(num_pages, generator=gen, device=device)
+        .to(torch.int32)
+        .view(batch, max_pages)
     )
     seq_lens_dev = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     return query, k_cache, v_cache, block_tables, seq_lens_dev
@@ -372,7 +396,13 @@ def _run_and_check(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True):
     assert result is out
     torch.cuda.synchronize()
     expected = reference_decode(
-        query, k_cache, v_cache, block_tables, seq_lens_dev, q_len=q_len, sm_scale=sm_scale
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens_dev,
+        q_len=q_len,
+        sm_scale=sm_scale,
     )
     torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
     # The device planner published the same plan as the host mirror, and the
@@ -436,7 +466,13 @@ def test_graph_replay_follows_device_lengths():
         graph.replay()
         torch.cuda.synchronize()
         expected = reference_decode(
-            query, k_cache, v_cache, block_tables, seq_lens_dev, q_len=1, sm_scale=sm_scale
+            query,
+            k_cache,
+            v_cache,
+            block_tables,
+            seq_lens_dev,
+            q_len=1,
+            sm_scale=sm_scale,
         )
         torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
         mirror = plan_balanced_work(new_lens, num_kv_heads=1, num_ctas=runner.num_ctas)
@@ -451,9 +487,7 @@ def test_launch_makes_no_allocation():
     runner()
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
-    assert (
-        after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
-    )
+    assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
 
 
 def test_prepare_rejects_small_workspace_and_wrong_device():
@@ -471,5 +505,10 @@ def test_prepare_rejects_small_workspace_and_wrong_device():
         )
     with pytest.raises(ValueError, match="backend"):
         prepare_balanced_batch_decode_with_kv_cache(
-            query, (k_cache, v_cache), block_tables, seq_lens_dev, workspace, backend="xqa"
+            query,
+            (k_cache, v_cache),
+            block_tables,
+            seq_lens_dev,
+            workspace,
+            backend="xqa",
         )

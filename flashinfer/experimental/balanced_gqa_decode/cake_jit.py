@@ -28,7 +28,84 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # balanced decode kernel) with its own translation units, compile flags, FFI
 # entry and argument plan.  Populated verbatim by the generated-program
 # export; do not edit by hand.
-MODULES: dict[str, dict[str, Any]] = {}
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_balanced_gqa_decode_sm_100a": {
+        "arch": "sm_100a",
+        "main": {
+            "module": "cake_balanced_gqa_decode_27b47222f1570d742ffb",
+            "sources": [
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_27b47222f1570d742ffb_kernel.cu",
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_27b47222f1570d742ffb_binding.cu",
+            ],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "Qt"],
+                ["tma_buffer", "K"],
+                ["tma_buffer", "V"],
+                ["buffer", "O_ptr"],
+                ["buffer", "page_table"],
+                ["buffer", "seq_lens_kv"],
+                ["buffer", "partial_o"],
+                ["buffer", "partial_stats"],
+                ["buffer", "tile_counters"],
+                ["buffer", "queue_counters"],
+                ["parameter", "max_pages_per_seq"],
+                ["parameter", "softmax_scale"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "group_ratio"],
+                ["parameter", "batch_size"],
+                ["parameter", "q_len"],
+                ["parameter", "max_items"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "f505ef788b473ea00bf708dd515dec0114ee2769ec331000ce1282499143411a",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "f505ef788b473ea00bf708dd515dec0114ee2769ec331000ce1282499143411a",
+    },
+    "cake_balanced_gqa_decode_sm_103a": {
+        "arch": "sm_103a",
+        "main": {
+            "module": "cake_balanced_gqa_decode_6996872de1bf4fcf9a2a",
+            "sources": [
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_6996872de1bf4fcf9a2a_kernel.cu",
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_6996872de1bf4fcf9a2a_binding.cu",
+            ],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "Qt"],
+                ["tma_buffer", "K"],
+                ["tma_buffer", "V"],
+                ["buffer", "O_ptr"],
+                ["buffer", "page_table"],
+                ["buffer", "seq_lens_kv"],
+                ["buffer", "partial_o"],
+                ["buffer", "partial_stats"],
+                ["buffer", "tile_counters"],
+                ["buffer", "queue_counters"],
+                ["parameter", "max_pages_per_seq"],
+                ["parameter", "softmax_scale"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "group_ratio"],
+                ["parameter", "batch_size"],
+                ["parameter", "q_len"],
+                ["parameter", "max_items"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "75a0c7a9134f2fb13001e0e92d15157e323c4fa30696a7286166f622c03335af",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "75a0c7a9134f2fb13001e0e92d15157e323c4fa30696a7286166f622c03335af",
+    },
+}
 
 STAGES = ("main",)
 ARCH_NVCC_FLAGS = {
