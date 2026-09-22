@@ -7,6 +7,12 @@ SHA-256 manifest, with no precompiled `.o` files. Required cuDNN Frost device he
 are included in each generated source. The deployed process does not import
 `cudnn-frontend`, construct a cuDNN Frost graph, or run the cuDNN Frost graph compiler.
 
+This POC includes local BF16 source-template derivatives of the bundled Frost
+export. Manifest source digests identify the derived code; `producer_revision`
+retains the original export lineage. These changes need reconciliation with the
+Frost generator before a future artifact refresh. Kernel and integration credit
+remain with the original contributors.
+
 On first use, `runtime.py` fills the selected template's geometry constants and
 TMA-store expansion, then compiles the instantiated source through
 `flashinfer.jit.cute_dsl_core.build_and_load_cute_dsl_kernel` and exposes native

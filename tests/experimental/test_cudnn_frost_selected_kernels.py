@@ -2788,7 +2788,9 @@ def test_frost_moe_declines_missing_graph_ownership(method, monkeypatch):
 @pytest.mark.parametrize(
     "tokens,hidden,experts,intermediate,topk",
     [(t, 128, 8, 256, 2) for t in (1, 17, 256, 257)]
-    + [(t, 2048, 64, 1408, 6) for t in (1, 8, 9)],
+    + [(t, 2048, 64, 1408, 6) for t in (1, 2, 8, 9)]
+    + [(t, 7168, 12, 3072, 2) for t in (1, 4, 5)]
+    + [(t, 4096, 8, 14336, 2) for t in (1, 4)],
 )
 def test_bf16_moe_workspace_reuse_and_small_routing_boundary(
     tokens, hidden, experts, intermediate, topk
@@ -2803,13 +2805,15 @@ def test_bf16_moe_workspace_reuse_and_small_routing_boundary(
     runner.build()
     inputs = runner.pack_inputs(act, weights)
     state = inputs.launch_state
-    # Mathematical accuracy is covered by the existing compound/model tests.
-    # This regression checks invocation state, so require exact equivalence to
-    # a fresh call instead of adding a new geometry-dependent error budget.
+    expected = _bf16_moe_reference(act, weights)
+    # Keep the existing model-geometry mathematical criterion, and require
+    # exact equivalence between fresh calls and workspace/graph reuse.
     for tactic in runner.get_valid_tactics(inputs, None):
         state.workspace.zero_()
         fresh = runner.forward(inputs, tactic).clone()
         assert torch.isfinite(fresh).all().item()
+        error = (fresh.float() - expected.float()).norm()
+        assert error / expected.float().norm().clamp_min(1e-10) < 0.01
         state.workspace.fill_(173)
         torch.testing.assert_close(
             runner.forward(inputs, tactic), fresh, atol=0, rtol=0
@@ -2824,6 +2828,9 @@ def test_bf16_moe_workspace_reuse_and_small_routing_boundary(
         state.workspace.zero_()
         fresh_changed = runner.forward(inputs, tactic).clone()
         assert torch.isfinite(fresh_changed).all().item()
+        expected_changed = _bf16_moe_reference(act, weights)
+        error = (fresh_changed.float() - expected_changed.float()).norm()
+        assert error / expected_changed.float().norm().clamp_min(1e-10) < 0.01
         state.workspace.fill_(217)
         inputs[0].fill_(float("nan"))
         for _ in range(3):
@@ -2836,7 +2843,7 @@ def test_bf16_moe_workspace_reuse_and_small_routing_boundary(
 
 
 def test_bf16_source_hosts_own_scheduler_initialization():
-    """Native plans rely on frozen hosts initializing scheduler state each call."""
+    """Frozen hosts own all required scheduler initialization for native plans."""
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
         runtime,
     )

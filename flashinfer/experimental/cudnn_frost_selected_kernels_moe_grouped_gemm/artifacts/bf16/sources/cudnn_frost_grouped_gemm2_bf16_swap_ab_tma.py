@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
+# Prototype adaptation of the Frost export; the manifest retains export lineage.
+# Source digests identify this derived version.
 
 """SM100 MoE weight-by-token matmul with grouped N scheduling."""
 
@@ -365,6 +367,7 @@ def frost_template_kernel(
     out_stride_n_0: cutlass.Int64,
     out_stride_l_0: cutlass.Int64,
     tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    direct_schedule: cutlass.Constexpr,
 ) -> None:
     tma_a_descs = [tma_a_desc_0]
     tma_b_descs = [tma_b_desc_0]
@@ -651,54 +654,60 @@ def frost_template_kernel(
         group_begin = cutlass.Int32(0)
         group_end = cutlass.Int32(0)
         is_tile_valid = cutlass.Int32(1)
+        if cutlass.const_expr(direct_schedule):
+            static_linear_idx = cutlass.Int32(bidx // cluster_m)
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the cluster leader claims the next GLOBAL
-            # tile index and broadcasts it, so the clusters live at any instant
-            # sit in one contiguous window of tile space and share L2. Static
-            # striding lets them drift apart and share nothing.
-            if cta_rank_in_cluster == 0:
+            if cutlass.const_expr(direct_schedule):
+                linear_idx = static_linear_idx
+                static_linear_idx += gridx // cluster_m
+            else:
+                # Dynamic tile assignment: the cluster leader claims the next GLOBAL
+                # tile index and broadcasts it, so the clusters live at any instant
+                # sit in one contiguous window of tile space and share L2. Static
+                # striding lets them drift apart and share nothing.
+                if cta_rank_in_cluster == 0:
+                    while not nvvm.mbarrier_try_wait_parity(
+                        sched_bcast_empty_mbar_ptr.subview(bcast_stage),
+                        bcast_empty_phase,
+                        time_limit=10_000_000,
+                    ):
+                        pass
+                    claimed = cutlass.Int32(0)
+                    if lane == 0:
+                        claimed = nvvm.atomicrmw(
+                            "add",
+                            sched_counter_ptr,
+                            cutlass.Int32(1),
+                            mem_order="relaxed",
+                            syncscope="gpu",
+                        )
+                    claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
+                    if lane < cluster_size:
+                        (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
+                        nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
                 while not nvvm.mbarrier_try_wait_parity(
-                    sched_bcast_empty_mbar_ptr.subview(bcast_stage),
-                    bcast_empty_phase,
+                    sched_bcast_full_mbar_ptr.subview(bcast_stage),
+                    bcast_full_phase,
                     time_limit=10_000_000,
                 ):
                     pass
-                claimed = cutlass.Int32(0)
+                linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
+                # Finish every lane's slot reads before the elected release.
+                nvvm.bar_warp_sync(0xFFFFFFFF)
                 if lane == 0:
-                    claimed = nvvm.atomicrmw(
-                        "add",
-                        sched_counter_ptr,
-                        cutlass.Int32(1),
-                        mem_order="relaxed",
-                        syncscope="gpu",
-                    )
-                claimed = nvvm.shfl_sync(full_warp_mask, claimed, 0, shfl_idx_clamp, nvvm.Shfl.IDX)
-                if lane < cluster_size:
-                    (nvvm.mapa(sched_bcast_slot.subview(bcast_stage), lane)).store(claimed)
-                    nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_full_mbar_ptr.subview(bcast_stage), lane))
-            while not nvvm.mbarrier_try_wait_parity(
-                sched_bcast_full_mbar_ptr.subview(bcast_stage),
-                bcast_full_phase,
-                time_limit=10_000_000,
-            ):
-                pass
-            linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
-            # Finish every lane's slot reads before the elected release.
-            nvvm.bar_warp_sync(0xFFFFFFFF)
-            if lane == 0:
-                nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
-            if cutlass.const_expr(cluster_size > 1):
-                # The final invalid broadcast has no next reuse of this stage to
-                # wait for its cluster-wide acknowledgements, so retain its exact
-                # stage and completion parity for the scheduler-warp drain below.
-                last_bcast_stage = bcast_stage
-                last_bcast_empty_done_phase = bcast_empty_phase ^ 1
-            bcast_stage += 1
-            if bcast_stage == SCHED_BCAST_STAGES:
-                bcast_stage = cutlass.Int32(0)
-                bcast_full_phase = bcast_full_phase ^ 1
-                bcast_empty_phase = bcast_empty_phase ^ 1
+                    nvvm.mbarrier_arrive(nvvm.mapa(sched_bcast_empty_mbar_ptr.subview(bcast_stage), 0))
+                if cutlass.const_expr(cluster_size > 1):
+                    # The final invalid broadcast has no next reuse of this stage to
+                    # wait for its cluster-wide acknowledgements, so retain its exact
+                    # stage and completion parity for the scheduler-warp drain below.
+                    last_bcast_stage = bcast_stage
+                    last_bcast_empty_done_phase = bcast_empty_phase ^ 1
+                bcast_stage += 1
+                if bcast_stage == SCHED_BCAST_STAGES:
+                    bcast_stage = cutlass.Int32(0)
+                    bcast_full_phase = bcast_full_phase ^ 1
+                    bcast_empty_phase = bcast_empty_phase ^ 1
             if linear_idx >= start_linear_idx + total_tiles:
                 is_search_live = cutlass.Int32(1)
                 while is_search_live != 0:
@@ -794,7 +803,7 @@ def frost_template_kernel(
         # leaving the loop. Keep the leader CTA's DSM alive until every
         # scheduler warp has consumed that final broadcast and acknowledged the
         # leader slot. A singleton cluster has no remote DSM lifetime to drain.
-        if cutlass.const_expr(cluster_size > 1):
+        if cutlass.const_expr(cluster_size > 1 and not direct_schedule):
             if cta_rank_in_cluster == 0:
                 # Each acknowledgement flips the saved pre-wrap empty phase, so
                 # pre-wrap ``bcast_empty_phase ^ 1`` is the completed parity.
@@ -1648,32 +1657,44 @@ def _host(
 
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
-    grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
+    nonempty_groups = cutlass.min(n, cutlass.Int64(num_groups))
+    max_token_tiles = nonempty_groups + (n - nonempty_groups) // cgrp_tile_mnk[1]
+    max_tiles = cute.ceil_div(m, cgrp_tile_mnk[0]) * max_token_tiles
+    launch_clusters = cutlass.max(cutlass.Int64(1), cutlass.min(cutlass.Int64(grid_num_clusters), max_tiles))
     counter_qword = grid_num_clusters * cluster_m * cluster_n * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-    frost_template_kernel(
-        problem_size[0],
-        problem_size[1],
-        problem_size[2],
-        cutlass.Int32(num_experts),
-        cutlass.Int32(num_groups),
-        first_token_offset,
-        tma_workspace,
-        tma_a_desc_list[0],
-        tma_b_desc_list[0],
-        b_0,
-        _b_stride_sets[0][0],
-        out_stride_m_0,
-        out_stride_n_0,
-        out_stride_l_0,
-        tma_c_desc_list[0],
-    ).launch(
-        grid=grid_shape,
-        block=(threads_per_cta, 1, 1),
-        cluster=cluster_shape_mnk,
-        use_pdl=USE_PDL,
-        stream=stream,
-    )
+    use_direct = (n <= 8) & (max_tiles <= grid_num_clusters)
+    if not use_direct:
+        _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    for direct_schedule in cutlass.range_constexpr(2):
+        if use_direct == (direct_schedule == 1):
+            if cutlass.const_expr(direct_schedule == 1):
+                grid_shape = (launch_clusters * cluster_m, cluster_n, 1)
+            else:
+                grid_shape = (grid_num_clusters * cluster_m, cluster_n, 1)
+            frost_template_kernel(
+                problem_size[0],
+                problem_size[1],
+                problem_size[2],
+                cutlass.Int32(num_experts),
+                cutlass.Int32(num_groups),
+                first_token_offset,
+                tma_workspace,
+                tma_a_desc_list[0],
+                tma_b_desc_list[0],
+                b_0,
+                _b_stride_sets[0][0],
+                out_stride_m_0,
+                out_stride_n_0,
+                out_stride_l_0,
+                tma_c_desc_list[0],
+                direct_schedule == 1,
+            ).launch(
+                grid=grid_shape,
+                block=(threads_per_cta, 1, 1),
+                cluster=cluster_shape_mnk,
+                use_pdl=USE_PDL,
+                stream=stream,
+            )
 
 
 @lru_cache(maxsize=None)
