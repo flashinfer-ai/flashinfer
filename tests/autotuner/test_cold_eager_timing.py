@@ -14,7 +14,7 @@ import pytest
 import torch
 import flashinfer.autotuner as at_package
 from flashinfer import MeasurementPolicy, autotune_v2
-from flashinfer.autotuner import TuningConfig
+from flashinfer.autotuner import AutoTuner, TuningConfig
 from .utils import DummyRunner, reset_autotuner
 
 at_module = importlib.import_module("flashinfer.autotuner.autotuner")
@@ -121,7 +121,10 @@ def tuner(monkeypatch):
     monkeypatch.setattr(result, "warmup", 1)
     monkeypatch.setattr(result, "repeat", 3)
     monkeypatch.setattr(result, "_use_global_timer", False)
-    monkeypatch.setattr(result, "_get_l2_cache_size_in_bytes", lambda *a: 32768)
+    # Patch the class so teardown does not leave a bound method on the singleton
+    # and hide later tests' class-level patches.
+    monkeypatch.setattr(AutoTuner, "_get_l2_cache_size_in_bytes", lambda *a: 32768)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         at_package,
         "_collect_metadata",

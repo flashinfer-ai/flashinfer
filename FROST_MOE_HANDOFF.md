@@ -118,3 +118,40 @@ BF16 dot products remains unresolved. Original and updated stage-depth versions
 reproduce it; no tolerance was relaxed. Passing reported fixtures does not prove
 accuracy on arbitrary ill-conditioned inputs. Full repository CI, broad workload
 coverage, deployment benefit and a performance roof remain unclaimed.
+
+
+## SM120 integration update — September 22, 2026
+
+The companion drafts now include the explicit BF16 SM120 SwiGLU and projection
+engines (20404 and 20403), prepared execution improvements, and FlashInfer
+measurement-policy handling. The specialized paths remain opt-in and retain
+the documented shape, device, layout and precision checks. Kernel sources are
+in Frontend PR #1080; the FlashInfer adapter is in PR #5250.
+
+The combined executable sources passed a fresh 20-process qualification on a
+188-SM RTX PRO 6000 Blackwell Server Edition: T1/T8/T64, packed and unpacked
+routing, 280 raw numerical checks, 120 changed-reference controls, and 100 direct
+Hugging Face comparisons. The candidate also passed T1/T8 memcheck and racecheck,
+live-binding and retained-graph checks. This establishes correctness for those
+fixtures, not general model coverage or a new performance result.
+
+In a separate fixed-configuration study using trained Qwen3-30B-A3B layer-0
+weights and captured inputs (BF16, E128, top-k 8, H2048, I768, T1), the small-token
+implementation reduced warm complete-MoE latency from 28.9925 to 26.3203 us
+(unpacked, 9.217%) and from 29.0439 to 26.1799 us (packed, 9.861%). Cold-cache
+latency did not improve, and T8/T64 controls remained within 0.04%. Those numbers
+are relative to the preceding implementation with fixed configurations; they
+are not a comparison with TensorRT-LLM or a full-model speedup. Preparation,
+router-logit/top-k computation and attention are excluded.
+
+This work builds on NVIDIA Frost/CuTeDSL/CUTLASS, Yanqin and Yihua's integration
+work, and the NVIDIA CuTeDSL MegaMoE contribution already credited in source.
+Our subsequent implementation changes and their measured increments are
+separate from configuration search and reused infrastructure.
+
+Customer-facing performance evaluation is still in progress. The next baseline
+uses representative model inputs and the normal automatically tuned execution
+path. Earlier fallback-tactic measurements do not establish the performance a
+TensorRT-LLM serving user obtains by default. Host-only improvements from separate
+studies must not be added to the kernel results above. Existing numerical
+limitations in the earlier SM100 paired path remain documented and unresolved.
