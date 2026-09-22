@@ -353,6 +353,9 @@ def prepare_sparse_mla_metadata(
         pytest.param(2, 3, 64, 129, False, False, False, False, id="single-source"),
         pytest.param(4, 1, 64, 513, True, False, False, True, id="wide-query"),
         pytest.param(64, 1, 128, 513, True, False, False, True, id="two-cta"),
+        pytest.param(
+            16, 1, 128, 2049, True, False, False, False, id="small-grid-wide-kv"
+        ),
         pytest.param(0, 1, 96, 513, True, False, False, True, id="partial-wide-heads"),
         pytest.param(
             0, 1, 8, 513, True, False, False, True, id="single-stream-short-kv"

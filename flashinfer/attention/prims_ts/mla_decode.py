@@ -2169,7 +2169,7 @@ def _fake_sparse_tensor(dtype, shape):
 def _compile_finish(device_index, heads, independent):
     import cutlass
     import cutlass.cute as cute
-    from .kernels.mla_decode.sparse_reduce import FinishSparseMla
+    from .kernels.separate_reduction import MergeMlaSourceStates
 
     rows = cute.sym_int()
 
@@ -2178,7 +2178,7 @@ def _compile_finish(device_index, heads, independent):
         lse = _fake_sparse_tensor(cutlass.Float32, (rows, heads))
         lens = _fake_sparse_tensor(cutlass.Int32, (rows,))
         return cute.compile[cute.FrontendNext](
-            FinishSparseMla(independent),
+            MergeMlaSourceStates(independent),
             partial,
             partial,
             lse,
@@ -2188,28 +2188,6 @@ def _compile_finish(device_index, heads, independent):
             _fake_sparse_tensor(cutlass.Float32, (heads,)),
             partial,
             lse,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options=_COMPILE_OPTIONS,
-        )
-
-
-@functools.cache
-def _compile_sparse_reduce(device_index, heads, storage_heads, splits, direct=False):
-    import cutlass
-    import cutlass.cute as cute
-    from .kernels.mla_decode.sparse_reduce import FinishSparseMlaSplit
-
-    rows = cute.sym_int()
-
-    with torch.cuda.device(device_index):
-        return cute.compile[cute.FrontendNext](
-            FinishSparseMlaSplit(splits, direct),
-            _fake_sparse_tensor(cutlass.BFloat16, (rows, storage_heads, splits, 512)),
-            _fake_sparse_tensor(cutlass.Float32, (rows, storage_heads, splits)),
-            _fake_sparse_tensor(cutlass.Int32, (rows,)),
-            _fake_sparse_tensor(cutlass.Float32, (heads,)),
-            _fake_sparse_tensor(cutlass.BFloat16, (rows, heads, 512)),
-            _fake_sparse_tensor(cutlass.Float32, (rows, heads)),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options=_COMPILE_OPTIONS,
         )
@@ -2447,7 +2425,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             assume_valid_prefix=assume_valid_prefix,
         )
         kernel = spec.kernel
-        family, tile = profile.family, profile.tile_size_q
+        family = profile.family
         splits = profile.split_kv
         max_rows = batch_size * max_seq_len_q
         # Policy resolves supported geometry before compilation. The fused
@@ -2470,13 +2448,11 @@ class BatchSparseMLADecodePagedTSWrapper:
         compiled = _get_compiled_mla_decode(spec)
         compiled_fused = None
         compiled_static = None
-        compiled_reducer = None
-        storage_heads = ((num_heads + tile - 1) // tile) * tile
         if use_fused_epilogue or use_fused_reduction:
             fused_kernel = copy.copy(kernel)
             if family == "2cta":
                 fused_kernel.fuse_sparse_epilogue = use_fused_epilogue
-                fused_kernel.external_sparse_reduction = use_fused_reduction
+                fused_kernel.fuse_sparse_reduction = use_fused_reduction
             else:
                 fused_kernel.finalize_output = True
             fused_kernel.direct_sparse = use_direct
@@ -2498,10 +2474,6 @@ class BatchSparseMLADecodePagedTSWrapper:
                         kernel=static_kernel,
                         kernel_signature=_mla_kernel_compile_signature(static_kernel),
                     )
-                )
-            if use_fused_reduction:
-                compiled_reducer = _compile_sparse_reduce(
-                    device.index, num_heads, storage_heads, splits, use_direct
                 )
         finish = tuple(
             _compile_finish(device.index, num_heads, independent)
@@ -2526,8 +2498,6 @@ class BatchSparseMLADecodePagedTSWrapper:
             compiled=compiled,
             compiled_fused=compiled_fused,
             compiled_static=compiled_static,
-            compiled_reducer=compiled_reducer,
-            storage_heads=storage_heads,
             direct_inputs=use_direct,
             assume_valid_prefix=assume_valid_prefix,
             finish=finish,
@@ -2871,7 +2841,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             and not independent
             and lse.data_ptr() % 16 == 0
         )
-        fused_main = fused and state["compiled_reducer"] is None
+        fused_main = fused
         direct = fused and state["direct_inputs"]
         static_scales = direct and all(
             not isinstance(v, torch.Tensor)
@@ -2947,27 +2917,6 @@ class BatchSparseMLADecodePagedTSWrapper:
                         if fused
                         else state["compiled"]
                     ),
-                )
-            if fused and not fused_main:
-                split_elements = rows * state["storage_heads"] * state["splits"]
-                o_bytes = split_elements * 512 * 2
-                partial = (
-                    buffers["core"][:o_bytes]
-                    .view(torch.bfloat16)
-                    .view(rows, state["storage_heads"], state["splits"], 512)
-                )
-                partial_lse = (
-                    buffers["core"][o_bytes : o_bytes + split_elements * 4]
-                    .view(torch.float32)
-                    .view(rows, state["storage_heads"], state["splits"])
-                )
-                state["compiled_reducer"](
-                    partial,
-                    partial_lse,
-                    buffers["counts"][0, :rows],
-                    sinks,
-                    out.view(rows, state["heads"], 512),
-                    lse.view(rows, state["heads"]),
                 )
             if not fused:
                 state["finish"][int(independent)](

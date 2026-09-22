@@ -1770,18 +1770,36 @@ class ThroughputLatencyMlaDecodeTs:
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
 
+    def _parallel_reduction_setup(self, cfg):
+        if cfg.fuse_sparse_reduction:
+            if cfg.logical_seq_len_q != 1:
+                raise ValueError(
+                    "final sparse reduction requires one virtual query per request"
+                )
+            # Partials already contain every V partition. Finalize one whole
+            # D512 head per CTA, sharing its statistics across four vec4 warps.
+            reducer_cfg = dataclass_replace(
+                cfg, num_ctas_per_head_dim=1, head_dim_per_cta_v=cfg.head_dim_v
+            )
+            topology = make_balanced_parallel_reduction_topology(
+                cfg.num_ctas_per_seq_kv, cluster_size=1
+            )
+            return reducer_cfg, topology, cfg.head_dim_v
+        return (
+            cfg,
+            self.parallel_reduction_topology,
+            self.parallel_reduction_elements_per_slice,
+        )
+
     def compile_topology_signature(self) -> tuple[object, ...]:
         """Describe batch-derived reducer choices without retaining batch."""
 
         cfg = self._make_config()
         if cfg.use_multi_ctas_kv != 1 or cfg.use_cluster_reduction == 1:
             return ("no_separate_reducer",)
-        if self.use_parallel_reduction:
-            return (
-                "parallel",
-                self.parallel_reduction_topology,
-                self.parallel_reduction_elements_per_slice,
-            )
+        if self.use_parallel_reduction or cfg.fuse_sparse_reduction:
+            _, topology, elements = self._parallel_reduction_setup(cfg)
+            return ("parallel", topology, elements)
         grid, smem, threads, reduction_ctas = gmem_reduction_launch_shape(
             cfg,
             cfg.seq_len_q,
@@ -2242,16 +2260,25 @@ class ThroughputLatencyMlaDecodeTs:
             min_blocks_per_mp=1,
             use_pdl=acc_o is not None,
         )
-        if cutlass.const_expr(cfg.external_sparse_reduction):
-            return
         if cutlass.const_expr(acc_o is not None):
-            if cutlass.const_expr(self.use_parallel_reduction):
-                topology = self.parallel_reduction_topology
+            if cutlass.const_expr(
+                self.use_parallel_reduction or cfg.fuse_sparse_reduction
+            ):
+                reducer_cfg, topology, elements = self._parallel_reduction_setup(cfg)
+                atten_sinks = None
+                if cutlass.const_expr(cfg.fuse_sparse_reduction):
+                    if cutlass.const_expr(cfg.sparse_direct):
+                        atten_sinks = block_split_kvs[-1]
+                    else:
+                        atten_sinks = cute.make_tensor(
+                            block_split_kvs.iterator + 2,
+                            cute.make_layout(cfg.logical_num_heads_q),
+                        )
                 reduction_grid, reduction_cluster = (
                     parallel_gmem_reduction_launch_shape(
-                        cfg,
+                        reducer_cfg,
                         topology,
-                        self.parallel_reduction_elements_per_slice,
+                        elements,
                     )
                 )
                 reduction_grid = (
@@ -2259,9 +2286,9 @@ class ThroughputLatencyMlaDecodeTs:
                     reduction_grid[1],
                     batch_size,
                 )
-                reduction_threads = parallel_gmem_reduction_threads(
-                    self.parallel_reduction_elements_per_slice
-                )
+                if cutlass.const_expr(cfg.fuse_sparse_reduction):
+                    reduction_grid = (cfg.logical_num_heads_q, 1, batch_size)
+                reduction_threads = parallel_gmem_reduction_threads(elements)
                 parallel_reducer = self.parallel_gmem_reduction_kernel(
                     o,
                     lse,
@@ -2269,6 +2296,7 @@ class ThroughputLatencyMlaDecodeTs:
                     acc_lse,
                     cache_seqs,
                     cu_seqlens_q,
+                    atten_sinks,
                 )
                 if cutlass.const_expr(topology.cluster_size == 1):
                     parallel_reducer.launch(
@@ -2633,11 +2661,12 @@ class ThroughputLatencyMlaDecodeTs:
         acc_lse: cute.Tensor,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
+        atten_sinks: cute.Tensor | None = None,
     ):
         """Dispatch the automatically selected parallel standalone reducer."""
 
         cfg = self._make_config()
-        topology = self.parallel_reduction_topology
+        cfg, topology, elements = self._parallel_reduction_setup(cfg)
         run_parallel_gmem_reduction_kernel(
             output,
             lse,
@@ -2649,5 +2678,7 @@ class ThroughputLatencyMlaDecodeTs:
             topology.cluster_size,
             topology.slots_per_rank,
             topology.actual_splits,
-            self.parallel_reduction_elements_per_slice,
+            elements,
+            atten_sinks,
+            cfg.fuse_sparse_reduction,
         )

@@ -19,8 +19,12 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
-from ...separate_reduction import finalize_log2_sum_exp, normalized_lse_weight
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ...separate_reduction import (
+    finalize_log2_sum_exp,
+    normalized_lse_weight,
+    attention_sink_scale,
+)
+from ..helpers.constants import LN_2, SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
 from ..helpers.ops import fmax_f32, warp_reduce_max_f32, warp_reduce_sum_f32
@@ -147,9 +151,12 @@ def _store_parallel_reduction_result(
     tidx,
     batch_idx,
     cu_seqlens_q,
+    finalize_attention: cutlass.Constexpr[bool] = False,
 ):
     """Publish one normalized FP32 output fragment and final LSE."""
 
+    if cutlass.const_expr(finalize_attention):
+        global_lse *= Float32(LN_2)
     if tidx == Int32(0) and query_is_valid:
         if cutlass.const_expr(cu_seqlens_q is not None):
             lse[logical_head_idx, storage_q_idx] = global_lse
@@ -193,6 +200,8 @@ def run_parallel_reduction_kernel(
     actual_splits: cutlass.Constexpr[int],
     cluster_size: cutlass.Constexpr[int],
     slots_per_rank: cutlass.Constexpr[int],
+    atten_sinks=None,
+    finalize_attention: cutlass.Constexpr[bool] = False,
 ):
     """Reduce one D=512 row cooperatively across a padded CTA cluster.
 
@@ -206,6 +215,8 @@ def run_parallel_reduction_kernel(
     signal before entering this body.
     """
 
+    if cutlass.const_expr(finalize_attention and cluster_size != 1):
+        raise ValueError("final attention output uses a single-CTA reducer per row")
     block_idx_x, query_tile_idx, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -298,15 +309,23 @@ def run_parallel_reduction_kernel(
             local_sum_lse += lane_exp[lane_slot_i]
         local_sum_lse = warp_reduce_sum_f32(local_sum_lse)
         local_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
+        sink_scale = Float32(1)
+        if cutlass.const_expr(finalize_attention and atten_sinks is not None):
+            sink_scale = Float32(0)
+            if query_is_valid:
+                sink_scale = attention_sink_scale(
+                    local_lse_value, Float32(atten_sinks[logical_head_idx])
+                )
         if lane_idx == Int32(0):
             smem_local_lse[0] = local_lse_value
 
         for lane_slot_i in cutlass.range_constexpr(lse_slots_per_lane):
             local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
             if local_slot_idx < Int32(slots_per_rank):
-                smem_local_scale[local_slot_idx] = normalized_lse_weight(
-                    lane_lse[lane_slot_i], local_lse_value
-                )
+                weight = normalized_lse_weight(lane_lse[lane_slot_i], local_lse_value)
+                if cutlass.const_expr(finalize_attention):
+                    weight *= sink_scale
+                smem_local_scale[local_slot_idx] = weight
 
     prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
 
@@ -331,23 +350,26 @@ def run_parallel_reduction_kernel(
         )
         if active_slot:
             split_scale = Float32(smem_local_scale[slot_i])
-            partial_offset = Int64(
-                row_in_tile * acc_output.stride[0]
-                + split_idx * acc_output.stride[1]
-                + element_idx * acc_output.stride[2]
-                + query_tile_idx * acc_output.stride[3]
-                + batch_idx * acc_output.stride[4]
-            )
-            partial_output = (
-                (acc_output_ptr + partial_offset)
-                .load(
-                    count=PARALLEL_REDUCTION_ELEMENTS_PER_THREAD,
-                    alignment=8,
+            if not finalize_attention or split_scale > Float32(0):
+                partial_offset = Int64(
+                    row_in_tile * acc_output.stride[0]
+                    + split_idx * acc_output.stride[1]
+                    + element_idx * acc_output.stride[2]
+                    + query_tile_idx * acc_output.stride[3]
+                    + batch_idx * acc_output.stride[4]
                 )
-                .to(Float32)
-            )
-            for j in cutlass.range_constexpr(PARALLEL_REDUCTION_ELEMENTS_PER_THREAD):
-                local_output[j] += partial_output[j] * split_scale
+                partial_output = (
+                    (acc_output_ptr + partial_offset)
+                    .load(
+                        count=PARALLEL_REDUCTION_ELEMENTS_PER_THREAD,
+                        alignment=8,
+                    )
+                    .to(Float32)
+                )
+                for j in cutlass.range_constexpr(
+                    PARALLEL_REDUCTION_ELEMENTS_PER_THREAD
+                ):
+                    local_output[j] += partial_output[j] * split_scale
 
     local_lse_value = smem_local_lse[0]
 
@@ -367,6 +389,7 @@ def run_parallel_reduction_kernel(
             tidx,
             batch_idx,
             cu_seqlens_q,
+            finalize_attention,
         )
         return
 

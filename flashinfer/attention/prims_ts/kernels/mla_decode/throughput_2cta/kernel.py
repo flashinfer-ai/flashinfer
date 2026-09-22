@@ -85,6 +85,7 @@ from .resources import (
 from ..helpers.math import qkv_dtype
 from ..parallel_reduction_topology import (
     ParallelReductionTopology,
+    make_balanced_parallel_reduction_topology,
     make_q128_wave_limited_parallel_reduction_topology,
     should_use_q128_g1_parallel_reducer,
     validate_parallel_reduction_workspace,
@@ -884,7 +885,7 @@ class MlaDecodeTs:
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
         self.device_scales = device_scales
-        self.external_sparse_reduction = False
+        self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         # Separate prepared source lists, rather than a premerged tagged list.
         # Both representations reuse the same metadata staging and KV loaders.
@@ -919,6 +920,13 @@ class MlaDecodeTs:
 
         return self.mma_qk_tiler_mn[0], self.num_q_tiles
 
+    def _reduction_topology(self):
+        if self.fuse_sparse_reduction:
+            return make_balanced_parallel_reduction_topology(
+                self.reduction_split_capacity, cluster_size=1
+            )
+        return self.parallel_reduction_topology
+
     def compile_signature(self) -> tuple[object, ...]:
         """Return the complete batch-independent JIT identity."""
 
@@ -946,8 +954,8 @@ class MlaDecodeTs:
             self.tail_q_rows,
             self._parallel_reduction_shape_is_eligible,
             self.use_parallel_reduction,
-            self.parallel_reduction_topology,
-            self.external_sparse_reduction,
+            self._reduction_topology(),
+            self.fuse_sparse_reduction,
             self.fuse_sparse_epilogue,
             self.direct_sparse,
             self.assume_valid_prefix,
@@ -1057,7 +1065,7 @@ class MlaDecodeTs:
         stream: object,
     ):
         """Execute the MLA decode TS kernel."""
-        if cutlass.const_expr(self.external_sparse_reduction):
+        if cutlass.const_expr(self.fuse_sparse_reduction):
             if cutlass.const_expr(
                 self.is_persistent
                 or self.is_var_split_kv
@@ -1065,7 +1073,7 @@ class MlaDecodeTs:
                 or self.static_split_kv < 2
             ):
                 raise ValueError(
-                    "external sparse reduction requires fixed, nonpersistent split-KV"
+                    "fused sparse reduction requires fixed, nonpersistent split-KV"
                 )
         if cutlass.const_expr(self.fuse_sparse_epilogue):
             # This CTA can finalize only an unsplit output. Split partials
@@ -1074,7 +1082,7 @@ class MlaDecodeTs:
                 raise ValueError("2CTA fused epilogue requires one split")
         if cutlass.const_expr(self.direct_sparse):
             if cutlass.const_expr(
-                not (self.external_sparse_reduction or self.fuse_sparse_epilogue)
+                not (self.fuse_sparse_reduction or self.fuse_sparse_epilogue)
                 or self.qkv_dtype not in ("e4m3", "bf16")
                 or self.page_size != 1
                 or self.rope_dim != 0
@@ -1357,10 +1365,9 @@ class MlaDecodeTs:
             kernel_split_kv,
             workspace,
         )
-        # Nonpersistent producers signal near retirement. Both the internal
-        # reducer and the direct sparse finisher can overlap setup with that
-        # retirement, then wait for the complete prerequisite grid before
-        # reading partials. Persistent schedules retain ordinary ordering.
+        # Nonpersistent producers signal near retirement. The native reducer
+        # can overlap setup, then waits for the complete prerequisite grid
+        # before reading partials. Persistent schedules retain stream ordering.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
         self.split_kv_kernel(
@@ -1394,9 +1401,11 @@ class MlaDecodeTs:
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
-        if cutlass.const_expr(acc_o is not None and not self.external_sparse_reduction):
-            if cutlass.const_expr(self.use_parallel_reduction):
-                topology = self.parallel_reduction_topology
+        if cutlass.const_expr(acc_o is not None):
+            if cutlass.const_expr(
+                self.use_parallel_reduction or self.fuse_sparse_reduction
+            ):
+                topology = self._reduction_topology()
                 self.parallel_reduction_kernel(
                     o,
                     lse,
@@ -1408,7 +1417,12 @@ class MlaDecodeTs:
                     block_split_kvs,
                 ).launch(
                     grid=(
-                        physical_tile_rows * topology.cluster_size,
+                        (
+                            self.num_heads
+                            if self.fuse_sparse_reduction
+                            else physical_tile_rows
+                        )
+                        * topology.cluster_size,
                         num_query_tiles,
                         batch_size,
                     ),
@@ -1683,29 +1697,10 @@ class MlaDecodeTs:
                 tile_sched_params.problem_shape_b_fdd,
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
-        tile_cluster_idx, tile_seq_q_idx, tile_batch_idx, tile_split_kv_idx = blk_coord
-        if cutlass.const_expr(self.external_sparse_reduction):
-            # The native reducer bounds its reads by each request's active
-            # split count. The shared sparse reducer consumes a fixed split
-            # array, so skipped splits must publish an explicit empty LSE.
-            if tidx < Int32(cfg.mma_qk_tiler[0] // cfg.num_mma_ctas):
-                total_tiles = (Int32(cache_seqs[tile_batch_idx]) + Int32(127)) // Int32(
-                    128
-                )
-                _, local_tiles = runtime_split_tile_range(
-                    total_tiles, split_kv, tile_split_kv_idx
-                )
-                if local_tiles == Int32(0):
-                    row_in_tile = (
-                        tile_cluster_idx
-                        * Int32(cfg.mma_qk_tiler[0] // cfg.num_mma_ctas)
-                        + tidx
-                    )
-                    acc_lse[
-                        row_in_tile, tile_split_kv_idx, tile_seq_q_idx, tile_batch_idx
-                    ] = Float32(-Float32.inf)
-        del tile_cluster_idx
-
+        _, tile_seq_q_idx, tile_batch_idx, tile_split_kv_idx = blk_coord
+        # The native reducer derives active splits from the same live
+        # combined-source extent. It never reads inactive workspace slots,
+        # so skipped CTAs need no separate sparse-only LSE initialization.
         fixed_nonempty_single_split = (
             not self.is_var_seq
             and not self.is_var_split_kv
@@ -2093,7 +2088,7 @@ class MlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: object,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
 
@@ -2108,7 +2103,23 @@ class MlaDecodeTs:
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-        topology = self.parallel_reduction_topology
+        atten_sinks = None
+        if cutlass.const_expr(self.fuse_sparse_reduction):
+            if cutlass.const_expr(self.direct_sparse):
+                from ..sparse_views import SparseBatchLengthView
+
+                _, _, primary_lengths, extra_lengths, _, _, _, _, atten_sinks = (
+                    block_split_kvs
+                )
+                cache_seqs = SparseBatchLengthView((primary_lengths, extra_lengths))
+            else:
+                atten_sinks = cute.make_tensor(
+                    block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
+                )
+            # Static sparse splitting uses the combined live extent above;
+            # this payload is not a variable-split tensor.
+            block_split_kvs = None
+        topology = self._reduction_topology()
         run_parallel_reduction_kernel(
             self.num_heads,
             self.seq_len_q,
@@ -2125,4 +2136,6 @@ class MlaDecodeTs:
             topology.actual_splits,
             topology.cluster_size,
             topology.slots_per_rank,
+            atten_sinks,
+            self.fuse_sparse_reduction,
         )

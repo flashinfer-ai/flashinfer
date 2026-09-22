@@ -12,8 +12,9 @@ existing experimental Prims-TS backend. CuTe DSL 4.7 is required.
 - `sparse_policy.py`: datatype-specific schedule selection, buffer sizing and
   split/V partition sizing from planned workload bounds and SM count.
 - `sparse_views.py`: live per-request storage-row metadata used by the loaders.
-- `sparse_reduce.py`: split reduction and joint normalization of independent
-  source passes, including sinks and LSE.
+- The existing 1CTA/2CTA reducers finalize split-KV outputs, sinks and LSE.
+  `kernels/separate_reduction.py` shares their arithmetic and merges
+  independently scaled source results.
 - `helpers/gather.py` and the existing 1-CTA/2-CTA families: TMA gather4,
   cached offsets, retained KV and softmax/correction pipelines.
 
