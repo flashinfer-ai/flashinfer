@@ -20,7 +20,7 @@ This helper owns the process's CUPTI activity session while measuring; run the
 benchmark without another profiler or concurrent workload in the same process.
 """
 
-from collections import Counter
+from collections import Counter, defaultdict
 import ctypes
 import importlib.metadata
 import math
@@ -181,6 +181,7 @@ def measure_moe_cupti(fn, *, mode, warmup, repeats):
     if len(timestamps) != repeats:
         raise RuntimeError("CUPTI did not collect every requested iteration")
 
+    breakdown = defaultdict(list)
     samples = {
         name: []
         for name in (
@@ -234,6 +235,12 @@ def measure_moe_cupti(fn, *, mode, warmup, repeats):
         samples["kernel_sum_ms"].append(
             sum(a["end"] - a["start"] for a in kernels) / 1e6
         )
+        # Per-launch breakdown in stream order; the multiplicity check above
+        # guarantees every iteration has the same launch sequence.
+        for index, activity in enumerate(sorted(kernels, key=lambda a: a["start"])):
+            breakdown[(index, activity["name"])].append(
+                (activity["end"] - activity["start"]) / 1e6
+            )
         samples["host_enqueue_ms"].append((submitted - start) / 1e6)
         samples["synchronized_e2e_ms"].append((synchronized - start) / 1e6)
     if any(
@@ -242,6 +249,15 @@ def measure_moe_cupti(fn, *, mode, warmup, repeats):
         for value in values
     ):
         raise RuntimeError("CUPTI returned invalid measurement samples")
+    kernel_breakdown = [
+        {
+            "index": index,
+            "name": name,
+            "median_ms": statistics.median(values),
+            "min_ms": min(values),
+        }
+        for (index, name), values in sorted(breakdown.items())
+    ]
     inventory = [
         {
             "kind": kind(activity_kind).name,
@@ -264,6 +280,7 @@ def measure_moe_cupti(fn, *, mode, warmup, repeats):
         "samples_ms": samples,
         **{name: statistics.median(values) for name, values in samples.items()},
         "activity_inventory": inventory,
+        "kernel_breakdown": kernel_breakdown,
         "kernel_launches_per_iteration": sum(
             item["count_per_iteration"]
             for item in inventory

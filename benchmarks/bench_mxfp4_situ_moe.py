@@ -220,6 +220,13 @@ def main():
     parser.add_argument("--accuracy", action="store_true")
     parser.add_argument("--offline-tactics", type=Path)
     parser.add_argument("--run-id", default="default")
+    parser.add_argument(
+        "--candidate-impl",
+        choices=("cute_dsl", "swapab"),
+        default="cute_dsl",
+        help="candidate implementation: the CuTe DSL wrapper plan, or the "
+        "experimental swap-AB decode path (separate routing only)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
     args = parser.parse_args()
@@ -248,6 +255,8 @@ def main():
         parser.error("modes must be eager,graph")
     if not all(math.isfinite(x) and x > 0 for x in (args.beta, args.linear_beta)):
         parser.error("paired TRT measurements require finite positive SiTU bounds")
+    if args.candidate_impl == "swapab" and args.routing != "separate":
+        parser.error("--candidate-impl swapab requires --routing separate")
 
     repository = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repository))
@@ -479,7 +488,51 @@ def main():
                     baseline_weights,
                     packed=packed,
                 )
-                plan.run()
+                candidate_run = plan.run
+                if args.candidate_impl == "swapab":
+                    from flashinfer.fused_moe.cute_dsl import swapab_moe as swap
+
+                    swap_buffers = swap.SwapAbBuffers(
+                        num_tokens=count,
+                        top_k=top_k,
+                        num_local_experts=local,
+                        hidden=hidden,
+                        intermediate=shard,
+                        device="cuda",
+                    )
+                    swap_alpha = torch.ones(local, device="cuda", dtype=torch.float32)
+                    swap_weights = weights.float().contiguous()
+                    w1, w1_sf, w2, w2_sf = candidate_weights
+
+                    def candidate_run(
+                        _case=case,
+                        _ids=ids,
+                        _weights=swap_weights,
+                        _buffers=swap_buffers,
+                        _output=output,
+                    ):
+                        swap.swapab_moe_forward(
+                            x=_case.x,
+                            x_sf=_case.x_scale,
+                            route_ids=_ids,
+                            route_weights=_weights,
+                            w1=w1,
+                            w1_sf=w1_sf,
+                            w2=w2,
+                            w2_sf=w2_sf,
+                            w1_alpha=swap_alpha,
+                            w2_alpha=swap_alpha,
+                            beta=_case.beta,
+                            linear_beta=_case.linear_beta,
+                            num_experts=experts,
+                            top_k=top_k,
+                            num_local_experts=local,
+                            local_expert_offset=offset,
+                            output=_output,
+                            buffers=_buffers,
+                        )
+
+                candidate_run()
                 baseline()
                 numerical = None
                 if args.accuracy:
@@ -509,7 +562,7 @@ def main():
                     state["active_row"] = active_key
                     save()
                     implementations = [
-                        ("candidate", plan.run),
+                        ("candidate", candidate_run),
                         ("trtllm_gen", baseline),
                     ]
                     if (tokens.index(count) + distributions.index(distribution)) % 2:
@@ -542,6 +595,7 @@ def main():
                         **ratios,
                         "routing_histogram": histogram,
                         "parallel_routing_histogram": rank_histogram,
+                        "candidate_impl": args.candidate_impl,
                         "workspace_bytes": workspace.numel(),
                         "output_bytes": output.numel() * output.element_size(),
                         "candidate_weight_bytes": candidate_weight_bytes,
@@ -555,6 +609,7 @@ def main():
                     )
                 del (
                     plan,
+                    candidate_run,
                     baseline,
                     baseline_output,
                     workspace,
