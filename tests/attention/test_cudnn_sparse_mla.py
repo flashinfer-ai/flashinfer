@@ -118,8 +118,11 @@ def _reference(args, row_ids=None):
 )
 def test_reference_and_preallocated_outputs(cudnn_available, dim, topk, layout):
     args = _inputs(dim=dim, topk=topk, layout=layout)
-    args["out"] = torch.empty(
-        args["query"].shape[:-1] + (512,), device="cuda", dtype=torch.bfloat16
+    args["out"] = torch.full(
+        args["query"].shape[:-1] + (512,),
+        float("nan"),
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     args["return_lse"] = True
     ids = args["block_tables"].view(6, -1)
@@ -313,7 +316,7 @@ def test_malformed_indices_are_rejected(cudnn_available):
         trtllm_batch_decode_with_kv_cache_mla(**args)
 
 
-def test_graph_replay_updates_indices_and_lengths(cudnn_available):
+def test_graph_replay_updates_inputs_and_lengths(cudnn_available):
     args = _inputs(rows=128, dim=512, topk=2051)
     args["backend"] = "auto"
     args["return_lse"] = True
@@ -321,10 +324,14 @@ def test_graph_replay_updates_indices_and_lengths(cudnn_available):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out, lse = trtllm_batch_decode_with_kv_cache_mla(**args)
+    args["query"].mul_(0.7)
+    args["kv_cache"].add_(0.125)
     args["block_tables"].add_(7).remainder_(4096)
     args["sparse_mla_top_k_lens"][:2] = torch.tensor(
         [0, 17], device="cuda", dtype=torch.int32
     )
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
     graph.replay()
     expected, expected_lse = _reference(args, [0, 1, 127])
     torch.testing.assert_close(
