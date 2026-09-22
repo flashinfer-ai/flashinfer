@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     nvfp4_global_decode_scale_te,
@@ -710,6 +711,13 @@ NVFP4_TE_REFERENCE_CONFIGS = [
         err_use_fast_math=True,
     ),
 ]
+
+
+def _nvfp4_te_reference_case_id(case) -> str:
+    config = case[5]
+    return "nvfp4" if config is None else config.id
+
+
 NVFP4_DEFAULT_4OVER6_CONFIGS = [
     None,
     NVFP44Over6TestConfig(
@@ -821,18 +829,20 @@ def set_nvfp4_quant_env():
             os.environ[name] = value
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("shape", NVFP4_SHAPES)
-@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
-@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
-@pytest.mark.parametrize("per_token_activation", [False, True])
-@pytest.mark.parametrize(
-    "nvfp4_4over6_config",
-    NVFP4_TE_REFERENCE_CONFIGS,
-    ids=lambda config: "nvfp4" if config is None else config.id,
+@parametrize_product(
+    {
+        "dtype": DTYPES,
+        "shape": NVFP4_SHAPES,
+        "sf_layout": NVFP4_SF_LAYOUTS,
+        "init_data": ["random", "boundary", "zeros", "maxes"],
+        "per_token_activation": [False, True],
+        "nvfp4_4over6_config": NVFP4_TE_REFERENCE_CONFIGS,
+        "backend": NVFP4_BACKENDS,
+        "device": CUDA_DEVICES,
+    },
+    regular=pairwise_product_cases,
+    ids=_nvfp4_te_reference_case_id,
 )
-@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_te_reference(
     backend: str,
