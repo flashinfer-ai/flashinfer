@@ -67,6 +67,11 @@ SWAP_PERF_PROBE = int(os.environ.get("SWAPAB_PROBE", "0"))
 SWAP_MAX_AB_STAGES = int(os.environ.get("SWAPAB_STAGES", "12"))
 SWAP_ACC_STAGES = int(os.environ.get("SWAPAB_ACC_STAGES", "2"))
 SWAP_TILE_STAGES = int(os.environ.get("SWAPAB_TILE_STAGES", "8"))
+# Where GEMM2 resolves its per-tile epilogue metadata (expert alpha, output
+# row and route weight per routed column): "sched" = the scheduler warp fills
+# a per-tile smem ring ahead of time, "epi" = the epilogue warps prefetch it
+# one tile ahead in registers.
+SWAP_META_IN_SCHED = os.environ.get("SWAPAB_META", "sched") != "epi"
 # bit 0: tile-major W1 (GEMM1), bit 1: tile-major W2 (GEMM2). Default: both.
 # Each 128x128 MMA tile becomes one contiguous 8 KB block so the weight TMA
 # streams whole DRAM pages (B300: GEMM1 -2%, GEMM2 -2.5% at T=16 balanced).
@@ -156,6 +161,7 @@ def _get_compiled_swapab_kernel(
         SWAP_MAX_AB_STAGES,
         SWAP_ACC_STAGES,
         SWAP_TILE_STAGES,
+        SWAP_META_IN_SCHED,
         SWAP_PERF_PROBE,
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
@@ -174,6 +180,7 @@ def _get_compiled_swapab_kernel(
             max_ab_stages=SWAP_MAX_AB_STAGES,
             num_acc_stages=SWAP_ACC_STAGES,
             num_tile_stages=SWAP_TILE_STAGES,
+            meta_in_sched=SWAP_META_IN_SCHED,
             perf_probe=SWAP_PERF_PROBE,
         )
         _swapab_kernel_cache[key] = cute.compile(
@@ -319,8 +326,10 @@ def swapab_gemm2(
     ``act`` / ``act_sf`` are the permuted ``[R, I]`` E4M3 rows and plain
     ``[R, I/32]`` scales written by GEMM1. ``finalize=True`` reduce-adds
     ``alpha * route_weight * acc`` into the zero-filled ``out[T, H]``;
-    ``finalize=False`` writes ``alpha * acc`` to ``out[T*top_k, H]`` rows
-    indexed by expanded index.
+    ``finalize=False`` (deferred finalize) writes ``alpha * acc`` to
+    ``out[R', H]`` (``R' >= R``) in permuted row order, i.e. row
+    ``expanded_idx_to_permuted_idx[t, k]`` holds expert output for
+    ``(token t, slot k)``; padding rows are left untouched.
     """
     num_local_experts, rows_w, packed_k = w2.shape
     k = packed_k * 2
@@ -338,9 +347,12 @@ def swapab_gemm2(
         if out.shape != (num_tokens, rows_w):
             raise ValueError("finalize output must be [T, H]")
     else:
-        num_tokens = out.shape[0] // top_k
-        if out.shape != (num_tokens * top_k, rows_w):
-            raise ValueError("partial output must be [T*top_k, H]")
+        if out.ndim != 2 or out.shape[0] < rows or out.shape[1] != rows_w:
+            raise ValueError(
+                "deferred output must be [>= permuted rows, H] BF16 rows in "
+                "permuted order"
+            )
+        num_tokens = out.shape[0]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(1)
     args = (
@@ -472,7 +484,12 @@ def swapab_moe_forward(
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
-    """Full swap-path MoE: ``moe_sort`` (``tile``-row groups) -> GEMM1 -> GEMM2."""
+    """Full swap-path MoE: ``moe_sort`` (``tile``-row groups) -> GEMM1 -> GEMM2.
+
+    ``finalize=False`` writes deferred rows (``alpha * acc`` per permuted row,
+    no route weight) into ``output[buffers.rows, H]``; the caller finalizes
+    with ``buffers.expanded_idx_to_permuted_idx`` and ``route_weights``.
+    """
     moe_sort(
         token_selected_experts=route_ids,
         token_final_scales=route_weights,

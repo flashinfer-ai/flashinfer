@@ -110,7 +110,46 @@ The default decode forward then launches GEMM1 and GEMM2 with finalize:
 three device-kernel launches in total. Expert IDs must be unique within each
 token and lie in ``[0, num_experts)``, as in standard top-k routing.
 PDL-enabled decode retains separate
-native sorting. Prefill conversion, sorting and clearing are unchanged.
+native sorting. Above T=16 the same conversion + output-clear kernel runs
+without the fused sort (it is grid-strided over any token count), followed
+by the native ``moe_sort``; PDL-enabled prefill keeps the torch conversion
+and separate memset.
+
+Deferred finalize
+~~~~~~~~~~~~~~~~~
+
+``plan(..., do_finalize=False)`` delivers the deferred form the feature
+request describes for fusing finalization with caller-owned collectives:
+rank-local GEMM2 rows, the router weights and the assignment-to-row map,
+mirroring ``trtllm_fp4_block_scale_routed_moe(do_finalize=False)``.
+
+* ``output`` is a caller-owned contiguous BF16 ``[rows, H]`` buffer with
+  ``rows >= get_deferred_output_rows(T)`` (the padded permuted-row capacity
+  for any routing at that token count; it is a host-side formula, no GPU
+  work). GEMM2 writes ``alpha * acc`` for every valid permuted row and never
+  applies the route weight; rows not referenced by the map are padding and
+  hold unspecified values.
+* ``plan.expanded_idx_to_permuted_idx`` (int32 ``[T, top_k]``) gives the
+  output row of each (token, slot) assignment, or ``-1`` when the expert is
+  not local to this rank; ``plan.route_weights`` (FP32 ``[T, top_k]``) are
+  the converted router weights. Both are workspace-resident, fixed-address
+  tensors valid after ``run``. The finalized output is
+  ``sum_k route_weights[t, k] * output[map[t, k]]`` over the local slots.
+* The deferred form is provided by the swap-AB path (SiTU, PDL disabled) at
+  every token count, in both parallel layouts: routing preprocessing (plus
+  ``moe_sort`` above T=16), GEMM1 and GEMM2 with the plain-store epilogue.
+  ``mxfp4_moe_capability(..., do_finalize=False)`` reports it through
+  ``deferred_output`` and ``get_workspace_size(T, do_finalize=False)``
+  sizes its workspace. The plan is CUDA Graph capturable exactly like the
+  finalized one; the EP rank-sum and TP shard-sum identities hold after the
+  caller's finalization.
+* Tests: ``tests/moe/test_cute_dsl_mxfp4_situ_deferred.py`` compares the
+  gathered (token, slot) rows with an FP64 row oracle
+  (``reference_moe_rows``), with trtllm-gen ``do_finalize=False`` rows
+  gathered through its own map, with the finalized plan output after
+  reduction, and replays T=1..16 graphs in both layouts.
+  ``benchmarks/bench_mxfp4_situ_moe.py --deferred`` produces the paired
+  timing table of this form against trtllm-gen ``do_finalize=False``.
 
 On B300, SiTU T1..16 additionally uses a ballot/popcount routing prefix and
 a 16-row A transfer in GEMM2 when PDL is disabled, routing tile size is 128,
@@ -215,9 +254,10 @@ It never inspects device routing on the host or autotunes during execution.
 ``mxfp4_moe_capability`` checks architecture, quantization, activation,
 dimensions, top-k and the explicit parallel metadata before a plan is
 constructed. Its result reports ``supported``, ``reason``, ``cuda_graph``
-(true for every supported configuration in both parallel modes) and
+(true for every supported configuration in both parallel modes),
 ``layout``, the resolved ``Mxfp4MoERankLayout`` with the mode, local expert
-interval and intermediate shard.
+interval and intermediate shard, and ``deferred_output`` (the
+``do_finalize=False`` form, available for SiTU).
 
 At H=7168, I=3072 and 112 local experts, one prepared weight bank occupies
 3,930,587,136 bytes. With top-k=16 and the conservative tactic, workspace is

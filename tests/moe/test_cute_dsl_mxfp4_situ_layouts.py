@@ -106,9 +106,13 @@ def prepare_rank_candidate(
     packed=False,
     prepared_weights=None,
     enable_pdl=False,
+    do_finalize=True,
     **wrapper_kwargs,
 ):
-    """Plan one rank from explicit layout metadata and its rank-local weights."""
+    """Plan one rank from explicit layout metadata and its rank-local weights.
+
+    ``do_finalize=False`` plans the deferred form; ``output`` is then the
+    ``[rows, H]`` permuted-row buffer."""
     from .mxfp4_situ_reference import pack_topk
 
     wrapper = _mxfp4().CuteDslMxfp4MoEWrapper(
@@ -126,9 +130,13 @@ def prepare_rank_candidate(
     weights = (
         prepare_cute_weights(case) if prepared_weights is None else prepared_weights
     )
-    output = torch.empty(case.x.shape, device=case.x.device, dtype=torch.bfloat16)
+    tokens = case.x.shape[0]
+    rows = tokens if do_finalize else wrapper.get_deferred_output_rows(tokens)
+    output = torch.empty(
+        (rows, case.hidden_size), device=case.x.device, dtype=torch.bfloat16
+    )
     workspace = torch.empty(
-        wrapper.get_workspace_size(case.x.shape[0]),
+        wrapper.get_workspace_size(tokens, do_finalize),
         device=case.x.device,
         dtype=torch.uint8,
     )
@@ -143,6 +151,7 @@ def prepare_rank_candidate(
         linear_beta=case.linear_beta,
         workspace=workspace,
         output=output,
+        do_finalize=do_finalize,
     )
     return plan, output, workspace
 

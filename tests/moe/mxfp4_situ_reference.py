@@ -308,6 +308,88 @@ def reference_moe(case: MXFP4SiTUCase, modes=("ideal_fp64", "mxfp8_fp32")):
     return outputs
 
 
+def reference_moe_rows(case: MXFP4SiTUCase, modes=("ideal_fp64", "mxfp8_fp32")):
+    """FP64 deferred-finalize oracle: per-(token, slot) expert rows.
+
+    Returns ``[T, top_k, H]`` tensors holding each local route's GEMM2 output
+    (SiTU between the GEMMs, no route weight, unit per-expert alpha as in the
+    planned runner); slots routed to non-local experts are zero. Same
+    ``modes`` as :func:`reference_moe`. ``reference_moe`` equals the
+    route-weighted sum over slots of these rows.
+    """
+    allowed = {"ideal_fp64", "mxfp8_fp32", "mxfp8_bf16"}
+    if not set(modes) <= allowed:
+        raise ValueError(f"reference modes must be in {allowed}")
+    device = case.x.device
+    x = decode_mxfp8(case.x, case.x_scale)
+    tokens, top_k = case.topk_ids.shape
+    outputs = {
+        mode: torch.zeros(
+            (tokens, top_k, x.shape[1]), dtype=torch.float64, device=device
+        )
+        for mode in modes
+    }
+    ids = case.topk_ids.cpu()
+    for local in range(case.local_num_experts):
+        pairs = (ids == local + case.local_expert_offset).nonzero()
+        if pairs.shape[0] == 0:
+            continue
+        token = pairs[:, 0].to(device)
+        slot = pairs[:, 1].to(device)
+        w1 = decode_mxfp4(case.w1[local], case.w1_scale[local], device=device)
+        fc1 = x[token] @ w1.t()
+        del w1
+        up, gate = fc1.chunk(2, dim=-1)
+        beta = case.beta[0 if case.beta.numel() == 1 else local].to(
+            device=device, dtype=torch.float64
+        )
+        linear_beta = (
+            None
+            if case.linear_beta is None
+            else case.linear_beta[0 if case.linear_beta.numel() == 1 else local].to(
+                device=device, dtype=torch.float64
+            )
+        )
+        activation = situ_reference(up, gate, beta, linear_beta)
+        w2 = decode_mxfp4(case.w2[local], case.w2_scale[local], device=device)
+        for mode in modes:
+            middle = activation
+            if mode != "ideal_fp64":
+                source = (
+                    activation.to(torch.bfloat16)
+                    if mode == "mxfp8_bf16"
+                    else activation.float()
+                )
+                q, sf = quantize_mxfp8_reference(source)
+                middle = decode_mxfp8(q, sf)
+            outputs[mode][token, slot] = middle @ w2.t()
+        del w2, fc1, activation
+    return outputs
+
+
+def gather_deferred_rows(rows, expanded_idx_to_permuted_idx, tokens, top_k):
+    """``[T, top_k, H]`` FP64 view of deferred rows through the assignment map.
+
+    ``rows`` are the permuted-order GEMM2 rows (``[R, H]``) and the map holds
+    the row of each (token, slot) assignment or ``-1`` when the route is not
+    local; those slots come back as zero rows. Works for the planned runner's
+    deferred output and for ``trtllm_fp4_block_scale_routed_moe`` with
+    ``do_finalize=False`` alike.
+    """
+    index = expanded_idx_to_permuted_idx.reshape(tokens, top_k).to(torch.long)
+    valid = index >= 0
+    gathered = rows[index.clamp_min(0)].to(torch.float64)
+    gathered[~valid] = 0
+    return gathered
+
+
+def finalize_deferred_rows(rows, expanded_idx_to_permuted_idx, route_weights):
+    """FP64 ``[T, H]`` route-weighted sum of deferred rows (the finalized output)."""
+    tokens, top_k = route_weights.shape
+    gathered = gather_deferred_rows(rows, expanded_idx_to_permuted_idx, tokens, top_k)
+    return (gathered * route_weights.to(torch.float64)[..., None]).sum(dim=1)
+
+
 def absolute_error_quantiles(absolute):
     """Exact linear p50/p95/p99, including arrays above torch.quantile's limit."""
     flat = absolute.flatten()
@@ -516,8 +598,13 @@ def prepare_trt_weights(case):
     return tuple(result)
 
 
-def make_trt_baseline(case, prepared_weights=None, *, packed=True):
-    """Prepare the explicit TRT-LLM Gen baseline outside timed execution."""
+def make_trt_baseline(case, prepared_weights=None, *, packed=True, do_finalize=True):
+    """Prepare the explicit TRT-LLM Gen baseline outside timed execution.
+
+    With ``do_finalize=False`` the returned ``run`` stores the unfinalized
+    triple ``[gemm2_rows, expert_weights, expanded_idx_to_permuted_idx]`` in
+    the returned holder dict under ``"value"`` and returns it.
+    """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.tllm_enums import ActivationType, SfLayout
 
@@ -532,7 +619,7 @@ def make_trt_baseline(case, prepared_weights=None, *, packed=True):
         if packed
         else (case.topk_ids, case.topk_weights)
     )
-    output = torch.empty_like(case.x, dtype=torch.bfloat16)
+    output = torch.empty_like(case.x, dtype=torch.bfloat16) if do_finalize else None
     kwargs = dict(
         topk_ids=routes,
         routing_bias=None,
@@ -561,12 +648,20 @@ def make_trt_baseline(case, prepared_weights=None, *, packed=True):
         local_num_experts=case.local_num_experts,
         routed_scaling_factor=1.0,
         routing_method_type=0,
-        do_finalize=True,
+        do_finalize=do_finalize,
         enable_pdl=False,
         activation_type=ActivationType.Situ,
         output=output,
         tune_max_num_tokens=max(8192, case.x.shape[0]),
     )
+    if not do_finalize:
+        holder = {}
+
+        def run_deferred():
+            holder["value"] = trtllm_fp4_block_scale_routed_moe(**kwargs)
+            return holder["value"]
+
+        return run_deferred, holder
 
     def run():
         trtllm_fp4_block_scale_routed_moe(**kwargs)

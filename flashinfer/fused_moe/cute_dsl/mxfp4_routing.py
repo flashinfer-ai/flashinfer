@@ -438,8 +438,9 @@ def _plan_route_preprocess(
     used only when PDL is disabled; later GEMMs wait for the complete kernel.
 
     Inputs may have independent nonnegative 2-D strides. Output and conversion
-    buffers are contiguous. This kernel supports tokens from 1..16, top-k from
-    1..32, and a positive even hidden size. No input data are read on
+    buffers are contiguous. The conversion + clear kernel serves any token
+    count; the fused sorting mode supports tokens from 1..16. Top-k is 1..32
+    and the hidden size a positive even number. No input data are read on
     the host. Tensor contents must be valid when planning because warmup runs.
     Shapes/strides are dynamic kernel arguments; beta values and tactic choices
     do not enter compilation. Cache entries are per input/sort mode, thread
@@ -457,13 +458,12 @@ def _plan_route_preprocess(
     if not isinstance(topk_ids, torch.Tensor) or topk_ids.ndim != 2:
         raise ValueError("topk_ids must be a 2-D tensor")
     top_k = topk_ids.shape[1]
-    if (
-        not 1 <= tokens <= 16
-        or not 1 <= top_k <= 32
-        or hidden_size <= 0
-        or hidden_size % 2
-    ):
-        raise ValueError("require T=1..16, top_k=1..32 and positive even hidden_size")
+    if not 1 <= top_k <= 32 or hidden_size <= 0 or hidden_size % 2 or tokens < 1:
+        raise ValueError("require T>=1, top_k=1..32 and positive even hidden_size")
+    if moe_sort_buffers is not None and tokens > 16:
+        # The fused sort is a single-CTA decode kernel; the conversion + output
+        # clear kernel is grid-strided and serves any token count.
+        raise ValueError("fused decode sorting requires T=1..16")
     if threads not in (128, 256):
         raise ValueError("route preprocessing supports 128 or 256 threads per block")
     device = output.device

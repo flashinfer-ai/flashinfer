@@ -231,8 +231,17 @@ def main():
     parser.add_argument(
         "--swapab-max-tokens",
         type=int,
-        default=16,
-        help="wrapper plan: largest token count routed to the swap-AB path (0 = off)",
+        default=None,
+        help="wrapper plan: largest token count routed to the swap-AB path "
+        "(0 = off; default: the wrapper's layout-dependent default)",
+    )
+    parser.add_argument(
+        "--deferred",
+        action="store_true",
+        help="time the deferred-finalize form: wrapper plan(do_finalize=False) "
+        "(GEMM2 rows in permuted order + route weights + assignment map) against "
+        "trtllm-gen do_finalize=False; --accuracy compares the (token, slot) rows "
+        "gathered through each side's map with the FP64 row oracle",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
@@ -264,6 +273,8 @@ def main():
         parser.error("paired TRT measurements require finite positive SiTU bounds")
     if args.candidate_impl == "swapab" and args.routing != "separate":
         parser.error("--candidate-impl swapab requires --routing separate")
+    if args.deferred and args.candidate_impl != "cute_dsl":
+        parser.error("--deferred times the wrapper plan (--candidate-impl cute_dsl)")
 
     repository = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repository))
@@ -472,11 +483,17 @@ def main():
                     offline_tactics=tactics,
                     swapab_max_tokens=args.swapab_max_tokens,
                 )
+                do_finalize = not args.deferred
                 workspace = torch.empty(
-                    wrapper.get_workspace_size(count), device="cuda", dtype=torch.uint8
+                    wrapper.get_workspace_size(count, do_finalize),
+                    device="cuda",
+                    dtype=torch.uint8,
+                )
+                output_rows = (
+                    count if do_finalize else wrapper.get_deferred_output_rows(count)
                 )
                 output = torch.empty(
-                    (count, hidden), device="cuda", dtype=torch.bfloat16
+                    (output_rows, hidden), device="cuda", dtype=torch.bfloat16
                 )
                 packed = args.routing == "packed"
                 candidate_ids = reference.pack_topk(ids, weights) if packed else ids
@@ -490,11 +507,13 @@ def main():
                     linear_beta=case.linear_beta,
                     workspace=workspace,
                     output=output,
+                    do_finalize=do_finalize,
                 )
                 baseline, baseline_output = reference.make_trt_baseline(
                     case,
                     baseline_weights,
                     packed=packed,
+                    do_finalize=do_finalize,
                 )
                 candidate_run = plan.run
                 if args.candidate_impl == "swapab":
@@ -543,10 +562,28 @@ def main():
                 candidate_run()
                 baseline()
                 numerical = None
-                if args.accuracy:
+                if args.accuracy and args.deferred:
+                    # Compare (token, slot) rows gathered through each side's
+                    # assignment map; non-local slots are zero on both sides.
+                    trt_rows, _, trt_map = baseline_output["value"]
+                    accuracy_candidate = reference.gather_deferred_rows(
+                        output, plan.expanded_idx_to_permuted_idx, count, top_k
+                    ).reshape(count * top_k, hidden)
+                    accuracy_baseline = reference.gather_deferred_rows(
+                        trt_rows, trt_map, count, top_k
+                    ).reshape(count * top_k, hidden)
+                    oracles = {
+                        name: rows.reshape(count * top_k, hidden)
+                        for name, rows in reference.reference_moe_rows(case).items()
+                    }
+                elif args.accuracy:
+                    accuracy_candidate, accuracy_baseline = output, baseline_output
                     oracles = reference.reference_moe(case)
+                if args.accuracy:
                     numerical = {
-                        name: reference.paired_accuracy(output, baseline_output, oracle)
+                        name: reference.paired_accuracy(
+                            accuracy_candidate, accuracy_baseline, oracle
+                        )
                         for name, oracle in oracles.items()
                     }
                     if not all(
@@ -564,8 +601,8 @@ def main():
                         }
                         detail = []
                         for tag, tensor in (
-                            ("candidate", output),
-                            ("baseline", baseline_output),
+                            ("candidate", accuracy_candidate),
+                            ("baseline", accuracy_baseline),
                         ):
                             finite = torch.isfinite(tensor)
                             if not bool(finite.all()):
@@ -579,7 +616,7 @@ def main():
                             "non-finite output or reference in accuracy evaluation: "
                             f"{bad}; {'; '.join(detail)}"
                         )
-                    del oracles
+                    del oracles, accuracy_candidate, accuracy_baseline
                 histogram = reference.routing_histogram(case)
                 rank_histogram = reference.parallel_routing_histogram(
                     ids, experts, histogram_ranks
@@ -626,6 +663,7 @@ def main():
                         "routing_histogram": histogram,
                         "parallel_routing_histogram": rank_histogram,
                         "candidate_impl": args.candidate_impl,
+                        "deferred": args.deferred,
                         "swapab_max_tokens": args.swapab_max_tokens,
                         "workspace_bytes": workspace.numel(),
                         "output_bytes": output.numel() * output.element_size(),

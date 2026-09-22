@@ -222,6 +222,10 @@ class Mxfp4MoECapability:
     reason: str
     cuda_graph: bool
     layout: Optional[Mxfp4MoERankLayout] = None
+    # Deferred finalize (``plan(..., do_finalize=False)``): rank-local GEMM2
+    # rows plus the route weights and the assignment-to-row map, for callers
+    # fusing the route-weight reduction with their own collectives.
+    deferred_output: bool = False
 
 
 def mxfp4_moe_capability(
@@ -237,6 +241,7 @@ def mxfp4_moe_capability(
     quantization: str = "mxfp4_w4a8",
     activation_type: ActivationType = ActivationType.Situ,
     cuda_graph: bool = True,
+    do_finalize: bool = True,
 ) -> Mxfp4MoECapability:
     """Query support from explicit metadata without allocating or using CUDA.
 
@@ -247,10 +252,14 @@ def mxfp4_moe_capability(
     ``parallel_layout`` and/or the explicit ``num_local_experts`` and
     ``local_expert_offset`` (see ``resolve_mxfp4_moe_layout``). The result
     carries that resolved layout; CUDA Graph capture is supported for every
-    supported configuration in both parallel modes.
+    supported configuration in both parallel modes. ``do_finalize=False``
+    asks for the deferred output form (GEMM2 rows in permuted order, route
+    weights and the expanded->permuted row map), which the SiTU swap-AB
+    path provides at every token count; ``deferred_output`` reports it.
     """
     reason = ""
     layout = None
+    deferred = activation_type == ActivationType.Situ
     if gpu_arch not in (100, 103):
         reason = "MXFP4 W4A8 requires SM100 or SM103"
     elif quantization != "mxfp4_w4a8":
@@ -276,7 +285,11 @@ def mxfp4_moe_capability(
             )
         except (TypeError, ValueError) as error:
             reason = str(error)
-    return Mxfp4MoECapability(not reason, reason, not reason, layout)
+    if not reason and not do_finalize and not deferred:
+        reason = "deferred (do_finalize=False) output requires SiTU activation"
+    return Mxfp4MoECapability(
+        not reason, reason, not reason, layout, not reason and deferred
+    )
 
 
 @dataclass(frozen=True)
@@ -372,6 +385,18 @@ class Mxfp4MoEPlan:
             # Preprocessing warmup clears output. Finish the complete MoE so
             # plan retains its existing valid-output postcondition.
             self.run()
+        elif not self._kwargs["enable_pdl"]:
+            # T > 16: one conversion + output-clear launch replaces the torch
+            # unpack kernels and the separate memset (run() skips the memset
+            # whenever a route preprocess is bound).
+            self._route_preprocess = _plan_route_preprocess(
+                self._topk_ids,
+                self._topk_weights,
+                route_ids=self._route_ids,
+                route_weights=self._route_weights,
+                output=self.output,
+            )
+            self.run()
 
     def run(self) -> torch.Tensor:
         """Enqueue on the caller's current stream and return the bound output.
@@ -399,10 +424,13 @@ class Mxfp4MoEPlan:
 
 
 class Mxfp4MoESwapAbPlan:
-    """Decode plan on the swap-AB path (T <= 16): fused route preprocessing
-    (ID unpack, FP32 weights, ``n_tile``-row expert groups, output zero-fill)
-    followed by the two swap-AB grouped GEMMs. Same contract as
-    :class:`Mxfp4MoEPlan`: fixed buffer addresses, graph-capturable ``run``.
+    """Plan on the swap-AB path: route preprocessing (ID unpack, FP32 weights,
+    output zero-fill; fused with ``n_tile``-row expert grouping for T <= 16,
+    followed by ``moe_sort`` above) and the two swap-AB grouped GEMMs. Same
+    contract as :class:`Mxfp4MoEPlan`: fixed buffer addresses,
+    graph-capturable ``run``. ``finalize=False`` is the deferred form: GEMM2
+    writes ``alpha * acc`` rows in permuted order into ``output`` and the plan
+    exposes ``expanded_idx_to_permuted_idx`` / ``route_weights``.
     """
 
     def __init__(
@@ -423,6 +451,7 @@ class Mxfp4MoESwapAbPlan:
         linear_beta,
         output,
         n_tile,
+        finalize=True,
     ):
         self._wrapper = wrapper
         self._buffers = buffers
@@ -430,6 +459,11 @@ class Mxfp4MoESwapAbPlan:
         self.output = output
         self.device = output.device
         self.n_tile = n_tile
+        self.finalize = bool(finalize)
+        self.deferred = not self.finalize
+        # Deferred-finalize outputs (valid after ``run``): row of each
+        # (token, slot) assignment (-1 when not local) and FP32 route weights.
+        self.expanded_idx_to_permuted_idx = buffers["out_expanded_idx_to_permuted_idx"]
         self._inputs = (x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf)
         self._beta = beta
         self._linear_beta = linear_beta
@@ -452,6 +486,7 @@ class Mxfp4MoESwapAbPlan:
             if topk_weights is not None and topk_weights.dtype == torch.float32
             else buffers["route_weights"]
         )
+        self.route_weights = self._route_weights
 
     def _prepare_routing(self):
         if self._topk_weights is None:
@@ -474,6 +509,10 @@ class Mxfp4MoESwapAbPlan:
             name: value for name, value in b.items() if name.startswith("out_")
         }
         launches = {}
+        # The route preprocess kernel clears the finalize output; in the
+        # deferred form the first T rows of the row buffer stand in (they are
+        # overwritten or padding, so the clear is harmless).
+        clear_target = self.output if self.finalize else self.output[:num_tokens]
         with torch.cuda.device(self.device):
             if num_tokens <= 16:
                 # Fused decode routing: ID unpack, FP32 weights, n_tile-row
@@ -483,7 +522,7 @@ class Mxfp4MoESwapAbPlan:
                     topk_weights,
                     route_ids=self._route_ids,
                     route_weights=self._route_weights,
-                    output=self.output,
+                    output=clear_target,
                     moe_sort_buffers=sort_buffers,
                     num_experts=w.num_experts,
                     num_local_experts=w.num_local_experts,
@@ -492,9 +531,15 @@ class Mxfp4MoESwapAbPlan:
                     _single_tile_per_expert=self.n_tile >= num_tokens,
                 )
             else:
-                # Generic routing: torch unpack + moe_sort with n_tile-row
-                # groups; GEMM1 zero-fills the output in-kernel.
-                self._prepare_routing()
+                # Generic routing: one conversion + output-clear launch, then
+                # moe_sort with n_tile-row groups.
+                self._route_preprocess = _plan_route_preprocess(
+                    topk_ids,
+                    topk_weights,
+                    route_ids=self._route_ids,
+                    route_weights=self._route_weights,
+                    output=clear_target,
+                )
                 moe_sort(
                     token_selected_experts=self._route_ids,
                     token_final_scales=self._route_weights,
@@ -523,7 +568,7 @@ class Mxfp4MoESwapAbPlan:
                 beta=self._beta,
                 linear_beta=self._linear_beta,
                 top_k=w.top_k,
-                zero_output=None if self._route_preprocess is not None else self.output,
+                zero_output=None,
                 n_tile=self.n_tile,
                 enable_pdl=w.enable_pdl,
                 _prepared_launches=launches,
@@ -539,9 +584,9 @@ class Mxfp4MoESwapAbPlan:
                 num_non_exiting_tiles=b["out_num_non_exiting_tiles"],
                 alpha=b["w2_alpha"],
                 permuted_idx_to_expanded_idx=b["out_permuted_idx_to_expanded_idx"],
-                token_final_scales=self._route_weights,
+                token_final_scales=self._route_weights if self.finalize else None,
                 top_k=w.top_k,
-                finalize=True,
+                finalize=self.finalize,
                 n_tile=self.n_tile,
                 enable_pdl=w.enable_pdl,
                 _prepared_launches=launches,
@@ -550,14 +595,12 @@ class Mxfp4MoESwapAbPlan:
             self._gemm2, self._gemm2_args = launches["swap_gemm2"]
 
     def run(self) -> torch.Tensor:
-        """Enqueue three launches on the caller's current stream."""
+        """Enqueue three (T <= 16) or four launches on the caller's stream."""
         with torch.cuda.device(self.device):
             stream_ptr = torch.cuda.current_stream().cuda_stream
             stream = cuda.CUstream(stream_ptr)
-            if self._route_preprocess is not None:
-                self._route_preprocess.run(stream)
-            else:
-                self._prepare_routing()
+            self._route_preprocess.run(stream)
+            if self._sort is not None:
                 self._sort(*self._sort_args, stream_ptr)
             self._gemm1(*self._gemm1_args, stream=stream)
             self._gemm2(*self._gemm2_args, stream=stream)
@@ -698,9 +741,10 @@ class CuteDslMxfp4MoEWrapper:
                 return tactic
         return DEFAULT_BLACKWELL_MOE_TACTIC
 
-    def _use_swapab(self, num_tokens):
+    def _use_swapab(self, num_tokens, do_finalize=True):
+        # Deferred output exists only on the swap-AB path, at any token count.
         return (
-            1 <= num_tokens <= self.swapab_max_tokens
+            (1 <= num_tokens <= self.swapab_max_tokens or not do_finalize)
             and self.activation_type == ActivationType.Situ
             and not self.enable_pdl
         )
@@ -713,10 +757,10 @@ class CuteDslMxfp4MoEWrapper:
                 return tile
         return self.swapab_tile_policy[-1][1]
 
-    def _workspace_fields(self, num_tokens):
+    def _workspace_fields(self, num_tokens, do_finalize=True):
         if num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
-        if self._use_swapab(num_tokens):
+        if self._use_swapab(num_tokens, do_finalize):
             tile = self._swap_tile(num_tokens)
             tiles = get_max_num_tiles(
                 num_tokens, self.top_k, self.num_local_experts, tile
@@ -792,14 +836,33 @@ class CuteDslMxfp4MoEWrapper:
             offset += size
         return fields, _align(offset)
 
-    def get_workspace_size(self, num_tokens: int) -> int:
+    def get_workspace_size(self, num_tokens: int, do_finalize: bool = True) -> int:
         """Return required workspace bytes for any routing at this token count.
 
         The size follows the rank-local layout: the GEMM1 intermediate region
         uses ``intermediate_shard`` columns and the per-expert regions use
-        ``num_local_experts``.
+        ``num_local_experts``. ``do_finalize=False`` sizes the deferred-output
+        (swap-AB) plan for this token count.
         """
-        return self._workspace_fields(num_tokens)[1]
+        return self._workspace_fields(num_tokens, do_finalize)[1]
+
+    def get_deferred_output_rows(self, num_tokens: int) -> int:
+        """Rows of the caller-owned ``[rows, hidden_size]`` BF16 buffer that
+        ``plan(..., do_finalize=False)`` writes: the permuted-row capacity
+        (every local expert's rows padded to the row-group width) for any
+        routing at this token count."""
+        if num_tokens <= 0:
+            raise ValueError("num_tokens must be positive")
+        if not self._use_swapab(num_tokens, do_finalize=False):
+            raise ValueError(
+                "deferred output requires SiTU activation without PDL "
+                "(the swap-AB path)"
+            )
+        tile = self._swap_tile(num_tokens)
+        return (
+            get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
+            * tile
+        )
 
     def plan(
         self,
@@ -816,6 +879,7 @@ class CuteDslMxfp4MoEWrapper:
         linear_beta: Optional[torch.Tensor] = None,
         workspace: torch.Tensor,
         output: torch.Tensor,
+        do_finalize: bool = True,
     ) -> Mxfp4MoEPlan:
         """Bind buffers and prepare kernels; all tensor contents must be valid.
 
@@ -835,6 +899,14 @@ class CuteDslMxfp4MoEWrapper:
         and must be distinct within each token. Output and workspace must be
         distinct from all inputs; workspace is a contiguous uint8 tensor whose
         address is aligned to 256 bytes.
+
+        ``do_finalize=False`` (deferred finalize, SiTU only) skips the
+        route-weight reduction: ``output`` is a caller-owned contiguous BF16
+        ``[rows, H]`` buffer with ``rows >= get_deferred_output_rows(T)``
+        that receives ``alpha * GEMM2`` rows in permuted order, and the plan
+        exposes ``expanded_idx_to_permuted_idx`` (int32 ``[T, top_k]``, ``-1``
+        for non-local routes) and ``route_weights`` (FP32 ``[T, top_k]``),
+        both valid after ``run``. Rows not referenced by the map are padding.
         """
         if x.device.type != "cuda":
             raise ValueError("plan requires CUDA tensors")
@@ -843,12 +915,31 @@ class CuteDslMxfp4MoEWrapper:
                 raise RuntimeError("plan must be called before CUDA Graph capture")
             major, minor = torch.cuda.get_device_capability(x.device)
             capability = mxfp4_moe_capability(
-                gpu_arch=major * 10 + minor, **self._metadata()
+                gpu_arch=major * 10 + minor, do_finalize=do_finalize, **self._metadata()
             )
             if not capability.supported:
                 raise ValueError(capability.reason)
             num_tokens = x.shape[0]
             layout = self.layout
+            if not do_finalize:
+                if not self._use_swapab(num_tokens, do_finalize=False):
+                    raise ValueError(
+                        "deferred output requires SiTU activation without PDL"
+                    )
+                deferred_rows = self.get_deferred_output_rows(num_tokens)
+                if (
+                    output.device != x.device
+                    or output.dtype != torch.bfloat16
+                    or output.ndim != 2
+                    or output.shape[0] < deferred_rows
+                    or output.shape[1] != self.hidden_size
+                    or not output.is_contiguous()
+                ):
+                    raise ValueError(
+                        "deferred output must be contiguous BF16 [>= "
+                        f"{deferred_rows}, {self.hidden_size}] on {x.device}; got "
+                        f"{output.dtype} {tuple(output.shape)} on {output.device}"
+                    )
             expected = {
                 "x": (x, (num_tokens, self.hidden_size), torch.float8_e4m3fn),
                 "x_sf": (x_sf, (num_tokens, self.hidden_size // 32), torch.uint8),
@@ -871,8 +962,13 @@ class CuteDslMxfp4MoEWrapper:
                     ),
                     torch.uint8,
                 ),
-                "output": (output, (num_tokens, self.hidden_size), torch.bfloat16),
             }
+            if do_finalize:
+                expected["output"] = (
+                    output,
+                    (num_tokens, self.hidden_size),
+                    torch.bfloat16,
+                )
             for name, (tensor, shape, dtype) in expected.items():
                 if (
                     tensor.device != x.device
@@ -936,7 +1032,7 @@ class CuteDslMxfp4MoEWrapper:
                     raise ValueError(
                         f"{name} must be CUDA FP32 [1] or [num_local_experts]"
                     )
-            fields, size = self._workspace_fields(num_tokens)
+            fields, size = self._workspace_fields(num_tokens, do_finalize)
             if (
                 workspace.device != x.device
                 or workspace.dtype != torch.uint8
@@ -985,7 +1081,7 @@ class CuteDslMxfp4MoEWrapper:
             validate_w4a8_inputs(x, x_sf, route_weights, w1, w1_sf, w2, w2_sf)
             if w1_sf.device != x.device or w2_sf.device != x.device:
                 raise ValueError("weight scales must be on the input device")
-            if self._use_swapab(num_tokens):
+            if self._use_swapab(num_tokens, do_finalize):
                 if (major, minor) not in ((10, 0), (10, 3)):
                     raise ValueError("the swap-AB decode path requires SM100/SM103")
                 swap_plan = Mxfp4MoESwapAbPlan(
@@ -1004,6 +1100,7 @@ class CuteDslMxfp4MoEWrapper:
                     linear_beta=linear_beta,
                     output=output,
                     n_tile=self._swap_tile(num_tokens),
+                    finalize=do_finalize,
                 )
                 swap_plan._prepare()
                 return swap_plan
