@@ -499,6 +499,81 @@ def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -
         assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 2
 
 
+@pytest.mark.parametrize(
+    ("use_block_sparse", "use_proxy_routes"),
+    ((False, False), (True, False), (True, True)),
+    ids=("dense", "exact", "proxy"),
+)
+def test_equivalent_sage_recipes_share_one_compiled_adapter(
+    monkeypatch: pytest.MonkeyPatch, use_block_sparse: bool, use_proxy_routes: bool
+) -> None:
+    """Resolve aliases before caching while preserving meaningful recipe differences."""
+
+    from flashinfer.attention.prims_ts._block_sparse import compiler, config
+
+    key = make_block_sparse_compile_key(
+        dtype_key="float8_e4m3fn",
+        out_dtype_key="bfloat16",
+        use_block_sparse=use_block_sparse,
+        use_proxy_routes=use_proxy_routes,
+    )
+    arguments = vars(key) | {"max_row_route_capacity": 4}
+    for name in ("use_persistent_scheduler", "use_parallel_sparse_kv_loads", "sage"):
+        arguments.pop(name)
+    monkeypatch.setattr(
+        config, "_select_block_sparse_scheduler", lambda **_: (64, False)
+    )
+    compiled_keys = []
+
+    def compile_adapter(key):
+        compiled_keys.append(key)
+        return object()
+
+    monkeypatch.setattr(compiler, "_compile_block_sparse", compile_adapter)
+    config._resolve_block_sparse_launch_spec.cache_clear()
+    compiler._get_compiled_block_sparse.cache_clear()
+    try:
+        recipes = (None, 16) if use_proxy_routes else (None, 16, 1, 4)
+        adapters = [
+            compiler._get_compiled_block_sparse(
+                config._resolve_block_sparse_launch_spec(
+                    **arguments, sage=SageAttentionConfig(k_summary_block_size=block)
+                ).compile_key
+            )
+            for block in recipes
+        ]
+        assert len(compiled_keys) == 1
+        assert all(adapter is adapters[0] for adapter in adapters)
+        for recipe in (
+            SageAttentionConfig(q_block_size=2),
+            SageAttentionConfig(k_block_size=4),
+            SageAttentionConfig(v_mean=True),
+        ):
+            spec = config._resolve_block_sparse_launch_spec(**arguments, sage=recipe)
+            assert (
+                compiler._get_compiled_block_sparse(spec.compile_key) is not adapters[0]
+            )
+        assert len(compiled_keys) == 4
+        invalid_recipes = [
+            SageAttentionConfig(q_block_size=3),
+            SageAttentionConfig(k_block_size=3),
+        ]
+        if use_proxy_routes:
+            invalid_recipes.append(SageAttentionConfig(k_summary_block_size=3))
+            spec = config._resolve_block_sparse_launch_spec(
+                **arguments, sage=SageAttentionConfig(k_summary_block_size=1)
+            )
+            assert (
+                compiler._get_compiled_block_sparse(spec.compile_key) is not adapters[0]
+            )
+        for recipe in invalid_recipes:
+            with pytest.raises(ValueError):
+                config._resolve_block_sparse_launch_spec(**arguments, sage=recipe)
+    finally:
+        config._resolve_block_sparse_launch_spec.cache_clear()
+        compiler._get_compiled_block_sparse.cache_clear()
+
+
 def test_summary_block_size_is_validated() -> None:
     """The summary block is a supported size and equals the token block without proxy routes."""
 

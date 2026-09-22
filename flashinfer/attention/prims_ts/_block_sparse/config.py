@@ -723,6 +723,17 @@ def _resolve_block_sparse_launch_spec(
         )
         config = _make_block_sparse_config(compile_key)
 
+    if compile_key.sage is not None:
+        # Cache the validated geometry: an implicit summary block equals its
+        # explicit value, and a plan without proxies uses the token block.
+        compile_key = replace(
+            compile_key,
+            sage=replace(
+                compile_key.sage,
+                k_summary_block_size=config.sage_k_summary_block_size,
+            ),
+        )
+
     policy_entries: list[tuple[str, object]] = [
         ("tile_size_q", q_tile_size),
         ("tile_size_kv", kv_route_size),
