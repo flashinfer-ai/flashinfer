@@ -1079,6 +1079,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         # per-batch KV-length view it binds.
         self._cudnn_prepared: Optional[CudnnDecodeGraph] = None
         self._cudnn_kv_lens_view: Optional[torch.Tensor] = None
+        self._cudnn_q_lens_view: Optional[torch.Tensor] = None
+        self._cudnn_q_lens_shape: Optional[tuple[int, int]] = None
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -2070,6 +2072,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
 
         self._page_size = page_size
+        if self._cudnn_q_lens_shape != (batch_size, q_len_per_req):
+            # CUDA-graph mode freezes both dimensions before reaching here.
+            # Keep this allocation on the wrapper even if a prepared graph is
+            # replaced (e.g. a later run requests LSE).
+            self._cudnn_q_lens_view = torch.full(
+                (batch_size, 1, 1, 1),
+                q_len_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._cudnn_q_lens_shape = (batch_size, q_len_per_req)
         if batch_size > self._kv_lens_buffer.shape[0]:
             self._kv_lens_buffer = torch.empty(
                 (batch_size,), dtype=torch.int32, device=self.device
@@ -2101,7 +2114,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1
             )
-            self._cudnn_prepared = None
             return
 
         # cuDNN bakes max_seq_len_kv and the block-table width into the built graph,
@@ -2141,7 +2153,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
             batch_size, 1, 1, 1
         )
-        self._cudnn_prepared = None
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -2657,6 +2668,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         out=out,
                         lse=lse,
                         sinks=sinks,
+                        actual_seq_lens_q=self._cudnn_q_lens_view,
                         **signature,
                     )
                 prepared.run(
@@ -2668,6 +2680,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._float_workspace_buffer,
                     actual_seq_lens_kv=kv_lens,
                     block_tables=self._block_tables,
+                    sinks=sinks,
                 )
         elif self.use_tensor_cores:
             run_args = [self._float_workspace_buffer]

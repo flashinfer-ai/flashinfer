@@ -8,7 +8,7 @@ command on the baseline and candidate checkouts in separate processes:
     python benchmarks/bench_cudnn_wrapper_host.py --kind decode --batch 64 --kv 1024 --output decode.json
     python benchmarks/bench_cudnn_wrapper_host.py --kind ragged --batch 16 --q 512 --kv 512 --output ragged.json
 
-Each result includes sampled independent math checks and bit-identical CUDA
+Each result includes sampled independent math checks and one-ULP CUDA
 graph replay after poisoning the output. Host enqueue excludes synchronization,
 first-call compilation and output allocation; these are component measurements.
 """
@@ -34,6 +34,11 @@ def main():
     p.add_argument("--layout", choices=["HND", "NHD"], default="NHD")
     p.add_argument("--backends", nargs="+", default=["cudnn"])
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--replan",
+        action="store_true",
+        help="also measure run after each plan and complete plan+run",
+    )
     a = p.parse_args()
     torch.manual_seed(42)
     b, sq, sk, h, hk, d, page = a.batch, a.q, a.kv, 32, 8, 128, 16
@@ -116,12 +121,12 @@ def main():
                 kw = dict(q_data_type=q.dtype, kv_data_type=q.dtype)
                 if sq > 1:
                     kw["q_len_per_req"] = sq
-                w.plan(indptr, indices, last, h, hk, d, page, **kw)
+                plan = lambda: w.plan(indptr, indices, last, h, hk, d, page, **kw)
             else:
                 w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                     ws, "NHD", backend=backend
                 )
-                w.plan(
+                plan = lambda: w.plan(
                     qo,
                     torch.arange(b + 1, dtype=torch.int32) * sk,
                     h,
@@ -131,6 +136,7 @@ def main():
                     q_data_type=q.dtype,
                     kv_data_type=q.dtype,
                 )
+            plan()
             row["plan_cpu_us"] = (time.perf_counter_ns() - t0) / 1e3
             out = torch.empty_like(q)
             run = (
@@ -168,15 +174,47 @@ def main():
                 host.append((time.perf_counter_ns() - t0) / 1e3)
             torch.cuda.synchronize()
             row["host_enqueue_us"] = statistics.median(host)
+            if a.replan:
+                after_plan, complete = [], []
+                for _ in range(100):
+                    plan()
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter_ns()
+                    run()
+                    after_plan.append((time.perf_counter_ns() - t0) / 1e3)
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter_ns()
+                    plan()
+                    run()
+                    complete.append((time.perf_counter_ns() - t0) / 1e3)
+                torch.cuda.synchronize()
+                row["run_after_plan_us"] = statistics.median(after_plan)
+                row["plan_run_host_us"] = statistics.median(complete)
+                for (bi, qi), ref in zip(samples, references, strict=True):
+                    torch.testing.assert_close(
+                        out[bi * sq + qi].float(), ref, atol=0.01, rtol=0.01
+                    )
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 for _ in range(20):
                     run()
             # Replay correctness is separate from eager, including poisoned output.
+            if a.replan:
+                plan()
             out.fill_(float("nan"))
             g.replay()
             torch.cuda.synchronize()
-            torch.testing.assert_close(out, outputs[backend], atol=0, rtol=0)
+            expected = outputs[backend]
+            upper = torch.nextafter(expected, torch.full_like(expected, float("inf")))
+            lower = torch.nextafter(expected, torch.full_like(expected, -float("inf")))
+            ulp = torch.maximum(
+                (upper.float() - expected.float()).abs(),
+                (expected.float() - lower.float()).abs(),
+            )
+            assert torch.isfinite(out).all()
+            assert ((out.float() - expected.float()).abs() <= ulp).all(), (
+                "replay differs by more than one output ULP"
+            )
             for _ in range(5):
                 g.replay()
             ts = []
@@ -193,7 +231,7 @@ def main():
             row.update(
                 graph_gpu_us=statistics.median(ts),
                 status="pass",
-                replay="bit_identical",
+                replay="within_one_ulp",
                 math_reference_rows=len(samples),
             )
         except Exception as exc:

@@ -7,7 +7,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
-from .utils import get_cudnn_fmha_gen_module
+from .utils import get_cudnn_fmha_gen_module, get_cudnn_attention_handle
 
 try:
     import cudnn
@@ -17,16 +17,9 @@ except ImportError:
     cudnn = None
     CUDNN_AVAILABLE = False
 
-# Global cudnn handle. need to make it per device in future
-_cudnn_handle = None
-
 
 def _create_cudnn_handle(stream: torch.cuda.Stream):
-    global _cudnn_handle
-    if _cudnn_handle is None:
-        _cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
-    return _cudnn_handle
+    return get_cudnn_attention_handle(cudnn, stream)
 
 
 # Tensor ids
@@ -80,6 +73,7 @@ def _sdpa_decode_key_fn(
 ):
     return (
         "decode",
+        q.device,
         max_sequence_kv,
         tuple(q.shape),
         # Q strides are baked into the graph descriptor: a query sliced out of
@@ -152,7 +146,7 @@ if CUDNN_AVAILABLE:
         window_left: int = -1,
         sinks: Optional[torch.Tensor] = None,
     ):
-        handle = _create_cudnn_handle(torch.cuda.current_stream())
+        handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
         # WAR: override batch offsets for now, as it leads to a poor performance
         batch_offsets_q = None
@@ -338,6 +332,23 @@ def _validate_decode_devices(device, tensors):
             )
 
 
+def _decode_sinks(q, sinks, *, normalize=True):
+    if sinks is None:
+        return None
+    if (
+        sinks.dim() != 1
+        or sinks.shape[0] != q.shape[1]
+        or sinks.dtype != torch.float32
+        or sinks.device != q.device
+    ):
+        raise ValueError(
+            f"sinks must be a float32 tensor of shape (num_heads_qo,) = "
+            f"({q.shape[1]},) on {q.device}, got shape {tuple(sinks.shape)} "
+            f"with dtype {sinks.dtype} on {sinks.device}"
+        )
+    return sinks.contiguous().view(1, q.shape[1], 1, 1) if normalize else sinks
+
+
 def _normalize_decode_inputs(
     q,
     k_cache,
@@ -414,21 +425,7 @@ def _normalize_decode_inputs(
             f"out must be a contiguous tensor of shape ({rows}, {h_qo}, {d_vo}) on "
             f"{q.device}, got shape {tuple(out.shape)} on {out.device}"
         )
-    sinks_view = None
-    if sinks is not None:
-        if (
-            sinks.dim() != 1
-            or sinks.shape[0] != h_qo
-            or sinks.dtype != torch.float32
-            or sinks.device != q.device
-        ):
-            raise ValueError(
-                "sinks must be a float32 tensor of shape (num_heads_qo,) = "
-                f"({h_qo},) on {q.device}, got shape {tuple(sinks.shape)} with "
-                f"dtype {sinks.dtype} on {sinks.device}"
-            )
-        # The graph binds the sink logits as a (1, H, 1, 1) fp32 tensor.
-        sinks_view = sinks.contiguous().view(1, h_qo, 1, 1)
+    sinks_view = _decode_sinks(q, sinks)
     # Every tensor bound to the graph (and the workspace) must live where q
     # does; the graph executes on q's device with raw pointers.
     _validate_decode_devices(
@@ -637,23 +634,15 @@ class CudnnDecodeGraph:
     ) -> bool:
         """Whether this prepared graph serves the call: same graph-cache key
         (shapes, strides, dtypes, scale, flags, mask), out / lse keep their
-        layout, the sink logits are the same buffer."""
+        layout, and sink presence is unchanged."""
         if (
             q_len_per_req != self.q_len_per_req
             or q.shape[0] != self.batch_size * q_len_per_req
         ):
             return False
-        if (sinks is None) != (self.sinks_view is None) or (
-            sinks is not None
-            and (
-                sinks.data_ptr() != self.sinks_view.data_ptr()
-                or sinks.shape != (q.shape[1],)
-                or sinks.dtype != torch.float32
-                or sinks.device != q.device
-                or not sinks.is_contiguous()
-            )
-        ):
+        if (sinks is None) != (self.sinks_view is None):
             return False
+        _decode_sinks(q, sinks, normalize=False)
         if (
             out.shape != self.out_shape
             or not out.is_contiguous()
@@ -700,6 +689,7 @@ class CudnnDecodeGraph:
         *,
         actual_seq_lens_kv: torch.Tensor,
         block_tables: torch.Tensor,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Matching graph metadata does not enforce the runtime device contract.
         # Revalidate every rebound buffer before handing raw pointers to cuDNN,
@@ -727,7 +717,9 @@ class CudnnDecodeGraph:
             actual_seq_lens_kv=actual_seq_lens_kv,
             block_tables=block_tables,
             return_lse=self.return_lse,
-            sinks=self.sinks_view,
+            # Normalize current values on this call's stream. In capture, a
+            # strided sink's copy is captured too, rather than cached stale.
+            sinks=self.sinks_view if sinks is None else _decode_sinks(q, sinks),
         )
 
 
@@ -746,6 +738,7 @@ def prepare_cudnn_batch_decode(
     q_len_per_req: int,
     window_left: int,
     sinks: Optional[torch.Tensor],
+    actual_seq_lens_q: Optional[torch.Tensor] = None,
 ) -> CudnnDecodeGraph:
     """Validate once and build (or fetch from the graph cache) the paged-decode
     graph for this signature; steps then execute through
@@ -776,9 +769,20 @@ def prepare_cudnn_batch_decode(
         sinks=sinks,
     )
     bs, sinks_view = inputs.batch_size, inputs.sinks
-    seq_lens_q = torch.full(
-        (bs, 1, 1, 1), q_len_per_req, device=q.device, dtype=torch.int32
-    )
+    seq_lens_q = actual_seq_lens_q
+    if seq_lens_q is None:
+        seq_lens_q = torch.full(
+            (bs, 1, 1, 1), q_len_per_req, device=q.device, dtype=torch.int32
+        )
+    elif (
+        seq_lens_q.shape != (bs, 1, 1, 1)
+        or seq_lens_q.dtype != torch.int32
+        or seq_lens_q.device != q.device
+        or not seq_lens_q.is_contiguous()
+    ):
+        raise ValueError(
+            "actual_seq_lens_q must be contiguous int32 (batch_size, 1, 1, 1) on q.device"
+        )
     q_graph = _decode_q_view(q, bs, q_len_per_req)
     kwargs = dict(
         max_sequence_kv=max_sequence_kv,
