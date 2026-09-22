@@ -3968,20 +3968,9 @@ def _should_auto_select_launch_mode(
     *,
     auto_tuner: bool,
     split_kv_mode: str,
-    qkv_layout: str,
     seq_len_q: int,
 ) -> bool:
     """Return whether automatic launch-mode selection is allowed for this shape."""
-    if (
-        auto_tuner
-        and split_kv_mode == "disabled"
-        and not cfg.use_sliding_window_causal
-        and not cfg.use_attention_sinks
-        and _is_h64_paged_mixed_q_len(
-            cfg=cfg, seq_len_q=seq_len_q, qkv_layout=qkv_layout
-        )
-    ):
-        return True
     single_query = seq_len_q == 1
     grouped_query = cfg.groups_tokens_heads_q and seq_len_q > 1
     return (
@@ -4008,27 +3997,11 @@ def _num_q_tiles_for_launch(cfg: FmhaDecodeConfig) -> int:
     return max(q_geometry.num_q_ctas(cfg.max_seq_len_q), 1)
 
 
-def _is_h64_paged_mixed_q_len(
-    *,
-    cfg: FmhaDecodeConfig,
-    seq_len_q: int,
-    qkv_layout: str,
-) -> bool:
-    """Return whether this is the compact mixed-KV SQ>1 profile."""
-    return (
-        cfg.headdim == 64
-        and seq_len_q > 1
-        and cfg.use_transform_kv
-        and qkv_layout == "pagedKv"
-    )
-
-
 def _apply_auto_launch_mode(
     cfg: FmhaDecodeConfig,
     *,
     auto_tuner: bool,
     split_kv_mode: str,
-    qkv_layout: str,
     batch_size: int,
     num_heads_q: int,
     num_heads_kv: int,
@@ -4041,7 +4014,6 @@ def _apply_auto_launch_mode(
         cfg,
         auto_tuner=auto_tuner,
         split_kv_mode=split_kv_mode,
-        qkv_layout=qkv_layout,
         seq_len_q=seq_len_q,
     ):
         return split_kv_mode
@@ -4960,7 +4932,6 @@ def make_decode_config(
                 cfg,
                 auto_tuner=auto_tuner,
                 split_kv_mode=split_kv_mode,
-                qkv_layout=qkv_layout,
                 batch_size=batch_size,
                 num_heads_q=num_heads_q,
                 num_heads_kv=num_heads_kv,
