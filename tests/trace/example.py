@@ -1012,7 +1012,7 @@ rk_source = torch.randn(
     rk_B + 2, rk_HV, rk_D, rk_D, dtype=torch.bfloat16, device=device
 )
 rk_source_indices = torch.arange(rk_B, dtype=torch.int32, device=device)
-flashinfer.kda_decode.recurrent_kda(
+flashinfer.recurrent_kda(
     rk_q,
     rk_k,
     rk_v,
@@ -2221,7 +2221,8 @@ for _pts_semantic_PS in (32, 4):
             _pts_SK,
             seq_len_q=_pts_SQ,
             q_dtype=_pts_q.dtype,
-            kv_dtype=_pts_k.dtype,
+            k_dtype=_pts_k.dtype,
+            v_dtype=_pts_v.dtype,
             out_dtype=torch.bfloat16,
             mask_type="causal",
             device=_pts_q.device,
@@ -2255,7 +2256,8 @@ for _pts_semantic_PS in (32, 4):
             max_seq_len_q=_pts_SQ,
             packed_query=False,
             q_data_type=_pts_q.dtype,
-            kv_data_type=_pts_k.dtype,
+            k_data_type=_pts_k.dtype,
+            v_data_type=_pts_v.dtype,
             o_data_type=torch.bfloat16,
             mask_type="causal",
             workspace_buffer=_pts_workspace,

@@ -45,7 +45,7 @@ def _fc1_weight_from_w13(
 def _interleave_gate_up_32(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    from ......kernel_src.cutedsl_megamoe import Mxfp8BlockSize
+    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize
 
     return interleave_gate_up(
         tensor,
@@ -83,7 +83,7 @@ def preprocess_mega_weights(
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # shim exposes the cutlass-pulling stacking helper lazily via the boundary.
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         _stack_byte_reinterpretable_tensors,
         ceil_div,
@@ -250,7 +250,7 @@ def validate_transformed_mega_weights(
     data_dtype = _mxfp8_data_dtype(kind)
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
+    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
 
     hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)

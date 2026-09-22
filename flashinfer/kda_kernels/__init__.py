@@ -28,6 +28,12 @@ Exported:
 - run_packed_kda_decode: Packed Kimi K3 T=1 recurrent decode backend
 - run_fused_kda_decode_multitoken: Packed T>=1 fused KDA backend
 
+The ``run_*`` names above are canonical. The bare ``recurrent_kda``,
+``fused_kda_decode`` and ``packed_kda_decode`` aliases are kept for existing
+callers but are no longer exported: the first two shadow the submodules of the
+same name, so attribute access returns a function where the module is what a
+reader expects. Import ``run_*``, or the module by path.
+
 The ``*_kda_prefill_sm120`` names below are the optional facade that
 ``flashinfer.kda_prefill`` dispatches through; they are not part of this
 package's public surface. Reach that backend through ``flashinfer.kda_prefill``,
@@ -114,10 +120,6 @@ except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
     run_kda_prefill_sm120 = None  # type: ignore
 
 __all__ = [
-    "fused_kda_decode",
-    "fused_kda_decode_multitoken",
-    "packed_kda_decode",
-    "recurrent_kda",
     "run_fused_kda_decode",
     "run_fused_kda_decode_multitoken",
     "run_packed_kda_decode",

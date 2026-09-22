@@ -52,6 +52,8 @@ class TestDefaultKnobs:
         assert knobs["cluster_shape_mnk"] == tuple(sel.config.cluster_shape_mnk)
         assert knobs["fp8_accum_mode"] == sel.config.accum_mode
         assert knobs["token_back_mode"] == sel.config.token_back_mode
+        assert knobs["group_hint"] == sel.config.group_hint
+        assert knobs["tail_split_pairs"] == sel.config.tail_split_pairs
         assert pkg.is_valid(knobs)
 
 
@@ -78,6 +80,24 @@ class TestIsValid:
         assert not pkg.is_valid({**ok, "cluster_shape_mnk": (4, 1, 1)})
         assert not pkg.is_valid({**ok, "cluster_shape_mnk": (1, 1, 2)})
         assert pkg.is_valid({**ok, "cluster_shape_mnk": (2, 2, 1)})
+        # tail-split pair tasks need exactly two CTAs along the tokens and
+        # one along the weights: non-swap cga (2, 1, 1), swap-AB cga (1, 2, 1).
+        assert pkg.is_valid(
+            {**ok, "cluster_shape_mnk": (2, 1, 1), "tail_split_pairs": True}
+        )
+        assert not pkg.is_valid(
+            {**ok, "cluster_shape_mnk": (1, 2, 1), "tail_split_pairs": True}
+        )
+        assert not pkg.is_valid(
+            {**ok, "cluster_shape_mnk": (2, 2, 1), "tail_split_pairs": True}
+        )
+        swap = dict(swap_ab=True, pingpong=True, mma_tiler_mnk=(128, 128, 128))
+        assert pkg.is_valid(
+            {**swap, "cluster_shape_mnk": (1, 2, 1), "tail_split_pairs": True}
+        )
+        assert not pkg.is_valid(
+            {**swap, "cluster_shape_mnk": (2, 1, 1), "tail_split_pairs": True}
+        )
         # ikr requires apply_topk_in_fc1.
         assert not pkg.is_valid(
             {**ok, "in_kernel_fc2_reduce": True}, apply_topk_in_fc1=False

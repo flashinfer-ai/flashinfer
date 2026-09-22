@@ -51,7 +51,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8ScaleDtype,
         autotune_bf16_mxfp8_mega_moe,
         compute_megamoe_reference_bf16_mxfp8,
@@ -160,7 +160,7 @@ def test_bf16_mxfp8_preprocesses_canonical_prequantized_weights():
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8ScaleDtype,
         mxfp8_quantize_per_block_32,
     )
