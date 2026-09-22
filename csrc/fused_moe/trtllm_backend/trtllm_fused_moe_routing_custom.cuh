@@ -243,6 +243,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 #pragma unroll
   for (int e = 0; e < ExpertsPerThread; e++) {
     int expert = threadIdx.x * ExpertsPerThread + e;
+    if (expert < params.mNumExperts && params.mPtrExpertFirstTokenOffset != nullptr) {
+      params.mPtrExpertFirstTokenOffset[expert] = expertScanCountsPerExpert[e];
+    }
     auto localExpIdx = expert - params.mLocalExpertsStartIdx;
     auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
     auto isLocal = localExpIdx >= 0 && localExpIdx < localExpertExtent &&
@@ -280,6 +283,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    if (params.mPtrExpertFirstTokenOffset != nullptr) {
+      params.mPtrExpertFirstTokenOffset[params.mNumExperts] = permutedIdxSize;
+    }
   }
 
   for (int tokenIdx = 0; tokenIdx < params.mNumTokens; tokenIdx++) {
@@ -578,6 +584,9 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 #pragma unroll
     for (int e = 0; e < ExpertsPerThread; e++) {
       int expert = threadIdx.x * ExpertsPerThread + e;
+      if (expert < params.mNumExperts && params.mPtrExpertFirstTokenOffset != nullptr) {
+        params.mPtrExpertFirstTokenOffset[expert] = expertScanCountsPerExpert[e];
+      }
       auto localExpIdx = expert - params.mLocalExpertsStartIdx;
       auto isLocal = localExpIdx >= 0 &&
                      localExpIdx < (params.mNumLocalExperts << params.mLocalExpertsStrideLog2) &&
@@ -612,6 +621,9 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    if (params.mPtrExpertFirstTokenOffset != nullptr) {
+      params.mPtrExpertFirstTokenOffset[params.mNumExperts] = permutedIdxSize;
+    }
   }
 
   // Phase 5: Permutation

@@ -203,6 +203,7 @@ from flashinfer.fused_moe.api import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CutlassBf16Config,
+    CudnnMoeConfig,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
     CutlassHummingConfig,
@@ -1155,7 +1156,7 @@ _DTYPE = {
     ),
     "bf16": DTypeHandler(
         variant="bf16",
-        candidate_configs=(TrtllmBf16Config, CutlassBf16Config),
+        candidate_configs=(TrtllmBf16Config, CutlassBf16Config, CudnnMoeConfig),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
         make_act_pack_logits=_bf16_act_pack_logits,
@@ -1515,7 +1516,12 @@ _UNFINALIZED_BACKENDS = {
 _UNPACKED_VARIANT_IDS = tuple(
     vid
     for vid, handler in _DTYPE.items()
-    if any(cfg_cls in _UNPACKED_BACKENDS for cfg_cls in handler.candidate_configs)
+    # Keep the historical random seed stream stable. Newly added cuDNN BF16
+    # unpacked coverage lives in explicit curated cases below.
+    if any(
+        cfg_cls in _UNPACKED_BACKENDS and cfg_cls is not CudnnMoeConfig
+        for cfg_cls in handler.candidate_configs
+    )
 )
 
 # Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
@@ -2231,6 +2237,20 @@ _CURATED = [
             ("cutlass_nvfp4", "cutlass_nvfp4", "silu", 900_101),
         )
     ],
+    Cfg(
+        17,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "imbalanced",
+        900_110,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+        expected_backend="cudnn",
+    ),
+    Cfg(17, 256, 256, 8, 2, "bf16", "imbalanced", 900_112, expected_backend="cudnn"),
 ]
 _CURATED_BY_SEED = {}
 for _cfg in _CURATED:

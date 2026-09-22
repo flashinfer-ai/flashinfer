@@ -38,6 +38,8 @@ from .api import (  # noqa: F401
     CakeWarpDecodeConfig,
     CuteDslConfig,
     CutlassBf16Config,
+    CudnnMoeConfig,
+    CudnnFp8PerTensorConfig,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
     CutlassHummingConfig,
@@ -393,3 +395,11 @@ if _cute_dsl_available:
         "cute_dsl_fused_moe_bf16",
         "CuteDslBf16MoEWrapper",
     ]
+
+from .cudnn_backend import CudnnMoeRunner
+
+__all__ += ["CudnnMoeConfig", "CudnnMoeRunner"]
+
+from .cudnn_fp8_backend import CudnnFp8PerTensorRunner
+
+__all__ += ["CudnnFp8PerTensorConfig", "CudnnFp8PerTensorRunner"]

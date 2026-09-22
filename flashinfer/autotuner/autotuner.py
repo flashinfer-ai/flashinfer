@@ -991,6 +991,8 @@ def autotune(
     if cache is not None:
         with tuner._lock:
             tuner._file_configs.clear()
+            tuner._ranked_tactics_cache.clear()
+            tuner._selection_generation += 1
             tuner._namespaced_records.clear()
             tuner._dirty_namespaces.clear()
             tuner._logged_file_hits.clear()
@@ -1540,7 +1542,9 @@ class AutoTuner:
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate.
-        self._ranked_tactics_cache: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
+        # Retain the winner partition alongside each shortlist so its identity
+        # cannot be recycled while an old ranking is still cached.
+        self._ranked_tactics_cache: dict[tuple, tuple[dict, tuple[Any, ...]]] = {}
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
@@ -1630,6 +1634,8 @@ class AutoTuner:
         # Set when new profiling results are added; cleared on save.
         self._dirty = False
         self._dirty_seq = 0
+        # Invalidate product dispatch caches when selected tactics change.
+        self._selection_generation = 0
         # Product-owned current-schema records persisted beside tactic records.
         self._namespaced_records: dict[str, dict[str, Any]] = {}
         # Namespaces changed in this process and requiring single-writer checks.
@@ -1826,6 +1832,21 @@ class AutoTuner:
         if part is None:
             part = self._winner_partitions[key] = {}
         return part
+
+    def _selection_context(self) -> tuple:
+        """Identity for product dispatch caches layered over choose_one().
+
+        Keep the winner partition itself by reference as well: managed-store
+        reloads and policy switches replace that partition independently.
+        """
+        return (
+            self._selection_generation,
+            self.is_tuning_mode,
+            self._override_tuning_buckets,
+            self._override_round_up,
+            self._override_cuda_graph_profile_replays,
+            self._effective_skip_ops,
+        )
 
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
         """Return the per-thread skip_ops stack, creating it on first access."""
@@ -2539,6 +2560,7 @@ class AutoTuner:
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
                             self._winner_cache()[cache_key] = (tactic, p)
+                            self._selection_generation += 1
                             self._profiling_cache_policies[cache_key] = (
                                 self._profiling_policy(tuning_config)
                             )
@@ -2622,8 +2644,17 @@ class AutoTuner:
             return [-1]
 
         with self._lock:
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            if (
+                self._override_tuning_buckets is not None
+                or self._override_round_up
+                or self._override_cuda_graph_profile_replays is not None
+            ):
                 tuning_config = self._apply_tuning_overrides(tuning_config)
+            measure_policy = self._effective_measure_policy
+            if measure_policy is not None:
+                tuning_config = self._apply_measure_policy(
+                    tuning_config, measure_policy
+                )
 
             input_shapes = tuple(self._get_input_sizes(inputs))
             profiles = self._generate_optimization_profiles(tuning_config, inputs)
@@ -2656,43 +2687,73 @@ class AutoTuner:
                 tuning_config,
                 runner.get_cache_key_extras(inputs),
             )
-            cached_ranking = self._ranked_tactics_cache.get(cache_key)
-            if cached_ranking is not None:
-                return list(cached_ranking[:k])
+            partition = self._winner_cache()
+            ranking_key = (
+                id(partition),
+                cache_key,
+                self._profiling_policy(tuning_config),
+            )
+            cached = self._ranked_tactics_cache.get(ranking_key)
+            if cached is not None:
+                owner, cached_ranked = cached
+                winner = partition.get(cache_key)
+                if (
+                    owner is partition
+                    and winner is not None
+                    and winner[0] == cached_ranked[0]
+                ):
+                    return list(cached_ranked[:k])
+
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "AutoTuner ranking cannot begin during an active outer CUDA Graph capture"
+                )
 
             tensors = None
+            prepared_input_batches = None
             input_preparation_oom = False
             try:
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
                     tensors = list(tuning_config.inputs_pre_hook(tensors))
+                prepared_input_batches = self._prepare_input_tensors_with_batches(
+                    tensors, tuning_config
+                )
             except (torch.cuda.OutOfMemoryError, MemoryError):
                 if _tune_process_group is None:
                     raise
                 input_preparation_oom = True
                 tensors = None
+                prepared_input_batches = None
 
             # Ranking can run inside another runner's get_valid_tactics().
             # Every rank must leave preparation before nested timing reduces.
             if _sync_oom_across_tune_group(input_preparation_oom):
                 tensors = None
+                prepared_input_batches = None
                 raise MemoryError("OOM during tactic-ranking input preparation")
 
-            assert tensors is not None
+            assert tensors is not None and prepared_input_batches is not None
             runner_preparation_oom = False
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
                 valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
                 if valid_tactics and "do_preparation" in runner_arg_names:
-                    runner(tensors, tactic=-1, do_preparation=True, **kwargs)
+                    handled = runner.precompile_tactics(
+                        tensors, valid_tactics, profile, **kwargs
+                    )
+                    if not handled:
+                        runner(tensors, tactic=-1, do_preparation=True, **kwargs)
             except (torch.cuda.OutOfMemoryError, MemoryError):
                 if _tune_process_group is None:
                     raise
                 runner_preparation_oom = True
                 tensors = None
+                prepared_input_batches = None
 
             if _sync_oom_across_tune_group(runner_preparation_oom):
                 tensors = None
+                prepared_input_batches = None
                 raise MemoryError("OOM during tactic-ranking runner preparation")
 
             if not valid_tactics:
@@ -2702,7 +2763,12 @@ class AutoTuner:
             for tac in valid_tactics:
                 try:
                     time_measured = self._profile_single_kernel(
-                        runner, tensors, tac, tuning_config, **kwargs
+                        runner,
+                        tensors,
+                        tac,
+                        tuning_config,
+                        input_tensor_batches=prepared_input_batches,
+                        **kwargs,
                     )
                 except Exception as e:
                     logger.debug(
@@ -2725,10 +2791,22 @@ class AutoTuner:
 
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
-            self.profiling_cache[cache_key] = (ranked[0], profile)
-            self._ranked_tactics_cache[cache_key] = tuple(ranked)
+            partition[cache_key] = (ranked[0], profile)
+            self._selection_generation += 1
+            self._profiling_cache_policies[cache_key] = self._profiling_policy(
+                tuning_config
+            )
+            self._ranked_tactics_cache[ranking_key] = (partition, tuple(ranked))
             self._dirty = True
             self._dirty_seq += 1
+            publish_store = self._active_managed_store
+            if publish_store is not None:
+                publish_store.publish(
+                    cache_key.file_key,
+                    cache_key.runner_class_name,
+                    _tactic_to_json(ranked[0]),
+                    key_fields=cache_key.key_fields,
+                )
 
             return ranked[:k]
 
@@ -2826,6 +2904,9 @@ class AutoTuner:
                 dtype=torch.int8,
                 device=device,
             )
+            include_host_cost = (
+                measure_policy is not None and measure_policy.timer == "events_no_delay"
+            )
             num_samples = repeat * profile_replays
             starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
@@ -2848,11 +2929,16 @@ class AutoTuner:
                     if graph is not None
                     else self.stream_delay_micro_secs
                 )
-                if delay_kernel_time_usec > 0:
+                if delay_kernel_time_usec > 0 and not include_host_cost:
                     delay_kernel(delay_kernel_time_usec)
 
                 for sample_idx in range(num_samples):
                     flush_buffer.zero_()
+                    if include_host_cost:
+                        # Drain the flush before starting the event window.
+                        # Otherwise its queued GPU work can hide eager host
+                        # submission even without an explicit delay kernel.
+                        stream.synchronize()
                     starts[sample_idx].record(stream)
                     if graph is not None:
                         graph.replay()
@@ -2862,8 +2948,8 @@ class AutoTuner:
                         )
                     ends[sample_idx].record(stream)
 
-                # One synchronization after all samples keeps host overhead
-                # out of the per-invocation measurements.
+                # Finish all timing events before reading their durations.
+                # Host-excluded policies retain one post-loop synchronization.
                 stream.synchronize()
 
             samples = [
@@ -2899,6 +2985,7 @@ class AutoTuner:
                     # GPU %globaltimer counts in ns; convert to ms to match the
                     # units of Torch.cuda.Event.elapsed_time()
                     return (end_ts.item() - start_ts.item()) / 1e6
+
             else:
                 start_evt = torch.cuda.Event(enable_timing=True)
                 end_evt = torch.cuda.Event(enable_timing=True)
@@ -3747,6 +3834,8 @@ class AutoTuner:
         with self._lock:
             if not isinstance(namespaced_records, dict):
                 raise ValueError("Autotuner namespaced records must be a JSON object")
+            self._selection_generation += 1
+            self._ranked_tactics_cache.clear()
             self._namespaced_records = copy.deepcopy(namespaced_records)
             self._dirty_namespaces.clear()
             for key, value in configs.items():
@@ -3871,9 +3960,11 @@ class AutoTuner:
             return batches
 
         one_buffer_bytes = sum(
-            input.numel() * input.element_size()
-            if isinstance(input, torch.Tensor)
-            else 0
+            (
+                input.numel() * input.element_size()
+                if isinstance(input, torch.Tensor)
+                else 0
+            )
             for input in inputs
         )
         if one_buffer_bytes <= 0:
@@ -3911,6 +4002,7 @@ class AutoTuner:
         """Clear the profiling cache and user-loaded file configs."""
         with self._lock:
             self.profiling_cache.clear()
+            self._selection_generation += 1
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()
             self._file_configs.clear()

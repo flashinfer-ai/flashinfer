@@ -20,19 +20,23 @@ by measuring each runner's best tactic, then dispatches to the winner.
 
 from __future__ import annotations
 
-from statistics import median
+from dataclasses import fields, replace
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
 from ..api_logging import flashinfer_api
-from ..autotuner import AutoTuner
+from ..autotuner import AutoTuner, TunableRunner, TuningConfig
+from ..autotuner.autotuner import _tactic_to_json_hashable
 from ..utils import get_compute_capability
 from .api import (
+    BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeWarpDecodeConfig,
     CutlassBf16Config,
+    CudnnMoeConfig,
+    CudnnFp8PerTensorConfig,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
     CutlassHummingConfig,
@@ -81,13 +85,15 @@ from .runners import (
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
 )
+from .cudnn_backend import CudnnMoeRunner
+from .cudnn_fp8_backend import CudnnFp8PerTensorRunner
 from .utils import map_to_hybrid_bucket
-
 
 # Union of the concrete runners the layer dispatches to.  All share
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
+    CudnnMoeRunner,
     CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
@@ -115,6 +121,8 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CudnnMoeConfig: CudnnMoeRunner,
+    CudnnFp8PerTensorConfig: CudnnFp8PerTensorRunner,
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
@@ -139,6 +147,41 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }
+
+
+class _BackendChoiceRunner(TunableRunner):
+    """Adapt a selected backend tactic to the common activation contract."""
+
+    def __init__(self, runner, tactic, activation, weights, tensor_names, key):
+        self.runner = runner
+        self.tactic = tactic
+        self.activation = activation
+        self.weights = weights
+        self.tensor_names = tensor_names
+        self.key = key
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def get_cache_key_extras(self, inputs):
+        return self.key
+
+    def get_valid_tactics(self, inputs, profile):
+        return [-1]
+
+    def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+        # The underlying runner has already selected and prepared its tactic.
+        return True
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        activation = replace(
+            self.activation,
+            **dict(zip(self.tensor_names, inputs, strict=True)),
+        )
+        packed = self.runner.pack_inputs(activation, self.weights)
+        return self.runner.forward(
+            packed, tactic=self.tactic, **self.runner.launch_kwargs_for(packed)
+        )
 
 
 class MoELayer:
@@ -200,7 +243,13 @@ class MoELayer:
                 # Construction is inside the guard because a runner may reject an
                 # unsupported config while binding backend resources; letting that
                 # escape would abort selection instead of skipping the backend.
-                runner = runner_cls(config, device=self.device)
+                # Runners select their backend options from config. Bind this
+                # candidate so repeated configs of the same type cannot all
+                # select the first one (e.g. an FC1/FC2 tactic sweep).
+                runner_config = replace(
+                    config, backend=BackendOptions(candidates=(backend_cfg,))
+                )
+                runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
@@ -255,13 +304,13 @@ class MoELayer:
                 f"runners: [{mvp}].{hint}"
             )
 
-        # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
-        # routing input mode).  See the MoELayer reuse contract (CR4): the
-        # fastest backend can differ across token-count buckets, so each bucket
-        # caches its own winner; the mode qualifier keeps a winner tuned for
-        # one routing input style (e.g. pre-routed → CuteDSL) from being
-        # dispatched a pack it cannot execute (FromLogits).
+        # Dispatch choices are scoped to the autotuner measurement partition.
+        # Cross-backend comparisons use actual token counts; a single backend
+        # keeps its tuning buckets. The routing-mode qualifier prevents a
+        # pre-routed winner from being dispatched incompatible FromLogits data.
         self._winners: Dict[Tuple[int, Any], Tuple[_RunnerT, Any]] = {}
+        self._winner_partition = None
+        self._winner_context = None
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
@@ -275,7 +324,10 @@ class MoELayer:
 
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
-        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        per token count and routing mode under the active measurement policy.
+        A single backend retains its per-runner token-count buckets. Profiling
+        follows the autotune context; replay and opt-out use cached choices or
+        the first usable configured backend without measuring new candidates.
 
         Parameters
         ----------
@@ -322,11 +374,25 @@ class MoELayer:
                 f"routing_input_mode={mode!r}."
             )
 
-        bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+        partition = self.tuner._winner_cache()
+        context = self.tuner._selection_context()
+        if self._winner_partition is not partition or self._winner_context != context:
+            self._winners.clear()
+            self._winner_partition = partition
+            self._winner_context = context
+        # Compare backends at the actual call shape. Per-runner tactics keep
+        # their own tuning buckets; cross-backend inputs retain real routing.
+        bucket = (
+            act_pack.num_tokens
+            if len(runners) > 1
+            else map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+        )
         winner = self._winners.get((bucket, mode))
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[(bucket, mode)] = winner
+            # choose_one may have published new selections during this call.
+            self._winner_context = self.tuner._selection_context()
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
 
@@ -343,51 +409,64 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Run per-runner autotune, then measure each winner-tactic and
-        pick cross-backend winner."""
-        # Lazy import: keep the library import path (``import flashinfer``) free
-        # of a dependency on the testing framework. The GPU timing helper is only
-        # needed here, on the autotune path. Relocating it to a non-testing
-        # utility module is the cleaner long-term fix (post-MVP).
-        from ..testing.utils import bench_gpu_time
-
-        best_time_ms = float("inf")
-        best_runner: Optional[_RunnerT] = None
-        best_tactic: Any = -1
-
+        """Select tactics and backends through the same autotune policy/cache."""
+        choices = []
+        identities = []
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
-            launch_kwargs = runner.launch_kwargs_for(inputs)
-            # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
                 custom_op=f"moe_{runner.backend_key}",
                 runners=[runner],
                 tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
-                **launch_kwargs,
+                **runner.launch_kwargs_for(inputs),
             )
-            # Measure runner at its winning tactic.  Use CUDA-graph timing so
-            # the cross-backend comparison reflects production (graph-captured)
-            # latency rather than per-call launch/Python overhead — at low token
-            # counts (~tens of us kernels) a no-graph 10-iter median is dominated
-            # by that overhead and picks the wrong backend.  Requires a warmed-up
-            # layer (the autotune pass above), not a cold capture.
-            times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
-                    i, tactic=t, **kw
-                ),
-                dry_run_iters=5,
-                repeat_iters=30,
-                use_cuda_graph=True,
+            if len(runners) == 1:
+                return runner, tactic
+            choices.append((runner, tactic))
+            identities.append(
+                (
+                    type(runner).__module__,
+                    type(runner).__qualname__,
+                    runner.backend_key,
+                    _tactic_to_json_hashable(tactic),
+                    runner.get_cache_key_extras(inputs),
+                )
             )
-            t_ms = median(times)
-            if t_ms < best_time_ms:
-                best_time_ms = t_ms
-                best_runner = runner
-                best_tactic = tactic
 
-        assert best_runner is not None  # runners is non-empty (checked by caller)
-        return best_runner, best_tactic
+        tensor_names = tuple(
+            field.name
+            for field in fields(act_pack)
+            if isinstance(getattr(act_pack, field.name), torch.Tensor)
+        )
+        inputs = [getattr(act_pack, name) for name in tensor_names]
+        metadata = tuple(
+            (
+                (field.name, str(value.dtype), str(value.device), tuple(value.stride()))
+                if isinstance(value := getattr(act_pack, field.name), torch.Tensor)
+                else (field.name, value)
+            )
+            for field in fields(act_pack)
+        )
+        roster = tuple(identities)
+        wrapped = [
+            _BackendChoiceRunner(
+                runner,
+                tactic,
+                act_pack,
+                weight_pack,
+                tensor_names,
+                (1, roster, identity, metadata),
+            )
+            for (runner, tactic), identity in zip(choices, identities, strict=True)
+        ]
+        selected, _ = self.tuner.choose_one(
+            custom_op="moe_backend_choice",
+            runners=wrapped,
+            tuning_config=TuningConfig(use_cuda_graph=True),
+            inputs=inputs,
+        )
+        return selected.runner, selected.tactic
 
     # ---- Introspection helpers ---------------------------------------------
 
@@ -397,6 +476,6 @@ class MoELayer:
         return self._last_winner_backend
 
     def reset_winner(self) -> None:
-        """Clear all cached per-bucket winners — next call re-tunes."""
+        """Clear layer dispatch choices; the next call consults the autotuner."""
         self._winners.clear()
         self._last_winner_backend = None

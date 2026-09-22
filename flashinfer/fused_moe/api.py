@@ -258,7 +258,7 @@ class SiTU(ActivationConfig):
 
     ``linear_scale`` applies
     ``linear_scale * tanh(linear / linear_scale)``; ``None`` selects an
-    unclamped linear branch, currently expressible only by CuTe-DSL. The
+    unclamped linear branch, expressible by CuTe-DSL and cuDNN graph adapters. The
     defaults are the canonical SiTU (Kimi-K3) scales. Backend adapters must
     lower these exact values or reject unsupported semantics rather than rely
     on different native defaults.
@@ -870,6 +870,282 @@ class TrtllmMxInt4Config:
 
     def __repr__(self) -> str:
         return "TrtllmMxInt4Config()"
+
+
+@dataclass(frozen=True)
+class CudnnMoeConfig:
+    """cuDNN BF16 grouped MoE with optional FROST shared-input activation fusion.
+
+    Explicit candidate only. On SM120, Frost uses a concatenated FC1 followed
+    by FP32 gated activation when shared-input GEMM fusion is unavailable.
+
+    ``fc1_tactic`` and ``fc2_tactic`` are optional stable engine/knob identities.
+    They replay exactly, with plan preparation outside CUDA graph capture.
+    ``use_native_routing`` reuses FI's native sorter and permutation kernels.
+    ``fc1_tactics`` and ``fc2_tactics`` declare candidate domains whose Cartesian
+    product participates in ordinary full-MoE autotuning. Empty domains retain
+    the frontend's proposed plans; they do not request an exhaustive sweep.
+    ``fc1_fusion=None`` prefers supported fusion, ``True`` requires it, and
+    ``False`` selects a separate FC1 and activation. Use separate backend
+    candidates to measure both routes, each with its own stage domains.
+    ``fc1_weight_layout="k_blocked_64_v1"`` opts into prepared K64 FC1
+    weights on SM100. Pass the same value to ``prepare_weights`` before
+    capture; this requires the paired SwiGLU engine and never falls back
+    to an engine that expects canonical weights.
+    ``fc2_weight_layout="k_blocked_64_v1"`` independently prepares FC2
+    as contiguous ``[E,I/64,H,64]`` on SM100, requiring paired FC2 and
+    1..513 routed rows. Set the same option in ``prepare_weights``;
+    H must be divisible by128 and I by64. Both layouts prepare outside capture.
+    """
+
+    use_native_routing: bool = False
+    fc1_tactic: Optional[tuple] = None
+    fc2_tactic: Optional[tuple] = None
+    fc1_tactics: Tuple[tuple, ...] = ()
+    fc2_tactics: Tuple[tuple, ...] = ()
+    fc1_fusion: Optional[bool] = None
+    fc1_weight_layout: Optional[str] = None
+    fc2_weight_layout: Optional[str] = None
+
+    def __post_init__(self):
+        if self.fc2_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC2 weight layout")
+        if self.fc1_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC1 weight layout")
+        if self.fc1_weight_layout is not None and self.fc1_fusion is False:
+            raise ValueError("Prepared K64 weights require fused FC1")
+        if self.fc1_fusion is not None and type(self.fc1_fusion) is not bool:
+            raise ValueError("fc1_fusion must be None or bool")
+
+        def normalize(record):
+            if not isinstance(record, tuple) or len(record) != 2:
+                raise ValueError(f"Invalid cuDNN engine/knob tactic: {record!r}")
+            engine, knobs = record
+            if type(engine) is not int or engine < 0 or not isinstance(knobs, tuple):
+                raise ValueError(f"Invalid cuDNN engine/knob tactic: {record!r}")
+            if any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or any(type(value) is not int for value in pair)
+                for pair in knobs
+            ):
+                raise ValueError("cuDNN tactics require integer knob pairs")
+            if len({pair[0] for pair in knobs}) != len(knobs):
+                raise ValueError("cuDNN tactic contains duplicate knob keys")
+            return engine, tuple(sorted(knobs))
+
+        for stage in ("fc1", "fc2"):
+            domain = getattr(self, stage + "_tactics")
+            pinned = getattr(self, stage + "_tactic")
+            if not isinstance(domain, tuple):
+                raise ValueError(f"{stage}_tactics must be an immutable tuple")
+            if domain and pinned is not None:
+                raise ValueError(f"Specify {stage}_tactic or {stage}_tactics, not both")
+            if pinned is not None:
+                object.__setattr__(self, stage + "_tactic", normalize(pinned))
+            object.__setattr__(
+                self,
+                stage + "_tactics",
+                tuple(dict.fromkeys(normalize(record) for record in domain)),
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107, 110, 120)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        fc1_weight_layout=None,
+        fc2_weight_layout=None,
+    ):
+        import torch
+
+        activation = activation or SwiGLU()
+        if not isinstance(activation, (SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep)):
+            raise NotImplementedError(
+                f"cuDNN MoE supports gated activations, got {activation!r}"
+            )
+        e, h, i = num_local_experts, hidden_size, intermediate_size
+        if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+            raise ValueError("cuDNN MoE weights must be BF16")
+        if tuple(w1_bf16.shape) != (e, 2 * i, h) or tuple(w2_bf16.shape) != (e, h, i):
+            raise ValueError(
+                "cuDNN MoE expects [up, gate] FC1 weights and [E,H,I] FC2 weights"
+            )
+        if fc2_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC2 weight layout")
+        if fc2_weight_layout is not None and (h % 128 or i % 64):
+            raise ValueError(
+                "K64 FC2 weights require H divisible by128 and I divisible by64"
+            )
+        if fc1_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC1 weight layout")
+        if fc1_weight_layout is not None and (
+            h % 64 or i % 64 or activation != SwiGLU()
+        ):
+            raise ValueError(
+                "K64 FC1 weights require H/I multiples of 64 and standard SwiGLU"
+            )
+        device = device or w1_bf16.device
+        up, gate = w1_bf16.to(device).split(i, dim=1)
+        if fc1_weight_layout == "k_blocked_64_v1":
+            # Concatenate directly into K64 order. Each input is a metadata-only
+            # view, avoiding an intermediate full-size canonical FC1 allocation.
+            gate_up = torch.cat(
+                (
+                    gate.unflatten(-1, (h // 64, 64)).transpose(1, 2),
+                    up.unflatten(-1, (h // 64, 64)).transpose(1, 2),
+                ),
+                dim=2,
+            ).contiguous()
+            # Flatten first to canonicalize singleton-axis strides as well.
+            gate_up = gate_up.view(-1).view(e, h // 64, 2 * i, 64)
+            gate, up = gate_up.split(i, dim=2)
+        else:
+            # Fused and unfused FC1 share one canonical allocation. Split views
+            # retain the combined tensor's expert pitch.
+            gate_up = torch.cat((gate, up), dim=1).contiguous()
+            gate, up = gate_up.split(i, dim=1)
+        down = w2_bf16.to(device)
+        if fc2_weight_layout is not None:
+            down = (
+                down.unflatten(-1, (i // 64, 64))
+                .transpose(1, 2)
+                .contiguous()
+                .view(-1)
+                .view(e, i // 64, h, 64)
+            )
+        else:
+            down = down.contiguous()
+        return {"up": up, "gate": gate, "down": down, "gate_up": gate_up}
+
+
+@dataclass(frozen=True)
+class CudnnFp8PerTensorConfig:
+    """Explicit Frost FP8 MoE candidate with calibrated E4M3 multipliers.
+
+    Canonical weights use one multiplier per expert, shared by the up/gate
+    pair. Input and intermediate multipliers come from caller calibration.
+    FC1 fuses dequantization, typed gated activation, and E4M3 requantization;
+    FC2 returns BF16 before weighted finalize. Both graphs select Frost20400.
+    Set CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 before constructing the layer.
+    Plans and all storage prepare outside capture; exact public tactics replay.
+    Optional ``fc1_tactics`` and ``fc2_tactics`` declare per-stage candidate
+    domains. Ordinary FI autotuning searches their Cartesian product in one
+    runner; each distinct stage plan and its storage prepare only once.
+    A singular tactic and a candidate domain for the same stage are exclusive.
+    Empty domains use FE's automatic Frost recommendation, not a full sweep.
+    """
+
+    use_native_routing: bool = True
+    fc1_tactic: Optional[tuple] = None
+    fc2_tactic: Optional[tuple] = None
+    fc1_tactics: Tuple[tuple, ...] = ()
+    fc2_tactics: Tuple[tuple, ...] = ()
+    weight_layout: Optional[str] = None
+
+    def __post_init__(self):
+        if self.weight_layout not in (None, "blocked_128x128_v1"):
+            raise ValueError(
+                f"Unsupported Frost FP8 weight_layout {self.weight_layout!r}"
+            )
+        # Keep domains immutable and canonical: they participate in persisted
+        # cache identity, and candidate order defines the untuned fallback.
+        for stage in ("fc1", "fc2"):
+            domain = getattr(self, stage + "_tactics")
+            if not isinstance(domain, tuple):
+                raise ValueError(f"{stage}_tactics must be an immutable tuple")
+            if domain and getattr(self, stage + "_tactic") is not None:
+                raise ValueError(f"Specify {stage}_tactic or {stage}_tactics, not both")
+            normalized = []
+            for record in domain:
+                if not isinstance(record, tuple) or len(record) != 2:
+                    raise ValueError(f"Invalid {stage} engine/knob tactic: {record!r}")
+                engine, knobs = record
+                if type(engine) is not int or engine != 20400:
+                    raise ValueError(
+                        "Frost FP8 MoE requires engine20400 for each stage"
+                    )
+                if (
+                    not isinstance(knobs, tuple)
+                    or not knobs
+                    or any(
+                        not isinstance(pair, tuple)
+                        or len(pair) != 2
+                        or any(type(value) is not int for value in pair)
+                        for pair in knobs
+                    )
+                ):
+                    raise ValueError(
+                        f"{stage}_tactics requires explicit integer knob pairs"
+                    )
+                if len({pair[0] for pair in knobs}) != len(knobs):
+                    raise ValueError(f"{stage}_tactics contains duplicate knob keys")
+                canonical = (engine, tuple(sorted(knobs)))
+                if canonical not in normalized:
+                    normalized.append(canonical)
+            object.__setattr__(self, stage + "_tactics", tuple(normalized))
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        copy_fc1_weights: bool = True,
+        weight_layout: Optional[str] = None,
+    ):
+        """Build unshuffled FP8 weights, preserving contiguous FC1 by default.
+
+        ``copy_fc1_weights=False`` retains canonical split up/gate views to
+        avoid two preparation copies. With blocked weights, it retains views
+        of one packed FC1 allocation, with a doubled expert stride.
+        Layout can affect kernel performance;
+        select it before tuning and warming the layer for CUDA Graph capture.
+        """
+        from .cudnn_fp8_backend import prepare_cudnn_fp8_per_tensor_weights
+
+        return prepare_cudnn_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            copy_fc1_weights=copy_fc1_weights,
+            weight_layout=weight_layout,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, hidden_states_scale_global):
+        """Return calibrated E4M3 values and None, matching the weight view."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_activations
+
+        return prepare_trtllm_fp8_per_tensor_activations(
+            hidden_states_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+        )
 
 
 @dataclass(frozen=True)
@@ -1671,6 +1947,8 @@ class B12xW4A16Config:
 
 # Union type for backend config
 BackendConfigType = Union[
+    CudnnFp8PerTensorConfig,
+    CudnnMoeConfig,
     CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -1697,6 +1975,8 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    CudnnFp8PerTensorConfig,
+    CudnnMoeConfig,
     CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,

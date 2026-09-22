@@ -154,6 +154,10 @@ class MeasurementPolicy:
             fields["measure_cold_l2"] = str(self.cold_l2)
         if self._timer != "auto":
             fields["measure_timer"] = self._timer
+        if self.timer == "events_no_delay" and self.cold_l2 is not False:
+            # Old cold samples could hide host cost behind delayed/queued
+            # work. Do not hydrate their winners under the corrected policy.
+            fields["measure_cold_events_no_delay_revision"] = "2"
         return fields
 
 
@@ -535,6 +539,8 @@ def autotune_v2_reload() -> None:
     tuner = AutoTuner.get()
     with tuner._lock:
         tuner.profiling_cache.clear()
+        tuner._ranked_tactics_cache.clear()
+        tuner._selection_generation += 1
         tuner._winner_partitions.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
