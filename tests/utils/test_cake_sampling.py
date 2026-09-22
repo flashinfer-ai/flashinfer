@@ -37,9 +37,9 @@ from flashinfer.cake_sampling import (
     top_k_top_p_sampling_from_probs,
 )
 from flashinfer.jit.cake_sampling import (
-    arch_dir_for_capability,
     load_cake_sampling_module,
     load_manifest,
+    supported_capability,
 )
 
 SLAB = 1024
@@ -52,13 +52,15 @@ _PHILOX_M0, _PHILOX_M1, _PHILOX_W0, _PHILOX_W1 = (
 )
 
 
-def _require_blackwell():
+def _require_supported_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    arch = arch_dir_for_capability(torch.cuda.get_device_capability())
-    if arch is None:
-        pytest.skip("frozen radix sampling kernels need SM100 or SM103")
-    return arch
+    capability = supported_capability(torch.cuda.get_device_capability())
+    if capability is None:
+        pytest.skip(
+            "frozen radix sampling kernels need compute capability 9.0/10.0/10.3/10.7/11.0"
+        )
+    return capability
 
 
 def _probs(batch, vocab, seed=536, scale=1.0):
@@ -227,8 +229,8 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
         s1, (threads, items) = variant
         cluster, ept = s1[0], s1[1]
         stream_variant = 1 if len(s1) > 2 and s1[2] else 0
-        arch = _require_blackwell()
-        module = load_cake_sampling_module(arch)
+        capability = _require_supported_device()
+        module = load_cake_sampling_module(capability)
         vals, idxs, cnt = ws
         if out is None:
             out = torch.empty(batch, device="cuda", dtype=torch.int32)
@@ -344,7 +346,7 @@ def _kept(run: Run, r: int):
     ],
 )
 def test_support_matches_top_k_first_semantics(batch, vocab, k, p):
-    _require_blackwell()
+    _require_supported_device()
     probs = _probs(batch, vocab)
     run, _ = _run_and_check(probs, k, p, 0xC0FFEE, 3)
     pn = probs.cpu().numpy()
@@ -356,7 +358,7 @@ def test_support_matches_top_k_first_semantics(batch, vocab, k, p):
 
 
 def test_deterministic_replay_and_offset_sensitivity():
-    _require_blackwell()
+    _require_supported_device()
     probs = _probs(16, 128256)
     a = _run(probs, 50, 0.9, 11, 5)
     for _ in range(5):
@@ -373,7 +375,7 @@ def test_deterministic_replay_and_offset_sensitivity():
 
 
 def test_generator_advances_like_flashinfer_sampling():
-    _require_blackwell()
+    _require_supported_device()
     from flashinfer.sampling import get_seed_and_offset
 
     probs = _probs(6, 32768)
@@ -385,7 +387,7 @@ def test_generator_advances_like_flashinfer_sampling():
 
 
 def test_statistical_total_variation():
-    _require_blackwell()
+    _require_supported_device()
     batch, vocab, k, p = 4, 32768, 50, 0.9
     probs = _probs(batch, vocab, scale=3.0)
     _, refs = _run_and_check(probs, k, p, 2024, 0)
@@ -409,7 +411,7 @@ def test_statistical_total_variation():
 
 
 def test_cuda_graph_capture_and_replay():
-    _require_blackwell()
+    _require_supported_device()
     probs = _probs(8, 128256)
     eager = _run(probs, 50, 0.9, 7, 1)
     out = torch.empty(8, device="cuda", dtype=torch.int32)
@@ -455,7 +457,7 @@ def test_cuda_graph_capture_and_replay():
 
 
 def test_per_request_tensors_and_routes():
-    arch = _require_blackwell()
+    _require_supported_device()
     batch, vocab = 7, 128256
     probs = _probs(batch, vocab)
     pn = probs.cpu().numpy()
@@ -482,13 +484,16 @@ def test_per_request_tensors_and_routes():
     assert cake_sampling_route(probs, vocab) == "fallback:top_k_disabled"
     assert cake_sampling_route(probs, 1025) == "fallback:top_k_gt_slab"
     assert cake_sampling_route(probs.half(), 50) == "fallback:dtype"
-    assert cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
-    assert choose_stage1(arch, 1, 128256) == (8, 32, False)
-    assert choose_stage1(arch, 16, 128256) == (4, 64, False)
-    assert choose_stage1(arch, 64, 128256) == (2, 16, True)
-    assert choose_stage1(arch, 16, 262144) == (4, 16, True)
-    assert choose_stage1(arch, 64, 262144)[2] and choose_stage1(arch, 128, 151936)[2]
-    assert choose_stage23(arch, 50) == (32, 2)
+    assert (
+        cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
+    )
+    assert choose_stage1(1, 128256) == (8, 32, False)
+    assert choose_stage1(8, 65536) == (8, 16, False)
+    assert choose_stage1(16, 128256) == (4, 16, True)
+    assert choose_stage1(64, 128256) == (2, 16, True)
+    assert choose_stage1(16, 262144) == (4, 16, True)
+    assert choose_stage1(64, 262144)[2] and choose_stage1(128, 151936)[2]
+    assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)
 
@@ -497,7 +502,7 @@ def test_per_request_tensors_and_routes():
 
 
 def test_adv_equal_probs_straddling_k_boundary():
-    _require_blackwell()
+    _require_supported_device()
     vocab = 4096
     where = (np.arange(7, 7 + 100 * 37, 37) % vocab).astype(np.int64)
     row = np.zeros(vocab, np.float32)
@@ -516,7 +521,7 @@ def test_adv_equal_probs_straddling_k_boundary():
 
 
 def test_adv_equal_probs_straddling_p_boundary():
-    _require_blackwell()
+    _require_supported_device()
     row = np.zeros(32768, np.float32)
     row[[400, 300, 200, 100]] = 0.25
     probs = _rows(row, row)
@@ -536,7 +541,7 @@ def test_adv_equal_probs_straddling_p_boundary():
 
 
 def test_adv_fully_uniform_row():
-    _require_blackwell()
+    _require_supported_device()
     probs = _rows(np.full(4096, np.float32(2**-12)), np.full(4096, np.float32(2**-12)))
     for k, p, expect in ((50, 0.9, 45), (1024, 0.9, 922), (7, 1.0, 7), (1, 0.5, 1)):
         run, _ = _run_and_check(probs, k, p, 77, 1)
@@ -552,7 +557,7 @@ def test_adv_fully_uniform_row():
 
 
 def test_adv_fewer_than_k_nonzero_entries():
-    _require_blackwell()
+    _require_supported_device()
     row = np.zeros(128256, np.float32)
     row[1000], row[2000], row[3000] = 0.5, 0.25, 0.25
     probs = _rows(row)
@@ -574,7 +579,7 @@ def test_adv_fewer_than_k_nonzero_entries():
 
 
 def test_adv_all_zero_rows():
-    _require_blackwell()
+    _require_supported_device()
     for vocab in (4096, 32003, 128256):
         run, _ = _run_and_check(
             _rows(np.zeros(vocab, np.float32), np.zeros(vocab, np.float32)),
@@ -593,7 +598,7 @@ def test_adv_all_zero_rows():
 
 
 def test_adv_nan_rows():
-    _require_blackwell()
+    _require_supported_device()
     vocab = 32768
     base = _probs(1, vocab, seed=5)[0].cpu().numpy()
     poisoned = base.copy()
@@ -619,7 +624,7 @@ def test_adv_nan_rows():
 
 
 def test_adv_inf_rows():
-    _require_blackwell()
+    _require_supported_device()
     vocab = 32768
     base = _probs(1, vocab, seed=6)[0].cpu().numpy()
     three, one, many = base.copy(), base.copy(), base.copy()
@@ -653,7 +658,7 @@ def test_adv_inf_rows():
 
 
 def test_adv_mixed_nan_inf_negative_rows():
-    _require_blackwell()
+    _require_supported_device()
     row = np.zeros(4096, np.float32)
     row[10], row[20], row[30], row[40] = np.nan, -np.inf, -0.5, -0.0
     row[50], row[60], row[70] = 0.3, 0.7, np.inf
@@ -670,7 +675,7 @@ def test_adv_mixed_nan_inf_negative_rows():
 
 
 def test_adv_denormal_probabilities():
-    _require_blackwell()
+    _require_supported_device()
     den = np.zeros(4096, np.float32)
     for m in range(1, 21):
         den[100 * m] = np.float32(m) * np.float32(2.0**-149)
@@ -692,7 +697,7 @@ def test_adv_denormal_probabilities():
 
 
 def test_adv_one_probability_near_one():
-    _require_blackwell()
+    _require_supported_device()
     row = np.zeros(32768, np.float32)
     row[777], row[778] = np.float32(1 - 2**-24), np.float32(2**-24)
     probs = _rows(row)
@@ -710,7 +715,7 @@ def test_adv_one_probability_near_one():
 
 
 def test_adv_extreme_p_values():
-    _require_blackwell()
+    _require_supported_device()
     probs = _probs(4, 128256, seed=13)
     pn = probs.cpu().numpy()
     for p in (1e-30, 1e-45, float(np.finfo(np.float32).tiny)):
@@ -732,7 +737,7 @@ def test_adv_extreme_p_values():
 
 
 def test_adv_k_one_and_k_vocab_minus_one():
-    _require_blackwell()
+    _require_supported_device()
     probs = _probs(3, 128256, seed=15)
     pn = probs.cpu().numpy()
     run, _ = _run_and_check(probs, 1, 0.9, 41, 0)
@@ -753,7 +758,7 @@ def test_adv_k_one_and_k_vocab_minus_one():
 
 
 def test_adv_k_at_slab_cap_with_ties():
-    _require_blackwell()
+    _require_supported_device()
     vocab = 128256
     row = np.zeros(vocab, np.float32)
     big = np.arange(24) * 5000 + 11
@@ -768,7 +773,7 @@ def test_adv_k_at_slab_cap_with_ties():
 
 @pytest.mark.parametrize("vocab", [32003, 100003, 128256, 151936])
 def test_adv_vocab_not_multiple_of_chunk(vocab):
-    arch = _require_blackwell()
+    _require_supported_device()
     probs = _probs(2, vocab, seed=vocab)
     pn = probs.cpu().numpy()
     pn[1] = 0
@@ -776,7 +781,7 @@ def test_adv_vocab_not_multiple_of_chunk(vocab):
     probs.copy_(torch.tensor(pn, device="cuda"))
     variants = [
         (v["cluster"], v["ept"])
-        for v in load_manifest(arch)["stage1"]
+        for v in load_manifest()["stage1"]
         if 512 * v["cluster"] * v["ept"] >= vocab
     ][:4]
     first = None
@@ -792,7 +797,7 @@ def test_adv_vocab_not_multiple_of_chunk(vocab):
 
 
 def test_adv_philox_offset_not_multiple_of_four():
-    _require_blackwell()
+    _require_supported_device()
     probs = _probs(5, 32768, seed=16)
     seen = set()
     for offset in (0, 1, 2, 3, 5, 6, 7, 4097, (1 << 32) + 3):
@@ -802,7 +807,7 @@ def test_adv_philox_offset_not_multiple_of_four():
 
 
 def test_adv_identical_rows_identical_results():
-    _require_blackwell()
+    _require_supported_device()
     vocab = 128256
     content = _probs(1, vocab, seed=17)[0]
     a = torch.stack([content, content, _probs(1, vocab, seed=18)[0], content])
@@ -820,7 +825,7 @@ def test_adv_identical_rows_identical_results():
 
 
 def test_adv_bitwise_across_launch_graph_and_every_variant():
-    arch = _require_blackwell()
+    _require_supported_device()
     vocab, k, p = 32768, 200, 0.9
     probs = _probs(4, vocab, seed=23)
     pn = probs.cpu().numpy()
@@ -833,7 +838,7 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
         assert np.array_equal(again.samples, base.samples) and np.array_equal(
             again.idx[:, :k], base.idx[:, :k]
         )
-    man = load_manifest(arch)
+    man = load_manifest()
     s1 = [
         (v["cluster"], v["ept"])
         for v in man["stage1"]
@@ -902,7 +907,7 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
 
 
 def test_adv_stage1_slab_is_deterministic_and_exact():
-    _require_blackwell()
+    _require_supported_device()
     vocab = 128256
     probs = _probs(3, vocab, seed=29)
     pn = probs.cpu().numpy()
@@ -935,7 +940,7 @@ def test_adv_top_k_first_parity():
     float32 boundary element, and every ``top_k_first`` draw on a shared generator falls inside that
     support.  Per-draw equality is not expected: that route's top-p sampler is a rejection sampler that
     consumes the Philox stream differently from the pipeline's inverse CDF."""
-    _require_blackwell()
+    _require_supported_device()
     from flashinfer.sampling import (
         get_seed_and_offset,
         top_k_renorm_probs,

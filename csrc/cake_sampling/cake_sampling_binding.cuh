@@ -17,8 +17,9 @@
 // TVM-FFI binding for the frozen radix top-k / sparse top-p sampling bundle.
 //
 // The JIT module (flashinfer/jit/cake_sampling.py) generates a small .cu that defines:
-//   CAKE_SAMPLING_BODY_FILE     "<arch>/cake_sampling_kernels.cu"
-//   CAKE_SAMPLING_TARGET_MAJOR / CAKE_SAMPLING_TARGET_MINOR   exact compute capability
+//   CAKE_SAMPLING_BODY_FILE     "generated/cake_sampling_kernels.cu" (one source for every device)
+//   CAKE_SAMPLING_TARGET_MAJOR / CAKE_SAMPLING_TARGET_MINOR   compute capability this module is
+//                                                            built for (one module per capability)
 //   CAKE_SAMPLING_SLAB          slab row stride (entries per row of the top-k slab)
 //   CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads, smem_bytes) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, smem_bytes) ...

@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 """Benchmark the frozen radix top-k / top-p sampling pipeline against the default
-``top_k_top_p_sampling_from_probs`` routes (top_k_first, joint) on Blackwell."""
+``top_k_top_p_sampling_from_probs`` routes (top_k_first, joint)."""
 
 import argparse
 

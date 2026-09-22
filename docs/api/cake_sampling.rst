@@ -3,8 +3,9 @@
 flashinfer.cake_sampling
 ========================
 
-``cake_sampling`` is a Blackwell (B200/GB200 SM100a, B300/GB300 SM103a) implementation of
-top-k-then-top-p sampling from probabilities.  It fuses the three stages of
+``cake_sampling`` is a thread-block-cluster implementation of top-k-then-top-p sampling from
+probabilities for Hopper and newer GPUs (compute capability 9.0, 10.0, 10.3, 10.7 and 11.0;
+measured and tuned on B200 and GB300).  It fuses the three stages of
 :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
 ``filter_apply_order="top_k_first"`` into two kernels per call:
 
@@ -31,13 +32,14 @@ through the generator) follow the ``top_k_first`` route with two extra guarantee
 
 Requests the frozen kernels cannot serve are dispatched to the ``top_k_first`` route
 (``deterministic=True``): top-k disabled or ``k >= vocab``, ``k > 1024``, non-``float32`` or
-non-contiguous rows, or a non-Blackwell device.  Large ``batch * vocab`` launches run on the
-streaming stage-1 variants (a cluster of 1-4 CTAs walks the row in register chunks), so there is
-no size-based fallback.  :func:`cake_sampling_route` reports the decision without launching.
+non-contiguous rows, or a device outside the compiled compute capabilities.  Large
+``batch * vocab`` launches run on the streaming stage-1 variants (a cluster of 1-4 CTAs walks the
+row in register chunks), so there is no size-based fallback.  :func:`cake_sampling_route` reports the decision without launching.
 
-The checked-in source product lives in ``csrc/cake_sampling/<arch>/`` with one manifest per
-architecture that records every frozen variant's launch resources; FlashInfer verifies the
-source hash before JIT compilation.
+The checked-in source product lives in ``csrc/cake_sampling/generated/`` as one translation
+unit plus a manifest that records every frozen variant's launch resources; FlashInfer verifies
+the source hash and JIT-compiles it once per device compute capability with that capability's
+``-gencode`` flags.
 
 .. currentmodule:: flashinfer.cake_sampling
 

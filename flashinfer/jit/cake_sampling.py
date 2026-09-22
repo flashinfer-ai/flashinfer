@@ -21,23 +21,42 @@ import hashlib
 import re
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+    sm110a_nvcc_flags,
+)
 from .utils import write_if_different
 
-_SOURCE_FILE = "cake_sampling_kernels.cu"
-_MANIFEST_FILE = "manifest.json"
+_GENERATED_DIR = "generated"
+_SOURCE_FILE = f"{_GENERATED_DIR}/cake_sampling_kernels.cu"
+_MANIFEST_FILE = f"{_GENERATED_DIR}/manifest.json"
 _BINDING_HEADER = "cake_sampling_binding.cuh"
-_ARCH_DIRS = {(10, 0): "sm100a", (10, 3): "sm103a"}
-_ARCH_FLAGS = {"sm100a": sm100a_nvcc_flags, "sm103a": sm103a_nvcc_flags}
+# One frozen source serves every supported device; it is compiled once per compute capability
+# with that capability's own -gencode flags.  The kernels use thread-block clusters, distributed
+# shared memory, programmatic dependent launch and redux.sync, i.e. sm_90-class features only.
+_CAPABILITY_FLAGS: dict[tuple[int, int], list[str]] = {
+    (9, 0): sm90a_nvcc_flags,
+    (10, 0): sm100a_nvcc_flags,
+    (10, 3): sm103a_nvcc_flags,
+    (10, 7): sm107a_nvcc_flags,
+    (11, 0): sm110a_nvcc_flags,
+}
 _MANIFEST_KEYS = {
-    "arch",
     "buckets",
+    "codegen_arch",
     "compile_flags",
     "kernel_count",
     "kernel_symbols",
+    "min_compute_capability",
     "schema_version",
     "semantics",
     "slab_entries",
@@ -46,7 +65,7 @@ _MANIFEST_KEYS = {
     "stage23",
     "tma_abi",
 }
-_LOADED: dict[str, Any] = {}
+_LOADED: dict[tuple[int, int], Any] = {}
 
 
 def _get_csrc_dir() -> Path:
@@ -72,9 +91,14 @@ def _get_include_dir() -> Path:
     raise FileNotFoundError("FlashInfer headers were not found")
 
 
-def arch_dir_for_capability(capability: tuple[int, int]) -> str | None:
-    """Return the frozen source directory name for a compute capability, or None."""
-    return _ARCH_DIRS.get((int(capability[0]), int(capability[1])))
+def supported_capability(capability: tuple[int, int]) -> Optional[tuple[int, int]]:
+    """Return ``(major, minor)`` when the frozen kernels are compiled for it, else ``None``."""
+    key = (int(capability[0]), int(capability[1]))
+    return key if key in _CAPABILITY_FLAGS else None
+
+
+def supported_capabilities() -> tuple[tuple[int, int], ...]:
+    return tuple(sorted(_CAPABILITY_FLAGS))
 
 
 def _reject_duplicate_keys(pairs):
@@ -87,18 +111,16 @@ def _reject_duplicate_keys(pairs):
 
 
 @functools.cache
-def load_manifest(arch: str) -> dict[str, Any]:
-    """Load and verify the frozen manifest for ``arch`` (``sm100a`` or ``sm103a``)."""
-    if arch not in _ARCH_FLAGS:
-        raise ValueError(f"unsupported radix sampling arch {arch!r}")
-    arch_dir = _get_csrc_dir() / arch
-    source = arch_dir / _SOURCE_FILE
-    manifest_path = arch_dir / _MANIFEST_FILE
-    binding = _get_csrc_dir() / _BINDING_HEADER
+def load_manifest() -> dict[str, Any]:
+    """Load and verify the frozen manifest (``csrc/cake_sampling/generated/manifest.json``)."""
+    csrc = _get_csrc_dir()
+    source = csrc / _SOURCE_FILE
+    manifest_path = csrc / _MANIFEST_FILE
+    binding = csrc / _BINDING_HEADER
     missing = [p.name for p in (source, manifest_path, binding) if not p.is_file()]
     if missing:
         raise RuntimeError(
-            f"radix sampling source package for {arch} is incomplete: missing {', '.join(missing)}"
+            f"radix sampling source package is incomplete: missing {', '.join(missing)}"
         )
     try:
         manifest = json.loads(
@@ -111,13 +133,21 @@ def load_manifest(arch: str) -> dict[str, Any]:
         raise RuntimeError("radix sampling manifest schema is invalid")
     if manifest["schema_version"] != 1 or manifest["tma_abi"] != "pointer":
         raise RuntimeError("radix sampling manifest identity is invalid")
-    if manifest["arch"] != f"sm_{arch[2:-1]}a":
+    min_cc = manifest["min_compute_capability"]
+    if (
+        not isinstance(min_cc, list)
+        or len(min_cc) != 2
+        or not all(isinstance(v, int) for v in min_cc)
+        or any(cap < tuple(min_cc) for cap in _CAPABILITY_FLAGS)
+    ):
         raise RuntimeError(
-            f"radix sampling manifest arch {manifest['arch']!r} does not match {arch}"
+            "radix sampling manifest min_compute_capability does not cover the compiled targets"
         )
+    if not re.fullmatch(r"sm_[0-9]+a", str(manifest["codegen_arch"])):
+        raise RuntimeError("radix sampling manifest codegen_arch is invalid")
     source_bytes = source.read_bytes()
     if hashlib.sha256(source_bytes).hexdigest() != manifest["source_sha256"]:
-        raise RuntimeError(f"radix sampling source identity is invalid for {arch}")
+        raise RuntimeError("radix sampling source identity is invalid")
     symbols = list(manifest["kernel_symbols"])
     stage_symbols = [v["symbol"] for v in manifest["stage1"]] + [
         v["symbol"] for v in manifest["stage23"]
@@ -135,8 +165,8 @@ def load_manifest(arch: str) -> dict[str, Any]:
     return manifest
 
 
-def _binding_source(arch: str, manifest: dict[str, Any]) -> str:
-    major, minor = {"sm100a": (10, 0), "sm103a": (10, 3)}[arch]
+def _binding_source(capability: tuple[int, int], manifest: dict[str, Any]) -> str:
+    major, minor = capability
     stage1 = " ".join(
         f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {1 if v['stream'] else 0}, "
         f"{v['block_threads']}, {v['dynamic_smem_bytes']})"
@@ -151,7 +181,7 @@ def _binding_source(arch: str, manifest: dict[str, Any]) -> str:
  * Copyright (c) 2026 by FlashInfer team.
  * Licensed under the Apache License, Version 2.0.
  */
-#define CAKE_SAMPLING_BODY_FILE "{arch}/{_SOURCE_FILE}"
+#define CAKE_SAMPLING_BODY_FILE "{_SOURCE_FILE}"
 #define CAKE_SAMPLING_TARGET_MAJOR {major}
 #define CAKE_SAMPLING_TARGET_MINOR {minor}
 #define CAKE_SAMPLING_SLAB {manifest["slab_entries"]}
@@ -161,32 +191,45 @@ def _binding_source(arch: str, manifest: dict[str, Any]) -> str:
 """
 
 
-def _module_identity(arch: str, manifest: dict[str, Any]) -> str:
+def _module_identity(capability: tuple[int, int], manifest: dict[str, Any]) -> str:
     csrc = _get_csrc_dir()
     digest = hashlib.sha256()
-    digest.update((csrc / arch / _SOURCE_FILE).read_bytes())
+    digest.update((csrc / _SOURCE_FILE).read_bytes())
     digest.update(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
     digest.update((csrc / _BINDING_HEADER).read_bytes())
-    digest.update(_binding_source(arch, manifest).encode())
-    digest.update(arch.encode())
-    return f"cake_sampling_{arch}_{digest.hexdigest()[:20]}"
+    digest.update(_binding_source(capability, manifest).encode())
+    digest.update(" ".join(_CAPABILITY_FLAGS[capability]).encode())
+    return f"cake_sampling_sm{capability[0]}{capability[1]}_{digest.hexdigest()[:20]}"
 
 
-def get_cake_sampling_uri(arch: str) -> str:
-    return _module_identity(arch, load_manifest(arch))
+def _checked_capability(capability: tuple[int, int]) -> tuple[int, int]:
+    key = supported_capability(capability)
+    if key is None:
+        raise ValueError(
+            "frozen radix sampling kernels are not compiled for compute capability "
+            f"{capability[0]}.{capability[1]}; supported: "
+            + ", ".join(f"{a}.{b}" for a, b in supported_capabilities())
+        )
+    return key
+
+
+def get_cake_sampling_uri(capability: tuple[int, int]) -> str:
+    return _module_identity(_checked_capability(capability), load_manifest())
 
 
 @functools.cache
-def gen_cake_sampling_module(arch: str) -> JitSpec:
-    manifest = load_manifest(arch)
+def gen_cake_sampling_module(capability: tuple[int, int]) -> JitSpec:
+    capability = _checked_capability(capability)
+    manifest = load_manifest()
     csrc = _get_csrc_dir()
-    uri = _module_identity(arch, manifest)
+    uri = _module_identity(capability, manifest)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_sampling_binding.cu"
-    write_if_different(binding, _binding_source(arch, manifest))
+    write_if_different(binding, _binding_source(capability, manifest))
     spec = gen_jit_spec(
         name=uri,
         sources=[binding],
-        extra_cuda_cflags=list(_ARCH_FLAGS[arch]) + list(manifest["compile_flags"]),
+        extra_cuda_cflags=list(_CAPABILITY_FLAGS[capability])
+        + list(manifest["compile_flags"]),
         extra_include_paths=[csrc, csrc.parent, _get_include_dir()],
         use_fast_math=False,
     )
@@ -194,24 +237,30 @@ def gen_cake_sampling_module(arch: str) -> JitSpec:
     return spec
 
 
-def load_cake_sampling_module(arch: str):
-    module = _LOADED.get(arch)
+def load_cake_sampling_module(capability: tuple[int, int]):
+    capability = _checked_capability(capability)
+    module = _LOADED.get(capability)
     if module is None:
-        module = gen_cake_sampling_module(arch).build_and_load()
-        _LOADED[arch] = module
-        logger.info("Loaded frozen radix sampling module for %s", arch)
+        module = gen_cake_sampling_module(capability).build_and_load()
+        _LOADED[capability] = module
+        logger.info(
+            "Loaded frozen radix sampling module for sm_%d%d",
+            capability[0],
+            capability[1],
+        )
     return module
 
 
-def is_cake_sampling_module_loaded(arch: str) -> bool:
-    return arch in _LOADED
+def is_cake_sampling_module_loaded(capability: tuple[int, int]) -> bool:
+    return supported_capability(capability) in _LOADED
 
 
 __all__ = [
-    "arch_dir_for_capability",
     "gen_cake_sampling_module",
     "get_cake_sampling_uri",
     "is_cake_sampling_module_loaded",
     "load_cake_sampling_module",
     "load_manifest",
+    "supported_capabilities",
+    "supported_capability",
 ]

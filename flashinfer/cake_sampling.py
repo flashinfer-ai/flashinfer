@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Fused radix top-k -> sparse top-p -> sampling for Blackwell (sm_100a / sm_103a).
+Fused radix top-k -> sparse top-p -> sampling for Hopper and newer (compute capability 9.0,
+10.0, 10.3, 10.7, 11.0; one frozen source compiled per device capability).
 
 Two frozen kernels per row of probabilities:
 
@@ -58,9 +59,9 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.cake_sampling import (
-    arch_dir_for_capability,
     load_cake_sampling_module,
     load_manifest,
+    supported_capability,
 )
 from .sampling import get_seed_and_offset
 
@@ -71,47 +72,49 @@ _TOPP_SCALAR, _TOPP_PER_ROW = 1, 2
 # Clusters are co-scheduled inside one GPC; measured B200 single-wave CTA capacity per cluster size.
 _WAVE_CTAS = {1: 148, 2: 144, 4: 128, 8: 64}
 _PREFERRED_MIN_EPT = 16
-# Stage-1 cost model (B200 stage-1 microseconds, k = 50): a register-resident wave costs
-# _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per register entry; a streaming wave costs
-# _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x 16-entry chunk each CTA walks.  The
-# estimates only rank the frozen variants.
-_RESIDENT_BASE_US = 8.0
-_RESIDENT_PER_EPT_US = 0.27
-_STREAM_WAVE_BASE_US = 16.0
-_STREAM_CHUNK_US = 2.5
+# Stage-1 cost model (fitted on B200 stage-1 CUPTI microseconds, k = 50, 49 (vocab, batch)
+# cells): a register-resident wave costs _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per register
+# entry; a streaming wave costs _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x 16-entry
+# chunk each CTA walks.  The constants minimise the dispatcher's regret against the measured
+# best variant per cell (0.07 summed relative regret); they only rank the frozen variants.
+_RESIDENT_BASE_US = 3.0
+_RESIDENT_PER_EPT_US = 0.2
+_STREAM_WAVE_BASE_US = 8.0
+_STREAM_CHUNK_US = 0.8
 
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
 
 
-def _arch(device: torch.device) -> Optional[str]:
-    return arch_dir_for_capability(torch.cuda.get_device_capability(device))
+def _capability(device: torch.device) -> Optional[tuple[int, int]]:
+    return supported_capability(torch.cuda.get_device_capability(device))
 
 
-def _stage1_variants(arch: str) -> list[tuple[int, int, bool]]:
+def _stage1_variants() -> list[tuple[int, int, bool]]:
     return [
-        (v["cluster"], v["ept"], bool(v["stream"])) for v in load_manifest(arch)["stage1"]
+        (v["cluster"], v["ept"], bool(v["stream"])) for v in load_manifest()["stage1"]
     ]
 
 
-def _stage23_variants(arch: str) -> list[tuple[int, int]]:
-    return [(v["threads"], v["items"]) for v in load_manifest(arch)["stage23"]]
+def _stage23_variants() -> list[tuple[int, int]]:
+    return [(v["threads"], v["items"]) for v in load_manifest()["stage23"]]
 
 
-def _slab(arch: str) -> int:
-    return int(load_manifest(arch)["slab_entries"])
+def _slab() -> int:
+    return int(load_manifest()["slab_entries"])
 
 
-def choose_stage1(arch: str, batch: int, vocab: int) -> tuple[int, int, bool]:
+def choose_stage1(batch: int, vocab: int) -> tuple[int, int, bool]:
     """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries.
 
     Register-resident candidates: fewest waves, then a register chunk of at least 16 entries,
     then the larger cluster.  That resident choice is compared with every streaming variant
     through the fitted cost model (resident ``waves * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US *
     ept)`` against streaming ``waves * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)``); the
-    resident variant wins ties and streaming ties prefer the smaller cluster."""
-    variants = _stage1_variants(arch)
+    resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table
+    and the cost constants were fitted on B200 and rank the frozen variants on every device."""
+    variants = _stage1_variants()
     epts = sorted({e for _, e, st in variants if not st})
     available = {(c, e) for c, e, st in variants if not st}
     streaming = [(c, e) for c, e, st in variants if st]
@@ -132,7 +135,11 @@ def choose_stage1(arch: str, batch: int, vocab: int) -> tuple[int, int, bool]:
     if candidates:
         resident = min(
             candidates,
-            key=lambda ce: (waves(ce[0]), 0 if ce[1] >= _PREFERRED_MIN_EPT else 1, -ce[0]),
+            key=lambda ce: (
+                waves(ce[0]),
+                0 if ce[1] >= _PREFERRED_MIN_EPT else 1,
+                -ce[0],
+            ),
         )
     if not streaming:
         if resident is None:
@@ -145,15 +152,17 @@ def choose_stage1(arch: str, batch: int, vocab: int) -> tuple[int, int, bool]:
 
     best = min(streaming, key=lambda ce: (stream_cost(ce), ce[0]))
     if resident is not None:
-        resident_cost = waves(resident[0]) * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US * resident[1])
+        resident_cost = waves(resident[0]) * (
+            _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US * resident[1]
+        )
         if resident_cost <= stream_cost(best):
             return resident[0], resident[1], False
     return best[0], best[1], True
 
 
-def choose_stage23(arch: str, top_k_max: int) -> tuple[int, int]:
+def choose_stage23(top_k_max: int) -> tuple[int, int]:
     """Smallest frozen ``(threads, items)`` slab that holds ``top_k_max`` entries."""
-    for threads, items in sorted(_stage23_variants(arch), key=lambda ti: ti[0] * ti[1]):
+    for threads, items in sorted(_stage23_variants(), key=lambda ti: ti[0] * ti[1]):
         if threads * items >= top_k_max:
             return threads, items
     raise ValueError(f"top_k_max={top_k_max} exceeds the frozen stage-2/3 capacity")
@@ -174,8 +183,7 @@ def cake_sampling_route(
         return "fallback:dtype"
     if probs.dim() != 2 or probs.stride(1) != 1 or probs.stride(0) != probs.size(1):
         return "fallback:layout"
-    arch = _arch(probs.device)
-    if arch is None:
+    if _capability(probs.device) is None:
         return "fallback:arch"
     batch, vocab = probs.shape
     if top_k is None:
@@ -186,10 +194,10 @@ def cake_sampling_route(
         kmax = int(top_k_max) if top_k_max is not None else int(top_k.max().item())
     if kmax <= 0 or kmax >= vocab:
         return "fallback:top_k_disabled"
-    if kmax > _slab(arch):
+    if kmax > _slab():
         return "fallback:top_k_gt_slab"
     try:
-        choose_stage1(arch, batch, vocab)
+        choose_stage1(batch, vocab)
     except ValueError:
         return "fallback:vocab_too_large"
     return "pipeline"
@@ -223,7 +231,7 @@ def top_k_top_p_sampling_from_probs(
     workspace: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
-    r"""Fused top-k-then-top-p sampling from probabilities (Blackwell radix pipeline).
+    r"""Fused top-k-then-top-p sampling from probabilities (thread-block-cluster radix pipeline).
 
     Parameters
     ----------
@@ -241,10 +249,12 @@ def top_k_top_p_sampling_from_probs(
     philox_seed, philox_offset: Optional[int]
         Explicit Philox parameters (both required together); ``generator`` is then not touched.
     out: Optional[torch.Tensor]
-        ``int32 [batch]`` output buffer (allocated when omitted); ``renorm_out`` optionally
-        receives ``float32 [batch, 1024]`` renormalized kept probabilities in sorted slab order
-        (descending probability, ascending index; zeros for dropped entries; only the first
-        ``count`` entries of a row are written).
+        ``int32 [batch]`` output buffer (allocated when omitted).
+    renorm_out: Optional[torch.Tensor]
+        Optional ``float32 [batch, 1024]`` buffer that receives the renormalized kept
+        probabilities in sorted slab order (descending probability, ascending index; zeros for
+        dropped entries; only the first ``count`` entries of a row are written).  Served by the
+        pipeline route only.
     workspace: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
         Stage-1 slab buffers ``(values float32 [batch, 1024], indices int32 [batch, 1024],
         counts int32 [batch])``. When given, the sorted top-k slab of this call is left in them
@@ -257,8 +267,14 @@ def top_k_top_p_sampling_from_probs(
     samples: torch.Tensor
         ``int32 [batch]`` sampled token ids.
     """
+    if (philox_seed is None) != (philox_offset is None):
+        raise ValueError("philox_seed and philox_offset must be given together")
     route = cake_sampling_route(probs, top_k, top_k_max)
     if route != "pipeline":
+        if renorm_out is not None:
+            raise ValueError(
+                f"renorm_out is served by the pipeline route only; this request falls back ({route})"
+            )
         from .sampling import top_k_top_p_sampling_from_probs as _fallback
 
         res = _fallback(
@@ -268,29 +284,29 @@ def top_k_top_p_sampling_from_probs(
             filter_apply_order="top_k_first",
             deterministic=True,
             generator=generator,
+            seed=philox_seed,
+            offset=philox_offset,
         )
         if out is not None:
             out.copy_(res.to(torch.int32))
             return out
         return res.to(torch.int32)
 
-    arch = _arch(probs.device)
+    capability = _capability(probs.device)
     batch, vocab = probs.shape
     kmax = (
         top_k
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept, stream_variant = choose_stage1(arch, batch, vocab)
-    threads, items = choose_stage23(arch, kmax)
-    slab = _slab(arch)
+    cluster, ept, stream_variant = choose_stage1(batch, vocab)
+    threads, items = choose_stage23(kmax)
+    slab = _slab()
     vals, idxs, cnt = (
         workspace if workspace is not None else _workspace(batch, slab, probs.device)
     )
     if out is None:
         out = torch.empty(batch, device=probs.device, dtype=torch.int32)
-    if (philox_seed is None) != (philox_offset is None):
-        raise ValueError("philox_seed and philox_offset must be given together")
     if philox_seed is None:
         # Same stride as top_p_sampling_from_probs (32 reserved draws per row): a generator shared with
         # the top_k_first route stays in lockstep.
@@ -306,7 +322,7 @@ def top_k_top_p_sampling_from_probs(
     else:
         p_arr, p_scalar, p_kind = top_p, 0.0, _TOPP_PER_ROW
     renorm = renorm_out if renorm_out is not None else vals
-    module = load_cake_sampling_module(arch)
+    module = load_cake_sampling_module(capability)
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
     module.radix_topk(
         probs,
@@ -351,18 +367,41 @@ def top_k_probs_to_slab(
     out_idx: Optional[torch.Tensor] = None,
     out_count: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Stage 1 alone: exact per-row top-k (first ``k`` entries of ``lexsort(-prob, index)``,
-    NaN/negative probabilities sanitized to ``+0``) into ``(values [batch, 1024], indices
-    [batch, 1024], counts [batch])``.  The slab layout is deterministic (a pure function of the
-    input) but *not* sorted; entries beyond ``count`` are undefined.  Same dispatch conditions as
-    :func:`top_k_top_p_sampling_from_probs`."""
+    r"""Stage 1 alone: exact per-row top-k into a ``[batch, 1024]`` slab.
+
+    The slab holds the first ``k`` entries of ``lexsort(-prob, index)`` (NaN/negative
+    probabilities sanitized to ``+0``).  Its layout is deterministic (a pure function of the
+    input) but *not* sorted; entries beyond ``count`` are undefined.  Same dispatch conditions
+    as :func:`top_k_top_p_sampling_from_probs`; requests the frozen kernels cannot serve raise
+    ``ValueError`` with the :func:`cake_sampling_route` reason.
+
+    Parameters
+    ----------
+    probs: torch.Tensor
+        ``float32 [batch, vocab]`` probabilities, contiguous.
+    top_k: Union[int, torch.Tensor]
+        Number of candidates kept per row (``int`` or ``int32 [batch]``), ``1 <= k <= 1024``.
+    top_k_max: Optional[int]
+        Upper bound of ``top_k`` when it is a tensor (avoids a device synchronization).
+    out_vals: Optional[torch.Tensor]
+        ``float32 [batch, 1024]`` slab values buffer (allocated when omitted).
+    out_idx: Optional[torch.Tensor]
+        ``int32 [batch, 1024]`` slab indices buffer (allocated when omitted).
+    out_count: Optional[torch.Tensor]
+        ``int32 [batch]`` per-row kept counts buffer (allocated when omitted).
+
+    Returns
+    -------
+    values, indices, counts: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        The slab ``(values [batch, 1024], indices [batch, 1024], counts [batch])``.
+    """
     route = cake_sampling_route(probs, top_k, top_k_max)
     if route != "pipeline":
         raise ValueError(f"frozen radix top-k cannot serve this request ({route})")
-    arch = _arch(probs.device)
+    capability = _capability(probs.device)
     batch, vocab = probs.shape
-    slab = _slab(arch)
-    cluster, ept, stream_variant = choose_stage1(arch, batch, vocab)
+    slab = _slab()
+    cluster, ept, stream_variant = choose_stage1(batch, vocab)
     vals = (
         out_vals
         if out_vals is not None
@@ -383,7 +422,7 @@ def top_k_probs_to_slab(
     else:
         k_arr, k_scalar, k_kind = top_k, 0, _TOPK_PER_ROW
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
-    load_cake_sampling_module(arch).radix_topk(
+    load_cake_sampling_module(capability).radix_topk(
         probs,
         k_arr,
         k_scalar,

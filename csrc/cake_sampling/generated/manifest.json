@@ -1,28 +1,21 @@
 {
-  "arch": "sm_100a",
   "buckets": 2048,
+  "codegen_arch": "sm_100a",
   "compile_flags": [],
-  "kernel_count": 28,
+  "kernel_count": 21,
   "kernel_symbols": [
     "kernel_cake_radix_topk_c1_e4",
     "kernel_cake_radix_topk_c1_e8",
     "kernel_cake_radix_topk_c1_e16",
     "kernel_cake_radix_topk_c1_e32",
-    "kernel_cake_radix_topk_c1_e48",
-    "kernel_cake_radix_topk_c1_e64",
     "kernel_cake_radix_topk_c2_e4",
     "kernel_cake_radix_topk_c2_e16",
     "kernel_cake_radix_topk_c2_e32",
-    "kernel_cake_radix_topk_c2_e48",
-    "kernel_cake_radix_topk_c2_e64",
     "kernel_cake_radix_topk_c4_e16",
     "kernel_cake_radix_topk_c4_e32",
-    "kernel_cake_radix_topk_c4_e48",
-    "kernel_cake_radix_topk_c4_e64",
     "kernel_cake_radix_topk_c8_e16",
     "kernel_cake_radix_topk_c8_e32",
     "kernel_cake_radix_topk_c8_e48",
-    "kernel_cake_radix_topk_c8_e64",
     "kernel_cake_radix_topk_c1_e16s",
     "kernel_cake_radix_topk_c2_e16s",
     "kernel_cake_radix_topk_c4_e16s",
@@ -33,6 +26,10 @@
     "kernel_cake_sparse_topp_sample_t256_i4",
     "kernel_cake_sparse_topp_sample_t512_i2"
   ],
+  "min_compute_capability": [
+    9,
+    0
+  ],
   "schema_version": 1,
   "semantics": {
     "determinism": "strict: no atomics decide any output; slab (vals, idx) is rewritten in sorted order and renorm_out is emitted in that order, bitwise identical across launches, CUDA-graph replay and every kernel variant",
@@ -42,7 +39,7 @@
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "23dd16a6b5a78e54b1867454eea5edcf6e1d521339ef3ebb6bc49780d3d20943",
+  "source_sha256": "1b159e424498e470a9c6102035b8b0553d5d229fa050fbb87e022213e1910526",
   "stage1": [
     {
       "block_threads": 512,
@@ -82,24 +79,6 @@
     },
     {
       "block_threads": 512,
-      "chunk": 24576,
-      "cluster": 1,
-      "dynamic_smem_bytes": 19584,
-      "ept": 48,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c1_e48"
-    },
-    {
-      "block_threads": 512,
-      "chunk": 32768,
-      "cluster": 1,
-      "dynamic_smem_bytes": 20608,
-      "ept": 64,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c1_e64"
-    },
-    {
-      "block_threads": 512,
       "chunk": 2048,
       "cluster": 2,
       "dynamic_smem_bytes": 16768,
@@ -127,24 +106,6 @@
     },
     {
       "block_threads": 512,
-      "chunk": 24576,
-      "cluster": 2,
-      "dynamic_smem_bytes": 19584,
-      "ept": 48,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c2_e48"
-    },
-    {
-      "block_threads": 512,
-      "chunk": 32768,
-      "cluster": 2,
-      "dynamic_smem_bytes": 20608,
-      "ept": 64,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c2_e64"
-    },
-    {
-      "block_threads": 512,
       "chunk": 8192,
       "cluster": 4,
       "dynamic_smem_bytes": 17536,
@@ -160,24 +121,6 @@
       "ept": 32,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e32"
-    },
-    {
-      "block_threads": 512,
-      "chunk": 24576,
-      "cluster": 4,
-      "dynamic_smem_bytes": 19584,
-      "ept": 48,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c4_e48"
-    },
-    {
-      "block_threads": 512,
-      "chunk": 32768,
-      "cluster": 4,
-      "dynamic_smem_bytes": 20608,
-      "ept": 64,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c4_e64"
     },
     {
       "block_threads": 512,
@@ -205,15 +148,6 @@
       "ept": 48,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e48"
-    },
-    {
-      "block_threads": 512,
-      "chunk": 32768,
-      "cluster": 8,
-      "dynamic_smem_bytes": 20608,
-      "ept": 64,
-      "stream": false,
-      "symbol": "kernel_cake_radix_topk_c8_e64"
     },
     {
       "block_threads": 512,
