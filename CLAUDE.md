@@ -202,6 +202,18 @@ The standalone API's optional `validate_indices=True` checks expert-index values
 and synchronizes with the CPU. Validate new routing data before CUDA graph
 capture; the default path assumes valid indices and performs metadata checks only.
 
+### Experimental Hopper VSA backend
+
+`VariableBlockSparseAttentionWrapper(..., backend="vsa_sm90_blk64")` explicitly
+selects the experimental BF16 CuTe DSL backend for SM90, D=128, equal Q/KV head
+counts and noncausal 64-token blocks. Planning owns descriptor snapshots and GPU
+metadata; repeated `run()` calls do not inspect or transfer CPU descriptors.
+Use `plan(..., q_data_type=torch.bfloat16)` and warm up before benchmarking.
+The backend is not selected by `auto`. See the wrapper's docstrings in
+`flashinfer/sparse.py` for supported inputs and limitations,
+`tests/experimental/test_vsa_sm90.py` for regression coverage, and
+`benchmarks/bench_vsa_sm90.py` for paired FA3 timings.
+
 ## Code Linting
 
 Run all pre-commit hooks:
