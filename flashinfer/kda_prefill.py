@@ -7390,13 +7390,17 @@ def prepare_bf16_kda_prefill(
     )
 
 
-def kda_prefill_supports_fp32_checkpoints(device=None) -> bool:
+def kda_prefill_supports_fp32_checkpoints(device=None, *, lower_bound=None) -> bool:
     """Whether this build exports FP32 intermediate states for ``device``.
 
     FP32 ``state_checkpoints`` select the FP32-carrier specialization of the
-    fused direct M128 body.  The check inspects the exported module registry
-    for the device's architecture, so an installation whose registry predates
-    that export reports ``False`` and callers keep BF16 checkpoint rows.
+    fused direct M128 body.  The specialization is exported per gate kind:
+    ``lower_bound=None`` asks about the unbounded softplus gate (Kimi-Linear /
+    Kimi-K3, the contract that radix prefix caching resumes from), any other
+    value about the bounded gate.  The check inspects the exported module
+    registry for the device's architecture, so an installation whose registry
+    lacks that variant reports ``False`` and callers keep BF16 checkpoint rows
+    for that gate kind.
     """
     from .jit.cake_kda_tf32 import FACTORIES, device_arch
 
@@ -7404,9 +7408,12 @@ def kda_prefill_supports_fp32_checkpoints(device=None) -> bool:
         arch = device_arch(device)
     except Exception:  # noqa: BLE001 - no CUDA device or unsupported arch
         return False
+    gate_kind = "unbounded_softplus" if lower_bound is None else "lower_bound"
     variants = FACTORIES.get(arch, {}).get("compiled_bf16_fused_m128", {})
     return any(
-        ("checkpoint_dtype_is_fp32", True) in key[1] for key in variants
+        ("checkpoint_dtype_is_fp32", True) in key[1]
+        and ("gate_kind", gate_kind) in key[1]
+        for key in variants
     )
 
 

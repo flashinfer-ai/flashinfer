@@ -14,7 +14,11 @@ interleaved shapes and CUDA-graph capture/replay of the hit path.
 import pytest
 import torch
 
-from flashinfer import KDAPrefillPlanCache, prepare_bf16_kda_prefill
+from flashinfer import (
+    KDAPrefillPlanCache,
+    kda_prefill_supports_fp32_checkpoints,
+    prepare_bf16_kda_prefill,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -60,7 +64,7 @@ def _inputs(lengths, heads, *, seed, storage_extra=0):
     )
 
 
-def _prepare(d, cache=None):
+def _prepare(d, cache=None, *, checkpoints=True):
     return prepare_bf16_kda_prefill(
         d["q"],
         d["k"],
@@ -76,15 +80,15 @@ def _prepare(d, cache=None):
         cu_seqlens=d["cu_seqlens"],
         sequence_lengths=d["lengths"],
         state_indices=d["state_indices"],
-        state_checkpoints=d["state_checkpoints"],
-        checkpoint_cu_starts=d["checkpoint_cu_starts"],
-        checkpoint_every_n_tokens=64,
+        state_checkpoints=d["state_checkpoints"] if checkpoints else None,
+        checkpoint_cu_starts=d["checkpoint_cu_starts"] if checkpoints else None,
+        checkpoint_every_n_tokens=64 if checkpoints else 0,
         plan_cache=cache,
     )
 
 
-def _run(d, cache=None):
-    call = _prepare(d, cache)
+def _run(d, cache=None, *, checkpoints=True):
+    call = _prepare(d, cache, checkpoints=checkpoints)
     call.launch()
     if cache is None:
         call.close()
@@ -161,15 +165,35 @@ def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
 
 
 def test_split_sequence_affine_route_is_pass_through():
+    # Without a checkpoint request a long unbounded sequence still takes the
+    # affine split route, whose multi-launch plan is not cached.
     cache = KDAPrefillPlanCache(8)
     d = _inputs([8192], 12, seed=5)
     pool = d["pool"].clone()
-    call = _run(d, cache)
+    call = _run(d, cache, checkpoints=False)
     assert "affine" in str(call.schedule)
     assert cache.uncacheable == 1 and len(cache) == 0
     got = _snapshot(d)
     d["pool"].copy_(pool)
-    _run(d)
+    _run(d, checkpoints=False)
+    _assert_same(got, _snapshot(d))
+
+
+def test_checkpointed_long_unbounded_sequence_runs_sequentially_and_caches():
+    # A checkpoint request on an unbounded sequence pins the sequential fused
+    # direct M128 body (FP32 chunk carrier, no affine composition error), and
+    # that single-launch plan is cacheable.
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192], 12, seed=5)
+    pool = d["pool"].clone()
+    call = _run(d, cache)
+    schedule = str(call.schedule)
+    assert "fused" in schedule and "affine" not in schedule
+    assert cache.uncacheable == 0 and len(cache) == 1
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    _run(d, cache)
+    assert cache.hits == 1
     _assert_same(got, _snapshot(d))
 
 
@@ -198,3 +222,18 @@ def test_cache_hit_is_cuda_graph_capturable():
     d["pool"].copy_(replay_pool)
     _run(d)
     _assert_same(got, _snapshot(d))
+
+
+def test_fp32_checkpoint_probe_is_per_gate_kind():
+    # The FP32 intermediate-state contract is exported for the unbounded
+    # softplus gate (Kimi-Linear / Kimi-K3); bounded-gate callers keep the
+    # validated BF16 checkpoint rows and the probe must say so.
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert kda_prefill_supports_fp32_checkpoints(device) is True
+    assert kda_prefill_supports_fp32_checkpoints(device, lower_bound=None) is True
+    assert kda_prefill_supports_fp32_checkpoints(device, lower_bound=-5.0) is False
+    d = _inputs([200, 130], 16, seed=7)
+    d["state_checkpoints"] = torch.empty_like(d["state_checkpoints"], dtype=torch.float32)
+    call = _run(d)
+    assert "fp32_checkpoint" in str(call.schedule)
+    assert torch.isfinite(d["state_checkpoints"]).all()
