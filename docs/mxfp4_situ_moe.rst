@@ -9,17 +9,30 @@ FP8 E4M3 activations and BF16 output. Quantization is explicit metadata.
 
    import torch
 
-   from flashinfer.fused_moe.prepare import prepare_cute_dsl_mxfp4_weights
-   from flashinfer.fused_moe.cute_dsl import CuteDslMxfp4MoEWrapper
+   from flashinfer.fused_moe.prepare import (
+       prepare_cute_dsl_mxfp4_weights, shard_cute_dsl_mxfp4_weights,
+   )
+   from flashinfer.fused_moe.cute_dsl import (
+       CuteDslMxfp4MoEWrapper, Mxfp4MoEParallelLayout,
+   )
    from flashinfer.tllm_enums import ActivationType
 
-   # Load time: canonical W1 is [up, gate]; all four tensors contain uint8 bytes.
-   weights = prepare_cute_dsl_mxfp4_weights(w1, w1_scale, w2, w2_scale)
+   # Explicit placement: this process is rank 3 of 8 expert-parallel ranks.
+   layout = Mxfp4MoEParallelLayout("expert_parallel", size=8, rank=3)
+
+   # Load time: canonical unsharded W1 is [up, gate]; all four tensors are
+   # uint8 bytes. Slice this rank's shard, then shuffle it for the kernels.
+   shard = shard_cute_dsl_mxfp4_weights(
+       w1, w1_scale, w2, w2_scale, ep_size=layout.size, ep_rank=layout.rank,
+   )
+   weights = prepare_cute_dsl_mxfp4_weights(*shard)
    runner = CuteDslMxfp4MoEWrapper(
        num_experts=896, top_k=16, hidden_size=7168, intermediate_size=3072,
-       num_local_experts=112, local_expert_offset=336,
+       parallel_layout=layout,
        quantization="mxfp4_w4a8", activation_type=ActivationType.Situ,
    )
+   assert runner.layout.num_local_experts == 112
+   assert runner.layout.local_expert_offset == 336
    workspace = torch.empty(runner.get_workspace_size(T), device="cuda", dtype=torch.uint8)
    output = torch.empty((T, 7168), device="cuda", dtype=torch.bfloat16)
    plan = runner.plan(
@@ -55,8 +68,9 @@ They are read at execution, not specialized into compiled constants:
 ``ActivationType.Situ`` is the default. ``ActivationType.Swiglu`` is also
 supported without SiTU parameters. GEMM1 quantizes the activation directly
 from FP32 to group-32 MXFP8 before GEMM2. Router weights are applied after the
-expert computation. Output includes only experts in this rank's interval;
-cross-rank reduction is external.
+expert computation. Output is this rank's partial sum (its expert interval or
+its intermediate shard, see `Parallel layouts`_); cross-rank reduction is
+external.
 
 Mixed MXFP8/MXFP4 SiTU uses native approximate FP32 tanh for the gate and
 optional up clamp. Runtime beta, sigmoid evaluation and intermediate
@@ -107,6 +121,82 @@ Routing and finalize caches include their specialization modes. SM100, T17+,
 other activations, PDL and other tactics retain the existing routing/finalize
 paths; native SiTU arithmetic still applies to other supported W4A8 shapes.
 
+Parallel layouts
+----------------
+
+``num_experts`` and ``intermediate_size`` passed to the capability query and
+the runner are always the global model values. The rank-local geometry is
+selected from explicit metadata; tensor shapes are validated against it and
+never used to infer it. Two forms exist and may be combined when they agree:
+
+* ``parallel_layout=Mxfp4MoEParallelLayout(mode, size, rank)`` with ``mode``
+  ``"single"``, ``"expert_parallel"`` or ``"moe_tensor_parallel"``.
+  ``Mxfp4MoEParallelLayout.from_sizes(ep_size=, ep_rank=, moe_tp_size=,
+  moe_tp_rank=)`` builds it from engine-style sizes.
+* ``num_local_experts``/``local_expert_offset``: an explicit contiguous global
+  expert interval. This is the expert-parallel form; every expert at offset 0
+  is ``single``. Any interval is accepted, not only uniform rank slices.
+
+``resolve_mxfp4_moe_layout`` derives and validates the rank-local values; the
+runner exposes them as ``runner.layout`` (an ``Mxfp4MoERankLayout``) and as
+``num_local_experts``, ``local_expert_offset`` and ``intermediate_shard``.
+Passing both forms with different results, an out-of-range rank, a
+non-divisible expert count or intermediate size, or a shard that is not a
+multiple of 128 is rejected with a message naming the conflict. Hybrid
+expert/tensor parallelism is not representable and ``from_sizes`` rejects
+sizes that both exceed one; the corresponding sharding helper does the same.
+
+.. list-table:: Kimi K3 rank-local layouts (E=896, I=3072, top-k 16)
+   :header-rows: 1
+
+   * - Mode
+     - Rank ``r`` owns
+     - Local experts
+     - Intermediate shard
+     - GEMM1 / GEMM2 per expert
+   * - ``expert_parallel`` (EP=8)
+     - global experts ``[112r, 112r+112)``
+     - 112 at offset ``112r``
+     - 3072
+     - ``[m,7168]x[7168,6144]`` / ``[m,3072]x[3072,7168]``
+   * - ``moe_tensor_parallel`` (MoE TP=8)
+     - intermediate columns ``[384r, 384r+384)`` of every expert
+     - 896 at offset 0
+     - 384
+     - ``[m,7168]x[7168,768]`` / ``[m,384]x[384,7168]``
+
+Routing is global in both modes. An expert-parallel rank ignores routes
+outside its interval (they produce no rows and no tiles) and returns zeros
+for tokens without local routes. MoE-tensor-parallel ranks receive identical
+inputs and routes and each returns a partial ``[T, H]`` BF16 result. In both
+modes the sum over ranks equals the unsharded result up to the BF16 rounding
+of each partial; the caller performs that reduction (all-reduce for TP,
+reduce or all-to-all combine for EP). FlashInfer performs no communication.
+
+``shard_cute_dsl_mxfp4_weights(w1, w1_scale, w2, w2_scale, ep_size=,
+ep_rank=, moe_tp_size=, moe_tp_rank=)`` slices the canonical unsharded
+``[E, 2I, H/2]``/``[E, 2I, H/32]``/``[E, H, I/2]``/``[E, H, I/32]`` tensors
+into one rank's canonical shard, which is then passed to
+``prepare_cute_dsl_mxfp4_weights``. With ``Is = I / moe_tp_size`` the
+tensor-parallel shard takes W1 up rows ``[r*Is, (r+1)*Is)`` and gate rows
+``[I + r*Is, I + (r+1)*Is)``, W2 packed columns ``[r*Is/2, (r+1)*Is/2)`` and
+W2 scale columns ``[r*Is/32, (r+1)*Is/32)``; the expert-parallel shard takes
+experts ``[r*E/ep_size, (r+1)*E/ep_size)``. Slicing is deterministic and
+depends only on these arguments. Expert-parallel shards are views of the bank
+(``copy=True`` clones the shard only); tensor-parallel shards are shard-sized
+copies because their rows and columns are not contiguous. No full-size
+duplicate is created; release the canonical bank when no other rank on the
+device needs it. Group-32 scale blocks are never split, so a shard's MXFP8
+intermediate quantization equals the unsharded one block for block.
+
+The kernels place no additional constraint on the shard beyond the existing
+multiple-of-128 rule: GEMM1 N=768 and GEMM2 K=384 satisfy the gather kernel's
+N-tile and 16-byte/128-element alignment checks and the finalize kernel's
+``N % 128`` and alignment checks. For T=1..16 with 896 local experts the fused
+routing kernel uses its 1024-thread variant; that is one additional compiled
+routing callable relative to a 112-local-expert inventory, and no new GEMM
+variant. Per-forward launch counts are unchanged in both modes.
+
 Workspace and kernel selection
 ------------------------------
 
@@ -123,14 +213,21 @@ to existing W4A8 tactic tuples. It chooses the smallest covering bucket using
 host shape metadata, with the conservative Blackwell tactic as the fallback.
 It never inspects device routing on the host or autotunes during execution.
 ``mxfp4_moe_capability`` checks architecture, quantization, activation,
-dimensions, top-k, global/local expert metadata and graph support before
-constructing a plan.
+dimensions, top-k and the explicit parallel metadata before a plan is
+constructed. Its result reports ``supported``, ``reason``, ``cuda_graph``
+(true for every supported configuration in both parallel modes) and
+``layout``, the resolved ``Mxfp4MoERankLayout`` with the mode, local expert
+interval and intermediate shard.
 
 At H=7168, I=3072 and 112 local experts, one prepared weight bank occupies
 3,930,587,136 bytes. With top-k=16 and the conservative tactic, workspace is
 6,499,072 bytes at T=1, 45,885,440 bytes at T=16, and 253,748,224 bytes at
-T=4096. These totals exclude caller activations/output and temporary load-time
-preparation storage. Evaluation retains CuTe- and TRT-prepared banks, with
+T=4096. A MoE-tensor-parallel rank (896 local experts, shard 384) holds a
+prepared bank of the same size and needs 828,160 bytes at T=1, 13,120,000
+at T=16, 48,907,264 at T=512 and 72,543,744 at T=4096: the GEMM1
+intermediate region shrinks with the shard while the per-expert regions grow
+with 896 local experts. These totals exclude caller activations/output and
+temporary load-time preparation storage. Evaluation retains CuTe- and TRT-prepared banks, with
 the CuTe revisions sharing prepared tensors; serving with the CuTe runner
 needs only its own bank.
 
@@ -299,7 +396,18 @@ The four-backend evolution comparison requires current ideal-FP64 error no
 greater than the previous CuTe implementation's error plus the reference's
 BF16 representation floor. The public tests retain their existing gate:
 current ideal-FP64 error no greater than TRT's error plus that floor. Neither
-gate requires explicit-reference nonregression. The historical
+gate requires explicit-reference nonregression. The parallel-layout tests sum
+the BF16 rank outputs in FP64 and allow one BF16 representation floor per
+rounded partial beyond the unsharded comparison's error; they also check that
+the FP64 partial references sum to the unsharded reference, which validates
+the slicing independently of the kernels.
+
+TRT-LLM Gen baseline comparisons use ``trtllm_fp4_block_scale_routed_moe``
+with the same shard geometry (for MoE TP, ``intermediate_size=384`` with 896
+local experts). Its SiTU argument names are inverted relative to this
+document: ``gemm1_alpha`` receives the gate bound ``beta`` and ``gemm1_beta``
+receives the up bound ``linear_beta`` (its reference is
+``situ_activation_reference`` with linear ``x0`` and gate ``x1``). The historical
 ``atol=0.1, rtol=0.15``, greater-than-95% precedent remains diagnostic.
 Final customer numerical acceptance is unresolved.
 
@@ -513,6 +621,13 @@ separate routing, runtime parameters and preallocated execution:
 
    FLASHINFER_KIMI_K3_FULL=1 pytest -q tests/moe/test_cute_dsl_mxfp4_situ.py
    FLASHINFER_KIMI_K3_ALL_LOCAL=1 pytest -q tests/moe/test_cute_dsl_mxfp4_situ.py -k all_local
+   # EP rank-sum and MoE-TP shard-sum identities, TP graph replay and streams
+   FLASHINFER_KIMI_K3_FULL=1 pytest -q tests/moe/test_cute_dsl_mxfp4_situ_layouts.py
+
+The layout tests build the unsharded 896-expert bank once per module and
+slice it; the small-geometry cases run on any SM100/SM103 without the
+environment flag. Routing histograms (global and per rank) are attached to
+the sum tests as ``numerical_report`` properties.
 
 The standalone benchmark reports kernel sum, GPU activity span, host enqueue
 and synchronized end-to-end latency, raw samples and paired ratios. GPU span
@@ -528,3 +643,10 @@ four-backend measurements additionally retain previous/control implementations.
      --tokens 1,2,4,8,16,128,256,512,1024,2048,4096 --distributions balanced,empty,hot \
      --modes eager,graph --routing packed --warmup 5 --repeats 20 \
      --run-id review --output mxfp4-situ-review.json
+
+``--layout ep8 --rank R`` measures expert-parallel rank ``R`` (112 experts at
+offset ``112R``) and ``--layout tp8 --rank R`` measures a MoE-tensor-parallel
+shard (896 experts, intermediate 384); both require ``--full`` and generate
+the rank-local bank directly rather than slicing a full bank. Every row
+records the global and per-rank routing histograms; ``--distributions`` also
+accepts ``remote_dominated``. The default invocation is unchanged.

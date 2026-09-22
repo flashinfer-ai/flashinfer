@@ -17,6 +17,10 @@ Run from a FlashInfer checkout on SM100/SM103 with cupti-python >= 13:
     python benchmarks/bench_mxfp4_situ_moe.py --full --accuracy --output kimi.json
 
 The full shape is H7168, I3072, E896, K16, with 112 local experts by default.
+``--layout ep8 --rank R`` selects expert-parallel rank R (112 experts at offset
+112R) and ``--layout tp8 --rank R`` a MoE-tensor-parallel shard (896 experts,
+intermediate 384) through explicit layout metadata; both require ``--full``
+and generate the rank-local bank directly instead of slicing a full bank.
 Both backends consume the same native quantized operands and BF16 router
 weights. All generation, preparation, compilation and accuracy work is excluded
 from timing. CUPTI is required; no timing fallback is available.
@@ -206,6 +210,8 @@ def main():
     parser.add_argument("--routing", choices=("packed", "separate"), default="packed")
     parser.add_argument("--local-experts", type=int)
     parser.add_argument("--offset", type=int)
+    parser.add_argument("--layout", choices=("ep8", "tp8"))
+    parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--beta", type=float, default=4.0)
     parser.add_argument("--linear-beta", type=float, default=25.0)
     parser.add_argument("--seed", type=int, default=123)
@@ -222,8 +228,22 @@ def main():
     modes = args.modes.split(",")
     if not tokens or min(tokens) < 1 or args.repeats < 1 or args.warmup < 1:
         parser.error("token counts, repeats and warmup must be positive")
-    if not set(distributions) <= {"balanced", "empty", "hot", "all_remote"}:
+    if not set(distributions) <= {
+        "balanced",
+        "empty",
+        "hot",
+        "all_remote",
+        "remote_dominated",
+    }:
         parser.error("unsupported synthetic routing distribution")
+    if args.layout is not None and not args.full:
+        parser.error("--layout requires --full")
+    if args.layout is not None and (
+        args.local_experts is not None or args.offset is not None
+    ):
+        parser.error("--layout replaces --local-experts/--offset")
+    if not 0 <= args.rank < 8:
+        parser.error("--rank must be in [0, 8)")
     if not set(modes) <= {"eager", "graph"}:
         parser.error("modes must be eager,graph")
     if not all(math.isfinite(x) and x > 0 for x in (args.beta, args.linear_beta)):
@@ -234,7 +254,10 @@ def main():
     _require_cupti()
     import torch
 
-    from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import (
+        CuteDslMxfp4MoEWrapper,
+        Mxfp4MoEParallelLayout,
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA device is required")
@@ -245,20 +268,38 @@ def main():
     hidden, intermediate, experts, top_k = (
         (7168, 3072, 896, 16) if args.full else (256, 128, 8, 2)
     )
-    local = (
-        args.local_experts
-        if args.local_experts is not None
-        else (112 if args.full else 4)
-    )
-    offset = (
-        args.offset
-        if args.offset is not None
-        else (336 if args.full and local == 112 else 0)
-    )
+    # ``intermediate`` stays the global model value; the rank-local shard is
+    # derived from the explicit layout, never from tensor shapes.
+    parallel_layout = None
+    if args.layout == "ep8":
+        parallel_layout = Mxfp4MoEParallelLayout("expert_parallel", 8, args.rank)
+    elif args.layout == "tp8":
+        parallel_layout = Mxfp4MoEParallelLayout("moe_tensor_parallel", 8, args.rank)
+    if parallel_layout is not None:
+        probe = CuteDslMxfp4MoEWrapper(
+            experts, top_k, hidden, intermediate, parallel_layout=parallel_layout
+        )
+        local, offset = probe.num_local_experts, probe.local_expert_offset
+        shard = probe.intermediate_shard
+    else:
+        local = (
+            args.local_experts
+            if args.local_experts is not None
+            else (112 if args.full else 4)
+        )
+        offset = (
+            args.offset
+            if args.offset is not None
+            else (336 if args.full and local == 112 else 0)
+        )
+        shard = intermediate
     if local < 1 or offset < 0 or offset + local > experts:
         parser.error(
             "local experts must form a valid contiguous global expert interval"
         )
+    histogram_ranks = (
+        experts // local if experts % local == 0 and offset % local == 0 else 1
+    )
     if "all_remote" in distributions and experts - local < top_k:
         parser.error("all_remote requires at least top_k nonlocal experts")
     tactics = None
@@ -292,6 +333,17 @@ def main():
         "compiled_counts_schema": 3,
         "timing_schema": 2,
     }
+    if parallel_layout is not None:
+        # Added only for explicit layouts so default checkpoints still resume.
+        configuration.update(
+            {
+                "layout": args.layout,
+                "parallel_mode": parallel_layout.mode,
+                "parallel_size": parallel_layout.size,
+                "parallel_rank": parallel_layout.rank,
+                "intermediate_shard": shard,
+            }
+        )
     configuration = json.loads(json.dumps(configuration))
     environment = {
         "gpu": torch.cuda.get_device_name(),
@@ -353,7 +405,7 @@ def main():
     base = reference.make_case(
         tokens=max(tokens),
         hidden=hidden,
-        intermediate=intermediate,
+        intermediate=shard,
         num_experts=experts,
         local_num_experts=local,
         local_expert_offset=offset,
@@ -399,6 +451,7 @@ def main():
                     intermediate,
                     num_local_experts=local,
                     local_expert_offset=offset,
+                    parallel_layout=parallel_layout,
                     enable_pdl=False,
                     offline_tactics=tactics,
                 )
@@ -445,6 +498,9 @@ def main():
                         )
                     del oracles
                 histogram = reference.routing_histogram(case)
+                rank_histogram = reference.parallel_routing_histogram(
+                    ids, experts, histogram_ranks
+                )
                 for mode in modes:
                     active_key = f"{count}/{distribution}/{mode}"
                     if complete(active_key):
@@ -485,6 +541,7 @@ def main():
                         "measurements": measurements,
                         **ratios,
                         "routing_histogram": histogram,
+                        "parallel_routing_histogram": rank_histogram,
                         "workspace_bytes": workspace.numel(),
                         "output_bytes": output.numel() * output.element_size(),
                         "candidate_weight_bytes": candidate_weight_bytes,
