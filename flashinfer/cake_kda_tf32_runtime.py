@@ -2916,6 +2916,20 @@ class FlashKDABlackwellBF16FusedLaunch:
             and uses_default_fused_m128
             and state_checkpoints is None
         )
+        # Affine split parts (_n32_ft_slab) run outside the serving-native ABI
+        # and cannot take the checkpoint-typed carrier unless they carry FP32
+        # rows.  Their map pass (BF16 state I/O, no rows) and row-less main /
+        # correction passes otherwise keep the BF16 carrier, whose per-part
+        # error compounds across the composed parts (0.002 -> 0.03 rel L2 over
+        # twelve parts on real 8K unbounded activations).  The standalone FP32
+        # state carrier keeps every part at sequential-body precision.
+        fp32_state_carrier = (
+            unbounded_softplus
+            and self._n32_ft_slab
+            and compute_dtype == "bf16"
+            and uses_default_fused_m128
+            and not fp32_carrier
+        )
         if backend != "cuda_cpp" and (
             compute_dtype == "tf32"
             or not (uses_default_fused_m128 or use_persistent_m128)
@@ -3018,6 +3032,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
                 **({"checkpoint_dtype_is_fp32": True} if fp32_carrier else {}),
+                **({"fp32_state_carrier": True} if fp32_state_carrier else {}),
                 pair_packed_beta=use_pair_packed_beta,
                 scalar_beta=use_scalar_beta,
                 active_beta_f32=self._active_beta_f32,
@@ -3062,7 +3077,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
             if fp32_checkpoints:
                 self.schedule += "_fp32_checkpoints"
-            elif fp32_carrier:
+            elif fp32_carrier or fp32_state_carrier:
                 self.schedule += "_fp32_carrier"
         if use_tf32_owner_helper:
             n32_value_rows = (
