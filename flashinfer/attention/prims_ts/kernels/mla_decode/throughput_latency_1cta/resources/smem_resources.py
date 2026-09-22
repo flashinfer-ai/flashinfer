@@ -648,55 +648,53 @@ class SmemPageOffsetsResource(MlaResource):
         del stage_info
         if cutlass.const_expr(self.cfg.num_tokens_per_page == 1):
             lane = lane_idx_from_thread(cute.arch.thread_idx()[0])
-            if cutlass.const_expr(
-                self.cfg.sparse_offset_cache in ("quad", "coalesced")
-            ):
-                warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
-                groups_per_warp = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+            warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
+            groups_per_warp = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+            for j in cutlass.range_constexpr(4):
+                cached_page_ids[cache_slot * self.cfg.sparse_cache_words + j] = Int32(
+                    0x7FFFFFFF
+                )
+            if lane < groups_per_warp:
+                quad = warp * groups_per_warp + lane
+                offset = (
+                    self.consumer_work_stage * self.cfg.page_offsets_entries_per_stage
+                    + quad * 4
+                )
+                values = self._smem_page_offsets.data_ptr(offset).load(
+                    count=4, alignment=16
+                )
                 for j in cutlass.range_constexpr(4):
                     cached_page_ids[cache_slot * self.cfg.sparse_cache_words + j] = (
-                        Int32(0x7FFFFFFF)
+                        values[j]
                     )
-                if lane < groups_per_warp:
-                    quad = warp * groups_per_warp + lane
-                    offset = (
-                        self.consumer_work_stage
-                        * self.cfg.page_offsets_entries_per_stage
-                        + quad * 4
+            base = cache_slot * self.cfg.sparse_cache_words
+            # Actual physical adjacency within one source is required. A
+            # full valid prefix can still contain random rows. Eight quads
+            # (32 rows) are needed for bulk; smaller issuer shares use gather4.
+            if cutlass.const_expr(groups_per_warp >= 8):
+                first = Int32(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=cached_page_ids[base],
+                        offset=lane & Int32(-8),
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
                     )
-                    values = self._smem_page_offsets.data_ptr(offset).load(
-                        count=4, alignment=16
-                    )
-                    for j in cutlass.range_constexpr(4):
-                        cached_page_ids[
-                            cache_slot * self.cfg.sparse_cache_words + j
-                        ] = values[j]
-                if cutlass.const_expr(self.cfg.sparse_offset_cache == "coalesced"):
-                    base = cache_slot * self.cfg.sparse_cache_words
-                    first = Int32(
-                        prims.shfl_sync(
-                            thread_mask=0xFFFFFFFF,
-                            val=cached_page_ids[base],
-                            offset=lane & Int32(-8),
-                            mask_and_clamp=0x1F,
-                            kind=prims.Shfl.IDX,
-                        )
-                    )
-                    contiguous = (first & Int32(0x7FFFFFFF)) != Int32(0x7FFFFFFF)
-                    empty = cutlass.Boolean(True)
-                    for j in cutlass.range_constexpr(4):
-                        raw = cached_page_ids[base + j]
-                        contiguous = contiguous and raw == first + (lane % 8) * 4 + j
-                        empty = empty and (raw & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF)
-                    cached_page_ids[base + 4] = Int32(
-                        cute.arch.vote_ballot_sync(contiguous)
-                    )
-                    cached_page_ids[base + 5] = Int32(cute.arch.vote_ballot_sync(empty))
-            elif cutlass.const_expr(self.cfg.sparse_offset_cache == "strided"):
-                for fragment in cutlass.range_constexpr(4):
-                    cached_page_ids[
-                        cache_slot * self.cfg.sparse_cache_words + fragment
-                    ] = self.page_id(lane + Int32(fragment * 32))
+                )
+                contiguous = (first & Int32(0x7FFFFFFF)) != Int32(0x7FFFFFFF)
+                empty = cutlass.Boolean(True)
+                for j in cutlass.range_constexpr(4):
+                    raw = cached_page_ids[base + j]
+                    contiguous = contiguous and raw == first + (lane % 8) * 4 + j
+                    empty = empty and (raw & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF)
+                cached_page_ids[base + 4] = Int32(
+                    cute.arch.vote_ballot_sync(contiguous)
+                )
+                cached_page_ids[base + 5] = Int32(cute.arch.vote_ballot_sync(empty))
+            else:
+                cached_page_ids[base + 4] = Int32(0)
+                cached_page_ids[base + 5] = Int32(0)
+
         else:
             cache_base = cache_slot * self.cfg.pages_per_kv_tile
             for page_frag in cutlass.range_constexpr(self.cfg.pages_per_kv_tile):
@@ -938,7 +936,7 @@ class SmemKvResource(MlaResource):
             )
             tma_desc = (
                 self.tma_desc_c_latent
-                if cfg.sparse_offset_cache == "coalesced"
+                if cfg.num_tokens_per_page == 1
                 else self.tma_desc_v
             )
         else:
@@ -979,7 +977,10 @@ class SmemKvResource(MlaResource):
             and cfg.head_dim_per_stage_kv == 128
         )
 
-        if cutlass.const_expr(cfg.sparse_offset_cache == "coalesced"):
+        # Each lane owns four adjacent index-list entries. Bulk TMA requires
+        # a verified 32-row physical run within one source; irregular rows
+        # use gather4. The separate empty-window path only zero-fills padding.
+        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
             warp = cute.arch.thread_idx()[0] // 32 - cfg.load_warp_idx
             groups_per_warp = cfg.tile_size_kv // (4 * cfg.load_num_warps)
             base = page_id_slot * cfg.sparse_cache_words
@@ -1069,141 +1070,6 @@ class SmemKvResource(MlaResource):
                                 coords[3],
                                 stage_info.barrier,
                             )
-            return
-
-        if cutlass.const_expr(
-            cfg.num_tokens_per_page == 1 and cfg.sparse_offset_cache != "strided"
-        ):
-            # One lane owns a full row quadruple; LDS.128 avoids bank conflicts
-            # and constant register indices avoid array indexing in the loop.
-            warp = cute.arch.thread_idx()[0] // 32 - cfg.load_warp_idx
-            groups_per_warp = cfg.tile_size_kv // (4 * cfg.load_num_warps)
-            if cutlass.const_expr(cfg.sparse_offset_cache in ("quad", "coalesced")):
-                first = Int32(
-                    prims.shfl_sync(
-                        thread_mask=0xFFFFFFFF,
-                        val=cached_page_ids[page_id_slot * 4],
-                        offset=0,
-                        mask_and_clamp=0x1F,
-                        kind=prims.Shfl.IDX,
-                    )
-                )
-                descriptor = select_gather_map(
-                    tma_desc, self.tma_desc_c_rope, first < 0
-                )
-            for local_group in cutlass.range(groups_per_warp, unroll=1):
-                group = warp * groups_per_warp + local_group
-                if cutlass.const_expr(cfg.sparse_offset_cache in ("quad", "coalesced")):
-                    coords = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                    for j in cutlass.range_constexpr(4):
-                        raw = Int32(
-                            prims.shfl_sync(
-                                thread_mask=0xFFFFFFFF,
-                                val=cached_page_ids[page_id_slot * 4 + j],
-                                offset=local_group,
-                                mask_and_clamp=0x1F,
-                                kind=prims.Shfl.IDX,
-                            )
-                        )
-                        row = raw & Int32(0x7FFFFFFF)
-                        coords[j] = row if row != Int32(0x7FFFFFFF) else Int32(-1)
-                    if prims.elect_sync():
-                        for feature_part in cutlass.range_constexpr(
-                            cfg.head_dim_per_stage_kv // (128 // cfg.qkv_dtype_bytes)
-                        ):
-                            gather4(
-                                stage_base.data_ptr(
-                                    group * (4 * inner_width)
-                                    + feature_part * cfg.tile_size_kv * inner_width
-                                ),
-                                descriptor,
-                                dim_offset + feature_part * inner_width,
-                                coords[0],
-                                coords[1],
-                                coords[2],
-                                coords[3],
-                                stage_info.barrier,
-                            )
-                else:
-                    if prims.elect_sync():
-                        raw = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                        coords = cutlass.Array(
-                            Int32, 4, space=cutlass.AddressSpace.rmem
-                        )
-                        for j in cutlass.range_constexpr(4):
-                            pos = tile_idx * 128 + group * 4 + j
-                            value = Int32(0x7FFFFFFF)
-                            if pos < self.page_offsets.shape[0]:
-                                value = Int32(self.page_offsets[pos, batch_idx])
-                            raw[j] = value
-                            row = value & Int32(0x7FFFFFFF)
-                            coords[j] = row if row != Int32(0x7FFFFFFF) else Int32(-1)
-                        descriptor = select_gather_map(
-                            tma_desc, self.tma_desc_c_rope, raw[0] < 0
-                        )
-                        for feature_part in cutlass.range_constexpr(
-                            cfg.head_dim_per_stage_kv // (128 // cfg.qkv_dtype_bytes)
-                        ):
-                            gather4(
-                                stage_base.data_ptr(
-                                    group * (4 * inner_width)
-                                    + feature_part * cfg.tile_size_kv * inner_width
-                                ),
-                                descriptor,
-                                dim_offset + feature_part * inner_width,
-                                coords[0],
-                                coords[1],
-                                coords[2],
-                                coords[3],
-                                stage_info.barrier,
-                            )
-            return
-
-        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            # Cache is distributed: four tagged row coordinates per lane per
-            # live K/V stream. Both K and delayed V consume the same window.
-            for group in cutlass.range(32, unroll_full=True):
-                coords = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                raw0 = Int32(
-                    prims.shfl_sync(
-                        thread_mask=0xFFFFFFFF,
-                        val=cached_page_ids[page_id_slot * 4 + group // 8],
-                        offset=(group * 4) % 32,
-                        mask_and_clamp=0x1F,
-                        kind=prims.Shfl.IDX,
-                    )
-                )
-                for j in cutlass.range_constexpr(4):
-                    token = group * 4 + Int32(j)
-                    raw = Int32(
-                        prims.shfl_sync(
-                            thread_mask=0xFFFFFFFF,
-                            val=cached_page_ids[page_id_slot * 4 + token // 32],
-                            offset=token % 32,
-                            mask_and_clamp=0x1F,
-                            kind=prims.Shfl.IDX,
-                        )
-                    )
-                    row = raw & Int32(0x7FFFFFFF)
-                    coords[j] = row if row != Int32(0x7FFFFFFF) else Int32(-1)
-                source_map = select_gather_map(tma_desc, self.tma_desc_c_rope, raw0 < 0)
-                for feature_part in cutlass.range_constexpr(
-                    cfg.head_dim_per_stage_kv // (128 // cfg.qkv_dtype_bytes)
-                ):
-                    if prims.elect_sync():
-                        gather4(
-                            stage_base.data_ptr(
-                                group * Int32(4 * inner_width)
-                                + Int32(feature_part * cfg.tile_size_kv * inner_width)
-                            ),
-                            source_map,
-                            dim_offset + Int32(feature_part * inner_width),
-                            coords[0],
-                            coords[1],
-                            coords[2],
-                            coords[3],
-                            stage_info.barrier,
-                        )
             return
 
         if cutlass.const_expr(cfg.use_paged_kv == 1):

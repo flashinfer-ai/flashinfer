@@ -886,6 +886,8 @@ class MlaDecodeTs:
         self.device_scales = device_scales
         self.external_sparse_reduction = False
         self.fuse_sparse_epilogue = False
+        # Separate prepared source lists, rather than a premerged tagged list.
+        # Both representations reuse the same metadata staging and KV loaders.
         self.direct_sparse = False
         self.sparse_gather_warps = 1
         self.sparse_kv_stages = 0

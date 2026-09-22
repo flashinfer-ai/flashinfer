@@ -3,7 +3,7 @@
   "description": "Native D512 sparse attention with caller-prepared storage-row metadata. One primary KV pool and optional extra pool; preparation excluded. LSE excludes sinks.",
   "op_type": "mla_paged",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.sparse_mla_decode.BatchSparseMLADecodePagedTSWrapper.run",
+    "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchSparseMLADecodePagedTSWrapper.run",
     "backend:prims-ts",
     "status:experimental",
     "mla",

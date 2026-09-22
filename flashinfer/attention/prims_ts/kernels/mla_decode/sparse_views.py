@@ -11,8 +11,12 @@
 
 """CTA-local views of caller-prepared storage-row indices.
 
-One nonpersistent CTA owns one virtual query request. Prefix lengths are
-loaded once; row mapping is evaluated when the page-loader consumes indices.
+Adapt separate primary/extra physical-row lists to the existing route/length
+interface without materializing a merged GPU array. Source spans are padded
+to 128 and tagged per tile; arbitrary holes remain masked. Nonpersistent CTAs
+bind one request, while persistent work tiles rebind live pointers/lengths.
+The common premerged-route path bypasses these views. Neither source is
+required to be SWA or compressed, and logical-page conversion is external.
 """
 
 import cutlass
@@ -85,7 +89,7 @@ class SparseRouteView:
             length = self.cl if compressed else self.sl
             return SparsePrefixMask((origin, length))
         routes = self.routes_for_tile(token)
-        return SparseTileMask((routes.indices, routes.origin, routes.length))
+        return routes
 
     @cute.jit
     def is_invalid(self, token, request):
@@ -146,31 +150,6 @@ class SparsePrefixMask:
         return (token < self.origin) | (token >= self.origin + self.length)
 
 
-class SparseTileMask:
-    def __init__(self, values):
-        self.values = values
-        self.indices, self.origin, self.length = values
-
-    def __extract_mlir_values__(self):
-        return cutlass.extract_mlir_values(self.values)
-
-    def __new_from_mlir_values__(self, values):
-        return SparseTileMask(cutlass.new_from_mlir_values(self.values, values))
-
-    @cute.jit
-    def is_invalid(self, token, request):
-        del request
-        position = token - self.origin
-        # A clamped load keeps the mask branchless without reading beyond a
-        # source's active prefix. Zero-capacity sources bind a one-row dummy.
-        safe = cute.math.min(
-            cute.math.max(position, Int32(0)),
-            cute.math.max(self.length - Int32(1), Int32(0)),
-        )
-        index = Int32(self.indices[safe])
-        return (position < Int32(0)) | (position >= self.length) | (index < Int32(0))
-
-
 class SparseTileRoutes:
     """One source selection per tile, with bounded scalar and quad loads."""
 
@@ -185,14 +164,27 @@ class SparseTileRoutes:
         return SparseTileRoutes(cutlass.new_from_mlir_values(self.values, values))
 
     @cute.jit
-    def mapped_row(self, token):
+    def _bounded_index(self, token):
         position = token - self.origin
+        # Zero-capacity sources bind a one-row dummy. Clamp even masked
+        # positions so both gather and softmax can use a bounded load.
         safe = cute.math.min(
             cute.math.max(position, Int32(0)),
             cute.math.max(self.length - Int32(1), Int32(0)),
         )
         index = Int32(self.indices[safe])
         valid = (position >= Int32(0)) & (position < self.length) & (index >= Int32(0))
+        return index, valid
+
+    @cute.jit
+    def is_invalid(self, token, request):
+        del request
+        _, valid = self._bounded_index(token)
+        return ~valid
+
+    @cute.jit
+    def mapped_row(self, token):
+        index, valid = self._bounded_index(token)
         return (index if valid else Int32(0x7FFFFFFF)) | self.tag
 
     @cute.jit

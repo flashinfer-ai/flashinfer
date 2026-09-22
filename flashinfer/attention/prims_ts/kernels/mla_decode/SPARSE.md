@@ -7,7 +7,7 @@ existing experimental Prims-TS backend. CuTe DSL 4.7 is required.
 
 ## Code organization
 
-- `attention/prims_ts/sparse_mla_decode.py`: the public `plan()` / `run()`
+- `attention/prims_ts/mla_decode.py`: the public `plan()` / `run()`
   wrapper, input validation, workspace ownership and kernel launch.
 - `sparse_policy.py`: datatype-specific schedule selection, buffer sizing and
   split/V partition sizing from planned workload bounds and SM count.

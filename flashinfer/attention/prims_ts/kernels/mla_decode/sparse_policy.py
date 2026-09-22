@@ -29,6 +29,8 @@ class SparseMlaProfile:
     reduction: str = "gmem_separate"
     head_dim_ctas: int = 1
     gather_issue_warps: int = 4
+    # Separate lists help qualified small decode grids; premerged tagged
+    # routes remain selected where their simpler loader improves throughput.
     direct_inputs: bool = True
     balanced_registers: bool = False
     reuse_kv: bool = False

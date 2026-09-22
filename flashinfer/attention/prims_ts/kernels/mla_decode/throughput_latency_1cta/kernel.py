@@ -55,6 +55,7 @@ from cutlass.experimental.task_scheduling.task_manager import TaskManager
 from .config import (
     MlaConfig,
     make_throughput_latency_mla_config,
+    configure_sparse_mla,
 )
 from .resources import (
     SmemKvResource,
@@ -887,44 +888,51 @@ def build_throughput_latency_mla_task_manager(
                 **task_domain_kwargs,
             )
         )
+    tasks.append(
+        create_throughput_latency_load_task(
+            smem_q,
+            smem_kv,
+            work_queue,
+            schedule_token_throttle,
+            cfg,
+            domain=load_domain,
+            smem_page_offsets=smem_page_offsets if use_page_offsets else None,
+            use_page_offsets=use_page_offsets,
+            task_class=MlaDecodeTask,
+            **task_domain_kwargs,
+        )
+    )
+    if not cfg.short_merged_softmax:
+        tasks.extend(
+            [
+                create_throughput_latency_softmax0_task(
+                    tmem_s0,
+                    local0,
+                    smem_p0,
+                    global0,
+                    work_queue,
+                    cfg,
+                    domain=softmax_domain,
+                    task_class=MlaDecodeTask,
+                    domain_bias=1,
+                    **task_domain_kwargs,
+                ),
+                create_throughput_latency_softmax1_task(
+                    tmem_s1,
+                    local1,
+                    smem_p1,
+                    global1,
+                    work_queue,
+                    cfg,
+                    domain=softmax_domain,
+                    task_class=MlaDecodeTask,
+                    domain_bias=1,
+                    **task_domain_kwargs,
+                ),
+            ]
+        )
     tasks.extend(
         [
-            create_throughput_latency_load_task(
-                smem_q,
-                smem_kv,
-                work_queue,
-                schedule_token_throttle,
-                cfg,
-                domain=load_domain,
-                smem_page_offsets=smem_page_offsets if use_page_offsets else None,
-                use_page_offsets=use_page_offsets,
-                task_class=MlaDecodeTask,
-                **task_domain_kwargs,
-            ),
-            create_throughput_latency_softmax0_task(
-                tmem_s0,
-                local0,
-                smem_p0,
-                global0,
-                work_queue,
-                cfg,
-                domain=softmax_domain,
-                task_class=MlaDecodeTask,
-                domain_bias=1,
-                **task_domain_kwargs,
-            ),
-            create_throughput_latency_softmax1_task(
-                tmem_s1,
-                local1,
-                smem_p1,
-                global1,
-                work_queue,
-                cfg,
-                domain=softmax_domain,
-                task_class=MlaDecodeTask,
-                domain_bias=1,
-                **task_domain_kwargs,
-            ),
             create_throughput_latency_correction_task(
                 local0,
                 local1,
@@ -1096,9 +1104,8 @@ def build_throughput_latency_mla_task_manager(
     if cfg.short_merged_softmax:
         from .tasks import create_short_merged_softmax_task
 
-        tasks = [
-            task for task in tasks if task.name not in ("Softmax0Task", "Softmax1Task")
-        ]
+        # Keep the two P/statistic streams, but create only their shared
+        # softmax worker. No steady-state correction exchanges are needed.
         tasks.append(
             create_short_merged_softmax_task(
                 tmem_s0,
@@ -1648,7 +1655,7 @@ def _make_single_kv_pipe_task_graph(
 
 
 class ThroughputLatencyMlaDecodeTs:
-    """Dense throughput-latency 1CTA MLA TS wrapper."""
+    """Throughput-latency 1CTA MLA over dense pages or prepared sparse rows."""
 
     def __init__(
         self,
@@ -1675,10 +1682,8 @@ class ThroughputLatencyMlaDecodeTs:
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
         device_scales: bool = False,
-        gather_issue_warps: int = 1,
-        sparse_offset_cache: str = "strided",
-        fuse_sparse_epilogue: bool = False,
-        external_sparse_reduction: bool = False,
+        sparse_profile=None,
+        finalize_output: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1708,20 +1713,10 @@ class ThroughputLatencyMlaDecodeTs:
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
         self.device_scales = device_scales
-        self.gather_issue_warps = gather_issue_warps
-        self.sparse_offset_cache = sparse_offset_cache
-        self.reuse_sparse_kv = False
-        self.sparse_kv_tile_size = 128
-        self.page_pipeline_stages = 0
-        self.reuse_sparse_kv_stages = 0
-        self.paired_sparse_correction = False
-        self.single_sparse_stream = False
-        self.defer_sparse_max_update = False
-        self.uniform_sparse_offset_cache = False
-        self.fuse_sparse_epilogue = fuse_sparse_epilogue
-        self.fuse_sparse_cluster_epilogue = False
-        self.external_sparse_reduction = external_sparse_reduction
-        self.balanced_sparse_registers = False
+        self.sparse_profile = sparse_profile
+        self.finalize_output = finalize_output
+        # Separate prepared source lists, rather than a premerged tagged list.
+        # Both representations reuse the same metadata staging and KV loaders.
         self.direct_sparse = False
         self.direct_static_scales = False
         self.direct_sparse_capacities = (0, 0)
@@ -1840,273 +1835,14 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
         )
-        if self.gather_issue_warps not in (
-            1,
-            2,
-            4,
-            8,
-        ) or self.sparse_offset_cache not in (
-            "strided",
-            "quad",
-            "global",
-            "coalesced",
-        ):
-            raise ValueError("invalid sparse gather tuning")
-        if self.gather_issue_warps == 8 and cfg.kernel_variant == "swaps_mma_ab":
-            if (
-                cfg.tile_size_q not in (8, 16)
-                or cfg.local_kv_tiles(cfg.total_kv_tiles) <= cfg.num_insts_kv
-            ):
-                raise ValueError(
-                    "eight swap issuers require M8/M16 and a steady-state loop"
-                )
-        if self.gather_issue_warps != 1 or self.sparse_offset_cache != "strided":
-            if cfg.num_tokens_per_page != 1 or (
-                cfg.kernel_variant,
-                cfg.tile_size_q,
-            ) not in (
-                ("swaps_mma_ab", 8),
-                ("swaps_mma_ab", 16),
-                ("swaps_mma_ab", 32),
-                ("keeps_mma_ab", 64),
-            ):
-                raise ValueError(
-                    "gather tuning requires sparse swap-M8/M16/M32 or keep-M64"
-                )
-            if cfg.kernel_variant == "keeps_mma_ab":
-                cfg = dataclass_replace(
-                    cfg,
-                    threads_per_cta=640 if self.gather_issue_warps == 8 else 512,
-                    load_warp_idx=12,
-                    load_num_warps=self.gather_issue_warps,
-                    sparse_offset_cache=self.sparse_offset_cache,
-                    softmax_regs=128 if self.gather_issue_warps == 8 else 192,
-                    correction_regs=160 if self.gather_issue_warps == 8 else 192,
-                    mma_load_regs=64,
-                )
-            else:
-                # Keep compute-role warp IDs fixed; eight issuers expand the
-                # CTA from 20 to 24 warps.
-                # M32 trades 16 softmax registers for its larger correction
-                # footprint while preserving the task manager's CTA budget.
-                cfg = dataclass_replace(
-                    cfg,
-                    threads_per_cta=768 if self.gather_issue_warps == 8 else 640,
-                    load_warp_idx=16,
-                    load_num_warps=self.gather_issue_warps,
-                    sparse_offset_cache=self.sparse_offset_cache,
-                    softmax_regs=144 if cfg.tile_size_q == 32 else 160,
-                    mma_load_regs=48,
-                )
-        if self.sparse_kv_tile_size != 128:
-            if (
-                self.sparse_kv_tile_size != 64
-                or not self.reuse_sparse_kv
-                or self.sparse_offset_cache != "coalesced"
-                or cfg.kernel_variant != "keeps_mma_ab"
-                or cfg.is_fp8_qkv()
-                or cfg.rope_dim != 0
-                or cfg.num_tokens_per_page != 1
-            ):
-                raise ValueError(
-                    "64-token KV tiles require native BF16 coalesced keep reuse"
-                )
-            if self.reuse_sparse_kv_stages < 2 * cfg.qk_head_dim_stages:
-                raise ValueError(
-                    "64-token KV tiles require stages for two retained K tiles"
-                )
-            cfg = dataclass_replace(
-                cfg, tile_size_kv=64, page_offsets_entries_per_stage=64
-            )
-        if self.reuse_sparse_kv:
-            if (
-                cfg.rope_dim != 0
-                or cfg.num_tokens_per_page != 1
-                or cfg.num_ctas_per_head_dim != 1
-                or cfg.sparse_offset_cache != "coalesced"
-            ):
-                raise ValueError(
-                    "KV reuse requires coalesced staged or nonpersistent native inputs with one V partition"
-                )
-            cfg = dataclass_replace(cfg, sparse_reuse_kv=True)
-            if self.reuse_sparse_kv_stages:
-                min_stages = (
-                    2 if cfg.is_fp8_qkv() or cfg.tile_size_kv == 64 else 1
-                ) * cfg.qk_head_dim_stages
-                if self.reuse_sparse_kv_stages < min_stages:
-                    raise ValueError("KV reuse has insufficient stages to retain K")
-                cfg = dataclass_replace(
-                    cfg, kv_stages=self.reuse_sparse_kv_stages, q_stages=1
-                )
-                if cfg.kernel_variant == "keeps_mma_ab" and (
-                    cfg.kv_stages == (12 if cfg.is_fp8_qkv() else 5)
-                    or cfg.tile_size_kv == 64
-                ):
-                    cfg = dataclass_replace(cfg, page_offsets_stages=1)
-        if self.page_pipeline_stages:
-            if (
-                self.page_pipeline_stages < 1
-                or cfg.kernel_variant != "keeps_mma_ab"
-                or cfg.num_tokens_per_page != 1
-            ):
-                raise ValueError(
-                    "page-stage overrides require positive stages and sparse keep"
-                )
-            cfg = dataclass_replace(cfg, page_offsets_stages=self.page_pipeline_stages)
-        if self.defer_sparse_max_update:
-            if cfg.num_tokens_per_page != 1 or cfg.is_fp8_qkv():
-                raise ValueError("deferred maxima require native BF16 probabilities")
-            cfg = dataclass_replace(cfg, defer_sparse_max_update=True)
-        if self.paired_sparse_correction:
-            if cfg.num_tokens_per_page != 1 or cfg.kernel_variant != "keeps_mma_ab":
-                raise ValueError("paired correction currently requires native keep-M64")
-            cfg = dataclass_replace(cfg, paired_sparse_correction=True)
-        if self.uniform_sparse_offset_cache:
-            if (
-                not cfg.sparse_reuse_kv
-                or (cfg.is_fp8_qkv() and cfg.kernel_variant != "keeps_mma_ab")
-                or cfg.load_num_warps not in (4, 8)
-                or (cfg.load_num_warps == 8 and cfg.kernel_variant != "keeps_mma_ab")
-            ):
-                raise ValueError(
-                    "uniform sparse cache requires four/eight issuers and native keep reuse"
-                )
-            cfg = dataclass_replace(
+        if self.sparse_profile is not None:
+            cfg = configure_sparse_mla(
                 cfg,
-                cache_uniform_sparse_quads=True,
-                softmax_regs=128,
-                correction_regs=160 if cfg.load_num_warps == 8 else 192,
-                mma_load_regs=64 if cfg.load_num_warps == 8 else 96,
-            )
-        if self.balanced_sparse_registers:
-            if (
-                cfg.num_tokens_per_page != 1
-                or cfg.kernel_variant != "swaps_mma_ab"
-                or cfg.tile_size_q not in (8, 16)
-            ):
-                raise ValueError("balanced registers require sparse swap-M8/M16")
-            cfg = dataclass_replace(
-                cfg,
-                softmax_regs=96,
-                correction_regs=96,
-                mma_load_regs=64 if cfg.load_num_warps == 8 else 96,
-                scheduler_regs=64 if cfg.load_num_warps == 8 else 96,
-            )
-        # Match short_merged_softmax before sparse_direct is materialized
-        # below. A long list can still assign just one group to each split.
-        if (
-            self.direct_sparse
-            and cfg.kernel_variant == "swaps_mma_ab"
-            and cfg.local_kv_tiles(cfg.total_kv_tiles) == cfg.num_insts_kv
-        ):
-            cfg = dataclass_replace(
-                cfg,
-                threads_per_cta=512,
-                correction_warp_idx=4,
-                mma_warp_idx=8,
-                page_offsets_warp_idx=9,
-                load_warp_idx=12,
-                scheduler_warp_idx=10,
-                softmax_regs=96,
-                correction_regs=96,
-                mma_load_regs=96,
-                scheduler_regs=96,
-            )
-        if self.fuse_sparse_cluster_epilogue:
-            if not (
-                cfg.num_tokens_per_page == 1
-                and cfg.use_cluster_reduction == 1
-                and cfg.kernel_variant == "swaps_mma_ab"
-                and cfg.tile_size_q in (16, 32)
-                and cfg.use_bf16_output == 1
-            ):
-                raise ValueError(
-                    "fused sparse cluster output requires native sparse swap-M16/M32 cluster reduction"
-                )
-            cfg = dataclass_replace(cfg, fuse_sparse_cluster_epilogue=True)
-        if self.fuse_sparse_epilogue:
-            if (
-                cfg.num_tokens_per_page != 1
-                or (cfg.kernel_variant, cfg.tile_size_q)
-                not in (
-                    ("swaps_mma_ab", 8),
-                    ("swaps_mma_ab", 16),
-                    ("swaps_mma_ab", 32),
-                    ("keeps_mma_ab", 64),
-                )
-                or cfg.num_ctas_per_seq_kv != 1
-                or cfg.logical_seq_len_q != 1
-            ):
-                raise ValueError(
-                    "fused sparse epilogue requires unsplit swap-M8/M16/M32 or keep-M64"
-                )
-            cfg = dataclass_replace(cfg, fuse_sparse_epilogue=True)
-        if self.external_sparse_reduction:
-            if (
-                cfg.num_tokens_per_page != 1
-                or cfg.num_ctas_per_seq_kv <= 1
-                or cfg.use_cluster_reduction
-            ):
-                raise ValueError("external sparse reduction requires separate split-KV")
-            cfg = dataclass_replace(cfg, external_sparse_reduction=True)
-        if self.direct_sparse:
-            if (
-                cfg.qkv_dtype not in ("e4m3", "bf16")
-                or cfg.num_tokens_per_page != 1
-                or not (
-                    self.fuse_sparse_epilogue
-                    or self.fuse_sparse_cluster_epilogue
-                    or self.external_sparse_reduction
-                )
-            ):
-                raise ValueError(
-                    "direct sparse inputs require native FP8/BF16 fused output"
-                )
-            cfg = dataclass_replace(
-                cfg,
-                sparse_direct=True,
-                sparse_static_scales=self.direct_static_scales,
-                sparse_direct_capacities=self.direct_sparse_capacities,
-            )
-        if self.single_sparse_stream:
-            if (
-                cfg.kernel_variant != "swaps_mma_ab"
-                or cfg.tile_size_q not in (8, 16)
-                or cfg.num_tokens_per_page != 1
-                or (cfg.num_ctas_per_seq_kv > 1 and cfg.use_persistent_scheduler != 0)
-                or cfg.use_cluster_reduction != 0
-                or cfg.num_ctas_per_head_dim != 1
-                or cfg.rope_dim != 0
-                or cfg.load_num_warps != 4
-            ):
-                raise ValueError(
-                    "single-stream swap requires native M8/M16 V1 and four issuers; split KV requires nonpersistent scheduling"
-                )
-            cfg = dataclass_replace(
-                cfg,
-                # Issuers cache the current tile's coordinates in registers.
-                # One shared metadata slot leaves room for six BF16 KV stages.
-                page_offsets_stages=(
-                    1
-                    if cfg.sparse_reuse_kv
-                    and cfg.kv_stages >= 6
-                    and not cfg.is_fp8_qkv()
-                    else cfg.page_offsets_stages
-                ),
-                num_insts_kv=1,
-                o_stages=1,
-                q_stages=1,
-                kv_stages=self.reuse_sparse_kv_stages or cfg.kv_stages,
-                threads_per_cta=512,
-                correction_warp_idx=4,
-                mma_warp_idx=8,
-                load_warp_idx=12,
-                page_offsets_warp_idx=10,
-                scheduler_warp_idx=11,
-                softmax_regs=128,
-                correction_regs=160,
-                mma_load_regs=64,
-                scheduler_regs=64,
+                self.sparse_profile,
+                finalize_output=self.finalize_output,
+                direct_inputs=self.direct_sparse,
+                static_scales=self.direct_static_scales,
+                source_capacities=self.direct_sparse_capacities,
             )
         return cfg
 
@@ -2400,7 +2136,7 @@ class ThroughputLatencyMlaDecodeTs:
             tma_desc_c_rope = tma_desc_c_latent
 
         tma_desc_v = tma_desc_c_latent
-        if cutlass.const_expr(cfg.sparse_offset_cache == "coalesced"):
+        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
             # D512 does not use Q-rope; reuse its descriptor slot for the
             # second pool's contiguous-run map. Gather maps stay separate.
             rows_per_issuer = 32
@@ -2506,7 +2242,7 @@ class ThroughputLatencyMlaDecodeTs:
             min_blocks_per_mp=1,
             use_pdl=acc_o is not None,
         )
-        if cutlass.const_expr(self.external_sparse_reduction):
+        if cutlass.const_expr(cfg.external_sparse_reduction):
             return
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.use_parallel_reduction):
