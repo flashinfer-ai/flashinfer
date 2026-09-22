@@ -738,6 +738,14 @@ class MsaSparseDecode:
 
 _COMPILED = {}
 _WS = {}          # scratch buffers (memory only, never carries results across calls)
+# Superseded scratch buffers, kept alive forever. A CUDA graph captured while an
+# older buffer was current still writes to THAT address on every replay, so
+# freeing it hands live graph memory back to the allocator: the next unrelated
+# tensor lands there and replay corrupts it. The fault then surfaces
+# asynchronously in whatever kernel runs next (observed: an illegal memory
+# access inside custom_all_reduce during vLLM's 17-size decode capture).
+# Growth is geometric, so the retained set stays within ~2x the largest buffer.
+_WS_RETIRED = []
 
 
 def _scratch(n, nc, d, device):
@@ -746,6 +754,9 @@ def _scratch(n, nc, d, device):
     key = (device, nc, d)
     buf = _WS.get(key)
     if buf is None or buf[0].shape[0] < n * nc * d:
+        if buf is not None:
+            _WS_RETIRED.append(buf)
+            n = max(n, 2 * (buf[0].shape[0] // (nc * d)))
         wo = torch.zeros((n * nc * d,), dtype=torch.float16, device=device)
         wl = torch.empty((n, nc), dtype=torch.float32, device=device)
         wm = torch.empty((n,), dtype=torch.float32, device=device)
