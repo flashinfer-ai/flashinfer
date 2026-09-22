@@ -446,16 +446,32 @@ def _neg_max_f32() -> Float32:
 
 @cute.jit
 def _masked_weighted_sum(terms: tuple) -> Float32:
-    """Return the sum of ``value * weight`` over ``(uses, value, weight)`` terms.
+    """Return the sum of ``value * weight`` over four ``(uses, value, weight)`` terms.
 
-    The terms are added in order and a term whose ``uses`` is false is skipped.
+    Two packed FMAs fold the terms: the first pair seeds the two lanes, the
+    second pair accumulates onto them, and the lanes are added last. A term
+    whose ``uses`` is false contributes zero, whatever its value holds. Every
+    caller evaluates the same term order, so lanes that share a row agree
+    bitwise.
     """
-    total = Float32(0.0)
-    for term_idx in cutlass.range_constexpr(len(terms)):
-        uses, value, weight = terms[term_idx]
-        if uses:
-            total += value * weight
-    return total
+    assert len(terms) == 4
+    (uses0, value0, weight0), (uses1, value1, weight1) = terms[0], terms[1]
+    (uses2, value2, weight2), (uses3, value3, weight3) = terms[2], terms[3]
+    masked0 = Float32(0.0)
+    masked1 = Float32(0.0)
+    masked2 = Float32(0.0)
+    masked3 = Float32(0.0)
+    if uses0:
+        masked0 = value0
+    if uses1:
+        masked1 = value1
+    if uses2:
+        masked2 = value2
+    if uses3:
+        masked3 = value3
+    lanes = ffma2((masked0, masked2), (weight0, weight2), (Float32(0.0), Float32(0.0)))
+    lanes = ffma2((masked1, masked3), (weight1, weight3), lanes)
+    return lanes[0] + lanes[1]
 
 
 def _softmax_tile_idx(
