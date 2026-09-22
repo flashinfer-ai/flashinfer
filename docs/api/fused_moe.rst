@@ -379,3 +379,18 @@ launch. Use :func:`has_monomoe` to check availability before calling.
     alloc_scratchpad
     interleave_for_tma_wgmma_up
     mono_moe
+
+cuDNN Grouped-GEMM MoE
+----------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    CudnnGroupedGemmBf16Config
+    CudnnGroupedGemmBf16Runner
+    CudnnGroupedGemmFp8PerTensorConfig
+    CudnnGroupedGemmFp8PerTensorRunner
+    CudnnGroupedGemmMxfp8Config
+    CudnnGroupedGemmMxfp8Runner
+    CudnnGroupedGemmNvfp4Config
+    CudnnGroupedGemmNvfp4Runner

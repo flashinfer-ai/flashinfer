@@ -32,6 +32,10 @@ from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeWarpDecodeConfig,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -67,6 +71,10 @@ from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -103,6 +111,10 @@ from .utils import map_to_hybrid_bucket
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -137,6 +149,10 @@ _RunnerT = Union[
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Config: CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorConfig: CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Config: CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Config: CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
     CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,

@@ -1,4 +1,4 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, and b12x MoE runners."""
+"""Apples-to-apples benchmarks for the unified MoE backends: CUTLASS, cuTile, b12x and cuDNN grouped GEMM."""
 
 from __future__ import annotations
 
@@ -18,8 +18,13 @@ from flashinfer.fused_moe import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
     CutlassFp8PerTensorConfig,
+    CutlassMxfp8Config,
     CutlassMxfp8Mxfp4Config,
     CutlassNvfp4Config,
     CutlassW4A16Config,
@@ -77,9 +82,11 @@ from .moe_utils import (
 _BACKEND_CONFIGS = {
     ("bf16", "cutlass"): CutlassBf16Config,
     ("bf16", "cutile"): CuTileBf16Config,
+    ("bf16", "cudnn"): CudnnGroupedGemmBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
     ("nvfp4", "b12x"): B12xNvfp4Config,
+    ("nvfp4", "cudnn"): CudnnGroupedGemmNvfp4Config,
     ("nvfp4_w4a16", "cutile"): CuTileNvfp4Bf16Config,
     ("nvfp4_w4a16", "b12x"): B12xW4A16Config,
     ("mxfp4", "cutile"): CuTileMxfp4Config,
@@ -87,12 +94,27 @@ _BACKEND_CONFIGS = {
     ("mxfp4_w4a16", "cutile"): CuTileMxfp4Bf16Config,
     ("fp8", "cutile"): CuTileFp8PerTensorConfig,
     ("fp8", "cutlass"): CutlassFp8PerTensorConfig,
+    ("fp8", "cudnn"): CudnnGroupedGemmFp8PerTensorConfig,
     ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
     ("mxfp8", "cutile"): CuTileMxfp8Config,
+    ("mxfp8", "cutlass"): CutlassMxfp8Config,
+    ("mxfp8", "cudnn"): CudnnGroupedGemmMxfp8Config,
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
 }
+
+# Backends consuming a pre-quantized activation pack built once, outside the
+# timed region, by their config's ``prepare_activations``. The other quantized
+# backends read BF16 and quantize in-kernel, or (CUTLASS FP8 / MXFP4 W4A8)
+# quantize inside the timed region through ``input_quantizer``.
+_PREQUANTIZED_ACTIVATIONS = (
+    CutlassNvfp4Config,
+    CutlassMxfp8Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
+)
 
 _ACTIVATIONS = {
     ActivationType.Swiglu: SwiGLU,
@@ -115,7 +137,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x"),
+        choices=("cutlass", "cutile", "b12x", "cudnn"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -296,7 +318,7 @@ def _prepare_weight_view(
         "activation": activation,
         "device": device,
     }
-    if quant_variant == "bf16" or backend == "cutlass":
+    if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
         return config_type.prepare_weights(w1, w2, **common)
 
     if quant_variant.startswith(("fp8", "mxfp8")):
@@ -571,14 +593,10 @@ def run_unified_moe_test(args):
         config = _config_for_backend(args, activation, backend_config)
         try:
             backend_activations = activations
-            if config_type is CutlassNvfp4Config:
-                # CUTLASS NVFP4 consumes the TRT-LLM canonical pre-quantized
-                # pack; b12x / cuTile NVFP4 quantize BF16 in-kernel. Inside the
-                # guard so an unaligned hidden_size skips this backend like any
-                # other unsupported configuration.
-                x_q, x_sf = CutlassNvfp4Config.prepare_activations(
-                    activations.hidden_states_q
-                )
+            if config_type in _PREQUANTIZED_ACTIVATIONS:
+                # Inside the guard so an unaligned hidden_size skips this
+                # backend like any other unsupported configuration.
+                x_q, x_sf = config_type.prepare_activations(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
                     hidden_states_q=x_q,
                     hidden_states_scale=x_sf,
@@ -678,9 +696,11 @@ def run_unified_moe_test(args):
             median_time,
             torch.bfloat16,
             weight_dtype,
-            # CUTLASS NVFP4 reads a pre-quantized FP4 + E4M3-scale pack; the
-            # other NVFP4 backends read BF16 and quantize in-kernel.
-            input_format="nvfp4" if config_type is CutlassNvfp4Config else None,
+            # Pre-quantized packs are read in their quantized format; the
+            # other backends read BF16.
+            input_format=(
+                weight_format if config_type in _PREQUANTIZED_ACTIVATIONS else None
+            ),
             weight_format=weight_format,
             routing_logits_dtype=None,
             active_experts=active_experts,
