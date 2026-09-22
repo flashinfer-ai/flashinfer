@@ -2586,16 +2586,6 @@ class TmemSResource(DecodeGenResourceBase):
         fragment_regs = cfg.softmax_score_fragment_regs
         # The seven-slot softmax metadata ABI carries exactly four token words.
         assert num_fragments == 4 and fragment_regs == 32
-        if cutlass.const_expr(not use_sparse):
-            # A dense tile has no route: no atoms, no validity flags, and
-            # all-ones token words.
-            sparse_origin0 = Int32(0)
-            sparse_origin1 = Int32(0)
-            sparse_route_flags = Int32(0)
-            sparse_token_word0 = Uint32(0xFFFFFFFF)
-            sparse_token_word1 = Uint32(0xFFFFFFFF)
-            sparse_token_word2 = Uint32(0xFFFFFFFF)
-            sparse_token_word3 = Uint32(0xFFFFFFFF)
         task_cache = _decode_gen_task_cache(stage_info)
         keep_words = cutlass.Array(
             Uint32, num_fragments, space=cutlass.AddressSpace.rmem
