@@ -219,6 +219,8 @@ requires its captured address and shape to remain stable.
 | [`fmha_decode_kernel.py`](fmha_decode_kernel.py) | TS kernel construction and launch |
 | [`fmha_decode_tasks.py`](fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
 | [`fmha_decode_resources/`](fmha_decode_resources/) | GMEM/SMEM/TMEM resources and pipeline state |
+| [`fmha_decode_resources/sage_scales.py`](fmha_decode_resources/sage_scales.py) | Sage scale addressing for the softmax and epilogue (flat layout, contiguous and block-sparse providers) |
+| [`../../sage.py`](../../sage.py) | `SageAttentionConfig`, `SageAttentionParams`, flat-layout helpers and host-side scale validation |
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
 
 ## Example
@@ -342,13 +344,202 @@ run-owned metadata and workspace storage at stable addresses, and pass a
 preallocated compact, 16-byte-aligned `out` tensor. A successful replan changes
 plan-owned length storage and requires graph recapture.
 
+## Sage attention
+
+The same kernel runs 8-bit Q/K/V with per-block dequantization scales
+("Sage attention") when planned through the contiguous
+`BlockSparseTSWrapper` with `sage_config=SageAttentionConfig(...)` and run with
+the
+scale tensors in `sage=SageAttentionParams(...)`. The user-facing
+contract (recipes, scale layouts, block-sparse summaries, examples) is in the
+[PrimTS guide](../../README.md#sage-attention-8-bit-qkv-with-dequantization-scales);
+this section records what the kernel does with the scales.
+
+### Gating
+
+`FmhaDecodeConfig.sage_k_block_size > 0` enables the feature
+(`use_sage_attention`); `sage_q_block_size` and `sage_v_mean` are only legal
+with it. The Sage rules live next to the rules they extend. `validate_dtypes`
+keeps Q == K for every recipe (`kv_dtype` is the K dtype) and, with Sage on,
+requires Q and K in `Float8E4M3FN` or `Int8`, `Float8E4M3FN` V and a 16-bit
+output; `Int8` K is legal only with Sage scales. `v_dtype` always holds a
+concrete type: `make_decode_config` sets it from `kv_dtype` when a caller
+leaves it out, and code that assigns `kv_dtype` assigns it as well.
+`validate_sage_profile` checks the rest of the recipe: `sage_k_block_size` in
+`SAGE_K_BLOCK_SIZES`, `sage_q_block_size` a power of two no larger than
+`tile_size_q`, contiguous K/V with `headdim == 128`, a two-instance Keeps
+profile (Q64/KV256 or Q128/KV128), and a nonsplit grid (static direct or the
+persistent scheduler): split-KV, the separate and cluster reductions, packed
+variable-length Q, sliding windows and attention sinks are all rejected;
+`validate_block_sparse_profile` keeps its matching-IO rule for block-sparse
+plans without Sage. The
+qualified Sage recipes are the `_SAGE_GROUPED_KEEPS_PROFILES` table beside
+the contiguous grouped-Keeps recipes, selected by `use_sage_attention`
+because the same E4M3 dtypes without scales name the static-only FP8
+profile. The block-sparse wrapper adds only what its compile key needs (Q and
+K share one dtype, 8-bit Q/K require `sage_config`, a 16-bit V matches K) and
+validates the per-run scale tensors; the recipe rules above live in the kernel
+configuration alone.
+
+Every Sage branch is a compile-time predicate on the configuration, so a
+16-bit kernel carries no Sage code. The softmax and correction mechanisms
+that do not depend on the element width are written once and shared by every
+dtype: the exponent addend formed once per row, the rolled masked max pass
+with a compile-time tail location, the seeded probability sum chains, the CLC
+response slots in the unified SMEM block and one correction store wait per O
+stage. The byte-wide-only policies (`prefetches_next_p_fragment`,
+`splits_kv_tile_256_tail_columns`, the four-stage KV256 ring) are measured
+performance choices gated on `use_8bit_qkv`, not dtype requirements.
+
+### Where the scales enter softmax
+
+Each softmax lane owns one Q row and streams its 128 score columns as four
+K32 fragments. Per tile the lane loads `sfQ[row]` once. Per fragment it loads
+the K scales covering its 32 columns: with `k_block_size >= 32` one scale,
+with `k_block_size == 16` two, giving `sage_k_groups_per_fragment`
+compile-time groups (the fragment is unrolled, so group boundaries cost no
+per-element work). With `c = sm_scale * log2(e)`:
+
+```text
+max pass:  gmax_g  = max(s in group g)              INT8: the biased FP32 scores, minus the bias per group
+           fragmax = max_g(gmax_g * sfK_g)          one packed FMUL per group pair
+           rowmax_true = rowmax * sfQ               once, after the last fragment
+exp pass:  p = EX2(FFMA(s, (c * sfQ) * sfK_g, -c * rowmax_true + log2(448)))
+           INT8: the bias leaves through the group's addend
+```
+
+The row sum, the correction factor `exp2(c * (m_old - m_new))`, the
+correction skip and LSE all operate on the dequantized maximum and are
+unchanged. Both passes use one algebra: the tile's raw `sfK` words per scale
+group, and the row's `sfQ` applied once per tile (to the tile maximum, to the
+`c * sfQ` factor of the exponent multipliers, and to the proxy tail shift).
+Where the `sfK` words live is a strategy object in `sage_scales.py`, shared
+by the S and P resources and the route metadata consumer of one softmax
+instance: `RegisterSageKScales` keeps the lane's words in a rotating register
+array that both passes read fragment by fragment without runtime indexing.
+The passes see only the strategy's `open`, `fragment` and `advance`. The
+sources are the same for both: the contiguous provider derives each
+fragment's first token from the tile offset and loads `sfK` from the softmax
+threads before the score wait (`load_lane_k_scales`); the block-sparse
+provider moves the loads off the softmax warps, the load warp resolving and
+staging the route's `sfK` words (`sage_k_scale_words` per route, ordered by
+consuming half and lane array) next to the route metadata from the route's
+K64 atom origins; a proxy route switches the K source to `k_summary_scale`
+indexed by summary position (`block_sparse_k_scale_source`). Tokens beyond
+the sequence end and Q rows beyond the valid count clamp to the last valid
+slot, so masked columns keep a finite scale and exponentiate to zero.
+
+The epilogue (`_store_final_o_columns`) multiplies each output column by
+`norm_scale * sfV[c]` and adds `v_mean[c]` when configured. Both vectors are
+per KV head: the correction warps copy them into SMEM once per tile while no
+output is pending (`stage_v_channel_scales`), and the epilogue reads its
+column range back with vector loads (`load_staged_v_channel_scales`, which
+returns a zero mean array without `sage_v_mean`, so the epilogue is one fused
+multiply-add). This is exact because `sfV` is constant along the PV
+reduction.
+
+### K/V ring depth
+
+The M64N256 profile stages one complete 256-row K or V tile per shared-ring
+slot, so the ring depth follows the element width
+(`KV_TILE_256_SHARED_FIFO_STAGES = 3`,
+`KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 4`). A 16-bit tile is 64 KiB:
+three stages occupy 192 KiB, and with the 16-KiB Q stage, the dedicated tail
+exchange and the metadata and barrier allocations the CTA sits at about
+227 KiB, the SM100 carveout. A byte-wide tile (E4M3 or Int8 K with E4M3 V) is
+32 KiB, so three stages leave about 111 KiB unused, and three is also too
+shallow: the ring alternates K and V tiles, a V slot stays held until its
+tile's PV has run, and with three slots the load of K(t+2) waits for that
+release, so the QK of tile t+2 sees the whole TMA latency. With four slots
+every K load takes the slot the previous QK freed and every V load the slot
+the previous PV freed. On B200 the block-sparse Sage kernels run about 7.5%
+faster with four stages than with three and gain nothing past four. The
+four-stage build demotes one pair of persistent scheduler words per warp role
+to an 8-byte stack (18 STL and 28 LDL per kernel, reloaded once per tile away
+from the softmax critical path); against a five-stage build, which keeps every
+role spill-free, four stages measure equal or faster on every byte-wide case
+(CUDA Graph replay minimum, three paired legs): dense S=10800 H=40 0.982, INT8
+proxy at the SOL shape 0.967, FP8 proxy 0.996, FP8 and INT8 exact within 0.3%,
+Q128 exact 0.995. The 32 KiB the shallower ring leaves free stay available
+for the small-block `sfK` buffers. An explicit `kv_stages` overrides the
+default in both directions.
+
+### INT32 scores
+
+`Int8` Q/K use the `INT8` tcgen05 kind with an `Int32` accumulator
+(`uses_int32_scores`). Over `D = 128` every dot product satisfies
+`|s| <= 128 * 127^2 < 2^21`, so the score is exact; input quantization is
+the only QK-side error. E4M3 Q/K use `F8F6F4` with FP32 accumulation. BMM2
+is `F8F6F4` on E4M3 P and V in both recipes.
+
+The softmax never converts INT32 scores. BMM1 accumulates onto the bit
+pattern of `INT32_SCORE_BIAS = 1.5 * 2^23`: every integer in `[2^23, 2^24)`
+is an FP32 number with unit spacing, so with `|s| <= 128 * 128 * 128 = 2^21`
+(INT8 magnitudes over `D = 128`) the final
+accumulator `bias + s` is exactly the FP32 number `12582912.0 + s`. The seed
+is written by one `kind::f16` MMA step over constant BF16 operands
+(one BF16 tile as both operands, every `K = 16` row `[1024, 1024, 1024, 0]`
+repeated, so the twelve products `2^20` sum to exactly `1.5 * 2^23`) issued
+right before the INT8 K steps
+(`_seed_score_bias` in `tmem_s.py`); the tensor core writes the slot at
+accumulator bandwidth and the INT8 steps accumulate onto it in tcgen05 issue
+order. Seeding the 64 KiB slot with `tcgen05.cp` or `tcgen05.st` costs several
+times more than the conversions the bias removes.
+
+The max pass reduces biased scores with FP32 maxima and subtracts the bias
+once per scale group (exact on the unit spacing; `-FLT_MAX` is unchanged by
+it), so masked tiles share the FP32 path: `-FLT_MAX` on masked lanes, the
+proxy tail shift applied in FP32. The P pass folds `-bias * c * sfQ * sfK_g`
+into each group's exponent addend with one FMA per group, so the per-element
+work is the same FFMA/EX2 stream as for FP32 scores; with the one-token K
+block, where every score is its own group, the P pass subtracts the bias from
+each score pair with one packed add instead (`sage_int32_bias_per_score`).
+Two roundings differ
+from converting every element, both below the INT8 quantization noise: the
+per-group addend is rounded once, to at most half an ulp of
+`bias * c * sfQ * sfK_g` (at most 0.75 quantized score units), and the proxy
+tail shift lands on the biased score's unit spacing (at most 0.5 quantized
+score units on that one lane).
+
+### Precision notes
+
+- P is E4M3 with the static scale `FP8_P_QUANT_SCALE = 448`, which represents
+  probabilities down to about 4.4e-6 with 3-bit relative precision. Row sums
+  are accumulated from the quantized P so the tail truncation cancels in
+  normalization.
+- `defers_softmax_anchor_updates` is off for every 8-bit profile: the 448
+  scale requires `p <= 1`, which a deferred anchor (lag up to `2^8`) would
+  violate, so FP8 P always anchors on the exact row maximum and pays the
+  TMEM rescale on every maximum increase. A `448 / 2^k` static scale would
+  buy anchor headroom at the cost of P range; the kernel does not make that
+  trade.
+- One quarter of the score pairs in a streamed fragment
+  (`KV_TILE_256_EX2_EMULATED_PAIRS = 4` of 16) evaluate `exp2` as an FMA
+  polynomial instead of MUFU. Its relative error moves about one to two
+  percent of the E4M3 probabilities to the neighbouring quantization step.
+  Dense rows of about a thousand tokens average this out (the dense fidelity
+  tests hold an absolute 2e-3), while a sparse row that attends to a few
+  hundred tokens
+  exposes up to about 1e-2, so the block-sparse fidelity bound is 2e-2. A
+  misaddressed scale moves the output by far more than either bound.
+- Proxy routes add the represented token mass to the logit in the max pass
+  (`log2(kv_block_size) / c` per proxy route; the ragged final summary shifts
+  its score by `(log2(tail_mass) - log2(kv_block_size)) / c`, divided by the
+  lane's group scale when Sage is on) and one route-uniform
+  `log2(kv_block_size)` to the exp-pass addend, so the denominator weight of a
+  proxy column is one and `p <= 1` holds for the 448 scaling. The 16-bit
+  proxy profiles follow the same mean-summary contract.
+
 ## Limitations
 
-- Only HND paged K/V is supported; contiguous K/V and NHD caches are outside
-  this API.
+- Only HND paged K/V is supported by the APIs above; contiguous BSHD K/V
+  (dense and block-sparse, including Sage attention) goes through
+  `BlockSparseTSWrapper`, and NHD caches are outside this API.
 - Attention sinks and custom masks are not exposed.
-- Q and K must share one dtype; the only mixed combination is
-  `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
+- Q and K must share one dtype. Two mixed K/V combinations exist:
+  `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V on the dense KV128
+  profiles, and the INT8 Sage recipe (INT8 Q/K with E4M3 V), which is only
+  reachable through `BlockSparseTSWrapper` and `block_sparse_attention`.
 - Effective K/V lengths must be positive and no greater than the static plan
   bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks
@@ -364,4 +555,13 @@ split-KV, and resource-safety coverage lives in:
 ```bash
 pytest -q tests/attention/test_attention_ts_decode.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
+```
+
+Sage attention fidelity (random 8-bit inputs and scales against an FP32
+reference that models the 448 P quantization) and recipe tests (the torch
+reference quantizer in `tests/attention/sage_quant_reference.py` against BF16
+attention) live in:
+
+```bash
+pytest -q tests/attention/test_attention_ts_sage.py
 ```
