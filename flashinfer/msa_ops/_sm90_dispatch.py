@@ -14,10 +14,11 @@ _BLK_KV = 128
 # The SM90 sparse-prefill union schedule is correct only while a sequence's
 # page list stays small: measured exact at max_pages_per_seq 64/320/560 and
 # WRONG at 1408/2344/3520 (~8% of elements outside tolerance -- it does not
-# fail, it silently mis-attends). The campaign dispatcher keyed on TOTAL
-# pages, which is why it routed these shapes into the bad path. 800 keeps
-# margin below the measured cliff.
-_MPG_MAX = 800
+# fail, it silently mis-attends). Above the bound the one-token-per-CTA
+# schedule is used instead: correct on all three, 1.70-1.98x over Triton.
+# The campaign dispatcher keyed on TOTAL pages, which is why it routed these
+# shapes into the bad path. 800 keeps margin below the measured cliff.
+_MPG_UNION_MAX = 800
 
 
 def _prefix_lens(cu_seqlens_q: torch.Tensor, seqused_k: torch.Tensor) -> torch.Tensor:
@@ -220,13 +221,10 @@ def sparse_prefill_sm90(
     v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """MSA sparse prefill attention on Hopper. Writes ``out``."""
-    mpg = int(page_table.shape[1])
-    if mpg > _MPG_MAX:
-        raise NotImplementedError(
-            f"SM90 sparse prefill is correct only for max_pages_per_seq <= {_MPG_MAX}, "
-            f"got {mpg}; the union schedule silently mis-attends above that"
-        )
-    from .cute_dsl.sparse_prefill_sm90 import run as _prefill
+    if int(page_table.shape[1]) > _MPG_UNION_MAX:
+        from .cute_dsl.sparse_prefill_single_sm90 import run as _prefill
+    else:
+        from .cute_dsl.sparse_prefill_sm90 import run as _prefill
 
     kv = _as_packed_kv(k, v)
     q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
