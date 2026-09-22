@@ -156,7 +156,7 @@ def prepared_metadata_fingerprint(fn):
 
 
 def make_backend(
-    name, fixture, splits, *, prepared=True, single_source=False, tuning_override=None
+    name, fixture, *, prepared=True, single_source=False, tuning_override=None
 ):
     q = fixture.query
     batch, queries, heads, _ = q.shape
@@ -366,7 +366,6 @@ def main():
     parser.add_argument("--dtype", choices=("fp8", "bf16"), default="fp8")
     parser.add_argument("--swa-page", type=int, default=256)
     parser.add_argument("--compressed-page", type=int, default=1)
-    parser.add_argument("--splits", type=int, default=1)
     parser.add_argument("--backends", default="ts-auto,trtllm-gen")
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--samples-per-replay", type=int, default=8)
@@ -597,7 +596,7 @@ def main():
         for name in backends:
             try:
                 fn, out, metadata = make_backend(
-                    name, fixture, args.splits, prepared=not args.include_preparation
+                    name, fixture, prepared=not args.include_preparation
                 )
                 torch.cuda.synchronize()
                 metrics = accuracy(out, expected, bound)

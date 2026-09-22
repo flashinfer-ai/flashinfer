@@ -71,7 +71,8 @@ def save(path, value):
 
 def provenance(args):
     prop = torch.cuda.get_device_properties(0)
-    assert prop.name == "NVIDIA GB300" and (prop.major, prop.minor) == (10, 3)
+    if (prop.major, prop.minor) not in ((10, 0), (10, 3)):
+        raise RuntimeError("native sparse MLA requires SM100/SM103")
     names = (
         subprocess.check_output(
             [
@@ -80,6 +81,7 @@ def provenance(args):
                 "--",
                 "flashinfer/attention/prims_ts",
                 "flashinfer/prims_ts",
+                "flashinfer/experimental/prims_ts_sparse_mla",
             ]
         )
         .decode()
@@ -202,7 +204,7 @@ def run_case(case, args, source):
     for name in args.backends.split(","):
         try:
             fn, out, metadata = make_backend(
-                name, fixture, 1, prepared=args.prepared, single_source=args.no_swa
+                name, fixture, prepared=args.prepared, single_source=args.no_swa
             )
             torch.cuda.synchronize()
             metrics = accuracy(out, expected, bound)

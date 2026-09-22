@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import torch
 
-_path = Path(__file__).resolve().parents[2] / "benchmarks/sparse_mla_fixtures.py"
+_path = Path(__file__).resolve().parents[3] / "benchmarks/sparse_mla_fixtures.py"
 _spec = importlib.util.spec_from_file_location("sparse_mla_fixtures", _path)
 _fixtures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fixtures)

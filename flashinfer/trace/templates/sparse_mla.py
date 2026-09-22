@@ -162,7 +162,7 @@ def sparse_mla_wrapper_trace_dispatch(**kwargs):
     )
 
 
-sparse_mla_wrapper_trace_dispatch.templates = [
+sparse_mla_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
     _template(
         dict(
             batch=2,
@@ -217,6 +217,6 @@ def sparse_mla_one_shot_trace_dispatch(**kwargs):
     )
 
 
-sparse_mla_one_shot_trace_dispatch.templates = (
-    sparse_mla_wrapper_trace_dispatch.templates
+sparse_mla_one_shot_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    sparse_mla_wrapper_trace_dispatch.templates  # type: ignore[attr-defined]
 )

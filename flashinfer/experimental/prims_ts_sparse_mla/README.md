@@ -5,6 +5,8 @@ attention on SM100/SM103 through the existing Prims-TS MLA kernel families.
 Q and KV have matching native BF16 or E4M3 types; output is BF16. Calling
 this API explicitly opts into experimental functionality. CuTe DSL 4.7 is
 required. There is no packed-FP8 cache conversion, projection, RoPE or indexer.
+Owner: @PerkzZheng; lifecycle and graduation are tracked in
+[issue #5432](https://github.com/flashinfer-ai/flashinfer/issues/5432).
 
 ## Interface
 
@@ -37,7 +39,8 @@ the sink. Empty rows return zero output and negative-infinity LSE. FP8 Q and
 KV descales are positive per-tensor scalars or live CUDA FP32 scalar tensors.
 Independent KV descales use two attention passes and a stable joint merge;
 shared scales use one pass. BF16 Q/KV descales must be one. Supply the model's
-`softmax_scale` explicitly when it differs from `512**-0.5`.
+`softmax_scale` explicitly when it differs from `512**-0.5`. Selected Q/KV
+values and effective scale products must be finite.
 
 ## Metadata and ownership
 

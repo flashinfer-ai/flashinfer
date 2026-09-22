@@ -39,8 +39,12 @@ def prepare_fixture(
         and not isinstance(swa_kv_scale, torch.Tensor)
         and extra_scale == swa_kv_scale
     )
-    key = (id(wrapper._impl._state), tuple(query.shape), shared)
-    cached = _buffers.setdefault(wrapper, {})
+    state = wrapper._impl._state
+    previous, cached = _buffers.get(wrapper, (None, {}))
+    if previous is not state:
+        cached = {}
+        _buffers[wrapper] = (state, cached)
+    key = (tuple(query.shape), shared)
     common = {
         k: kwargs[k]
         for k in ("softmax_scale", "q_scale", "output_scale", "sinks")
