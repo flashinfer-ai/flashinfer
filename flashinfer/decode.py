@@ -1301,6 +1301,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
 
+        # Same normalization as plan(): the native size query reads these host
+        # copies through raw data pointers.
+        indptr = indptr.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         indptr_host = indptr.to("cpu")
         last_page_len_host = last_page_len.to("cpu")
         if seq_lens is None:
@@ -1613,6 +1620,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         indptr = indptr.contiguous()
         indices = indices.contiguous()
         last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(last_page_len)
         if logits_soft_cap is None:

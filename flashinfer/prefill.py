@@ -2467,6 +2467,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
+        # Same normalization as plan(): the native size query reads these host
+        # copies through raw data pointers.
+        qo_indptr = qo_indptr.contiguous()
+        paged_kv_indptr = paged_kv_indptr.contiguous()
+        paged_kv_indices = paged_kv_indices.contiguous()
+        paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         batch_size = len(qo_indptr) - 1
         qo_indptr_host = qo_indptr.to("cpu")
         total_num_rows = int(qo_indptr_host[-1])
@@ -2754,6 +2763,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr = paged_kv_indptr.contiguous()
         paged_kv_indices = paged_kv_indices.contiguous()
         paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
