@@ -416,7 +416,7 @@ def _cudnn_mm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _tgv_gemm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -873,7 +873,7 @@ def _cutile_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _tgv_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2947,7 +2947,7 @@ def get_tgv_gemm_sm10x_module(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_blockscaled_tgv_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3095,8 +3095,8 @@ def tgv_gemm_sm100(
         - FP4 packs two values per byte, so its physical K dimension is ``K // 2``.
         - For block-scaled inputs, ``bias`` and the output must be BF16 or FP16 and share the same dtype.
     """
-    if not _match_sm_version(a.device, ["100", "103"]):
-        raise ValueError("TGV GEMM requires SM100, SM103 architecture")
+    if not _match_sm_version(a.device, ["100", "103", "107"]):
+        raise ValueError("TGV GEMM requires SM100, SM103, SM107 architecture")
 
     fp4_dtype = get_native_fp4_dtype()
     quantized_dtypes = (fp4_dtype, torch.float8_e4m3fn, torch.float8_e5m2)
@@ -5703,7 +5703,7 @@ def _trtllm_low_latency_gemm_fp8_requirement(**_):
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_blockscaled_gemm_fp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6183,7 +6183,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7394,7 +7394,7 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7564,7 +7564,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
         _, _, _, _, _, _, problem_mnkl, _, _ = prepared_inputs
         a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype, _ = dtypes
         _, n, _, _ = problem_mnkl
-        if sm_version not in (100, 103) or n > 8:
+        if sm_version not in (100, 103, 107) or n > 8:
             return []
         return autotune_tactics(
             problem_mnkl,
@@ -10501,7 +10501,7 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_group_gemm_fp8_nt_groupwise_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,

@@ -531,8 +531,10 @@ def _assert_fp8_groupwise_group_cute_dsl(
     group_counts, n, k, use_non_default_stream=False, use_out=False
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3)]:
-        pytest.skip("The contiguous grouped CuTe-DSL kernel requires SM100 or SM103")
+    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip(
+            "The contiguous grouped CuTe-DSL kernel requires SM100, SM103 or SM107"
+        )
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 
@@ -613,8 +615,8 @@ def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k, use_ou
 
 def _require_grouped_cute_dsl(device="cuda"):
     """Skip unsupported environments before importing the optional kernel."""
-    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3)]:
-        pytest.skip("Requires SM100 or SM103")
+    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip("Requires SM100, SM103 or SM107")
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 

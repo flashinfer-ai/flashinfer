@@ -31,8 +31,8 @@ def test_mm_fp8(
     if compute_capability[0] not in [10]:
         pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
     if backend == "cutedsl_low_latency":
-        if compute_capability[1] not in (0, 3):
-            pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103")
+        if compute_capability[1] not in (0, 3, 7):
+            pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103/SM107")
         if m > 8:
             pytest.skip("cutedsl_low_latency mm_fp8 requires M <= 8")
 
