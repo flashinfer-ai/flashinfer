@@ -67,6 +67,7 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
+    _copy_to_cpu,
     check_shape_dtype_device,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
@@ -1301,12 +1302,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
 
-        indptr_host = indptr.to("cpu")
-        last_page_len_host = last_page_len.to("cpu")
+        indptr_host, last_page_len_host, *seq_lens_host = _copy_to_cpu(
+            indptr,
+            last_page_len,
+            *((seq_lens,) if seq_lens is not None else ()),
+        )
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens_host[0]
         if q_len_per_req > 1:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1529,6 +1533,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
+        Planning reads indptr and length metadata on the CPU. Passing these
+        tensors on the CPU avoids device-to-host synchronization; page indices
+        may still reside on the GPU. GPU metadata is staged together before
+        host planning. ``non_blocking`` controls host-to-device transfers and
+        does not remove the wait for GPU-produced metadata.
+
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
 
         Optional arguments after ``page_size`` are accepted positionally for
@@ -1677,8 +1687,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.device, non_blocking=non_blocking
             )
 
-        indptr_host = indptr.to("cpu")
-        last_page_len_host = last_page_len.to("cpu")
+        indptr_host, last_page_len_host, *seq_lens_host = _copy_to_cpu(
+            indptr,
+            last_page_len,
+            *((seq_lens,) if seq_lens is not None else ()),
+        )
 
         if data_type is not None:
             if q_data_type is None:
@@ -1714,7 +1727,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens_host[0]
         if q_len_per_req > 1 and is_causal:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:

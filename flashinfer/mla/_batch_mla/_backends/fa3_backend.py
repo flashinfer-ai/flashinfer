@@ -73,6 +73,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAPagedAttentionFaBackendBase):
         output_dtype: torch.dtype,
         scale_mode: str,
         use_profiler: bool,
+        host_metadata: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         _validate_generated_fa_plan(
             backend="fa3",
@@ -111,6 +112,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAPagedAttentionFaBackendBase):
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
             use_profiler=use_profiler,
+            host_metadata=host_metadata,
         )
 
 

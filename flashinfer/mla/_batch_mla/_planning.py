@@ -7,10 +7,12 @@ you may not use this file except in compliance with the License.
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from functools import wraps
+from functools import cached_property, wraps
 from typing import Any, Callable, Iterator, Literal, Optional, TypeVar, cast
 
 import torch
+
+from ...utils import _copy_to_cpu
 
 from ._contracts import MLAPlanMetadata, MLAStructuralInputKind
 
@@ -24,6 +26,13 @@ class _CSRPlanMetadata:
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
     kv_len_arr: torch.Tensor
+
+    @cached_property
+    def host_metadata(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The resolver lives for one plan request. Reuse validation's host copy
+        # in the generated FA planner, without caching across metadata updates.
+        qo, kv, lengths = _copy_to_cpu(self.qo_indptr, self.kv_indptr, self.kv_len_arr)
+        return qo, kv, lengths
 
 
 @dataclass(frozen=True)
@@ -103,8 +112,15 @@ def _validate_csr_metadata(
     validated_kv_len_arr = _validate_metadata_tensor(
         "kv_len_arr", kv_len_arr, rank=1, device=device
     )
-    qo_values = _indptr_values("qo_indptr", validated_qo_indptr)
-    kv_values = _indptr_values("kv_indptr", validated_kv_indptr)
+    csr = _CSRPlanMetadata(
+        qo_indptr=validated_qo_indptr,
+        kv_indptr=validated_kv_indptr,
+        kv_indices=validated_kv_indices,
+        kv_len_arr=validated_kv_len_arr,
+    )
+    qo_host, kv_host, lengths_host = csr.host_metadata
+    qo_values = _indptr_values("qo_indptr", qo_host)
+    kv_values = _indptr_values("kv_indptr", kv_host)
     batch_size = qo_values.numel() - 1
     has_canonical_batch_shape = (
         kv_values.numel() == batch_size + 1
@@ -123,7 +139,7 @@ def _validate_csr_metadata(
             f"kv_indices metadata has {validated_kv_indices.numel()} entries but "
             f"kv_indptr[-1] is {kv_end}."
         )
-    kv_lens_values = validated_kv_len_arr.to(device="cpu", dtype=torch.int64)
+    kv_lens_values = lengths_host.to(dtype=torch.int64)
     if bool(torch.any(kv_lens_values < 0).item()):
         raise ValueError("kv_len_arr metadata must be nonnegative.")
     if strict or has_canonical_batch_shape:
@@ -138,12 +154,7 @@ def _validate_csr_metadata(
                 "CSR metadata page counts in kv_indptr must equal ceil(kv_len_arr / "
                 "page_size)."
             )
-    return _CSRPlanMetadata(
-        qo_indptr=validated_qo_indptr,
-        kv_indptr=validated_kv_indptr,
-        kv_indices=validated_kv_indices,
-        kv_len_arr=validated_kv_len_arr,
-    )
+    return csr
 
 
 def _validate_dense_metadata(
@@ -265,7 +276,8 @@ def _derive_dense_from_csr(
     *,
     table_width_alignment: Optional[int],
 ) -> _DensePlanMetadata:
-    kv_indptr_host = csr.kv_indptr.to(device="cpu", dtype=torch.int64)
+    qo_host, kv_host, _ = csr.host_metadata
+    kv_indptr_host = kv_host.to(dtype=torch.int64)
     page_counts = kv_indptr_host[1:] - kv_indptr_host[:-1]
     max_pages = int(page_counts.max().item()) if page_counts.numel() else 0
     if table_width_alignment is None:
@@ -291,7 +303,7 @@ def _derive_dense_from_csr(
         cum_seq_lens_q=csr.qo_indptr,
         block_tables=block_tables,
         seq_lens=csr.kv_len_arr,
-        max_q_len=_max_q_len(csr.qo_indptr),
+        max_q_len=_max_q_len(qo_host),
     )
 
 

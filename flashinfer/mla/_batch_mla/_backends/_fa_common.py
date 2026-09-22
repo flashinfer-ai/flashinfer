@@ -12,7 +12,12 @@ from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union
 import torch
 
 from ....jit import gen_batch_mla_module
-from ....utils import MaskMode, check_shape_dtype_device, get_compute_capability
+from ....utils import (
+    MaskMode,
+    _copy_to_cpu,
+    check_shape_dtype_device,
+    get_compute_capability,
+)
 from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 
@@ -295,14 +300,17 @@ class _BatchMLAGeneratedFaMechanics:
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
         use_profiler: bool,
+        host_metadata: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         # ---------------------------------------------------------------------------
         # Build the generated backend plan
         # ---------------------------------------------------------------------------
         cached_module = module_loader()
-        qo_indptr_host = qo_indptr.to("cpu")
-        kv_indptr_host = kv_indptr.to("cpu")
-        kv_len_arr_host = kv_len_arr.to("cpu")
+        qo_indptr_host, kv_indptr_host, kv_len_arr_host = (
+            host_metadata
+            if host_metadata is not None
+            else _copy_to_cpu(qo_indptr, kv_indptr, kv_len_arr)
+        )
         plan_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -550,6 +558,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         output_dtype: torch.dtype,
         scale_mode: str,
         use_profiler: bool,
+        host_metadata: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         raise NotImplementedError
 
@@ -596,6 +605,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             output_dtype=args.output_dtype,
             scale_mode=args.scale_mode,
             use_profiler=args.use_profiler,
+            host_metadata=csr.host_metadata,
         )
         return backend
 
