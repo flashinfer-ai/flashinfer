@@ -132,3 +132,16 @@ attention reductions, finishing and counter resets remain timed. Backend order
 alternates between replays. `--include-preparation` explicitly measures external
 preparation plus attention; `--no-swa` exercises a single source. The TRT DSV4
 ABI requires an invalid 128-entry first segment for that comparison.
+
+Post-rebase GB300 validation (CUDA 13.0, DSL 4.7.0): 293 focused tests,
+31 cleanup rechecks, 38 upstream dense tests and 794 trace checks passed
+(one trace skip); two memcheck cases reported zero errors. Twelve dense
+pairs against upstream main produced bitwise-identical outputs, with a
+worst latency change of +0.17%. Nineteen selected model-suite cases remained
+within 5% of TRT-LLM (worst slowdown 3.76%); the full 480-case suite was not
+rerun for this cleanup. Example paired attention latencies:
+
+| Dtype | B / SQ / H / top-k | Prims-TS µs | TRT-LLM µs |
+|---|---|---|---|
+| BF16 | 64 / 8 / 32 / 2048 | 249.664 | 241.984 |
+| E4M3 | 256 / 8 / 128 / 2048 | 531.424 | 526.912 |
