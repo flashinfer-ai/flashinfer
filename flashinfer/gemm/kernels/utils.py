@@ -246,7 +246,8 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
 # kernel runs on Rubin (sm_100f family target) and gemm_base.get_valid_tactics
 # enumerates sm100 tactics alongside sm107 ones there, so both are reachable.
 # The autotuner picks from both: over 110 tuned fp4_gemm shapes on DeepSeek-R1
-# nvfp4 tp4 (VR200) its winners split sm100 29 / sm107 1 at M<=32, sm100 16 /
+# nvfp4 tp4 (Vera Rubin NVL72) its winners split sm100 29 / sm107 1 at M<=32,
+# sm100 16 /
 # sm107 4 at M 33-512, and sm107 41 / sm100 19 above that -- narrow sm100 tiles
 # win decode, wide sm107 tiles win prefill.
 #
