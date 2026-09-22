@@ -188,6 +188,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     ws._symmetric_base = ws.shared_workspace.data_ptr()
     ws._peer_offsets = (0,)
     ws._compiled = lambda **kwargs: ws.output_activation.fill_(3)
+    # The dummy kernel does not use peer mapping, which imports Rubin-only code.
+    ws._peer_mapper = lambda: None
     weights = preprocess_block_scaled_weights(
         torch.randn(4, 128, 128, device="cuda").bfloat16(),
         torch.randn(4, 128, 64, device="cuda").bfloat16(),
