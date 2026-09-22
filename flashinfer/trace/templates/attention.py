@@ -4193,6 +4193,9 @@ def _trtllm_batch_decode_mla_reference(
     cache is [ckv ‖ kpe]. Dense calls return the K_nope-projected
     attention as ``[batch, q_len, num_heads, kv_lora_rank]``; ragged
     calls return ``[num_tokens, num_heads, kv_lora_rank]``.
+
+    This reference models only the attention output, not optional LSE output.
+    ``return_lse_base`` is accepted in kwargs and does not affect it.
     """
     cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
     if cum_seq_lens_q is None:
@@ -4267,7 +4270,11 @@ def _trtllm_batch_decode_mla_sparse_reference(
     sparse_mla_top_k,
     **kwargs,
 ):
-    """Reference for sparse top-k page MLA decode."""
+    """Reference for sparse top-k page MLA decode.
+
+    This reference models only the attention output, not optional LSE output.
+    ``return_lse_base`` is accepted in kwargs and does not affect it.
+    """
     del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k
     batch_size, q_len, num_heads, head_dim_qk = query.shape
     assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
@@ -4511,7 +4518,9 @@ trtllm_batch_decode_mla_dense_trace = TraceTemplate(
         "Q_pe] with head_dim_qk = kv_lora_rank + qk_rope_head_dim; KV cache "
         "is [ckv ‖ kpe]. Dense API calls pass "
         "[batch_size, q_len_per_request, num_heads, head_dim_qk] and return "
-        "[batch_size, q_len_per_request, num_heads, kv_lora_rank]."
+        "[batch_size, q_len_per_request, num_heads, kv_lora_rank]. "
+        "The trace and reference currently model only the attention output, "
+        "not the optional LSE output."
     ),
     axes={
         "batch_size": Var(),
@@ -4569,6 +4578,15 @@ trtllm_batch_decode_mla_dense_trace = TraceTemplate(
             optional=True,
             description="Scale applied after softmax @ V.",
         ),
+        "return_lse_base": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None "
+                "preserves the backend's historical default. "
+                "Does not affect attention output."
+            ),
+        ),
         "skip_softmax_threshold_scale_factor": Scalar(
             "float32",
             optional=True,
@@ -4595,7 +4613,8 @@ trtllm_batch_decode_mla_ragged_trace = TraceTemplate(
         "SM100+ TRT-LLM MLA paged decode for variable query lengths. Query is "
         "concatenated [Q_nope, Q_pe] in flattened "
         "[num_tokens, num_heads, head_dim_qk] form with cum_seq_lens_q. Output "
-        "dim equals kv_lora_rank."
+        "dim equals kv_lora_rank. The trace and reference currently model "
+        "only the attention output, not the optional LSE output."
     ),
     axes={
         "batch_size": Var(),
@@ -4664,6 +4683,15 @@ trtllm_batch_decode_mla_ragged_trace = TraceTemplate(
             optional=True,
             description="Maximum query sequence length when cum_seq_lens_q is provided.",
         ),
+        "return_lse_base": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None "
+                "preserves the backend's historical default. "
+                "Does not affect attention output."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(
@@ -4686,7 +4714,8 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
         "selection (DSV3.2 / GLM-5). Selected when sparse_mla_top_k > 0. "
         "block_tables is a sparse top-k page index of shape [num_seqs, "
         "q_len_per_request, sparse_mla_top_k] rather than the dense "
-        "[batch_size, max_pages_per_seq] layout."
+        "[batch_size, max_pages_per_seq] layout. The trace and reference "
+        "currently model only the attention output, not the optional LSE output."
     ),
     axes={
         "batch_size": Var(),
@@ -4755,6 +4784,15 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
             description=(
                 "Threshold for skip-softmax sparsity (kernel rejects this "
                 "kwarg when sparse_mla_top_k>0; documented for completeness)."
+            ),
+        ),
+        "return_lse_base": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None "
+                "preserves the backend's historical default. "
+                "Does not affect attention output."
             ),
         ),
     },
@@ -5023,6 +5061,17 @@ _CUDNN_PAGED_AXES: dict[str, Var | Const] = {
     "page_size": Const(abbrev="ps"),
 }
 
+# Decode-only: q / output carry batch_size * q_len_per_req rows (one request's
+# rows consecutive), while block_tables and the per-request lengths keep
+# batch_size rows. Kept out of _CUDNN_PAGED_AXES because prefill uses that map
+# with num_tokens.
+_CUDNN_PAGED_DECODE_AXES: dict[str, Var | Const] = {
+    **_CUDNN_PAGED_AXES,
+    "num_q_rows": Var(
+        description="q.shape[0] = batch_size * q_len_per_req (batch_size for one-token decode)."
+    ),
+}
+
 
 @torch.no_grad()
 def _cudnn_batch_decode_reference(
@@ -5033,8 +5082,19 @@ def _cudnn_batch_decode_reference(
     K/V layout: [total_num_pages, num_heads_kv, page_size, head_dim] (HND).
     block_tables: [batch_size, num_pages_per_seq] gathers per-sequence pages.
     actual_seq_lens_kv (optional) gives the true length of each sequence.
+    q has batch_size * q_len_per_req rows (consecutive rows per request);
+    with q_len_per_req > 1 row i of a request sees keys 0 .. kv_len -
+    q_len_per_req + i (bottom-right causal). window_left >= 0 keeps only the
+    window_left keys before that diagonal position plus the position itself.
+    sinks[h] joins the softmax denominator as one extra logit with a zero
+    value row.
     """
-    batch_size, num_heads_qo, head_dim = q.shape
+    q_len = int(kwargs.get("q_len_per_req") or 1)
+    window_left = kwargs.get("window_left")
+    window_left = -1 if window_left is None else int(window_left)
+    sinks = kwargs.get("sinks")
+    rows, num_heads_qo, head_dim = q.shape
+    batch_size = rows // q_len
     _, num_heads_kv, page_size, _ = k_cache.shape
     gqa_ratio = num_heads_qo // num_heads_kv
     block_tables = kwargs.get("block_tables")
@@ -5062,13 +5122,21 @@ def _cudnn_batch_decode_reference(
             .permute(1, 0, 2, 3)
             .reshape(num_heads_kv, -1, head_dim)[:, :kv_len]
         )
-        for h in range(num_heads_qo):
-            kv_h = h // gqa_ratio
-            logits = torch.matmul(
-                q[b, h].to(torch.float32), k_b[kv_h].to(torch.float32).T
-            ) * float(scale)
-            attn = torch.softmax(logits, dim=-1)
-            output[b, h] = torch.matmul(attn, v_b[kv_h].to(torch.float32))
+        for i in range(q_len):
+            r = b * q_len + i
+            hi = kv_len - q_len + i + 1  # keys 0 .. hi-1 are visible
+            lo = max(0, hi - 1 - window_left) if window_left >= 0 else 0
+            for h in range(num_heads_qo):
+                kv_h = h // gqa_ratio
+                logits = torch.matmul(
+                    q[r, h].to(torch.float32), k_b[kv_h][lo:hi].to(torch.float32).T
+                ) * float(scale)
+                if sinks is not None:
+                    logits = torch.cat([logits, sinks[h].to(torch.float32).reshape(1)])
+                attn = torch.softmax(logits, dim=-1)
+                if sinks is not None:
+                    attn = attn[:-1]
+                output[r, h] = torch.matmul(attn, v_b[kv_h][lo:hi].to(torch.float32))
     return output.to(q.dtype)
 
 
@@ -5150,11 +5218,12 @@ cudnn_batch_decode_trace = TraceTemplate(
     description=(
         "Standalone cuDNN paged decode. Separate k_cache/v_cache "
         "[total_num_pages, Hkv, page_size, D], rectangular block_tables, "
-        "single sm_scale. No plan() — block_tables passed at call time."
+        "single sm_scale. No plan() — block_tables passed at call time. "
+        "q has num_q_rows = batch_size * q_len_per_req rows."
     ),
-    axes=_CUDNN_PAGED_AXES,
+    axes=_CUDNN_PAGED_DECODE_AXES,
     inputs={
-        "q": Tensor(["batch_size", "num_heads_qo", "head_dim"]),
+        "q": Tensor(["num_q_rows", "num_heads_qo", "head_dim"]),
         "k_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
         "v_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
         "scale": Scalar("float32", description="Softmax scale, typically 1/sqrt(d)."),
@@ -5167,9 +5236,28 @@ cudnn_batch_decode_trace = TraceTemplate(
             optional=True,
             description="Per-sequence page-id mapping.",
         ),
+        "q_len_per_req": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "Query rows per request; q then has batch_size * q_len_per_req "
+                "rows and > 1 applies the bottom-right causal diagonal."
+            ),
+        ),
+        "window_left": Scalar(
+            "int32",
+            optional=True,
+            description="Sliding-window keys before the diagonal position; -1 = none.",
+        ),
+        "sinks": Tensor(
+            ["num_heads_qo"],
+            dtype="float32",
+            optional=True,
+            description="Per-head attention sink logits (one extra softmax column).",
+        ),
     },
     outputs={
-        "output": Tensor(["batch_size", "num_heads_qo", "head_dim"], dtype_from="q"),
+        "output": Tensor(["num_q_rows", "num_heads_qo", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "stage:decode", "backend:cudnn"],
     reference=_cudnn_batch_decode_reference,

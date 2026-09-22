@@ -102,7 +102,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import (
+        from ......kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_bf16_mxfp8_mega_moe,
         )
 
@@ -142,7 +142,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         del quantize_input
-        from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
         stage_mega_moe_inputs(
             t.hidden_states,
@@ -161,7 +161,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import (
+        from ......kernel_src.sm100.cutedsl_megamoe import (
             autotune_bf16_mxfp8_mega_moe,
             bf16_mxfp8_mega_moe,
             staged_tokens,
@@ -236,7 +236,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

@@ -1402,6 +1402,46 @@ class TestMoERunnerSupport:
         runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
         assert runner.check_support() is None
 
+    @pytest.mark.parametrize(
+        ("runner_cls", "quant"),
+        (
+            (
+                TrtllmFp4RoutedRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP4,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP8,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            (
+                CuteDslRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP4,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+        ),
+    )
+    def test_swizzled_scale_factors_rejected_outside_cutlass_mxfp8(
+        self, runner_cls, quant
+    ):
+        """The flat swizzled input_sf is a CUTLASS MXFP8 opt-in; every other
+        candidate for the pair must refuse it in check_support rather than
+        fail at pack_inputs with a shape error."""
+        runner = runner_cls.__new__(runner_cls)
+        runner.config = self._nvfp4_swiglu(quant=quant)
+        with pytest.raises(NotImplementedError, match="swizzled_scale_factors=True"):
+            runner.check_support()
+
     def test_trtllm_rejects_unclamped_situ_linear_branch(self):
         # The TRT-LLM per-expert gemm1_beta tensor cannot encode "no clamp",
         # so the mode CuTe-DSL accepts must be rejected here rather than

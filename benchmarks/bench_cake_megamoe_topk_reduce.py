@@ -7,7 +7,7 @@ kernel and not a claimed historical FlashInfer performance baseline.
 
 ``--baseline vendored-cutedsl-matched`` (the default) selects the exact vendored
 implementation at
-``flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
+``flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
 Both kernels process the same live ``T x 6 x 4096`` elements in this primary
 comparison. ``--baseline vendored-cutedsl-fixed-capacity`` separately measures
 the serving scenario where the old reducer processes a prefill-sized ``C=4096``
@@ -54,9 +54,7 @@ _GRID_CTAS_PER_TOKEN = 4
 _LEGACY_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
-_CUTEDSL_SOURCE = (
-    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
-)
+_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
 _CUTEDSL_SOURCE_SHA256 = (
     "d7d1fc2361c30dcd8a37269edda27e75953dadf396014e47a3c3cbd7a2551184"
 )
@@ -145,7 +143,7 @@ def _make_vendored_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim._paths import (
+        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim._paths import (
             bootstrap_paths,
         )
 

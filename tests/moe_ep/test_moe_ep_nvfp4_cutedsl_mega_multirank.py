@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
+``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -32,9 +32,9 @@ import os
 import pytest
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -80,7 +80,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         make_dummy_epilogue_params,
     )
 
@@ -220,7 +220,7 @@ def _reference_nvfp4_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -243,6 +243,8 @@ def _reference_nvfp4_mega_moe_staged(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        swiglu_alpha=problem.get("swiglu_alpha"),
+        swiglu_beta=problem.get("swiglu_beta"),
         combine_dtype=combine_dtype,
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -290,7 +292,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -380,6 +382,8 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
         top_k=problem["topk"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
+        swiglu_alpha=problem.get("swiglu_alpha"),
+        swiglu_beta=problem.get("swiglu_beta"),
     )
     if epilogue_via_config:
         kwargs.update(
@@ -401,6 +405,8 @@ def _run_mega_layer(
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     import torch
     import torch.distributed as dist
@@ -428,6 +434,7 @@ def _run_mega_layer(
     problem = _mega_problem(
         rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
     )
+    problem.update(swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta)
     config_extra = dict(
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
@@ -445,7 +452,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
                 get_symm_buffer_for_mega_moe,
             )
 
@@ -739,7 +746,7 @@ def _run_mega_layer_zero_token_ikr_regression(
     occupancy, never from num_tokens), so the same fix -- fall through to the
     same full-buffer frontend.run() call every nonzero num_tokens already
     takes -- applies unchanged. See
-    kernel_src/cutedsl_megamoe/shim/nvfp4.py::nvfp4_mega_moe.
+    kernel_src/sm100/cutedsl_megamoe/shim/nvfp4.py::nvfp4_mega_moe.
 
     Shapes/scale intentionally match the real repro (hidden=2048,
     intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384),
@@ -964,6 +971,8 @@ def _run_mega_torch_oracle(
     *,
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
@@ -1006,7 +1015,7 @@ def _run_mega_torch_oracle(
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -1020,6 +1029,10 @@ def _run_mega_torch_oracle(
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
     num_local = problem["num_experts"] // world_size
+    if swiglu_alpha is not None:
+        problem["hidden_states"].mul_(0.1)
+        problem["w13"].mul_(0.1)
+        problem["gate_up_clamp"] = 0.5
     # Identity epilogue scalars: the torch oracle has no alpha/norm-const legs.
     (
         problem["fc1_alpha"],
@@ -1058,6 +1071,8 @@ def _run_mega_torch_oracle(
             rank,
             world_size,
             gate_up_clamp=problem["gate_up_clamp"],
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_dtype=combine_dtype,
             fc1_alpha=problem["fc1_alpha"],
@@ -1116,7 +1131,7 @@ def _run_mega_torch_oracle(
             # combine encoder + topk_reduce do.
             term_transform = None
             if combine_dtype != "bf16":
-                from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
                     CombineFormat,
                     combine_roundtrip_to_fp32,
                 )
@@ -1141,6 +1156,8 @@ def _run_mega_torch_oracle(
                 intermediate=problem["intermediate"],
                 gate_up_clamp=problem["gate_up_clamp"],
                 term_transform=term_transform,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
             )
 
             assert torch.isfinite(y_kernel).all()
@@ -1351,7 +1368,7 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         MegaMoENvfp4Config,
     )
 
@@ -1388,7 +1405,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
 
 
 def test_tuner_is_valid_quantized_combine_rules():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
 
     # quantized combine excludes the in-kernel REDG reduce ...
     assert not tuner.is_valid(
@@ -1411,7 +1428,7 @@ def test_tuner_is_valid_quantized_combine_rules():
 
 
 def test_autotune_nvfp4_candidates_cover_ikr():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         nvfp4_candidates,
     )
 
@@ -1434,3 +1451,20 @@ def test_autotune_nvfp4_candidates_cover_ikr():
     pinned = nvfp4_candidates()
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
     assert len(pinned) * 2 == len(cands)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("check", ["layer", "torch-oracle"])
+def test_nvfp4_minimax_multirank(check):
+    """MiniMax activation through the public layer and real EP vs torch math."""
+    _require_cuda()
+    pytest.importorskip("triton")
+    rank, world_size = _launcher_ranks()
+    if world_size < 2:
+        pytest.skip("needs >=2 ranks")
+    kwargs = dict(swiglu_alpha=1.702, swiglu_beta=1.0)
+    if check == "layer":
+        _run_mega_layer(rank, world_size, quantize_input=True, **kwargs)
+    else:
+        _run_mega_torch_oracle(rank, world_size, **kwargs)
