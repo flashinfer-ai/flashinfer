@@ -71,8 +71,10 @@ bounds the workspace for any plan; the runner's `main_kwargs` /
 Limits of the current route: head dimension 512 with shared K/V rows (MQA),
 page size 64, the same number of query tokens per request across the batch,
 causal masking inside the
-query block, optional sinks, SM100 (B200) and SM103 (B300) only (SM120/SM121
-lack the block-scaled tensor-core path). At most 64 KV splits per request.
+query block, optional sinks, at least 128 packed query rows per batch
+(`batch * q_len * num_heads >= 128`, the kernel's query tile), SM100 (B200)
+and SM103 (B300) only (SM120/SM121 lack the block-scaled tensor-core path).
+At most 64 KV splits per request.
 
 See `tests/experimental/test_cake_nvfp4_mla_decode.py` for the torch
 reference and validated shape set and `benchmarks/bench_cake_nvfp4_mla_decode.py`

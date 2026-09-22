@@ -210,7 +210,7 @@ def test_rejects_unknown_backend():
 
 
 def test_rejects_host_tensors_and_bad_shapes():
-    inputs = make_inputs([64, 100], 2, q_len=6, enable_sink=False, device="cpu")
+    inputs = make_inputs([64, 100], 16, q_len=6, enable_sink=False, device="cpu")
     workspace = torch.empty(1 << 20, dtype=torch.uint8)
     with pytest.raises(ValueError, match="CUDA"):
         prepare_nvfp4_batch_decode_with_kv_cache_mla(
@@ -251,7 +251,7 @@ def test_rejects_host_tensors_and_bad_shapes():
 @pytest.mark.parametrize("q_len", [1, 6])
 def test_q_len_is_derived_from_query_rows(q_len):
     inputs = make_inputs(
-        [64, 100, 130], 4, q_len=q_len, enable_sink=False, device="cpu"
+        [64, 100, 130], 64, q_len=q_len, enable_sink=False, device="cpu"
     )
     batch, num_heads, num_pages, got = cake_backend.validate_nvfp4_mla_decode_inputs(
         inputs["query"],
@@ -263,10 +263,27 @@ def test_q_len_is_derived_from_query_rows(q_len):
     )
     assert (batch, num_heads, num_pages, got) == (
         3,
-        4,
+        64,
         inputs["kv_cache"].shape[0],
         q_len,
     )
+
+
+@pytest.mark.parametrize("kv_lens,num_heads,q_len", [([512, 300], 8, 6), ([64], 64, 1)])
+def test_rejects_fewer_than_128_query_rows(kv_lens, num_heads, q_len):
+    inputs = make_inputs(
+        kv_lens, num_heads, q_len=q_len, enable_sink=False, device="cpu"
+    )
+    assert len(kv_lens) * q_len * num_heads < ROWS_PER_TILE
+    with pytest.raises(ValueError, match="must be >= 128"):
+        cake_backend.validate_nvfp4_mla_decode_inputs(
+            inputs["query"],
+            inputs["query_scale"],
+            inputs["kv_cache"],
+            inputs["kv_scale"],
+            inputs["block_tables"],
+            inputs["seq_lens"],
+        )
 
 
 # Expected values computed once from the source host plan module for the same
@@ -710,7 +727,7 @@ def test_rejects_unsupported_compute_capability():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() in SUPPORTED_COMPUTE_CAPABILITIES:
         pytest.skip("device is supported; nothing to reject")
-    inputs = make_inputs([64], 2, q_len=1, enable_sink=False, device="cuda")
+    inputs = make_inputs([64], 128, q_len=1, enable_sink=False, device="cuda")
     workspace = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="compute capability"):
         prepare_nvfp4_batch_decode_with_kv_cache_mla(
@@ -811,10 +828,12 @@ def test_public_api_returns_out_without_lse():
     if reason:
         pytest.skip(reason)
     kv_lens = [512, 300]
-    inputs = make_inputs(kv_lens, 8, q_len=DSV4_Q_LEN, enable_sink=False, device="cuda")
+    inputs = make_inputs(
+        kv_lens, 16, q_len=DSV4_Q_LEN, enable_sink=False, device="cuda"
+    )
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     workspace = torch.empty(
-        nvfp4_mla_decode_workspace_size(kv_lens, 8, num_sms=num_sms, q_len=DSV4_Q_LEN),
+        nvfp4_mla_decode_workspace_size(kv_lens, 16, num_sms=num_sms, q_len=DSV4_Q_LEN),
         dtype=torch.uint8,
         device="cuda",
     )
@@ -832,7 +851,7 @@ def test_public_api_returns_out_without_lse():
     out = decode()
     assert isinstance(out, torch.Tensor) and out.shape == (
         len(kv_lens) * DSV4_Q_LEN,
-        8,
+        16,
         HEAD_DIM,
     )
     torch.cuda.synchronize()

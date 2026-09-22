@@ -613,6 +613,12 @@ def validate_nvfp4_mla_decode_inputs(
             "query rows must be batch * q_len with the same number of query tokens per request"
         )
     q_len = total_q // batch
+    if total_q * num_heads < ROWS_PER_TILE:
+        raise ValueError(
+            "the decode kernel loads query rows in tiles of "
+            f"{ROWS_PER_TILE}: batch * q_len * num_heads must be >= {ROWS_PER_TILE} "
+            f"(got {total_q * num_heads})"
+        )
     if seq_lens.shape != (batch,) or seq_lens.dtype != torch.int32:
         raise ValueError("seq_lens must be an int32 [batch] tensor")
     if kv_cache.ndim != 3 or tuple(kv_cache.shape[1:]) != (PAGE_SIZE, ROW_BYTES):

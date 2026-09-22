@@ -4379,7 +4379,8 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     pages, both stored as packed E2M1 bytes (256 per row) with UE4M3
     block-16 scales (32 per row), with a causal mask inside each request's
     query block, optional per-head attention sinks, BF16 output and
-    natural-log FP32 LSE. It requires compute capability 10.0 or 10.3.
+    natural-log FP32 LSE. It requires compute capability 10.0 or 10.3 and at
+    least 128 packed query rows per batch (``batch * q_len * num_heads``).
 
     Preparation validates inputs, builds the host work plan from the
     sequence lengths (one device-to-host copy unless ``seq_lens_cpu`` is
