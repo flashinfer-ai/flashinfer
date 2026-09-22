@@ -2558,6 +2558,11 @@ class TmemSResource(DecodeGenResourceBase):
         tail_lane: Constexpr[int] = 0
         shifts_tail: Constexpr[bool] = False
         route_is_proxy = cutlass.Boolean(False)
+        # A mixed plan quantizes proxy summaries with another K block size
+        # than tokens, so exact and proxy tiles carry different numbers of
+        # ``sfK`` groups per fragment and read different scale resources. The
+        # pass then selects the geometry per tile on the CTA-uniform route
+        # kind; a dense plan or one with equal block sizes has one geometry.
         mixed_scales: Constexpr[bool] = use_sparse and cfg.sage_mixed_k_geometry
         # The unmasked pass below carries the exact geometry alone: a mixed
         # plan's proxy tiles take the rolled masked pass, and on every other

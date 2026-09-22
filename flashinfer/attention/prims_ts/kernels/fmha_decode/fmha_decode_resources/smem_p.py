@@ -495,6 +495,9 @@ class SmemPResource(DecodeGenResourceBase):
             and summary_dequantized
             and not exact_scales_in_smem
         )
+        # Exact and proxy tiles read different ``sfK`` resources when the
+        # summary K block size differs from the token one, unless the exact
+        # register resource serves both through ``unified_scales``.
         mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry and not unified_scales
         exp_scale = None
         scales_view = None

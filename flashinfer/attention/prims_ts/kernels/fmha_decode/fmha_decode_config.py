@@ -220,6 +220,12 @@ def _dtype_bytes(dtype: type) -> int:
 # ``(Q, K/V, O)`` dtype recipes of the Q64/KV256 profile without Sage
 # attention: 16-bit profiles keep one dtype throughout, and FP8 Q/K/V
 # publishes FP8 or FP16 output, matching the FP8 D128 Keeps profiles.
+#
+# KV256 is the one tile profile that qualifies on dtypes alone, so it keeps a
+# dtype table; every KV128 Keeps profile qualifies on a full key (Q, K, V and
+# output dtypes, Q tile, page size, head ratios) through the grouped-Keeps
+# profile tables above, and Sage attention qualifies both tile sizes through
+# ``_SAGE_GROUPED_KEEPS_PROFILES``.
 _KV256_DTYPE_RECIPES = {
     (Float16, Float16, Float16),
     (BFloat16, BFloat16, BFloat16),
