@@ -86,9 +86,9 @@ def recurrent_kda(
     can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
     kernel. The Cake backend includes a generated two-stage BT=16
     prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
-    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
-    contracts and keeps Cake as the feature-complete fallback; use
-    ``backend="cake"`` to select and benchmark the generated portfolio
+    selection. ``backend="auto"``, the default, prefers CuTe DSL for supported
+    plain prefill contracts and keeps Cake as the feature-complete fallback;
+    use ``backend="cake"`` to select and benchmark the generated portfolio
     explicitly, and ``backend="cudnn"`` to run cuDNN's fused SM100 engine.
     Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
     frozen Cake specialization automatically. The Cake path accepts any
@@ -251,11 +251,16 @@ def recurrent_kda(
             frozen route also accepts multiples of 16. SGLang normally uses
             64 or a larger cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cake", "cudnn"]):
-            Implementation backend. ``"auto"`` selects the architecture-
-            appropriate CuTe DSL kernel for supported ordinary multi-token
-            prefill, including the SM120 backend and SM100-family state
-            checkpoints, and otherwise falls back to an exported frozen Cake
-            specialization.
+            Implementation backend, defaulting to ``"auto"``. Which backend
+            ``"auto"`` prefers depends on the phase: for ordinary multi-token
+            prefill it selects the architecture-appropriate CuTe DSL kernel,
+            including the SM120 backend and SM100-family state checkpoints,
+            and otherwise falls back to an exported frozen Cake
+            specialization; for ``T=1`` decode it prefers the frozen Cake
+            specialization on its native equal-head/D128/unbounded-softplus
+            contract and falls back to CuTe DSL for everything else. On both
+            phases ``"auto"`` accepts everything ``"cute-dsl"`` accepts, so it
+            does not raise where ``"cute-dsl"`` would have run.
             ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
             Cake prefill path chooses among direct, persistent, small-BH, and
             two-stage BT16 schedules from the input shape and physical device.
@@ -268,6 +273,10 @@ def recurrent_kda(
             serve the call. It is never selected implicitly, and it covers
             ordinary multi-token prefill only: no speculative decode, no state
             pool, no ``initial_state_source``, no state checkpoints.
+            With ``ssm_state_indices`` and ``output_final_state=True`` the
+            returned state follows whichever backend ran: the whole pool from
+            Cake, or the gathered ``[B, HV, V, K]`` rows from CuTe DSL. The
+            in-place pool update is the same either way.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
