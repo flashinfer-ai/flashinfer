@@ -3286,14 +3286,10 @@ def fmha_decode_launch(
     tma_box0_k = min(128 // cfg.k_dtype_bytes, cfg.headdim)
     tma_box0_v = min(128 // cfg.v_dtype_bytes, cfg.headdim)
     tma_swizzle_qk = cuda.TensorMapSwizzle.s128b
-    if cutlass.const_expr(
-        (cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1) and cfg.headdim == 64
-    ):
+    if cutlass.const_expr(cfg.qk_mma_dtype.width == 8 and cfg.headdim == 64):
         tma_swizzle_qk = cuda.TensorMapSwizzle.s64b
     tma_swizzle_v = cuda.TensorMapSwizzle.s128b
-    if cutlass.const_expr(
-        (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1) and cfg.headdim == 64
-    ):
+    if cutlass.const_expr(cfg.pv_mma_dtype.width == 8 and cfg.headdim == 64):
         tma_swizzle_v = cuda.TensorMapSwizzle.s64b
     if cutlass.const_expr(cfg.tile_size_kv == 256):
         # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.

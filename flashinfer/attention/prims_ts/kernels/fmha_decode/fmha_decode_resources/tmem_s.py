@@ -490,9 +490,7 @@ class TmemSResource(DecodeGenResourceBase):
         MMA-K slice.
         """
         cfg = self.cfg
-        if cutlass.const_expr(
-            not (cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1) and crosses_64b_chunk
-        ):
+        if cutlass.const_expr(cfg.qk_mma_dtype.width != 8 and crosses_64b_chunk):
             k_desc = k_desc + Int32(8 * cfg.tile_size_kv - 6)
             if cutlass.const_expr(cfg.tile_size_q >= 16):
                 q_desc = q_desc + Int32(8 * cfg.tile_size_q - 6)
@@ -913,7 +911,7 @@ class TmemSResource(DecodeGenResourceBase):
             # closed form therefore adds each boundary jump minus that +2.
             # Keeping descriptors out of iter_args avoids staged-D256 spills.
             for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
-                if cutlass.const_expr(cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1):
+                if cutlass.const_expr(cfg.qk_mma_dtype.width == 8):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
                 else:
@@ -2466,7 +2464,7 @@ class TmemSResource(DecodeGenResourceBase):
         cfg = self.cfg
         # ConsTailWork: denominator update runs after P has been materialized,
         # so the resource-owned local sum matches the P payload consumed by BMM2.
-        if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
+        if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
             # FP8 uses TmemSoftmaxGlobal to update sums after P
             # quantization, so this stage only copies the corrected sums
             # back into the running state. This keeps the denominator
@@ -2511,7 +2509,7 @@ class TmemSResource(DecodeGenResourceBase):
                 cfg.has_static_dense_full_kv_tiles
                 and cfg.tile_size_q in (16, 32)
                 and not cfg.use_keeps_mma_ab
-                and not (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
+                and cfg.pv_mma_dtype.width != 8
                 and cfg.q_tiles_are_full
             ):
                 for pair_idx in cutlass.range_constexpr(pair_width):

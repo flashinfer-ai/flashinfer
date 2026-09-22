@@ -3591,7 +3591,6 @@ def test_attention_ts_decode_kv256_fp8_tiles_size_the_ring_and_alias_p() -> None
     """
 
     cfg = _make_contiguous_kv256_config(dtype=Float8E4M3FN)
-    assert cfg.use_8bit_qkv
     assert cfg.smem_kv_tile_bytes == cfg.tile_size_kv * cfg.headdim
     pipeline_smem_bytes = (
         cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
@@ -3652,9 +3651,6 @@ def test_attention_ts_decode_kv256_ring_depth_follows_element_width(
         num_tokens_per_page=128 if qkv_layout == "pagedKv" else 32,
     )
     assert cfg.kv_stages == expected_kv_stages
-    assert cfg.use_8bit_qkv == (
-        expected_kv_stages == KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
-    )
     if not persistent:
         resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
         assert resources["smemKv"].pipeline_config.num_stages == expected_kv_stages
@@ -3677,7 +3673,6 @@ def test_attention_ts_decode_kv256_fp8_explicit_ring_depth_is_honored() -> None:
 def test_attention_ts_decode_kv256_fp8_rejects_attention_sinks() -> None:
     """FP8 KV256 follows the FP8 Keeps recipes and excludes attention sinks."""
 
-    assert _make_contiguous_kv256_config(dtype=Float8E4M3FN).use_8bit_qkv
     with pytest.raises(ValueError, match="KV256 supports only"):
         _make_contiguous_kv256_config(
             dtype=Float8E4M3FN,
@@ -3713,7 +3708,6 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert kv256.defers_softmax_anchor_updates
 
     kv256_fp8 = _make_contiguous_kv256_config(dtype=Float8E4M3FN, persistent=persistent)
-    assert kv256_fp8.use_8bit_qkv
     assert kv256_fp8.streams_tmem_p_fragments
     assert kv256_fp8.softmax_score_fragment_regs == 32
     assert kv256_fp8.num_softmax_score_fragments == 4
@@ -3769,7 +3763,6 @@ def test_attention_ts_decode_sage_profile_accepts_int8_qk_with_e4m3_v(
     assert cfg.use_sage_attention and cfg.uses_int32_scores
     assert cfg.q_dtype == cfg.k_dtype == Int8
     assert cfg.v_dtype == Float8E4M3FN
-    assert cfg.use_8bit_qkv
     assert cfg.q_dtype_bytes == cfg.kv_dtype_bytes == 1
     assert cfg.streams_tmem_p_fragments
     assert cfg.fragment_p_packed_cols == 8
@@ -3782,14 +3775,12 @@ def test_attention_ts_decode_sage_profile_accepts_int8_qk_with_e4m3_v(
         tile_size_q=tile_size_q, tile_size_kv=256 if tile_size_q == 64 else 128
     )
     assert fp8_cfg.v_dtype == Float8E4M3FN
-    assert fp8_cfg.use_8bit_qkv
     assert not fp8_cfg.uses_int32_scores
     assert _mma_kind_for_qk(fp8_cfg) == Tcgen05MMAKind.F8F6F4
     assert _mma_kind_for_pv(fp8_cfg) == Tcgen05MMAKind.F8F6F4
 
     bf16_cfg = _make_contiguous_kv256_config()
     assert bf16_cfg.v_dtype == bf16_cfg.k_dtype == BFloat16
-    assert not bf16_cfg.use_8bit_qkv
     assert _mma_kind_for_qk(bf16_cfg) == Tcgen05MMAKind.F16
     assert _mma_kind_for_pv(bf16_cfg) == Tcgen05MMAKind.F16
 
@@ -3875,7 +3866,7 @@ def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
     assert cfg.use_sage_attention
     assert cfg.use_persistent_scheduler is persistent
     assert cfg.streams_tmem_p_fragments
-    assert cfg.use_8bit_qkv and not cfg.uses_int32_scores
+    assert not cfg.uses_int32_scores
     assert cfg.out_dtype == o_dtype
     assert not cfg.defers_softmax_anchor_updates
 

@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float16, Float32, Int8, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
@@ -160,32 +160,32 @@ def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
 
 
 def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA kind of the QK GEMM from the Q/K dtype.
+    """Select the tcgen05 MMA kind of the QK GEMM from ``qk_mma_dtype``.
 
     Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
     """
-    if cfg.uses_int32_scores:
+    if cfg.qk_mma_dtype == Int8:
         return prims.Tcgen05MMAKind.INT8
-    if cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1:
+    if cfg.qk_mma_dtype.width == 8:
         return prims.Tcgen05MMAKind.F8F6F4
     return prims.Tcgen05MMAKind.F16
 
 
 def _mma_k_step_qk(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one QK-GEMM MMA instruction."""
-    return 32 if (cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1) else 16
+    return 32 if cfg.qk_mma_dtype.width == 8 else 16
 
 
 def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA kind of the PV GEMM from the V (and hence P) dtype."""
-    if cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1:
+    """Select the tcgen05 MMA kind of the PV GEMM from ``pv_mma_dtype``."""
+    if cfg.pv_mma_dtype.width == 8:
         return prims.Tcgen05MMAKind.F8F6F4
     return prims.Tcgen05MMAKind.F16
 
 
 def _mma_k_step_pv(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one PV-GEMM MMA instruction."""
-    return 32 if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1) else 16
+    return cfg.pv_mma_k_step
 
 
 def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
@@ -194,7 +194,7 @@ def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
     INT32 scores are accumulated on top of ``INT32_SCORE_BIAS``, so the
     softmax reads every score tile as FP32.
     """
-    return Int32 if cfg.uses_int32_scores else Float32
+    return Int32 if cfg.qk_mma_dtype == Int8 else Float32
 
 
 @cute.jit
@@ -415,7 +415,7 @@ def _pack_float2_to_bf16(v0: Float32, v1: Float32) -> Int32:
 
 def _qkv_smem_swizzle(cfg: FmhaDecodeConfig) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for staged Q/K/V tiles."""
-    if cfg.use_8bit_qkv and cfg.headdim == 64:
+    if cfg.k_dtype_bytes == 1 and cfg.v_dtype_bytes == 1 and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 

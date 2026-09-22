@@ -1115,14 +1115,24 @@ class FmhaDecodeConfig:
         return self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
 
     @property
-    def use_8bit_qkv(self) -> bool:
-        """8-bit Q/K (E4M3 or Int8): the byte-wide score path.
+    def qk_mma_dtype(self) -> type:
+        """Element type of both QK MMA operands.
 
-        Selects one byte per staged K element and K = 32 per QK MMA; the QK
-        MMA kind and the score interpretation follow ``q_dtype`` separately.
-        P storage and the PV path follow ``v_dtype`` (``v_dtype_bytes``).
+        Q and K share one dtype, and the KV-cache side names the MMA, as
+        ``pv_mma_dtype`` does for PV. One-byte Q/K (E4M3 or Int8) advance
+        K = 32 per MMA instruction; the kind and the score interpretation
+        follow the dtype itself.
         """
-        return self.q_dtype_bytes == 1
+        return self.k_dtype
+
+    @property
+    def pv_mma_dtype(self) -> type:
+        """Element type of both PV MMA operands.
+
+        P is stored in V's dtype: E4M3 quantized with the static 448 scale and
+        packed four per 32-bit column for E4M3 V, else the 16-bit type.
+        """
+        return self.v_dtype
 
     @property
     def use_fp8_output(self) -> bool:
@@ -1370,7 +1380,7 @@ class FmhaDecodeConfig:
     @property
     def p_values_per_reg(self) -> int:
         """Return the probabilities packed into one 32-bit P register."""
-        return PACKED_REGISTER_BYTES // self.v_dtype_bytes
+        return PACKED_REGISTER_BYTES // _dtype_bytes(self.pv_mma_dtype)
 
     @property
     def fragment_p_packed_cols(self) -> int:
@@ -1386,19 +1396,18 @@ class FmhaDecodeConfig:
         """Return the K elements one PV MMA instruction consumes.
 
         The instruction reads ``MMA_K_STEP_BYTES`` of the K-major V row: 32
-        one-byte or 16 two-byte elements. P is stored in V's element width.
+        one-byte or 16 two-byte elements of ``pv_mma_dtype``.
         """
-        return MMA_K_STEP_BYTES // self.v_dtype_bytes
+        return MMA_K_STEP_BYTES // _dtype_bytes(self.pv_mma_dtype)
 
     @property
     def p_cols_per_mma_k_step(self) -> int:
         """Return the packed TMEM P columns one PV MMA K step advances.
 
         A 32-bit P column holds ``PACKED_REGISTER_BYTES`` bytes of the K-major
-        P row, and one K step consumes ``pv_mma_k_step`` P values of
-        ``v_dtype_bytes`` each.
+        P row, and one K step consumes ``MMA_K_STEP_BYTES`` of it.
         """
-        return self.pv_mma_k_step * self.v_dtype_bytes // PACKED_REGISTER_BYTES
+        return MMA_K_STEP_BYTES // PACKED_REGISTER_BYTES
 
     @property
     def pv_mma_steps_per_fragment(self) -> int:
@@ -1574,7 +1583,7 @@ class FmhaDecodeConfig:
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
         regs_per_repeat = (
             FP8_P_PACKED_REGS_PER_Q_REPEAT
-            if (self.use_fp8_qkv or self.v_dtype_bytes == 1)
+            if self.pv_mma_dtype.width == 8
             else FP16_P_PACKED_REGS_PER_Q_REPEAT
         )
         return regs_per_repeat * q_repeats
@@ -2276,7 +2285,11 @@ class FmhaDecodeConfig:
         return (
             self.tile_size_kv == 256
             or self.use_block_sparse
-            or (self.use_8bit_qkv and self.keeps_stats_via_smem)
+            or (
+                self.k_dtype_bytes == 1
+                and self.v_dtype_bytes == 1
+                and self.keeps_stats_via_smem
+            )
         )
 
     @property
@@ -2294,7 +2307,7 @@ class FmhaDecodeConfig:
         """
         return (
             self.use_keeps_mma_ab
-            and not self.use_8bit_qkv
+            and self.pv_mma_dtype.width != 8
             and (self.tile_size_kv == 256 or self.use_block_sparse)
         )
 
@@ -2306,7 +2319,7 @@ class FmhaDecodeConfig:
     @property
     def uses_int32_scores(self) -> bool:
         """Whether BMM1 accumulates INT8 Q/K into INT32 scores."""
-        return self.use_sage_attention and self.q_dtype == Int8
+        return self.use_sage_attention and self.qk_mma_dtype == Int8
 
     def softmax_num_warps(self, inst_id: int) -> int:
         """Return the warps of one softmax instance."""
@@ -2406,7 +2419,8 @@ class FmhaDecodeConfig:
         """Whether two-instance Keeps has room for standalone stats tiles."""
         if not (
             self.use_keeps_mma_ab
-            and self.use_8bit_qkv
+            and self.k_dtype_bytes == 1
+            and self.v_dtype_bytes == 1
             and self.tile_size_kv == 128
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -2445,7 +2459,11 @@ class FmhaDecodeConfig:
         K/V keeps the row-owner exchange because its ring already fills the
         SMEM budget.
         """
-        return self.tile_size_kv == 256 and self.use_8bit_qkv
+        return (
+            self.tile_size_kv == 256
+            and self.k_dtype_bytes == 1
+            and self.v_dtype_bytes == 1
+        )
 
     @property
     def keeps_loop_correction_chunk_regs(self) -> int:
@@ -2634,7 +2652,11 @@ class FmhaDecodeConfig:
                 or not self._kv256_dtypes_qualified
                 # FP8 Keeps recipes exclude attention sinks, as the paged FP8
                 # Q64/Q128 profiles do.
-                or (self.use_8bit_qkv and self.use_attention_sinks)
+                or (
+                    self.k_dtype_bytes == 1
+                    and self.v_dtype_bytes == 1
+                    and self.use_attention_sinks
+                )
                 or self.use_cluster_smem_reduction
                 or not self.matches_kv256_task_topology
             ):
@@ -2968,7 +2990,7 @@ def _finalize_static_decode_config(
                 cfg,
                 "kv_stages",
                 KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
-                if cfg.use_8bit_qkv
+                if cfg.k_dtype_bytes == 1 and cfg.v_dtype_bytes == 1
                 else KV_TILE_256_SHARED_FIFO_STAGES,
                 explicit_fields,
             )

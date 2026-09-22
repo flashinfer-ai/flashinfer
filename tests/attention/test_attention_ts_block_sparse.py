@@ -1781,7 +1781,6 @@ def test_block_sparse_compile_key_builds_int8_sage_config() -> None:
     assert cfg.v_dtype == Float8E4M3FN
     assert cfg.out_dtype == BFloat16
     assert cfg.uses_int32_scores
-    assert cfg.use_8bit_qkv
     fp8_cfg = block_sparse_config._make_block_sparse_config(
         replace(key, dtype_key="float8_e4m3fn", v_dtype_key="float8_e4m3fn")
     )
@@ -1847,7 +1846,6 @@ def test_kv256_ring_depth_follows_element_width_and_fits_smem(
     )
     cfg = block_sparse_config._make_block_sparse_config(key)
     assert cfg.tile_size_kv == 256
-    assert cfg.use_8bit_qkv is sage
     expected_kv_stages = (
         KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
         if sage

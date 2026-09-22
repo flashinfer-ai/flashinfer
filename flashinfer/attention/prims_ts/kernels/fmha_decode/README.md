@@ -388,8 +388,8 @@ dtype: the exponent addend formed once per row, the rolled masked max pass
 with a compile-time tail location, the seeded probability sum chains, the CLC
 response slot in the unified SMEM block and one correction store wait per O
 stage. The byte-wide-only policies (`splits_kv_tile_256_tail_columns`, the
-four-stage KV256 ring) are measured performance choices gated on
-`use_8bit_qkv`, not dtype requirements; the P pass loads the next score
+four-stage KV256 ring) are measured performance choices gated on the
+one-byte K and V element widths, not dtype requirements; the P pass loads the next score
 fragment behind the scale FFMAs for every dtype.
 
 ### Where the scales enter softmax

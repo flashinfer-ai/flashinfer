@@ -415,13 +415,11 @@ class TmemOResource(DecodeGenResourceBase):
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
                         v_desc = v_desc + Int32(
-                            (cfg.headdim * 2)
-                            if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
-                            else 128
+                            (cfg.headdim * 2) if cfg.pv_mma_dtype.width == 8 else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
+                                cfg.pv_mma_dtype.width != 8
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):
@@ -494,12 +492,12 @@ class TmemOResource(DecodeGenResourceBase):
                         # staged head-dim tile.
                         v_desc = v_desc + Int32(
                             (cfg.head_dim_kv_stage * 2)
-                            if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
+                            if cfg.pv_mma_dtype.width == 8
                             else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
+                                cfg.pv_mma_dtype.width != 8
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):

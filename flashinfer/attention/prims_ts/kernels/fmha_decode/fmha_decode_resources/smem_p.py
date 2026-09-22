@@ -352,7 +352,7 @@ class SmemPResource(DecodeGenResourceBase):
         # rematerialize thread indices and spill registers in the callers of
         # every profile.
         addend = Float32(-self.scale_softmax_log2 * safe_new_max)
-        if cutlass.const_expr(self.cfg.use_fp8_qkv or self.cfg.v_dtype_bytes == 1):
+        if cutlass.const_expr(self.cfg.pv_mma_dtype.width == 8):
             addend += Float32(FP8_P_QUANT_LOG2_SCALE)
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             if route_is_proxy:
@@ -605,7 +605,7 @@ class SmemPResource(DecodeGenResourceBase):
             local_sum_pair = self._exponentiate_fragment_pairs(s_arr)
             total_sum_pair = cute.arch.add_packed_f32x2(total_sum_pair, local_sum_pair)
 
-            if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
+            if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
                 packed_regs = cutlass.Array(
                     Int32, fragment_cols, space=cutlass.AddressSpace.rmem
                 )
@@ -882,7 +882,7 @@ class SmemPResource(DecodeGenResourceBase):
         for block_idx in cutlass.range_constexpr(num_vector_blocks):
             s_base = block_idx * vector_elements
             packed_base = block_idx * 4 if cfg.uses_two_inst_tmem_p else 0
-            if cutlass.const_expr((cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)):
+            if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
                 for packed_idx in cutlass.range_constexpr(4):
                     val_base = packed_idx * 4
                     scaled_pair_01 = ffma2(
@@ -980,9 +980,7 @@ class SmemPResource(DecodeGenResourceBase):
             # complete-row Q128/KV128 path; KV256 publishes K32 fragments.
             assert cfg.num_packed_p_regs in (16, 32, 64)
             regs_per_store = (
-                cfg.num_packed_p_regs
-                if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
-                else 16
+                cfg.num_packed_p_regs if cfg.pv_mma_dtype.width == 8 else 16
             )
             assert cfg.num_packed_p_regs % regs_per_store == 0
             for store_idx in cutlass.range_constexpr(
@@ -1058,9 +1056,7 @@ class SmemPResource(DecodeGenResourceBase):
         # warp/lane ownership for SMEM offsets and STSM swizzles.
         task_cache = _decode_gen_task_cache(stage_info)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        if cutlass.const_expr(
-            cfg.tile_size_q == 32 and (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
-        ):
+        if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.pv_mma_dtype.width == 8):
             # Tile-Q=32 FP8 fast path: compute E4M3 P registers in the
             # same order consumed by the STSM helper, while also capturing
             # one local denominator sum per softmax scale group.
@@ -1126,9 +1122,7 @@ class SmemPResource(DecodeGenResourceBase):
             prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
             return
 
-        if cutlass.const_expr(
-            cfg.tile_size_q == 16 and (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
-        ):
+        if cutlass.const_expr(cfg.tile_size_q == 16 and cfg.pv_mma_dtype.width == 8):
             # Tile-Q=16 FP8 fast path: each helper call handles two softmax
             # scale groups and returns the low/high K halves already packed for
             # STSM. This avoids keeping all 16 FP32 P values live and packing
@@ -1219,7 +1213,7 @@ class SmemPResource(DecodeGenResourceBase):
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
                 self.tmem_s_ref.store_p_local_sum(scale_idx, local_sums[scale_idx])
 
-            if cutlass.const_expr((cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)):
+            if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
                 # FP8 P is packed four values per register and stored with
                 # transposed 8-bit helpers so BMM2 sees the tcgen05 layout.
                 packed_p = cutlass.Array(
@@ -1282,7 +1276,7 @@ class SmemPResource(DecodeGenResourceBase):
             cute.arch.fence_view_async_shared()
             return
 
-        if cutlass.const_expr((cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)):
+        if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
             # Tile-Q=8 FP8 path: compute packed P and local sums directly
             # from the eight S registers owned by this lane.
             packed_p = cutlass.Array(
@@ -1453,7 +1447,7 @@ class SmemPResource(DecodeGenResourceBase):
                 shape=prims.StoreShape.M8N8,
             )
         cute.arch.fence_view_async_shared()
-        if cutlass.const_expr((cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)):
+        if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
             # FP8 P uses inline STSM stores. Synchronize the producer
             # warpgroup before the UMMA-consumer pipeline is committed so
             # BMM2 cannot observe a partially written P tile.
