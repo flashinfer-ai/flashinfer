@@ -1011,7 +1011,7 @@ rk_source = torch.randn(
     rk_B + 2, rk_HV, rk_D, rk_D, dtype=torch.bfloat16, device=device
 )
 rk_source_indices = torch.arange(rk_B, dtype=torch.int32, device=device)
-flashinfer.kda_decode.recurrent_kda(
+flashinfer.recurrent_kda(
     rk_q,
     rk_k,
     rk_v,
