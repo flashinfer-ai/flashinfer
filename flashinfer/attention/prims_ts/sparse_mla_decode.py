@@ -268,7 +268,6 @@ class BatchSparseMLADecodePagedTSWrapper:
             kernel.sparse_kv_stages = profile.kv_pipeline_stages
             kernel.sparse_uniform_pages = profile.uniform_offset_cache
             kernel.sparse_balanced_registers = profile.balanced_registers
-            kernel.sparse_defer_max_update = profile.defer_max_update
             core_bytes = workspace_2cta(
                 tile_size_q=128,
                 num_q_tiles=1,

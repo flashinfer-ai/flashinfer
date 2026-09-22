@@ -263,7 +263,6 @@ class MlaDecodeConfig:
     # the useful split prefix. Grid and workspace geometry retain the maximum.
     is_var_split_kv: bool = False
     cache_uniform_sparse_pages: bool = False
-    defer_sparse_max_update: bool = False
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
@@ -344,7 +343,6 @@ def make_mla_decode_config(
     sparse_kv_stages: int = 0,
     cache_uniform_sparse_pages: bool = False,
     balance_sparse_registers: bool = False,
-    defer_sparse_max_update: bool = False,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     cfg = MlaDecodeConfig()
@@ -458,26 +456,17 @@ def make_mla_decode_config(
         cfg.correction_reg_num = 160 if sparse_gather_warps == 8 else 192
         cfg.other_reg_num = 64 if sparse_gather_warps == 8 else 96
 
-    if defer_sparse_max_update:
-        if page_size != 1 or rope_dim != 0 or qkv_dtype != "bf16":
-            raise ValueError(
-                "2CTA deferred maxima require native sparse BF16 probabilities"
-            )
-        cfg.defer_sparse_max_update = True
-
     if balance_sparse_registers:
-        if page_size != 1 or not (
-            qkv_dtype == "e4m3" or (qkv_dtype == "bf16" and sparse_gather_warps == 8)
-        ):
-            raise ValueError("balanced registers require sparse FP8 or eight-warp BF16")
+        if page_size != 1 or qkv_dtype != "e4m3":
+            raise ValueError("balanced registers require sparse FP8")
         # Sparse FP8 keeps 64 registers for the gather issuers. Split the
         # remaining budget equally: 128 softmax registers spilled live loop
         # state on every KV tile, while correction fits in 144 registers.
         # 4*144 + 4*144 + 12*64 = 1920 warp-registers, the same CTA total
         # as the previous 128/160/64 allocation (61440 registers).
-        cfg.softmax_reg_num = 160 if qkv_dtype == "bf16" else 144
-        cfg.correction_reg_num = 176 if qkv_dtype == "bf16" else 144
-        cfg.other_reg_num = 48 if qkv_dtype == "bf16" else 64
+        cfg.softmax_reg_num = 144
+        cfg.correction_reg_num = 144
+        cfg.other_reg_num = 64
 
     # SETMAXNREG redistributes the CTA's initial allocation, rounded down
     # to eight registers/thread; the remainder of the SM file is not credit.

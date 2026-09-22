@@ -77,8 +77,8 @@ Split-KV and V partitions fill small grids. Larger query tiles share gather
 work across heads; KV reuse retains K through PV when one CTA owns V and the
 buffer budget permits it. BF16 BK64 permits two retained tiles where BK128
 would not fit. Selection uses host bounds; live lengths remain on the GPU.
-BF16 deferred maxima use FlashMLA's six-log2 bound; FP8 uses exact maxima and
-P scale 448. `assume_valid_prefix=True` promises no holes before each length
+Selected BF16 1CTA schedules use FlashMLA's six-log2 bound; FP8 uses exact
+maxima and P scale 448. `assume_valid_prefix=True` promises no holes before each length
 and enables analytic masking in the direct FP8 2-CTA path.
 
 DSL 4.7's credit simulator has a bounded iteration count that can report

@@ -890,7 +890,6 @@ class MlaDecodeTs:
         self.sparse_kv_stages = 0
         self.sparse_uniform_pages = False
         self.sparse_balanced_registers = False
-        self.sparse_defer_max_update = False
         self.assume_valid_prefix = False
         self.direct_static_scales = False
         self.direct_sparse_capacities = (0, 0)
@@ -955,7 +954,6 @@ class MlaDecodeTs:
             self.sparse_kv_stages,
             self.sparse_uniform_pages,
             self.sparse_balanced_registers,
-            self.sparse_defer_max_update,
         )
 
     def _configure_parallel_reduction_topology(self) -> None:
@@ -1079,7 +1077,6 @@ class MlaDecodeTs:
             sparse_kv_stages=self.sparse_kv_stages,
             cache_uniform_sparse_pages=self.sparse_uniform_pages,
             balance_sparse_registers=self.sparse_balanced_registers,
-            defer_sparse_max_update=self.sparse_defer_max_update,
         )
         physical_tile_rows = self.mma_qk_tiler_mn[0]
         num_query_tiles = self.num_q_tiles
@@ -1552,7 +1549,6 @@ class MlaDecodeTs:
             sparse_kv_stages=self.sparse_kv_stages,
             cache_uniform_sparse_pages=self.sparse_uniform_pages,
             balance_sparse_registers=self.sparse_balanced_registers,
-            defer_sparse_max_update=self.sparse_defer_max_update,
         )
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()

@@ -2809,14 +2809,6 @@ class TmemSResource(HighThroughputMlaResource):
                     row_max_prev, row_sum_prev = load_peer_state()
 
         row_max_new = fmax_f32(row_max_prev, row_max_tile)
-        if cutlass.const_expr(cfg.defer_sparse_max_update):
-            # A retained common anchor preserves attention while keeping
-            # BF16 probabilities at most 64, matching FlashMLA's six-log2
-            # threshold. Native FP8 retains exact maxima and scale 448.
-            if row_max_prev != neg_inf and self.softmax_scale_log2 > Float32(0):
-                increase_log2 = (row_max_new - row_max_prev) * self.softmax_scale_log2
-                if increase_log2 <= Float32(6.0):
-                    row_max_new = row_max_prev
         row_has_values = row_max_new != neg_inf
         safe_row_max_prev = row_max_prev if row_has_values else Float32(0)
         safe_row_max_new = row_max_new if row_has_values else Float32(0)
