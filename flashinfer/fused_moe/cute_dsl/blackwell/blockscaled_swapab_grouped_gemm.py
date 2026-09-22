@@ -66,7 +66,8 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     UnalignedNamedBarrier,
-    red_add_bf16x2_pair,
+    red_add_bf16x2_pair_pred,
+    st_bf16_pred,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     native_situ_f32,
@@ -94,7 +95,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         use_linear_beta: bool = True,
         max_ab_stages: int = 12,
         num_acc_stages: int = 2,
-        num_tile_stages: int = 2,
+        num_tile_stages: int = 8,
         perf_probe: int = 0,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
@@ -486,6 +487,19 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             sInfo: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage], 1
             ]
+            # Per-tile epilogue metadata filled by the scheduler warp: output
+            # row per column, route weight per column and the expert alpha
+            # (slot n_tile of sScale).
+            sTok: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, self.n_tile * self.num_tile_stage],
+                16,
+            ]
+            sScale: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, (self.n_tile + 1) * self.num_tile_stage
+                ],
+                16,
+            ]
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
@@ -734,6 +748,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sExch = storage.sExch.get_tensor(exch_smem_layout)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
+        sTok = storage.sTok.get_tensor(
+            cute.make_layout((n_tile, self.num_tile_stage), stride=(1, n_tile))
+        )
+        sScale = storage.sScale.get_tensor(
+            cute.make_layout((n_tile + 1, self.num_tile_stage), stride=(1, n_tile + 1))
+        )
 
         # (bM, bK, loopM, loopK, loopL)
         gA_mkl = cute.local_tile(
@@ -792,6 +812,32 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
                     expert_idx = tile_idx_to_expert_idx[cur[1]]
                     mn_limit = tile_idx_to_mn_limit[cur[1]]
+                    # Epilogue metadata for this tile: the scheduler warp runs
+                    # tiles ahead, so the dependent route lookups never sit on
+                    # the epilogue's per-tile critical path.
+                    meta_stage = tile_info_producer_state.index
+                    sched_lane = tidx % self.threads_per_warp
+                    if sched_lane == 0:
+                        sScale[(n_tile, meta_stage)] = cutlass.Float32(
+                            alpha[expert_idx]
+                        )
+                    if cutlass.const_expr(not self.is_situ):
+                        if sched_lane < n_tile:
+                            meta_prow = cur[1] * n_tile + sched_lane
+                            meta_valid = meta_prow < mn_limit
+                            meta_expanded = permuted_idx_to_expanded_idx[meta_prow]
+                            meta_safe = cutlass.max(meta_expanded, cutlass.Int32(0))
+                            if cutlass.const_expr(self.is_finalize):
+                                meta_token = meta_safe // self.top_k
+                                meta_topk = meta_safe % self.top_k
+                                meta_gather = meta_token * cutlass.Int32(meta_valid)
+                                sScale[(sched_lane, meta_stage)] = cutlass.Float32(
+                                    token_final_scales[(meta_gather, meta_topk)]
+                                )
+                                sTok[(sched_lane, meta_stage)] = meta_token
+                            else:
+                                sScale[(sched_lane, meta_stage)] = cutlass.Float32(1.0)
+                                sTok[(sched_lane, meta_stage)] = meta_safe
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = cur[0]
                         sInfo[(1, tile_info_producer_state.index)] = cur[1]
@@ -838,6 +884,32 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
                     expert_idx = tile_idx_to_expert_idx[cur[1]]
                     mn_limit = tile_idx_to_mn_limit[cur[1]]
+                    # Epilogue metadata for this tile: the scheduler warp runs
+                    # tiles ahead, so the dependent route lookups never sit on
+                    # the epilogue's per-tile critical path.
+                    meta_stage = tile_info_producer_state.index
+                    sched_lane = tidx % self.threads_per_warp
+                    if sched_lane == 0:
+                        sScale[(n_tile, meta_stage)] = cutlass.Float32(
+                            alpha[expert_idx]
+                        )
+                    if cutlass.const_expr(not self.is_situ):
+                        if sched_lane < n_tile:
+                            meta_prow = cur[1] * n_tile + sched_lane
+                            meta_valid = meta_prow < mn_limit
+                            meta_expanded = permuted_idx_to_expanded_idx[meta_prow]
+                            meta_safe = cutlass.max(meta_expanded, cutlass.Int32(0))
+                            if cutlass.const_expr(self.is_finalize):
+                                meta_token = meta_safe // self.top_k
+                                meta_topk = meta_safe % self.top_k
+                                meta_gather = meta_token * cutlass.Int32(meta_valid)
+                                sScale[(sched_lane, meta_stage)] = cutlass.Float32(
+                                    token_final_scales[(meta_gather, meta_topk)]
+                                )
+                                sTok[(sched_lane, meta_stage)] = meta_token
+                            else:
+                                sScale[(sched_lane, meta_stage)] = cutlass.Float32(1.0)
+                                sTok[(sched_lane, meta_stage)] = meta_safe
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = cur[0]
                         sInfo[(1, tile_info_producer_state.index)] = cur[1]
@@ -1252,9 +1324,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            cur_tok = cute.make_rmem_tensor((n_tile,), cutlass.Int32)
+            cur_scale = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
+            meta_alpha = cute.make_rmem_tensor((1,), cutlass.Float32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for i in cutlass.range_constexpr(5):
                 tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
+            meta_alpha[0] = sScale[(n_tile, tile_info_consumer_state.index)]
+            if cutlass.const_expr(not self.is_situ):
+                for c in cutlass.range_constexpr(n_tile):
+                    cur_tok[c] = sTok[(c, tile_info_consumer_state.index)]
+                    cur_scale[c] = sScale[(c, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy("async.shared", space="cta")
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
@@ -1262,82 +1342,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
             inv_fp8_max = cutlass.Float32(1.0 / 448.0)
 
-            pf_alpha = cute.make_rmem_tensor((1,), cutlass.Float32)
-            pf_tok = cute.make_rmem_tensor((n_tile,), cutlass.Int32)
-            pf_scale = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
-            cur_tok = cute.make_rmem_tensor((n_tile,), cutlass.Int32)
-            cur_scale = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
-            pf_alpha[0] = cutlass.Float32(0.0)
-            for c in cutlass.range_constexpr(n_tile):
-                pf_tok[c] = cutlass.Int32(0)
-                pf_scale[c] = cutlass.Float32(0.0)
-            # Prefetch per-tile epilogue metadata (expert alpha and, per column, the
-            # output row and route weight) for the tile in ``tile_info`` into
-            # registers so the dependent global loads overlap the previous tile.
-            pf_alpha[0] = cutlass.Float32(
-                alpha[cutlass.max(tile_info[2], cutlass.Int32(0))]
-            )
-            if cutlass.const_expr(not self.is_situ):
-                for c in cutlass.range_constexpr(n_tile):
-                    pf_prow = tile_info[1] * n_tile + c
-                    pf_valid = pf_prow < tile_info[4]
-                    pf_expanded = permuted_idx_to_expanded_idx[pf_prow]
-                    pf_safe_idx = cutlass.max(pf_expanded, cutlass.Int32(0))
-                    if cutlass.const_expr(self.is_finalize):
-                        pf_token_idx = pf_safe_idx // self.top_k
-                        pf_topk_idx = pf_safe_idx % self.top_k
-                        pf_gather_tok = pf_token_idx * cutlass.Int32(pf_valid)
-                        pf_scale[c] = cutlass.Float32(
-                            token_final_scales[(pf_gather_tok, pf_topk_idx)]
-                        )
-                        pf_tok[c] = pf_token_idx
-                    else:
-                        pf_scale[c] = cutlass.Float32(1.0)
-                        pf_tok[c] = pf_safe_idx
-
             while is_valid_tile:
                 m_tile = tile_info[0]
                 row_group = tile_info[1]
                 expert_idx = tile_info[2]
                 mn_limit = tile_info[4]
                 row_base = row_group * n_tile
-                alpha_val = pf_alpha[0]
-                # Keep this tile's prefetched column metadata before peeking ahead.
-                if cutlass.const_expr(not self.is_situ):
-                    for c in cutlass.range_constexpr(n_tile):
-                        cur_tok[c] = pf_tok[c]
-                        cur_scale[c] = pf_scale[c]
-
-                # Peek the next tile and start its metadata loads now.
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for i in cutlass.range_constexpr(5):
-                    tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
-                cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
-                # Prefetch per-tile epilogue metadata (expert alpha and, per column, the
-                # output row and route weight) for the tile in ``tile_info`` into
-                # registers so the dependent global loads overlap the previous tile.
-                pf_alpha[0] = cutlass.Float32(
-                    alpha[cutlass.max(tile_info[2], cutlass.Int32(0))]
-                )
-                if cutlass.const_expr(not self.is_situ):
-                    for c in cutlass.range_constexpr(n_tile):
-                        pf_prow = tile_info[1] * n_tile + c
-                        pf_valid = pf_prow < tile_info[4]
-                        pf_expanded = permuted_idx_to_expanded_idx[pf_prow]
-                        pf_safe_idx = cutlass.max(pf_expanded, cutlass.Int32(0))
-                        if cutlass.const_expr(self.is_finalize):
-                            pf_token_idx = pf_safe_idx // self.top_k
-                            pf_topk_idx = pf_safe_idx % self.top_k
-                            pf_gather_tok = pf_token_idx * cutlass.Int32(pf_valid)
-                            pf_scale[c] = cutlass.Float32(
-                                token_final_scales[(pf_gather_tok, pf_topk_idx)]
-                            )
-                            pf_tok[c] = pf_token_idx
-                        else:
-                            pf_scale[c] = cutlass.Float32(1.0)
-                            pf_tok[c] = pf_safe_idx
+                alpha_val = meta_alpha[0]
 
                 acc_stage_index = acc_consumer_state.index
                 acc_pipeline.consumer_wait(acc_consumer_state)
@@ -1422,25 +1433,35 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         # column. Adjacent lanes pair their BF16 values so one
                         # ``red.global.add.bf16x2`` per lane pair covers a coalesced
                         # 256-byte row segment: no smem staging, no barrier, and
-                        # nothing on the TMA unit (the bulk reduce this replaces
-                        # queued behind the weight loads and throttled short-K
-                        # tiles). ``vals`` already carries the expert alpha.
+                        # nothing on the TMA unit. Column validity is a predicate,
+                        # not a branch, so the unrolled shuffles pipeline.
+                        # ``vals`` already carries the expert alpha.
                         h = m_tile * 128 + epi_tidx
+                        is_even_lane = (lane % 2) == 0
                         for c in cutlass.range_constexpr(n_tile):
-                            prow = row_base + c
-                            if prow < mn_limit:
-                                v = vals[c] * cur_scale[c]
-                                if cutlass.const_expr(self.is_finalize):
-                                    v_hi = cute.arch.shuffle_sync_bfly(v, 1)
-                                    if lane % 2 == 0:
-                                        dst = cute.domain_offset(
-                                            (cur_tok[c], h, 0), out
-                                        )
-                                        red_add_bf16x2_pair(dst, v, v_hi)
-                                else:
-                                    out[(cur_tok[c], h, 0)] = v.to(cutlass.BFloat16)
+                            v = vals[c] * cur_scale[c]
+                            col_ok = (row_base + c) < mn_limit
+                            dst = cute.domain_offset((cur_tok[c], h, 0), out)
+                            if cutlass.const_expr(self.is_finalize):
+                                v_hi = cute.arch.shuffle_sync_bfly(v, 1)
+                                red_add_bf16x2_pair_pred(
+                                    dst, v, v_hi, cutlass.Int32(col_ok & is_even_lane)
+                                )
+                            else:
+                                st_bf16_pred(dst, v, cutlass.Int32(col_ok))
 
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for i in cutlass.range_constexpr(5):
+                    tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
+                meta_alpha[0] = sScale[(n_tile, tile_info_consumer_state.index)]
+                if cutlass.const_expr(not self.is_situ):
+                    for c in cutlass.range_constexpr(n_tile):
+                        cur_tok[c] = sTok[(c, tile_info_consumer_state.index)]
+                        cur_scale[c] = sScale[(c, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy("async.shared", space="cta")
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
 
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()

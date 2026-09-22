@@ -178,11 +178,12 @@ def blk_copy(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
-def red_add_bf16x2_pair(dst_gmem, lo_f32, hi_f32, loc=None, ip=None):
-    """``red.global.add.bf16x2`` of two F32 values rounded to BF16.
+def red_add_bf16x2_pair_pred(dst_gmem, lo_f32, hi_f32, pred_i32, loc=None, ip=None):
+    """Predicated ``red.global.add.bf16x2`` of two F32 values rounded to BF16.
 
-    ``lo_f32`` lands at ``dst`` and ``hi_f32`` at ``dst + 1`` (element order),
-    so a lane pair covering adjacent output columns issues one 4-byte reduce.
+    ``lo_f32`` lands at ``dst`` and ``hi_f32`` at ``dst + 1`` (element order);
+    nothing is issued when ``pred_i32`` is zero. Predication instead of a
+    branch keeps unrolled per-column epilogue loops free of control flow.
     """
     llvm.inline_asm(
         None,
@@ -190,10 +191,32 @@ def red_add_bf16x2_pair(dst_gmem, lo_f32, hi_f32, loc=None, ip=None):
             dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
             lo_f32.ir_value(loc=loc, ip=ip),
             hi_f32.ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
         ],
-        "{\n\t.reg .b32 pk_;\n\tcvt.rn.bf16x2.f32 pk_, $2, $1;\n\t"
-        "red.global.add.noftz.bf16x2 [$0], pk_;\n}",
-        "l,f,f",
+        "{\n\t.reg .pred p_;\n\t.reg .b32 pk_;\n\tsetp.ne.b32 p_, $3, 0;\n\t"
+        "cvt.rn.bf16x2.f32 pk_, $2, $1;\n\t@p_ red.global.add.noftz.bf16x2 [$0], pk_;\n}",
+        "l,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_bf16_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
+    """Predicated 2-byte store of an F32 value rounded to BF16."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            v_f32.ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\t.reg .b16 h_;\n\tsetp.ne.b32 p_, $2, 0;\n\t"
+        "cvt.rn.bf16.f32 h_, $1;\n\t@p_ st.global.b16 [$0], h_;\n}",
+        "l,f,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

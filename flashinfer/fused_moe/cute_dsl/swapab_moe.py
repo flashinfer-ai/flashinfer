@@ -66,7 +66,7 @@ SWAP_PERF_PROBE = int(os.environ.get("SWAPAB_PROBE", "0"))
 # Pipeline depth knobs (SWAPAB_STAGES / SWAPAB_ACC_STAGES override for tuning).
 SWAP_MAX_AB_STAGES = int(os.environ.get("SWAPAB_STAGES", "12"))
 SWAP_ACC_STAGES = int(os.environ.get("SWAPAB_ACC_STAGES", "2"))
-SWAP_TILE_STAGES = int(os.environ.get("SWAPAB_TILE_STAGES", "2"))
+SWAP_TILE_STAGES = int(os.environ.get("SWAPAB_TILE_STAGES", "8"))
 # bit 0: tile-major W1 (GEMM1), bit 1: tile-major W2 (GEMM2). Default: both.
 # Each 128x128 MMA tile becomes one contiguous 8 KB block so the weight TMA
 # streams whole DRAM pages (B300: GEMM1 -2%, GEMM2 -2.5% at T=16 balanced).
