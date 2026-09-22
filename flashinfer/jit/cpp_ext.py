@@ -76,7 +76,25 @@ def get_cuda_version() -> Version:
             raise RuntimeError(
                 f"Could not parse CUDA version from nvcc --version output: {txt}"
             )
-        return Version(matches[0])
+        cuda_version = Version(matches[0])
+        torch_cuda_version = (
+            Version(torch.version.cuda) if torch.version.cuda is not None else None
+        )
+        if (
+            torch_cuda_version is not None
+            and cuda_version.major != torch_cuda_version.major
+        ):
+            logger.warning(
+                "FlashInfer JIT resolved CUDA toolkit %s (version %s), but "
+                "PyTorch was built with CUDA %s. Cross-major CUDA JIT builds "
+                "may link against a CUDA runtime that is unavailable or "
+                "incompatible in worker processes. Set CUDA_HOME or CUDA_PATH "
+                "to the intended toolkit before compiling JIT modules.",
+                cuda_home,
+                cuda_version,
+                torch_cuda_version,
+            )
+        return cuda_version
     except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError) as e:
         # NOTE(Zihao): when nvcc is unavailable, fall back to torch.version.cuda
         if torch.version.cuda is None:
