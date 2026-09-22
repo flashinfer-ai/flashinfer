@@ -175,6 +175,50 @@ def test_lse_buffer_and_units(cudnn_available, base, return_lse):
     )
 
 
+@pytest.mark.parametrize("layout", ["decode", "fixed_multi", "compact"])
+@pytest.mark.parametrize("backend", ["cudnn", "auto"])
+def test_seq_lens_bound_valid_selected_slots(cudnn_available, layout, backend):
+    args = _inputs(rows=128, dim=576, topk=64)
+    args["query"].zero_()
+    kv = args["kv_cache"].view(-1, 576)
+    kv.copy_(torch.arange(len(kv), device="cuda")[:, None])
+    args["block_tables"].copy_(torch.arange(64, device="cuda"))
+    if layout == "fixed_multi":
+        args["query"] = args["query"].view(32, 4, 64, 576)
+        args["block_tables"] = args["block_tables"].view(32, 4, 64)
+        args["seq_lens"] = args["seq_lens"][:32]
+    elif layout == "compact":
+        args["query"] = args["query"].view(128, 64, 576)
+        args["block_tables"] = args["block_tables"].view(128, 64)
+        args["seq_lens"] = args["seq_lens"][:32]
+        lengths = torch.tensor([3, 5] * 16, device="cuda", dtype=torch.int32)
+        args["cum_seq_lens_q"] = torch.cat(
+            [torch.zeros(1, device="cuda", dtype=torch.int32), lengths.cumsum(0)]
+        ).int()
+        args["max_q_len"] = 5
+    args["seq_lens"].fill_(32)
+    args["seq_lens"][-1] = 65  # Also exercise the top-k capacity bound.
+    expected = trtllm_batch_decode_with_kv_cache_mla(
+        **{**args, "backend": "trtllm-gen"}
+    )
+    args["backend"] = backend
+    actual = trtllm_batch_decode_with_kv_cache_mla(**args)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # Ignoring seq_lens gives 31.5 instead of these causal-prefix averages.
+    first_mean = {"decode": 15.5, "fixed_multi": 14.0, "compact": 14.5}[layout]
+    assert actual.flatten()[0].item() == first_mean
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = trtllm_batch_decode_with_kv_cache_mla(**args)
+    args["seq_lens"].sub_(7)
+    actual.fill_(float("nan"))
+    graph.replay()
+    expected = trtllm_batch_decode_with_kv_cache_mla(
+        **{**args, "backend": "trtllm-gen"}
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "rows,layout", [(127, "fixed"), (128, "fixed"), (129, "compact"), (128, "prefill")]
 )

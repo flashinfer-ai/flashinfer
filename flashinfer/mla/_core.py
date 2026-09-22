@@ -3424,9 +3424,11 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     seq_lens : Optional[torch.Tensor]
         Per-request physical KV sequence lengths for dense and TRTLLM-GEN
         paths. With DCP these are rank-local lengths and continue to control
-        paging, memory bounds, and split-KV. cuDNN uses only the selected
-        physical token IDs and optional ``sparse_mla_top_k_lens``; it does not
-        derive a causal mask from ``seq_lens``. For
+        paging, memory bounds, and split-KV. For QK576, cuDNN also bounds the
+        active selected-list prefix by each query's causal sequence length
+        unless explicit ``sparse_mla_top_k_lens`` are supplied. This limits
+        selected-list slots, not the numerical values of physical token IDs.
+        QK512 uses the explicit per-query top-k lengths instead. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
@@ -3582,8 +3584,9 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         final request.
     sparse_mla_top_k_lens : Optional[torch.Tensor] = None
         Flattened active sparse top-k lengths, one INT32 value per query token.
-        Optional for cuDNN at either QK dimension; a missing length selects all
-        nonnegative in-bounds indices. cuDNN permits empty rows (zero output,
+        Optional for cuDNN at either QK dimension; when omitted at QK576,
+        ``seq_lens`` supplies causal per-query selected-list bounds. Otherwise
+        all nonnegative in-bounds indices are selected. cuDNN permits empty rows (zero output,
         positive-infinity LSE).
         Required by the native ``kv_lora_rank=512, qk_rope_head_dim=0``
         TRTLLM-GEN kernel. Sparse indices must be packed before any ``-1``

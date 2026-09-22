@@ -259,6 +259,29 @@ def try_cudnn_sparse_mla(
             sparse_mla_top_k_lens, (rows,), torch.int32, device, "sparse_mla_top_k_lens"
         )
 
+    # D576 TRTLLM bounds the selected-list prefix by each query's causal KV
+    # length, even when later slots contain valid physical IDs. D512 instead
+    # uses explicit per-query top-k lengths, independent of seq_lens.
+    topk_length = sparse_mla_top_k_lens
+    if topk_length is None and qk_rope_head_dim == 64 and seq_lens is not None:
+        if cum_seq_lens_q is None:
+            q_len = query.shape[1]
+            if q_len == 1:
+                topk_length = seq_lens.contiguous()
+            else:
+                positions = torch.arange(q_len, device=device, dtype=torch.int32)
+                topk_length = (
+                    (seq_lens[:, None] - q_len + positions[None, :] + 1)
+                    .reshape(rows)
+                    .clamp_min_(0)
+                )
+        else:
+            positions = torch.arange(rows, device=device, dtype=torch.int32)
+            requests = torch.searchsorted(cum_seq_lens_q[1:], positions, right=True)
+            topk_length = (
+                seq_lens[requests] - cum_seq_lens_q[requests + 1] + positions + 1
+            ).clamp_min_(0)
+
     shape = query.shape[:-1] + (512,)
     if out is None:
         out = torch.empty(shape, dtype=torch.bfloat16, device=device)
@@ -284,7 +307,7 @@ def try_cudnn_sparse_mla(
     q = query.view(rows, 64, query.shape[-1])
     kv = kv_cache.view(-1, query.shape[-1])
     indices = block_tables.view(rows, sparse_mla_top_k)
-    key = (device, query.shape[-1], sparse_mla_top_k, sparse_mla_top_k_lens is not None)
+    key = (device, query.shape[-1], sparse_mla_top_k, topk_length is not None)
     op = _operations.get(key)
     if op is None:
         if capturing:
@@ -292,7 +315,7 @@ def try_cudnn_sparse_mla(
                 "Warm up cudnn sparse MLA outside CUDA graph capture before using this configuration"
             )
         op = operation_type(
-            q, kv, indices, sample_topk_length=sparse_mla_top_k_lens, indexer_topk=0
+            q, kv, indices, sample_topk_length=topk_length, indexer_topk=0
         )
         op.check_support()
         op.compile()
@@ -300,7 +323,7 @@ def try_cudnn_sparse_mla(
         q,
         kv,
         indices,
-        topk_length=sparse_mla_top_k_lens,
+        topk_length=topk_length,
         softmax_scale=float(bmm1_scale),
         out=out.view(rows, 64, 512),
         max_logits=max_logits,
