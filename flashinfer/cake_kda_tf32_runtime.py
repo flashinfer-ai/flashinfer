@@ -4115,7 +4115,18 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             (num_parts, heads, HEAD_DIM, HEAD_DIM), dtype=torch.float32, device=q.device
         )
         self._main_final = torch.empty_like(self._main_initial)
-        map_dtype = torch.float32 if compute_dtype == "tf32" else torch.bfloat16
+        # Unbounded (softplus) gates decay slowly, so BF16 rounding of the
+        # near-identity part maps costs several 1e-3 rel L2 per composed part
+        # on real activations (8K: 0.0016 at part 1 -> 0.033 after 12 parts
+        # while the sequential fused path stays at Triton level).  Keep those
+        # maps in FP32 when the caller's state pool is FP32; the scan then
+        # composes FP32 maps exactly as the TF32 route does.
+        self._fp32_map = compute_dtype == "tf32" or (
+            lower_bound is None and self._external_state_is_fp32
+        )
+        if self._fp32_map and compute_dtype != "tf32":
+            self.schedule += "_fp32_map"
+        map_dtype = torch.float32 if self._fp32_map else torch.bfloat16
         self._map_initial = torch.zeros(
             (num_parts - 1, heads, HEAD_DIM, HEAD_DIM), dtype=map_dtype, device=q.device
         )
@@ -4292,7 +4303,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             )
         map_launch_cls = (
             FlashKDABlackwellFP32SlabM128PDLProducerLaunch
-            if compute_dtype == "tf32"
+            if self._fp32_map
             else FlashKDABlackwellBF16DirectM128PDLBridgeLaunch
         )
         self._map = map_launch_cls(
@@ -4322,12 +4333,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 )
             ),
         )
-        if compute_dtype == "bf16":
+        if not self._fp32_map:
             self._map.args["initial_state_f32"] = self._main_final
         self._scan_module = _build_kda_module(
             partial(_factory, "compiled_flashkda_split_scan_bf16_m128"),
             use_pdl=True,
-            compute_dtype=compute_dtype,
+            compute_dtype="tf32" if self._fp32_map else compute_dtype,
             backend=backend,
         )
         self._out_tail = out[:, first_part_tokens:]
