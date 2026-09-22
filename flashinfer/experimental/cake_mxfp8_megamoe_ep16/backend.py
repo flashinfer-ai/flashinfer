@@ -240,7 +240,9 @@ def _resolve_policy(
     )
     family = "mixed" if tile_n == "mixed" else f"n{tile_n}"
     segments = (
-        (32, 16, 16) if tile_n == "mixed" else (tile_n,) * (_EXPERT_ROWS // tile_n)
+        (tile_n,) * (_EXPERT_ROWS // tile_n)
+        if isinstance(tile_n, int)
+        else (32, 16, 16)
     )
     return f"{family}_{protocol}", segments
 

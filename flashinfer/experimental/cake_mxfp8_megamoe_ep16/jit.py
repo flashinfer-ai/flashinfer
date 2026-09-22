@@ -114,7 +114,7 @@ def _validate_sequence(csrc_root: Path, sequence: dict[str, Any]) -> None:
         or sequence.get("tile_n") != tile_n
         or sequence.get("return_protocol") != protocol
         or sequence.get("row_segments")
-        != ([32, 16, 16] if tile_n == "mixed" else [tile_n] * (64 // tile_n))
+        != ([tile_n] * (64 // tile_n) if isinstance(tile_n, int) else [32, 16, 16])
         or sequence.get("runtime_tokens_per_rank") != [1, 64]
         or sequence.get("launches_per_call") != 2
         or sequence.get("setup_launches") != 1
