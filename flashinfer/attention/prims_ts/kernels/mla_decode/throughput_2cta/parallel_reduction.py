@@ -221,28 +221,40 @@ def run_parallel_reduction_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane_idx = tidx % Int32(cfg.threads_per_warp)
-    cluster_rank = cute.arch.block_idx_in_cluster()
+    cluster_rank = Int32(0) if cluster_size == 1 else cute.arch.block_idx_in_cluster()
     row_in_tile = block_idx_x // Int32(cluster_size)
-    (
-        logical_head_idx,
-        logical_q_idx,
-        storage_q_idx,
-        query_is_valid,
-        active_split_kv,
-    ) = _parallel_reduction_row_state(
-        cfg.mma_qk_tiler[0],
-        num_heads,
-        seq_len_q,
-        is_var_split_kv,
-        cache_seqs,
-        cu_seqlens_q,
-        block_split_kvs,
-        split_kv,
-        row_in_tile,
-        query_tile_idx,
-        batch_idx,
-        cfg,
-    )
+    if cutlass.const_expr(finalize_attention):
+        # A sparse query is already one virtual request. The producer writes
+        # neutral LSE for skipped splits, so the compiled slot count suffices;
+        # live length loads and dynamic split division would repeat per head.
+        if cutlass.const_expr(seq_len_q != 1 or cu_seqlens_q is not None):
+            raise ValueError("final sparse reduction requires virtual query rows")
+        logical_head_idx = query_tile_idx * Int32(cfg.mma_qk_tiler[0]) + row_in_tile
+        logical_q_idx = Int32(0)
+        storage_q_idx = batch_idx
+        query_is_valid = logical_head_idx < Int32(num_heads)
+        active_split_kv = Int32(actual_splits)
+    else:
+        (
+            logical_head_idx,
+            logical_q_idx,
+            storage_q_idx,
+            query_is_valid,
+            active_split_kv,
+        ) = _parallel_reduction_row_state(
+            cfg.mma_qk_tiler[0],
+            num_heads,
+            seq_len_q,
+            is_var_split_kv,
+            cache_seqs,
+            cu_seqlens_q,
+            block_split_kvs,
+            split_kv,
+            row_in_tile,
+            query_tile_idx,
+            batch_idx,
+            cfg,
+        )
 
     element_idx = tidx * Int32(PARALLEL_REDUCTION_ELEMENTS_PER_THREAD)
     neg_inf = Float32(-Float32.inf)

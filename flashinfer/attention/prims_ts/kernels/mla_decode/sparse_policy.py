@@ -52,14 +52,8 @@ def _base_fp8(rows, heads, capacity, sm_count):
     long_list = capacity >= 8192
     m16_work = rows * ((heads + 15) // 16)
     m16_one_step_work = m16_work * ((capacity + 255) // 256)
-    use_keep = (
-        heads >= 64
-        and (
-            capacity > 1024
-            and m16_one_step_work > sm_count
-            or m16_work >= sm_count // 2
-        )
-        or (heads == 16 and rows == 1 and (capacity <= 256))
+    use_keep = heads >= 64 and (
+        capacity > 1024 and m16_one_step_work > sm_count or m16_work >= sm_count // 2
     )
     use_keep = use_keep or (long_list and heads >= 16 and (rows >= 8))
     use_keep = use_keep or (capacity <= 256 and heads >= 16)

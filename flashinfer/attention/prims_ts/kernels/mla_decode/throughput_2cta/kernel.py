@@ -1418,7 +1418,7 @@ class MlaDecodeTs:
                 ).launch(
                     grid=(
                         (
-                            self.num_heads
+                            min(self.num_heads, physical_tile_rows)
                             if self.fuse_sparse_reduction
                             else physical_tile_rows
                         )
@@ -1427,7 +1427,9 @@ class MlaDecodeTs:
                         batch_size,
                     ),
                     block=[PARALLEL_REDUCTION_THREADS, 1, 1],
-                    cluster=[topology.cluster_size, 1, 1],
+                    cluster=None
+                    if topology.cluster_size == 1
+                    else [topology.cluster_size, 1, 1],
                     stream=stream,
                     min_blocks_per_mp=1,
                     use_pdl=use_one_wave_reducer_pdl,
@@ -1697,10 +1699,29 @@ class MlaDecodeTs:
                 tile_sched_params.problem_shape_b_fdd,
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
-        _, tile_seq_q_idx, tile_batch_idx, tile_split_kv_idx = blk_coord
-        # The native reducer derives active splits from the same live
-        # combined-source extent. It never reads inactive workspace slots,
-        # so skipped CTAs need no separate sparse-only LSE initialization.
+        tile_cluster_idx, tile_seq_q_idx, tile_batch_idx, tile_split_kv_idx = blk_coord
+        if cutlass.const_expr(self.fuse_sparse_reduction):
+            # Final output uses a fixed-S reducer: neutral LSE slots let it
+            # avoid reloading source lengths and dividing split ranges in
+            # every output CTA. Active tiles publish their own statistics.
+            if tidx < Int32(cfg.mma_qk_tiler[0] // cfg.num_mma_ctas):
+                total_tiles = (Int32(cache_seqs[tile_batch_idx]) + Int32(127)) // Int32(
+                    128
+                )
+                _, local_tiles = runtime_split_tile_range(
+                    total_tiles, split_kv, tile_split_kv_idx
+                )
+                if local_tiles == Int32(0):
+                    row_in_tile = (
+                        tile_cluster_idx
+                        * Int32(cfg.mma_qk_tiler[0] // cfg.num_mma_ctas)
+                        + tidx
+                    )
+                    acc_lse[
+                        row_in_tile, tile_split_kv_idx, tile_seq_q_idx, tile_batch_idx
+                    ] = Float32(-Float32.inf)
+        del tile_cluster_idx
+
         fixed_nonempty_single_split = (
             not self.is_var_seq
             and not self.is_var_split_kv
@@ -2106,18 +2127,11 @@ class MlaDecodeTs:
         atten_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):
             if cutlass.const_expr(self.direct_sparse):
-                from ..sparse_views import SparseBatchLengthView
-
-                _, _, primary_lengths, extra_lengths, _, _, _, _, atten_sinks = (
-                    block_split_kvs
-                )
-                cache_seqs = SparseBatchLengthView((primary_lengths, extra_lengths))
+                atten_sinks = block_split_kvs[-1]
             else:
                 atten_sinks = cute.make_tensor(
                     block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
                 )
-            # Static sparse splitting uses the combined live extent above;
-            # this payload is not a variable-split tensor.
             block_split_kvs = None
         topology = self._reduction_topology()
         run_parallel_reduction_kernel(
