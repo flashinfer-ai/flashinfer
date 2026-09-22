@@ -203,6 +203,23 @@ def cake_sampling_route(
     return "pipeline"
 
 
+def _per_row_param(
+    value: torch.Tensor, batch: int, dtype: torch.dtype, name: str
+) -> torch.Tensor:
+    """Per-request sampling parameter as a contiguous ``[batch]`` tensor of the kernel dtype.
+
+    Same contract as the tensor form accepted by :mod:`flashinfer.sampling` (any integer or
+    floating dtype, one entry per row); the kernels read ``int32`` / ``float32`` only.
+    """
+    if value.dim() != 1 or value.shape[0] != batch:
+        raise ValueError(
+            f"{name}: expected a 1D tensor of shape (batch_size,), got {tuple(value.shape)}"
+        )
+    if not value.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    return value.to(dtype=dtype).contiguous()
+
+
 def _workspace(batch: int, slab: int, device: torch.device):
     key = (batch, slab, device.index or 0)
     ws = _WORKSPACES.get(key)
@@ -294,6 +311,10 @@ def top_k_top_p_sampling_from_probs(
 
     capability = _capability(probs.device)
     batch, vocab = probs.shape
+    if isinstance(top_k, torch.Tensor):
+        top_k = _per_row_param(top_k, batch, torch.int32, "top_k")
+    if isinstance(top_p, torch.Tensor):
+        top_p = _per_row_param(top_p, batch, torch.float32, "top_p")
     kmax = (
         top_k
         if isinstance(top_k, int)
