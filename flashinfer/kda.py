@@ -353,20 +353,10 @@ def recurrent_kda(
         # gated_delta_rule_mtp flag): outputs only, no state writes,
         # optional slot-indexed correction/kg caches. Handled ahead of the
         # prefill routing — none of the prefill-only features apply.
-        if backend in ("cake", "small-bh"):
+        if backend == "small-bh":
             raise ValueError(
                 f"backend={backend!r} has no frozen-state kernels; "
                 "disable_state_update=True requires the CuTe-DSL backends"
-            )
-        if output_final_state:
-            raise ValueError(
-                "output_final_state=True is incompatible with "
-                "disable_state_update=True (no state is produced)"
-            )
-        if num_accepted_tokens is not None:
-            raise ValueError(
-                "num_accepted_tokens applies to the state-updating fused "
-                "spec path, not the frozen-verify mode"
             )
         if (
             seq_order is not None
@@ -379,7 +369,7 @@ def recurrent_kda(
             raise ValueError(
                 "prefill-only arguments are incompatible with disable_state_update=True"
             )
-        return _kda_decode._run_frozen_recurrent_kda(
+        return _kda_decode._dispatch_recurrent_kda_decode(
             q=q,
             k=k,
             v=v,
@@ -388,19 +378,23 @@ def recurrent_kda(
             A_log=A_log,
             dt_bias=dt_bias,
             scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
             ssm_state_indices=ssm_state_indices,
             num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
             output=output,
-            initial_state=initial_state,
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
             beta_is_logit=beta_is_logit,
+            disable_state_update=disable_state_update,
             correction_cache=correction_cache,
             kg_cache=kg_cache,
+            backend=backend,
         )
 
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
@@ -764,12 +758,9 @@ def recurrent_kda(
             "seq_order is only supported by eligible packed ordinary "
             "SM100-family prefill"
         )
-    if _kda_decode._run_recurrent_kda is None:
-        raise NotImplementedError("recurrent KDA backend is unavailable")
-
     # An explicit small-BH request either returned or raised in prefill dispatch.
     assert backend != "small-bh"
-    return _kda_decode._run_recurrent_kda(
+    return _kda_decode._dispatch_recurrent_kda_decode(
         q=q,
         k=k,
         v=v,
@@ -791,6 +782,9 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        disable_state_update=disable_state_update,
+        correction_cache=correction_cache,
+        kg_cache=kg_cache,
         backend=backend,
     )
 

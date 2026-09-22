@@ -47,7 +47,7 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.kda_decode import recurrent_kda
+from flashinfer import recurrent_kda
 from flashinfer.testing import bench_gpu_time
 
 

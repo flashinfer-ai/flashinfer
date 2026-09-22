@@ -396,6 +396,62 @@ def test_frozen_state_rejects_checkpoint_state_indices():
         )
 
 
+@pytest.mark.parametrize("backend", ["auto", "cute-dsl"])
+def test_frozen_state_uses_shared_decode_dispatcher_before_prefill(
+    monkeypatch, backend
+):
+    calls = []
+    sentinel = (object(), None)
+    dispatch = kda_decode_api._dispatch_recurrent_kda_decode
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        return dispatch(**kwargs)
+
+    monkeypatch.setattr(kda_decode_api, "_dispatch_recurrent_kda_decode", run)
+    monkeypatch.setattr(
+        kda_decode_api, "_run_frozen_recurrent_kda", lambda **kwargs: sentinel
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_plain_multi_token_prefill",
+        lambda *args: pytest.fail("frozen-state calls must bypass prefill selection"),
+    )
+    correction_cache = object()
+    kg_cache = object()
+
+    assert (
+        recurrent_kda(
+            **cpu_route_tensors(),
+            disable_state_update=True,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+            backend=backend,
+        )
+        is sentinel
+    )
+    assert len(calls) == 1
+    assert calls[0]["disable_state_update"] is True
+    assert calls[0]["backend"] == backend
+    assert calls[0]["correction_cache"] is correction_cache
+    assert calls[0]["kg_cache"] is kg_cache
+
+
+@pytest.mark.parametrize("backend", ["cake", "small-bh"])
+def test_frozen_state_rejects_unsupported_backends(monkeypatch, backend):
+    monkeypatch.setattr(
+        kda_decode_api,
+        "_run_frozen_recurrent_kda",
+        lambda **kwargs: pytest.fail("unsupported frozen-state backend must not run"),
+    )
+    with pytest.raises(ValueError, match="has no frozen-state kernels"):
+        recurrent_kda(
+            **cpu_route_tensors(),
+            disable_state_update=True,
+            backend=backend,
+        )
+
+
 def test_auto_backend_selects_small_bh_at_half_sm_count_boundary(monkeypatch):
     sentinel = (object(), object())
     monkeypatch.setattr(kda_api, "is_cute_dsl_available", lambda: True)
