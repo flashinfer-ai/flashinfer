@@ -48,6 +48,7 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
     hopper_mxfp4_tuning_provenance,
     hopper_mxfp4_runtime_candidates,
     hopper_mxfp4_runtime_candidates_for_shape,
+    is_hopper_mxfp4_tactic_shape_compatible,
     normalize_hopper_mxfp4_routing_profile,
 )
 
@@ -926,26 +927,46 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
         for candidate in candidates:
             resolve_mxfp4_tactic_optimizations(candidate, **_OPTIMIZATION_SHAPE)
 
-    def test_tail_catalog_scope_does_not_restrict_explicit_kernel_tactics(self):
-        explicit_tail = _optimization_anchor(
-            cluster_shape_mnk=(1, 2, 1), tail_split_pairs=True
-        )
+    def test_tail_catalog_filters_candidates_for_each_model_shape(self):
         for override in (
             {"hidden": 4096},
             {"intermediate": 4096},
             {"num_experts": 192},
             {"world_size": 8},
+            {"hidden": 384},
+            {"intermediate": 384},
+            {"hidden": 128, "intermediate": 128, "num_experts": 6, "world_size": 2},
         ):
-            shape = dict(_OPTIMIZATION_SHAPE, **override)
-            base = hopper_mxfp4_ordered_candidates(
-                2048, hidden=shape["hidden"], intermediate=shape["intermediate"]
-            )
-            actual = hopper_mxfp4_optimization_candidates(2048, **shape)
-            self.assertEqual(
-                actual, expand_mxfp4_optimization_candidates(base, **shape)
-            )
-            self.assertTrue(all(not c["tail_split_pairs"] for c in actual))
-            resolve_mxfp4_tactic_optimizations(explicit_tail, **shape)
+            with self.subTest(override=override):
+                shape = dict(_OPTIMIZATION_SHAPE, **override)
+                base = hopper_mxfp4_ordered_candidates(
+                    2048, hidden=shape["hidden"], intermediate=shape["intermediate"]
+                )
+                previous = expand_mxfp4_optimization_candidates(base, **shape)
+                actual = hopper_mxfp4_optimization_candidates(2048, **shape)
+                self.assertEqual(actual[: len(previous)], previous)
+                tails = [c for c in actual if c["tail_split_pairs"]]
+                self.assertTrue(tails)
+                self.assertTrue(all(c["fc1_ready_mode"] == "tile" for c in actual))
+                if shape["hidden"] != 7168:
+                    self.assertTrue(all(not c["fc2_tail_n8"] for c in actual))
+                if shape["hidden"] % 256 or shape["intermediate"] % 256:
+                    self.assertTrue(all(c["mma_tiler_mnk"][2] == 128 for c in actual))
+                for token in MXFP4_TUNING_TOKEN_BUCKETS:
+                    seed = normalize_mxfp4_optimization_tactic(
+                        hopper_mxfp4_default_tactic(token)
+                    )
+                    tail = dict(
+                        seed, cluster_shape_mnk=(1, 2, 1), tail_split_pairs=True
+                    )
+                    if is_hopper_mxfp4_tactic_shape_compatible(
+                        tail, hidden=shape["hidden"], intermediate=shape["intermediate"]
+                    ):
+                        self.assertIn(tail, tails)
+                    else:
+                        self.assertNotIn(tail, actual)
+                for candidate in actual:
+                    resolve_mxfp4_tactic_optimizations(candidate, **shape)
 
     def test_historical_fused_manifests_are_unchanged(self):
         for profile in MXFP4_TUNING_ROUTING_PROFILES:

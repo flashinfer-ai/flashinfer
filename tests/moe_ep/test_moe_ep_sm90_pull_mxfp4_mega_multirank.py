@@ -780,6 +780,60 @@ def test_moe_ep_sm90_pull_mxfp4_tail_pairs_independent_oracle(
     )
 
 
+@pytest.mark.gpu_2
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "hidden,intermediate,local_experts,tokens,tile,tail_n8",
+    [
+        pytest.param(384, 384, 3, 12, (256, 32, 128), False, id="k128-only"),
+        pytest.param(
+            768, 512, 3, 12, (256, 16, 256), False, id="k256-odd-weight-tiles"
+        ),
+        pytest.param(4096, 768, 4, 16, (256, 64, 256), False, id="wide-hidden"),
+        pytest.param(7168, 512, 4, 4, (256, 64, 256), True, id="n8-tail"),
+    ],
+)
+def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
+    monkeypatch, hidden, intermediate, local_experts, tokens, tile, tail_n8
+):
+    """Execute normal tuning candidates beyond the original model/EP shape."""
+    import sys
+
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        hopper_mxfp4_optimization_candidates,
+    )
+
+    module = sys.modules[__name__]
+    for field, value in (
+        ("HIDDEN", hidden),
+        ("INTERMEDIATE", intermediate),
+        ("LOCAL_EXPERTS", local_experts),
+        ("TOKENS_PER_RANK", tokens),
+    ):
+        monkeypatch.setattr(module, field, value)
+    _, world_size, _ = _launcher_ranks()
+    candidates = hopper_mxfp4_optimization_candidates(
+        tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=local_experts * world_size,
+        world_size=world_size,
+    )
+    tactic = next(
+        candidate
+        for candidate in candidates
+        if candidate["tail_split_pairs"]
+        and candidate["mma_tiler_mnk"] == tile
+        and candidate["fc2_tail_n8"] == tail_n8
+    )
+    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+        "cross_rank",
+        tactic=tactic,
+        expected_kernel={"tail_split_pairs": True},
+        expected_policy={"fc2_tail_n8": tail_n8},
+    )
+
+
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(

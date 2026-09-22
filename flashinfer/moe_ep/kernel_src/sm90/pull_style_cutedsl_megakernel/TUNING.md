@@ -497,10 +497,11 @@ For that model/EP domain, the live union now retains those 23 and adds three
 measured large-token configurations plus 12 distinct tail-pair neighbors: 38
 candidates total. Each neighbor retains the original tile, communication and
 group/stage settings, changes the cluster to `(1,2,1)` and uses whole-tile
-readiness. Existing N8 selection is retained where legal. This initial tuning
-coverage is not a kernel restriction: other models retain the original tuning
-domain and can still use explicit legal tail-pair tactics. The frozen default
-buckets are unchanged.
+readiness. Existing N8 selection is retained where legal. Every model considers
+this same bounded extension catalog, filtering each candidate by tile alignment
+and the existing N8/readiness eligibility rules. There is no exact-model
+whitelist for tail pairs; the final count depends on which candidates are legal
+for the model and EP size. The frozen default buckets are unchanged.
 
 Online and offline tuning call the same
 `hopper_mxfp4_optimization_candidates`; token capacity changes ordering, not
@@ -587,9 +588,10 @@ Unsupported combinations reject before allocation. Applying a legacy tactic
 releases the old workspace. Benchmark spellings remain `--mxfp4-fc2-tail-n8`
 and `--mxfp4-fc1-ready-mode k256`; no additional tail-pair CLI option is added.
 Actual strategies enter the runtime and compiled identities. The cache
-provenance records the normal candidate union's tail-pair domain, exact
-extension strategies and initial model scope separately. Previous 23-candidate
-cache rows miss after this extension; frozen manifests remain unchanged.
+provenance records the exact extension strategies and per-candidate eligibility
+policy. Cache rows from the previous model-whitelisted domain miss after this
+change, so newly eligible candidates participate in the next live tune. Frozen
+manifests remain unchanged.
 `fused_local_v2` invalidates earlier fused winners after
 correcting the bulk weight-offset completion notification. Bulk copies retain
 their transaction-byte tracking and use ordinary producer barrier arrivals;

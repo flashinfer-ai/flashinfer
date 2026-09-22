@@ -30,11 +30,6 @@ from .mxfp4_tuner import (
 
 MXFP4_STRATEGY_FIELDS = frozenset({"fc2_tail_n8", "fc1_ready_mode", "tail_split_pairs"})
 
-# Initial live-tuning coverage, not a restriction on explicit legal tactics.
-_TAIL_PAIR_TUNING_SHAPE = dict(
-    hidden=7168, intermediate=3072, num_experts=384, world_size=4
-)
-
 
 def normalize_mxfp4_optimization_tactic(
     tactic: Mapping[str, Any],
@@ -206,9 +201,9 @@ def _tail_pair_candidate_extensions() -> list[dict[str, Any]]:
 
 
 def mxfp4_tail_candidate_provenance() -> dict[str, Any]:
-    """Bind the limited model scope and exact added strategies into the cache."""
+    """Bind per-candidate eligibility and exact added strategies into the cache."""
     return {
-        "model": dict(_TAIL_PAIR_TUNING_SHAPE),
+        "eligibility": "per_candidate_v1",
         "candidate_union_sha256": mxfp4_optimization_candidate_sha256(
             _tail_pair_candidate_extensions()
         ),
@@ -242,8 +237,8 @@ def hopper_mxfp4_optimization_candidates(
         world_size=world_size,
     )
     result = expand_mxfp4_optimization_candidates(base, **shape)
-    if shape == _TAIL_PAIR_TUNING_SHAPE:
-        for candidate in _tail_pair_candidate_extensions():
+    for candidate in _tail_pair_candidate_extensions():
+        try:
             resolve_mxfp4_tactic_optimizations(
                 candidate,
                 hidden=hidden,
@@ -251,8 +246,10 @@ def hopper_mxfp4_optimization_candidates(
                 num_experts=num_experts,
                 world_size=world_size,
             )
-            if candidate not in result:
-                result.append(candidate)
+        except ValueError:
+            continue
+        if candidate not in result:
+            result.append(candidate)
     return result
 
 
