@@ -35,6 +35,14 @@ if is_cute_dsl_available():
         cute_dsl_fused_moe_bf16,
         CuteDslBf16MoEWrapper,
     )
+    from .mxfp4 import (
+        CuteDslMxfp4MoEWrapper,
+        Mxfp4MoEParallelLayout,
+        Mxfp4MoEPlan,
+        Mxfp4MoERankLayout,
+        mxfp4_moe_capability,
+        resolve_mxfp4_moe_layout,
+    )
 
 
 __all__ = [
@@ -52,4 +60,10 @@ if is_cute_dsl_available():
         "B12xMoEWrapper",
         "cute_dsl_fused_moe_bf16",
         "CuteDslBf16MoEWrapper",
+        "CuteDslMxfp4MoEWrapper",
+        "Mxfp4MoEParallelLayout",
+        "Mxfp4MoEPlan",
+        "Mxfp4MoERankLayout",
+        "mxfp4_moe_capability",
+        "resolve_mxfp4_moe_layout",
     ]

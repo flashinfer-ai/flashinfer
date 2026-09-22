@@ -39,6 +39,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
+    UnalignedNamedBarrier,
     blk_copy,
     blk_reduce_bf16,
     blk_reduce_fp16,
@@ -46,6 +47,8 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    tcgen05_fence_after_thread_sync,
+    tcgen05_fence_before_thread_sync,
 )
 
 """
@@ -367,6 +370,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        enable_narrow_a: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -390,6 +394,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        # Opted in only by the planned unique-ID decode path. The compiled
+        # finalize cache includes this flag independently of runtime T.
+        self.enable_narrow_a = enable_narrow_a
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -431,21 +438,43 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             barrier_id=1,
             num_threads=self.threads_per_cta,
         )
-        self.epilog_sync_barrier = pipeline.NamedBarrier(
+        self.epilog_sync_barrier = UnalignedNamedBarrier(
             barrier_id=2,
             num_threads=32 * len(self.epilog_warp_id),
         )
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+        self.tmem_alloc_barrier = UnalignedNamedBarrier(
             barrier_id=3,
             num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
-        self.sched_sync_barrier = pipeline.NamedBarrier(
+        self.sched_sync_barrier = UnalignedNamedBarrier(
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
+
+    def _validate_narrow_a_config(self):
+        """Validate static narrow-A mode outside CuTe Boolean preprocessing."""
+        if not self.enable_narrow_a:
+            return
+        if not (
+            self.a_dtype is cutlass.Float8E4M3FN
+            and self.b_dtype is cutlass.Float4E2M1FN
+            and self.sf_dtype is cutlass.Float8E8M0FNU
+            and self.sf_vec_size == 32
+            and self.out_dtype is cutlass.BFloat16
+            and self.cta_tile_shape_mnk[:2] == (128, 128)
+            and self.cluster_shape_mn == (1, 1)
+            and self.a_major_mode == tcgen05.OperandMajorMode.K
+            and self.b_major_mode == tcgen05.OperandMajorMode.K
+            and not self.use_2cta_instrs
+            and not self.enable_pdl
+            and self.use_fused_finalize
+        ):
+            raise ValueError(
+                "narrow A requires M128/N128/cluster1 MXFP8xMXFP4 BF16 fused mode"
+            )
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -712,6 +741,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
+        self._validate_narrow_a_config()
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
@@ -749,19 +779,34 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(
-                self.smem_alloc_a_dtype
-                if self.needs_unpack and self.a_dtype.width < 8
-                else None
-            ),
-        )
+        if cutlass.const_expr(self.enable_narrow_a):
+            # Same physical swizzle and K-major row offsets as the first 16
+            # rows of the full M128 MMA buffer. Storage/stages stay unchanged.
+            a_smem_layout = cute.make_composed_layout(
+                self.a_smem_layout_staged.inner,
+                0,
+                cute.make_layout(
+                    (16, self.mma_tiler[2], 1),
+                    stride=(self.mma_tiler[2], 1, 16 * self.mma_tiler[2]),
+                ),
+            )
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                a_op, a, a_smem_layout, (16, self.mma_tiler[2], 1)
+            )
+        else:
+            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+                a_op,
+                a,
+                a_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=(
+                    self.smem_alloc_a_dtype
+                    if self.needs_unpack and self.a_dtype.width < 8
+                    else None
+                ),
+            )
 
         # Setup TMA load for B
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
@@ -1298,13 +1343,41 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), loopM, loopK, loopL)
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
-        )
+        if cutlass.const_expr(not self.enable_narrow_a):
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                block_in_cluster_coord_vmnk[2],
+                a_cta_layout,
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(tCgA, 0, 3),
+            )
+        else:
+            # Generic TMA descriptor uses 16-row tiles. Its global M tile
+            # coordinate is multiplied by 8 below to retain original M128
+            # expert/tile spacing. Only the first16 rows in each SMEM stage
+            # are destinations; the original full stage stride is retained.
+            narrow_sA = cute.make_tensor(
+                sA.iterator,
+                cute.make_layout(
+                    (16, self.mma_tiler[2], 1, self.num_ab_stage),
+                    stride=(
+                        self.mma_tiler[2],
+                        1,
+                        16 * self.mma_tiler[2],
+                        128 * self.mma_tiler[2],
+                    ),
+                ),
+            )
+            narrow_gA = cute.local_tile(
+                mA_mkl, (16, self.mma_tiler[2], 1), (None, None, None)
+            )
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(narrow_sA, 0, 3),
+                cute.group_modes(narrow_gA, 0, 3),
+            )
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
@@ -1588,7 +1661,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), loopK)
-                tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
+                a_tile_m = mma_tile_coord_mnl[0]
+                if cutlass.const_expr(self.enable_narrow_a):
+                    a_tile_m = a_tile_m * 8
+                tAgA_slice = tAgA[(None, a_tile_m, None, 0)]
                 # ((atom_v, rest_v), loopK)
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
@@ -1697,7 +1773,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
-            tmem.wait_for_alloc()
+            # TmemAllocator reconstructs its barrier as an aligned NamedBarrier
+            # across DSL regions. Preserve our explicit unaligned barrier here.
+            self.tmem_alloc_barrier.arrive_and_wait()
 
             #
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -1830,6 +1908,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
+                    tcgen05_fence_after_thread_sync()
                 #
                 # Reset the ACCUMULATE field for each tile
                 #
@@ -2024,7 +2103,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
-            tmem.wait_for_alloc()
+            self.tmem_alloc_barrier.arrive_and_wait()
 
             #
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -2109,6 +2188,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 # Wait for accumulator buffer full
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                tcgen05_fence_after_thread_sync()
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 #
@@ -2136,6 +2216,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
+                            tcgen05_fence_before_thread_sync()
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
@@ -2164,6 +2245,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
                     cute.arch.fence_view_async_tmem_load()
+                    tcgen05_fence_before_thread_sync()
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 

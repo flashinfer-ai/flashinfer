@@ -2420,6 +2420,204 @@ def _interleave_linear_and_gate(
     return x
 
 
+def prepare_cute_dsl_mxfp4_weights(
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare native packed MXFP4 weights for CuTe-DSL W4A8 without requantizing.
+
+    The canonical inputs are contiguous uint8 tensors on the same device:
+
+    * ``w1``: ``[E, 2 * I, H // 2]``, with the up rows followed by gate rows.
+    * ``w1_scale``: ``[E, 2 * I, H // 32]`` linear UE8M0 scale bytes.
+    * ``w2``: ``[E, H, I // 2]`` packed E2M1 down-projection weights.
+    * ``w2_scale``: ``[E, H, I // 32]`` linear UE8M0 scale bytes.
+
+    ``H`` and ``I`` must be positive multiples of 128. Each byte stores two
+    E2M1 values in their original nibble order; one scale covers 32 values.
+    Scale bytes encode UE8M0 directly, so unity is byte 127, not an E4M3 one.
+
+    Returns ``(w1_prepared, w1_sf_mma, w2, w2_sf_mma)``. W1 rows and their
+    scales are interleaved in 64-row up/gate groups. Scale outputs use the
+    strided six-dimensional MMA layout expected by the W4A8 kernels. All
+    payload and scale bytes are preserved exactly; W2 storage is reused.
+
+    This load-time operation allocates the prepared W1 and scale storage.
+    It does not cache or retain the source tensors: callers may release the
+    original W1 and linear scales after preparation. Run before graph capture.
+    """
+    for name, tensor in (
+        ("w1", w1),
+        ("w1_scale", w1_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+    ):
+        if tensor.dtype != torch.uint8 or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a three-dimensional uint8 tensor")
+        if tensor.device != w1.device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous and on the W1 device")
+
+    experts, hidden, packed_intermediate = w2.shape
+    intermediate = packed_intermediate * 2
+    if experts <= 0 or min(hidden, intermediate) <= 0:
+        raise ValueError("expert count and matrix dimensions must be positive")
+    if hidden % 128 or intermediate % 128:
+        raise ValueError(
+            "MXFP4 hidden and intermediate dimensions must be multiples of 128"
+        )
+    expected = (
+        ("w1", w1, (experts, 2 * intermediate, hidden // 2)),
+        ("w1_scale", w1_scale, (experts, 2 * intermediate, hidden // 32)),
+        ("w2_scale", w2_scale, (experts, hidden, intermediate // 32)),
+    )
+    for name, tensor, shape in expected:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+            )
+
+    def to_mma_layout(scale: torch.Tensor) -> torch.Tensor:
+        # Linear [E, M, K/32] -> physical [E, M/128, K/128, 32, 4, 4].
+        # Within a 128-row tile, the row index is inner_m * 32 + outer_m.
+        groups, rows, blocks = scale.shape
+        physical = (
+            scale.view(groups, rows // 128, 4, 32, blocks // 4, 4)
+            .permute(0, 1, 4, 3, 2, 5)
+            .contiguous()
+        )
+        # Logical MMA axes: [outer_m, inner_m, M/128, inner_k, K/128, E].
+        return physical.permute(3, 4, 1, 5, 2, 0)
+
+    w1_prepared = _interleave_linear_and_gate(w1, group_size=64, dim=1)
+    w1_scale_interleaved = _interleave_linear_and_gate(w1_scale, group_size=64, dim=1)
+    return (
+        w1_prepared,
+        to_mma_layout(w1_scale_interleaved),
+        w2,
+        to_mma_layout(w2_scale),
+    )
+
+
+def _check_canonical_cute_dsl_mxfp4_weights(w1, w1_scale, w2, w2_scale):
+    """Validate the canonical unsharded layout; return (E, H, I)."""
+    for name, tensor in (
+        ("w1", w1),
+        ("w1_scale", w1_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+    ):
+        if tensor.dtype != torch.uint8 or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a three-dimensional uint8 tensor")
+        if tensor.device != w1.device:
+            raise ValueError(f"{name} must be on the W1 device")
+    experts, hidden, packed_intermediate = w2.shape
+    intermediate = packed_intermediate * 2
+    if experts <= 0 or min(hidden, intermediate) <= 0:
+        raise ValueError("expert count and matrix dimensions must be positive")
+    if hidden % 128 or intermediate % 128:
+        raise ValueError(
+            "MXFP4 hidden and intermediate dimensions must be multiples of 128"
+        )
+    expected = (
+        ("w1", w1, (experts, 2 * intermediate, hidden // 2)),
+        ("w1_scale", w1_scale, (experts, 2 * intermediate, hidden // 32)),
+        ("w2_scale", w2_scale, (experts, hidden, intermediate // 32)),
+    )
+    for name, tensor, shape in expected:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+            )
+    return experts, hidden, intermediate
+
+
+def shard_cute_dsl_mxfp4_weights(
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    moe_tp_size: int = 1,
+    moe_tp_rank: int = 0,
+    copy: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Slice canonical unsharded MXFP4 weights into one rank's shard.
+
+    Inputs are the canonical ``prepare_cute_dsl_mxfp4_weights`` layouts for
+    all ``E`` experts with the global intermediate size ``I``: ``w1``
+    ``[E, 2*I, H//2]`` in [up, gate] row order, ``w1_scale`` ``[E, 2*I, H//32]``,
+    ``w2`` ``[E, H, I//2]`` and ``w2_scale`` ``[E, H, I//32]``. The returned
+    tuple has the same order and is the canonical input of
+    ``prepare_cute_dsl_mxfp4_weights`` for the rank-local runner layout.
+
+    Expert parallelism (``ep_size > 1``) returns experts
+    ``[ep_rank*E/ep_size, (ep_rank+1)*E/ep_size)`` with the full intermediate
+    dimension. MoE tensor parallelism (``moe_tp_size > 1``) returns every
+    expert with ``Is = I/moe_tp_size`` intermediate columns: W1 up rows
+    ``[r*Is, (r+1)*Is)`` followed by gate rows ``[I + r*Is, I + (r+1)*Is)``,
+    W2 packed columns ``[r*Is/2, (r+1)*Is/2)`` and W2 scale columns
+    ``[r*Is/32, (r+1)*Is/32)``. Both sizes above one is a hybrid layout and
+    raises. Selection is deterministic and depends only on these explicit
+    arguments, never on tensor contents.
+
+    Memory: expert-parallel shards are contiguous views of the input storage
+    (no bytes are copied, and the views keep the full bank alive) unless
+    ``copy=True``, which clones only the shard. Tensor-parallel shards are
+    always new shard-sized allocations because their rows/columns are not
+    contiguous in the bank; no full-size duplicate is created. Release the
+    canonical bank afterwards if no other rank on this device needs it.
+    """
+    experts, hidden, intermediate = _check_canonical_cute_dsl_mxfp4_weights(
+        w1, w1_scale, w2, w2_scale
+    )
+    for name, size, rank in (
+        ("ep", ep_size, ep_rank),
+        ("moe_tp", moe_tp_size, moe_tp_rank),
+    ):
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError(f"require {name}_size >= 1 and 0 <= {name}_rank < size")
+    if ep_size > 1 and moe_tp_size > 1:
+        raise ValueError(
+            "hybrid expert/tensor parallelism is unsupported: "
+            f"ep_size={ep_size} and moe_tp_size={moe_tp_size} both exceed 1"
+        )
+    if moe_tp_size > 1:
+        if intermediate % moe_tp_size or (intermediate // moe_tp_size) % 128:
+            raise ValueError(
+                f"intermediate size {intermediate} must split into moe_tp_size="
+                f"{moe_tp_size} shards that are multiples of 128"
+            )
+        shard = intermediate // moe_tp_size
+        up = moe_tp_rank * shard
+        gate = intermediate + up
+
+        def rows(tensor):
+            return torch.cat(
+                (tensor.narrow(1, up, shard), tensor.narrow(1, gate, shard)), dim=1
+            )
+
+        return (
+            rows(w1),
+            rows(w1_scale),
+            w2.narrow(2, up // 2, shard // 2).contiguous(),
+            w2_scale.narrow(2, up // 32, shard // 32).contiguous(),
+        )
+    if experts % ep_size:
+        raise ValueError(
+            f"expert count {experts} must be divisible by ep_size={ep_size}"
+        )
+    local = experts // ep_size
+    shards = tuple(
+        tensor.narrow(0, ep_rank * local, local).contiguous()
+        for tensor in (w1, w1_scale, w2, w2_scale)
+    )
+    return tuple(t.clone() for t in shards) if copy else shards
+
+
 def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
