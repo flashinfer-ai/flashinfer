@@ -466,6 +466,57 @@ def test_mla_decode_cutile_cuda_graph_replays_mutated_plan_metadata():
 # Prepared kernel ABI, launch limits, and execution lifetime.
 
 
+@pytest.mark.parametrize("fail_load", [False, True])
+def test_cutile_library_budget_preserves_cached_kernels(monkeypatch, fail_load):
+    from flashinfer.mla._batch_mla._backends import _cutile_prepared as prepared
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    driver = pytest.importorskip("cuda.bindings.driver")
+    compilation = pytest.importorskip("cuda.tile.compilation")
+    # Isolate ownership; fake libraries must never enter the real process cache.
+    monkeypatch.setattr(prepared, "_LOADED_LIBRARIES", {})
+    monkeypatch.setattr(prepared, "_MAX_LOADED_LIBRARIES", 2)
+    loaded, unloaded, exported = [], [], []
+
+    def load(*args):
+        library = len(loaded) + 1
+        loaded.append(library)
+        return (0, library)
+
+    monkeypatch.setattr(driver, "cuLibraryLoadData", load)
+    monkeypatch.setattr(driver, "cuLibraryGetKernel", lambda lib, _: (0, lib * 10))
+    monkeypatch.setattr(driver, "cuKernelGetFunction", lambda fn: (0, fn))
+    monkeypatch.setattr(driver, "cuLibraryUnload", lambda lib: unloaded.append(lib))
+    monkeypatch.setattr(compilation, "KernelSignature", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        compilation, "export_kernel", lambda *args, **kwargs: exported.append(True)
+    )
+    kernel = object()
+
+    def prepare(signature):
+        with prepared._COMPILE_LOCK:
+            return prepared._load_kernel(kernel, (signature,), "decode", "sm_100a", 0)
+
+    if fail_load:
+        with monkeypatch.context() as failed:
+            failed.setattr(driver, "cuKernelGetFunction", lambda fn: (1, None))
+            with pytest.raises(RuntimeError, match="CUDA driver call failed"):
+                prepare(0)
+        assert unloaded == [1]
+        assert not prepared._LOADED_LIBRARIES
+
+    first, second = prepare(0), prepare(1)
+    with pytest.raises(_BackendPlanUnsupportedError, match="library.*limit"):
+        prepare(2)
+    assert prepare(0) == first
+    assert prepare(1) == second
+    assert len(prepared._LOADED_LIBRARIES) == 2
+    assert len(exported) == len(loaded) == 2 + int(fail_load)
+    assert unloaded == ([1] if fail_load else [])
+
+
 def _argument_array(shape, strides):
     return SimpleNamespace(shape=shape, stride=lambda: strides, data_ptr=lambda: 4096)
 
@@ -742,7 +793,27 @@ def test_cutile_binary_lifetime_survives_preparer_collection(
     )
     assert second.run(query=query, kv_cache=cache, out=out) is out
     torch.testing.assert_close(out, torch.full_like(out, 2.0))
-    assert _cutile_prepared._LOADED_LIBRARIES
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        second.run(query=query, kv_cache=cache, out=out)
+    del second
+    gc.collect()
+    # A refused new specialization must not evict code held by this graph.
+    monkeypatch.setattr(
+        _cutile_prepared,
+        "_MAX_LOADED_LIBRARIES",
+        len(_cutile_prepared._LOADED_LIBRARIES),
+    )
+    with (
+        pytest.raises(
+            _cutile_prepared._BackendPlanUnsupportedError, match="library.*limit"
+        ),
+        _cutile_prepared._COMPILE_LOCK,
+    ):
+        _cutile_prepared._load_kernel(object(), (), "new", "sm_100a", 0)
+    out.fill_(math.nan)
+    graph.replay()
+    torch.testing.assert_close(out, torch.full_like(out, 2.0))
 
 
 if __name__ == "__main__":

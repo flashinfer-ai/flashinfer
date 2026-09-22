@@ -18,9 +18,12 @@ from ._capabilities import _BackendPlanUnsupportedError
 
 
 _COMPILE_LOCK = threading.Lock()
-# CUDA graphs can outlive the Python wrapper that captured them. Keep loaded
-# libraries alive until process teardown, including after replans/cache changes.
-_LOADED_LIBRARIES = []
+# CUDA graphs can outlive their wrappers: never evict loaded code. Bound both
+# signatures and libraries process-wide by admitting at most 128 exports (a
+# split-KV plan can need two). At capacity, cached signatures remain usable;
+# new signatures raise a typed refusal so auto can try another backend.
+_MAX_LOADED_LIBRARIES = 128
+_LOADED_LIBRARIES: dict[tuple, tuple] = {}
 
 
 def _check(result):
@@ -97,9 +100,17 @@ def _array(compilation, ct, dtype, shape, *, aliases=(), strides=None, divisible
     return compilation.ArrayConstraint(dtype, len(shape), **kwargs)
 
 
-@functools.cache
 def _load_kernel(kernel, parameters, symbol, architecture, device_index):
     # Only called under _COMPILE_LOCK during plan, never on the run path.
+    key = (kernel, parameters, symbol, architecture, device_index)
+    cached = _LOADED_LIBRARIES.get(key)
+    if cached is not None:
+        return cached[1]
+    if len(_LOADED_LIBRARIES) >= _MAX_LOADED_LIBRARIES:
+        raise _BackendPlanUnsupportedError(
+            f"cuTile MLA loaded-library limit ({_MAX_LOADED_LIBRARIES}) reached; "
+            "existing kernels remain available, but new specializations cannot be loaded."
+        )
     from cuda.bindings import driver
     from cuda.tile import compilation
 
@@ -123,7 +134,7 @@ def _load_kernel(kernel, parameters, symbol, architecture, device_index):
     except BaseException:
         driver.cuLibraryUnload(library)
         raise
-    _LOADED_LIBRARIES.append(library)
+    _LOADED_LIBRARIES[key] = (library, function)
     return function
 
 

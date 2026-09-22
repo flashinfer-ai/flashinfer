@@ -59,6 +59,44 @@ def get_batch_mla_module(
     ).build_and_load()
 
 
+def _get_fa_shared_memory_limits(device: torch.device) -> tuple[int, int]:
+    """Return per-SM and opt-in per-block limits, including on older PyTorch."""
+    properties = get_device_properties(device)
+    per_sm = getattr(properties, "shared_memory_per_multiprocessor", None)
+    per_block = getattr(properties, "shared_memory_per_block_optin", None)
+    if per_sm is not None and per_block is not None:
+        return per_sm, per_block
+
+    # PyTorch < 2.7 does not expose these CUDA device attributes. Keep FA
+    # available there instead of treating missing Python bindings as hardware
+    # incompatibility. Support both cuda-python import layouts.
+    try:
+        from cuda.bindings import driver
+    except ImportError:
+        from cuda import cuda as driver
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+
+    def query(attribute):
+        status, value = driver.cuDeviceGetAttribute(attribute, index)
+        if int(status):
+            raise RuntimeError(
+                f"MLA cuDeviceGetAttribute({attribute}) failed: {status}"
+            )
+        return int(value)
+
+    attributes = driver.CUdevice_attribute
+    if per_sm is None:
+        per_sm = query(
+            attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+        )
+    if per_block is None:
+        per_block = query(
+            attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+        )
+    return per_sm, per_block
+
+
 def _validate_generated_fa_plan(
     *,
     backend: str,
@@ -163,18 +201,18 @@ def _validate_generated_fa_plan(
         raise _BackendPlanUnsupportedError(
             f"fa2 MLA requires SM80 or newer, got SM{major}{minor}."
         )
-    properties = get_device_properties(device)
+    smem_per_sm, smem_per_block = _get_fa_shared_memory_limits(device)
     shared_bytes = _generated_fa_shared_bytes(
         backend,
         head_dim_ckv,
         head_dim_kpe,
         kv_data_type == torch.float8_e4m3fn,
-        properties.shared_memory_per_multiprocessor,
+        smem_per_sm,
     )
-    if shared_bytes > properties.shared_memory_per_block_optin:
+    if shared_bytes > smem_per_block:
         raise _BackendPlanUnsupportedError(
             f"{backend} MLA needs {shared_bytes} shared-memory bytes per block, "
-            f"but this device supports {properties.shared_memory_per_block_optin}."
+            f"but this device supports {smem_per_block}."
         )
 
 
@@ -304,7 +342,7 @@ def _validate_fa_causal_tile_bound(
     elif kv_data_type == torch.float8_e4m3fn:
         tile_kv = 32
     else:
-        smem = get_device_properties(device).shared_memory_per_multiprocessor
+        smem, _ = _get_fa_shared_memory_limits(device)
         # Match mla.cuh DISPATCH_SMEM_CONFIG (dimensions do not select tiles).
         tile_kv = 64 if smem >= 221696 else 32 if smem >= 147968 else 16
     for request, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True)):

@@ -1044,10 +1044,80 @@ def test_cpu_experimental_warning_failure_restores_unpublished_plan(
     torch.testing.assert_close(_cpu_run(wrapper), previous_output)
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("missing", [(), ("sm",), ("block",), ("sm", "block")])
+def test_cpu_fa_shared_memory_compatibility(monkeypatch, backend, missing):
+    from flashinfer.mla._batch_mla._backends import _fa_common as fa
+
+    driver = pytest.importorskip("cuda.bindings.driver")
+    values = {
+        "shared_memory_per_multiprocessor": 232448,
+        "shared_memory_per_block_optin": 227328,
+    }
+    names = {
+        "sm": "shared_memory_per_multiprocessor",
+        "block": "shared_memory_per_block_optin",
+    }
+    properties = SimpleNamespace(
+        **{k: v for k, v in values.items() if k not in [names[n] for n in missing]}
+    )
+    monkeypatch.setattr(fa, "get_device_properties", lambda _: properties)
+    monkeypatch.setattr(fa, "get_compute_capability", lambda _: (9, 0))
+    monkeypatch.setattr(fa, "is_sm90a_supported", lambda _: True)
+    queried = []
+    attributes = driver.CUdevice_attribute
+    limits = {
+        attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: 232448,
+        attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: 227328,
+    }
+
+    def query(attribute, index):
+        assert index == 3
+        queried.append(attribute)
+        return (0, limits[attribute])
+
+    monkeypatch.setattr(driver, "cuDeviceGetAttribute", query)
+    tensors = dict(
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indices=torch.tensor([0], dtype=torch.int32),
+        kv_len_arr=torch.tensor([1], dtype=torch.int32),
+    )
+    kwargs = dict(
+        backend=backend,
+        device=torch.device("cuda:3"),
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        scale_mode="default",
+        **tensors,
+    )
+    fa._validate_generated_fa_plan(**kwargs)
+    # Odd heads exercise the second shared-memory consumer, beyond preflight.
+    fa._validate_fa_causal_tile_bound(
+        [5], [10], 17, backend, torch.bfloat16, torch.device("cuda:3")
+    )
+    assert bool(queried) == bool(missing)
+    # Preserve the capacity rejection even when torch lacks the properties.
+    if "block" in missing:
+        limits[attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN] = 1
+    else:
+        properties.shared_memory_per_block_optin = 1
+    with pytest.raises(_BackendPlanUnsupportedError, match="shared-memory bytes"):
+        fa._validate_generated_fa_plan(**kwargs)
+
+
 @pytest.mark.parametrize("q_len", [65535, 65536])
 def test_cpu_monolithic_grid_boundary_rejects_before_compile(
     _cpu_planners, monkeypatch, q_len
 ):
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL is unavailable")
+
     from flashinfer.cute_dsl.attention.monolithic import mla_decode as native
     from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
         _BatchMLAPagedAttentionCuteDslMonolithicBackend,
@@ -1421,6 +1491,38 @@ def _check_case(backend, q_lens, kv_lens, capacity, dtype, *, causal, crafted=Fa
     # Match existing native CuTe FP16/BF16 tests; inputs have no FP8
     # quantization. The crafted test rules out masking errors at this tolerance.
     torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.usefixtures("_sm100_reference_precision")
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
+def test_fa_plan_without_torch_shared_memory_properties(monkeypatch, backend):
+    from flashinfer.mla._batch_mla._backends import _fa_common as fa
+
+    monkeypatch.setattr(fa, "get_device_properties", lambda _: SimpleNamespace())
+    # Exercise the legacy auto branch on this GPU, with real FA planning/run.
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (8, 0))
+    _check_case(backend, (2,), (9,), 4, torch.bfloat16, causal=False)
+
+
+@pytest.mark.usefixtures("_sm100_reference_precision")
+def test_auto_falls_back_when_cutile_library_budget_is_full(monkeypatch):
+    from flashinfer.mla._batch_mla._backends import _cutile_prepared as prepared
+
+    monkeypatch.setattr(prepared, "_LOADED_LIBRARIES", {})
+    monkeypatch.setattr(prepared, "_MAX_LOADED_LIBRARIES", 0)
+    load_kernel = prepared._load_kernel
+    attempted = []
+
+    def load(*args):
+        attempted.append(True)
+        return load_kernel(*args)
+
+    monkeypatch.setattr(prepared, "_load_kernel", load)
+    monkeypatch.setattr(
+        _auto_policy, "ordered_sm100_backends", lambda _: ("cutile", "fa2")
+    )
+    _check_case("auto", (1,), (9,), 4, torch.bfloat16, causal=False)
+    assert attempted == [True]
 
 
 @pytest.mark.usefixtures("_sm100_reference_precision")
