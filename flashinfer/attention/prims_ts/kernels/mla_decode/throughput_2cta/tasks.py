@@ -467,10 +467,39 @@ def create_load_tma_task(
     return task_class(
         src_resources=src,
         dst_resources=[smem_q, smem_kv],
-        warp_idx=9,
-        num_warps=1,
+        warp_idx=smem_kv.cfg.load_tma_warp_id,
+        num_warps=smem_kv.cfg.load_num_warps,
         schedule=captured_schedule,
         name="LoadTmaTask",
+        **task_kwargs,
+    )
+
+
+def create_sparse_offsets_task(
+    page_offsets, work_queue=None, task_class=MlaTask, **task_kwargs
+):
+    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+
+    @schedule
+    def offsets_schedule(page_offsets, work_queue=None):
+        with domain_loop(loop_start, loop_end, loop_step):
+            page_offsets.acquire()
+            page_offsets.load_sparse_offsets()
+            page_offsets.commit()
+        work_queue_tail(work_queue, advance_label="advance_tile")
+
+    result = (
+        offsets_schedule(page_offsets)
+        if work_queue is None
+        else offsets_schedule(page_offsets, work_queue)
+    )
+    return task_class(
+        src_resources=[work_queue] if work_queue is not None else [],
+        dst_resources=[page_offsets],
+        warp_idx=9,
+        num_warps=1,
+        schedule=result,
+        name="SparseOffsetsTask",
         **task_kwargs,
     )
 
@@ -478,6 +507,7 @@ def create_load_tma_task(
 def create_load_k_task(
     smem_q: SmemQResource,
     smem_k: SmemKResource,
+    page_offsets=None,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
     **task_kwargs,
@@ -489,8 +519,7 @@ def create_load_k_task(
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
-    @schedule
-    def load_k_schedule(smem_q, smem_k, work_queue=None):
+    def load_k_body(smem_q, smem_k, page_offsets=None, work_queue=None):
         """Load Q once and then publish one K stage per loop tile."""
         smem_q.init_load_state()
         smem_k.init_load_state()
@@ -499,23 +528,48 @@ def create_load_k_task(
         smem_q.commit()
 
         with domain_loop(loop_start, loop_end, loop_step):
-            smem_k.acquire()
-            smem_k.tma_load_direct()
-            smem_k.commit()
+            if page_offsets is not None:
+                page_offsets.wait()
+                quads = page_offsets.read_sparse_k()
+                page_offsets.release()
+                smem_k.acquire()
+                smem_k.tma_load_cached(cached_k_pages=quads)
+                smem_k.commit()
+            else:
+                smem_k.acquire()
+                smem_k.tma_load_direct()
+                smem_k.commit()
         work_queue_tail(work_queue, advance_label="advance_tile")
 
-    schedule_result = (
-        load_k_schedule(smem_q, smem_k)
-        if work_queue is None
-        else load_k_schedule(smem_q, smem_k, work_queue)
-    )
+    @schedule
+    def load_k_schedule(smem_q, smem_k, page_offsets, work_queue=None):
+        load_k_body(smem_q, smem_k, page_offsets, work_queue)
 
-    src = [work_queue] if work_queue is not None else []
+    @schedule
+    def load_k_dense_schedule(smem_q, smem_k, work_queue=None):
+        load_k_body(smem_q, smem_k, None, work_queue)
+
+    if page_offsets is None:
+        schedule_result = (
+            load_k_dense_schedule(smem_q, smem_k)
+            if work_queue is None
+            else load_k_dense_schedule(smem_q, smem_k, work_queue)
+        )
+    else:
+        schedule_result = (
+            load_k_schedule(smem_q, smem_k, page_offsets)
+            if work_queue is None
+            else load_k_schedule(smem_q, smem_k, page_offsets, work_queue)
+        )
+
+    src = ([page_offsets] if page_offsets is not None else []) + (
+        [work_queue] if work_queue is not None else []
+    )
     return task_class(
         src_resources=src,
         dst_resources=[smem_q, smem_k],
-        warp_idx=9,
-        num_warps=1,
+        warp_idx=smem_k.cfg.load_k_warp_id,
+        num_warps=smem_k.cfg.load_num_warps,
         schedule=schedule_result,
         name="LoadKTask",
         **task_kwargs,
@@ -524,6 +578,7 @@ def create_load_k_task(
 
 def create_load_v_task(
     smem_v: SmemVResource,
+    page_offsets=None,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
     **task_kwargs,
@@ -531,28 +586,52 @@ def create_load_v_task(
     """Create the FP8 V TMA task (warp 10)."""
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
-    @schedule
-    def load_v_schedule(smem_v, work_queue=None):
+    def load_v_body(smem_v, page_offsets=None, work_queue=None):
         """Publish one V stage per logical K tile."""
         smem_v.init_load_state()
         with domain_loop(loop_start, loop_end, loop_step):
-            smem_v.acquire()
-            smem_v.tma_load_direct()
-            smem_v.commit()
+            if page_offsets is not None:
+                page_offsets.wait()
+                quads = page_offsets.read_sparse_v()
+                page_offsets.release()
+                smem_v.acquire()
+                smem_v.tma_load_cached(cached_v_pages=quads)
+                smem_v.commit()
+            else:
+                smem_v.acquire()
+                smem_v.tma_load_direct()
+                smem_v.commit()
         work_queue_tail(work_queue, advance_label="advance_tile")
 
-    schedule_result = (
-        load_v_schedule(smem_v)
-        if work_queue is None
-        else load_v_schedule(smem_v, work_queue)
-    )
+    @schedule
+    def load_v_schedule(smem_v, page_offsets, work_queue=None):
+        load_v_body(smem_v, page_offsets, work_queue)
 
-    src = [work_queue] if work_queue is not None else []
+    @schedule
+    def load_v_dense_schedule(smem_v, work_queue=None):
+        load_v_body(smem_v, None, work_queue)
+
+    if page_offsets is None:
+        schedule_result = (
+            load_v_dense_schedule(smem_v)
+            if work_queue is None
+            else load_v_dense_schedule(smem_v, work_queue)
+        )
+    else:
+        schedule_result = (
+            load_v_schedule(smem_v, page_offsets)
+            if work_queue is None
+            else load_v_schedule(smem_v, page_offsets, work_queue)
+        )
+
+    src = ([page_offsets] if page_offsets is not None else []) + (
+        [work_queue] if work_queue is not None else []
+    )
     return task_class(
         src_resources=src,
         dst_resources=[smem_v],
-        warp_idx=10,
-        num_warps=1,
+        warp_idx=smem_v.cfg.load_v_warp_id,
+        num_warps=smem_v.cfg.load_num_warps,
         schedule=schedule_result,
         name="LoadVTask",
         **task_kwargs,
@@ -896,6 +975,7 @@ def create_softmax_task(
     smem_p: SmemPResource,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
+    page_offsets=None,
     warp_idx: int = 0,
     name: str = "SoftmaxTask",
     softmax_group_id: int = 0,
@@ -919,9 +999,15 @@ def create_softmax_task(
         )
         return init_softmax_state()
 
-    def softmax_body(tmem_s, tmem_corr, smem_p, softmax_state):
+    def softmax_body(tmem_s, tmem_corr, smem_p, softmax_state, page_offsets=None):
         """Consume S tiles, materialize P, and publish correction factors."""
-        load_s = tmem_s.load_s_odd if softmax_group_id == 1 else tmem_s.load_s
+        load_s = (
+            tmem_s.load_s_odd
+            if softmax_group_id == 1
+            else tmem_s.load_s_cached
+            if page_offsets is not None
+            else tmem_s.load_s
+        )
         finish_softmax = (
             tmem_s.finish_softmax_odd
             if softmax_group_id == 1
@@ -947,6 +1033,15 @@ def create_softmax_task(
         ) = softmax_state
 
         with domain_loop(loop_start, loop_end, loop_step):
+            mask_kwargs = {}
+            if page_offsets is not None:
+                page_offsets.wait()
+                mask_low, mask_high = page_offsets.read_sparse_mask()
+                page_offsets.release()
+                mask_kwargs = {
+                    "cached_mask_low": mask_low,
+                    "cached_mask_high": mask_high,
+                }
             tmem_s.wait()
             if softmax_group_id == 1:
                 (
@@ -983,6 +1078,7 @@ def create_softmax_task(
                     row_max_new=row_max_new,
                     correction_factor_out=correction_factor_out,
                     no_correction_out=no_correction_out,
+                    **mask_kwargs,
                 )
             tmem_s.release()
             if softmax_group_id == 1:
@@ -1056,29 +1152,44 @@ def create_softmax_task(
                 )
             tmem_corr.commit()
 
-    @schedule
-    def softmax_schedule(tmem_s, tmem_corr, smem_p, work_queue=None):
-        """Capture one active softmax tile and unconditional queue progress."""
-
+    def capture_softmax(tmem_s, tmem_corr, smem_p, work_queue, page_offsets):
         _capture_clc_work_tile_body(
             work_queue,
             lambda softmax_state: softmax_body(
-                tmem_s,
-                tmem_corr,
-                smem_p,
-                softmax_state,
+                tmem_s, tmem_corr, smem_p, softmax_state, page_offsets
             ),
             lambda: softmax_prelude(tmem_s),
             use_clc_dynamic=use_clc_dynamic,
         )
 
-    schedule_result = (
-        softmax_schedule(tmem_s, tmem_corr, smem_p)
-        if work_queue is None
-        else softmax_schedule(tmem_s, tmem_corr, smem_p, work_queue)
-    )
+    @schedule
+    def softmax_schedule(tmem_s, tmem_corr, smem_p, work_queue=None):
+        capture_softmax(tmem_s, tmem_corr, smem_p, work_queue, None)
+
+    @schedule
+    def sparse_softmax_schedule(
+        tmem_s, tmem_corr, smem_p, page_offsets, work_queue=None
+    ):
+        capture_softmax(tmem_s, tmem_corr, smem_p, work_queue, page_offsets)
+
+    if page_offsets is None:
+        schedule_result = (
+            softmax_schedule(tmem_s, tmem_corr, smem_p)
+            if work_queue is None
+            else softmax_schedule(tmem_s, tmem_corr, smem_p, work_queue)
+        )
+    else:
+        schedule_result = (
+            sparse_softmax_schedule(tmem_s, tmem_corr, smem_p, page_offsets)
+            if work_queue is None
+            else sparse_softmax_schedule(
+                tmem_s, tmem_corr, smem_p, page_offsets, work_queue
+            )
+        )
 
     src = [tmem_s]
+    if page_offsets is not None:
+        src.append(page_offsets)
     if work_queue is not None:
         src.append(work_queue)
     return task_class(

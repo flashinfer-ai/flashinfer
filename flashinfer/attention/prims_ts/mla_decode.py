@@ -86,6 +86,7 @@ class _MLADecodeCompileSpec:
     has_kernel_workspace: bool
     split_kv: int
     kernel: Any = field(compare=False, hash=False, repr=False)
+    device_scales: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,9 @@ class _MLARuntime:
     num_physical_pages: int
     bmm1_scale: float
     bmm2_scale: float
+    extra_cache: Optional[torch.Tensor] = None
+    scale_params: Optional[torch.Tensor] = None
+    sparse_inputs: Optional[tuple] = None
 
 
 def _make_mla_workspace_layout(
@@ -1014,6 +1018,7 @@ def _make_mla_decode_compile_spec(
     output_dtype_key: str,
     max_seq_len_q: int,
     packed_query: bool,
+    device_scales: bool = False,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1031,6 +1036,7 @@ def _make_mla_decode_compile_spec(
         has_kernel_workspace=launch_spec.kernel_workspace_bytes > 0,
         split_kv=launch_spec.split_kv,
         kernel=launch_spec.kernel,
+        device_scales=device_scales,
     )
 
 
@@ -1047,6 +1053,10 @@ def _get_compiled_mla_decode(
     num_heads = compile_spec.num_heads
     kv_lora_rank = compile_spec.kv_lora_rank
     qk_rope_head_dim = compile_spec.qk_rope_head_dim
+    query_dim = kv_lora_rank + qk_rope_head_dim
+    # The D512 path has no separate RoPE stage. Use an unused full-width
+    # alias in the callable ABI rather than a zero-extent tensor map.
+    rope_view_dim = qk_rope_head_dim or kv_lora_rank
     page_size = compile_spec.page_size
     max_seq_len_q = compile_spec.max_seq_len_q
     packed_query = compile_spec.packed_query
@@ -1063,21 +1073,21 @@ def _get_compiled_mla_decode(
 
     # These fake tensors pin the public ABI while allowing runtime page counts,
     # table widths/row strides, and batch metadata pointers to vary.
-    q_stride_h = _MLA_QUERY_DIM
-    q_stride_q = num_heads * _MLA_QUERY_DIM
+    q_stride_h = query_dim
+    q_stride_q = num_heads * query_dim
     q_latent_shape: tuple[int, ...]
     q_rope_shape: tuple[int, ...]
     q_stride: tuple[int, ...]
     if packed_query:
         q_latent_shape = (num_heads, kv_lora_rank, runtime_total_q)
-        q_rope_shape = (num_heads, qk_rope_head_dim, runtime_total_q)
+        q_rope_shape = (num_heads, rope_view_dim, runtime_total_q)
         q_stride = (q_stride_h, 1, q_stride_q)
     else:
         q_stride_batch = max_seq_len_q * q_stride_q
         q_latent_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
         q_rope_shape = (
             num_heads,
-            qk_rope_head_dim,
+            rope_view_dim,
             max_seq_len_q,
             batch_size,
         )
@@ -1088,8 +1098,8 @@ def _get_compiled_mla_decode(
     q_rope_fake = cute.runtime.make_fake_tensor(
         qkv_dtype, q_rope_shape, stride=q_stride, assumed_align=16
     )
-    cache_token_stride = _MLA_QUERY_DIM
-    cache_page_stride = page_size * _MLA_QUERY_DIM
+    cache_token_stride = query_dim
+    cache_page_stride = page_size * query_dim
     c_latent_fake = cute.runtime.make_fake_tensor(
         qkv_dtype,
         (page_size, kv_lora_rank, physical_pages),
@@ -1098,7 +1108,11 @@ def _get_compiled_mla_decode(
     )
     c_rope_fake = cute.runtime.make_fake_tensor(
         qkv_dtype,
-        (page_size, qk_rope_head_dim, physical_pages),
+        (
+            page_size,
+            rope_view_dim,
+            cute.sym_int() if page_size == 1 else physical_pages,
+        ),
         stride=(cache_token_stride, 1, cache_page_stride),
         assumed_align=16,
     )
@@ -1156,6 +1170,42 @@ def _get_compiled_mla_decode(
             stride_order=(0,),
             assumed_align=4,
         )
+    scale_params_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(),), stride_order=(0,), assumed_align=4
+        )
+        if compile_spec.device_scales
+        else None
+    )
+    if getattr(kernel, "direct_sparse", False):
+
+        def sparse_indices(capacity):
+            return cute.runtime.make_fake_tensor(
+                cutlass.Int32,
+                (batch_size, max(1, capacity)),
+                stride=(cute.sym_int64(), 1),
+                assumed_align=4,
+            )
+
+        scalar = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
+        )
+        sink = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (num_heads,), stride_order=(0,), assumed_align=4
+        )
+        scale_params_fake = (
+            sparse_indices(kernel.direct_sparse_capacities[0]),
+            sparse_indices(kernel.direct_sparse_capacities[1]),
+            cache_seqs_fake,
+            cache_seqs_fake,
+            scalar,
+            scalar,
+            scalar,
+            scalar,
+            sink,
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+        )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1174,7 +1224,7 @@ def _get_compiled_mla_decode(
             cutlass.Int32(compile_spec.split_kv),
             cache_seqs_fake,
             qo_indptr_fake,
-            None,
+            scale_params_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             stream_fake,
@@ -1377,6 +1427,11 @@ def _launch_mla_decode(
         lse_kernel = workspace.lse.permute(2, 1, 0)
     c_latent = runtime.normalized_cache[..., :kv_lora_rank].permute(1, 2, 0)
     c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
+    if runtime.query.shape[-1] == kv_lora_rank:
+        q_rope = q_latent
+        c_rope = c_latent
+        if runtime.extra_cache is not None:
+            c_rope = runtime.extra_cache.permute(1, 2, 0)
     page_offsets = block_tables.transpose(0, 1)
     compiled(
         q_latent,
@@ -1390,7 +1445,9 @@ def _launch_mla_decode(
         split_kv,
         seq_lens,
         qo_indptr,
-        None,
+        runtime.sparse_inputs
+        if runtime.sparse_inputs is not None
+        else runtime.scale_params,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
     )

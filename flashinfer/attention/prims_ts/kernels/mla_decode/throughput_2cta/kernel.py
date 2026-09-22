@@ -32,7 +32,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.experimental.cuda as cuda
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64
 from cutlass.cute.testing import assert_ as runtime_assert
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.experimental import primitives as prims
@@ -107,6 +107,7 @@ from .tasks import (
     MlaInterleavedTask,
     MlaTask,
     create_load_k_task,
+    create_sparse_offsets_task,
     create_load_v_task,
     create_load_tma_task,
     create_mma_task,
@@ -132,6 +133,7 @@ def build_mla_decode_task_manager(
     smem_kc_arr=None,
     smem_vc_arr=None,
     smem_p_arr=None,
+    sparse_offsets_arr=None,
     # TMA descriptors (None for validate-only)
     tma_desc_q_latent=None,
     tma_desc_q_rope=None,
@@ -145,6 +147,7 @@ def build_mla_decode_task_manager(
     tidx=None,
     # GMEM output tensors
     output=None,
+    sparse_sinks=None,
     acc_output=None,
     lse=None,
     acc_lse=None,
@@ -200,7 +203,7 @@ def build_mla_decode_task_manager(
     )
 
     # Cooperative groups
-    tma_producer_group = pipeline.CooperativeGroup(Agent.Thread)  # elect_one TMA
+    tma_producer_group = pipeline.CooperativeGroup(Agent.Thread)
     umma_hw_group = pipeline.CooperativeGroup(Agent.Thread)  # UMMA hardware
 
     # Softmax warps: 4 warps * 32 threads * 2 CTAs for cluster-scoped consumer
@@ -227,10 +230,15 @@ def build_mla_decode_task_manager(
         num_stages=cfg.load_q_stage,
         num_bytes=cfg.tma_copy_q_bytes,
         producer_group=tma_producer_group,
+        producer_signaling_threads=SignalingThreads.TaskWarpLeader
+        if cfg.load_num_warps > 1
+        else SignalingThreads.All,
         consumer_group=umma_hw_group,
         cta_layout_vmnk=cluster_shape_vmnk,
         consumer_signaling_threads=SignalingThreads.CtaLeader,
-        num_bytes_per_warp_per_cta=(cfg.tma_copy_q_bytes // cfg.num_mma_ctas),
+        num_bytes_per_warp_per_cta=(
+            cfg.tma_copy_q_bytes // cfg.num_mma_ctas // cfg.load_num_warps
+        ),
     )
 
     if cfg.use_fp8_split_mma_schedule:
@@ -241,19 +249,29 @@ def build_mla_decode_task_manager(
             num_stages=cfg.load_k_stage,
             num_bytes=cfg.tma_copy_k_tile_bytes,
             producer_group=tma_producer_group,
+            producer_signaling_threads=SignalingThreads.TaskWarpLeader
+            if cfg.load_num_warps > 1
+            else SignalingThreads.All,
             consumer_group=umma_hw_group,
             cta_layout_vmnk=cluster_shape_vmnk,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
-            num_bytes_per_warp_per_cta=(cfg.tma_copy_k_tile_bytes // cfg.num_mma_ctas),
+            num_bytes_per_warp_per_cta=(
+                cfg.tma_copy_k_tile_bytes // cfg.num_mma_ctas // cfg.load_num_warps
+            ),
         )
         smem_v_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
             num_stages=cfg.load_v_stage,
             num_bytes=cfg.tma_copy_v_tile_bytes,
             producer_group=tma_producer_group,
+            producer_signaling_threads=SignalingThreads.TaskWarpLeader
+            if cfg.load_num_warps > 1
+            else SignalingThreads.All,
             consumer_group=umma_hw_group,
             cta_layout_vmnk=cluster_shape_vmnk,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
-            num_bytes_per_warp_per_cta=(cfg.tma_copy_v_tile_bytes // cfg.num_mma_ctas),
+            num_bytes_per_warp_per_cta=(
+                cfg.tma_copy_v_tile_bytes // cfg.num_mma_ctas // cfg.load_num_warps
+            ),
         )
         smem_kv_pipeline_cfg = None
     else:
@@ -265,7 +283,12 @@ def build_mla_decode_task_manager(
             consumer_group=umma_hw_group,
             cta_layout_vmnk=cluster_shape_vmnk,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
-            num_bytes_per_warp_per_cta=(cfg.tma_kc_subtile_bytes // cfg.num_mma_ctas),
+            num_bytes_per_warp_per_cta=(
+                cfg.tma_kc_subtile_bytes // cfg.num_mma_ctas // cfg.load_num_warps
+            ),
+            producer_signaling_threads=SignalingThreads.TaskWarpLeader
+            if cfg.load_num_warps > 1
+            else SignalingThreads.All,
         )
         smem_k_pipeline_cfg = None
         smem_v_pipeline_cfg = None
@@ -329,10 +352,31 @@ def build_mla_decode_task_manager(
     # Create resource instances
     # ──────────────────────────────────────────────────────────────
 
+    sparse_offsets_enabled = cfg.page_size == 1 and cfg.use_fp8_split_mma_schedule
+    shared_mask_enabled = (
+        sparse_offsets_enabled
+        and not cfg.use_fp8_dual_softmax_schedule
+        and not getattr(page_offsets, "assume_valid_prefix", False)
+    )
+    # Prefix masks use live lengths only: softmax no longer consumes the
+    # offset ring. Remove its arrivals along with its task dependency; K/V
+    # loaders remain consumers with the same addressing and synchronization.
+    offsets_cfg = None
+    if sparse_offsets_enabled:
+        offsets_cfg = PipelineConfig.create_async_async_pipeline_cfg(
+            num_stages=cfg.sparse_offset_stages,
+            producer_group=pipeline.CooperativeGroup(Agent.Thread, 32),
+            consumer_group=pipeline.CooperativeGroup(
+                Agent.Thread,
+                (2 * cfg.load_num_warps + (4 if shared_mask_enabled else 0)) * 32,
+            ),
+            cta_layout_vmnk=cluster_shape_vmnk,
+        )
     page_offset_window = PageOffsetWindowResource(
         page_offsets=page_offsets,
+        smem_sparse_offsets=sparse_offsets_arr,
         cfg=cfg,
-        pipeline_config=None,
+        pipeline_config=offsets_cfg,
         name="page_offset_window",
     )
 
@@ -364,6 +408,7 @@ def build_mla_decode_task_manager(
             smem_v=smem_vc_arr,
             page_offsets=page_offsets,
             tma_desc_c_transpose=tma_desc_c_transpose,
+            tma_desc_extra_v=tma_desc_q_rope,
             logical_seq_len_q=logical_seq_len_q,
             cfg=cfg,
             pipeline_config=smem_v_pipeline_cfg,
@@ -376,6 +421,7 @@ def build_mla_decode_task_manager(
             tma_desc_c_latent=tma_desc_c_latent,
             tma_desc_c_rope=tma_desc_c_rope,
             tma_desc_c_transpose=tma_desc_c_transpose,
+            tma_desc_extra_v=tma_desc_q_rope,
             cfg=cfg,
             pipeline_config=smem_kv_pipeline_cfg,
             name="smem_kv",
@@ -384,6 +430,7 @@ def build_mla_decode_task_manager(
         smem_v = None
 
     tmem_s = TmemSResource(
+        page_offsets=page_offsets,
         smem_q_latent=smem_q_latent_arr,
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
@@ -428,6 +475,7 @@ def build_mla_decode_task_manager(
         partial_lse=acc_lse,
         tmem_o_ref=tmem_o,
         tmem_corr_ref=tmem_corr,
+        sparse_sinks=sparse_sinks,
         output_scale=None,  # set at runtime
         softmax_scale_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
@@ -451,12 +499,14 @@ def build_mla_decode_task_manager(
         load_k_task = create_load_k_task(
             smem_q,
             smem_k,
+            page_offsets=page_offset_window if sparse_offsets_enabled else None,
             work_queue=work_queue,
             domain=domain,
             num_registers=wg2_reg_count,
         )
         load_v_task = create_load_v_task(
             smem_v,
+            page_offsets=page_offset_window if sparse_offsets_enabled else None,
             work_queue=work_queue,
             domain=domain,
             num_registers=wg2_reg_count,
@@ -521,6 +571,7 @@ def build_mla_decode_task_manager(
         tmem_s,
         tmem_corr,
         smem_p,
+        page_offsets=page_offset_window if shared_mask_enabled else None,
         work_queue=work_queue,
         task_class=(
             MlaInterleavedTask
@@ -580,13 +631,33 @@ def build_mla_decode_task_manager(
         ]
         task_list.extend([mma_task, softmax_task, correction_task])
 
+    if sparse_offsets_enabled:
+        task_list.append(
+            create_sparse_offsets_task(
+                page_offset_window,
+                work_queue=work_queue,
+                domain=domain,
+                num_registers=wg2_reg_count,
+            )
+        )
+    if cfg.use_fp8_split_mma_schedule and cfg.load_num_warps > 1:
+        task_list.append(
+            create_padding_task(
+                work_queue=work_queue,
+                domain=domain,
+                num_registers=wg2_reg_count,
+                warp_idx=10 if sparse_offsets_enabled else 9,
+                num_warps=1 if sparse_offsets_enabled else 2,
+            )
+        )
     if not cfg.use_fp8_split_mma_schedule and use_clc_dynamic:
         padding_task = create_padding_task(
             work_queue=work_queue,
             task_class=non_interleaved_task_class,
             domain=task_domain,
             num_registers=wg2_reg_count,
-            warp_idx=10,
+            warp_idx=9 if cfg.load_num_warps > 1 else 10,
+            num_warps=2 if cfg.load_num_warps > 1 else 1,
         )
         task_list.append(padding_task)
         scheduler_task = create_scheduler_task(
@@ -604,8 +675,8 @@ def build_mla_decode_task_manager(
             work_queue=work_queue,
             domain=domain,
             num_registers=wg2_reg_count,
-            warp_idx=10,
-            num_warps=2,
+            warp_idx=9 if cfg.load_num_warps > 1 else 10,
+            num_warps=3 if cfg.load_num_warps > 1 else 2,
         )
         task_list.append(padding_task)
 
@@ -663,6 +734,12 @@ def build_mla_decode_task_manager(
                 resource_dependency_graph[work_throttle] = [tmem_s]
         else:
             resource_dependency_graph[work_queue] = []
+
+    if sparse_offsets_enabled:
+        # K/V TMA reads register snapshots; metadata has no asynchronous SMEM read edge.
+        resource_dependency_graph[page_offset_window] = (
+            [work_queue] if work_queue is not None else []
+        )
 
     # ──────────────────────────────────────────────────────────────
     # Create TaskManager
@@ -722,6 +799,7 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        device_scales: bool = False,
     ):
         """
         Parameters
@@ -804,6 +882,19 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
+        self.device_scales = device_scales
+        self.external_sparse_reduction = False
+        self.fuse_sparse_epilogue = False
+        self.direct_sparse = False
+        self.sparse_gather_warps = 1
+        self.sparse_kv_stages = 0
+        self.sparse_uniform_pages = False
+        self.sparse_balanced_registers = False
+        self.sparse_defer_max_update = False
+        self.assume_valid_prefix = False
+        self.direct_static_scales = False
+        self.direct_sparse_pages = (1, 1)
+        self.direct_sparse_capacities = (0, 0)
         self.query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, mma_qk_tiler_mn[0]
         )
@@ -855,6 +946,18 @@ class MlaDecodeTs:
             self._parallel_reduction_shape_is_eligible,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
+            self.external_sparse_reduction,
+            self.fuse_sparse_epilogue,
+            self.direct_sparse,
+            self.assume_valid_prefix,
+            self.direct_static_scales,
+            self.direct_sparse_pages,
+            self.direct_sparse_capacities,
+            self.sparse_gather_warps,
+            self.sparse_kv_stages,
+            self.sparse_uniform_pages,
+            self.sparse_balanced_registers,
+            self.sparse_defer_max_update,
         )
 
     def _configure_parallel_reduction_topology(self) -> None:
@@ -929,12 +1032,39 @@ class MlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: object,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: object,
     ):
         """Execute the MLA decode TS kernel."""
+        if cutlass.const_expr(self.external_sparse_reduction):
+            if cutlass.const_expr(
+                self.is_persistent
+                or self.is_var_split_kv
+                or self.static_split_kv is None
+                or self.static_split_kv < 2
+            ):
+                raise ValueError(
+                    "external sparse reduction requires fixed, nonpersistent split-KV"
+                )
+        if cutlass.const_expr(self.fuse_sparse_epilogue):
+            if cutlass.const_expr(self.static_split_kv != 1 or not self.device_scales):
+                raise ValueError(
+                    "2CTA fused epilogue requires device scales and one split"
+                )
+        if cutlass.const_expr(self.direct_sparse):
+            if cutlass.const_expr(
+                not (self.external_sparse_reduction or self.fuse_sparse_epilogue)
+                or self.qkv_dtype not in ("e4m3", "bf16")
+                or self.page_size != 1
+                or self.rope_dim != 0
+                or self.seq_len_q != 1
+                or not self.device_scales
+            ):
+                raise ValueError(
+                    "direct sparse 2CTA requires native FP8/BF16 D512 and fused output"
+                )
         cfg = make_mla_decode_config(
             mma_qk_tiler_mn=self.mma_qk_tiler_mn,
             mma_pv_tiler_mn=self.mma_pv_tiler_mn,
@@ -947,6 +1077,11 @@ class MlaDecodeTs:
             is_var_seq=self.is_var_seq,
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
+            sparse_gather_warps=self.sparse_gather_warps,
+            sparse_kv_stages=self.sparse_kv_stages,
+            cache_uniform_sparse_pages=self.sparse_uniform_pages,
+            balance_sparse_registers=self.sparse_balanced_registers,
+            defer_sparse_max_update=self.sparse_defer_max_update,
         )
         physical_tile_rows = self.mma_qk_tiler_mn[0]
         num_query_tiles = self.num_q_tiles
@@ -1084,48 +1219,96 @@ class MlaDecodeTs:
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        tma_desc_c_latent = create_tensor_map_tiled_from_view(
-            c_latent_tma,
-            box_dims=(cfg.mma_qk_tiler[2], cfg.kc_page_tile_size, 1),
-            stride_order=(0, 1, 2),
-            swizzle=cuda.TensorMapSwizzle.s128b,
-            l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-        )
-
-        if cutlass.const_expr(cfg.rope_dim > 0):
-            c_rope_tma = cute.make_tensor(
-                c_rope.iterator,
-                cute.select(c_rope.layout, mode=[1, 0, 2]),
+        if cutlass.const_expr(cfg.page_size == 1):
+            # D512 has no separate Q/K RoPE maps. Reuse their ABI slots for
+            # extra-K and extra-V descriptors, keeping dense launch ABI stable.
+            primary_rows = cute.make_tensor(
+                c_latent.iterator,
+                cute.make_layout(
+                    (c_latent.shape[1], c_latent.shape[2]),
+                    stride=(c_latent.stride[1], c_latent.stride[2]),
+                ),
             )
-            c_rope_swizzle = cuda.TensorMapSwizzle.s128b
-            if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.rope_dim == 64):
-                c_rope_swizzle = cuda.TensorMapSwizzle.s64b
+            extra_rows = cute.make_tensor(
+                c_rope.iterator,
+                cute.make_layout(
+                    (c_rope.shape[1], c_rope.shape[2]),
+                    stride=(c_rope.stride[1], c_rope.stride[2]),
+                ),
+            )
+            tma_desc_c_latent = create_tensor_map_tiled_from_view(
+                primary_rows,
+                box_dims=(cfg.mma_qk_tiler[2], 1),
+                stride_order=(0, 1),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
             tma_desc_c_rope = create_tensor_map_tiled_from_view(
-                c_rope_tma,
-                box_dims=(cfg.mma_qk_rope_tiler[2], cfg.kc_page_tile_size, 1),
-                stride_order=(0, 1, 2),
-                swizzle=c_rope_swizzle,
+                extra_rows,
+                box_dims=(cfg.mma_qk_tiler[2], 1),
+                stride_order=(0, 1),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+            v_swizzle = cuda.TensorMapSwizzle.s128b
+            sparse_v_width = 128 if cfg.is_fp8_qkv() else V_TMA_LATENT_ELEMENTS
+            tma_desc_c_transpose = create_tensor_map_tiled_from_view(
+                primary_rows,
+                box_dims=(sparse_v_width, 1),
+                stride_order=(0, 1),
+                swizzle=v_swizzle,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+            tma_desc_q_rope = create_tensor_map_tiled_from_view(
+                extra_rows,
+                box_dims=(sparse_v_width, 1),
+                stride_order=(0, 1),
+                swizzle=v_swizzle,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
         else:
-            tma_desc_c_rope = tma_desc_c_latent
+            tma_desc_c_latent = create_tensor_map_tiled_from_view(
+                c_latent_tma,
+                box_dims=(cfg.mma_qk_tiler[2], cfg.kc_page_tile_size, 1),
+                stride_order=(0, 1, 2),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
 
-        c_transpose_swizzle = cuda.TensorMapSwizzle.s128b
-        if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.mma_pv_tiler[2] == 64):
-            c_transpose_swizzle = cuda.TensorMapSwizzle.s64b
-        c_latent_transpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
-        c_latent_transpose = cute.make_tensor(
-            c_latent.iterator, c_latent_transpose_layout
-        )
-        # The physical page controls only the GMEM coordinate.  TMA assembles
-        # fixed K32 SMEM blocks for PV from one or more page-bounded copies.
-        tma_desc_c_transpose = create_tensor_map_tiled_from_view(
-            c_latent_transpose,
-            box_dims=(V_TMA_LATENT_ELEMENTS, cfg.v_tma_token_count, 1),
-            stride_order=(0, 1, 2),
-            swizzle=c_transpose_swizzle,
-            l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-        )
+            if cutlass.const_expr(cfg.rope_dim > 0):
+                c_rope_tma = cute.make_tensor(
+                    c_rope.iterator,
+                    cute.select(c_rope.layout, mode=[1, 0, 2]),
+                )
+                c_rope_swizzle = cuda.TensorMapSwizzle.s128b
+                if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.rope_dim == 64):
+                    c_rope_swizzle = cuda.TensorMapSwizzle.s64b
+                tma_desc_c_rope = create_tensor_map_tiled_from_view(
+                    c_rope_tma,
+                    box_dims=(cfg.mma_qk_rope_tiler[2], cfg.kc_page_tile_size, 1),
+                    stride_order=(0, 1, 2),
+                    swizzle=c_rope_swizzle,
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
+            else:
+                tma_desc_c_rope = tma_desc_c_latent
+
+            c_transpose_swizzle = cuda.TensorMapSwizzle.s128b
+            if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.mma_pv_tiler[2] == 64):
+                c_transpose_swizzle = cuda.TensorMapSwizzle.s64b
+            c_latent_transpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
+            c_latent_transpose = cute.make_tensor(
+                c_latent.iterator, c_latent_transpose_layout
+            )
+            # The physical page controls only the GMEM coordinate.  TMA assembles
+            # fixed K32 SMEM blocks for PV from one or more page-bounded copies.
+            tma_desc_c_transpose = create_tensor_map_tiled_from_view(
+                c_latent_transpose,
+                box_dims=(V_TMA_LATENT_ELEMENTS, cfg.v_tma_token_count, 1),
+                stride_order=(0, 1, 2),
+                swizzle=c_transpose_swizzle,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
 
@@ -1173,9 +1356,10 @@ class MlaDecodeTs:
             kernel_split_kv,
             workspace,
         )
-        # A one-wave producer can publish its dependent reducer launch while
-        # retiring, hiding launch latency without admitting reducer CTAs into
-        # an actively grid-striding persistent producer.
+        # Nonpersistent producers signal near retirement. Both the internal
+        # reducer and the direct sparse finisher can overlap setup with that
+        # retirement, then wait for the complete prerequisite grid before
+        # reading partials. Persistent schedules retain ordinary ordering.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
         self.split_kv_kernel(
@@ -1209,7 +1393,7 @@ class MlaDecodeTs:
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(acc_o is not None and not self.external_sparse_reduction):
             if cutlass.const_expr(self.use_parallel_reduction):
                 topology = self.parallel_reduction_topology
                 self.parallel_reduction_kernel(
@@ -1280,13 +1464,86 @@ class MlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: object,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
+        if cutlass.const_expr(self.direct_sparse):
+            from flashinfer.experimental.prims_ts_sparse_mla.views import (
+                SparseRouteView,
+                SparseLengthView,
+                SparseBatchRouteView,
+                SparseBatchLengthView,
+            )
+
+            si, ci, sl, cl, sm, qs, ss, os, sinks, swa_stride, compressed_stride = (
+                block_split_kvs
+            )
+            capacity = cutlass.const_expr(
+                max(
+                    256,
+                    (
+                        (self.direct_sparse_capacities[0] + 127) // 128
+                        + (self.direct_sparse_capacities[1] + 127) // 128
+                    )
+                    * 128,
+                )
+            )
+            if cutlass.const_expr(self.is_persistent):
+                page_offsets = SparseBatchRouteView(
+                    (si, ci, sl, cl, swa_stride, compressed_stride),
+                    self.direct_sparse_pages,
+                    capacity,
+                    self.assume_valid_prefix,
+                )
+                cache_seqs = SparseBatchLengthView((sl, cl))
+            else:
+                _, row = divmod_constexpr_power_of_two_or_fdd(
+                    cute.arch.block_idx()[1],
+                    None,
+                    tile_sched_params.problem_shape_b_fdd,
+                )
+                request = Int64(row)
+                swa_length = Int32(sl[request])
+                compressed_length = Int32(cl[request])
+                selected_length = cute.math.max(
+                    (
+                        (swa_length + Int32(127)) // Int32(128)
+                        + (compressed_length + Int32(127)) // Int32(128)
+                    )
+                    * Int32(128),
+                    Int32(1),
+                )
+                page_offsets = SparseRouteView(
+                    (
+                        si,
+                        ci,
+                        swa_length,
+                        compressed_length,
+                        request,
+                        swa_stride,
+                        compressed_stride,
+                    ),
+                    self.direct_sparse_pages,
+                    capacity,
+                    self.assume_valid_prefix,
+                )
+                cache_seqs = SparseLengthView((selected_length, si.shape[0]))
+            if cutlass.const_expr(not self.direct_static_scales):
+                softmax_scale_log2 = (
+                    Float32(sm[0]) * Float32(qs[0]) * Float32(ss[0]) * LOG2_E
+                )
+                output_scale = Float32(os[0]) * Float32(ss[0])
+        elif cutlass.const_expr(self.device_scales):
+            softmax_scale_log2 = cutlass.Float32(block_split_kvs[0]) * LOG2_E
+            output_scale = cutlass.Float32(block_split_kvs[1])
+            if cutlass.const_expr(self.fuse_sparse_epilogue):
+                sinks = cute.make_tensor(
+                    block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
+                )
         cfg = make_mla_decode_config(
             mma_qk_tiler_mn=self.mma_qk_tiler_mn,
             mma_pv_tiler_mn=self.mma_pv_tiler_mn,
@@ -1299,6 +1556,11 @@ class MlaDecodeTs:
             is_var_seq=self.is_var_seq,
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
+            sparse_gather_warps=self.sparse_gather_warps,
+            sparse_kv_stages=self.sparse_kv_stages,
+            cache_uniform_sparse_pages=self.sparse_uniform_pages,
+            balance_sparse_registers=self.sparse_balanced_registers,
+            defer_sparse_max_update=self.sparse_defer_max_update,
         )
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
@@ -1362,6 +1624,14 @@ class MlaDecodeTs:
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
+        sparse_offsets_arr = None
+        if cutlass.const_expr(cfg.page_size == 1 and cfg.use_fp8_split_mma_schedule):
+            sparse_offsets_arr = cutlass.Array(
+                Int32,
+                cfg.sparse_offset_stages * 128,
+                space=cutlass.AddressSpace.smem,
+                alignment=128,
+            )
         softmax_exchange_arr = cutlass.Array(
             self.acc_dtype,
             cfg.softmax_exchange_elems,
@@ -1452,6 +1722,26 @@ class MlaDecodeTs:
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
         tile_cluster_idx, tile_seq_q_idx, tile_batch_idx, tile_split_kv_idx = blk_coord
+        if cutlass.const_expr(self.external_sparse_reduction):
+            # The native reducer bounds its reads by each request's active
+            # split count. The shared sparse reducer consumes a fixed split
+            # array, so skipped splits must publish an explicit empty LSE.
+            if tidx < Int32(cfg.mma_qk_tiler[0] // cfg.num_mma_ctas):
+                total_tiles = (Int32(cache_seqs[tile_batch_idx]) + Int32(127)) // Int32(
+                    128
+                )
+                _, local_tiles = runtime_split_tile_range(
+                    total_tiles, split_kv, tile_split_kv_idx
+                )
+                if local_tiles == Int32(0):
+                    row_in_tile = (
+                        tile_cluster_idx
+                        * Int32(cfg.mma_qk_tiler[0] // cfg.num_mma_ctas)
+                        + tidx
+                    )
+                    acc_lse[
+                        row_in_tile, tile_split_kv_idx, tile_seq_q_idx, tile_batch_idx
+                    ] = Float32(-Float32.inf)
         del tile_cluster_idx
 
         fixed_nonempty_single_split = (
@@ -1636,6 +1926,7 @@ class MlaDecodeTs:
                 smem_kc_arr=smem_kc_arr,
                 smem_vc_arr=smem_vc_arr,
                 smem_p_arr=smem_p_arr,
+                sparse_offsets_arr=sparse_offsets_arr,
                 tma_desc_q_latent=tma_desc_q_latent.get_ptr(),
                 tma_desc_q_rope=tma_desc_q_rope.get_ptr(),
                 tma_desc_c_latent=tma_desc_c_latent.get_ptr(),
@@ -1645,6 +1936,7 @@ class MlaDecodeTs:
                 blk_coord=blk_coord,
                 tidx=tidx,
                 output=o,
+                sparse_sinks=sinks if self.fuse_sparse_epilogue else None,
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,

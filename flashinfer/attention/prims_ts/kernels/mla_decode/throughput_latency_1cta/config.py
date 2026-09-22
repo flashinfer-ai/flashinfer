@@ -165,6 +165,19 @@ class MlaConfig:
     correction_num_warps: int = 4
     mma_num_warps: int = 1
     load_num_warps: int = 1
+    sparse_offset_cache: str = "strided"
+    sparse_reuse_kv: bool = False
+    paired_sparse_correction: bool = False
+    single_stream_swap: bool = False
+    defer_sparse_max_update: bool = False
+    cache_uniform_sparse_quads: bool = False
+    fuse_sparse_epilogue: bool = False
+    fuse_sparse_cluster_epilogue: bool = False
+    external_sparse_reduction: bool = False
+    sparse_direct: bool = False
+    sparse_static_scales: bool = False
+    sparse_direct_pages: tuple[int, int] = (1, 1)
+    sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
     clc_padding_warp_idx: int = 14
@@ -192,6 +205,36 @@ class MlaConfig:
     use_attention_sinks: int = 0
     use_sliding_window_causal: int = 0
     attention_window_size: int = 0
+
+    @property
+    def single_kv_pipe(self) -> bool:
+        """Use one softmax/P stream while retaining two score stages."""
+        return self.kernel_variant == "keeps_mma_ab" or self.single_stream_swap
+
+    @property
+    def short_merged_softmax(self) -> bool:
+        """Use one softmax group when a sparse split has no steady-state loop."""
+        return (
+            self.sparse_direct
+            and not self.single_stream_swap
+            and self.kernel_variant == "swaps_mma_ab"
+            and self.fixed_sparse_kv_tiles > 0
+        )
+
+    @property
+    def serial_swap_reuse(self):
+        return (
+            self.sparse_reuse_kv
+            and self.num_insts_kv == 2
+            and not self.is_fp8_qkv()
+            and self.kernel_variant == "swaps_mma_ab"
+        )
+
+    @property
+    def sparse_cache_words(self):
+        if self.cache_uniform_sparse_quads:
+            return 6 + self.tile_size_kv // self.load_num_warps
+        return 6 if self.sparse_offset_cache == "coalesced" else 4
 
     @property
     def softmax0_num_warps(self) -> int:
@@ -368,6 +411,21 @@ class MlaConfig:
         """Return whether Q/K/V tensors use E4M3 data."""
 
         return self.qkv_dtype == "e4m3"
+
+    @property
+    def fixed_sparse_kv_tiles(self) -> int:
+        """Return the minimum instruction group when bounded by the plan.
+
+        Keep-AB uses one KV tile and Swap-AB uses two independent streams.
+        If the maximum planned split fits that group, every shorter valid
+        prefix already has the same partition. Live lengths still mask data.
+        """
+        tiles = self.local_kv_tiles(self.total_kv_tiles)
+        return (
+            self.num_insts_kv
+            if self.sparse_direct and tiles == self.num_insts_kv
+            else 0
+        )
 
     def local_kv_tiles(self, total_kv_tiles: int) -> int:
         """Return per-CTA KV tiles after multi-CTA KV splitting."""
@@ -1233,10 +1291,13 @@ def is_throughput_latency_mla_supported_shape(
     del batch_size
     return (
         latent_dim == 512
-        and rope_dim == 64
+        and rope_dim in (0, 64)
         and 1 <= num_heads_q <= 128
         and is_power_of_two(num_heads_q)
-        and num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
+        and (
+            num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
+            or (num_tokens_per_page == 1 and rope_dim == 0)
+        )
         and seq_len_q >= 1
         and seq_len_kv >= 128
     )
@@ -1479,7 +1540,9 @@ def make_throughput_latency_mla_config(
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
-    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES:
+    if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
+        num_tokens_per_page == 1 and rope_dim == 0
+    ):
         raise ValueError(
             "num_tokens_per_page must be one of "
             f"{SUPPORTED_MLA_PAGE_SIZES}, got {num_tokens_per_page}"
@@ -1491,7 +1554,10 @@ def make_throughput_latency_mla_config(
             f"num_tokens_per_page={num_tokens_per_page}"
         )
     pages_per_kv_tile = MlaConfig.tile_size_kv // num_tokens_per_page
-    if pages_per_kv_tile > MlaConfig.page_offsets_entries_per_stage:
+    metadata_capacity = (
+        128 if num_tokens_per_page == 1 else MlaConfig.page_offsets_entries_per_stage
+    )
+    if pages_per_kv_tile > metadata_capacity:
         raise ValueError(
             "page-offset staging capacity is smaller than one KV tile: "
             f"pages_per_kv_tile={pages_per_kv_tile}, "
@@ -1528,6 +1594,11 @@ def make_throughput_latency_mla_config(
         selected_profile,
         explicit_persistent,
     )
+    if selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv:
+        # Persistent work queues enumerate Q/head-dimension tiles, not KV
+        # splits. Direct MlaProfile callers must obey the same restriction
+        # as persistent_override_profile, or only split zero gets produced.
+        raise ValueError("persistent scheduling is not supported with split-KV")
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )
@@ -1612,6 +1683,7 @@ def make_throughput_latency_mla_config(
         softmax_regs=softmax_register_budget(tile_size_q),
         correction_regs=correction_register_budget(tile_size_q),
         num_tokens_per_page=num_tokens_per_page,
+        page_offsets_entries_per_stage=metadata_capacity,
         max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
         tmem_s_cols=tile_size_q,
         tmem_stats_cols=MlaConfig.tmem_stats_cols,

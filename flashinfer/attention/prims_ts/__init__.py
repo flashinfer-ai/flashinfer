@@ -49,7 +49,18 @@ from .q_token_kv_block_sparse_metadata import (
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
 
+from .sparse_mla_decode import (
+    BatchSparseMLADecodePagedTSWrapper,
+    SparseMLAPreparedMetadata,
+    batch_sparse_mla_decode_with_paged_kv_cache,
+    get_prims_ts_sparse_mla_decode_workspace_size,
+)
+
 __all__ = [
+    "SparseMLAPreparedMetadata",
+    "BatchSparseMLADecodePagedTSWrapper",
+    "batch_sparse_mla_decode_with_paged_kv_cache",
+    "get_prims_ts_sparse_mla_decode_workspace_size",
     "BlockSparseTSWrapper",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",

@@ -56,6 +56,17 @@ from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
+from ..helpers.gather import (
+    gather4_cached,
+    load_sparse_rows,
+    invalid_sparse_token,
+    gather4_quad,
+    gather4_uniform_quad_slices,
+    load_sparse_quad,
+    cache_sparse_mask,
+    CachedSparseMask,
+)
+
 from .config import (
     V_SMEM_K_BLOCK_TOKENS,
     V_TMA_LATENT_ELEMENTS,
@@ -626,6 +637,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     """GMEM page table cached as one register per lane of the TMA warp."""
 
     page_offsets: Any = None  # GMEM page-offset tensor
+    smem_sparse_offsets: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     cached_k_pages: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
@@ -639,7 +651,20 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     cached_window_page: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    cached_mask_low: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    cached_mask_high: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+        ("cached_mask_low", Int32, Int32(0), "Low half of the prefetched sparse mask."),
+        (
+            "cached_mask_high",
+            Int32,
+            Int32(0),
+            "High half of the prefetched sparse mask.",
+        ),
         (
             "cached_k_pages",
             cutlass.Array,
@@ -666,6 +691,81 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         ),
     )
 
+    @producer_work
+    @cute.jit
+    def load_sparse_offsets(self, stage_info: StageInfo):
+        lane = cute.arch.thread_idx()[0] % 32
+        k_index = stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
+        token = k_index * Int32(128) + lane * Int32(4)
+        quad = load_sparse_quad(
+            self.page_offsets, stage_info.work_tile.tile_idx[2], token
+        )
+        self.smem_sparse_offsets.data_ptr(stage_info.stage_idx * 128 + lane * 4).store(
+            quad.load(0, 4), alignment=16
+        )
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _read_sparse_quad(
+        self, stage_info: StageInfo, *, is_v: cutlass.Constexpr[bool]
+    ):
+        lane = cute.arch.thread_idx()[0] % 32
+        warp = cute.arch.thread_idx()[0] // 32 - (
+            self.cfg.load_v_warp_id if is_v else self.cfg.load_k_warp_id
+        )
+        groups = (32 if is_v else 16) // self.cfg.load_num_warps
+        origin = (
+            Int32(0)
+            if is_v
+            else cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            * Int32(64)
+        )
+        raw = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+        for j in cutlass.range_constexpr(4):
+            raw[j] = Int32(0x7FFFFFFF)
+        if lane < Int32(groups):
+            offset = stage_info.stage_idx * 128 + origin + (warp * groups + lane) * 4
+            loaded = self.smem_sparse_offsets.data_ptr(offset).load(
+                count=4, alignment=16
+            )
+            for j in cutlass.range_constexpr(4):
+                raw[j] = loaded[j]
+        return raw
+
+    @consumer_work(returns=(cached_mask_low, cached_mask_high))
+    @cute.jit
+    def read_sparse_mask(self, stage_info: StageInfo):
+        lane = cute.arch.thread_idx()[0] % 32
+        half = (cute.arch.thread_idx()[0] % 128) // 64
+        base = stage_info.stage_idx * 128 + half * 64
+        tile = stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
+        token = tile * Int32(128) + half * Int32(64) + lane
+        length = Int32(stage_info.work_tile.k_len)
+        low = self.smem_sparse_offsets[base + lane]
+        high = self.smem_sparse_offsets[base + lane + 32]
+        low_bits = Int32(
+            cute.arch.vote_ballot_sync(
+                ((low & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF)) | (token >= length)
+            )
+        )
+        high_bits = Int32(
+            cute.arch.vote_ballot_sync(
+                ((high & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF))
+                | (token + Int32(32) >= length)
+            )
+        )
+        return low_bits, high_bits
+
+    @consumer_work(returns="cached_k_pages")
+    @cute.jit
+    def read_sparse_k(self, stage_info: StageInfo):
+        return self._read_sparse_quad(stage_info, is_v=False)
+
+    @consumer_work(returns="cached_v_pages")
+    @cute.jit
+    def read_sparse_v(self, stage_info: StageInfo):
+        return self._read_sparse_quad(stage_info, is_v=True)
+
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
         returns=(
@@ -683,17 +783,21 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         return (
             cutlass.Array(
                 Int32,
-                cfg.pages_per_k_cta,
+                (64 // cfg.load_num_warps if cfg.cache_uniform_sparse_pages else 2)
+                if cfg.page_size == 1
+                else cfg.pages_per_k_cta,
                 space=cutlass.AddressSpace.rmem,
             ),
             cutlass.Array(
                 Int32,
-                cfg.pages_per_v_tile,
+                (128 // cfg.load_num_warps if cfg.cache_uniform_sparse_pages else 4)
+                if cfg.page_size == 1
+                else cfg.pages_per_v_tile,
                 space=cutlass.AddressSpace.rmem,
             ),
             cutlass.Array(
                 Int32,
-                cfg.pages_per_v_tile,
+                4 if cfg.page_size == 1 else cfg.pages_per_v_tile,
                 space=cutlass.AddressSpace.rmem,
             ),
             Int32(0),
@@ -731,6 +835,73 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         blk_coord = work_tile.tile_idx
         local_k_index = Int32(stage_info.loop_offset)
         global_k_index = work_tile.k_index_base + local_k_index
+        if cutlass.const_expr(cfg.page_size == 1):
+            cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            new_k = load_sparse_rows(
+                self.page_offsets,
+                blk_coord[2],
+                global_k_index * 128 + cta * 64,
+                fragments=2,
+            )
+            new_v = load_sparse_rows(
+                self.page_offsets, blk_coord[2], global_k_index * 128, fragments=4
+            )
+            if cutlass.const_expr(cfg.cache_uniform_sparse_pages):
+                warp = (
+                    cute.arch.make_warp_uniform(cute.arch.warp_idx())
+                    - cfg.load_tma_warp_id
+                )
+                fragment = (
+                    new_k[0] if warp < Int32(cfg.load_num_warps // 2) else new_k[1]
+                )
+                for i in cutlass.range_constexpr(64 // cfg.load_num_warps):
+                    cached_k_pages[i] = cute.arch.make_warp_uniform(
+                        prims.shfl_sync(
+                            thread_mask=0xFFFFFFFF,
+                            val=fragment,
+                            offset=(warp % Int32(cfg.load_num_warps // 2))
+                            * Int32(64 // cfg.load_num_warps)
+                            + Int32(i),
+                            mask_and_clamp=0x1F,
+                            kind=prims.Shfl.IDX,
+                        )
+                    )
+            else:
+                for i in cutlass.range_constexpr(2):
+                    cached_k_pages[i] = new_k[i]
+            if cutlass.const_expr(cfg.cache_uniform_sparse_pages):
+                # Expand only the delayed V tile; retain the next V tile in
+                # lane fragments to keep the register footprint bounded.
+                for i in cutlass.range_constexpr(128 // cfg.load_num_warps):
+                    if cutlass.const_expr(init_v_cache):
+                        cached_v_pages[i] = Int32(0x7FFFFFFF)
+                    else:
+                        cached_v_pages[i] = cute.arch.make_warp_uniform(
+                            prims.shfl_sync(
+                                thread_mask=0xFFFFFFFF,
+                                val=cached_next_v_pages[
+                                    i // (32 // cfg.load_num_warps)
+                                ],
+                                offset=warp * Int32(32 // cfg.load_num_warps)
+                                + Int32(i % (32 // cfg.load_num_warps)),
+                                mask_and_clamp=0x1F,
+                                kind=prims.Shfl.IDX,
+                            )
+                        )
+                for i in cutlass.range_constexpr(4):
+                    cached_next_v_pages[i] = new_v[i]
+            else:
+                for i in cutlass.range_constexpr(4):
+                    cached_v_pages[i] = (
+                        Int32(0x7FFFFFFF) if init_v_cache else cached_next_v_pages[i]
+                    )
+                    cached_next_v_pages[i] = new_v[i]
+            return (
+                cached_k_pages,
+                cached_v_pages,
+                cached_next_v_pages,
+                cached_window_page,
+            )
         pages_per_k_tile = cutlass.const_expr(cfg.pages_per_k_tile)
         page_window_tiles = cutlass.const_expr(32 // pages_per_k_tile)
         page_window_mask = cutlass.const_expr(page_window_tiles - 1)
@@ -864,6 +1035,15 @@ class SmemQResource(HighThroughputMlaResource):
     @producer_work
     @cute.jit
     def tma_load(self, stage_info: StageInfo) -> None:
+        """Let one warp issue Q while the full loader group signals readiness."""
+        if cutlass.const_expr(self.cfg.load_num_warps > 1):
+            if cute.arch.thread_idx()[0] // 32 == self.cfg.load_k_warp_id:
+                self._tma_load(stage_info)
+        else:
+            self._tma_load(stage_info)
+
+    @cute.jit
+    def _tma_load(self, stage_info: StageInfo) -> None:
         """TMA load Q latent + Q rope into SMEM (all sub-tiles in one commit)."""
         cfg = self.cfg
         work_tile = stage_info.work_tile
@@ -963,6 +1143,7 @@ class SmemKVResource(HighThroughputMlaResource):
     tma_desc_c_latent: Any = None
     tma_desc_c_rope: Any = None
     tma_desc_c_transpose: Any = None
+    tma_desc_extra_v: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     cta_rank: Any = field(init=False, default=None)
     is_leader: Any = field(init=False, default=None)
@@ -1001,6 +1182,154 @@ class SmemKVResource(HighThroughputMlaResource):
         """TMA load one K or delayed-V sub-tile into the shared KV ring."""
         cfg = self.cfg
         stage_idx = stage_info.stage_idx
+
+        if cutlass.const_expr(cfg.page_size == 1):
+            cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            base = stage_idx * cfg.smem_k_stage_elems
+            warp = (
+                cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_tma_warp_id
+            )
+            if cutlass.const_expr(cfg.load_num_warps in (4, 8)):
+                if cutlass.const_expr(not is_v):
+                    if cutlass.const_expr(not cfg.cache_uniform_sparse_pages):
+                        fragment = (
+                            cached_k_pages[0]
+                            if warp < Int32(cfg.load_num_warps // 2)
+                            else cached_k_pages[1]
+                        )
+                    for owner in cutlass.range_constexpr(16 // cfg.load_num_warps):
+                        raw = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                        for j in cutlass.range_constexpr(4):
+                            if cutlass.const_expr(cfg.cache_uniform_sparse_pages):
+                                raw[j] = cached_k_pages[owner * 4 + j]
+                            else:
+                                lane_base = (
+                                    warp % Int32(cfg.load_num_warps // 2)
+                                ) * Int32(64 // cfg.load_num_warps) + Int32(owner * 4)
+                                raw[j] = cute.arch.make_warp_uniform(
+                                    prims.shfl_sync(
+                                        thread_mask=0xFFFFFFFF,
+                                        val=fragment,
+                                        offset=lane_base + Int32(j),
+                                        mask_and_clamp=0x1F,
+                                        kind=prims.Shfl.IDX,
+                                    )
+                                )
+                        group = warp * Int32(16 // cfg.load_num_warps) + Int32(owner)
+                        gather4_uniform_quad_slices(
+                            self.smem_kv.data_ptr(
+                                base + group * 4 * cfg.mma_qk_tiler_k
+                            ),
+                            self.tma_desc_c_latent,
+                            self.tma_desc_c_rope,
+                            Int32(
+                                subtile_idx
+                                * cfg.kv_subtiles_per_stage
+                                * cfg.mma_qk_tiler_k
+                            ),
+                            raw,
+                            stage_info.barrier,
+                            num_slices=cfg.kv_subtiles_per_stage,
+                            dst_stride=64 * cfg.mma_qk_tiler_k * cfg.qkv_dtype_bytes,
+                            col_stride=cfg.mma_qk_tiler_k,
+                        )
+                else:
+                    cached = cached_next_v_pages if use_next_v_pages else cached_v_pages
+                    pv_j = subtile_idx // cfg.kv_subtiles_per_stage
+                    token_partition = subtile_idx % cfg.kv_subtiles_per_stage
+                    for part in cutlass.range_constexpr(cfg.kv_subtiles_per_stage):
+                        pv_i = token_partition * cfg.kv_subtiles_per_stage + part
+                        for owner in cutlass.range_constexpr(8 // cfg.load_num_warps):
+                            group = warp * Int32(8 // cfg.load_num_warps) + Int32(owner)
+                            raw = cutlass.Array(
+                                Int32, 4, space=cutlass.AddressSpace.rmem
+                            )
+                            for j in cutlass.range_constexpr(4):
+                                if cutlass.const_expr(
+                                    cfg.cache_uniform_sparse_pages
+                                    and not use_next_v_pages
+                                ):
+                                    raw[j] = cached_v_pages[
+                                        pv_i * (32 // cfg.load_num_warps)
+                                        + owner * 4
+                                        + j
+                                    ]
+                                else:
+                                    raw[j] = cute.arch.make_warp_uniform(
+                                        prims.shfl_sync(
+                                            thread_mask=0xFFFFFFFF,
+                                            val=cached[pv_i],
+                                            offset=group * Int32(4) + Int32(j),
+                                            mask_and_clamp=0x1F,
+                                            kind=prims.Shfl.IDX,
+                                        )
+                                    )
+                            gather4_uniform_quad_slices(
+                                self.smem_kv.data_ptr(
+                                    base + part * 32 * 128 + group * 4 * 64
+                                ),
+                                self.tma_desc_c_transpose,
+                                self.tma_desc_extra_v,
+                                cta * Int32(128) + Int32(pv_j * 256),
+                                raw,
+                                stage_info.barrier,
+                                num_slices=2,
+                                dst_stride=32 * 64 * cfg.qkv_dtype_bytes,
+                                col_stride=64,
+                            )
+                return
+            if cutlass.const_expr(not is_v):
+                for part in cutlass.range_constexpr(cfg.kv_subtiles_per_stage):
+                    column = Int32(
+                        (subtile_idx * cfg.kv_subtiles_per_stage + part)
+                        * cfg.mma_qk_tiler_k
+                    )
+                    for local_group in cutlass.range(
+                        16 // cfg.load_num_warps, unroll_full=True
+                    ):
+                        group = local_group
+                        gather4_cached(
+                            self.smem_kv.data_ptr(
+                                base
+                                + part * 64 * cfg.mma_qk_tiler_k
+                                + group * 4 * cfg.mma_qk_tiler_k
+                            ),
+                            self.tma_desc_c_latent,
+                            self.tma_desc_c_rope,
+                            column,
+                            cached_k_pages,
+                            group * 4,
+                            stage_info.barrier,
+                            cta_group=2,
+                        )
+            else:
+                cached = cached_next_v_pages if use_next_v_pages else cached_v_pages
+                pv_j = subtile_idx // cfg.kv_subtiles_per_stage
+                token_partition = subtile_idx % cfg.kv_subtiles_per_stage
+                for part in cutlass.range_constexpr(cfg.kv_subtiles_per_stage):
+                    pv_i = token_partition * cfg.kv_subtiles_per_stage + part
+                    for panel in cutlass.range_constexpr(2):
+                        column = cta * 128 + Int32(pv_j * 256 + panel * 64)
+                        for local_group in cutlass.range(
+                            8 // cfg.load_num_warps, unroll_full=True
+                        ):
+                            group = local_group
+                            gather4_cached(
+                                self.smem_kv.data_ptr(
+                                    base
+                                    + part * 32 * 128
+                                    + panel * 32 * 64
+                                    + group * 4 * 64
+                                ),
+                                self.tma_desc_c_transpose,
+                                self.tma_desc_extra_v,
+                                column,
+                                cached,
+                                Int32(pv_i * 32) + group * 4,
+                                stage_info.barrier,
+                                cta_group=2,
+                            )
+            return
 
         kc_page_smem_elems = cfg.kc_page_tile_size * cfg.mma_qk_tiler_k
         kv_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
@@ -1284,6 +1613,40 @@ class SmemKResource(HighThroughputMlaResource):
 
     @producer_work
     @cute.jit
+    def tma_load_cached(self, stage_info: StageInfo, *, cached_k_pages):
+        """Broadcast each cached quad once, then issue its FP8 feature slices."""
+        cfg = self.cfg
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_k_warp_id
+        base = (
+            cute.arch.make_warp_uniform(stage_info.stage_idx) * cfg.smem_k_stage_elems
+        )
+        for owner in cutlass.range_constexpr(16 // cfg.load_num_warps):
+            raw = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+            for j in cutlass.range_constexpr(4):
+                raw[j] = cute.arch.make_warp_uniform(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=cached_k_pages[j],
+                        offset=Int32(owner),
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                    )
+                )
+            quad = warp * Int32(16 // cfg.load_num_warps) + Int32(owner)
+            gather4_uniform_quad_slices(
+                self.smem_k.data_ptr(base + quad * 4 * cfg.mma_qk_tiler_k),
+                self.tma_desc_c_latent,
+                self.tma_desc_c_rope,
+                Int32(0),
+                raw,
+                stage_info.barrier,
+                num_slices=cfg.iterations_qk_latent,
+                dst_stride=64 * cfg.mma_qk_tiler_k,
+                col_stride=cfg.mma_qk_tiler_k,
+            )
+
+    @producer_work
+    @cute.jit
     def tma_load_direct(self, stage_info: StageInfo) -> None:
         """TMA load one full K tile using page offsets read directly from GMEM."""
         cfg = self.cfg
@@ -1292,6 +1655,34 @@ class SmemKResource(HighThroughputMlaResource):
         work_tile = stage_info.work_tile
         blk_coord = work_tile.tile_idx
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
+
+        if cutlass.const_expr(cfg.page_size == 1):
+            cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            lane = cute.arch.thread_idx()[0] % 32
+            warp = cute.arch.thread_idx()[0] // 32 - cfg.load_k_warp_id
+            groups_per_warp = 16 // cfg.load_num_warps
+            group = warp * groups_per_warp + lane
+            if lane < Int32(groups_per_warp):
+                cached = load_sparse_quad(
+                    self.page_offsets,
+                    blk_coord[2],
+                    k_index * 128 + cta * 64 + group * 4,
+                )
+                for part in cutlass.range_constexpr(cfg.iterations_qk_latent):
+                    gather4_quad(
+                        self.smem_k.data_ptr(
+                            stage_base
+                            + part * 64 * cfg.mma_qk_tiler_k
+                            + group * 4 * cfg.mma_qk_tiler_k
+                        ),
+                        self.tma_desc_c_latent,
+                        self.tma_desc_c_rope,
+                        Int32(part * cfg.mma_qk_tiler_k),
+                        cached,
+                        stage_info.barrier,
+                        cta_group=2,
+                    )
+            return
 
         page_row_idx = blk_coord[2]
         page_offsets_batch = self.page_offsets[None, page_row_idx]
@@ -1440,6 +1831,7 @@ class SmemVResource(HighThroughputMlaResource):
     smem_v: Any = None
     page_offsets: Any = None
     tma_desc_c_transpose: Any = None
+    tma_desc_extra_v: Any = None
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     desc_v_base: cutlass.Constexpr[TaskLocalVariable] = (
@@ -1457,6 +1849,46 @@ class SmemVResource(HighThroughputMlaResource):
 
     @producer_work
     @cute.jit
+    def tma_load_cached(self, stage_info: StageInfo, *, cached_v_pages):
+        """Reuse a warp-uniform quad across the FP8 V feature panels."""
+        cfg = self.cfg
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_v_warp_id
+        cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        base = (
+            cute.arch.make_warp_uniform(stage_info.stage_idx) * cfg.smem_v_stage_elems
+        )
+        for owner in cutlass.range_constexpr(32 // cfg.load_num_warps):
+            raw = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+            for j in cutlass.range_constexpr(4):
+                raw[j] = cute.arch.make_warp_uniform(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=cached_v_pages[j],
+                        offset=Int32(owner),
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                    )
+                )
+            quad = warp * Int32(32 // cfg.load_num_warps) + Int32(owner)
+            call = (quad // Int32(16)) * cfg.iterations_pv_n
+            gather4_uniform_quad_slices(
+                self.smem_v.data_ptr(
+                    base
+                    + call * 128 * cfg.mma_pv_tiler[2]
+                    + (quad % Int32(16)) * 4 * 128
+                ),
+                self.tma_desc_c_transpose,
+                self.tma_desc_extra_v,
+                cta * 128,
+                raw,
+                stage_info.barrier,
+                num_slices=cfg.iterations_pv_n,
+                dst_stride=128 * cfg.mma_pv_tiler[2],
+                col_stride=256,
+            )
+
+    @producer_work
+    @cute.jit
     def tma_load_direct(self, stage_info: StageInfo) -> None:
         """TMA load one full V tile using page offsets read directly from GMEM."""
         cfg = self.cfg
@@ -1465,6 +1897,38 @@ class SmemVResource(HighThroughputMlaResource):
         work_tile = stage_info.work_tile
         blk_coord = work_tile.tile_idx
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
+        if cutlass.const_expr(cfg.page_size == 1):
+            cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            lane = cute.arch.thread_idx()[0] % 32
+            warp = cute.arch.thread_idx()[0] // 32 - cfg.load_v_warp_id
+            groups_per_warp = 32 // cfg.load_num_warps
+            quad = warp * groups_per_warp + lane
+            if lane < Int32(groups_per_warp):
+                cached = load_sparse_quad(
+                    self.page_offsets, blk_coord[2], k_index * 128 + quad * 4
+                )
+                for call in cutlass.range_constexpr(
+                    cfg.iterations_pv_k * cfg.iterations_pv_n
+                ):
+                    pv_i = call // cfg.iterations_pv_n
+                    pv_j = call % cfg.iterations_pv_n
+                    if quad // Int32(cfg.mma_pv_tiler[2] // 4) == Int32(pv_i):
+                        group = quad % Int32(cfg.mma_pv_tiler[2] // 4)
+                        gather4_quad(
+                            self.smem_v.data_ptr(
+                                stage_base
+                                + call * 128 * cfg.mma_pv_tiler[2]
+                                + group * 4 * 128
+                            ),
+                            self.tma_desc_c_transpose,
+                            self.tma_desc_extra_v,
+                            cta * 128 + Int32(pv_j * 256),
+                            cached,
+                            stage_info.barrier,
+                            cta_group=2,
+                        )
+            return
+
         page_row_idx = blk_coord[2]
         page_offsets_batch = self.page_offsets[None, page_row_idx]
 
@@ -1567,6 +2031,10 @@ class SmemVResource(HighThroughputMlaResource):
         layout = cutlass.const_expr(
             qk_desc_layout_for_head_dim(cfg, cfg.mma_pv_tiler[2])
         )
+        if cutlass.const_expr(cfg.page_size == 1):
+            leading_byte_offset = 0
+            stride_byte_offset = 1024
+            layout = 2
         svc_ptr = self.smem_v.data_ptr(subtile_offset)
         desc = Int64(
             prims.Tcgen05SmemDesc.build(
@@ -1607,6 +2075,10 @@ class SmemVResource(HighThroughputMlaResource):
         layout = cutlass.const_expr(
             qk_desc_layout_for_head_dim(cfg, cfg.mma_pv_tiler[2])
         )
+        if cutlass.const_expr(cfg.page_size == 1):
+            leading_byte_offset = 0
+            stride_byte_offset = 1024
+            layout = 2
         svc_ptr = self.smem_v.data_ptr(subtile_offset)
         desc = Int64(
             prims.Tcgen05SmemDesc.build(
@@ -1639,6 +2111,7 @@ class TmemSResource(HighThroughputMlaResource):
     smem_p: Any = None  # SMEM P array
     smem_exchange: Any = None  # SMEM array for cross-warp max exchange
     softmax_scale_log2: Any = None  # softmax_scale * log2(e)
+    page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
@@ -1981,6 +2454,8 @@ class TmemSResource(HighThroughputMlaResource):
         row_max_new,
         correction_factor_out,
         no_correction_out,
+        cached_mask_low=None,
+        cached_mask_high=None,
     ):
         """Load S from TMEM and compute the local row max."""
         del row_sum_out, row_max_new, correction_factor_out, no_correction_out
@@ -2040,6 +2515,40 @@ class TmemSResource(HighThroughputMlaResource):
             )
             qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
+        if cutlass.const_expr(cfg.page_size == 1):
+            group_needs_mask = True
+        if cutlass.const_expr(cached_mask_low is not None):
+            mask_routes = CachedSparseMask((cached_mask_low, cached_mask_high), False)
+            # The cached invalid bits already include the live K boundary.
+            # Whole valid halves need no per-score masking instructions.
+            if cutlass.const_expr(not needs_row_causal_mask):
+                group_needs_mask = (cached_mask_low | cached_mask_high) != Int32(0)
+        else:
+            raw_mask_routes = (
+                self.page_offsets.mask_for_tile(tile_offset_k, work_tile.tile_idx[2])
+                if cutlass.const_expr(hasattr(self.page_offsets, "mask_for_tile"))
+                else self.page_offsets
+            )
+            mask_routes = (
+                cache_sparse_mask(
+                    raw_mask_routes,
+                    tile_offset_k,
+                    K,
+                    work_tile.tile_idx[2],
+                    swaps=False,
+                    column_half=local_tidx >> EPILOGUE_COLUMN_GROUP_SHIFT,
+                )
+                if cutlass.const_expr(
+                    cfg.page_size == 1 and self.logical_seq_len_q == 1
+                )
+                else raw_mask_routes
+            )
+            if cutlass.const_expr(
+                cfg.page_size == 1
+                and self.logical_seq_len_q == 1
+                and not needs_row_causal_mask
+            ):
+                group_needs_mask = (mask_routes.low | mask_routes.high) != Int32(0)
         if group_needs_mask:
             if cutlass.const_expr(needs_row_causal_mask):
                 # Clamp padded physical tail rows to the request's last real
@@ -2070,8 +2579,21 @@ class TmemSResource(HighThroughputMlaResource):
                         token_idx - K + logical_seq_len_q
                     )
                     token_is_visible = flat_query_row >= mask_flat_row
+                elif cutlass.const_expr(
+                    cached_mask_low is not None
+                    or getattr(self.page_offsets, "assume_valid_prefix", False)
+                ):
+                    token_is_visible = not mask_routes.is_invalid(
+                        token_idx, work_tile.tile_idx[2]
+                    )
                 else:
-                    token_is_visible = token_idx < K
+                    token_is_visible = not invalid_sparse_token(
+                        token_idx,
+                        K,
+                        mask_routes,
+                        work_tile.tile_idx[2],
+                        sparse=cfg.page_size == 1,
+                    )
                 qk_acc_regs[i] = qk_acc_regs[i] if token_is_visible else neg_inf
 
         max0 = neg_inf
@@ -2132,6 +2654,46 @@ class TmemSResource(HighThroughputMlaResource):
             row_max_new=row_max_new,
             correction_factor_out=correction_factor_out,
             no_correction_out=no_correction_out,
+        )
+
+    @consumer_work(
+        returns=(
+            qk_acc_regs,
+            row_max,
+            row_sum,
+            row_sum_out,
+            row_max_new,
+            correction_factor_out,
+            no_correction_out,
+        ),
+    )
+    @cute.jit
+    def load_s_cached(
+        self,
+        stage_info: StageInfo,
+        *,
+        qk_acc_regs,
+        row_max,
+        row_sum,
+        row_sum_out,
+        row_max_new,
+        correction_factor_out,
+        no_correction_out,
+        cached_mask_low,
+        cached_mask_high,
+    ):
+        """Load S for the even softmax group."""
+        return self._load_s_impl(
+            stage_info,
+            qk_acc_regs=qk_acc_regs,
+            row_max=row_max,
+            row_sum=row_sum,
+            row_sum_out=row_sum_out,
+            row_max_new=row_max_new,
+            correction_factor_out=correction_factor_out,
+            no_correction_out=no_correction_out,
+            cached_mask_low=cached_mask_low,
+            cached_mask_high=cached_mask_high,
         )
 
     @consumer_work(
@@ -2247,6 +2809,14 @@ class TmemSResource(HighThroughputMlaResource):
                     row_max_prev, row_sum_prev = load_peer_state()
 
         row_max_new = fmax_f32(row_max_prev, row_max_tile)
+        if cutlass.const_expr(cfg.defer_sparse_max_update):
+            # A retained common anchor preserves attention while keeping
+            # BF16 probabilities at most 64, matching FlashMLA's six-log2
+            # threshold. Native FP8 retains exact maxima and scale 448.
+            if row_max_prev != neg_inf and self.softmax_scale_log2 > Float32(0):
+                increase_log2 = (row_max_new - row_max_prev) * self.softmax_scale_log2
+                if increase_log2 <= Float32(6.0):
+                    row_max_new = row_max_prev
         row_has_values = row_max_new != neg_inf
         safe_row_max_prev = row_max_prev if row_has_values else Float32(0)
         safe_row_max_new = row_max_new if row_has_values else Float32(0)
@@ -2264,8 +2834,8 @@ class TmemSResource(HighThroughputMlaResource):
         fma_b = self.softmax_scale_log2
         fma_c = Float32(0) - safe_row_max_new * self.softmax_scale_log2
         if cutlass.const_expr(cfg.is_fp8_qkv()):
-            # Match the 448-scaled E4M3 P convention used by the reference
-            # output and the 1CTA implementation.
+            # Use the same selected FP8 probability scale as output and LSE.
+            # Native FP8 uses exact maxima and scale 448.
             fma_c = fma_c + fp8_log2_quant_scale()
         for i in cutlass.range_constexpr(0, 64, 2):
             fma_result = fma_packed_f32x2(
@@ -3043,6 +3613,7 @@ class GmemOResource(HighThroughputMlaResource):
     tmem_o_ref: Any = None  # Reference to TmemOResource for tmem_base_addr
     tmem_corr_ref: Any = None  # Reference to TmemCorrResource for correction data
     output_scale: Any = None
+    sparse_sinks: Any = None
     softmax_scale_log2: Any = None
     smem_exchange: Any = None  # SMEM for row_sum exchange (as Int32 base addr)
     split_kv: Any = None
@@ -3050,6 +3621,39 @@ class GmemOResource(HighThroughputMlaResource):
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
+
+    @cute.jit
+    def _normalization_scale(self, row_sum, row_max, local_tidx, blk_coord):
+        safe_sum = row_sum if row_sum > Float32(0) else Float32(1)
+        scale = self.output_scale * cute.math.rcp(safe_sum, approx=True)
+        if cutlass.const_expr(self.sparse_sinks is not None):
+            head = (
+                Int32(blk_coord[1]) * self.cfg.mma_qk_tiler[0]
+                + Int32(blk_coord[0])
+                * (self.cfg.mma_qk_tiler[0] // self.cfg.num_mma_ctas)
+                + (local_tidx & Int32(63))
+            )
+            head = cute.math.min(head, Int32(self.logical_num_heads_q - 1))
+            sink = Float32(self.sparse_sinks[head])
+            scale = Float32(0)
+            if row_sum > Float32(0) and sink != Float32(Float32.inf):
+                max_log2 = row_max * self.softmax_scale_log2
+                sink_log2 = sink * Float32(1.4426950408889634)
+                norm_max = cute.math.max(max_log2, sink_log2)
+                rescale = cute.math.exp2(max_log2 - norm_max, fastmath=True)
+                inv_quant = Float32(
+                    fp8_quant_scale_rcp() if self.cfg.is_fp8_qkv() else 1.0
+                )
+                denominator = row_sum * inv_quant * rescale + cute.math.exp2(
+                    sink_log2 - norm_max, fastmath=True
+                )
+                scale = (
+                    self.output_scale
+                    * inv_quant
+                    * rescale
+                    * cute.math.rcp(denominator, approx=True)
+                )
+        return scale
 
     @cute.jit
     def _query_row_state(self, row_in_tile, query_tile_idx, batch_idx):
@@ -3150,8 +3754,7 @@ class GmemOResource(HighThroughputMlaResource):
         # causal query rows have no visible K values in this split. Store zero
         # O and -inf LSE so split-KV reduction gives those rows zero weight.
         row_has_values = row_sum > Float32(0)
-        safe_row_sum = row_sum if row_has_values else Float32(1)
-        norm_scale = self.output_scale * cute.math.rcp(safe_row_sum, approx=True)
+        norm_scale = self._normalization_scale(row_sum, row_max, local_tidx, blk_coord)
 
         for iter_n in cutlass.range_constexpr(cfg.iterations_pv_n):
             # Load O from TMEM
@@ -3303,6 +3906,8 @@ class GmemOResource(HighThroughputMlaResource):
             else Float32(-Float32.inf)
         )
 
+        if cutlass.const_expr(self.sparse_sinks is not None):
+            lse *= Float32(0.6931471805599453)
         # Use local_tidx (0..127 within correction warpgroup) for LSE
         # indexing, not global tidx (which is 128..255 for correction warps).
         lse_tidx = local_tidx
@@ -3395,8 +4000,7 @@ class GmemOResource(HighThroughputMlaResource):
             qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
         row_has_values = row_sum > Float32(0)
-        safe_row_sum = row_sum if row_has_values else Float32(1)
-        norm_scale = self.output_scale * cute.math.rcp(safe_row_sum, approx=True)
+        norm_scale = self._normalization_scale(row_sum, row_max, local_tidx, blk_coord)
         for i in cutlass.range_constexpr(0, 128, 2):
             scaled = mul_packed_f32x2(
                 (qk_acc_regs[i], qk_acc_regs[i + 1]),
@@ -3543,6 +4147,8 @@ class GmemOResource(HighThroughputMlaResource):
                 if row_has_values
                 else Float32(-Float32.inf)
             )
+            if cutlass.const_expr(self.sparse_sinks is not None):
+                lse *= Float32(0.6931471805599453)
             lse_tidx = local_tidx
             if lse_tidx < tile_h:
                 lse_row_in_tile = head_tile_idx * tile_h + lse_tidx

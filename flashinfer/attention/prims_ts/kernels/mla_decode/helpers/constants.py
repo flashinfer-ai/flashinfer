@@ -34,8 +34,10 @@ WARP_REDUCTION_BFLY_DISTANCES = (16, 8, 4, 2, 1)
 WARPGROUP_WARPS = 4
 WARPGROUP_THREADS = WARPGROUP_WARPS * WARP_LANES
 
-# Kernel-level TMEM lifecycle synchronization.  Barrier ID 15 is reserved for
-# alloc/dealloc phases in the 1CTA path; the 2CTA path uses config-owned IDs.
+# Kernel-level 1CTA TMEM synchronization: 14 publishes allocation to compute
+# warps; 15 handles full-CTA initialization/deallocation. The 2CTA path owns
+# its barrier IDs in its configuration.
+TMEM_READY_BARRIER_ID = 14
 TMEM_LIFECYCLE_BARRIER_ID = 15
 TMEM_DEALLOC_MBAR_THREADS = WARP_LANES
 
