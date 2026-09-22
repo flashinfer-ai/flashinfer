@@ -289,7 +289,9 @@ def _issue_sparse_page_copies(
     chunk_hd = min(head_dim_stage, 128 if cfg.use_fp8_qkv else 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-    if cutlass.const_expr(cfg.uses_2d_flat_kv_tma and cfg.kv_dtype == cutlass.BFloat16):
+    if cutlass.const_expr(
+        cfg.uses_2d_flat_kv_tma and cfg.k_dtype == cfg.v_dtype == cutlass.BFloat16
+    ):
         # Prefetch warp-owned locators before TMA issue and reuse each across
         # BF16's head chunks. Static indexing keeps the small array in registers.
         fragments_per_warp = fragments // cfg.load_num_warps
@@ -1233,7 +1235,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
             if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
-                if cutlass.const_expr(cfg.use_fp8_qkv and cfg.uses_scattered_page_route):
+                if cutlass.const_expr(
+                    cfg.use_fp8_qkv and cfg.uses_scattered_page_route
+                ):
                     _issue_sparse_page_copies(
                         cfg,
                         self.page_offsets_kv,

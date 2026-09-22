@@ -974,7 +974,7 @@ class FmhaDecodeConfig:
             and (self.tile_size_kv // self.num_tokens_per_page) % self.load_num_warps
             == 0
             and (
-                self.kv_dtype == BFloat16
+                self.k_dtype == self.v_dtype == BFloat16
                 or (
                     self.use_fp8_qkv
                     and self.use_persistent_scheduler
