@@ -6160,6 +6160,11 @@ _DENSE_GQA_Q128_KV128 = _Case(
 _DENSE_CONTIGUOUS_CASES = (
     _DENSE_MHA_Q64_KV256,
     _DENSE_GQA_Q128_KV128,
+    replace(
+        _DENSE_GQA_Q128_KV128,
+        name="q128_kv128_gqa8_bf16",
+        dtype=torch.bfloat16,
+    ),
     # Two batches with a K/V length that is not a multiple of the KV route
     # width exercise the contiguous batch stride and the TMA tail together.
     # Their 240 Q tiles exceed one resident wave, so the plan takes the

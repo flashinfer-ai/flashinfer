@@ -1245,8 +1245,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 chunk_hd = min(head_dim_stage, 64)
                 num_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
+                # Keep the Array type stable across the elected-lane control-flow join.
+                stage_base = self._stage_base(stage_info)
                 if prims.elect_sync():
-                    stage_base = self._stage_base(stage_info)
                     for chunk_idx in cutlass.range_constexpr(num_chunks):
                         local_head_dim_offset = chunk_idx * chunk_hd
                         global_head_dim_offset = (
@@ -2705,8 +2706,9 @@ class SmemKvResource(DecodeGenResourceBase):
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
+            # Keep the Array type stable across the elected-lane control-flow join.
+            stage_base = self._stage_base(stage_info)
             if prims.elect_sync():
-                stage_base = self._stage_base(stage_info)
                 for chunk_idx in cutlass.range_constexpr(num_chunks):
                     local_head_dim_offset = chunk_idx * chunk_hd
                     global_head_dim_offset = (
