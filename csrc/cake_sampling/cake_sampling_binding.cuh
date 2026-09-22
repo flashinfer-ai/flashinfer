@@ -199,14 +199,15 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   CheckCuda(cudaLaunchKernelExC(&config, v->kernel, args), "frozen radix top-k launch");
 }
 
-// Stages 2/3: sort the slab prefix, apply top-p, renormalize, draw one token per row.
+// Stages 2/3: sort the slab (descending probability, ascending index), apply top-p on exact
+//   fixed-point prefix sums, renormalize, draw one token per row, and rewrite the slab in sorted
+//   order (out_renorm follows that order).  Strictly deterministic: no atomics decide an output.
 //   seed/offset are curand Philox parameters: curand_init(seed, row, offset).
 //   enable_pdl launches with programmatic stream serialization so the prologue overlaps stage 1.
 void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorView topp_arr,
                       double topp_scalar, int64_t topp_kind, TensorView out_samples,
-                      TensorView out_renorm, int64_t seed, int64_t offset, int64_t deterministic,
-                      int64_t emit_renorm, int64_t threads, int64_t items, int64_t enable_pdl,
-                      int64_t cuda_stream) {
+                      TensorView out_renorm, int64_t seed, int64_t offset, int64_t emit_renorm,
+                      int64_t threads, int64_t items, int64_t enable_pdl, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(out_samples);
   const int32_t device_id = out_samples.device().device_id;
@@ -259,11 +260,9 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
   unsigned int seed_hi = static_cast<unsigned int>(seed_u >> 32);
   unsigned int offset_lo = static_cast<unsigned int>(offset_u & 0xFFFFFFFFu);
   unsigned int offset_hi = static_cast<unsigned int>(offset_u >> 32);
-  int det_i = deterministic != 0 ? 1 : 0;
   int renorm_i = emit_renorm != 0 ? 1 : 0;
-  void* args[] = {&vals_ptr,   &idx_ptr,   &count_ptr, &topp_ptr, &samples_ptr,
-                  &renorm_ptr, &topp_f,    &kind_i,    &seed_lo,  &seed_hi,
-                  &offset_lo,  &offset_hi, &det_i,     &renorm_i};
+  void* args[] = {&vals_ptr, &idx_ptr, &count_ptr, &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,
+                  &kind_i,   &seed_lo, &seed_hi,   &offset_lo, &offset_hi,   &renorm_i};
 
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(static_cast<uint32_t>(batch), 1, 1);

@@ -32,18 +32,20 @@
   ],
   "schema_version": 1,
   "semantics": {
-    "rng": "one curand_uniform per row from curand_init(seed, row, offset) (Philox4x32-10)",
-    "top_k": "k largest probabilities per row; ties resolved toward the lower vocabulary index",
-    "top_p": "shortest sorted prefix whose exclusive mass is below p * mass(top-k), renormalized"
+    "determinism": "strict: no atomics decide any output; slab (vals, idx) is rewritten in sorted order and renorm_out is emitted in that order, bitwise identical across launches, CUDA-graph replay and every kernel variant",
+    "nan_inf": "NaN, negative and -0.0 probabilities are sanitized to +0 and never sampled; a row containing +inf keeps exactly its +inf entries, samples uniformly among them and renormalizes to 1/m; a zero-mass row returns its smallest slab index with an all-zero renorm",
+    "rng": "one curand_uniform per row from curand_init(seed, row, offset) (Philox4x32-10); a shared torch.Generator is advanced by 32 * batch like the FlashInfer top-p routes",
+    "top_k": "first k entries of lexsort(-prob, index): k largest sanitized probabilities, ties toward the lower vocabulary index; k clamped to [1, min(vocab, slab_entries)]",
+    "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "30d0bd0902b63b8d91676bced6c7659f5b1bc39df8bedc118a2b547814b696ff",
+  "source_sha256": "844d7318ffcda5aa048f27a925138408d019c7128fd00a026acbc41df6112121",
   "stage1": [
     {
       "block_threads": 512,
       "chunk": 2048,
       "cluster": 1,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 16768,
       "ept": 4,
       "symbol": "kernel_cake_radix_topk_c1_e4"
     },
@@ -51,7 +53,7 @@
       "block_threads": 512,
       "chunk": 4096,
       "cluster": 1,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 17024,
       "ept": 8,
       "symbol": "kernel_cake_radix_topk_c1_e8"
     },
@@ -59,7 +61,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 1,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 17536,
       "ept": 16,
       "symbol": "kernel_cake_radix_topk_c1_e16"
     },
@@ -67,7 +69,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 1,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 18560,
       "ept": 32,
       "symbol": "kernel_cake_radix_topk_c1_e32"
     },
@@ -75,7 +77,7 @@
       "block_threads": 512,
       "chunk": 24576,
       "cluster": 1,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 19584,
       "ept": 48,
       "symbol": "kernel_cake_radix_topk_c1_e48"
     },
@@ -83,7 +85,7 @@
       "block_threads": 512,
       "chunk": 32768,
       "cluster": 1,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 20608,
       "ept": 64,
       "symbol": "kernel_cake_radix_topk_c1_e64"
     },
@@ -91,7 +93,7 @@
       "block_threads": 512,
       "chunk": 2048,
       "cluster": 2,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 16768,
       "ept": 4,
       "symbol": "kernel_cake_radix_topk_c2_e4"
     },
@@ -99,7 +101,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 2,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 17536,
       "ept": 16,
       "symbol": "kernel_cake_radix_topk_c2_e16"
     },
@@ -107,7 +109,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 2,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 18560,
       "ept": 32,
       "symbol": "kernel_cake_radix_topk_c2_e32"
     },
@@ -115,7 +117,7 @@
       "block_threads": 512,
       "chunk": 24576,
       "cluster": 2,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 19584,
       "ept": 48,
       "symbol": "kernel_cake_radix_topk_c2_e48"
     },
@@ -123,7 +125,7 @@
       "block_threads": 512,
       "chunk": 32768,
       "cluster": 2,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 20608,
       "ept": 64,
       "symbol": "kernel_cake_radix_topk_c2_e64"
     },
@@ -131,7 +133,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 4,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 17536,
       "ept": 16,
       "symbol": "kernel_cake_radix_topk_c4_e16"
     },
@@ -139,7 +141,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 4,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 18560,
       "ept": 32,
       "symbol": "kernel_cake_radix_topk_c4_e32"
     },
@@ -147,7 +149,7 @@
       "block_threads": 512,
       "chunk": 24576,
       "cluster": 4,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 19584,
       "ept": 48,
       "symbol": "kernel_cake_radix_topk_c4_e48"
     },
@@ -155,7 +157,7 @@
       "block_threads": 512,
       "chunk": 32768,
       "cluster": 4,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 20608,
       "ept": 64,
       "symbol": "kernel_cake_radix_topk_c4_e64"
     },
@@ -163,7 +165,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 8,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 17536,
       "ept": 16,
       "symbol": "kernel_cake_radix_topk_c8_e16"
     },
@@ -171,7 +173,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 8,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 18560,
       "ept": 32,
       "symbol": "kernel_cake_radix_topk_c8_e32"
     },
@@ -179,7 +181,7 @@
       "block_threads": 512,
       "chunk": 24576,
       "cluster": 8,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 19584,
       "ept": 48,
       "symbol": "kernel_cake_radix_topk_c8_e48"
     },
@@ -187,7 +189,7 @@
       "block_threads": 512,
       "chunk": 32768,
       "cluster": 8,
-      "dynamic_smem_bytes": 32896,
+      "dynamic_smem_bytes": 20608,
       "ept": 64,
       "symbol": "kernel_cake_radix_topk_c8_e64"
     }

@@ -21,15 +21,32 @@ Two frozen kernels per row of probabilities:
    radix select (11/11/10 bits of the float32 key), reducing the 2048-bucket histograms across
    the cluster through distributed shared memory, and writes a ``[batch, 1024]`` slab of
    (value, index) pairs.
-2. ``sparse_topp_sample``: one CTA per row sorts the slab prefix, keeps the shortest prefix
-   whose exclusive mass is below ``top_p * mass(top-k)``, renormalizes, and draws one token by
-   inverse CDF from ``curand_init(seed, row, offset)``.  It is launched with programmatic
-   dependent launch so its prologue overlaps the tail of stage 1.
+2. ``sparse_topp_sample``: one CTA per row sorts the slab (descending probability, ascending
+   index), keeps the shortest prefix whose exclusive mass is below ``top_p * mass(top-k)``,
+   renormalizes, draws one token by inverse CDF from ``curand_init(seed, row, offset)``, and
+   rewrites the slab in sorted order.  It is launched with programmatic dependent launch so its
+   prologue overlaps the tail of stage 1.
 
-Semantics match :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
-``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement).  Requests
-the kernels cannot serve (top-k disabled, ``k > 1024``, non-float32 rows, very large
-``batch * vocab``, or an unsupported GPU) are dispatched to that function.
+Semantics follow :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
+``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement) with these
+guarantees on top:
+
+* **Strict determinism.** Ties at the top-k boundary are resolved toward the lower vocabulary
+  index (the support is exactly the first ``k`` entries of ``lexsort(-prob, index)``), every
+  top-p / sampling decision uses exact 64-bit fixed-point prefix sums, and no atomic decides an
+  output.  Identical inputs give bitwise identical samples, ``renorm_out`` and slab for every
+  kernel variant, stream launch or CUDA-graph replay.
+* **NaN / Inf.** NaN, negative and ``-0.0`` probabilities are treated as ``+0`` and never
+  sampled.  A row containing ``+inf`` keeps exactly its ``+inf`` entries, samples uniformly among
+  them and renormalizes them to ``1/m`` (``top_p`` is ignored for that row).  A row whose top-k
+  mass is zero returns its smallest slab index with an all-zero ``renorm_out``.  Entries below
+  ``2**-53`` times the row maximum carry zero mass.  Every output is finite.
+* ``top_p`` is clamped to ``(0, 1]`` per row (``p <= 0`` selects the argmax, ``p >= 1`` or NaN
+  keeps every entry with mass); ``top_k`` is clamped to ``[1, min(vocab, 1024)]`` per row.
+
+Requests the kernels cannot serve (top-k disabled, ``k > 1024``, non-float32 rows, very large
+``batch * vocab``, or an unsupported GPU) are dispatched to
+:func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` (``deterministic=True``).
 """
 
 from __future__ import annotations
@@ -170,7 +187,6 @@ def top_k_top_p_sampling_from_probs(
     top_p: Union[float, torch.Tensor],
     *,
     top_k_max: Optional[int] = None,
-    deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     philox_seed: Optional[int] = None,
     philox_offset: Optional[int] = None,
@@ -191,8 +207,6 @@ def top_k_top_p_sampling_from_probs(
         Nucleus threshold in ``(0, 1]`` (``float`` or ``float32 [batch]``).
     top_k_max: Optional[int]
         Upper bound of ``top_k`` when it is a tensor (avoids a device synchronization).
-    deterministic: bool
-        Break probability ties by vocabulary index so equal inputs replay bit-identically.
     generator: Optional[torch.Generator]
         Source of the Philox seed/offset (default CUDA generator when omitted), advanced exactly
         like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.
@@ -200,11 +214,13 @@ def top_k_top_p_sampling_from_probs(
         Explicit Philox parameters (both required together); ``generator`` is then not touched.
     out: Optional[torch.Tensor]
         ``int32 [batch]`` output buffer (allocated when omitted); ``renorm_out`` optionally
-        receives ``float32 [batch, 1024]`` renormalized kept probabilities in slab order.
+        receives ``float32 [batch, 1024]`` renormalized kept probabilities in sorted slab order
+        (descending probability, ascending index; zeros for dropped entries; only the first
+        ``count`` entries of a row are written).
     workspace: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
         Stage-1 slab buffers ``(values float32 [batch, 1024], indices int32 [batch, 1024],
-        counts int32 [batch])``. When given, the exact top-k slab of this call is left in them
-        (the slab order matches ``renorm_out``); otherwise a cached per-shape workspace is used.
+        counts int32 [batch])``. When given, the sorted top-k slab of this call is left in them
+        (aligned with ``renorm_out``); otherwise a cached per-shape workspace is used.
     enable_pdl: bool
         Launch stage 2/3 with programmatic dependent launch.
 
@@ -222,7 +238,7 @@ def top_k_top_p_sampling_from_probs(
             top_k,
             top_p,
             filter_apply_order="top_k_first",
-            deterministic=deterministic,
+            deterministic=True,
             generator=generator,
         )
         if out is not None:
@@ -248,7 +264,11 @@ def top_k_top_p_sampling_from_probs(
     if (philox_seed is None) != (philox_offset is None):
         raise ValueError("philox_seed and philox_offset must be given together")
     if philox_seed is None:
-        philox_seed, philox_offset = get_seed_and_offset(batch, generator, probs.device)
+        # Same stride as top_p_sampling_from_probs (32 reserved draws per row): a generator shared with
+        # the top_k_first route stays in lockstep.
+        philox_seed, philox_offset = get_seed_and_offset(
+            batch * 32, generator, probs.device
+        )
     if isinstance(top_k, int):
         k_arr, k_scalar, k_kind = cnt, int(top_k), _TOPK_SCALAR
     else:
@@ -274,7 +294,6 @@ def top_k_top_p_sampling_from_probs(
         renorm,
         int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
-        1 if deterministic else 0,
         1 if renorm_out is not None else 0,
         threads,
         items,
@@ -294,8 +313,10 @@ def top_k_probs_to_slab(
     out_idx: Optional[torch.Tensor] = None,
     out_count: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Stage 1 alone: exact per-row top-k into ``(values [batch, 1024], indices [batch, 1024],
-    counts [batch])``; entries beyond ``count`` are undefined.  Same dispatch conditions as
+    r"""Stage 1 alone: exact per-row top-k (first ``k`` entries of ``lexsort(-prob, index)``,
+    NaN/negative probabilities sanitized to ``+0``) into ``(values [batch, 1024], indices
+    [batch, 1024], counts [batch])``.  The slab layout is deterministic (a pure function of the
+    input) but *not* sorted; entries beyond ``count`` are undefined.  Same dispatch conditions as
     :func:`top_k_top_p_sampling_from_probs` except that large batches are accepted."""
     route = cake_sampling_route(probs, top_k, top_k_max)
     if route not in ("pipeline", "fallback:large_batch"):
