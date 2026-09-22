@@ -599,7 +599,7 @@ class CuteDslMxfp4MoEWrapper:
         quantization: str = "mxfp4_w4a8",
         enable_pdl: bool = False,
         offline_tactics: Optional[dict] = None,
-        swapab_max_tokens: int = 16,
+        swapab_max_tokens: Optional[int] = None,
         swapab_n_tile: int = SWAP_ROW_TILE,
         swapab_tile_policy=None,
     ):
@@ -613,10 +613,10 @@ class CuteDslMxfp4MoEWrapper:
         # Swap-AB decode path: token counts up to ``swapab_max_tokens`` (0
         # disables) run weights-as-M grouped GEMMs with ``swapab_n_tile``-row
         # expert groups; the fused route preprocess bounds it to T <= 16.
-        if swapab_max_tokens < 0:
+        if swapab_max_tokens is not None and swapab_max_tokens < 0:
             raise ValueError("swapab_max_tokens must be >= 0")
-        if swapab_n_tile not in (8, 16, 32, 64, 128):
-            raise ValueError("swapab_n_tile must be 8, 16, 32, 64 or 128")
+        if swapab_n_tile not in (8, 16, 32):
+            raise ValueError("swapab_n_tile must be 8, 16 or 32")
         self.swapab_max_tokens = swapab_max_tokens
         self.swapab_n_tile = swapab_n_tile
         # (max_tokens, rows per expert group) buckets for T > 16; T <= 16 uses
@@ -626,18 +626,22 @@ class CuteDslMxfp4MoEWrapper:
         if policy is None:
             env_policy = os.environ.get("SWAPAB_TILE_POLICY")
             if env_policy:
-                # "256:8,1024:16,2048:32,0:64" (0 = no upper bound)
+                # "256:8,0:32" (0 = no upper bound)
                 policy = tuple(
                     (int(t) if int(t) > 0 else (1 << 62), int(n))
                     for t, n in (item.split(":") for item in env_policy.split(","))
                 )
             else:
-                policy = ((256, 8), (1024, 16), (2048, 32), (1 << 62, 64))
+                # B300: 8-row groups win up to T=256 (2-3 local rows per
+                # expert); 32-row groups from T=512 (one group per expert).
+                policy = ((256, 8), (1 << 62, 32))
         policy = tuple((int(t), int(n)) for t, n in policy)
-        if any(n not in (8, 16, 32, 64, 128) for _, n in policy) or any(
+        if any(n not in (8, 16, 32) for _, n in policy) or any(
             policy[i][0] >= policy[i + 1][0] for i in range(len(policy) - 1)
         ):
-            raise ValueError("swapab_tile_policy must be ascending (max_tokens, tile in {8..128})")
+            raise ValueError(
+                "swapab_tile_policy must be ascending (max_tokens, tile in {8,16,32})"
+            )
         self.swapab_tile_policy = policy
         supported = mxfp4_moe_capability(
             gpu_arch=103,
@@ -658,6 +662,12 @@ class CuteDslMxfp4MoEWrapper:
         self.num_local_experts = self.layout.num_local_experts
         self.local_expert_offset = self.layout.local_expert_offset
         self.intermediate_shard = self.layout.intermediate_shard
+        if self.swapab_max_tokens is None:
+            # Measured on B300 (Kimi K3 geometry): the swap path beats the
+            # dense grouped GEMMs up to T=1024 with the full intermediate
+            # size (EP) and up to T=256 with a narrow MoE-TP shard, whose
+            # 3-k-step GEMM2 tiles amortise less per weight byte.
+            self.swapab_max_tokens = 1024 if self.intermediate_shard >= 1024 else 256
         self._offline_tactics = sorted(
             (int(limit), canonicalize_w4a8_tactic(tactic))
             for limit, tactic in (offline_tactics or {}).items()

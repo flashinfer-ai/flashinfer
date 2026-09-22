@@ -30,18 +30,51 @@ from .moe_utils import get_max_num_tiles, moe_sort
 
 # Rows of routed activations per MMA-N tile. SWAPAB_NTILE overrides for
 # experiments (8, 16, 32, 64 or 128).
-SWAP_ROW_TILE = int(os.environ.get("SWAPAB_NTILE", "32"))
+SWAP_ROW_TILE = int(os.environ.get("SWAPAB_NTILE", "8"))
 # K-blocks (of 32 elements) per mainloop stage: 4, 8 or 16 (SWAPAB_KBLOCKS).
-SWAP_K_BLOCKS_PER_STAGE = int(os.environ.get("SWAPAB_KBLOCKS", "4"))
+_ENV_KBLOCKS = os.environ.get("SWAPAB_KBLOCKS")
+SWAP_K_BLOCKS_PER_STAGE = int(_ENV_KBLOCKS or "4")
+
+
+def gemm1_k_blocks_per_stage(n_tile: int) -> int:
+    """Stage depth for GEMM1 (K = hidden size). 8-row groups are bound by the
+    per-stage round trip once the weights sit in L2 (few hot experts), so they
+    take 256-wide stages; wider groups stream from HBM and keep 128-wide
+    stages with the deeper pipeline (B300: 32-row prefill tiles lose ~3% at 8)."""
+    if _ENV_KBLOCKS:
+        return int(_ENV_KBLOCKS)
+    return 8 if n_tile == 8 else 4
+
+
+# GEMM2 (K = intermediate shard) may use a different stage depth: 12 covers a
+# 384-wide MoE-TP shard in one stage.
+_ENV_KBLOCKS2 = os.environ.get("SWAPAB_KBLOCKS2")
+
+
+def gemm2_k_blocks_per_stage(k: int) -> int:
+    """Stage depth for GEMM2: one 384-wide stage when the intermediate shard
+    allows it (a 384-wide MoE-TP shard becomes a single stage per tile),
+    otherwise the generic 128-wide stage."""
+    if _ENV_KBLOCKS2:
+        return int(_ENV_KBLOCKS2)
+    if k % 384 == 0:
+        return 12
+    return SWAP_K_BLOCKS_PER_STAGE
+
+
+SWAP_PERF_PROBE = int(os.environ.get("SWAPAB_PROBE", "0"))
 # Pipeline depth knobs (SWAPAB_STAGES / SWAPAB_ACC_STAGES override for tuning).
 SWAP_MAX_AB_STAGES = int(os.environ.get("SWAPAB_STAGES", "12"))
 SWAP_ACC_STAGES = int(os.environ.get("SWAPAB_ACC_STAGES", "2"))
+SWAP_TILE_STAGES = int(os.environ.get("SWAPAB_TILE_STAGES", "2"))
 # bit 0: tile-major W1 (GEMM1), bit 1: tile-major W2 (GEMM2). Default: both.
 # Each 128x128 MMA tile becomes one contiguous 8 KB block so the weight TMA
 # streams whole DRAM pages (B300: GEMM1 -2%, GEMM2 -2.5% at T=16 balanced).
 SWAP_TILED_WEIGHTS = int(os.environ.get("SWAPAB_TILED_W", "3"))
 
-_tiled_weight_cache: "OrderedDict[Tuple, Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+_tiled_weight_cache: "OrderedDict[Tuple, Tuple[torch.Tensor, torch.Tensor]]" = (
+    OrderedDict()
+)
 _TILED_WEIGHT_CACHE_MAX = 64
 
 
@@ -56,7 +89,11 @@ def tile_major_weights(w: torch.Tensor) -> torch.Tensor:
     """
     key = (w.data_ptr(), tuple(w.shape), w.dtype, w.device)
     hit = _tiled_weight_cache.get(key)
-    if hit is not None and hit[0] is w or (hit is not None and hit[0].data_ptr() == w.data_ptr()):
+    if (
+        hit is not None
+        and hit[0] is w
+        or (hit is not None and hit[0].data_ptr() == w.data_ptr())
+    ):
         _tiled_weight_cache.move_to_end(key)
         return hit[1]
     e, m, kb = w.shape
@@ -67,6 +104,7 @@ def tile_major_weights(w: torch.Tensor) -> torch.Tensor:
     while len(_tiled_weight_cache) > _TILED_WEIGHT_CACHE_MAX:
         _tiled_weight_cache.popitem(last=False)
     return t
+
 
 _swapab_kernel_cache: Dict[Tuple, Any] = {}
 
@@ -101,6 +139,7 @@ def _get_compiled_swapab_kernel(
     max_active_clusters: int,
     stream: cuda.CUstream,
     tiled_a: bool = False,
+    zero_fill: bool = False,
 ):
     import os
     import sys
@@ -116,7 +155,11 @@ def _get_compiled_swapab_kernel(
         enable_pdl,
         SWAP_MAX_AB_STAGES,
         SWAP_ACC_STAGES,
+        SWAP_TILE_STAGES,
+        SWAP_PERF_PROBE,
         tiled_a,
+        # ``zero_output`` is a compile-time specialisation (None vs pointer).
+        zero_fill,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -130,6 +173,8 @@ def _get_compiled_swapab_kernel(
             use_linear_beta=use_linear_beta,
             max_ab_stages=SWAP_MAX_AB_STAGES,
             num_acc_stages=SWAP_ACC_STAGES,
+            num_tile_stages=SWAP_TILE_STAGES,
+            perf_probe=SWAP_PERF_PROBE,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -164,7 +209,7 @@ def swapab_gemm1_situ(
     top_k: int,
     zero_output: Optional[torch.Tensor] = None,
     n_tile: int = SWAP_ROW_TILE,
-    k_blocks_per_stage: int = SWAP_K_BLOCKS_PER_STAGE,
+    k_blocks_per_stage: Optional[int] = None,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -196,6 +241,8 @@ def swapab_gemm1_situ(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(1)
     use_linear_beta = linear_beta is not None
+    if k_blocks_per_stage is None:
+        k_blocks_per_stage = gemm1_k_blocks_per_stage(n_tile)
     args = (
         _gmem_ptr(
             cutlass.Float4E2M1FN,
@@ -240,6 +287,7 @@ def swapab_gemm1_situ(
         max_active_clusters=max_active_clusters,
         stream=stream,
         tiled_a=bool(SWAP_TILED_WEIGHTS & 1),
+        zero_fill=zero_output is not None,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -262,7 +310,7 @@ def swapab_gemm2(
     top_k: int,
     finalize: bool = True,
     n_tile: int = SWAP_ROW_TILE,
-    k_blocks_per_stage: int = SWAP_K_BLOCKS_PER_STAGE,
+    k_blocks_per_stage: Optional[int] = None,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -276,6 +324,8 @@ def swapab_gemm2(
     """
     num_local_experts, rows_w, packed_k = w2.shape
     k = packed_k * 2
+    if k_blocks_per_stage is None:
+        k_blocks_per_stage = gemm2_k_blocks_per_stage(k)
     rows = act.shape[0]
     if act.shape[1] != k or act_sf.shape != (rows, k // 32):
         raise ValueError("act must be [R, I] with act_sf [R, I/32]")

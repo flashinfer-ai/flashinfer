@@ -100,7 +100,13 @@ def shard_case(unsharded, layout):
 
 
 def prepare_rank_candidate(
-    case, layout, *, packed=False, prepared_weights=None, enable_pdl=False
+    case,
+    layout,
+    *,
+    packed=False,
+    prepared_weights=None,
+    enable_pdl=False,
+    **wrapper_kwargs,
 ):
     """Plan one rank from explicit layout metadata and its rank-local weights."""
     from .mxfp4_situ_reference import pack_topk
@@ -112,6 +118,7 @@ def prepare_rank_candidate(
         _global_intermediate(case, layout),
         parallel_layout=layout,
         enable_pdl=enable_pdl,
+        **wrapper_kwargs,
     )
     assert wrapper.num_local_experts == case.local_num_experts
     assert wrapper.local_expert_offset == case.local_expert_offset
@@ -174,7 +181,7 @@ def check_partial_sum(partials, partial_refs, reference, comparisons):
     return report
 
 
-def _run_ranks(unsharded, layouts, *, prepared=None):
+def _run_ranks(unsharded, layouts, *, prepared=None, **wrapper_kwargs):
     partials, refs = [], []
     for index, layout in enumerate(layouts):
         rank_case = shard_case(unsharded, layout)
@@ -182,6 +189,7 @@ def _run_ranks(unsharded, layouts, *, prepared=None):
             rank_case,
             layout,
             prepared_weights=None if prepared is None else prepared[index],
+            **wrapper_kwargs,
         )
         plan.run()
         partials.append(output)
@@ -299,41 +307,39 @@ def test_capability_rejects_hybrid_and_invalid_layouts():
 def test_tp_workspace_size_follows_intermediate_shard():
     mx = _mxfp4()
     layout = mx.Mxfp4MoEParallelLayout
+    dense = dict(swapab_max_tokens=0)
     tp = mx.CuteDslMxfp4MoEWrapper(
-        896, 16, 7168, 3072, parallel_layout=layout("moe_tensor_parallel", 8, 1)
+        896,
+        16,
+        7168,
+        3072,
+        parallel_layout=layout("moe_tensor_parallel", 8, 1),
+        **dense,
     )
-    single_shard = mx.CuteDslMxfp4MoEWrapper(896, 16, 7168, 384)
+    single_shard = mx.CuteDslMxfp4MoEWrapper(896, 16, 7168, 384, **dense)
     ep = mx.CuteDslMxfp4MoEWrapper(
-        896, 16, 7168, 3072, parallel_layout=layout("expert_parallel", 8, 3)
+        896, 16, 7168, 3072, parallel_layout=layout("expert_parallel", 8, 3), **dense
     )
     assert (tp.parallel_mode, tp.intermediate_shard) == ("moe_tensor_parallel", 384)
     for tokens in (1, 16, 512, 4096):
         assert tp.get_workspace_size(tokens) == single_shard.get_workspace_size(tokens)
         assert tp.get_workspace_size(tokens) < ep.get_workspace_size(tokens)
-    # The swap-AB decode path (T <= 16) needs less workspace than the 128-row
-    # token-tile layout it replaces.
-    ep_legacy = mx.CuteDslMxfp4MoEWrapper(
-        896,
-        16,
-        7168,
-        3072,
-        parallel_layout=layout("expert_parallel", 8, 3),
-        swapab_max_tokens=0,
+    # Default swap-AB caps follow the intermediate shard (B300 crossover points)
+    # and the swap workspace is smaller than the 128-row token-tile layout it
+    # replaces; past the cap both wrappers carve the same dense workspace.
+    tp_swap = mx.CuteDslMxfp4MoEWrapper(
+        896, 16, 7168, 3072, parallel_layout=layout("moe_tensor_parallel", 8, 1)
     )
+    ep_swap = mx.CuteDslMxfp4MoEWrapper(
+        896, 16, 7168, 3072, parallel_layout=layout("expert_parallel", 8, 3)
+    )
+    assert (tp_swap.swapab_max_tokens, ep_swap.swapab_max_tokens) == (256, 1024)
     for tokens in (1, 16):
-        assert ep.get_workspace_size(tokens) < ep_legacy.get_workspace_size(tokens)
-    assert ep.get_workspace_size(17) == ep_legacy.get_workspace_size(17)
-    tp, ep = (
-        mx.CuteDslMxfp4MoEWrapper(
-            896,
-            16,
-            7168,
-            3072,
-            parallel_layout=layout(mode, 8, rank),
-            swapab_max_tokens=0,
-        )
-        for mode, rank in (("moe_tensor_parallel", 1), ("expert_parallel", 3))
-    )
+        assert ep_swap.get_workspace_size(tokens) < ep.get_workspace_size(tokens)
+        assert tp_swap.get_workspace_size(tokens) < tp.get_workspace_size(tokens)
+    assert ep_swap.get_workspace_size(17) != ep.get_workspace_size(17)
+    assert ep_swap.get_workspace_size(1025) == ep.get_workspace_size(1025)
+    assert tp_swap.get_workspace_size(257) == tp.get_workspace_size(257)
     # Documented sizes of the 128-row layout; expert parallelism keeps it.
     assert [ep.get_workspace_size(t) for t in (1, 16, 4096)] == [
         6499072,
@@ -458,6 +464,27 @@ def test_small_rank_sum_matches_unsharded(tokens, mode, distribution, record_pro
         torch.testing.assert_close(explicit_output, partials[1], atol=1e-2, rtol=1e-2)
     report["routing"] = parallel_routing_histogram(
         ids, 8, SMALL_WAYS if mode == "expert_parallel" else 1
+    )
+    record_property("numerical_report", json.dumps(report))
+
+
+@pytest.mark.parametrize("tokens,tile", [(129, 8), (129, 16), (129, 32), (600, 32)])
+@pytest.mark.parametrize("mode", ["expert_parallel", "moe_tensor_parallel"])
+def test_small_rank_sum_swap_prefill_tiles(tokens, tile, mode, record_property):
+    """The T > 16 swap-AB path (moe_sort row groups of ``tile`` rows) sums to
+    the unsharded result for every offered group width on both layouts."""
+    _require_blackwell()
+    unsharded = make_case(tokens=tokens, **SMALL)
+    ids, weights = make_routing(tokens, 8, 2, 2, 2, "hot")
+    unsharded = replace(unsharded, topk_ids=ids, topk_weights=weights)
+    layouts = _layouts(mode, SMALL_WAYS)
+    swap = dict(swapab_max_tokens=1024, swapab_tile_policy=((1 << 62, tile),))
+    partials, refs = _run_ranks(unsharded, layouts, **swap)
+    whole, whole_output, _ = prepare_candidate(unsharded)
+    whole.run()
+    reference = reference_moe(unsharded, modes=("ideal_fp64",))["ideal_fp64"]
+    report = check_partial_sum(
+        partials, refs, reference, {"unsharded_candidate": whole_output}
     )
     record_property("numerical_report", json.dumps(report))
 

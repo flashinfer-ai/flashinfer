@@ -554,8 +554,30 @@ def main():
                         for row in numerical.values()
                         for backend in ("candidate", "baseline")
                     ):
+                        bad = {
+                            name: [
+                                backend
+                                for backend in ("candidate", "baseline")
+                                if not row[backend]["finite"]
+                            ]
+                            for name, row in numerical.items()
+                        }
+                        detail = []
+                        for tag, tensor in (
+                            ("candidate", output),
+                            ("baseline", baseline_output),
+                        ):
+                            finite = torch.isfinite(tensor)
+                            if not bool(finite.all()):
+                                bad_rows = (~finite).any(dim=-1).nonzero().flatten()
+                                detail.append(
+                                    f"{tag}: {int((~finite).sum())} non-finite values in "
+                                    f"{int(bad_rows.numel())} rows "
+                                    f"(first rows {bad_rows[:8].tolist()})"
+                                )
                         raise RuntimeError(
-                            "non-finite output or reference in accuracy evaluation"
+                            "non-finite output or reference in accuracy evaluation: "
+                            f"{bad}; {'; '.join(detail)}"
                         )
                     del oracles
                 histogram = reference.routing_histogram(case)
