@@ -108,3 +108,52 @@ def test_cache_rebinds_when_workspace_changes(monkeypatch):
     _dispatch(other, cache, calls)
     assert len(calls) == 4, "a different workspace must force a rebuild"
     assert cache["_workspace"] is other
+
+
+class _IdentityInt(int):
+    """An ``int`` that hashes and compares by identity.
+
+    Stands in for a hypothetical FFI integer wrapper.  ``tvm_ffi`` does not produce
+    one today -- ``Array<int64_t>`` elements arrive as plain Python ints -- so this
+    is the only way to exercise the guard the cache key rests on.
+    """
+
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+
+def test_cache_key_survives_an_identity_hashing_ffi_int(monkeypatch):
+    """The key must hash by value even if the FFI hands back a wrapper.
+
+    ``moe_a2a_dispatch`` returns ``tvm::ffi::Array<int64_t>``, and each read boxes a
+    fresh object (``a[0] is a[0]`` is False outside CPython's small-int intern
+    range).  Value-based hashing is what makes that harmless.  Were the elements
+    ever boxed in something that hashed by identity, every lookup would miss:
+    results stay correct, the cache silently never hits, and the dict grows by one
+    entry per payload per dispatch with no eviction.  The ``int()`` in the key is
+    what rules that out, and this test is what keeps it there.
+    """
+    calls = []
+    _patch(monkeypatch, calls)
+
+    class _WrapperModule:
+        @staticmethod
+        def moe_a2a_dispatch(*args, **kwargs):
+            # Fresh objects per call, mirroring the per-read boxing above.
+            return (
+                [_IdentityInt(o) for o in _RECV_OFFSETS],
+                [_IdentityInt(s) for s in _RECV_SIZES],
+                1024,
+                -1,
+                0,
+            )
+
+    monkeypatch.setattr(a2a, "get_moe_alltoall_module", lambda *a, **k: _WrapperModule)
+
+    ws = torch.zeros(4)
+    cache = {}
+    _dispatch(ws, cache, calls)
+    assert len(calls) == 2
+    _dispatch(ws, cache, calls)
+    assert len(calls) == 2, "the key must not depend on FFI integer identity"
+    assert len(cache) == 3, "two payload entries plus the _workspace binding"
