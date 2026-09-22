@@ -27,6 +27,7 @@ ENV PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
 # does not exist for a particular CUDA major is harmless.
 ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cu13/lib:/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+ENV TRITON_PTXAS_BLACKWELL_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
 ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 

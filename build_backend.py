@@ -129,17 +129,26 @@ def _no_pip_installs() -> bool:
     return os.environ.get("FLASHINFER_BUILD_NO_PIP") == "1"
 
 
-def _detect_cuda_major() -> int:
-    """Best-effort detection of the CUDA major version on the host."""
+def _detect_cuda_release() -> tuple[int, int] | None:
+    """Best-effort detection of the CUDA major/minor release on the host."""
     try:
         out = subprocess.check_output(["nvcc", "--version"]).decode()
         for line in out.splitlines():
             if "release" in line:
                 # e.g. "Cuda compilation tools, release 13.0, V13.0.48"
                 token = line.split("release", 1)[1].split(",", 1)[0].strip()
-                return int(token.split(".")[0])
+                major, minor = token.split(".", 1)
+                return int(major), int(minor)
     except Exception:
         pass
+    return None
+
+
+def _detect_cuda_major() -> int:
+    """Best-effort detection of the CUDA major version on the host."""
+    release = _detect_cuda_release()
+    if release is not None:
+        return release[0]
     return 13  # default — pyproject's nvep extras pin cu13 packages
 
 
@@ -780,6 +789,15 @@ def _compile_deps_installed(specs) -> bool:
     return True
 
 
+def _system_cuda_tile_compiler_available() -> bool:
+    """Return whether CUDA 13.4+ provides an executable toolkit TileIRAS."""
+    release = _detect_cuda_release()
+    if release is None or release < (13, 4):
+        return False
+    compiler = Path("/usr/local/cuda/bin/tileiras")
+    return compiler.is_file() and os.access(compiler, os.X_OK)
+
+
 def _install_cuda_tile_compile_deps() -> None:
     """Install cuda-tile's compile chain with ``--no-deps`` to dodge libcudart.so.13.
 
@@ -809,13 +827,22 @@ def _install_cuda_tile_compile_deps() -> None:
     ``pip install`` from within that environment to resolve the
     ``nvidia-cuda-runtime`` version conflict described above.
 
-    In such isolated builds (e.g. the AOT Build Import workflow) the compile
-    chain is already present on flashinfer-ci images, so we *warn and continue*
-    instead of blocking the build.  A clean PyPI install on a system that lacks
+    CUDA toolkits that provide ``/usr/local/cuda/bin/tileiras`` (CUDA 13.4 and
+    newer) do not need the pip compiler overlay. In isolated builds (e.g. the
+    AOT Build Import workflow) without that system compiler, the compile chain
+    is already present on flashinfer-ci images, so we *warn and continue*
+    instead of blocking the build. A clean PyPI install on a system that lacks
     both ``uv`` and the compile chain will surface a clear ``ImportError`` the
     first time the user calls a cuTile kernel — a better failure mode than
     aborting the install entirely.
     """
+    if _system_cuda_tile_compiler_available():
+        print(
+            "[BUILD] using system cuda-tile compiler; skipping pip compile deps",
+            flush=True,
+        )
+        return
+
     wheels = get_cuda_tile_compile_dependency_requirements()
 
     if _compile_deps_installed(wheels):

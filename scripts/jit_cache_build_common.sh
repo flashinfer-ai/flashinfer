@@ -118,7 +118,14 @@ setup_jit_cache_python_build() {
   local pytorch_index=$3
   local pytorch_index_url="https://download.pytorch.org/whl/${pytorch_index}"
 
-  "${python_bin}" -m pip install --upgrade build
+  # pip 26.2.1 fixed ProtocolError from truncated downloads bypassing its
+  # resume logic. Provider builds download CUDA wheels hundreds of MB in size,
+  # so use that fix and allow more connection/resume attempts by default.
+  export PIP_RETRIES="${PIP_RETRIES:-10}"
+  export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-10}"
+  export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
+  env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+    "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
 
   if "${python_bin}" - "${expected_cuda_version}" <<'PY'
 import sys

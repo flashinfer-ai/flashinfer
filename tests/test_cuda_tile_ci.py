@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,24 +62,11 @@ def test_ci_installer_uses_shared_cuda_tile_compile_requirements_for_cuda13() ->
     assert "mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES" in installer
     assert 'pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"' in installer
     assert "cuda-tile[tileiras]" not in installer
-
-    cuda13_blocks = [
-        match.group("body")
-        for match in re.finditer(
-            r'if \[\[ "\$\{CUDA_MAJOR\}" == "13" \]\]; then\n'
-            r"(?P<body>.*?)\nfi",
-            installer,
-            flags=re.DOTALL,
-        )
-    ]
-    assert len(cuda13_blocks) == 2
-    assert any(
-        "mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES" in block for block in cuda13_blocks
-    )
-    assert any(
-        'pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"' in block
-        for block in cuda13_blocks
-    )
+    assert '[[ "${CUDA_MAJOR}" == "13" ]] && (( 10#${CUDA_MINOR} < 4 ))' in installer
+    assert "(( ${#CUDA_TILE_COMPILE_DEPENDENCIES[@]} > 0 ))" in installer
+    assert '[[ "${CUDA_TAG}" == "cu134" ]]' in installer
+    assert 'CUDA_PYTHON="cuda-python==13.4.1"' in installer
+    assert 'CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"' in installer
 
     resolver_install = installer.index(
         "pip3 install \\\n  -r /install/requirements.txt"
@@ -100,6 +86,9 @@ def test_build_backend_installs_shared_cuda_tile_compile_requirements(
     sentinel = "example-compile-dependency==1"
     commands: list[list[str]] = []
 
+    monkeypatch.setattr(
+        build_backend, "_system_cuda_tile_compiler_available", lambda: False
+    )
     monkeypatch.setattr(build_backend, "_compile_deps_installed", lambda specs: False)
     monkeypatch.setattr(build_backend, "_no_pip_installs", lambda: False)
     monkeypatch.setattr(build_backend.shutil, "which", lambda executable: None)
@@ -118,6 +107,33 @@ def test_build_backend_installs_shared_cuda_tile_compile_requirements(
     build_backend._install_cuda_tile_compile_deps()
 
     assert commands == [[sys.executable, "-m", "pip", "install", "--no-deps", sentinel]]
+
+
+def test_build_backend_uses_system_cuda_tile_compiler(monkeypatch) -> None:
+    monkeypatch.setattr(
+        build_backend, "_system_cuda_tile_compiler_available", lambda: True
+    )
+    monkeypatch.setattr(
+        build_backend,
+        "get_cuda_tile_compile_dependency_requirements",
+        lambda: pytest.fail("pip compile requirements should not be loaded"),
+    )
+
+    build_backend._install_cuda_tile_compile_deps()
+
+
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [((13, 0), False), ((13, 4), True), ((13, 5), True), (None, False)],
+)
+def test_build_backend_system_cuda_tile_compiler_requires_cuda_13_4(
+    monkeypatch, release, expected
+) -> None:
+    monkeypatch.setattr(build_backend, "_detect_cuda_release", lambda: release)
+    monkeypatch.setattr(build_backend.Path, "is_file", lambda path: True)
+    monkeypatch.setattr(build_backend.os, "access", lambda path, mode: True)
+
+    assert build_backend._system_cuda_tile_compiler_available() is expected
 
 
 def test_ci_image_validates_cuda_tile_versions_and_compiler(monkeypatch) -> None:
@@ -167,31 +183,119 @@ def test_ci_image_validates_cuda_tile_versions_and_compiler(monkeypatch) -> None
     ]
 
 
+def test_ci_image_uses_system_tileiras_for_cuda_13_4(monkeypatch) -> None:
+    ci_image = load_ci_image_module()
+    compiler_path = "/usr/local/cuda/bin/tileiras"
+    compile_module = SimpleNamespace(
+        _find_compiler_bin=lambda: SimpleNamespace(path=compiler_path)
+    )
+
+    def fake_import_module(name: str):
+        if name == "cuda.tile.tune":
+            return SimpleNamespace()
+        if name == "cuda.tile._compile":
+            return compile_module
+        raise AssertionError(f"unexpected import: {name}")
+
+    def fake_version(name: str):
+        if name == "cuda-tile":
+            return "1.6.0"
+        raise ci_image.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(ci_image.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(ci_image.importlib.metadata, "version", fake_version)
+    monkeypatch.setattr(
+        ci_image.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            stdout="Supported targets: sm_100 sm_107", stderr=""
+        ),
+    )
+
+    assert ci_image._validate_cuda_tile_compiler("13.4") == (
+        "1.6.0",
+        "system",
+        compiler_path,
+    )
+
+
+def test_ci_image_rejects_tileiras_wheel_for_cuda_13_4(monkeypatch) -> None:
+    ci_image = load_ci_image_module()
+    monkeypatch.setattr(
+        ci_image.importlib, "import_module", lambda name: SimpleNamespace()
+    )
+    versions = {"cuda-tile": "1.6.0", "nvidia-cuda-tileiras": "13.4.92"}
+    monkeypatch.setattr(
+        ci_image.importlib.metadata, "version", lambda name: versions[name]
+    )
+
+    with pytest.raises(SystemExit, match="shadows the system compiler"):
+        ci_image._validate_cuda_tile_compiler("13.4")
+
+
+def test_ci_image_rejects_system_tileiras_without_sm107(monkeypatch) -> None:
+    ci_image = load_ci_image_module()
+    compiler_path = "/usr/local/cuda/bin/tileiras"
+
+    def fake_import_module(name: str):
+        if name == "cuda.tile.tune":
+            return SimpleNamespace()
+        if name == "cuda.tile._compile":
+            return SimpleNamespace(
+                _find_compiler_bin=lambda: SimpleNamespace(path=compiler_path)
+            )
+        raise AssertionError(f"unexpected import: {name}")
+
+    def fake_version(name: str):
+        if name == "cuda-tile":
+            return "1.6.0"
+        raise ci_image.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(ci_image.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(ci_image.importlib.metadata, "version", fake_version)
+    monkeypatch.setattr(
+        ci_image.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(stdout="sm_100", stderr=""),
+    )
+
+    with pytest.raises(SystemExit, match="does not advertise SM107"):
+        ci_image._validate_cuda_tile_compiler("13.4")
+
+
 @pytest.mark.parametrize(
     ("expected_cuda", "expected_result", "expected_calls"),
     [
         ("12.9", None, []),
-        ("13.0", ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras"), [True]),
+        ("13.0", ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras"), ["13.0"]),
+        ("13.4", ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras"), ["13.4"]),
     ],
 )
 def test_ci_image_requires_cuda_tile_compiler_only_for_cuda13(
     monkeypatch,
     expected_cuda: str,
     expected_result: tuple[str, str, str] | None,
-    expected_calls: list[bool],
+    expected_calls: list[str],
 ) -> None:
     ci_image = load_ci_image_module()
     calls = []
     compiler_details = ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras")
 
-    def validate_compiler():
-        calls.append(True)
+    def validate_compiler(expected_cuda_version):
+        calls.append(expected_cuda_version)
         return compiler_details
 
     monkeypatch.setattr(ci_image, "_validate_cuda_tile_compiler", validate_compiler)
 
     assert ci_image._validate_cuda_tile_for_runtime(expected_cuda) == expected_result
     assert calls == expected_calls
+
+
+def test_ci_image_routes_triton_blackwell_to_the_system_toolkit() -> None:
+    dockerfile = (REPO_ROOT / "docker" / "Dockerfile.ci").read_text()
+
+    assert 'ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"' in dockerfile
+    assert 'ENV TRITON_PTXAS_BLACKWELL_PATH="/usr/local/cuda/bin/ptxas"' in dockerfile
 
 
 def test_ci_image_rejects_cuda_tile_tune_import_failure(monkeypatch) -> None:
