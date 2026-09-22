@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Host wrapper for the SM90 MoE GEMM1: gather grouped GEMM + fused gated
-activation.
+Host wrapper for the SM90 MoE GEMM1: gather grouped GEMM + fused activation
+(gated SwiGLU/OAI/SiTU and GeGLU-tanh, or non-gated ReLU^2).
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -26,11 +26,22 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
 from ...cute_dsl.utils import get_max_active_clusters, make_ptr
+from ...tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+)
 from ...utils import get_compute_capability
 from .hopper.contiguous_gather_grouped_gemm_act_fusion import (
     Sm90ContiguousGatherGroupedGemmActFusionKernel,
 )
 from .hopper.utils import TORCH_TO_CUTLASS_DTYPE
+from .moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
+)
 
 _gather_kernel_cache: Dict[Tuple, Any] = {}
 
@@ -55,15 +66,23 @@ def _get_compiled_gather_kernel(
     tile_shape_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     topk: int,
+    swizzle_size: int,
     raster_along_m: bool,
     enable_pdl: bool,
+    activation_type: int,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
 ) -> Any:
     """Get or compile one GEMM1 specialization.
 
     Problem dimensions, pointers, and the CUDA stream are runtime parameters;
-    pointer dtypes and the kernel-specializing parameters (tile/cluster/raster
-    tactics, ``topk``, ``max_active_clusters``, ``enable_pdl``) form the
-    process-local compile key.
+    pointer dtypes and the kernel-specializing parameters
+    (tile_size/cluster_shape_mn/swizzle_size/raster_along_m tactics, ``topk``,
+    ``max_active_clusters``, ``enable_pdl``, the activation type and its
+    constants) form the process-local compile key.
     """
     cache_key = (
         ab_dtype,
@@ -71,9 +90,16 @@ def _get_compiled_gather_kernel(
         tile_shape_mn,
         cluster_shape_mn,
         topk,
+        swizzle_size,
         raster_along_m,
         max_active_clusters,
         enable_pdl,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
     )
     compiled = _gather_kernel_cache.get(cache_key)
     if compiled is not None:
@@ -84,8 +110,15 @@ def _get_compiled_gather_kernel(
         tile_shape_mn=tile_shape_mn,
         topk=topk,
         cluster_shape_mn=cluster_shape_mn,
+        swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     compiled = cute.compile(
         gemm.wrapper,
@@ -128,11 +161,13 @@ def _interleave_gated_halves(up: torch.Tensor, gate: torch.Tensor) -> torch.Tens
 
 
 def interleave_up_gate_sm90(w_gate_up: torch.Tensor) -> torch.Tensor:
-    """Repack ``[E, 2I, K]`` gate-first concatenated weights:
-    ``[gate; up]``) into the 32-column up/gate interleave this kernel expects.
+    """Repack ``[E, 2I, K]`` gate-first concatenated weights (``[gate; up]``)
+    into the 32-column up/gate interleave this kernel expects.
 
+    The input order is the reverse of the unified MoE canonical ``[up, gate]``
+    pack; :func:`_interleave_gated_halves` takes the two halves explicitly.
     Reference implementation, used by the in-tree tests — frameworks own
-    their weight conversion and keep a local copy of this trivial reshape
+    their weight conversion and keep a local copy of this trivial reshape.
     The result places each 32-column up block immediately before its matching
     gate block."""
     inter = w_gate_up.shape[1] // 2
@@ -152,34 +187,68 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     permuted_m: int,
     tile_shape_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 1),
+    swizzle_size: int = 1,
     raster_along_m: bool = False,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> torch.Tensor:
-    """MoE GEMM1 on SM90: gather + grouped GEMM + SiLU-gating, bf16/fp16.
+    """MoE GEMM1 on SM90: gather + grouped GEMM + fused activation, bf16/fp16.
 
-    ``out[r, j] = silu(gate_j) * up_j`` with
-    ``[up, gate] = x[token(r)] @ w1_weight[expert(r)].T`` for every valid permuted
-    row ``r``; token permute is fused into the A load (never materialized).
+    Gated activations (``ActivationType.Swiglu``, ``ActivationType.GegluTanh``):
+    ``out[r, j] = act(gate_j) * up_j`` with
+    ``[up, gate] = x[token(r)] @ w1_weight[expert(r)].T``. Non-gated
+    (``ActivationType.Relu2``): ``out[r, j] = relu(h_j)^2`` with
+    ``h = x[token(r)] @ w1_weight[expert(r)].T``. Both hold for every valid
+    permuted row ``r``; the token permute is fused into the A load (never
+    materialized).
 
     Args:
         x: Unpermuted activations ``[num_tokens, k]``, row-major bf16/fp16.
-        w1_weight: Expert weights ``[num_local_experts, 2I, k]``, k contiguous,
-            up/gate interleaved at 32 columns (see
-            :func:`interleave_up_gate_sm90`).
-        tile_idx_to_expert_idx / tile_idx_to_mn_limit /
-        num_non_exiting_tiles: ``moe_sort`` outputs (tile size =
-            ``tile_shape_mn[0]``).
+        w1_weight: Expert weights, k contiguous. Gated:
+            ``[num_local_experts, 2I, k]`` with up/gate interleaved at 32
+            columns (see :func:`interleave_up_gate_sm90`). Non-gated:
+            ``[num_local_experts, I, k]``, no interleave.
+        tile_idx_to_expert_idx: ``moe_sort`` output, local expert per tile
+            (tile size = ``tile_shape_mn[0]``).
+        tile_idx_to_mn_limit: ``moe_sort`` output, valid-row limit per tile.
+        num_non_exiting_tiles: ``moe_sort`` output, number of live tiles.
         token_id_mapping: ``moe_sort``'s ``permuted_idx_to_expanded_idx``
             (``[permuted_m]`` int32; garbage on padding rows).
         out: Optional ``[permuted_m, I]`` output. Padding rows hold garbage.
         topk: MoE top-k (compile-time constant of the kernel).
         permuted_m: ``max_num_tiles * tile_m`` (padded row count).
-        tile_shape_mn: CTA tile over the accumulator (N counts up+gate
-            columns); ``tile_n % 64 == 0``.
+        tile_shape_mn: CTA tile over the accumulator (for gated activations
+            N counts up+gate columns); ``tile_n % 64 == 0``.
+        cluster_shape_mn: CTA cluster, ``(1, 1)`` or a ``(2, 1)`` M-pair.
+        swizzle_size: Persistent-walk swizzle — groups the tile walk into
+            blocks of this many M-tiles so each expert's B streams once per
+            block instead of once per M-tile row (1 = plain N-fast walk).
+        raster_along_m: Walk the tile grid M-fast instead of N-fast.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+        activation_type: ``ActivationType.Swiglu`` (default; the OAI variant
+            through ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``, SiTU
+            through ``situ_beta``), ``ActivationType.GegluTanh`` or the
+            non-gated ``ActivationType.Relu2``.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
+        situ_beta: With ``Swiglu``, selects the SiTU gate.
+        situ_linear_beta: Optional SiTU tanh clamp of the up branch.
 
     Returns:
-        The output tensor ``[permuted_m, I]`` where ``I = w1_weight.shape[1] // 2``.
+        The output tensor ``[permuted_m, I]`` where ``I`` is
+        ``w1_weight.shape[1] // 2`` for gated activations and
+        ``w1_weight.shape[1]`` otherwise.
     """
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
+    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    out_n_factor = 2 if gated else 1
     major, minor = get_compute_capability(x.device)
     if major != 9:
         raise ValueError(
@@ -192,26 +261,14 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         raise ValueError("x must be a contiguous 2D [num_tokens, k] tensor")
     if not (w1_weight.dim() == 3 and w1_weight.stride(2) == 1):
         raise ValueError(
-            "w1_weight must be [num_local_experts, 2I, k] with k contiguous"
+            "w1_weight must be [num_local_experts, 2I (gated) or I, k] with k "
+            "contiguous"
         )
 
     orig_m, k = x.shape
     num_local_experts, n, w_k = w1_weight.shape
     if w_k != k:
         raise ValueError(f"k mismatch: x k={k}, w1_weight k={w_k}")
-    if n % 64 != 0:
-        raise ValueError(f"w1_weight 2I dim ({n}) must be a multiple of 64")
-    # The epilogue writes full N tiles and the gather/mainloop assume whole
-    # K tiles — partial tiles would read/write out of bounds.
-    if n % tile_shape_mn[1] != 0:
-        raise ValueError(f"n={n} must be a multiple of tile_n={tile_shape_mn[1]}")
-    if k % 64 != 0:
-        raise ValueError(f"k={k} must be a multiple of the K tile (64)")
-    tile_m = tile_shape_mn[0]
-    if permuted_m % tile_m != 0:
-        raise ValueError(
-            f"permuted_m={permuted_m} must be a multiple of tile_m={tile_m}"
-        )
     if token_id_mapping.numel() != permuted_m:
         raise ValueError(
             f"token_id_mapping has {token_id_mapping.numel()} entries, "
@@ -219,16 +276,34 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         )
 
     ab_dtype = TORCH_TO_CUTLASS_DTYPE[x.dtype]
+    inter = n // out_n_factor
     if out is None:
-        out = torch.empty(permuted_m, n // 2, dtype=x.dtype, device=x.device)
-    elif out.shape != (permuted_m, n // 2):
-        raise ValueError(f"out shape {tuple(out.shape)} != ({permuted_m}, {n // 2})")
+        out = torch.empty(permuted_m, inter, dtype=x.dtype, device=x.device)
+    elif out.shape != (permuted_m, inter):
+        raise ValueError(f"out shape {tuple(out.shape)} != ({permuted_m}, {inter})")
     elif not out.is_contiguous() or out.device != x.device:
         raise ValueError("out must be a contiguous tensor on x's device")
     c_dtype = TORCH_TO_CUTLASS_DTYPE[out.dtype]
 
-    if cluster_shape_mn == (2, 1) and (permuted_m // tile_shape_mn[0]) % 2 != 0:
-        cluster_shape_mn = (1, 1)  # odd M-tile count cannot pair
+    if not Sm90ContiguousGatherGroupedGemmActFusionKernel.can_implement(
+        ab_dtype,
+        ab_dtype,
+        c_dtype,
+        tile_shape_mn,
+        cluster_shape_mn,
+        permuted_m,
+        n,
+        k,
+        num_local_experts,
+        swizzle_size=swizzle_size,
+    ):
+        raise ValueError(
+            "sm90_contiguous_gather_grouped_gemm_act_fusion cannot implement "
+            f"tile_shape_mn={tile_shape_mn}, cluster_shape_mn={cluster_shape_mn}, "
+            f"swizzle_size={swizzle_size} for "
+            f"permuted_m={permuted_m}, n={n} ({'2I' if gated else 'I'}), k={k}, "
+            f"{x.dtype} -> {out.dtype}"
+        )
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
@@ -284,8 +359,15 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         tile_shape_mn=tile_shape_mn,
         cluster_shape_mn=cluster_shape_mn,
         topk=topk,
+        swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        activation_type=int(activation),
+        swiglu_alpha=float(swiglu_alpha),
+        swiglu_beta=float(swiglu_beta),
+        swiglu_limit=float(swiglu_limit),
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
     compiled(

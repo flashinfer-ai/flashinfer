@@ -565,6 +565,7 @@ __device__ __forceinline__ void RadixSelectOneRound(
     }
 
     // Barrier: wait for all CTAs to finish atomicAdd and clearing
+    __syncthreads();  // converge the CTA so tx0's release covers every thread's atomicAdds/clears
     AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
     // Read current histogram (after barrier, all atomicAdds are complete)
@@ -744,6 +745,7 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
           next_hist[i] = 0;
         }
       }
+      __syncthreads();  // converge the CTA so tx0's release covers every thread's atomicAdds/clears
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
       for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {

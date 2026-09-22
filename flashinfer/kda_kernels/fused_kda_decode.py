@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Fused Kimi KDA decode kernel for SM100.
+Fused Kimi KDA decode kernel for SM100 and SM103.
 
 The kernel combines the width-four depthwise causal convolution, SiLU,
 per-key-dimension gated delta-rule recurrence, and gated RMSNorm into one
@@ -22,7 +22,9 @@ heads.
 """
 
 import functools
+import math
 from pathlib import Path
+from typing import Literal
 
 import cutlass
 import cutlass.cute as cute
@@ -31,7 +33,16 @@ import torch
 from cutlass.utils import SmemAllocator
 import tvm_ffi  # noqa: F401 -- TVM FFI is required for kernel dispatch
 
+from ..jit.cake_fused_kda_decode import (
+    CakeFusedKDADecodeStateIndicesMode,
+    CakeFusedKDADecodeTarget,
+    CakeFusedKDADecodeVariant,
+    get_cake_fused_kda_decode_variants,
+    load_cake_fused_kda_decode_module,
+    select_cake_fused_kda_decode_variant,
+)
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from ..utils import get_compute_capability
 
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
@@ -611,6 +622,104 @@ def _check_cuda_tensor(name, tensor, dtype):
         raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
 
 
+def _select_cake_variant(
+    *,
+    x,
+    conv_state,
+    raw_beta,
+    state,
+    output_gate,
+    output,
+    state_indices_mode: CakeFusedKDADecodeStateIndicesMode,
+    lower_bound,
+    norm_eps,
+) -> CakeFusedKDADecodeVariant | None:
+    capability = get_compute_capability(x.device)
+    target: CakeFusedKDADecodeTarget
+    if capability == (10, 0):
+        target = "sm100a"
+    elif capability == (10, 3):
+        target = "sm103a"
+    else:
+        return None
+    variants = get_cake_fused_kda_decode_variants(target)
+    if not variants:
+        return None
+    if not math.isfinite(float(norm_eps)) or (
+        lower_bound is not None and not math.isfinite(float(lower_bound))
+    ):
+        return None
+    if int(conv_state.stride(0)) * conv_state.element_size() % 8:
+        return None
+    state_alignment = 16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
+    if int(state.stride(0)) * state.element_size() % state_alignment:
+        return None
+    if int(conv_state.data_ptr()) % 8:
+        return None
+    if int(state.data_ptr()) % state_alignment:
+        return None
+    if int(output.data_ptr()) % 8:
+        return None
+
+    num_rows = int(x.shape[0])
+    num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
+    state_dtype = "bfloat16" if state.dtype == torch.bfloat16 else "float32"
+    return select_cake_fused_kda_decode_variant(
+        target=target,
+        num_heads=num_heads,
+        num_rows=num_rows,
+        num_slots=int(conv_state.shape[0]),
+        state_dtype=state_dtype,
+        state_indices_mode=state_indices_mode,
+        lower_bound=None if lower_bound is None else float(lower_bound),
+        norm_eps=float(norm_eps),
+        x_row_stride=int(x.stride(0)),
+        conv_slot_stride=int(conv_state.stride(0)),
+        beta_row_stride=int(raw_beta.stride(1)),
+        state_slot_stride=int(state.stride(0)),
+        output_gate_row_stride=int(output_gate.stride(0)),
+        variants=variants,
+    )
+
+
+def _run_cake_variant(
+    variant: CakeFusedKDADecodeVariant,
+    *,
+    x,
+    weight,
+    conv_state,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    state_indices,
+    state,
+    output_gate,
+    norm_weight,
+    output,
+    lower_bound,
+    norm_eps,
+) -> None:
+    module = load_cake_fused_kda_decode_module(variant.name, variant.target)
+    module.run(
+        x,
+        weight,
+        conv_state,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_indices,
+        state,
+        output_gate,
+        norm_weight,
+        output,
+        int(lower_bound is not None),
+        0.0 if lower_bound is None else float(lower_bound),
+        float(norm_eps),
+    )
+
+
 @torch.no_grad()
 def run_fused_kda_decode(
     x: torch.Tensor,
@@ -627,8 +736,28 @@ def run_fused_kda_decode(
     lower_bound: float | None = -5.0,
     norm_eps: float = 1e-5,
     output: torch.Tensor | None = None,
+    *,
+    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
+    state_indices_mode: CakeFusedKDADecodeStateIndicesMode | None = None,
 ) -> torch.Tensor:
     """Run fused Kimi decode and update both cache tensors in-place."""
+    if backend not in ("cute-dsl", "cake", "auto"):
+        raise ValueError(
+            f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
+        )
+    if state_indices_mode is not None and state_indices_mode not in (
+        "positive_unique",
+        "unique_or_null",
+        "repeated_positive",
+    ):
+        raise ValueError(
+            "state_indices_mode must be 'positive_unique', 'unique_or_null', "
+            f"or 'repeated_positive', got {state_indices_mode!r}"
+        )
+    if backend == "cake" and state_indices_mode is None:
+        raise ValueError(
+            "backend='cake' requires the host-known state_indices_mode assertion"
+        )
     _check_cuda_tensor("x", x, torch.bfloat16)
     _check_cuda_tensor("weight", weight, torch.float32)
     _check_cuda_tensor("conv_state", conv_state, torch.bfloat16)
@@ -739,6 +868,44 @@ def run_fused_kda_decode(
             raise ValueError(
                 "output must be contiguous with shape [1, num_rows, H, 128]"
             )
+
+    cake_variant = None
+    if backend != "cute-dsl" and state_indices_mode is not None:
+        cake_variant = _select_cake_variant(
+            x=x,
+            conv_state=conv_state,
+            raw_beta=raw_beta,
+            state=state,
+            output_gate=output_gate,
+            output=output,
+            state_indices_mode=state_indices_mode,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+        )
+    if cake_variant is not None:
+        _run_cake_variant(
+            cake_variant,
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices,
+            state=state,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            output=output,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+        )
+        return output
+    if backend == "cake":
+        raise RuntimeError(
+            "backend='cake' does not have a route for this architecture, layout, "
+            "dtype, scalar configuration, and state_indices_mode"
+        )
 
     kernel = _get_compiled_kernel(state.dtype, lower_bound, float(norm_eps))
     kernel(

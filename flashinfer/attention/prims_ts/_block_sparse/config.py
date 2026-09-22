@@ -84,6 +84,7 @@ class _BlockSparseCompileKey:
     sparse_format: Literal["bsr", "bitmask"] = "bsr"
     use_proxy_routes: bool = False
     page_size: int | None = None
+    share_pattern_across_kv_heads: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,9 @@ class _BlockSparseLaunchSpec:
 
     policy: tuple[tuple[str, object], ...]
     compile_key: _BlockSparseCompileKey
+    # Whether prepared routes carry K32 score-validity words; the decode
+    # config owns this rule and the plan sizes its route storage from it.
+    prepares_score_words: bool
 
 
 _CAPACITY_UNSET = object()
@@ -119,6 +123,7 @@ class _BlockSparseStaticProfile:
     use_kv_valid_bits: bool
     max_blocks_per_row: int | None
     page_size: int | None = None
+    share_pattern_across_kv_heads: bool = False
 
 
 def _select_block_sparse_kv_route_size(
@@ -195,9 +200,13 @@ def _select_block_sparse_scheduler(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
-    use_proxy_routes: bool,
 ) -> tuple[int, bool]:
-    """Select the Q tile and scheduler without depending on KV storage."""
+    """Select the Q tile and scheduler without depending on KV storage.
+
+    Proxy routes add one summary route per row on top of the exact routes and
+    see the same per-tile fixed cost the persistent scheduler amortizes, so
+    the selection does not depend on the route kind.
+    """
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
     q_tile_size = _select_block_sparse_q_tile_size(
@@ -205,11 +214,6 @@ def _select_block_sparse_scheduler(
         heads_q_per_kv=heads_q_per_kv,
         kv_block_size=kv_block_size,
     )
-    # Reusable planning sees route capacity, not the live exact-route work.
-    # Keep proxy execution on the direct grid as a conservative workload-level
-    # default until runtime work can participate in scheduling.
-    if use_proxy_routes:
-        return q_tile_size, False
     if not _should_consider_clc(
         q_tile_size=q_tile_size,
         kv_block_size=kv_block_size,
@@ -301,9 +305,12 @@ def _validate_block_sparse_static_profile(
     output_dtype: torch.dtype | None,
     max_blocks_per_row: object = _CAPACITY_UNSET,
     page_size: int | None = None,
+    share_pattern_across_kv_heads: bool = False,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection."""
 
+    if not isinstance(share_pattern_across_kv_heads, bool):
+        raise TypeError("share_pattern_across_kv_heads must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
     seq_len_kv = _validate_positive_int(seq_len_kv, "seq_len_kv")
@@ -360,11 +367,13 @@ def _validate_block_sparse_static_profile(
         kv_block_size=kv_block_size,
     )
     if page_size is not None:
+        # Validate the paged route geometry with a capacity-free layout; the
+        # score-word slots do not take part in the page/atom checks.
         _BlockSparseRouteLayout.create(
             kv_route_size=kv_route_size,
             kv_block_size=kv_block_size,
             page_size=page_size,
-            has_token_bits=use_kv_valid_bits,
+            has_token_bits=False,
             route_metadata_capacity=0,
             num_rows=1,
         )
@@ -387,6 +396,7 @@ def _validate_block_sparse_static_profile(
         use_kv_valid_bits=use_kv_valid_bits,
         max_blocks_per_row=validated_max_blocks_per_row,
         page_size=page_size,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
 
 
@@ -414,6 +424,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "tile_size_kv": key.kv_route_size,
         "groups_tokens_heads_q": True,
         "use_block_sparse": True,
+        "share_pattern_across_kv_heads": key.share_pattern_across_kv_heads,
         "q_block_size": key.q_block_size,
         "kv_block_size": key.kv_block_size,
         "use_kv_valid_bits": key.use_kv_valid_bits,
@@ -439,10 +450,13 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         batch_size=key.batch_size,
         num_heads_q=key.num_qo_heads,
         num_heads_kv=key.num_kv_heads,
-        qkv_dtype=dtype,
+        q_dtype=dtype,
+        k_dtype=dtype,
+        v_dtype=dtype,
         o_dtype=dtype,
         split_kv_mode="disabled",
         splits_kv=1,
+        split_kv=False,
         mask_type=key.mask_type,
         auto_tuner=False,
         **layout_args,
@@ -468,14 +482,15 @@ def _resolve_block_sparse_launch_spec(
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     page_size: int | None = None,
+    share_pattern_across_kv_heads: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
     ``max_row_route_capacity`` is a conservative prepared-route bound. Live
     index values and physical-tail morphology never specialize this cache
-    entry. Proxy routes use the direct grid; exact routes retain the common
-    automatic scheduler. An unsupported persistent profile falls back to its
-    valid static counterpart.
+    entry. Proxy and exact routes share one scheduler selection. An
+    unsupported persistent profile falls back to its valid static
+    counterpart.
     """
 
     q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
@@ -490,7 +505,6 @@ def _resolve_block_sparse_launch_spec(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         max_row_route_capacity=max_row_route_capacity,
-        use_proxy_routes=use_proxy_routes,
     )
     compile_key = _BlockSparseCompileKey(
         device_index=device_index,
@@ -516,9 +530,10 @@ def _resolve_block_sparse_launch_spec(
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         page_size=page_size,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     try:
-        _make_block_sparse_config(compile_key)
+        config = _make_block_sparse_config(compile_key)
     except ValueError:
         if not compile_key.use_persistent_scheduler:
             raise
@@ -532,7 +547,7 @@ def _resolve_block_sparse_launch_spec(
                 use_persistent_scheduler=False,
             ),
         )
-        _make_block_sparse_config(compile_key)
+        config = _make_block_sparse_config(compile_key)
 
     policy_entries: list[tuple[str, object]] = [
         ("tile_size_q", q_tile_size),
@@ -558,6 +573,7 @@ def _resolve_block_sparse_launch_spec(
     return _BlockSparseLaunchSpec(
         policy=tuple(policy_entries),
         compile_key=compile_key,
+        prepares_score_words=config.uses_prepared_score_keep_words,
     )
 
 
