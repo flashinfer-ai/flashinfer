@@ -1,0 +1,1065 @@
+{
+  "artifact_kind": "source_only",
+  "build_contract": {
+    "architecture_source": "modules[].arch",
+    "binary_payloads": false,
+    "source_license_header_sha256": "dcf2449c2d70596e2c32bf1fa23720023965ff05857b85772decee99d830bf2f",
+    "target_infrastructure": {
+      "binding_runtime": "flashinfer_tvm_ffi_utils",
+      "headers_owned_by_target": true,
+      "required_headers": [
+        "tvm_ffi_utils.h"
+      ]
+    },
+    "translation_unit_model": "separate_device_and_binding"
+  },
+  "contract": {
+    "arches": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "integration_files": [
+      "flashinfer/cute_dsl/sparse/bsa_attn_sm100_blk64.py",
+      "flashinfer/jit/cake_sage_block_sparse_attention.py"
+    ],
+    "operator": "sage_fp8_block_sparse_attention",
+    "stages": [
+      "attention",
+      "quantize_qk_vamax",
+      "quantize_v"
+    ]
+  },
+  "files": [
+    {
+      "bytes": 9625,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_binding.cu",
+      "sha256": "0939a09141e03fba2944b88a6173b41448a69159d220566088a398c18d98124e"
+    },
+    {
+      "bytes": 6252,
+      "kind": "device_source",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_kernel.cu",
+      "sha256": "9fce6d7999b53e2cb2803de05d1b7fcb941a8b55d29a7dcd8df14edff94a4fbc"
+    },
+    {
+      "bytes": 12794,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_e46b194b07d454419fba_binding.cu",
+      "sha256": "2ccc551b355f12e06c9822a6c058b97208ae0289d316f4a48f0b097e9378ed6e"
+    },
+    {
+      "bytes": 33544,
+      "kind": "device_source",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_e46b194b07d454419fba_kernel.cu",
+      "sha256": "04d905ccf73b1db493b5e007c42dadb4fa08529845146816eacba680ba0436d8"
+    },
+    {
+      "bytes": 29922,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_binding.cu",
+      "sha256": "67c4a339c05d22ccfcb08b8a08c18bad872dba215bb3ee2e5eff37e0c7fbcb53"
+    },
+    {
+      "bytes": 135707,
+      "kind": "device_source",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_kernel.cu",
+      "sha256": "32e73dfe3785b2229f94a44660ef167ca1a5a81889d5698aad4c38072449ee64"
+    },
+    {
+      "bytes": 29922,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_62c3142a797348e374c0_binding.cu",
+      "sha256": "ca4ed80b9e3d18b51180dca44e3869c6e4b907ee2559603ec531f7c9ea92d961"
+    },
+    {
+      "bytes": 135133,
+      "kind": "device_source",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_62c3142a797348e374c0_kernel.cu",
+      "sha256": "b5fb672d44384a79a0ba3266b6e8c97f8f28823b3c1ed0efe86df4f2c0ebb332"
+    },
+    {
+      "bytes": 12794,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_7374900a242cff867ec4_binding.cu",
+      "sha256": "d7d0a9c79ff2668d1da4e792b762afd74904ffebdd207eadb7eee3a0a0dae57f"
+    },
+    {
+      "bytes": 33447,
+      "kind": "device_source",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_7374900a242cff867ec4_kernel.cu",
+      "sha256": "37090530dd1c10db416c0e73827a1de1e5b2abacdfe30b6e16d269445b12e165"
+    },
+    {
+      "bytes": 9625,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_binding.cu",
+      "sha256": "595bfdbbd80710ddfd11f3ff9cf7f4115606ecba822b4dc3a7602aefd5b7c394"
+    },
+    {
+      "bytes": 6252,
+      "kind": "device_source",
+      "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_kernel.cu",
+      "sha256": "e6ab04a6ab1b82962ccf93b1b7b2884942c123efad48e48be086ec18d56a6aac"
+    }
+  ],
+  "generation_inputs": {
+    "schema": "cake.library_export.generation_inputs.v4"
+  },
+  "library": "flashinfer",
+  "modules": [
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "v_in"
+        ],
+        [
+          "buffer",
+          "v_out"
+        ],
+        [
+          "buffer",
+          "v_amax"
+        ],
+        [
+          "buffer",
+          "v_scale"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "chunks_per_bh"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "0464189fb4b13f138488d25c2be7c97f2c160ad3c4f5a5d4e80f34c85d616472",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 6252,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_kernel.cu",
+          "sha256": "9fce6d7999b53e2cb2803de05d1b7fcb941a8b55d29a7dcd8df14edff94a4fbc"
+        },
+        {
+          "bytes": 9625,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_binding.cu",
+          "sha256": "0939a09141e03fba2944b88a6173b41448a69159d220566088a398c18d98124e"
+        }
+      ],
+      "closure_sha256": "17e3e9f0a47359f0ca2c80e6b3658a593950d56f272606d547aaf95ddc8b1be5",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sage_block_sparse_attention_43e2bcadf25e569b50fb",
+      "launch": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 0,
+        "use_pdl": false
+      },
+      "module_ident": "cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_sm_100a",
+      "name": "cake_sage_block_sparse_attention_43e2bcadf25e569b50fb",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "43e2bcadf25e569b50fbe94dbb4f28f4c74552ccc6105f37bdfdfaf63d851f09",
+        "stage": "quantize_v",
+        "template": "sage_quantize_v"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_43e2bcadf25e569b50fb_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q_in"
+        ],
+        [
+          "buffer",
+          "k_in"
+        ],
+        [
+          "buffer",
+          "v_in"
+        ],
+        [
+          "buffer",
+          "q_out"
+        ],
+        [
+          "buffer",
+          "k_out"
+        ],
+        [
+          "buffer",
+          "q_scale"
+        ],
+        [
+          "buffer",
+          "k_scale"
+        ],
+        [
+          "buffer",
+          "v_amax"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "grid_heads"
+        ],
+        [
+          "parameter",
+          "k_scale_groups"
+        ],
+        [
+          "parameter",
+          "chunks_per_bh"
+        ],
+        [
+          "parameter",
+          "q_chunks"
+        ],
+        [
+          "parameter",
+          "k_chunks"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "2dc3b8eab096307996e8aefdec906a852ca1b96012c2fdf3c891c104db228faa",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 33544,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_e46b194b07d454419fba_kernel.cu",
+          "sha256": "04d905ccf73b1db493b5e007c42dadb4fa08529845146816eacba680ba0436d8"
+        },
+        {
+          "bytes": 12794,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_e46b194b07d454419fba_binding.cu",
+          "sha256": "2ccc551b355f12e06c9822a6c058b97208ae0289d316f4a48f0b097e9378ed6e"
+        }
+      ],
+      "closure_sha256": "7914db6693e9b63064f94988a5c3a92cedc7300bb239f60b122a7ca3e9691dbe",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba",
+      "launch": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 4224,
+        "use_pdl": false
+      },
+      "module_ident": "cake_sage_block_sparse_attention_e46b194b07d454419fba_sm_100a",
+      "name": "cake_sage_block_sparse_attention_e46b194b07d454419fba",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "e46b194b07d454419fba5ab67d9368d037ed16ee26bf92be3400db06a1d37d75",
+        "stage": "quantize_qk_vamax",
+        "template": "sage_quantize_qk_vamax"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_e46b194b07d454419fba_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_e46b194b07d454419fba_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "q_scale"
+        ],
+        [
+          "buffer",
+          "k_scale"
+        ],
+        [
+          "buffer",
+          "v_scale"
+        ],
+        [
+          "buffer",
+          "block_index"
+        ],
+        [
+          "buffer",
+          "block_nums"
+        ],
+        [
+          "buffer",
+          "block_sizes"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "q_blocks"
+        ],
+        [
+          "parameter",
+          "k_blocks"
+        ],
+        [
+          "parameter",
+          "k_scale_groups"
+        ],
+        [
+          "parameter",
+          "capacity"
+        ],
+        [
+          "parameter",
+          "block_sparse_num"
+        ],
+        [
+          "parameter",
+          "has_block_nums"
+        ],
+        [
+          "parameter",
+          "block_sizes_mode"
+        ],
+        [
+          "parameter",
+          "v_scale_batch_stride"
+        ],
+        [
+          "parameter",
+          "total_tiles"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "return_lse"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "f97fc6d3503f6acd3371ae1df5e3952a35034aef80efed2b6809c712ffcd8c3d",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 135707,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_kernel.cu",
+          "sha256": "32e73dfe3785b2229f94a44660ef167ca1a5a81889d5698aad4c38072449ee64"
+        },
+        {
+          "bytes": 29922,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_binding.cu",
+          "sha256": "67c4a339c05d22ccfcb08b8a08c18bad872dba215bb3ee2e5eff37e0c7fbcb53"
+        }
+      ],
+      "closure_sha256": "5ab13605bee45ae45c905c7b3507d590b82c0162044b7518803d0451688ec905",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sage_block_sparse_attention_f63b7fc8674de9925f7e",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 77824,
+        "use_pdl": false
+      },
+      "module_ident": "cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_sm_100a",
+      "name": "cake_sage_block_sparse_attention_f63b7fc8674de9925f7e",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "f63b7fc8674de9925f7e8993de8bd11452d5fee88d311a7b5654dbf1e757c8eb",
+        "stage": "attention",
+        "template": "flashinfer_sm100_sage_block_sparse_attention"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 384,
+      "translation_units": {
+        "binding": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_sage_block_sparse_attention/sm_100a/cake_sage_block_sparse_attention_f63b7fc8674de9925f7e_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "q_scale"
+        ],
+        [
+          "buffer",
+          "k_scale"
+        ],
+        [
+          "buffer",
+          "v_scale"
+        ],
+        [
+          "buffer",
+          "block_index"
+        ],
+        [
+          "buffer",
+          "block_nums"
+        ],
+        [
+          "buffer",
+          "block_sizes"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "q_blocks"
+        ],
+        [
+          "parameter",
+          "k_blocks"
+        ],
+        [
+          "parameter",
+          "k_scale_groups"
+        ],
+        [
+          "parameter",
+          "capacity"
+        ],
+        [
+          "parameter",
+          "block_sparse_num"
+        ],
+        [
+          "parameter",
+          "has_block_nums"
+        ],
+        [
+          "parameter",
+          "block_sizes_mode"
+        ],
+        [
+          "parameter",
+          "v_scale_batch_stride"
+        ],
+        [
+          "parameter",
+          "total_tiles"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "return_lse"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "f97fc6d3503f6acd3371ae1df5e3952a35034aef80efed2b6809c712ffcd8c3d",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 135133,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_62c3142a797348e374c0_kernel.cu",
+          "sha256": "b5fb672d44384a79a0ba3266b6e8c97f8f28823b3c1ed0efe86df4f2c0ebb332"
+        },
+        {
+          "bytes": 29922,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_62c3142a797348e374c0_binding.cu",
+          "sha256": "ca4ed80b9e3d18b51180dca44e3869c6e4b907ee2559603ec531f7c9ea92d961"
+        }
+      ],
+      "closure_sha256": "02514500b2937edff0fb1f0eb17704b2d0895d0e46d7143e791de0d83b90d55f",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sage_block_sparse_attention_62c3142a797348e374c0",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 77824,
+        "use_pdl": false
+      },
+      "module_ident": "cake_sage_block_sparse_attention_62c3142a797348e374c0_sm_103a",
+      "name": "cake_sage_block_sparse_attention_62c3142a797348e374c0",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "62c3142a797348e374c086769db6fd183df8ca4e3b1dce5b0fbee908129af6e9",
+        "stage": "attention",
+        "template": "flashinfer_sm100_sage_block_sparse_attention"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 384,
+      "translation_units": {
+        "binding": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_62c3142a797348e374c0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_62c3142a797348e374c0_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q_in"
+        ],
+        [
+          "buffer",
+          "k_in"
+        ],
+        [
+          "buffer",
+          "v_in"
+        ],
+        [
+          "buffer",
+          "q_out"
+        ],
+        [
+          "buffer",
+          "k_out"
+        ],
+        [
+          "buffer",
+          "q_scale"
+        ],
+        [
+          "buffer",
+          "k_scale"
+        ],
+        [
+          "buffer",
+          "v_amax"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "grid_heads"
+        ],
+        [
+          "parameter",
+          "k_scale_groups"
+        ],
+        [
+          "parameter",
+          "chunks_per_bh"
+        ],
+        [
+          "parameter",
+          "q_chunks"
+        ],
+        [
+          "parameter",
+          "k_chunks"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "2dc3b8eab096307996e8aefdec906a852ca1b96012c2fdf3c891c104db228faa",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 33447,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_7374900a242cff867ec4_kernel.cu",
+          "sha256": "37090530dd1c10db416c0e73827a1de1e5b2abacdfe30b6e16d269445b12e165"
+        },
+        {
+          "bytes": 12794,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_7374900a242cff867ec4_binding.cu",
+          "sha256": "d7d0a9c79ff2668d1da4e792b762afd74904ffebdd207eadb7eee3a0a0dae57f"
+        }
+      ],
+      "closure_sha256": "ffe404bfc4bec850b718e2c2ca3f9c3563898c2ac323ce9ff4db754e76bab13e",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sage_block_sparse_attention_7374900a242cff867ec4",
+      "launch": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 4224,
+        "use_pdl": false
+      },
+      "module_ident": "cake_sage_block_sparse_attention_7374900a242cff867ec4_sm_103a",
+      "name": "cake_sage_block_sparse_attention_7374900a242cff867ec4",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "7374900a242cff867ec4e4117f47295d8f3e1ff4425fa00fc2c14a868928de25",
+        "stage": "quantize_qk_vamax",
+        "template": "sage_quantize_qk_vamax"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_7374900a242cff867ec4_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_7374900a242cff867ec4_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "v_in"
+        ],
+        [
+          "buffer",
+          "v_out"
+        ],
+        [
+          "buffer",
+          "v_amax"
+        ],
+        [
+          "buffer",
+          "v_scale"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "chunks_per_bh"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "0464189fb4b13f138488d25c2be7c97f2c160ad3c4f5a5d4e80f34c85d616472",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 6252,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_kernel.cu",
+          "sha256": "e6ab04a6ab1b82962ccf93b1b7b2884942c123efad48e48be086ec18d56a6aac"
+        },
+        {
+          "bytes": 9625,
+          "path": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_binding.cu",
+          "sha256": "595bfdbbd80710ddfd11f3ff9cf7f4115606ecba822b4dc3a7602aefd5b7c394"
+        }
+      ],
+      "closure_sha256": "a5c217a6e4b8761e8a38fe39f70cfc3ad9c8a3a84786ef841419b1de1caef0e6",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sage_block_sparse_attention_d961cdf9b05b70c09c59",
+      "launch": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 0,
+        "use_pdl": false
+      },
+      "module_ident": "cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_sm_103a",
+      "name": "cake_sage_block_sparse_attention_d961cdf9b05b70c09c59",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "d961cdf9b05b70c09c59c0321a82bdcf74025820de8fc55e3c12f25fcf1d1f70",
+        "stage": "quantize_v",
+        "template": "sage_quantize_v"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_sage_block_sparse_attention/sm_103a/cake_sage_block_sparse_attention_d961cdf9b05b70c09c59_kernel.cu"
+      }
+    }
+  ],
+  "name": "cake_sage_block_sparse_attention_sm100",
+  "producer": "cake",
+  "producer_revision": null,
+  "schema": "cake.library_export.v4",
+  "sequences": []
+}
