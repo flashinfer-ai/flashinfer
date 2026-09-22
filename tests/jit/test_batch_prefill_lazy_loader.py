@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -105,6 +106,7 @@ def test_fa2_selects_stride_variant_once(monkeypatch):
         lambda *args: independent_spec,
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
     module = prefill.get_batch_prefill_module("fa2", *_MODULE_ARGS)
     assert primary_spec.build_count == 1
@@ -177,8 +179,17 @@ class _PrewarmRecorder:
     "wrapper_cls",
     [prefill.BatchPrefillWithPagedKVCacheWrapper, BatchDecodeWithPagedKVCacheWrapper],
 )
-def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls):
+def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls, monkeypatch):
+    devices = []
+
+    @contextmanager
+    def device_context(device):
+        devices.append(device)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "device", device_context)
     wrapper = wrapper_cls.__new__(wrapper_cls)
+    wrapper.device = torch.device("cuda:1")
     wrapper._plan_info = [1]
     wrapper._cached_module = _PrewarmRecorder()
     wrapper._jit_module = None
@@ -187,6 +198,7 @@ def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls):
 
     wrapper.prewarm_paged_kv_stride_variant("independent")
     assert wrapper._cached_module.variants == ["independent"]
+    assert devices == [torch.device("cuda:1")]
 
     wrapper._plan_info = None
     with pytest.raises(RuntimeError, match=r"plan\(\) must complete"):

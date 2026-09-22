@@ -6,6 +6,7 @@ import torch
 
 import flashinfer
 from flashinfer.trace.templates.attention import batch_attention_run_trace
+from flashinfer.utils import get_compute_capability
 import pytest
 
 from tests.test_helpers.paged_kv import make_paged_kv_cache_pair
@@ -87,6 +88,10 @@ def test_batch_attention_run_reference_correctness(
     )
     out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+    # This fixture exceeds the SM120/121 cooperative-grid limit.
+    # Avoid leaving a CUDA launch error for the next test.
+    if dim == 128 and get_compute_capability(q.device)[0] == 12:
+        pytest.xfail("SM120/121 persistent BatchAttention cooperative-launch limit")
     actual = wrapper.run(q, kv, out=out, lse=lse)
     _check(batch_attention_run_trace, expected, actual, atol=1e-2, rtol=1e-2)
     for result, reference in zip(actual, expected, strict=True):

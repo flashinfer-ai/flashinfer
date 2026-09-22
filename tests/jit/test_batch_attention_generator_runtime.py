@@ -9,7 +9,7 @@ from flashinfer.jit.attention.modules import (
     gen_batch_attention_module,
     gen_customize_batch_attention_module,
 )
-from flashinfer.utils import MaskMode, TensorLayout
+from flashinfer.utils import MaskMode, TensorLayout, get_compute_capability
 from tests.test_helpers.paged_kv import make_paged_kv_cache_pair
 
 
@@ -142,6 +142,12 @@ def test_batch_attention_generator_direct_plan_run(batch_attention_module, causa
         for scale in scales:
             out.fill_(torch.nan)
             lse.fill_(torch.nan)
+            # This fixture exceeds the SM120/121 cooperative-grid limit.
+            # Avoid leaving a CUDA launch error for the next test.
+            if q.shape[-1] == 128 and get_compute_capability(q.device)[0] == 12:
+                pytest.xfail(
+                    "SM120/121 persistent BatchAttention cooperative-launch limit"
+                )
             module.run(
                 float_workspace,
                 int_workspace,
