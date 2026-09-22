@@ -14,6 +14,12 @@
 Planning binds caller-owned buffers and compiles the selected offline tactic.
 Execution reads their current contents, including runtime SiTU parameters.
 Use a separate plan/output/workspace for concurrently executing calls.
+
+Rank-local layouts come from explicit metadata (``Mxfp4MoEParallelLayout`` or
+the explicit local expert interval), never from tensor shapes. Expert
+parallelism owns a contiguous global expert interval; MoE tensor parallelism
+owns an intermediate-dimension shard of every expert. Hybrid layouts are
+rejected. Every rank output is a partial sum whose reduction is external.
 """
 
 from dataclasses import dataclass
@@ -30,11 +36,190 @@ from .mxfp4_routing import _plan_route_preprocess
 from .tuner import DEFAULT_BLACKWELL_MOE_TACTIC, canonicalize_w4a8_tactic
 
 
+_PARALLEL_MODES = ("single", "expert_parallel", "moe_tensor_parallel")
+
+
+@dataclass(frozen=True)
+class Mxfp4MoEParallelLayout:
+    """Explicit rank placement; ``size`` ranks, this process is ``rank``.
+
+    ``mode`` is ``"single"`` (one rank owns everything), ``"expert_parallel"``
+    (rank ``r`` owns global experts ``[r*E/size, (r+1)*E/size)`` with the
+    full intermediate dimension) or ``"moe_tensor_parallel"`` (every rank owns
+    all experts and intermediate columns ``[r*I/size, (r+1)*I/size)`` of each).
+    Hybrid expert/tensor parallelism is not representable; ``from_sizes``
+    rejects it. Global ``num_experts`` and ``intermediate_size`` are resolved
+    into rank-local values by ``resolve_mxfp4_moe_layout``.
+    """
+
+    mode: str = "single"
+    size: int = 1
+    rank: int = 0
+
+    def __post_init__(self):
+        if self.mode not in _PARALLEL_MODES:
+            raise ValueError(f"parallel mode must be one of {_PARALLEL_MODES}")
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise ValueError("parallel size must be an int")
+        if not isinstance(self.rank, int) or isinstance(self.rank, bool):
+            raise ValueError("parallel rank must be an int")
+        if self.size < 1:
+            raise ValueError("parallel size must be positive")
+        if not 0 <= self.rank < self.size:
+            raise ValueError(f"parallel rank must be in [0, {self.size})")
+        if self.mode == "single" and (self.size, self.rank) != (1, 0):
+            raise ValueError("single layout requires size 1 and rank 0")
+
+    @classmethod
+    def from_sizes(
+        cls,
+        *,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        moe_tp_size: int = 1,
+        moe_tp_rank: int = 0,
+    ) -> "Mxfp4MoEParallelLayout":
+        """Build a layout from EP/TP sizes; both above one is a hybrid error."""
+        for name, size, rank in (
+            ("ep", ep_size, ep_rank),
+            ("moe_tp", moe_tp_size, moe_tp_rank),
+        ):
+            if size < 1 or not 0 <= rank < size:
+                raise ValueError(
+                    f"require {name}_size >= 1 and 0 <= {name}_rank < size"
+                )
+        if ep_size > 1 and moe_tp_size > 1:
+            raise ValueError(
+                "hybrid expert/tensor parallelism is unsupported: "
+                f"ep_size={ep_size} and moe_tp_size={moe_tp_size} both exceed 1"
+            )
+        if ep_size > 1:
+            return cls("expert_parallel", ep_size, ep_rank)
+        if moe_tp_size > 1:
+            return cls("moe_tensor_parallel", moe_tp_size, moe_tp_rank)
+        return cls()
+
+
+@dataclass(frozen=True)
+class Mxfp4MoERankLayout:
+    """Resolved rank-local geometry; ``num_experts``/``intermediate_size`` are global.
+
+    ``parallel_size``/``parallel_rank`` are ``None`` when an explicit expert
+    interval does not coincide with a uniform expert-parallel rank slice.
+    """
+
+    mode: str
+    num_experts: int
+    intermediate_size: int
+    num_local_experts: int
+    local_expert_offset: int
+    intermediate_shard: int
+    parallel_size: Optional[int] = None
+    parallel_rank: Optional[int] = None
+
+    @property
+    def gemm1_n(self) -> int:
+        """Rank-local GEMM1 output width: interleaved up and gate rows."""
+        return 2 * self.intermediate_shard
+
+    @property
+    def gemm2_k(self) -> int:
+        """Rank-local GEMM2 contraction length."""
+        return self.intermediate_shard
+
+
+def resolve_mxfp4_moe_layout(
+    num_experts: int,
+    intermediate_size: int,
+    *,
+    parallel_layout: Optional[Mxfp4MoEParallelLayout] = None,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: Optional[int] = None,
+) -> Mxfp4MoERankLayout:
+    """Derive and validate rank-local geometry from explicit metadata only.
+
+    ``parallel_layout`` is the uniform EP/TP form. ``num_local_experts`` and
+    ``local_expert_offset`` are the explicit expert-interval form, which is
+    expert parallelism (or single when the interval is every expert). When
+    both forms are given they must agree. Nothing is inferred from tensors.
+    """
+    if num_experts <= 0 or intermediate_size <= 0:
+        raise ValueError("num_experts and intermediate_size must be positive")
+    if parallel_layout is None:
+        local = num_experts if num_local_experts is None else num_local_experts
+        offset = 0 if local_expert_offset is None else local_expert_offset
+        if local <= 0 or offset < 0 or offset + local > num_experts:
+            raise ValueError(
+                "local experts must form a nonempty contiguous global expert interval"
+            )
+        if local == num_experts and offset == 0:
+            return Mxfp4MoERankLayout(
+                "single",
+                num_experts,
+                intermediate_size,
+                local,
+                0,
+                intermediate_size,
+                1,
+                0,
+            )
+        uniform = num_experts % local == 0 and offset % local == 0
+        return Mxfp4MoERankLayout(
+            "expert_parallel",
+            num_experts,
+            intermediate_size,
+            local,
+            offset,
+            intermediate_size,
+            num_experts // local if uniform else None,
+            offset // local if uniform else None,
+        )
+    if not isinstance(parallel_layout, Mxfp4MoEParallelLayout):
+        raise TypeError("parallel_layout must be an Mxfp4MoEParallelLayout")
+    mode, size, rank = parallel_layout.mode, parallel_layout.size, parallel_layout.rank
+    if mode == "expert_parallel":
+        if num_experts % size:
+            raise ValueError(
+                f"expert parallelism requires num_experts ({num_experts}) divisible "
+                f"by ep size ({size})"
+            )
+        local, offset, shard = (
+            num_experts // size,
+            rank * (num_experts // size),
+            (intermediate_size),
+        )
+    elif mode == "moe_tensor_parallel":
+        if intermediate_size % size or (intermediate_size // size) % 128:
+            raise ValueError(
+                f"MoE tensor parallelism requires intermediate_size ({intermediate_size}) "
+                f"divisible by moe_tp size ({size}) into a multiple of 128"
+            )
+        local, offset, shard = num_experts, 0, intermediate_size // size
+    else:
+        local, offset, shard = num_experts, 0, intermediate_size
+    if num_local_experts is not None and num_local_experts != local:
+        raise ValueError(
+            f"num_local_experts={num_local_experts} is inconsistent with "
+            f"{mode} size {size} rank {rank}, which owns {local} local experts"
+        )
+    if local_expert_offset is not None and local_expert_offset != offset:
+        raise ValueError(
+            f"local_expert_offset={local_expert_offset} is inconsistent with "
+            f"{mode} size {size} rank {rank}, whose offset is {offset}"
+        )
+    return Mxfp4MoERankLayout(
+        mode, num_experts, intermediate_size, local, offset, shard, size, rank
+    )
+
+
 @dataclass(frozen=True)
 class Mxfp4MoECapability:
+    """Support verdict plus the resolved rank-local layout when it resolves."""
+
     supported: bool
     reason: str
     cuda_graph: bool
+    layout: Optional[Mxfp4MoERankLayout] = None
 
 
 def mxfp4_moe_capability(
@@ -45,7 +230,8 @@ def mxfp4_moe_capability(
     num_experts: int,
     top_k: int,
     num_local_experts: Optional[int] = None,
-    local_expert_offset: int = 0,
+    local_expert_offset: Optional[int] = None,
+    parallel_layout: Optional[Mxfp4MoEParallelLayout] = None,
     quantization: str = "mxfp4_w4a8",
     activation_type: ActivationType = ActivationType.Situ,
     cuda_graph: bool = True,
@@ -54,9 +240,15 @@ def mxfp4_moe_capability(
 
     ``gpu_arch`` is 100 for SM100 or 103 for SM103. Weight scales are UE8M0
     with group size 32; activation storage is E4M3 and output is BF16.
+    ``num_experts`` and ``intermediate_size`` are global model values; the
+    rank-local expert interval and intermediate shard are derived from
+    ``parallel_layout`` and/or the explicit ``num_local_experts`` and
+    ``local_expert_offset`` (see ``resolve_mxfp4_moe_layout``). The result
+    carries that resolved layout; CUDA Graph capture is supported for every
+    supported configuration in both parallel modes.
     """
-    local = num_experts if num_local_experts is None else num_local_experts
     reason = ""
+    layout = None
     if gpu_arch not in (100, 103):
         reason = "MXFP4 W4A8 requires SM100 or SM103"
     elif quantization != "mxfp4_w4a8":
@@ -71,13 +263,18 @@ def mxfp4_moe_capability(
         reason = "require 1 <= top_k <= num_experts <= 1024"
     elif top_k > 32:
         reason = "top_k must not exceed 32"
-    elif (
-        local <= 0
-        or local_expert_offset < 0
-        or local_expert_offset + local > num_experts
-    ):
-        reason = "local experts must form a nonempty contiguous global expert interval"
-    return Mxfp4MoECapability(not reason, reason, not reason)
+    else:
+        try:
+            layout = resolve_mxfp4_moe_layout(
+                num_experts,
+                intermediate_size,
+                parallel_layout=parallel_layout,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
+            )
+        except (TypeError, ValueError) as error:
+            reason = str(error)
+    return Mxfp4MoECapability(not reason, reason, not reason, layout)
 
 
 @dataclass(frozen=True)
@@ -111,7 +308,8 @@ class Mxfp4MoEPlan:
 
     Update bound activation, routing, beta and scale tensors in-place before
     calling ``run`` or replaying a captured graph. No weights are copied.
-    The output is this rank's contribution when expert parallelism is used.
+    The output is this rank's partial sum: its local experts under expert
+    parallelism, or its intermediate shard under MoE tensor parallelism.
     """
 
     def __init__(
@@ -210,6 +408,13 @@ class CuteDslMxfp4MoEWrapper:
     The smallest covering bucket is selected from host shape metadata. No
     serving-time tuning or device-to-host routing inspection is performed.
     An omitted table uses the conservative existing Blackwell tactic.
+
+    ``num_experts`` and ``intermediate_size`` are the global model values.
+    The rank-local layout is explicit: ``parallel_layout`` (uniform EP or MoE
+    TP) and/or the expert interval ``num_local_experts``/``local_expert_offset``
+    (the expert-parallel form). Both forms may be given if they agree. The
+    derived ``layout`` fixes the weight shapes ``plan`` accepts; shapes never
+    select the mode. Every rank computes a partial output; reduce externally.
     """
 
     def __init__(
@@ -220,7 +425,8 @@ class CuteDslMxfp4MoEWrapper:
         intermediate_size: int,
         *,
         num_local_experts: Optional[int] = None,
-        local_expert_offset: int = 0,
+        local_expert_offset: Optional[int] = None,
+        parallel_layout: Optional[Mxfp4MoEParallelLayout] = None,
         activation_type: ActivationType = ActivationType.Situ,
         quantization: str = "mxfp4_w4a8",
         enable_pdl: bool = False,
@@ -230,22 +436,38 @@ class CuteDslMxfp4MoEWrapper:
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.num_local_experts = (
-            num_experts if num_local_experts is None else num_local_experts
-        )
-        self.local_expert_offset = local_expert_offset
         self.activation_type = ActivationType(activation_type)
         self.quantization = quantization
         self.enable_pdl = enable_pdl
-        supported = mxfp4_moe_capability(gpu_arch=103, **self._metadata())
+        supported = mxfp4_moe_capability(
+            gpu_arch=103,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            parallel_layout=parallel_layout,
+            quantization=quantization,
+            activation_type=self.activation_type,
+        )
         if not supported.supported:
             raise ValueError(supported.reason)
+        self.parallel_layout = parallel_layout
+        self.layout = supported.layout
+        self.num_local_experts = self.layout.num_local_experts
+        self.local_expert_offset = self.layout.local_expert_offset
+        self.intermediate_shard = self.layout.intermediate_shard
         self._offline_tactics = sorted(
             (int(limit), canonicalize_w4a8_tactic(tactic))
             for limit, tactic in (offline_tactics or {}).items()
         )
         if any(limit <= 0 for limit, _ in self._offline_tactics):
             raise ValueError("offline tactic bucket bounds must be positive")
+
+    @property
+    def parallel_mode(self) -> str:
+        return self.layout.mode
 
     def _metadata(self):
         return dict(
@@ -255,6 +477,7 @@ class CuteDslMxfp4MoEWrapper:
             top_k=self.top_k,
             num_local_experts=self.num_local_experts,
             local_expert_offset=self.local_expert_offset,
+            parallel_layout=self.parallel_layout,
             quantization=self.quantization,
             activation_type=self.activation_type,
         )
@@ -283,10 +506,10 @@ class CuteDslMxfp4MoEWrapper:
             ("out_permuted_idx_to_expanded_idx", (rows,), torch.int32, 4),
             ("out_total_num_padded_tokens", (1,), torch.int32, 4),
             ("out_num_non_exiting_tiles", (1,), torch.int32, 4),
-            ("gemm1_out", (rows, self.intermediate_size), torch.float8_e4m3fn, 1),
+            ("gemm1_out", (rows, self.intermediate_shard), torch.float8_e4m3fn, 1),
             (
                 "gemm1_out_scale",
-                (32, 4, rows // 128, 4, self.intermediate_size // 128, 1),
+                (32, 4, rows // 128, 4, self.intermediate_shard // 128, 1),
                 torch.uint8,
                 1,
             ),
@@ -306,7 +529,12 @@ class CuteDslMxfp4MoEWrapper:
         return fields, _align(offset)
 
     def get_workspace_size(self, num_tokens: int) -> int:
-        """Return required workspace bytes for any routing at this token count."""
+        """Return required workspace bytes for any routing at this token count.
+
+        The size follows the rank-local layout: the GEMM1 intermediate region
+        uses ``intermediate_shard`` columns and the per-expert regions use
+        ``num_local_experts``.
+        """
         return self._workspace_fields(num_tokens)[1]
 
     def plan(
@@ -327,7 +555,11 @@ class CuteDslMxfp4MoEWrapper:
     ) -> Mxfp4MoEPlan:
         """Bind buffers and prepare kernels; all tensor contents must be valid.
 
-        Weights use ``prepare_cute_dsl_mxfp4_weights`` layouts. ``x_sf`` is
+        Weights use ``prepare_cute_dsl_mxfp4_weights`` layouts for this rank's
+        shard: ``[num_local_experts, 2*intermediate_shard, H/2]`` W1 and
+        ``[num_local_experts, H, intermediate_shard/2]`` W2, as produced by
+        ``shard_cute_dsl_mxfp4_weights`` for the resolved layout. Shapes are
+        validated against that layout and never used to select it. ``x_sf`` is
         linear UE8M0 bytes [T,H/32]. ``beta`` and optional ``linear_beta`` are
         contiguous CUDA FP32 tensors with one value or one per local expert.
         Their values must be finite and positive; they are read on the device
@@ -352,6 +584,7 @@ class CuteDslMxfp4MoEWrapper:
             if not capability.supported:
                 raise ValueError(capability.reason)
             num_tokens = x.shape[0]
+            layout = self.layout
             expected = {
                 "x": (x, (num_tokens, self.hidden_size), torch.float8_e4m3fn),
                 "x_sf": (x_sf, (num_tokens, self.hidden_size // 32), torch.uint8),
@@ -359,8 +592,8 @@ class CuteDslMxfp4MoEWrapper:
                 "w1": (
                     w1,
                     (
-                        self.num_local_experts,
-                        2 * self.intermediate_size,
+                        layout.num_local_experts,
+                        2 * layout.intermediate_shard,
                         self.hidden_size // 2,
                     ),
                     torch.uint8,
@@ -368,9 +601,9 @@ class CuteDslMxfp4MoEWrapper:
                 "w2": (
                     w2,
                     (
-                        self.num_local_experts,
+                        layout.num_local_experts,
                         self.hidden_size,
-                        self.intermediate_size // 2,
+                        layout.intermediate_shard // 2,
                     ),
                     torch.uint8,
                 ),
@@ -384,7 +617,34 @@ class CuteDslMxfp4MoEWrapper:
                     or not tensor.is_contiguous()
                 ):
                     raise ValueError(
-                        f"{name} must be contiguous {dtype} {shape} on {x.device}"
+                        f"{name} must be contiguous {dtype} {shape} on {x.device} "
+                        f"for parallel mode {layout.mode} ({layout.num_local_experts} "
+                        f"local experts at offset {layout.local_expert_offset}, "
+                        f"intermediate shard {layout.intermediate_shard}); got "
+                        f"{tensor.dtype} {tuple(tensor.shape)} on {tensor.device}"
+                    )
+            for name, tensor, rows, columns in (
+                ("w1_sf", w1_sf, 2 * layout.intermediate_shard, self.hidden_size),
+                ("w2_sf", w2_sf, self.hidden_size, layout.intermediate_shard),
+            ):
+                expected_shape = (
+                    32,
+                    4,
+                    rows // 128,
+                    4,
+                    columns // 128,
+                    layout.num_local_experts,
+                )
+                if (
+                    tensor.device != x.device
+                    or tensor.dtype != torch.uint8
+                    or tuple(tensor.shape) != expected_shape
+                ):
+                    raise ValueError(
+                        f"{name} must be the prepared uint8 MMA scale layout "
+                        f"{expected_shape} on {x.device} for parallel mode "
+                        f"{layout.mode}; got {tensor.dtype} {tuple(tensor.shape)} "
+                        f"on {tensor.device}"
                     )
             if topk_weights is not None and (
                 topk_weights.device != x.device
