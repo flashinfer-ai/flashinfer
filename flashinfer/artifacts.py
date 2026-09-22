@@ -74,9 +74,9 @@ def get_available_cubin_files(
                 logger.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
 
-    # TODO: check if we really want to return an empty collection here instead of crashing.
-    logger.error("Max retries reached. Fetch failed.")
-    return tuple()
+    raise RuntimeError(
+        f"Failed to fetch the cubin artifact index {source} after {retries} attempts"
+    )
 
 
 def get_available_header_files(
@@ -120,7 +120,9 @@ def get_available_header_files(
                     logger.info(f"Retrying in {delay} seconds...")
                     time.sleep(delay)
 
-        logger.error(f"Max retries reached for {url}. Fetch failed.")
+        raise RuntimeError(
+            f"Failed to fetch the header artifact index {url} after {retries} attempts"
+        )
 
     fetch_directory(source)
     logger.info(f"result: {result}")
@@ -147,7 +149,7 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
-    DSL_FMHA: str = "5b34f84266cbc2135066ce96885b664992535670/fmha/cute-dsl/"
+    DSL_FMHA: str = "6efb974aae4c012d9fb317c2ef360210b3f352e4/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = (
         "sm_100a",
         "sm_103a",
@@ -177,16 +179,16 @@ class CheckSumHash:
     # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
-            "sm_100a": "832c303bb9b386af590d3efc294681859829b91991975fd2e188a5d7dc30c461",
-            "sm_103a": "57322c10ddbbe9072c7ded41e2856fdf9d4276fbd79ac4bc825af0cd78844da6",
-            "sm_107a": "8480678539adf622f8395e875923471bce683be7158694556bd6c536eadeaa45",
-            "sm_110a": "4f6f0f3a868f0e9171c8ab217e6d2a87fde46b02a9417d8f55f1a779c53fa9fb",
+            "sm_100a": "7bb9eb497d295a6471ce85d0913e3b4955fd9a7d918ddd9b92882cba41af5365",
+            "sm_103a": "3c0dc183a6f73fe3f0705a4b6d6fe8de667cf1dd1908bfe27422327faa16e27b",
+            "sm_107a": "70be29547f3d9b2e7e22981865de20f35eef61fa3b6493443680b058e7523dd4",
+            "sm_110a": "817e55486f3c35fe1841dccafc9b7fe34e50aff99edc4a15da952ace123d9edd",
         },
         "aarch64": {
-            "sm_100a": "064cfcac21886c3e16b5007ca769f1b93111db7a63864db1e026a53e61fe20fe",
-            "sm_103a": "1631a884738d706f5bc39bf4032bcd54b25ba0a0d734c26f388dce4ae32093c9",
-            "sm_107a": "0348ef0b74dffa67c0c9662d3f567b26dccf46c356009f315860f31a9550e207",
-            "sm_110a": "8f16f510d159797432bda92d55d0d82d65d3e19080f9af1b751dec4146cdcbe6",
+            "sm_100a": "f1395b80f2c8917fd1f52dca0bf0a37efc6f74fc594c245284076c72bf7e8130",
+            "sm_103a": "c4a44f8be82d9544f18eb7e139712d9fe3b09b30d890b5d09e3cbc5a203a1544",
+            "sm_107a": "fe30ea44d746c630c0347ed357ce317de29968da3e1d848a1d6a6864cbd25b7e",
+            "sm_110a": "634636627af7a98f8e1ff8c8332baac91a2e2f4f3dddbf647b6da9d60a8085ca",
         },
     }
     map_checksums: dict[str, str] = {
@@ -302,16 +304,37 @@ def download_artifacts() -> None:
     session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
+
+    cached_files: set[str] = set()
+    files_to_download: list[tuple[str, str]] = []
+    for name, checksum in cubin_files:
+        local_path = FLASHINFER_CUBIN_DIR / name
+        if local_path.is_file():
+            try:
+                if verify_cubin(str(local_path), checksum):
+                    cached_files.add(name)
+                    continue
+            except OSError as e:
+                logger.warning(f"Failed to read cached artifact {local_path}: {e}")
+        files_to_download.append((name, checksum))
+
+    logger.info(
+        "Using %d checksum-verified cached artifacts; downloading %d artifacts",
+        len(cached_files),
+        len(files_to_download),
+    )
+
     with tqdm_logging_redirect(
         total=len(cubin_files), desc="Downloading cubins"
     ) as pbar:
+        pbar.update(len(cached_files))
 
         def update_pbar_cb(_) -> None:
             pbar.update(1)
 
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
-            for name, _ in cubin_files:
+            for name, _ in files_to_download:
                 source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
@@ -328,8 +351,9 @@ def download_artifacts() -> None:
     if not all_success:
         raise RuntimeError("Failed to download cubins")
 
-    # Check checksums of all downloaded cubins
-    for name, checksum in cubin_files:
+    # Cached artifacts were verified before they were skipped. Verify each file
+    # fetched in this invocation before allowing it into the wheel.
+    for name, checksum in files_to_download:
         local_path = FLASHINFER_CUBIN_DIR / name
         if not verify_cubin(str(local_path), checksum):
             raise RuntimeError("Failed to download cubins: checksum mismatch")

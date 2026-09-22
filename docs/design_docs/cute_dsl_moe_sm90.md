@@ -9,17 +9,23 @@ The contiguous-grouped implementation is exposed through the Python API
 
 - Dtypes: BF16 and FP16 activations/weights, f32 accumulation. No
   quantization. Output dtype = input dtype.
-- Activation: gated SiLU (SwiGLU), fused into GEMM1's epilogue.
+- Activation, fused into GEMM1's epilogue: gated SwiGLU (default; the OAI
+  variant through `swiglu_alpha`/`swiglu_beta`/`swiglu_limit`, SiTU through
+  `situ_beta`/`situ_linear_beta`), gated GeGLU-tanh, and the non-gated
+  ReLU² (`w1` is then a plain `[E, I, hidden]` projection). Selected with
+  `activation_type` (`ActivationType.Swiglu`, `GegluTanh`, `Relu2`; any
+  other value is rejected) plus the SwiGLU/SiTU constants.
 - Routing: pre-routed only (`token_selected_experts` int32 global ids +
   caller-normalized `token_final_scales` fp32); no in-kernel router;
   `top_k` is a compile-time constant.
 - EP: `num_local_experts` + `local_expert_offset` select the local expert
   shard (tokens routed entirely outside it contribute zeros). TP is
   shape-only (callers pass per-rank weight shards).
-- Shapes: `hidden % 64 == 0` (also GEMM1's reduction dim — no tile-32
-  fallback there), `2I % 64 == 0`, `I % 32 == 0` (interleave granularity;
-  GEMM2 falls back to tile-k 32 when `I % 64 != 0`); `num_tokens == 0`
-  supported.
+- Shapes: `hidden % 64 == 0` (GEMM1's reduction moves whole 64-element K
+  tiles); gated activations need `I % 32 == 0` (interleave granularity,
+  GEMM1 walks `2I` in 64-column tiles), ReLU² needs `I % 64 == 0` (GEMM1
+  walks `I` in the same tiles); GEMM2's K tail is zero-filled by TMA;
+  `num_tokens == 0` supported.
 - Execution: CUDA-graph capturable; PDL on by default (`enable_pdl`);
   fused finalize (default) is atomic and not bitwise-reproducible,
   `use_fused_finalize=False` selects the deterministic two-stage path.
@@ -28,8 +34,8 @@ The contiguous-grouped implementation is exposed through the Python API
 
 ```
 moe_sort (C++ JIT routing)  ->  index maps only, no data movement
-GEMM1: gather + grouped GEMM + SwiGLU  ->  intermediate [permuted_m, I]
-GEMM2: grouped GEMM + fused finalize   ->  out [num_tokens, hidden]
+GEMM1: gather + grouped GEMM + activation  ->  intermediate [permuted_m, I]
+GEMM2: grouped GEMM + fused finalize       ->  out [num_tokens, hidden]
 ```
 
 The expert dimension is flattened into M: rows are expert-sorted and each
@@ -62,35 +68,21 @@ aux memset -> `memset_event` -> main waits before GEMM2). No
 `Tensor.record_stream` — it is illegal under CUDA-graph capture and
 redundant given the event join.
 
-**PDL** (`enable_pdl`, default on): both GEMMs launch with Programmatic
-Dependent Launch (`use_pdl=` launch attribute) so each kernel's prologue
-(descriptor prefetch, SMEM/pipeline setup) overlaps its predecessor's
-tail. Placement: GEMM1 issues one `griddepcontrol_wait()` on all threads
-after the pipeline-init barrier, before its first gmem read (the moe_sort
-outputs). GEMM2 hoists the wait into the **load warp only**, immediately
-before the A TMA loop — A (GEMM1's output) is the one read that must
-wait; the tile maps and `num_non_exiting_tiles` are already ordered
-transitively through GEMM1's own dependency on moe_sort, so the meta warp
-and consumers start their prologues without waiting. Each kernel ends
-with one `griddepcontrol_launch_dependents()`: GEMM1 after the TMA-store
-`producer_tail`, GEMM2 after every thread has drained its own
-scatter bulk-groups (`cp_async_bulk_wait_group(0)` past the persistent
-loop — the per-tile drain is deferred to the next tile's sC reuse). The
-device PTX is emitted unconditionally (a no-op without the launch
-attribute); only the launch attribute is gated, and `enable_pdl` is part
-of every compile cache key. `moe_sort` launches PDL-off and the
-deterministic path's `moe_unpermute` PDL-on.
-The inter-GEMM `memset_event` wait does not defeat the overlap: the aux
-zeroing completes during GEMM1, so GEMM2's early launch is gated only by
-GEMM1's trigger.
+**PDL** (`enable_pdl`, default on) allows dependent kernel setup to overlap
+its predecessor's tail. GEMM1 signals dependents after its epilogue and
+TMA-store drain. GEMM2 waits before reading the intermediate and signals
+its dependents after draining the output scatters. Routing dependencies
+and the auxiliary-stream output initialization remain ordered.
 
 ## 3. GEMM1 — `Sm90ContiguousGatherGroupedGemmActFusionKernel`
 
-`C[r, 0:I] = silu(gate) * up` where `[up | gate] = x[token(r)] @ w1[e].T`.
+`C[r, 0:I] = act(gate) * up` where `[up | gate] = x[token(r)] @ w1[e].T`.
 `w1[e] [2I, hidden]` is the expert's fc1 pack: the model's two separate
 projection matrices (gate and up — w1/w3 in Llama-style naming), row-
 concatenated and 32-column interleaved (§6), so one GEMM with N = 2I
-produces both projections and the epilogue gates them in registers.
+produces both projections and the epilogue gates them in registers. For
+the non-gated ReLU² the pack is the single projection `w1[e] [I, hidden]`,
+N = I, and the epilogue writes every accumulator column.
 
 Warp specialization (persistent, `StaticPersistentTileScheduler` per
 warpgroup — no scheduler warp; the tile maps are read directly from GMEM):
@@ -100,7 +92,7 @@ warpgroup — no scheduler warp; the tile maps are read directly from GMEM):
   16 B chunk `t%8`; rows past `mn_limit` predicated off); warp 0's elected
   lane TMA-loads B with the expert index as L-coordinate.
 - **1–2 consumer warpgroups (232 regs)**: WGMMA `MmaF16BF16Op`
-  (m64·n·k16, f32 accumulators) + the gated epilogue. Two consumer
+  (m64·n·k16, f32 accumulators) + the activation epilogue. Two consumer
   warpgroups iff `tile_m > 64 and tile_n > 128`.
 
 Pipelines: A on `PipelineCpAsync`, B on `PipelineTmaAsync` (consumers wait
@@ -110,10 +102,21 @@ epilogue ring (~6 stages at 128x128, 4 at 128x256).
 
 Gated epilogue: w1 is pre-interleaved at **32-column up/gate granularity**
 (`[up 0:32 | gate 0:32 | up 32:64 | ...]`), so an even accumulator subtile
-is always "up" and the following odd subtile its "gate"; the epilogue emits
-`silu(gate)*up` in f32 and TMA-stores `N/2` output columns. Requires
+is always "up" and the following odd subtile its "gate"; the epilogue applies
+the formula selected by `activation_type` to each pair in f32 (`silu(gate)*up`
+for the default SwiGLU) and TMA-stores `N/2` output columns. Requires
 `tile_n % 64 == 0`: the 32-column interleave makes each complete up/gate
 pair 64 columns.
+
+**Persistent-walk swizzle** (`swizzle_size`, tuned over 1/8/16): the
+persistent scheduler walks the (M-tile, N-tile) grid N-fast, so an
+expert's weight tile is streamed from HBM once per M-tile row. A swizzle
+of `s` groups the walk into blocks of `s` M-tiles, so the CTAs of one
+wave share the expert's B tiles through L2 and fetch them once per block.
+It is a pure schedule reorder (bitwise-identical output), and the tuner
+profiles it only where it can pay: batches with at least eight routed
+rows per expert (an expert spans several M-tiles) and expert weights that
+fit in L2 (below 48 MiB per expert, or at most 16 experts).
 
 ## 4. GEMM2 — `Sm90ContiguousGroupedGemmFinalizeFusionKernel`
 
@@ -121,10 +124,9 @@ pair 64 columns.
 `out[expanded(r)] = intermediate[r] @ w2[e].T` (deterministic mode).
 
 - A (the intermediate) is contiguous -> plain TMA on a single A+B pipeline;
-  expert index again as B's L-coordinate. `tile_k` is 64, or **32 when the
-  per-rank K is not a multiple of 64** and on prefill tiles at `K >= 384`,
-  where the halved stage footprint under the full-tile sC doubles the A/B
-  pipeline depth (§5 table).
+  expert index again as B's L-coordinate. The K tile is 64 elements (one
+  SW128 atom, four WGMMA K-steps per stage); a partial last K tile is
+  zero-filled by TMA on both operands.
 - A **meta warp** (producer warpgroup, warp 1; 2-stage `PipelineAsync`)
   prefetches per-row `(output_row, scale)` into SMEM one tile ahead:
   fused mode reads `token_final_scales[token, slot]`, deterministic mode
@@ -156,69 +158,48 @@ autotuned tactic axis:
   scheduling even when a pair cannot share an expert weight tile.
 - **GEMM2 (1,2) A-multicast is tuned independently of tile and raster
   order.** It halves intermediate re-reads across paired N-tiles but also
-  constrains CTA scheduling. The untuned `-1` fallback uses a shape policy.
-  A `(1,2)` candidate is excluded before profiling unless the GEMM2 N-tile
-  count is even and every host/kernel can-implement condition passes, so it
-  is never timed as a silent `(1,1)` alias.
+  constrains CTA scheduling. The untuned `-1` fallback keeps `(1,1)`. A
+  `(1,2)` candidate is profiled only at per-rank `I >= 192` (the per-problem
+  filter, §5; below it the re-read it halves is already small) and is excluded
+  unless the GEMM2 N-tile count is even. Unsupported clusters are rejected
+  rather than silently downgraded.
 
 ## 4.6 GEMM2 raster order
 
 The finalize scatter-RMW can dominate L2 traffic at small reduction
 dimensions. M-major rasterization pins each concurrent CTA wave to one
 output-column slice, confining the RMW working set to an L2-resident band;
-the cost is re-reading each A tile once per N tile. Raster order is an
-independent GEMM2 tactic axis. The untuned `-1` fallback uses M-major for
-large output working sets with inexpensive A re-reads and N-major elsewhere.
+the cost is re-reading each A tile once per N tile. Raster order is a GEMM2
+tactic field: the untuned `-1` fallback keeps N-major, and the tuner
+profiles M-major on tile 128 with per-rank `I <= 384` (the per-problem
+filter, §5), the only region where it won (up to 19.5% on a tiny-I
+16k-token prefill).
 
 ## 5. Tile selection, tuning, and compilation
 
-Tactic and fallback selection (`sm90_fused_moe.py`):
+Both GEMMs share the routing row tile but tune their other options
+independently. Every legal N tile of both GEMMs is a candidate; only
+scheduling options with little expected benefit are pruned. Profiling
+replaces the routing with a seeded uniform top-k draw over the global
+experts, so tactics are ranked under the uneven expert loads of real
+routing rather than a balanced assignment.
 
-| axis | values | selection |
-|---|---|---|
-| tile_size (= `moe_sort` tile) | 64, 128 | 64 below 64 avg rows/local expert (halves decode padding waste); tiny reductions (I < 192) switch to 128 at 16 rows/local expert to amortize GEMM2's fixed per-tile cost |
-| GEMM1 tile_n | (256, 192, 128, 64) at tile_size 128; (128, 64) at 64 | largest divisor of 2I |
-| GEMM2 tile_n | (256, 128, 64) / (128, 64) | largest divisor of hidden |
-| GEMM2 tile_k | 64; 32 when K % 64 != 0, and on prefill tiles at I >= 384 (doubled pipeline depth: +2..6%) | shape-derived |
-| GEMM2 raster | N-major, M-major | independently autotuned; §4.6 defines the fallback |
-| GEMM1 cluster | (1,1) | fixed; (2,1) remains a validated low-level option |
-| GEMM1 raster | N-major | fixed; M-major remains a low-level option on the GEMM-level wrapper |
-| GEMM2 cluster | (1,1), (1,2) | independently autotuned; illegal (1,2) topologies filtered before profiling |
+Autotuning compares candidates, including the fixed default, using CUDA
+graph replay to exclude host launch overhead. Winners are cached per token
+bucket. Calls use the cached winner or the fixed default unless a tactic
+is explicitly selected. Tactic validation belongs to candidate selection,
+keeping dispatch lightweight: a persisted winner of another tactic schema
+fails at its first dispatch with a `ValueError` naming the expected
+structure, so tuning caches are re-tuned after a schema change rather
+than validated on every call. Candidate lists depend on the problem
+shapes and the global expert count; the local shard enters only through
+the padded row bound, so expert-parallel ranks that tune together profile
+identical sequences.
 
-Dispatch goes through the FlashInfer AutoTuner:
-`cute_dsl_fused_moe_bf16` routes through
-`AutoTuner.choose_one` with `CuteDslFusedMoESm90Runner`, whose tactic space
-is `Sm90MoeTactic(tile_size, gemm1_tile_n, gemm2_tile_n, gemm2_tile_k,
-gemm2_cluster_shape_mn, gemm2_raster_along_m)` (top-2 legal N tiles per
-GEMM, tile_k pinned to the shape heuristic, and the legal cross-product of
-the two independent GEMM2 cluster/raster axes). Under the `autotune`
-context every tactic
-is profiled and the per-bucket winner cached; otherwise the cached winner —
-or the heuristic auto-selection as the default tactic — dispatches.
-Explicit tile / GEMM2 cluster / raster / buffer keyword overrides bypass the
-tuner.
-
-**Compilation and reuse**: each low-level host module owns a process-local
-dictionary of compiled callables. On the first real launch of a specialization,
-the wrapper calls `cute.compile` with the actual CuTe pointers, problem
-dimensions, and current `cuda.CUstream`; subsequent launches reuse that callable.
-Pointer dtypes and tactic fields form the key, while dimensions, pointer values,
-and the stream remain runtime arguments. There is no separate dispatch lattice
-or SM90-specific persistent object cache.
-
-An autotune pass naturally compiles every candidate that it profiles. A process
-that loads an existing AutoTuner winner compiles only the selected specialization
-on its first launch. Applications must therefore warm the selected shapes and
-tactics before CUDA-graph capture or latency-sensitive serving.
-
-**Tactic profiling** uses CUDA-graph replay windows
-(`TuningConfig.use_cuda_graph`): without it the per-call host path
-(moe_sort launcher, aux-stream events) dominates decode-size measurements
-and the argmin ranks noise. The local timing feeds the optional
-cross-rank reduction. The graph is captured once per tactic. The heuristic
-auto-selection competes as an explicit candidate (tactic `-1`), so a tuned
-winner never ranks below the default dispatch in the same measurement
-session.
+Compiled kernels are reused within a process. Loading saved tuning results
+still requires compiling the selected kernels, so applications must warm
+relevant shapes and tactics before CUDA-graph capture or latency-sensitive
+serving.
 
 ## 6. Weight layout and Python API
 
@@ -236,9 +217,10 @@ The public API carries an `@flashinfer_api` trace template
 
 ## 7. Testing
 
-| tier | what | where |
-|---|---|---|
-| kernel + e2e unit | tiles/clusters/boundary tiles; bf16+fp16 e2e, auto-select, EP shards (incl. all-routed-outside-shard), autotune (tactic profiling and cached-winner recall), process-local compile reuse, deterministic mode (bitwise), CUDA-graph capture/replay, tiny/empty batch, fail-fast bad inputs | `tests/moe/test_cute_dsl_bf16_gather_grouped_gemm.py`, `test_cute_dsl_bf16_grouped_gemm_finalize.py`, `test_cute_dsl_bf16_moe.py` |
+Tests cover numerical correctness across dtypes, tiles, and expert shards;
+empty and partial batches; deterministic output; CUDA-graph replay; and
+autotuning with persisted results. Host-side tests cover tactic legality,
+pruning boundaries, and dispatch behavior.
 
 ## 8. Performance
 
@@ -266,29 +248,31 @@ faster):
 
 | model (h / I global / E / top_k) | tp -> I/rank | T=1 | 256 | 1024 | 4096 | 16384 |
 |---|---|---|---|---|---|---|
-| Qwen3-30B-A3B (2048/768/128/8) | 1 -> 768 | 1.38x | 1.02x | 1.02x | 1.27x | 1.31x |
-| | 4 -> 192 | 1.82x | 1.24x | 1.34x | 1.75x | 1.90x |
-| Qwen3-235B-A22B (4096/1536/128/8) | 1 -> 1536 | 1.10x | 1.00x | 0.88x | 1.08x | 1.14x |
-| | 4 -> 384 | 1.48x | 1.05x | 1.09x | 1.35x | 1.38x |
-| Qwen3-Next-80B-A3B (2048/512/512/10) | 1 -> 512 | 1.70x | 0.98x | 1.03x | 1.17x | 1.48x |
-| | 4 -> 128 | 2.30x | 1.17x | 1.26x | 1.73x | 1.82x |
-| GLM-4.5-Air (4096/1408/128/8) | 1 -> 1408 | 1.14x | 1.01x | 0.89x | 1.04x | 1.13x |
-| | 4 -> 352 | 1.48x | 1.09x | 1.07x | 1.11x | 1.11x |
-| Kimi-K2 (7168/2048/384/8) | 1 -> 2048 | 1.08x | 1.00x | 1.03x | 1.02x | 1.12x |
-| | 4 -> 512 | 1.35x | 1.01x | 1.04x | 1.12x | 1.18x |
-| DeepSeek-V3 (7168/2048/256/8) | 1 -> 2048 | 1.08x | 1.00x | 1.05x | 0.86x | 1.03x |
-| | 4 -> 512 | 1.33x | 1.02x | 1.10x | 1.04x | 1.21x |
-| Mixtral-8x7B (4096/14336/8/2) | 1 -> 14336 | 1.07x | 0.85x | 0.86x | 0.89x | 0.95x |
-| | 4 -> 3584 | 1.18x | 0.90x | 1.07x | 1.07x | 1.05x |
+| Qwen3-30B-A3B (2048/768/128/8) | 1 -> 768 | 1.39x | 1.02x | 1.15x | 1.25x | 1.27x |
+| | 4 -> 192 | 1.88x | 1.25x | 1.51x | 1.76x | 1.90x |
+| Qwen3-235B-A22B (4096/1536/128/8) | 1 -> 1536 | 1.11x | 1.00x | 1.08x | 1.09x | 1.14x |
+| | 4 -> 384 | 1.50x | 1.05x | 1.26x | 1.25x | 1.43x |
+| Qwen3-Next-80B-A3B (2048/512/512/10) | 1 -> 512 | 1.71x | 0.99x | 1.04x | 1.18x | 1.33x |
+| | 4 -> 128 | 2.34x | 1.17x | 1.26x | 1.72x | 1.82x |
+| GLM-4.5-Air (4096/1408/128/8) | 1 -> 1408 | 1.14x | 1.00x | 1.06x | 1.08x | 1.16x |
+| | 4 -> 352 | 1.54x | 1.09x | 1.15x | 1.10x | 1.07x |
+| Kimi-K2 (7168/2048/384/8) | 1 -> 2048 | 1.08x | 1.00x | 1.03x | 1.02x | 1.22x |
+| | 4 -> 512 | 1.47x | 1.01x | 1.05x | 1.13x | 1.23x |
+| DeepSeek-V3 (7168/2048/256/8) | 1 -> 2048 | 1.08x | 1.00x | 1.04x | 0.90x | 1.10x |
+| | 4 -> 512 | 1.33x | 1.02x | 1.10x | 1.02x | 1.16x |
+| Mixtral-8x7B (4096/14336/8/2) | 1 -> 14336 | 1.06x | 1.06x | 0.95x | 1.00x | 1.06x |
+| | 4 -> 3584 | 1.19x | 1.11x | 1.08x | 1.05x | 1.07x |
 
-All 70 cells pass the variance gate; their geo-mean speedup is **1.16x**,
-and CuTe-DSL is faster in 59. The per-model geo-mean ranges from **0.98x**
-for Mixtral-8x7B to **1.41x** for Qwen3-Next-80B-A3B. The advantage grows
-with TP (smaller per-rank I) and is largest at T=1 decode (up to 2.30x);
-the losses concentrate in Mixtral's very large I/rank at mid batch sizes
-and in the T=1024 band of the h=4096 models at TP1. Across cells,
-CuTe-DSL's between-round CV has median 0.12%, p95 2.45%, and maximum
-4.23%; the baseline's has median 0.14%, p95 1.13%, and maximum 4.09%.
+All 70 cells pass the variance gate; their geo-mean speedup is **1.19x**.
+CuTe-DSL is faster in 62 cells, at 1.00x in 5 (Qwen3-235B-A22B,
+GLM-4.5-Air, Kimi-K2 and DeepSeek-V3 at TP1 T=256, Mixtral-8x7B at TP1
+T=4096) and slower in 3: DeepSeek-V3 at TP1 T=4096 (0.90x), Mixtral-8x7B
+at TP1 T=1024 (0.95x) and Qwen3-Next-80B-A3B at TP1 T=256 (0.99x). The per-model geo-mean ranges
+from **1.06x** for Mixtral-8x7B to **1.41x** for Qwen3-30B-A3B and
+Qwen3-Next-80B-A3B. The advantage grows with TP (smaller per-rank I) and
+is largest at T=1 decode (up to 2.34x) and at T >= 4096. Across cells, CuTe-DSL's between-round CV
+has median 0.17%, p95 2.20%, and maximum 2.88%; the baseline's has median
+0.15%, p95 2.16%, and maximum 4.65%.
 
 ## 9. Limitations
 

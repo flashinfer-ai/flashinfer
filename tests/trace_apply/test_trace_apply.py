@@ -93,8 +93,9 @@ def _ref_rmsnorm(x, w, eps=1e-6):
 
 
 @pytest.fixture(autouse=True)
-def _reset_trace_apply():
-    """Apply is process-global; ensure every test starts and ends disabled."""
+def _reset_trace_apply(monkeypatch: pytest.MonkeyPatch):
+    """Reset process-global Apply state without requiring a CUDA device."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     ta.disable_apply()
     yield
     ta.disable_apply()
@@ -646,3 +647,110 @@ def test_solutions_positional_and_keyword_equivalent():
 def test_enable_apply_empty_is_noop():
     assert ta.enable_apply({}) == 0
     assert not ta.is_enabled()
+
+
+def test_multi_template_apply_uses_only_selected_metadata(monkeypatch):
+    """A runtime-selected template owns extraction, plan state, and outputs."""
+
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+    import flashinfer.trace_apply.apply as apply_module
+    from flashinfer.trace.template import Const, Tensor, TraceTemplate
+    from flashinfer.trace_apply import plan_capture
+    from flashinfer.trace_apply.plan_capture import StatefulAdapter
+
+    def make_template(name, state_param, *, destination=True):
+        output = (
+            Tensor(["width"], dtype_from="state", param="target")
+            if destination
+            else Tensor(["width"], dtype_from="state")
+        )
+        return TraceTemplate(
+            op_type="synthetic_multi_template",
+            name_prefix=name,
+            axes={"width": Const(abbrev="w")},
+            inputs={"state": Tensor(["width"], param=state_param)},
+            outputs={"output": output},
+        )
+
+    other = make_template("other", "other_state")
+    broken = make_template("broken", "broken_state")
+    selected = make_template("selected", "selected_state")
+    no_destination = make_template(
+        "no_destination", "no_destination_state", destination=False
+    )
+    unknown = make_template("unknown", "unknown_state")
+
+    def fail_to_build_extractors():
+        raise ValueError("invalid template")
+
+    monkeypatch.setattr(broken, "_build_axis_extractors", fail_to_build_extractors)
+    templates = [other, broken, selected, no_destination]
+    extractor_maps = build_extractor_maps(templates)
+    state = torch.empty(4)
+    assert extractor_maps[1] is None
+    assert extract_axes(extractor_maps, {"selected_state": state}) == {"width": 4}
+
+    class Owner:
+        def plan(self):
+            return None
+
+        def run(self, target, other_state=None) -> None:
+            del other_state
+            target.fill_(-1)
+
+    original = Owner.run
+    modes = {
+        "broken": broken,
+        "selected": selected,
+        "no_destination": no_destination,
+        "unknown": unknown,
+    }
+
+    def dispatch(*, self, save_dir=None, name=None, **_kwargs):
+        del save_dir, name
+        return modes[self.mode]
+
+    fi_api = "tests.synthetic_multi_template.Owner.run"
+    adapter = StatefulAdapter(plan_attr="plan", self_attrs={"state": "_state"})
+    monkeypatch.setattr(
+        apply_module,
+        "_registry_by_fi_api",
+        lambda: {fi_api: (original, templates)},
+    )
+    monkeypatch.setattr(apply_module, "_resolve_target", lambda _fi_api: (Owner, "run"))
+    monkeypatch.setattr(apply_module, "_build_alias_map", lambda: {})
+    monkeypatch.setitem(_TRACE_DISPATCHERS, original, dispatch)
+    monkeypatch.setattr(plan_capture, "is_stateful", lambda name: name == fi_api)
+    monkeypatch.setattr(plan_capture, "adapter_for", lambda _name: adapter)
+
+    def should_not_run(**_kwargs):
+        raise AssertionError("unselected solution was called")
+
+    def selected_solution(*, state):
+        return torch.ones_like(state)
+
+    assert (
+        ta.enable_apply(
+            {
+                "broken_w4": should_not_run,
+                "broken": should_not_run,
+                "selected_w4": selected_solution,
+                "no_destination_w4": should_not_run,
+                "unknown_w4": should_not_run,
+            }
+        )
+        == 1
+    )
+
+    owner = Owner()
+    owner._state = state
+    target = torch.zeros_like(state)
+    owner.mode = "selected"
+    assert owner.run(target, other_state=torch.empty(7)) is None
+    torch.testing.assert_close(target, torch.ones_like(target))
+
+    for mode in ("broken", "no_destination", "unknown"):
+        owner.mode = mode
+        target.zero_()
+        assert owner.run(target) is None
+        torch.testing.assert_close(target, -torch.ones_like(target))

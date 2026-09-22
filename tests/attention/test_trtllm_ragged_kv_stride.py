@@ -1,3 +1,7 @@
+import math
+import sys
+import types
+
 import pytest
 import torch
 
@@ -48,9 +52,15 @@ def _run_trtllm_ragged(
     lse: torch.Tensor | None = None,
     q_lens_cpu: torch.Tensor | None = None,
     kv_lens_cpu: torch.Tensor | None = None,
-    skip_all_rows_active_check: bool = False,
+    skip_all_rows_active_check: bool | None = None,
+    backend: str = "trtllm-gen",
 ):
     head_dim_qk = q.shape[2]
+    row_activity_kwargs = (
+        {}
+        if skip_all_rows_active_check is None
+        else {"skip_all_rows_active_check": skip_all_rows_active_check}
+    )
     return flashinfer.prefill.trtllm_ragged_attention_deepseek(
         query=q,
         key=k,
@@ -79,7 +89,8 @@ def _run_trtllm_ragged(
         lse=lse,
         q_seq_lens_cpu=q_lens_cpu,
         kv_seq_lens_cpu=kv_lens_cpu,
-        skip_all_rows_active_check=skip_all_rows_active_check,
+        backend=backend,
+        **row_activity_kwargs,
     )
 
 
@@ -330,8 +341,8 @@ def test_trtllm_ragged_empty_kv_rows_are_neutral_and_match_compacted_call():
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_empty_kv_rows_direct_fallback_matches_cpu_mirror_path():
-    """Direct callers without CPU mirrors still get the same neutral semantics."""
+def test_trtllm_ragged_empty_kv_rows_explicit_check_matches_cpu_mirror_path():
+    """Explicit device checks retain the CPU-mirror path's neutral semantics."""
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -354,14 +365,18 @@ def test_trtllm_ragged_empty_kv_rows_direct_fallback_matches_cpu_mirror_path():
         q_indptr,
         kv_indptr,
         kv_lens,
+        skip_all_rows_active_check=False,
     )
 
     torch.testing.assert_close(fallback_output, mirror_output, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(fallback_lse, mirror_lse, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("skip_value", [None, True])
 @pytest.mark.cuda
-def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
+def test_trtllm_ragged_default_and_explicit_skip_match_checked_path(
+    monkeypatch, skip_value
+):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -389,7 +404,7 @@ def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
         q_indptr,
         kv_indptr,
         kv_lens,
-        skip_all_rows_active_check=True,
+        skip_all_rows_active_check=skip_value,
     )
     checked_output, checked_lse = _run_trtllm_ragged(
         q,
@@ -406,29 +421,52 @@ def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
     torch.testing.assert_close(assumed_lse, checked_lse, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl"])
+@pytest.mark.parametrize("skip_value", [None, True, False])
 @pytest.mark.cuda
-def test_trtllm_ragged_skipped_active_check_rejects_cpu_mirrors():
+def test_trtllm_ragged_cpu_mirrors_override_explicit_skip(backend, skip_value):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
+    if backend == "cute-dsl":
+        pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
     q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
 
-    with pytest.raises(ValueError, match="cannot be combined"):
-        _run_trtllm_ragged(
-            q,
-            k,
-            v,
-            q_indptr,
-            kv_indptr,
-            kv_lens,
-            q_lens_cpu=q_lens.cpu(),
-            kv_lens_cpu=kv_lens.cpu(),
-            skip_all_rows_active_check=True,
-        )
+    mirror_output, mirror_lse = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        skip_all_rows_active_check=False,
+        backend=backend,
+    )
+    explicit_skip_output, explicit_skip_lse = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        skip_all_rows_active_check=skip_value,
+        backend=backend,
+    )
+
+    torch.testing.assert_close(
+        explicit_skip_output, mirror_output, atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(explicit_skip_lse, mirror_lse, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("use_cpu_lens", [True, False])
+@pytest.mark.parametrize("row_validation_mode", ["cpu_mirrors", "explicit_check"])
 @pytest.mark.cuda
-def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
+def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(
+    row_validation_mode,
+):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -458,10 +496,10 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
     )
     lse = torch.full((q.shape[0], num_heads), 3.0, device=device)
 
-    cpu_lens_kwargs = (
+    row_validation_kwargs = (
         {"q_lens_cpu": q_lens.cpu(), "kv_lens_cpu": kv_lens.cpu()}
-        if use_cpu_lens
-        else {}
+        if row_validation_mode == "cpu_mirrors"
+        else {"skip_all_rows_active_check": False}
     )
     output, lse_out = _run_trtllm_ragged(
         q,
@@ -473,7 +511,7 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
         max_kv_len=0,
         out=out,
         lse=lse,
-        **cpu_lens_kwargs,
+        **row_validation_kwargs,
     )
 
     assert output.data_ptr() == out.data_ptr()
@@ -483,7 +521,7 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_capture_without_cpu_lens_raises(monkeypatch):
+def test_trtllm_ragged_explicit_check_capture_without_cpu_lens_raises(monkeypatch):
     """Capture without CPU seq-len mirrors must refuse to launch.
 
     Regression for https://github.com/flashinfer-ai/flashinfer/issues/4609:
@@ -531,11 +569,22 @@ def test_trtllm_ragged_capture_without_cpu_lens_raises(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="must be provided during CUDA graph capture"):
-        _run_trtllm_ragged(q, k, v, q_indptr, kv_indptr, kv_lens, return_lse=False)
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            return_lse=False,
+            skip_all_rows_active_check=False,
+        )
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_capture_q_empty_row_needs_cpu_mirrors(monkeypatch):
+def test_trtllm_ragged_capture_q_empty_row_explicit_check_needs_cpu_mirrors(
+    monkeypatch,
+):
     """A ``q_len == 0, kv_len > 0`` row still requires CPU mirrors under capture.
 
     The documentation used to imply mirrors were needed only for empty-KV
@@ -582,10 +631,21 @@ def test_trtllm_ragged_capture_q_empty_row_needs_cpu_mirrors(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="must be provided during CUDA graph capture"):
-        _run_trtllm_ragged(q, k, v, q_indptr, kv_indptr, kv_lens, return_lse=False)
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            return_lse=False,
+            skip_all_rows_active_check=False,
+        )
 
 
-@pytest.mark.parametrize("row_activity_mode", ["cpu_mirrors", "assumed_active"])
+@pytest.mark.parametrize(
+    "row_activity_mode", ["default", "assumed_active", "cpu_mirrors"]
+)
 @pytest.mark.cuda
 def test_trtllm_ragged_all_active_cuda_graph_capture_replay(row_activity_mode):
     """Trusted row metadata lets an active batch capture and replay.
@@ -633,11 +693,15 @@ def test_trtllm_ragged_all_active_cuda_graph_capture_replay(row_activity_mode):
     out = torch.empty(
         (q.shape[0], num_heads, head_dim_vo), device=device, dtype=torch.bfloat16
     )
-    row_activity_kwargs = (
-        {"q_lens_cpu": q_lens_cpu, "kv_lens_cpu": kv_lens_cpu}
-        if row_activity_mode == "cpu_mirrors"
-        else {"skip_all_rows_active_check": True}
-    )
+    if row_activity_mode == "cpu_mirrors":
+        row_activity_kwargs = {
+            "q_lens_cpu": q_lens_cpu,
+            "kv_lens_cpu": kv_lens_cpu,
+        }
+    elif row_activity_mode == "assumed_active":
+        row_activity_kwargs = {"skip_all_rows_active_check": True}
+    else:
+        row_activity_kwargs = {}
 
     def _call():
         _run_trtllm_ragged(
@@ -669,3 +733,522 @@ def test_trtllm_ragged_all_active_cuda_graph_capture_replay(row_activity_mode):
 
     assert out.shape == (q.shape[0], num_heads, head_dim_vo)
     assert torch.isfinite(out).all()
+
+
+def _stub_cute_dsl_kernel(monkeypatch) -> list:
+    """Install a recording stub for the cute-dsl ragged prefill kernel.
+
+    ``trtllm_ragged_attention_deepseek`` imports the kernel lazily on
+    every call, so replacing the module in ``sys.modules`` intercepts the
+    launch without requiring the CuTe DSL toolchain to be importable.
+    The stub records the launch kwargs and writes nothing, which makes
+    the wrapper-level pre-fill observable: rows the kernel would write
+    keep their sentinel values, rows it would skip must have been
+    neutralized by the wrapper.
+    """
+    calls: list = []
+    stub = types.ModuleType("flashinfer.attention.cute_dsl.fmha")
+
+    def _fake_kernel(**kwargs):
+        calls.append(kwargs)
+
+    stub.cute_dsl_fmha_ragged_prefill = _fake_kernel
+    monkeypatch.setitem(sys.modules, "flashinfer.attention.cute_dsl.fmha", stub)
+    return calls
+
+
+@pytest.mark.parametrize("skip_value", [None, True, False])
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_mirror_validation_shared(skip_value):
+    """CPU-mirror validation must also fire on the cute-dsl backend.
+
+    The wrapper's ``backend="cute-dsl"`` route forwards
+    ``q_seq_lens_cpu`` / ``kv_seq_lens_cpu`` snapshots taken at plan
+    time, so the mirror contract has to be validated before the backend
+    split rather than being a trtllm-gen-only feature.
+    """
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(42)
+
+    q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            q_lens_cpu=q_lens.cpu(),
+            backend="cute-dsl",
+            skip_all_rows_active_check=skip_value,
+        )
+
+    bad_kv_lens = kv_lens.cpu().clone()
+    bad_kv_lens[0] += 1
+    with pytest.raises(ValueError, match="sums to"):
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            q_lens_cpu=q_lens.cpu(),
+            kv_lens_cpu=bad_kv_lens,
+            backend="cute-dsl",
+            skip_all_rows_active_check=skip_value,
+        )
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_empty_kv_rows_neutralized_before_launch(monkeypatch):
+    """cute-dsl neutral-fill touches only inactive rows and launches once.
+
+    The CuTe DSL varlen kernel skips ``kv_len == 0`` batches without
+    writing their output rows, and ``out`` defaults to ``torch.empty``.
+    With CPU mirrors the wrapper must pre-fill those rows
+    (``out = 0`` / ``lse = -inf``) and still launch the kernel exactly
+    once with the original, uncompacted tensors.
+    """
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(42)
+
+    q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
+    calls = _stub_cute_dsl_kernel(monkeypatch)
+
+    out = torch.full(
+        (q.shape[0], q.shape[1], v.shape[2]),
+        7.0,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    lse = torch.full((q.shape[0], q.shape[1]), 3.0, device=device)
+
+    output, lse_out = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        out=out,
+        lse=lse,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+
+    assert output.data_ptr() == out.data_ptr()
+    assert lse_out.data_ptr() == lse.data_ptr()
+
+    assert len(calls) == 1
+    kernel_args = calls[0]
+    assert kernel_args["q"].data_ptr() == q.data_ptr()
+    assert kernel_args["k"].data_ptr() == k.data_ptr()
+    assert kernel_args["v"].data_ptr() == v.data_ptr()
+    assert kernel_args["o"].data_ptr() == out.data_ptr()
+
+    for row, kv_len in enumerate(kv_lens.tolist()):
+        q_start = int(q_indptr[row].item())
+        q_end = int(q_indptr[row + 1].item())
+        if kv_len > 0:
+            assert torch.all(output[q_start:q_end] == 7.0)
+            assert torch.all(lse_out[q_start:q_end] == 3.0)
+        else:
+            assert torch.all(output[q_start:q_end] == 0)
+            assert torch.isneginf(lse_out[q_start:q_end]).all()
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_all_empty_rows_skip_launch(monkeypatch):
+    """All-inactive cute-dsl batches are zero-filled without a launch."""
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(42)
+
+    batch_size = 3
+    num_heads = 16
+    head_dim = 128
+    q_lens = torch.tensor([4, 2, 3], device=device, dtype=torch.int32)
+    kv_lens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+    q = torch.randn(
+        int(q_indptr[-1].item()),
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.empty((0, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    v = torch.empty((0, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    calls = _stub_cute_dsl_kernel(monkeypatch)
+
+    out = torch.full(
+        (q.shape[0], num_heads, head_dim), 7.0, device=device, dtype=torch.bfloat16
+    )
+    lse = torch.full((q.shape[0], num_heads), 3.0, device=device)
+
+    output, lse_out = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        max_kv_len=0,
+        out=out,
+        lse=lse,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+
+    assert not calls
+    assert torch.all(output == 0)
+    assert torch.isneginf(lse_out).all()
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_all_empty_rows_capture_records_launch(monkeypatch):
+    """Under CUDA graph capture, the launch must still be recorded even when
+    the plan-time mirrors report an all-inactive batch. Otherwise a later
+    replay with active rows would find no kernel in the graph.
+
+    The DSL varlen kernel is a no-op for kv_len <= 0 rows, so an all-empty
+    launch under capture is safe. This test stubs both the kernel and the
+    capture predicate so it can run on any CUDA device without recording a
+    real graph.
+    """
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(42)
+
+    batch_size = 3
+    num_heads = 16
+    head_dim = 128
+    q_lens = torch.tensor([4, 2, 3], device=device, dtype=torch.int32)
+    kv_lens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+    q = torch.randn(
+        int(q_indptr[-1].item()),
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.empty((0, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    v = torch.empty((0, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    calls = _stub_cute_dsl_kernel(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    out = torch.full(
+        (q.shape[0], num_heads, head_dim), 7.0, device=device, dtype=torch.bfloat16
+    )
+    lse = torch.full((q.shape[0], num_heads), 3.0, device=device)
+
+    output, lse_out = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        max_kv_len=0,
+        out=out,
+        lse=lse,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+
+    assert len(calls) == 1, (
+        "kernel launch must be recorded during capture even when all rows "
+        "are inactive, so replay with active data can still run the kernel"
+    )
+    assert torch.all(output == 0)
+    assert torch.isneginf(lse_out).all()
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_empty_kv_rows_match_compacted_call():
+    """Real-kernel companion: neutral rows plus parity with a compacted call."""
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
+    torch.manual_seed(42)
+
+    q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
+
+    output, lse_out = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+
+    active_rows = [row for row, length in enumerate(kv_lens.tolist()) if length > 0]
+    for row in range(kv_lens.shape[0]):
+        q_start = int(q_indptr[row].item())
+        q_end = int(q_indptr[row + 1].item())
+        if row not in active_rows:
+            assert torch.all(output[q_start:q_end] == 0)
+            assert torch.isneginf(lse_out[q_start:q_end]).all()
+
+    compact_q_lens = q_lens[active_rows]
+    compact_kv_lens = kv_lens[active_rows]
+    compact_q_indptr = _indptr(compact_q_lens)
+    compact_kv_indptr = _indptr(compact_kv_lens)
+    compact_output, compact_lse = _run_trtllm_ragged(
+        _pack_rows(q, q_indptr, active_rows),
+        _pack_rows(k, kv_indptr, active_rows),
+        _pack_rows(v, kv_indptr, active_rows),
+        compact_q_indptr,
+        compact_kv_indptr,
+        compact_kv_lens,
+        q_lens_cpu=compact_q_lens.cpu(),
+        kv_lens_cpu=compact_kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+
+    for compact_row, row in enumerate(active_rows):
+        q_start = int(q_indptr[row].item())
+        q_end = int(q_indptr[row + 1].item())
+        compact_start = int(compact_q_indptr[compact_row].item())
+        compact_end = int(compact_q_indptr[compact_row + 1].item())
+        torch.testing.assert_close(
+            output[q_start:q_end],
+            compact_output[compact_start:compact_end],
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        torch.testing.assert_close(
+            lse_out[q_start:q_end],
+            compact_lse[compact_start:compact_end],
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_wrapper_graph_capture_with_empty_rows():
+    """Wrapper cute-dsl route: plan-time mirrors, zero-length rows, CUDA graph.
+
+    ``BatchPrefillWithRaggedKVCacheWrapper.plan()`` snapshots CPU
+    seq-len mirrors and ``run()`` forwards them into
+    ``trtllm_ragged_attention_deepseek``; with the cute-dsl backend
+    those mirrors now drive the empty-row neutral-fill, so a batch with
+    asymmetric zero-length rows can be captured into a CUDA graph and
+    replayed with fully defined output.
+    """
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
+    torch.manual_seed(42)
+
+    num_heads = 16
+    head_dim = 128
+    q_lens = torch.tensor([4, 5, 3, 2, 1], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor([5, 0, 7, 0, 3], device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+
+    q = torch.randn(
+        int(q_indptr[-1].item()),
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        int(kv_indptr[-1].item()),
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn(
+        int(kv_indptr[-1].item()),
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    out = torch.empty(
+        (q.shape[0], num_heads, head_dim), device=device, dtype=torch.bfloat16
+    )
+
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        _workspace(device),
+        kv_layout="NHD",
+        backend="cute-dsl",
+    )
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        num_heads,
+        num_heads,
+        head_dim,
+        head_dim_vo=head_dim,
+        causal=False,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+
+    # Warm up outside capture so JIT compilation and workspace
+    # allocations do not run inside the captured region.
+    wrapper.run(q, k, v, out=out)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, out=out)
+
+    out.fill_(7.0)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for row, kv_len in enumerate(kv_lens.tolist()):
+        q_start = int(q_indptr[row].item())
+        q_end = int(q_indptr[row + 1].item())
+        if kv_len == 0:
+            assert torch.all(out[q_start:q_end] == 0)
+        else:
+            assert torch.isfinite(out[q_start:q_end]).all()
+
+    active_rows = [row for row, length in enumerate(kv_lens.tolist()) if length > 0]
+    compact_q_lens = q_lens[active_rows]
+    compact_kv_lens = kv_lens[active_rows]
+    compact_q_indptr = _indptr(compact_q_lens)
+    compact_kv_indptr = _indptr(compact_kv_lens)
+    compact_output = _run_trtllm_ragged(
+        _pack_rows(q, q_indptr, active_rows),
+        _pack_rows(k, kv_indptr, active_rows),
+        _pack_rows(v, kv_indptr, active_rows),
+        compact_q_indptr,
+        compact_kv_indptr,
+        compact_kv_lens,
+        return_lse=False,
+        q_lens_cpu=compact_q_lens.cpu(),
+        kv_lens_cpu=compact_kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+    for compact_row, row in enumerate(active_rows):
+        q_start = int(q_indptr[row].item())
+        q_end = int(q_indptr[row + 1].item())
+        compact_start = int(compact_q_indptr[compact_row].item())
+        compact_end = int(compact_q_indptr[compact_row + 1].item())
+        torch.testing.assert_close(
+            out[q_start:q_end],
+            compact_output[compact_start:compact_end],
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+
+@pytest.mark.parametrize(
+    "capture_q_lens,capture_kv_lens,replay_q_lens,replay_kv_lens",
+    [
+        pytest.param([4, 0], [0, 4], [0, 4], [0, 4], id="inactive-to-active"),
+        pytest.param([2, 2, 2], [4, 2, 2], [2, 2, 2], [4, 4, 0], id="active-to-mixed"),
+    ],
+)
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_wrapper_graph_replan(
+    capture_q_lens, capture_kv_lens, replay_q_lens, replay_kv_lens
+):
+    """Replanning fixed buffers must preserve captured fills and launches."""
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
+    torch.manual_seed(42)
+
+    num_heads, head_dim = 16, 128
+    q = torch.randn(
+        sum(capture_q_lens), num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        sum(capture_kv_lens), num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+    q_indptr = torch.empty(len(capture_q_lens) + 1, device=device, dtype=torch.int32)
+    kv_indptr = torch.empty_like(q_indptr)
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        _workspace(device),
+        backend="cute-dsl",
+        use_cuda_graph=True,
+        qo_indptr_buf=q_indptr,
+        kv_indptr_buf=kv_indptr,
+    )
+
+    def plan(q_lens, kv_lens):
+        wrapper.plan(
+            _indptr(torch.tensor(q_lens, dtype=torch.int32)),
+            _indptr(torch.tensor(kv_lens, dtype=torch.int32)),
+            num_heads,
+            num_heads,
+            head_dim,
+            causal=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+
+    # Warm the real kernel on active rows before capturing an inactive plan,
+    # whose eager path deliberately skips the launch. Both plans have the same
+    # token totals and maximum lengths, so the captured launch bounds suffice.
+    plan(replay_q_lens, replay_kv_lens)
+    wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, enable_pdl=False)
+    plan(capture_q_lens, capture_kv_lens)
+    wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, enable_pdl=False)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, enable_pdl=False)
+
+    # Check both the changed plan and a return to the original plan. No run()
+    # call after capture may repair the outputs before replay is checked.
+    for q_lens, kv_lens in [
+        (replay_q_lens, replay_kv_lens),
+        (capture_q_lens, capture_kv_lens),
+    ]:
+        plan(q_lens, kv_lens)
+        out.fill_(7.0)
+        lse.fill_(999.0)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        q_start = kv_start = 0
+        for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+            q_end, kv_end = q_start + q_len, kv_start + kv_len
+            if q_len > 0:
+                if kv_len == 0:
+                    assert torch.all(out[q_start:q_end] == 0)
+                    assert torch.isneginf(lse[q_start:q_end]).all()
+                else:
+                    qr = q[q_start:q_end].float().transpose(0, 1)
+                    kr = k[kv_start:kv_end].float().transpose(0, 1)
+                    vr = v[kv_start:kv_end].float().transpose(0, 1)
+                    scores = (qr @ kr.transpose(-1, -2)) / math.sqrt(head_dim)
+                    expected_out = (scores.softmax(dim=-1) @ vr).transpose(0, 1)
+                    # The CuTe FMHA entrypoint returns base-2 LSE.
+                    expected_lse = scores.logsumexp(dim=-1).T * math.log2(math.e)
+                    torch.testing.assert_close(
+                        out[q_start:q_end].float(), expected_out, atol=2e-2, rtol=2e-2
+                    )
+                    torch.testing.assert_close(
+                        lse[q_start:q_end], expected_lse, atol=2e-2, rtol=2e-2
+                    )
+            q_start, kv_start = q_end, kv_end

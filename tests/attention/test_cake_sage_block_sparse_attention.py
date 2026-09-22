@@ -173,6 +173,42 @@ _CASES = json.loads(r"""[
         }
     },
     {
+        "name": "ut_noncontiguous_topk_ragged_k",
+        "params": {
+            "batch_size": 1,
+            "benchmark": false,
+            "block_sizes_mode": 0,
+            "check_correctness": true,
+            "empty_first_row": false,
+            "noncontiguous_topk": true,
+            "num_heads": 4,
+            "position_sensitive": false,
+            "seed": 4951,
+            "selected_blocks": 16,
+            "seqlen_k": 4000,
+            "seqlen_q": 4000,
+            "softmax_scale": "default"
+        }
+    },
+    {
+        "name": "ut_noncontiguous_topk_ragged_k_unaligned_tail",
+        "params": {
+            "batch_size": 1,
+            "benchmark": false,
+            "block_sizes_mode": 0,
+            "check_correctness": true,
+            "empty_first_row": false,
+            "noncontiguous_topk": true,
+            "num_heads": 4,
+            "position_sensitive": false,
+            "seed": 4951,
+            "selected_blocks": 16,
+            "seqlen_k": 4033,
+            "seqlen_q": 128,
+            "softmax_scale": "default"
+        }
+    },
+    {
         "name": "ut_empty_first_row",
         "params": {
             "batch_size": 1,
@@ -262,6 +298,77 @@ _CASES = json.loads(r"""[
     }
 ]""")
 
+# These choices are independent in the public API.  In particular, sorted
+# top-k indices still require the non-contiguous route with either count API.
+_COUNT_MODES = (
+    ("per_row", {"varying_block_counts": True, "empty_first_row": True}),
+    ("omitted", {"omit_block_nums": True, "uniform_block_count": False}),
+    ("uniform", {"uniform_block_count": True}),
+    ("omitted_uniform", {"omit_block_nums": True, "uniform_block_count": True}),
+    (
+        "empty_omitted",
+        {"omit_block_nums": True, "uniform_block_count": False, "block_sparse_num": 0},
+    ),
+    ("empty_uniform", {"uniform_block_count": True, "block_sparse_num": 0}),
+    (
+        "empty_contiguous",
+        {
+            "omit_block_nums": True,
+            "uniform_block_count": True,
+            "contiguous_block_indices": True,
+            "noncontiguous_topk": False,
+            "block_sparse_num": 0,
+        },
+    ),
+)
+_CASES.extend(
+    {
+        "name": f"topk_{count_name}_sizes{mode}_k{seqlen_k}",
+        "params": {
+            "batch_size": 2,
+            "num_heads": 2,
+            "seqlen_q": 100,
+            "seqlen_k": seqlen_k,
+            "selected_blocks": 3,
+            "softmax_scale": "default",
+            "block_sizes_mode": mode,
+            "valid_last_block": 40,
+            "empty_first_row": False,
+            "position_sensitive": False,
+            "noncontiguous_topk": True,
+            "contiguous_block_indices": False,
+            "seed": 508300 + mode,
+            **count_options,
+        },
+    }
+    for mode in range(4)
+    for seqlen_k in (320, 257)
+    for count_name, count_options in _COUNT_MODES
+)
+_CASES.extend(
+    {
+        "name": f"topk_scalar_count_below_capacity_uniform{uniform}",
+        "params": {
+            "batch_size": 1,
+            "num_heads": 2,
+            "seqlen_q": 100,
+            "seqlen_k": 257,
+            "selected_blocks": 3,
+            "softmax_scale": "default",
+            "block_sizes_mode": 0,
+            "empty_first_row": False,
+            "position_sensitive": False,
+            "noncontiguous_topk": True,
+            "contiguous_block_indices": False,
+            "uniform_block_count": uniform,
+            "omit_block_nums": not uniform,
+            "block_sparse_num": 2,
+            "seed": 508399,
+        },
+    }
+    for uniform in (False, True)
+)
+
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
@@ -275,15 +382,21 @@ def _make_block_sizes(params, *, batch: int, heads: int, k_blocks: int, device):
     if mode == 1:
         sizes = torch.full((k_blocks,), _BLOCK, dtype=torch.int32, device=device)
         sizes[-1] = valid_last
-        return sizes
-    if mode == 2:
+    elif mode == 2:
         sizes = torch.full((batch, k_blocks), _BLOCK, dtype=torch.int32, device=device)
         sizes[:, -1] = valid_last
-        return sizes
-    sizes = torch.full(
-        (batch, heads, k_blocks), _BLOCK, dtype=torch.int32, device=device
-    )
-    sizes[:, :, -1] = valid_last
+    else:
+        sizes = torch.full(
+            (batch, heads, k_blocks), _BLOCK, dtype=torch.int32, device=device
+        )
+        sizes[:, :, -1] = valid_last
+    if params.get("noncontiguous_topk", False):
+        sizes[..., 0] = 0
+        if mode >= 2:
+            offsets = torch.arange(batch, device=device) * 7
+            if mode == 3:
+                offsets = offsets[:, None] + torch.arange(heads, device=device) * 11
+            sizes[..., -1] = (valid_last - offsets).clamp(min=0)
     return sizes
 
 
@@ -397,6 +510,21 @@ def _make_inputs(params, *, device):
             + 0.25
         )
 
+    block_sizes = _make_block_sizes(
+        params, batch=batch, heads=heads, k_blocks=k_blocks, device=device
+    )
+    if bool(params.get("noncontiguous_topk", False)):
+        # Make attention to padded tokens fail the numerical comparison.
+        logical_v[..., seqlen_k:] = 64.0
+        if block_sizes is not None:
+            sizes = block_sizes.reshape(
+                batch if block_sizes.ndim >= 2 else 1,
+                heads if block_sizes.ndim == 3 else 1,
+                k_blocks,
+            )
+            invalid = torch.arange(_BLOCK, device=device) >= sizes.unsqueeze(-1)
+            logical_v.masked_fill_(invalid.reshape(*sizes.shape[:2], 1, padded_k), 64.0)
+
     inverse_perm = torch.tensor(_V_INVERSE_PERM, dtype=torch.long, device=device)
     v_fp8 = logical_v.view(batch, heads, _HEAD_DIM, k_blocks * 4, 16)
     v_fp8 = v_fp8.index_select(-1, inverse_perm).reshape(
@@ -419,18 +547,44 @@ def _make_inputs(params, *, device):
     q2k = ((batch_coord * 3 + head_coord * 5 + query_coord * 7 + slot) % k_blocks).to(
         torch.int32
     )
+    if bool(params.get("noncontiguous_topk", False)):
+        # Always select the partial tail and exclude its predecessor so every
+        # row has a gap, even if its random top-k happens to be consecutive.
+        scores = torch.rand(
+            (batch, heads, q_blocks, k_blocks - 2),
+            device=device,
+            generator=generator,
+        )
+        selected = scores.topk(selected_blocks - 1, dim=-1).indices
+        tail = torch.full(
+            (batch, heads, q_blocks, 1),
+            k_blocks - 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        q2k = torch.cat((selected, tail), dim=-1).sort(dim=-1).values.to(torch.int32)
     q2k = q2k.contiguous()
+    block_sparse_num = int(params.get("block_sparse_num", selected_blocks))
     q2k_nums = torch.full(
         (batch, heads, q_blocks),
-        selected_blocks,
+        block_sparse_num,
         dtype=torch.int32,
         device=device,
     )
+    if params.get("varying_block_counts", False):
+        q2k_nums = (
+            (
+                torch.arange(batch * heads * q_blocks, device=device)
+                % (selected_blocks + 1)
+            )
+            .reshape(batch, heads, q_blocks)
+            .to(torch.int32)
+        )
     if bool(params["empty_first_row"]):
         q2k_nums[0, 0, 0] = 0
 
-    block_sizes = _make_block_sizes(
-        params, batch=batch, heads=heads, k_blocks=k_blocks, device=device
+    uniform_contiguous = not params["empty_first_row"] and not params.get(
+        "noncontiguous_topk", False
     )
     softmax_scale = (
         _HEAD_DIM**-0.5
@@ -446,9 +600,15 @@ def _make_inputs(params, *, device):
         "K_scale": k_scale.contiguous(),
         "V_scale": v_scale.contiguous(),
         "q2k_block_index": q2k,
-        "q2k_block_nums": q2k_nums.contiguous(),
+        "q2k_block_nums": None
+        if params.get("omit_block_nums", False)
+        else q2k_nums.contiguous(),
+        "uniform_block_count": params.get("uniform_block_count", uniform_contiguous),
+        "contiguous_block_indices": params.get(
+            "contiguous_block_indices", uniform_contiguous
+        ),
         "block_sizes": block_sizes,
-        "block_sparse_num": selected_blocks,
+        "block_sparse_num": block_sparse_num,
         "softmax_scale": float(softmax_scale),
         "O": torch.empty(
             (batch, heads, seqlen_q, _HEAD_DIM),
@@ -505,8 +665,11 @@ def _reference(inputs):
             for q_block in range(_ceil_div(seqlen_q, _BLOCK)):
                 q_start = q_block * _BLOCK
                 q_end = min(seqlen_q, q_start + _BLOCK)
-                count = int(
-                    inputs["q2k_block_nums"][batch_idx, head_idx, q_block].item()
+                counts = inputs["q2k_block_nums"]
+                count = (
+                    int(inputs["block_sparse_num"])
+                    if counts is None or inputs["uniform_block_count"]
+                    else int(counts[batch_idx, head_idx, q_block].item())
                 )
                 if count == 0:
                     continue
@@ -547,7 +710,9 @@ def _reference(inputs):
 
 
 def _aligned_workspace(*, device):
-    storage = torch.empty(_WORKSPACE_BYTES + 127, dtype=torch.uint8, device=device)
+    storage = torch.full(
+        (_WORKSPACE_BYTES + 127,), 0xA5, dtype=torch.uint8, device=device
+    )
     offset = (-int(storage.data_ptr())) % 128
     workspace = storage[offset : offset + _WORKSPACE_BYTES]
     assert workspace.numel() == _WORKSPACE_BYTES
@@ -564,6 +729,22 @@ def test_cake_sage_block_sparse_attention(case):
     softmax_scale = (
         None if params["softmax_scale"] == "default" else float(params["softmax_scale"])
     )
+    noncontiguous_topk = bool(params.get("noncontiguous_topk", False))
+    if noncontiguous_topk:
+        q2k = inputs["q2k_block_index"]
+        tail_block = _ceil_div(int(params["seqlen_k"]), _BLOCK) - 1
+        assert torch.all(q2k[..., -1] == tail_block).item()
+        assert torch.all(torch.any(q2k[..., 1:] - q2k[..., :-1] > 1, dim=-1)).item()
+    if inputs["uniform_block_count"] and inputs["q2k_block_nums"] is not None:
+        # A true uniform guarantee makes the scalar count authoritative, even
+        # if the supplied per-row counts describe a different selection.
+        inputs["q2k_block_nums"].fill_(1 if inputs["block_sparse_num"] == 0 else 0)
+    elif inputs["q2k_block_nums"] is not None:
+        slots = torch.arange(
+            inputs["q2k_block_index"].shape[-1], device=inputs["Q"].device
+        )
+        inactive = slots >= inputs["q2k_block_nums"].unsqueeze(-1)
+        inputs["q2k_block_index"].masked_fill_(inactive, -1)
 
     returned = bsa_attn_sm120_blk64_sage_fwd(
         inputs["Q"],
@@ -579,16 +760,19 @@ def test_cake_sage_block_sparse_attention(case):
         softmax_scale=softmax_scale,
         out=inputs["O"],
         tma_descriptor_workspace=workspace,
-        uniform_block_count=not bool(params["empty_first_row"]),
-        contiguous_block_indices=not bool(params["empty_first_row"]),
+        uniform_block_count=inputs["uniform_block_count"],
+        contiguous_block_indices=inputs["contiguous_block_indices"],
         backend="cake",
     )
 
-    assert workspace_storage.data_ptr() != 0
+    # The compatibility workspace is unused by every exported specialization.
+    assert torch.all(workspace_storage == 0xA5).item()
     assert returned.data_ptr() == inputs["O"].data_ptr()
     if bool(params["empty_first_row"]):
         first_q_block = returned[0, 0, : min(_BLOCK, int(params["seqlen_q"]))]
         assert torch.count_nonzero(first_q_block).item() == 0
+    if inputs["block_sparse_num"] == 0:
+        assert torch.count_nonzero(returned).item() == 0
     atol, rtol = (
         (3.0e-3, 0.0) if bool(params["position_sensitive"]) else (1.0e-2, 1.0e-2)
     )
