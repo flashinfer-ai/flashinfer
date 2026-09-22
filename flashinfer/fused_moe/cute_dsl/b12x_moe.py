@@ -103,7 +103,10 @@ def b12x_fused_moe(
     w2_weight_sf : torch.Tensor
         Scale factors for ``w2_weight``.
     token_selected_experts : torch.Tensor
-        Expert assignments of shape ``[num_tokens, top_k]``.
+        Expert assignments of shape ``[num_tokens, top_k]``.  A negative id
+        marks an unrouted slot (for example CUDA-graph padding): it
+        contributes nothing, and a token whose slots are all negative
+        produces a zero output row.
     token_final_scales : torch.Tensor
         Routing weights of shape ``[num_tokens, top_k]``.
     num_experts : int
@@ -590,7 +593,10 @@ class B12xMoEWrapper:
         w2_weight_sf : torch.Tensor
             Scale factors for ``w2_weight``.
         token_selected_experts : torch.Tensor
-            Expert assignments of shape ``[num_tokens, top_k]``.
+            Expert assignments of shape ``[num_tokens, top_k]``.  A negative
+            id marks an unrouted slot (for example CUDA-graph padding): it
+            contributes nothing, and a token whose slots are all negative
+            produces a zero output row.
         token_final_scales : torch.Tensor
             Routing weights of shape ``[num_tokens, top_k]``.
         w1_alpha : torch.Tensor

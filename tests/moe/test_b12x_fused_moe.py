@@ -3670,5 +3670,365 @@ def test_borrowed_dense_method_self_deps(path_name, cls, borrowed, target):
         )
 
 
+# =============================================================================
+# Unrouted (negative) expert ids
+# =============================================================================
+
+
+def _mask_routing(tensors: dict, pattern: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mark unrouted slots with expert id -1 and routing weight 0.
+
+    ``tail`` masks every slot of the last quarter of the tokens (CUDA-graph
+    padding), ``all`` masks every slot, and ``mixed`` masks alternating slots
+    of every token so the remaining weights no longer sum to one.
+    """
+    ids = tensors["token_selected_experts"].clone()
+    weights = tensors["token_final_scales"].clone()
+    num_tokens, top_k = ids.shape
+    if pattern == "tail":
+        masked = torch.zeros_like(ids, dtype=torch.bool)
+        masked[num_tokens - max(1, num_tokens // 4) :] = True
+    elif pattern == "all":
+        masked = torch.ones_like(ids, dtype=torch.bool)
+    elif pattern == "mixed":
+        assert top_k >= 2
+        token = torch.arange(num_tokens, device=ids.device)[:, None]
+        slot = torch.arange(top_k, device=ids.device)[None, :]
+        masked = (token + slot) % 2 == 0
+    else:
+        raise ValueError(pattern)
+    ids[masked] = -1
+    weights[masked] = 0.0
+    return ids, weights
+
+
+def _assert_unrouted_output(
+    result: torch.Tensor, expected: torch.Tensor, ids: torch.Tensor, label: str
+) -> None:
+    assert torch.isfinite(result).all(), f"{label}: non-finite output"
+    fully_masked = (ids < 0).all(dim=1)
+    if fully_masked.any():
+        masked_rows = result[fully_masked]
+        assert torch.equal(masked_rows, torch.zeros_like(masked_rows)), (
+            f"{label}: fully unrouted tokens must produce exact zeros"
+        )
+    passed, percent_within, atol = check_accuracy(result, expected)
+    assert passed, (
+        f"{label}: {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+    )
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestUnroutedPairs:
+    """A negative expert id marks an unrouted slot.
+
+    vLLM writes -1 into the CUDA-graph padding rows of ``topk_ids``; every
+    b12x backend must skip such pairs and emit exact zeros for tokens whose
+    slots are all unrouted.
+    """
+
+    hidden_size = 256
+    intermediate_size = 512
+    num_experts = 64
+
+    def _nvfp4_case(
+        self,
+        num_tokens: int,
+        top_k: int,
+        pattern: str,
+        activation: str = "silu",
+        intermediate_size: int | None = None,
+    ):
+        intermediate_size = intermediate_size or self.intermediate_size
+        create = (
+            create_relu2_moe_tensors if activation == "relu2" else create_moe_tensors
+        )
+        tensors = create(
+            num_tokens=num_tokens,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_experts,
+            top_k=top_k,
+            seed=11 + num_tokens,
+        )
+        ids, weights = _mask_routing(tensors, pattern)
+        reference = (
+            compute_reference_moe_relu2
+            if activation == "relu2"
+            else compute_reference_moe_fp4
+        )
+        weight_names = (
+            ("fc1_weights", "fc2_weights")
+            if activation == "relu2"
+            else ("gemm1_weights", "gemm2_weights")
+        )
+        expected = reference(
+            hidden_states=tensors["x_bf16"].float(),
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_tokens=num_tokens,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            **{
+                weight_names[0]: tensors["w1_weight_bf16"].float(),
+                weight_names[1]: tensors["w2_weight_bf16"].float(),
+            },
+        )
+        return tensors, ids, weights, expected
+
+    def _run(self, tensors, ids, weights, top_k, **kwargs):
+        """Run the masked routing after an unmasked call on the same shape.
+
+        The unmasked call dirties the cached workspace, so a kernel that
+        sums the scratch rows of unrouted slots cannot pass by reading a
+        freshly zeroed allocation.
+        """
+        from flashinfer import b12x_fused_moe
+
+        b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=self.num_experts,
+            top_k=top_k,
+            **kwargs,
+        )
+        return b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            **kwargs,
+        )
+
+    def test_compact_topk_ids_skips_unrouted(self):
+        """The micro pre-pass gives unrouted pairs compact id -1."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.triton_compact import (
+            compact_topk_ids,
+        )
+
+        ids = torch.tensor([5, -1, 3, 5, -1, 7], dtype=torch.int32, device="cuda")
+        compact = torch.empty_like(ids)
+        weight_expert_ids = torch.full_like(ids, -7)
+        active_expert_count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        compact_topk_ids(ids, compact, weight_expert_ids, active_expert_count)
+        assert compact.tolist() == [0, -1, 1, 0, -1, 2]
+        assert weight_expert_ids[:3].tolist() == [5, 3, 7]
+        assert active_expert_count.item() == 3
+
+    @pytest.mark.parametrize("pattern", ["tail", "all", "mixed"])
+    @pytest.mark.parametrize(
+        "backend,num_tokens",
+        [("direct_micro", 4), ("micro", 4), ("static", 64), ("dynamic", 256)],
+    )
+    def test_forced_backend(self, monkeypatch, backend: str, num_tokens: int, pattern):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+        top_k = 4
+        tensors, ids, weights, expected = self._nvfp4_case(num_tokens, top_k, pattern)
+        result = self._run(tensors, ids, weights, top_k)
+        _assert_unrouted_output(result, expected, ids, f"{backend}/{pattern}")
+
+    @pytest.mark.parametrize("pattern", ["tail", "all", "mixed"])
+    @pytest.mark.parametrize(
+        "activation,intermediate_size",
+        [("silu", 640), ("relu2", 512)],
+        ids=["silu-n640", "relu2-n512"],
+    )
+    def test_dynamic_generic_kernel(
+        self, monkeypatch, activation: str, intermediate_size: int, pattern: str
+    ):
+        """intermediate_size > 512 or a non-gated activation takes the generic
+        dynamic kernel rather than the branch-paired gated one."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dynamic_kernel import (
+            _GATED_OPTIMIZED_SF_VEC_SIZE,
+            _GATED_OPTIMIZED_TILE_MN,
+            _can_use_gated_optimized_kernel,
+        )
+
+        top_k = 4
+        assert not _can_use_gated_optimized_kernel(
+            activation=activation,
+            sf_vec_size=_GATED_OPTIMIZED_SF_VEC_SIZE,
+            mma_tiler_mn=_GATED_OPTIMIZED_TILE_MN,
+            hidden_size=self.hidden_size,
+            intermediate_size=intermediate_size,
+            num_topk=top_k,
+        )
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "dynamic")
+        tensors, ids, weights, expected = self._nvfp4_case(
+            256,
+            top_k,
+            pattern,
+            activation=activation,
+            intermediate_size=intermediate_size,
+        )
+        result = self._run(tensors, ids, weights, top_k, activation=activation)
+        _assert_unrouted_output(
+            result,
+            expected,
+            ids,
+            f"dynamic generic {activation} n={intermediate_size}/{pattern}",
+        )
+
+    @pytest.mark.parametrize("activation", ["silu", "relu2", "relu2_shared_input"])
+    @pytest.mark.parametrize("pattern", ["all", "mixed"])
+    def test_single_token_micro(self, monkeypatch, activation: str, pattern: str):
+        """num_tokens == 1 keeps a dense pair-to-expert layout in the MMA micro
+        kernel, so unrouted pairs are handled inside the kernel."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "micro")
+        top_k = 4
+        base_activation = "relu2" if activation.startswith("relu2") else "silu"
+        tensors, ids, weights, expected = self._nvfp4_case(
+            1, top_k, pattern, activation=base_activation
+        )
+        kwargs = {"activation": base_activation}
+        if activation == "relu2_shared_input":
+            # A scalar FC1 input scale selects the shared-input specialization.
+            kwargs["input_global_scale"] = torch.ones(
+                1, dtype=torch.float32, device="cuda"
+            )
+        result = self._run(tensors, ids, weights, top_k, **kwargs)
+        _assert_unrouted_output(
+            result, expected, ids, f"micro m=1 {activation}/{pattern}"
+        )
+
+    @pytest.mark.parametrize("pattern", ["tail", "mixed"])
+    @pytest.mark.parametrize("num_tokens", [64, 512])
+    def test_mxfp4(self, num_tokens: int, pattern: str):
+        """MXFP4 shares the static and dynamic kernels (block-32 scales)."""
+        hidden_size = intermediate_size = 256
+        top_k = 2
+        tensors = create_b12x_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_experts,
+            top_k=top_k,
+            seed=21 + num_tokens,
+        )
+        ids, weights = _mask_routing(tensors, pattern)
+        result = self._run(tensors, ids, weights, top_k, quant_mode="mxfp4")
+        expected = compute_reference_moe_mxfp4_w4a4(
+            tensors["x_bf16"],
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            ids,
+            weights,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+        )
+        _assert_unrouted_output(
+            result, expected, ids, f"mxfp4 m={num_tokens}/{pattern}"
+        )
+
+    @pytest.mark.parametrize("pattern", ["tail", "mixed"])
+    @pytest.mark.parametrize("num_tokens", [4, 64])
+    def test_w4a16(self, num_tokens: int, pattern: str):
+        """The W4A16 route packer already drops out-of-range ids."""
+        top_k = 4
+        tensors, ids, weights, _ = self._nvfp4_case(num_tokens, top_k, pattern)
+        expected = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=ids,
+            token_final_scales=weights,
+            num_tokens=num_tokens,
+            num_experts=self.num_experts,
+            top_k=top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            fc2_input_scale=None,
+        )
+        result = self._run(tensors, ids, weights, top_k, quant_mode="w4a16")
+        _assert_unrouted_output(
+            result, expected, ids, f"w4a16 m={num_tokens}/{pattern}"
+        )
+
+    @pytest.mark.parametrize("pattern", ["tail", "mixed"])
+    def test_wrapper_cuda_graph(self, pattern: str):
+        """B12xMoEWrapper covers static and dynamic workspaces under replay."""
+        from flashinfer import B12xMoEWrapper
+
+        top_k = 4
+        max_num_tokens = 512
+        tensors, ids, weights, _ = self._nvfp4_case(max_num_tokens, top_k, pattern)
+        moe = B12xMoEWrapper(
+            num_experts=self.num_experts,
+            top_k=top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=max_num_tokens,
+        )
+        for num_tokens in (4, 64, max_num_tokens):
+            kwargs = {
+                "x": tensors["x_bf16"][:num_tokens],
+                "w1_weight": tensors["w1_weight"],
+                "w1_weight_sf": tensors["w1_weight_sf"],
+                "w1_alpha": tensors["w1_alpha"],
+                "fc2_input_scale": tensors["fc2_input_scale"],
+                "w2_weight": tensors["w2_weight"],
+                "w2_weight_sf": tensors["w2_weight_sf"],
+                "w2_alpha": tensors["w2_alpha"],
+                "token_selected_experts": ids[:num_tokens],
+                "token_final_scales": weights[:num_tokens],
+            }
+            moe.run(**kwargs)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = moe.run(**kwargs)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = compute_reference_moe_fp4(
+                hidden_states=tensors["x_bf16"][:num_tokens].float(),
+                gemm1_weights=tensors["w1_weight_bf16"].float(),
+                gemm2_weights=tensors["w2_weight_bf16"].float(),
+                token_selected_experts=ids[:num_tokens],
+                token_final_scales=weights[:num_tokens],
+                num_tokens=num_tokens,
+                num_experts=self.num_experts,
+                top_k=top_k,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+            )
+            _assert_unrouted_output(
+                result.clone(),
+                expected,
+                ids[:num_tokens],
+                f"wrapper m={num_tokens}/{pattern}",
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
