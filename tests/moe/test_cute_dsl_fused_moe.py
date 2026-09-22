@@ -64,8 +64,9 @@ def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) CuTe DSL MoE kernels do not implement.
 
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
-    Blackwell kernels rather than a port of them: the gather kernel hardcodes
-    SwiGLU and exposes no ``activation_type``, its wrapper has no
+    Blackwell kernels rather than a port of them: the gather kernel implements
+    SwiGLU (including its SiTU variant) and Relu2 but not GeGLU-tanh or custom
+    SwiGLU alpha/beta/limit constants, its wrapper has no
     ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
     path. The wrappers raise ``NotImplementedError`` for these cases, which is
     correct behaviour -- but on Rubin it reports as a test failure on every CI
@@ -97,7 +98,7 @@ def _skip_sm107_unimplemented_moe_features(request):
         pytest.skip("SM107 finalize kernel implements only the fused path")
 
     if params.get("activation_type") == ActivationType.GegluTanh:
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     # test_geglu_tanh_accuracy sets the activation in its body rather than via a
     # parameter, so it has to be matched by identity. Match the function exactly
@@ -105,7 +106,7 @@ def _skip_sm107_unimplemented_moe_features(request):
     # prefix but only exercises normalize_cute_dsl_moe_activation_type, touches no
     # kernel, and passes on SM107 -- a substring match silently dropped it.
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     if (
         request.node.function.__name__
@@ -1744,12 +1745,6 @@ class TestCuteDslFusedMoeFunctional:
     ):
         from flashinfer import cute_dsl_fused_moe
 
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
-
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
 
@@ -1899,12 +1894,6 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
-        if is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
-                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
-                "situ_linear_beta"
-            )
         from flashinfer import cute_dsl_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -2403,12 +2392,6 @@ class TestCuteDslMoEWrapper:
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
