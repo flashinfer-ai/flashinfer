@@ -4695,7 +4695,8 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     ):
         return False
     if argument(9, "lower_bound") is None and (
-        checkpoint_request or initial_state.dtype == torch.float32
+        checkpoint_request
+        or (initial_state.dtype == torch.float32 and compute_dtype == "bf16")
     ):
         # Unbounded (softplus) prefill on the FP32 external state pool is the
         # serving contract: its final state resumes decode and, when
@@ -4708,7 +4709,8 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         # is also rebuilt on every call (about 2.4 ms of host work at 8K),
         # while the sequential direct M128 recurrence with the FP32 carrier
         # stays at Triton level and its single-launch plan is cacheable, so it
-        # owns this contract.  BF16-state callers keep the split.
+        # owns this contract.  BF16-state callers and the TF32 compute family
+        # (TF32 map and correction operands) keep the split.
         return False
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
