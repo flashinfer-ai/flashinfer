@@ -387,9 +387,23 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
+  # The server captures logging configuration only at startup, and writes it to
+  # SCCACHE_ERROR_LOG rather than the job log. The nvcc backend reports its
+  # --dryrun decomposition (dependency pass, per-subcommand commands) at trace
+  # level, so that module is raised past the default level here. Stop any
+  # server started before these settings existed so they take effect.
+  export SCCACHE_LOG="${SCCACHE_LOG:-sccache=debug,sccache::compiler::nvcc=trace}"
+  if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
+    mkdir -p "${SCCACHE_STATS_DIR}"
+    export SCCACHE_ERROR_LOG="${SCCACHE_ERROR_LOG:-${SCCACHE_STATS_DIR}/sccache-server.log}"
+  fi
+  sccache --stop-server >/dev/null 2>&1 || true
+
   sccache --start-server
   sccache --zero-stats
   export FLASHINFER_SCCACHE_ACTIVE=true
+  echo "sccache log filter: ${SCCACHE_LOG}"
+  echo "sccache server log: ${SCCACHE_ERROR_LOG:-(not captured)}"
   echo "sccache version: $(sccache --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
   echo "sccache revision: ${FLASHINFER_SCCACHE_REVISION}"
