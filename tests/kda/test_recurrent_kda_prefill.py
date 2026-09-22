@@ -6010,9 +6010,9 @@ def test_frozen_bt16_scalar_prepare_subgroup_heads_cuda_graph_replay(
     ("seq_lens", "num_heads", "packed", "has_initial_state", "lower_bound"),
     (
         pytest.param((17,), 1, False, False, -5.0, id="fixed-h1-bounded"),
-        pytest.param((65,), 4, False, True, None, id="fixed-h4-unbounded"),
+        pytest.param((65,), 4, False, True, -5.0, id="fixed-h4-bounded"),
         pytest.param((17, 33), 8, True, False, -5.0, id="packed-h8-bounded"),
-        pytest.param((1, 65), 12, True, True, None, id="packed-h12-unbounded"),
+        pytest.param((1, 65), 12, True, True, -5.0, id="packed-h12-bounded"),
     ),
 )
 def test_small_bh_prefill_matches_reference(
