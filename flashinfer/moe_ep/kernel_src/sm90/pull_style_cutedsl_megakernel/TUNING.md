@@ -465,9 +465,15 @@ token-back modes — 38 candidates.
   ping-pong kernel no longer spills with it on — the drop's 4-rank
   generate_c overhead fell from 17-22% to 0.7-2.4% at 2048-32768 and the
   earlier per_tensor 16384 training override was dropped again.
-- `dedup_dispatch`, `grouped_token_back`, `combine_format` — top-k dedup
-  on dispatch / combine and the quantized combine wire; see
-  `dedup_topk_design.md`.
+- Top-k dedup (`dedup_dispatch`, `grouped_token_back`, the quantized
+  `combine_format` wires) was removed on 2026-09-21.  Measured on 4x H200
+  (clock-locked, 2 interleaved rounds, 26 buckets) dispatch dedup was
+  e2e-neutral (both the sender-election and the receiver-only "rank cache"
+  variant within ±0.1%: dispatch is overlapped with the GEMMs) and combine
+  dedup lost 12% (walker-side reduce) to 27% (owner-side reduce in the FC2
+  epilogue warps) because the reduce sits on the critical path while the
+  NVLink bytes it saves are worth well under 0.5 ms even at 32768 tokens.
+  The combine wire is bf16 only.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
 ## Sweep methodology + environment (reproduce recipe)
