@@ -1163,17 +1163,18 @@ def _topk_kernel(
 
 
 @cute.jit
-def _launch_fill(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
+def _launch_fill(stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
                  MASK: cutlass.Constexpr):
     rows = mS.shape[0] * mS.shape[2]
     _fill_kernel(mS, mO, mNVP, MASK).launch(
         grid=[(rows + Int32(7)) // Int32(8), 1, 1],
         block=[FILL_BLOCK, 1, 1],
+        stream=stream,
     )
 
 
 @cute.jit
-def _launch(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
+def _launch(stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
             FB: Int32, FE: Int32, LW: cutlass.Constexpr,
             DENSE: cutlass.Constexpr, TL: cutlass.Constexpr,
             FILTER: cutlass.Constexpr,
@@ -1185,6 +1186,7 @@ def _launch(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
                  LW, DENSE, TL, FILTER, C0, MASK).launch(
         grid=[(Nq + C - Int32(1)) // C, Hq, 1],
         block=[C0, 1 << LW, 1],
+        stream=stream,
     )
 
 
@@ -1396,6 +1398,21 @@ def _plan(Hq, T, Nq):
     return lw, dense, TL, filt, C
 
 
+# --- CUDA-graph stream plumbing (see proxy_score_decode_sm90 for rationale) ---
+import cuda.bindings.driver as _kf_cuda
+
+_KF_STREAMS = {}
+
+
+def _kf_stream():
+    h = torch.cuda.current_stream().cuda_stream
+    s = _KF_STREAMS.get(h)
+    if s is None:
+        s = _kf_cuda.CUstream(h)
+        _KF_STREAMS[h] = s
+    return s
+
+
 _cache = {}
 _compiled_fill = None
 
@@ -1425,10 +1442,10 @@ def run(max_score, cu_seqlens_q, context_lens, topk_idx,
         key = ("fill", mask)
         fn = _cache.get(key)
         if fn is None:
-            fn = cute.compile(_launch_fill, _dyn(max_score, 2), _dyn(topk_idx, 2),
+            fn = cute.compile(_launch_fill, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2),
                               _dyn(nvp, 0), mask, options="--enable-tvm-ffi")
             _cache[key] = fn
-        fn(max_score, topk_idx, nvp)
+        fn(_kf_stream(), max_score, topk_idx, nvp)
         return
 
     plan = _plan(int(Hq), int(T), int(Nq))
@@ -1438,9 +1455,9 @@ def run(max_score, cu_seqlens_q, context_lens, topk_idx,
     key = plan + (mask,)
     fn = _cache.get(key)
     if fn is None:
-        fn = cute.compile(_launch, _dyn(max_score, 2), _dyn(topk_idx, 2),
+        fn = cute.compile(_launch, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2),
                           _dyn(nvp, 0), Int32(force_begin), Int32(force_end),
                           plan[0], plan[1], plan[2], plan[3], plan[4], mask,
                           options="--enable-tvm-ffi")
         _cache[key] = fn
-    fn(max_score, topk_idx, nvp, force_begin, force_end)
+    fn(_kf_stream(), max_score, topk_idx, nvp, force_begin, force_end)
