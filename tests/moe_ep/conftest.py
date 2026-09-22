@@ -65,6 +65,24 @@ def isolated_deep_gemm_cache():
 
 
 @pytest.fixture
+def require_split_backend(request):
+    """Gate split regressions before their first collective.
+
+    The graph tests parametrize ``backend``; unparametrized guard and memo
+    regressions exercise nccl_ep only.
+    """
+    from flashinfer.moe_ep import available_backends
+
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "nccl_ep") if callspec else "nccl_ep"
+    selected = request.config.getoption("--backend")
+    if selected not in (None, "both", backend):
+        pytest.skip(f"requires {backend}; --backend={selected}")
+    if backend not in available_backends():
+        pytest.skip(f"{backend} backend is not available")
+
+
+@pytest.fixture
 def stubbed_fleet_registry():
     """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
     from unittest import mock
