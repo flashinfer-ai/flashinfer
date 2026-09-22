@@ -11,6 +11,7 @@ class MLAPlanCapabilities:
     kv_layouts: frozenset[str]
     output_scales: frozenset[str]
     scale_modes: frozenset[str]
+    is_experimental: bool = False
     supports_skip_softmax: bool = False
     supports_skip_softmax_with_lse: bool = False
     supports_enable_pdl: bool = False

@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the cuTile MLA paged decode backend of BatchMLAPagedAttentionWrapper."""
 
+import ctypes
+import gc
+import importlib
 import math
+from types import SimpleNamespace
 import warnings
 
 import pytest
@@ -12,13 +16,15 @@ import flashinfer
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability
 
-if not is_cuda_tile_available():
-    pytest.skip("cuda.tile not available", allow_module_level=True)
 
-
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _require_blackwell():
     """Skip unless this is a cuTile MLA-validated Blackwell target."""
+    if not torch.cuda.is_available():
+        pytest.skip("cuTile MLA decode requires CUDA")
+    pytest.importorskip("cuda.tile.compilation")
+    if not is_cuda_tile_available():
+        pytest.skip("cuTile compiler toolchain is unavailable")
     capability = get_compute_capability(torch.device("cuda"))
     if capability not in {(10, 0), (10, 3), (12, 0), (12, 1)}:
         pytest.skip("cuTile MLA decode requires SM100, SM103, SM120, or SM121")
@@ -167,6 +173,7 @@ def _run_mla_decode_case(
 @pytest.mark.parametrize("max_seq_len", [256, 1024])
 @pytest.mark.parametrize("page_size", [16, 32, 64])
 @pytest.mark.parametrize("num_heads", [16, 32])
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_heads):
     """cuTile paged MLA decode must match the torch reference across the shape sweep."""
     _run_mla_decode_case(
@@ -188,6 +195,7 @@ def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_head
         (torch.bfloat16, 128),
     ],
 )
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_supported_dtype_and_head_contract(dtype, num_heads):
     """Persistent coverage for the restored dtype and head-count support."""
     _run_mla_decode_case(
@@ -199,6 +207,7 @@ def test_mla_decode_cutile_supported_dtype_and_head_contract(dtype, num_heads):
     )
 
 
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_packed_inputs():
     """Packed canonical inputs must lower to the unchanged split kernel."""
     _run_mla_decode_case(
@@ -210,6 +219,7 @@ def test_mla_decode_cutile_packed_inputs():
     )
 
 
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_legacy_flat_api():
     """The original flat-plan and positional-run compatibility path still works."""
     _run_mla_decode_case(
@@ -226,6 +236,7 @@ def test_mla_decode_cutile_legacy_flat_api():
     [2, 8],
     ids=["no_split", "split_kv"],
 )
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_zero_length_rows(pages_per_batch):
     """Empty KV rows must be zero for auto- and caller-allocated outputs."""
     device = torch.device("cuda")
@@ -298,6 +309,7 @@ def test_mla_decode_cutile_zero_length_rows(pages_per_batch):
     torch.testing.assert_close(caller_out.float(), ref, rtol=2e-1, atol=1e-2)
 
 
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_preallocated_out():
     """Passing a preallocated out tensor must match the auto-allocated path."""
     device = torch.device("cuda")
@@ -360,6 +372,7 @@ def test_mla_decode_cutile_preallocated_out():
     torch.testing.assert_close(o_auto, o_pre)
 
 
+@pytest.mark.usefixtures("_require_blackwell")
 def test_mla_decode_cutile_cuda_graph_replays_mutated_plan_metadata():
     """Captured runs must read updated values through stable metadata pointers."""
     device = torch.device("cuda")
@@ -448,6 +461,288 @@ def test_mla_decode_cutile_cuda_graph_replays_mutated_plan_metadata():
     assert not torch.equal(initial, out)
     torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0, atol=0)
     torch.testing.assert_close(out.float(), ref, rtol=2e-1, atol=1e-2)
+
+
+# Prepared kernel ABI, launch limits, and execution lifetime.
+
+
+def _argument_array(shape, strides):
+    return SimpleNamespace(shape=shape, stride=lambda: strides, data_ptr=lambda: 4096)
+
+
+def test_cutile_v1_constraints_do_not_require_v2_api():
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import _array
+
+    ct = SimpleNamespace(
+        int32="int32", int64="int64", float16="float16", bfloat16="bfloat16"
+    )
+    seen = {}
+
+    def constructor(dtype, ndim, **kwargs):
+        seen.update(kwargs)
+        return (dtype, ndim)
+
+    compilation = SimpleNamespace(
+        ArrayConstraint=constructor,
+        CallingConvention=SimpleNamespace(cutile_python_v1=lambda: None),
+    )
+    assert _array(compilation, ct, ct.bfloat16, (None, 128, 512)) == ("bfloat16", 3)
+    assert "shape_constant" not in seen
+    assert seen["index_dtype"] == "int64"
+    assert seen["base_addr_divisible_by"] == 2
+    assert seen["stride_constant"] == (None, None, 1)
+
+
+@pytest.mark.parametrize(
+    "batch,heads,block_h,splits",
+    [
+        (1, 65535, 1, 1),
+        (1, 65536, 16, 1),
+        (1, 65535, 1, 2),
+        (1, 1, 1, 65535),
+        (2**31 - 1, 1, 1, 1),
+    ],
+)
+def test_cutile_launch_grid_exact_boundaries(batch, heads, block_h, splits):
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import (
+        _validate_launch_grids,
+    )
+
+    _validate_launch_grids(batch, heads, block_h, splits)
+
+
+@pytest.mark.parametrize(
+    "batch,heads,block_h,splits,message",
+    [
+        (1, 65537, 1, 1, "decode grid Y"),
+        (1, 65536, 16, 2, "reduction grid Y"),
+        (1, 1, 1, 65536, "decode grid Z"),
+        (2**31, 1, 1, 1, "decode grid X"),
+    ],
+)
+def test_cutile_launch_grid_overflow_is_typed(batch, heads, block_h, splits, message):
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import (
+        _validate_launch_grids,
+    )
+
+    with pytest.raises(_BackendPlanUnsupportedError, match=message):
+        _validate_launch_grids(batch, heads, block_h, splits)
+
+
+def test_cutile_int64_abi_preserves_large_known_and_dynamic_strides():
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import (
+        _configuration,
+        _parameters,
+        _validate_launch_grids,
+    )
+
+    heads = 4194304
+    config = _configuration(16, heads, 128, 128, 148, (10, 0))
+    _validate_launch_grids(16, heads, config[0], config[2])
+    query = _argument_array((16, heads, 512), (heads * 576, 576, 1))
+    pool = _argument_array((2**31 + 17, 128, 512), (128 * 576, 576, 1))
+    values, types = _parameters((query, pool), (2**31 + 1,))
+    assert values == (
+        4096,
+        16,
+        heads,
+        512,
+        2415919104,
+        576,
+        1,
+        4096,
+        2**31 + 17,
+        128,
+        512,
+        73728,
+        576,
+        1,
+        2**31 + 1,
+    )
+    assert types == ((ctypes.c_void_p,) + (ctypes.c_int64,) * 6) * 2 + (ctypes.c_int64,)
+    # Exercise the actual ctypes conversion rather than merely compare metadata.
+    assert [
+        kind(value).value for value, kind in zip(values, types, strict=True)
+    ] == list(values)
+
+
+@pytest.mark.parametrize(
+    "shape,strides,scalars",
+    [
+        ((2**63,), (1,), ()),
+        ((2,), (2**63,), ()),
+        ((2,), (-1,), ()),
+        ((2,), (1,), (2**63,)),
+    ],
+)
+def test_cutile_int64_abi_rejects_unrepresentable_arguments(shape, strides, scalars):
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import _parameters
+
+    with pytest.raises(ValueError, match="int64"):
+        _parameters((_argument_array(shape, strides),), scalars)
+
+
+def _forbidden(*args, **kwargs):
+    raise AssertionError(
+        "prepared cuTile run attempted compilation, tuning or allocation"
+    )
+
+
+@pytest.fixture
+def cutile_sm100():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("prepared cuTile acceptance requires SM100")
+    pytest.importorskip("cuda.tile.compilation")
+    from flashinfer.cutile.cutile_common import is_cuda_tile_available
+
+    if not is_cuda_tile_available():
+        pytest.skip("cuTile compiler toolchain is unavailable")
+    prior = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prior
+
+
+@pytest.fixture
+def cutile_runtime_case(cutile_sm100):
+    """Zero queries and constant values give an exact output without an oracle."""
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
+
+    def make(batch=1, heads=16, page=128, length=96):
+        width = math.ceil(length / page)
+        metadata = MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.arange(batch + 1, device="cuda", dtype=torch.int32),
+            block_tables=torch.arange(
+                batch * width, device="cuda", dtype=torch.int32
+            ).view(batch, width),
+            seq_lens=torch.full((batch,), length, device="cuda", dtype=torch.int32),
+            max_q_len=1,
+        )
+        wrapper = BatchMLAPagedAttentionWrapper(
+            torch.empty(1024, device="cuda", dtype=torch.uint8), backend="cutile"
+        )
+        wrapper.plan(
+            metadata=metadata,
+            num_heads=heads,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=page,
+            causal=True,
+            sm_scale=1 / math.sqrt(576),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            query_layout="split",
+            kv_cache_layout="split",
+        )
+        return wrapper, metadata
+
+    return make
+
+
+@pytest.mark.parametrize(
+    "batch,heads,page,length", [(1, 16, 128, 96), (16, 64, 64, 384)]
+)
+def test_cutile_prepared_run_only_launches(
+    cutile_runtime_case, monkeypatch, batch, heads, page, length
+):
+    import cuda.tile as ct
+    from cuda.tile import compilation
+
+    wrapper, metadata = cutile_runtime_case(batch, heads, page, length)
+    prepared = wrapper._planned_backend._decode_mla_kv_paged_cutile
+    assert (prepared.partial is not None) == (batch == 16)
+    scratch_pointer = (
+        prepared.partial.data_ptr() if prepared.partial is not None else None
+    )
+    native = importlib.import_module(
+        "flashinfer.attention.kernels.cutile.fmha_decode_bsr_cutile"
+    )
+    compile_module = importlib.import_module("cuda.tile._compile")
+    monkeypatch.setattr(ct, "launch", _forbidden)
+    monkeypatch.setattr(compilation, "export_kernel", _forbidden)
+    monkeypatch.setattr(compile_module, "compile_tile", _forbidden)
+    monkeypatch.setattr(native, "exhaustive_search", _forbidden)
+    monkeypatch.setattr(native, "decode_mla_kv_paged_cutile", _forbidden)
+    for extra_pools in (0, 1, 17):
+        for adjacent in (False, True):
+            pools = metadata.block_tables.numel() + extra_pools
+            if adjacent:
+                q = torch.zeros(batch, heads, 576, device="cuda", dtype=torch.bfloat16)
+                kv = torch.full(
+                    (pools, page, 576), 2.0, device="cuda", dtype=torch.bfloat16
+                )
+                query = (q[..., :512], q[..., 512:])
+                cache = (kv[..., :512], kv[..., 512:])
+            else:
+                query = tuple(
+                    torch.zeros(batch, heads, d, device="cuda", dtype=torch.bfloat16)
+                    for d in (512, 64)
+                )
+                cache = tuple(
+                    torch.full(
+                        (pools, page, d), 2.0, device="cuda", dtype=torch.bfloat16
+                    )
+                    for d in (512, 64)
+                )
+            out = torch.empty(
+                batch * heads * 512 + 1, device="cuda", dtype=torch.bfloat16
+            )[1:].view(batch, heads, 512)
+
+            def run():
+                with monkeypatch.context() as guard:
+                    for name in ("empty", "zeros", "full", "zeros_like", "empty_like"):
+                        guard.setattr(torch, name, _forbidden)
+                    assert wrapper.run(query=query, kv_cache=cache, out=out) is out
+
+            for current_length in (length, 0, 13, length):
+                metadata.seq_lens.fill_(current_length)
+                out.fill_(math.nan)
+                run()
+                torch.testing.assert_close(
+                    out, torch.full_like(out, 2.0 if current_length else 0.0)
+                )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            out.fill_(math.nan)
+            graph.replay()
+            torch.testing.assert_close(out, torch.full_like(out, 2.0))
+    assert (
+        prepared.partial.data_ptr() if prepared.partial is not None else None
+    ) == scratch_pointer
+
+
+def test_cutile_binary_lifetime_survives_preparer_collection(
+    cutile_runtime_case, monkeypatch
+):
+    from flashinfer.mla._batch_mla._backends import _cutile_prepared
+    import cuda.tile.compilation as compilation
+
+    first, _ = cutile_runtime_case()
+    binary = first._planned_backend._decode_mla_kv_paged_cutile.decode
+    del first
+    gc.collect()
+    monkeypatch.setattr(compilation, "export_kernel", _forbidden)
+    second, _ = cutile_runtime_case()
+    assert second._planned_backend._decode_mla_kv_paged_cutile.decode == binary
+    query = tuple(
+        torch.zeros(1, 16, d, device="cuda", dtype=torch.bfloat16) for d in (512, 64)
+    )
+    cache = tuple(
+        torch.full((1, 128, d), 2.0, device="cuda", dtype=torch.bfloat16)
+        for d in (512, 64)
+    )
+    out = torch.empty(16 * 512 + 1, device="cuda", dtype=torch.bfloat16)[1:].view(
+        1, 16, 512
+    )
+    assert second.run(query=query, kv_cache=cache, out=out) is out
+    torch.testing.assert_close(out, torch.full_like(out, 2.0))
+    assert _cutile_prepared._LOADED_LIBRARIES
 
 
 if __name__ == "__main__":

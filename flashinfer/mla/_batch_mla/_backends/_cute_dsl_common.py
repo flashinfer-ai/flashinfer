@@ -33,6 +33,7 @@ class _CuteDslMlaExecutionState:
     seq_lens: torch.Tensor
     batch_size: int
     q_len: int
+    cum_seq_lens_q: Optional[torch.Tensor]
     num_heads: int
     total_q: int
     kv_lora_rank: int
@@ -50,17 +51,13 @@ class _CuteDslMlaExecutionState:
 
 
 def _validate_cute_dsl_plan_args_before_metadata(args: _MLAPlanArguments) -> None:
-    if args.output_dtype != torch.bfloat16:
+    if args.output_dtype not in (torch.float16, torch.bfloat16):
         raise _BackendPlanUnsupportedError(
-            "cute-dsl backend requires a bfloat16 output contract without o_scale."
+            "cute-dsl backend requires a float16 or bfloat16 output contract without o_scale."
         )
     if args.use_profiler:
         raise _BackendPlanUnsupportedError(
             "use_profiler is not supported by the cute-dsl backend."
-        )
-    if args.causal:
-        raise _BackendPlanUnsupportedError(
-            "causal=True is not supported by the cute-dsl backend."
         )
     if args.enable_pdl is True:
         raise _BackendPlanUnsupportedError(
@@ -86,9 +83,9 @@ def _validate_cute_dsl_plan_args_before_metadata(args: _MLAPlanArguments) -> Non
             "cute-dsl dense metadata requires page_size to divide 128, "
             f"got {args.page_size}."
         )
-    if args.q_data_type not in (torch.bfloat16, torch.float8_e4m3fn):
+    if args.q_data_type not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
         raise _BackendPlanUnsupportedError(
-            "cute-dsl backend supports bfloat16 or float8_e4m3fn query tensors, "
+            "cute-dsl backend supports float16, bfloat16 or float8_e4m3fn query tensors, "
             f"got {args.q_data_type}."
         )
     if args.kv_data_type != args.q_data_type:
@@ -133,10 +130,6 @@ def _q_layout(cum_seq_lens_q: torch.Tensor) -> tuple[int, int, int, bool, int]:
         )
     q_len = int(q_lengths[0].item())
     is_uniform = not bool(torch.any(q_lengths != q_len).item())
-    if not is_uniform:
-        raise _BackendPlanUnsupportedError(
-            "cute-dsl planned backend does not support compact variable-Q metadata."
-        )
     return (
         q_lengths.numel(),
         int(q_offsets[-1].item()),
@@ -161,9 +154,22 @@ def _prepare_cute_dsl_mla_execution_state(
     q_data_type: torch.dtype,
     use_cuda_graph: bool,
     use_sinks: bool,
+    output_dtype: torch.dtype,
+    causal: bool,
+    supports_variable_q: bool,
     compile_kernel: Callable[..., tuple[Any, Any, torch.Tensor, int, int]],
 ) -> _CuteDslMlaExecutionState:
-    batch_size, total_q, actual_max_q_len, _, q_len = _q_layout(cum_seq_lens_q)
+    batch_size, total_q, actual_max_q_len, is_uniform, q_len = _q_layout(cum_seq_lens_q)
+    if not is_uniform and not supports_variable_q:
+        raise _BackendPlanUnsupportedError(
+            "cute-dsl-modular does not support compact variable-Q metadata."
+        )
+    if actual_max_q_len > 1 and causal != supports_variable_q:
+        raise _BackendPlanUnsupportedError(
+            "cute-dsl-monolithic multi-Q requires causal=True; "
+            "cute-dsl-modular multi-Q requires causal=False."
+        )
+    q_len = actual_max_q_len
     if max_q_len < actual_max_q_len:
         raise _BackendPlanUnsupportedError(
             "cute-dsl backend expects max_q_len to be at least the maximum "
@@ -190,7 +196,7 @@ def _prepare_cute_dsl_mla_execution_state(
     has_variable_kv_lengths = bool(torch.any(seq_lens_host != seq_lens_host[0]).item())
     resolved_is_var_seq = use_cuda_graph or has_variable_kv_lengths
 
-    out_dtype = torch.bfloat16
+    out_dtype = output_dtype
     try:
         implementation, compiled_kernel, workspace_i8, workspace_size, split_kv = (
             compile_kernel(
@@ -205,6 +211,9 @@ def _prepare_cute_dsl_mla_execution_state(
                 head_dim_ckv=head_dim_ckv,
                 head_dim_kpe=head_dim_kpe,
                 resolved_is_var_seq=resolved_is_var_seq,
+                is_var_q=not is_uniform,
+                total_q=total_q,
+                max_seq_len=block_tables.shape[1] * page_size,
                 use_sinks=use_sinks,
                 enable_pdl=False,
             )
@@ -214,12 +223,12 @@ def _prepare_cute_dsl_mla_execution_state(
             f"cute-dsl backend unsupported configuration: {error}"
         ) from error
     if workspace_i8.numel() < workspace_size:
-        raise ValueError(
+        raise _BackendPlanUnsupportedError(
             "workspace_buffer too small for cute-dsl backend: "
             f"have {workspace_i8.numel()} bytes, need {workspace_size} bytes."
         )
     lse_scratch = torch.empty(
-        (batch_size, q_len, num_heads),
+        (total_q, num_heads) if not is_uniform else (batch_size, q_len, num_heads),
         dtype=torch.float32,
         device=workspace_buffer.device,
     )
@@ -231,6 +240,7 @@ def _prepare_cute_dsl_mla_execution_state(
         seq_lens=seq_lens,
         batch_size=batch_size,
         q_len=q_len,
+        cum_seq_lens_q=None if is_uniform else cum_seq_lens_q,
         num_heads=num_heads,
         total_q=total_q,
         kv_lora_rank=head_dim_ckv,
@@ -347,30 +357,24 @@ def _run_cute_dsl_mla_execution_state(
         if not lse.is_contiguous():
             raise ValueError("lse must be contiguous for cute-dsl backend.")
 
-    query_4d = query.view(
-        state.batch_size,
-        state.q_len,
-        state.num_heads,
-        state.kv_lora_rank + state.qk_rope_head_dim,
-    )
-    out_4d = out.view(
-        state.batch_size,
-        state.q_len,
-        state.num_heads,
-        state.kv_lora_rank,
-    )
-    lse_kernel = (
-        state.lse_scratch
-        if lse is None
-        else lse.view(state.batch_size, state.q_len, state.num_heads)
-    )
+    if state.cum_seq_lens_q is None:
+        query_kernel = query.view(state.batch_size, state.q_len, state.num_heads, -1)
+        out_kernel = out.view(state.batch_size, state.q_len, state.num_heads, -1)
+        lse_kernel = (
+            state.lse_scratch
+            if lse is None
+            else lse.view(state.batch_size, state.q_len, state.num_heads)
+        )
+    else:
+        query_kernel, out_kernel = query, out
+        lse_kernel = state.lse_scratch if lse is None else lse
     launch_args: tuple[Any, ...] = (
-        query_4d[..., : state.kv_lora_rank],
-        query_4d[..., state.kv_lora_rank :],
+        query_kernel[..., : state.kv_lora_rank],
+        query_kernel[..., state.kv_lora_rank :],
         kv_cache[..., : state.kv_lora_rank],
         kv_cache[..., state.kv_lora_rank :],
         state.block_tables,
-        out_4d,
+        out_kernel,
         lse_kernel,
         state.workspace_bytes,
         state.Int32(state.split_kv),
@@ -389,6 +393,7 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
     _backend_name = "cute-dsl"
     _supports_lse = False
     _reject_cuda_graph = False
+    _supports_variable_q = False
     _plan_capability_error_type = _BackendPlanUnsupportedError
     _plan_capabilities: ClassVar[MLAPlanCapabilities]
 
@@ -419,6 +424,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
             q_data_type=args.q_data_type,
             use_cuda_graph=args._use_cuda_graph,
             use_sinks=args.use_sinks,
+            output_dtype=args.output_dtype,
+            causal=args.causal,
         )
         return backend
 
@@ -447,6 +454,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
         q_data_type: torch.dtype,
         use_cuda_graph: bool,
         use_sinks: bool,
+        output_dtype: torch.dtype,
+        causal: bool,
     ) -> None:
         self._execution_state = _prepare_cute_dsl_mla_execution_state(
             workspace_buffer=self._float_workspace_buffer,
@@ -462,6 +471,9 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
             q_data_type=q_data_type,
             use_cuda_graph=use_cuda_graph,
             use_sinks=use_sinks,
+            output_dtype=output_dtype,
+            causal=causal,
+            supports_variable_q=self._supports_variable_q,
             compile_kernel=self._compile_kernel,
         )
 
@@ -578,6 +590,9 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
         head_dim_ckv: int,
         head_dim_kpe: int,
         resolved_is_var_seq: bool,
+        is_var_q: bool,
+        total_q: int,
+        max_seq_len: int,
         use_sinks: bool,
         enable_pdl: bool,
     ) -> tuple[Any, Any, torch.Tensor, int, int]:
@@ -593,6 +608,9 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
             head_dim_ckv,
             head_dim_kpe,
             resolved_is_var_seq,
+            is_var_q,
+            total_q,
+            max_seq_len,
             use_sinks,
             enable_pdl,
         )
