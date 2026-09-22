@@ -35,7 +35,7 @@ from .test_cute_dsl_mxfp4_situ import (
     prepare_candidate,
 )
 
-KIMI = dict(hidden=7168, intermediate=3072, num_experts=896, top_k=16)
+KIMI = dict(hidden_size=7168, intermediate_size=3072, num_experts=896, top_k=16)
 # Small geometry: 8 experts, top-k 2, I=512 so that 4 TP shards stay 128-wide.
 SMALL = dict(
     hidden=256,
