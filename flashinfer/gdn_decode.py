@@ -127,7 +127,9 @@ TILE_V = 8  # pretranspose tile size
 # CuTe decode kernels trust caller-provided slots, so the Cake adapters now do
 # the same by default; set ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore
 # the asynchronous fail-closed check (used by the invalid-slot tests).
-_CAKE_GDN_VALIDATE_SLOTS = os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+_CAKE_GDN_VALIDATE_SLOTS = (
+    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+)
 
 
 def _cake_gdn_assert_state_slots(
