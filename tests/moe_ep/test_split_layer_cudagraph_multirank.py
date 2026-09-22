@@ -16,9 +16,8 @@ graph binds.
 
 Both comm backends are exercised. They reach the same place by different
 routes: nccl_ep needs the real ``ncclEpInitHandle``/``ncclEpUpdateHandle``
-split, while nixl_ep has no handle-init step and instead must drop its
-host-side recv hook under capture (a host callback runs once at capture and
-never again on replay).
+split, while nixl_ep has no handle-init step and uses a combined send/recv
+kernel launch under capture, with the same device-side arrival waits.
 """
 
 from __future__ import annotations
@@ -27,6 +26,12 @@ import os
 from datetime import timedelta
 
 import pytest
+
+pytestmark = [
+    pytest.mark.nvep,
+    pytest.mark.gpu_4,
+    pytest.mark.usefixtures("require_split_backend"),
+]
 
 _PG_TIMEOUT = timedelta(minutes=60)
 
@@ -176,6 +181,9 @@ def test_split_layer_forward_is_capturable(backend, algo_name):
     layer.forward(t, graph_state=state)  # warmup, still eager
     eager = layer.forward(t, graph_state=state).clone()
     x_orig = t.hidden_states.clone()
+    t.hidden_states.mul_(-3.0)
+    eager_newx = layer.forward(t, graph_state=state).clone()
+    t.hidden_states.copy_(x_orig)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -207,6 +215,7 @@ def test_split_layer_forward_is_capturable(backend, algo_name):
     # Replay must reproduce eager. This is the capture property itself and
     # holds for both algorithms.
     torch.testing.assert_close(replay_same, eager, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(replay_newx, eager_newx, atol=5e-2, rtol=5e-2)
     # A replay that re-ran tracks the rewritten activations; one that did not
     # would still hold the previous result. True for both algorithms, and the
     # assertion that actually distinguishes them.

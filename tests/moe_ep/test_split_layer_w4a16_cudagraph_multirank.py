@@ -31,6 +31,13 @@ from datetime import timedelta
 
 import pytest
 
+pytestmark = [
+    pytest.mark.nvep,
+    pytest.mark.gpu_4,
+    pytest.mark.arch_blackwell,
+    pytest.mark.usefixtures("require_split_backend"),
+]
+
 _PG_TIMEOUT = timedelta(minutes=60)
 
 # Kept small: the capture, not the shape, is under test. Both are multiples of
@@ -226,6 +233,10 @@ def test_w4a16_split_layer_chain_is_capturable(backend):
     state = layer.create_graph_state(t)
     layer.forward(t, graph_state=state)  # warmup: compiles + autotunes
     eager = layer.forward(t, graph_state=state).clone()
+    x_orig = t.hidden_states.clone()
+    t.hidden_states.mul_(-3.0)
+    eager_newx = layer.forward(t, graph_state=state).clone()
+    t.hidden_states.copy_(x_orig)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -260,6 +271,7 @@ def test_w4a16_split_layer_chain_is_capturable(backend):
     # construction and the same kernel runs both times, so eager and replay
     # should agree tightly; the tolerance covers only reduction-order noise.
     torch.testing.assert_close(replay_same, eager, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(replay_newx, eager_newx, atol=5e-2, rtol=5e-2)
     # (4) replay re-ran rather than serving a stale buffer
     assert not torch.allclose(replay_newx, replay_same, atol=5e-2, rtol=5e-2), (
         "replay did not track activations rewritten between replays"
@@ -276,7 +288,7 @@ def test_w4a16_split_layer_chain_is_capturable(backend):
 # rewrites the routing in place against real expert weights.
 @pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
 def test_w4a16_graph_matches_eager_across_routing_changes(backend):
-    """Rewriting the routing between replays must change what the graph serves.
+    """Replays must match eager results for rewritten routing IDs and weights.
 
     Activations alone cannot witness this: dispatch could ignore the ids
     entirely and a changed ``x`` would still change the output. Rewriting
@@ -293,6 +305,18 @@ def test_w4a16_graph_matches_eager_across_routing_changes(backend):
 
     state = layer.create_graph_state(t)
     layer.forward(t, graph_state=state)
+    eager_before = layer.forward(t, graph_state=state).clone()
+    ids_orig = t.topk_ids.clone()
+    weights_orig = t.topk_weights.clone()
+    new_ids = (ids_orig + 1) % NUM_EXPERTS
+    # Compute each reference before capture, then restore the original input
+    # buffers. No eager update between replays can repair a stale graph binding.
+    t.topk_ids.copy_(new_ids)
+    eager_newids = layer.forward(t, graph_state=state).clone()
+    t.topk_weights.mul_(0.5)
+    eager_newweights = layer.forward(t, graph_state=state).clone()
+    t.topk_ids.copy_(ids_orig)
+    t.topk_weights.copy_(weights_orig)
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -308,17 +332,30 @@ def test_w4a16_graph_matches_eager_across_routing_changes(backend):
 
     # Derived from the current ids rather than a fresh draw, so every rank is
     # guaranteed a different-but-valid assignment and none can diverge.
-    t.topk_ids.copy_((t.topk_ids + 1) % NUM_EXPERTS)
+    t.topk_ids.copy_(new_ids)
     graph.replay()
     torch.cuda.synchronize()
     after = captured.clone()
     dist.barrier()
 
+    t.topk_weights.mul_(0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    after_weights = captured.clone()
+    dist.barrier()
+
+    del graph
     state.destroy()
     layer.destroy()
     dist.barrier()
 
     assert torch.isfinite(before).all() and torch.isfinite(after).all()
+    torch.testing.assert_close(before, eager_before, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(after, eager_newids, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(after_weights, eager_newweights, atol=5e-2, rtol=5e-2)
     assert not torch.allclose(after, before, atol=5e-2, rtol=5e-2), (
         "replay did not track topk_ids rewritten between replays"
+    )
+    assert not torch.allclose(after_weights, after, atol=5e-2, rtol=5e-2), (
+        "replay did not track topk_weights rewritten between replays"
     )

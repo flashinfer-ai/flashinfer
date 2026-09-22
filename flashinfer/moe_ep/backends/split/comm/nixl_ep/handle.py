@@ -97,8 +97,8 @@ class NixlEpHandle(Handle):
     def _capturing() -> bool:
         """The single predicate deciding this handle's capture-mode behavior.
 
-        Two things change under capture: the recv hook is dropped (see
-        :meth:`_use_hook` -- a host callback cannot replay) and :meth:`update`
+        Two things change under capture: send and recv use a combined launch
+        (see :meth:`_use_hook`) and :meth:`update`
         promotes a routing-address change from a harmless rebind into an
         error. Both ask here so they can never disagree about which mode the
         handle is in.
@@ -116,12 +116,11 @@ class NixlEpHandle(Handle):
         combine), which lets the caller interleave host work between send and
         recv.
 
-        Under capture: no. The hook is a HOST callback, and a CUDA graph
-        records device work only -- a captured hook runs once, at capture time
-        and never again on replay. ``return_recv_hook=False`` launches
+        Under capture: no. ``return_recv_hook=False`` launches
         ``EP_SEND_PHASE | EP_RECV_PHASE`` as one kernel and joins it back to
-        the compute stream inside the transport, so the same device code runs
-        with no host in the loop. Arrival is a device spin on a peer-written
+        the compute stream inside the transport. A hook invoked during capture
+        would also record its kernel launch, but the combined path needs no
+        deferred host orchestration. Arrival is a device spin on a peer-written
         flag in either mode, so dropping the hook removes no waiting.
 
         ``async_finish`` stays False in both modes -- see ``dispatch()``.

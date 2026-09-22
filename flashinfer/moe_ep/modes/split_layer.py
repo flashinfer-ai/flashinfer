@@ -61,6 +61,10 @@ def _is_capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
+def _graph_tensor_signature(t: torch.Tensor) -> tuple:
+    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
+
+
 class MoEEpSplitGraphState:
     """Persistent EP state that makes :meth:`MoEEpSplitLayer.forward` capturable.
 
@@ -80,7 +84,7 @@ class MoEEpSplitGraphState:
     the handle at creation and ``out`` is the address combine writes, so both
     must be stable buffers whose *contents* the caller overwrites between
     replays -- the standard CUDA-graph static-input discipline.
-    ``forward`` re-checks the owning layer and the addresses on every call: a
+    ``forward`` re-checks the owning layer and buffer metadata on every call: a
     caller that silently passes a fresh tensor would otherwise get a graph that
     keeps serving the old one, and a caller that passes another layer's state
     would run this layer's tokens over that layer's transport and write that
@@ -94,6 +98,7 @@ class MoEEpSplitGraphState:
         "_topk_ids",
         "_topk_weights",
         "_out",
+        "_buffer_signatures",
         "_destroyed",
     )
 
@@ -119,6 +124,17 @@ class MoEEpSplitGraphState:
         self._topk_ids = t.topk_ids
         self._topk_weights = t.topk_weights
         self._out = out
+        # Tensor metadata is mutable: retaining the tensor alone does not
+        # preserve the binding if the caller uses set_(), resize_(), or .data.
+        self._buffer_signatures = {
+            name: _graph_tensor_signature(tensor)
+            for name, tensor in (
+                ("hidden_states", self._hidden_states),
+                ("topk_ids", self._topk_ids),
+                ("topk_weights", self._topk_weights),
+                ("out", self._out),
+            )
+        }
         self._destroyed = False
 
     @property
@@ -181,16 +197,22 @@ class MoEEpSplitGraphState:
             ("hidden_states", self._hidden_states, t.hidden_states),
             ("topk_ids", self._topk_ids, t.topk_ids),
             ("topk_weights", self._topk_weights, t.topk_weights),
+            ("out", self._out, self._out),
         ):
-            if got.data_ptr() != bound.data_ptr() or got.shape != bound.shape:
+            expected = self._buffer_signatures[name]
+            actual = _graph_tensor_signature(got)
+            # The handle also retains the original weights tensor; passing an
+            # unchanged alias must not hide a mutation of that original.
+            if actual == expected and bound is not got:
+                actual = _graph_tensor_signature(bound)
+            if actual != expected:
                 raise ValueError(
                     f"MoEEpSplitGraphState: {name} must be the same buffer the "
-                    f"state was created with (a captured graph binds addresses "
-                    f"once). Expected data_ptr=0x{bound.data_ptr():x} "
-                    f"shape={tuple(bound.shape)}, got "
-                    f"0x{got.data_ptr():x} shape={tuple(got.shape)}. Copy the "
-                    "new values into the registered tensor in place instead of "
-                    "rebinding it."
+                    "state was created with, with unchanged shape, strides, "
+                    "dtype and device. Expected "
+                    f"(data_ptr, shape, strides, dtype, device)={expected}, "
+                    f"got {actual}. Copy new values into the registered tensor "
+                    "in place instead of rebinding it or changing its metadata."
                 )
 
     def destroy(self) -> None:
@@ -416,12 +438,20 @@ class MoEEpSplitLayer(nn.Module):
                 "shape needs a second layer, not a second state on this one."
             )
         if out is None:
-            out = torch.empty_like(t.hidden_states)
-        elif out.shape != t.hidden_states.shape or out.dtype != t.hidden_states.dtype:
+            out = torch.empty_like(
+                t.hidden_states, memory_format=torch.contiguous_format
+            )
+        elif (
+            out.shape != t.hidden_states.shape
+            or out.dtype != t.hidden_states.dtype
+            or out.device != t.hidden_states.device
+            or not out.is_contiguous()
+        ):
             raise ValueError(
-                f"out must match hidden_states: expected shape "
-                f"{tuple(t.hidden_states.shape)} dtype {t.hidden_states.dtype}, "
-                f"got {tuple(out.shape)} {out.dtype}."
+                "out must be contiguous and match hidden_states: expected "
+                f"shape {tuple(t.hidden_states.shape)} dtype {t.hidden_states.dtype} "
+                f"device {t.hidden_states.device}, got shape {tuple(out.shape)} "
+                f"dtype {out.dtype} device {out.device} strides {out.stride()}."
             )
 
         fleet = self._ensure_fleet()

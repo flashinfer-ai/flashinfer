@@ -695,9 +695,10 @@ Rules, in rough order of how easily they are violated:
 - **Update the registered tensors in place, never rebind them.** `t`'s
   tensors become the graph's bound buffers (`topk_weights` is bound into the
   handle at creation; `out` is the address combine writes). `forward()`
-  re-checks all three addresses each call and raises, because a caller that
-  quietly passed a fresh tensor would otherwise get a graph still serving the
-  old one.
+  re-checks their addresses and tensor metadata, including shape, dtype, device,
+  and strides, and also validates the state's output buffer. Only the contents
+  may change: rebinding or changing the layout would leave an existing graph
+  using its original pointers and layout.
 - **The warmup forward is not optional, and `forward()` enforces it.**
   Capturing through a `graph_state` on a layer that has never completed an
   eager forward raises instead of proceeding. The first round trip is what
@@ -760,10 +761,11 @@ Backend notes:
   *binding* (when this build's index width differs from the caller's, the ids
   cast lands in a handle-owned buffer, so the
   captured address keeps receiving new routing). Under capture the handle also
-  drops its recv hook (`return_recv_hook=False`): the hook is a **host**
-  callback, so a captured one runs once at capture and never on replay,
-  leaving replays reading data that had not landed. The kernel's own arrival
-  wait records faithfully instead.
+  disables the recv hook (`return_recv_hook=False`) and records the combined
+  send/receive kernel. The hook only defers the receive-phase kernel launch;
+  it performs no host-side wait. A receive kernel launched through a hook on
+  a captured stream would also be recorded. Combining the phases avoids that
+  host orchestration, while retaining the same device-side arrival waits.
 
 ### Scope of validation, and how a stall surfaces
 
@@ -801,26 +803,53 @@ nothing weaker proves a replay actually ran.
 
 ### Why this is opt-in rather than the default
 
-The persistent-handle path is cheaper per forward -- eager `forward()` pays
-`create_handle` + `empty_like(out)` + `destroy()` every call -- so the reason
-`create_graph_state()` is explicit is semantics, not cost:
+The explicit API makes the lifetime and buffer-reuse requirements visible to
+the caller. It avoids repeating `create_handle`, `empty_like(out)`, and
+`destroy()` on every forward, and eager forwards using a graph state were faster
+in the measured cases. Those measurements do not establish a performance
+guarantee for every backend or workload. The reasons to retain the opt-in are:
 
-* `out` becomes a **reused** buffer instead of a fresh allocation per call, which
-  changes what a caller holding last step's result observes.
-* The pointer check exists to **raise** on a rebound tensor. An implicit,
-  address-keyed cache would silently rebuild instead -- harmless eagerly, wrong
-  under capture, where the recorded graph still reads the old address. That
-  raise is the feature.
-* A handle carries state the key does not capture (bound stream, staged flag,
-  token count, nixl's cast buffer), and a pinned handle cannot be evicted.
+* `out` is a **reused** buffer. A caller retaining the previous result observes
+  it change on the next forward or replay; retaining a snapshot requires a copy.
+* The input tensors, handle, and output remain live for the state's lifetime.
+  Every graph using them must be retired before destroying that state or layer.
+  An implicit cache miss cannot safely evict an old state while a graph still
+  refers to its buffers.
+* An address alone is not a binding contract: the shape, dtype, device, layout,
+  stream, and routing state also matter. Explicit state lets `forward()` reject
+  an incompatible binding rather than silently replace buffers that a graph
+  still uses.
+* State creation and transport calls must follow the same sequence on every EP
+  rank. Independent address-cache misses on different ranks cannot determine
+  when to rebuild collective resources safely. The caller also has to maintain
+  that ordering across eager forwards and replays.
 
-Tests: `tests/moe_ep/test_split_layer_cudagraph_multirank.py` (layer API, both
-backends) and `tests/moe_ep/test_moe_ep_cudagraph_multirank.py` (the same
-property one layer down, driving `Fleet`/`Handle` directly).
+This is separate from the NCCL tensor-wrapper memo. That memo is cleared after
+passing its 256-entry threshold and bypasses tensors larger than 2 MiB. Caching
+a fresh eager output there retained it until a cache flush, causing bounded
+memory retention and allocation churn, rather than unbounded growth. Eager
+combine outputs bypass that memo; graph-state outputs may be cached because
+their addresses are reused.
+
+The smoke harness includes the layer graph tests for both available backends,
+the W4A16 graph tests on Blackwell, and the NCCL handle graph and output-memo
+regressions. `BACKEND` selects a backend; an unavailable backend is skipped only
+when selecting `both`.
+
+The checked-in CI workflows do not invoke this harness. A distributed run on a
+CUDA 13 host with at least four supported GPUs is still required to execute
+these regressions; ordinary pytest collection skips them without `torchrun`.
+
+```bash
+NPROC=4 BACKEND=both bash scripts/task_test_moe_ep_smoke.sh
+```
+
+To run just the layer graph tests (`--backend=nixl_ep` selects NIXL instead):
 
 ```bash
 torchrun --nproc_per_node=4 -m pytest \
-    tests/moe_ep/test_split_layer_cudagraph_multirank.py -v -m "nvep and gpu_4"
+    tests/moe_ep/test_split_layer_cudagraph_multirank.py \
+    -v -m "nvep and gpu_4" --backend=nccl_ep
 ```
 
 ## Fault tolerance

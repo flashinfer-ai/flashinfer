@@ -6,15 +6,16 @@ Launched via torchrun::
         tests/moe_ep/test_nccl_ep_wrap_memo_multirank.py -v -m "nvep and gpu_4"
 
 ``NcclEpHandle._wrap`` memoizes ``nccl.ep.Tensor`` descriptors keyed by
-``(data_ptr, dtype, shape)``, and the wrapper keeps its torch tensor alive. That
-is fine for the workspace addresses the memo exists for -- the allocator recycles
-them, so the key recurs and the entry pays for itself.
+``(data_ptr, dtype, shape)``, and the wrapper keeps its torch tensor alive. This
+allows descriptor reuse for stable workspace buffers.
 
 It is not fine for combine's ``out``, which eager ``forward()`` allocates fresh
 every call. Caching on first sight pinned it, which stopped the allocator
 recycling that address, so the next forward got a new one, the memo missed 100%
-of the time, and the layer leaked one output buffer per forward. Measured before
-the fix at 128 tokens x 4096 hidden: 50/50 distinct ``out`` pointers, the memo
+of the time, retaining one output buffer per forward until cache eviction.
+This is bounded retention (roughly 512 MiB at the memo's limits), not an
+unbounded leak. Measured before the fix at 128 tokens x 4096 hidden:
+50/50 distinct ``out`` pointers, the memo
 growing by exactly one entry per forward, and torch's allocated bytes climbing
 27 -> 227 MiB across 200 forwards. The knock-on cost was an ``empty_like`` going
 from 1.1us to ~103us once its predecessors were pinned, which is what made the
@@ -22,7 +23,7 @@ benchmark's amortized eager number exceed its own per-call number.
 
 The shape here is deliberate. 128 tokens x 4096 hidden x 2 B = 1 MiB, under
 ``_WRAP_MEMO_MAX_BYTES`` (2 MiB), so ``out`` goes through the memo rather than
-the large-tensor bypass -- at 512 tokens it would bypass and the leak would not
+the large-tensor bypass -- at 512 tokens it would bypass and the retention would not
 reproduce at all.
 """
 
@@ -32,6 +33,8 @@ import os
 from datetime import timedelta
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("require_split_backend")
 
 _PG_TIMEOUT = timedelta(minutes=60)
 
@@ -61,14 +64,16 @@ def _init_dist():
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-def test_eager_forwards_do_not_grow_the_wrap_memo():
-    """Repeated eager forwards must not grow the memo or leak device memory.
+@pytest.mark.parametrize("algo_name", ["low_latency", "high_throughput"])
+def test_eager_forwards_do_not_grow_the_wrap_memo(algo_name):
+    """Repeated eager forwards must not retain outputs in the fleet memo.
 
     Both assertions target the same defect from different sides, because either
-    alone is weak: the memo could stay small while memory still leaked (if
-    something else held the tensors), and memory could look flat over a short
-    run purely because the allocator had spare reservation. Together they pin
-    the actual contract -- a per-call tensor is neither cached nor kept alive.
+    alone is weak: the memo could stay small while another owner retained
+    outputs, and memory could remain flat if a different allocation was freed.
+    Together they check the identity path's output lifetime. The identity
+    kernel deliberately reuses dispatch buffers; transient packed payloads
+    and expert outputs from other kernels are outside this test's scope.
 
     Fails against the pre-fix code, where the memo grew by one entry and torch's
     allocated bytes by one output buffer on every single forward.
@@ -78,6 +83,7 @@ def test_eager_forwards_do_not_grow_the_wrap_memo():
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        EpAlgorithm,
         FleetParams,
         MoEEpSplitLayer,
         MoEEpTensors,
@@ -86,6 +92,10 @@ def test_eager_forwards_do_not_grow_the_wrap_memo():
 
     rank, world_size = _init_dist()
     assert world_size >= 4, f"needs >=4 ranks, got {world_size}"
+    algorithm = {
+        "low_latency": EpAlgorithm.LOW_LATENCY,
+        "high_throughput": EpAlgorithm.HIGH_THROUGHPUT,
+    }[algo_name]
 
     layer = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(
@@ -98,6 +108,7 @@ def test_eager_forwards_do_not_grow_the_wrap_memo():
             max_tokens_per_rank=TOKENS_PER_RANK,
             token_hidden_size=HIDDEN,
             dtype_bytes=2,
+            algorithm=algorithm,
         ),
         weights=dummy_moe_weights(
             num_local_experts=NUM_EXPERTS // world_size, hidden=HIDDEN
@@ -154,10 +165,10 @@ def test_eager_forwards_do_not_grow_the_wrap_memo():
         "depends on."
     )
     # One output buffer is 1 MiB here; pre-fix this grew by FORWARDS MiB.
-    leaked_mib = (mem_after - mem_before) / (1 << 20)
-    assert leaked_mib < 4.0, (
-        f"device memory grew {leaked_mib:.1f} MiB over {FORWARDS} eager "
-        f"forwards (~{leaked_mib / FORWARDS:.2f} MiB per forward). Eager "
+    retained_mib = (mem_after - mem_before) / (1 << 20)
+    assert retained_mib < 4.0, (
+        f"device memory grew {retained_mib:.1f} MiB over {FORWARDS} eager "
+        f"forwards (~{retained_mib / FORWARDS:.2f} MiB per forward). Eager "
         "forward allocates one output buffer per call; if it is still "
         "reachable afterwards the memo is pinning it."
     )

@@ -236,9 +236,9 @@ class NcclEpHandle(Handle):
 
         ONLY call this for a tensor whose address the caller keeps stable. The
         wrapper holds its torch tensor alive, so memoizing a per-call buffer
-        pins it, stops the allocator handing that address back, and leaks one
-        buffer per call — the memo then misses every time, defeating its own
-        premise. Combine's output is exactly that case and is gated on
+        pins it and stops the allocator handing that address back until the
+        bounded cache is cleared. The memo then misses every time, defeating
+        its own premise. Combine's output is exactly that case and is gated on
         ``CombineInputParams.out_is_stable``; do not route a churning tensor
         here on the assumption that a repeated address proves stability, since
         a freed-then-reallocated buffer repeats on the very next call.
@@ -661,17 +661,20 @@ class NcclEpHandle(Handle):
                 self._num_tokens_in, hidden, dtype=x.dtype, device=x.device
             )
         )
+        # The stability promise applies only to a caller-supplied buffer.
+        # An output allocated above is fresh even if the flag was set.
+        out_is_stable = params.out is not None and params.out_is_stable
 
         if self._is_ht:
             x2d = x.reshape(-1, hidden)
-            # Cache the static config; the token wraps go through the _wrap
-            # memo (x2d is a fresh view each call, out_t may alias new tensors).
+            # Cache the static config and explicitly stable output only.
             ck = ("ht_comb_cfg", self._staged)
             config = self._hot.get(ck)
             if config is None:
                 config = self._ep.CombineConfig(send_only=int(self._staged))
                 self._hot[ck] = config
-            outputs = self._ep.CombineOutputs(tokens=self._wrap(out_t))
+            out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
+            outputs = self._ep.CombineOutputs(tokens=out_w)
             inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
             self._handle.combine(
                 inputs, outputs, config=config, stream=self._op_stream()
@@ -718,13 +721,9 @@ class NcclEpHandle(Handle):
         inputs = self._ep.CombineInputs(tokens=self._wrap(x))
         # Memoize the output descriptor only when the caller owns a stable
         # buffer (a graph state does; the default forward's empty_like does
-        # not). Caching a per-call buffer pins it and leaks one output per
-        # forward -- see _wrap.
-        out_w = (
-            self._wrap(out_t)
-            if getattr(params, "out_is_stable", False)
-            else self._ep.Tensor(out_t)
-        )
+        # not). Caching a per-call buffer retains one output per forward until
+        # the bounded cache is cleared -- see _wrap.
+        out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
         outputs = self._ep.CombineOutputs(
             tokens=out_w,
             topk_weights=weights_t,
