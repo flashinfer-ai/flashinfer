@@ -10,10 +10,16 @@ fixes MMA-M at 128 for one CTA, so the only way to shrink the token dimension is
 to swap the operands:
 
     acc[weight_rows(128) x tokens(N_TILE)] = W_e[rows x K] (A, TMA)
-                                            x X_perm[tokens x K]^T (B, TMA)
+                                            x X[rows(N_TILE) x K]^T (B, cp.async gather)
 
-with ``N_TILE`` in {32, 64, 128}. Weights therefore stream through TMA exactly
-once per row group while the MMA work per weight byte drops by 128/N_TILE.
+with ``N_TILE`` in {8, 16, 32, 64, 128}. Weights therefore stream through TMA
+exactly once per row group while the MMA work per weight byte drops by
+128/N_TILE. The row operand is gathered straight from the unpermuted
+activations by a dedicated ``cp.async`` warp (GEMM1: rows indexed through
+``permuted_idx_to_expanded_idx``; GEMM2: contiguous permuted rows), so no
+separate permute kernel is needed. Its UE8M0 scale factors are plain
+``(rows, K/32)`` bytes; the gather warp drops each row's 4 bytes per 128-wide
+K tile into the scale-factor smem atom the ``tcgen05.cp`` S2T copy expects.
 Every output column is one routed row of one expert; TMEM lane == weight row.
 
 Two epilogues share the mainloop:
@@ -24,8 +30,9 @@ Two epilogues share the mainloop:
   compute ``linear_beta*tanh(u/linear_beta)`` (or ``u``), the product is formed
   after an smem exchange, and the MXFP8 requantization group of 32 along the
   intermediate dimension is exactly one warp: a 32-lane max reduction per token
-  column yields the UE8M0 scale. Output: ``act[rows, I]`` E4M3 + scale factors in
-  the MMA atom layout, identical to the existing GEMM1 output contract.
+  column yields the UE8M0 scale. Output: ``act[rows, I]`` E4M3 + plain
+  ``(rows, I/32)`` scale-factor bytes (consumed by the GEMM2 gather warp).
+  Optionally zero-fills the finalize output buffer so GEMM2 can reduce into it.
 * ``"finalize"`` (GEMM2): scale each token column by ``alpha * route_weight``,
   transpose the 128 x N_TILE tile through smem and ``cp.reduce.async.bulk`` add
   it into ``out[token, h0:h0+128]`` (BF16), the same reduction the existing
@@ -56,6 +63,7 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
     ue8m0_to_inv_scale_fast,
 )
 
+from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     UnalignedNamedBarrier,
     blk_copy,
@@ -74,7 +82,7 @@ EPILOGUE_KINDS = ("situ_mxfp8", "finalize", "partial")
 class Sm100BlockScaledSwapAbGroupedGemmKernel:
     """Persistent warp-specialized swap-AB grouped GEMM (see module docstring).
 
-    Warp roles: epilogue (0-3), MMA (4), TMA (5), scheduler (6).
+    Warp roles: epilogue (0-3), MMA (4), TMA (5), scheduler (6), gather (7).
     """
 
     def __init__(
@@ -88,12 +96,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
-        if n_tile not in (32, 64, 128):
-            raise ValueError(
-                "n_tile must be 32, 64 or 128 (one or more 32-row SF atoms)"
-            )
-        if k_blocks_per_stage <= 0:
-            raise ValueError("k_blocks_per_stage must be positive")
+        if n_tile not in (8, 16, 32, 64, 128):
+            raise ValueError("n_tile must be 8, 16, 32, 64 or 128")
+        if k_blocks_per_stage != 4:
+            # The gather warp writes one 128-byte swizzle atom (128 FP8 K
+            # elements) per row per stage; other stage depths need a second
+            # K-atom mode in the manual swizzle below.
+            raise ValueError("k_blocks_per_stage must be 4 on the gather path")
         self.sf_vec_size = sf_vec_size
         self.n_tile = n_tile
         self.k_blocks_per_stage = k_blocks_per_stage
@@ -103,6 +112,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.is_partial = epilogue_kind == "partial"
         self.enable_pdl = enable_pdl
         self.use_linear_beta = use_linear_beta
+        # GEMM1 gathers activation rows through the permuted->expanded map;
+        # GEMM2 reads the already-permuted GEMM1 output rows contiguously.
+        self.gather_rows = self.is_situ
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
@@ -114,9 +126,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.sched_warp_id = 6
+        self.gather_warp_id = 7
         self.threads_per_warp = 32
-        self.threads_per_cta = self.threads_per_warp * 7
-        self.threads_wo_sched = self.threads_per_warp * 6
+        self.threads_per_cta = self.threads_per_warp * 8
+        self.threads_wo_sched = self.threads_per_warp * 7
         self.num_epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -138,8 +151,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
     # ------------------------------------------------------------------
     def _setup_attributes(self):
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
-        # SF atoms cover 32 MN rows x (4 K blocks); the B-side TMA always moves a
-        # 128-row SF tile, the MMA reads the sub-range for this row group.
+        # SF atoms cover 32 MN rows x (4 K blocks); the row-operand SF smem tile
+        # keeps the 128-row atom layout the S2T copy expects, the gather warp
+        # fills rows [0, n_tile) of atom 0 and the MMA reads at the TMEM base.
         self.mma_inst_shape_mn_sfb = (self.mma_inst_shape_mn[0], 128)
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -179,12 +193,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
         )
-        self.cluster_layout_sfb_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)),
-            (tiled_mma_sfb.thr_id.shape,),
-        )
-        # One 32-column TMEM load per subtile, like the reference kernels.
-        self.epi_tile = (self.mma_tiler[0], 32)
+        # One TMEM load of up to 32 columns per subtile, like the reference kernels.
+        self.epi_tile = (self.mma_tiler[0], min(32, self.n_tile))
 
         (
             self.num_acc_stage,
@@ -315,29 +325,35 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         token_final_scales: Optional[cute.Tensor],
         situ_beta: Optional[cute.Tensor],
         situ_linear_beta: Optional[cute.Tensor],
+        zero_buf: Optional[cute.Tensor],
+        top_k: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         """Launch the kernel.
 
         :param a: weights ``(rows_w, K, L)`` K-major (E2M1); ``L`` = local experts
-        :param b: permuted activation rows ``(R, K, 1)`` K-major (E4M3), ``R`` a
-            multiple of 128
+        :param b: row operand ``(rows_b, K, 1)`` K-major (E4M3): the unpermuted
+            activations ``(T, K)`` for ``situ_mxfp8`` (rows gathered through
+            ``permuted_idx_to_expanded_idx``), the permuted GEMM1 output
+            ``(R, K)`` otherwise
         :param sfa: A scale factors in the MMA atom layout of ``a``'s shape
-        :param sfb: B scale factors in the MMA atom layout of ``b``'s shape
+        :param sfb: B scale factors as plain ``(rows_b, K/32)`` UE8M0 bytes
         :param out: ``situ_mxfp8``: ``(R, rows_w/2, 1)`` E4M3; ``finalize``:
             ``(T, rows_w, 1)`` BF16 (zero-initialised); ``partial``:
             ``(T*topK, rows_w, 1)`` BF16
-        :param out_sf: ``situ_mxfp8`` only: scale factors (atom layout of
-            ``(R, rows_w/2, 1)``) as UInt8
+        :param out_sf: ``situ_mxfp8`` only: plain ``(R, rows_w/64)`` UInt8 scales
         :param tile_idx_to_expert_idx: expert per row group ``(G,)``
         :param tile_idx_to_mn_limit: exclusive valid permuted-row bound per group
         :param num_non_exiting_tiles: ``(1,)`` number of valid row groups
         :param alpha: per-expert scale ``(L,)`` f32
-        :param permuted_idx_to_expanded_idx: ``(R,)`` int32 (finalize/partial)
+        :param permuted_idx_to_expanded_idx: ``(R,)`` int32 (all kinds)
         :param token_final_scales: ``(T, topK)`` route weights (finalize)
         :param situ_beta / situ_linear_beta: ``(1,)`` or ``(L,)`` f32 runtime
             SiTU parameters (situ_mxfp8); a size-1 tensor is broadcast
+        :param zero_buf: optional flat Int64 buffer zero-filled by the
+            scheduler warps (the finalize output for the following GEMM2)
+        :param top_k: routed experts per token (expanded idx = token*top_k+k)
         """
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
@@ -352,9 +368,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.smem_alloc_b_dtype = (
             cutlass.Int8 if self.b_dtype.width < 8 else self.b_dtype
         )
-        self.top_k = 1
-        if cutlass.const_expr(token_final_scales is not None):
-            self.top_k = token_final_scales.shape[1]
+        self.top_k = top_k
         self.beta_broadcast = True
         self.linear_beta_broadcast = True
         if cutlass.const_expr(situ_beta is not None):
@@ -366,20 +380,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
         sfa = cute.make_tensor(sfa.iterator, sfa_layout)
-        # Group-tiled SF layout for the row operand: every row group owns one
-        # 128-row SF tile in which its n_tile rows are replicated 128/n_tile
-        # times, so the MMA always reads scale factors at the unshifted TMEM
-        # base (a 1-column TMEM shift for 32-row groups is not addressable).
-        num_row_groups = cute.ceil_div(b.shape[0], self.n_tile)
-        sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            (num_row_groups * 128, b.shape[1], 1), self.sf_vec_size
-        )
-        sfb = cute.make_tensor(sfb.iterator, sfb_layout)
-        if cutlass.const_expr(self.is_situ):
-            out_sf_layout = blockscaled_utils.tile_atom_to_shape_SF(
-                (num_row_groups * 128, out.shape[1], 1), self.sf_vec_size
-            )
-            out_sf = cute.make_tensor(out_sf.iterator, out_sf_layout)
+        # The grid covers every row-group slot; slots >= num_non_exiting_tiles
+        # exit through the scheduler warp.
+        num_row_groups = tile_idx_to_expert_idx.shape[0]
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -415,19 +418,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             self.cluster_layout_vmnk.shape,
             internal_type=(self.smem_alloc_a_dtype if self.a_dtype.width < 8 else None),
         )
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(self.smem_alloc_b_dtype if self.b_dtype.width < 8 else None),
-        )
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
@@ -443,29 +433,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             self.cluster_layout_vmnk.shape,
             internal_type=cutlass.Int16,
         )
-        sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        sfb_smem_layout = cute.slice_(
-            self.sfb_smem_layout_staged, (None, None, None, 0)
-        )
-        tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_op,
-            sfb,
-            sfb_smem_layout,
-            self.mma_tiler_sfb,
-            tiled_mma_sfb,
-            self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
-        sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
-        self.num_tma_load_bytes = (
-            a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
-        )
+        self.num_tma_load_bytes = a_copy_size + sfa_copy_size
 
         num_m_tiles = cute.ceil_div(a.shape[0], self.cta_tile_shape_mnk[0])
         self.tile_sched_params, grid = self._compute_grid(
@@ -485,6 +455,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage], 1
             ]
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_tile_stage * 2
@@ -538,12 +509,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a,
-            tma_atom_b,
-            tma_tensor_b,
             tma_atom_sfa,
             tma_tensor_sfa,
-            tma_atom_sfb,
-            tma_tensor_sfb,
+            b,
+            sfb,
             out,
             out_sf,
             tile_idx_to_expert_idx,
@@ -554,8 +523,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             token_final_scales,
             situ_beta,
             situ_linear_beta,
+            zero_buf,
             self.cluster_layout_vmnk,
-            self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
@@ -642,12 +611,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
-        tma_atom_b: cute.CopyAtom,
-        mB_nkl: cute.Tensor,
         tma_atom_sfa: cute.CopyAtom,
         mSFA_mkl: cute.Tensor,
-        tma_atom_sfb: cute.CopyAtom,
-        mSFB_nkl: cute.Tensor,
+        mB: cute.Tensor,
+        mSFB: cute.Tensor,
         out: cute.Tensor,
         out_sf: Optional[cute.Tensor],
         tile_idx_to_expert_idx: cute.Tensor,
@@ -658,8 +625,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         token_final_scales: Optional[cute.Tensor],
         situ_beta: Optional[cute.Tensor],
         situ_linear_beta: Optional[cute.Tensor],
+        zero_buf: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
-        cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
@@ -674,9 +641,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
-            cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfa)
-            cpasync.prefetch_descriptor(tma_atom_sfb)
 
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
@@ -684,9 +649,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             cute.arch.block_idx_in_cluster()
         )
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
-            cta_rank_in_cluster
-        )
-        block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
         tidx, _, _ = cute.arch.thread_idx()
@@ -700,6 +662,16 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             tx_count=self.num_tma_load_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+        )
+        # Row operand + its scale factors: 32 cp.async lanes -> MMA.
+        b_pipeline = PipelineCpAsyncUmma.create(
+            barrier_storage=storage.b_mbar_ptr.data_ptr(),
+            num_stages=self.num_ab_stage,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.threads_per_warp
+            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
@@ -750,26 +722,14 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, loopN, loopK, loopL)
-        gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-        )
         gSFA_mkl = cute.local_tile(
             mSFA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
-        )
-        gSFB_nkl = cute.local_tile(
-            mSFB_nkl,
-            cute.slice_(self.mma_tiler_sfb, (0, None, None)),
-            (None, None, None),
         )
         k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
         tCgA = thr_mma.partition_A(gA_mkl)
-        tCgB = thr_mma.partition_B(gB_nkl)
         tCgSFA = thr_mma.partition_A(gSFA_mkl)
-        tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
 
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -781,16 +741,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        b_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-        )
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
-            b_cta_layout,
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(tCgB, 0, 3),
-        )
         tAsSFA, tAgSFA = cpasync.tma_partition(
             tma_atom_sfa,
             block_in_cluster_coord_vmnk[2],
@@ -800,18 +750,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         )
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
-        sfb_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
-        )
-        tBsSFB, tBgSFB = cpasync.tma_partition(
-            tma_atom_sfb,
-            block_in_cluster_coord_sfb_vmnk[1],
-            sfb_cta_layout,
-            cute.group_modes(sSFB, 0, 3),
-            cute.group_modes(tCgSFB, 0, 3),
-        )
-        tBsSFB = cute.filter_zeros(tBsSFB)
-        tBgSFB = cute.filter_zeros(tBgSFB)
 
         tCrA = tiled_mma.make_fragment_A(sA)
         tCrB = tiled_mma.make_fragment_B(sB)
@@ -852,6 +790,20 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
         self.cta_sync_barrier.arrive_and_wait()
         griddepcontrol_wait()
+
+        # Zero-fill the finalize output for the following GEMM2 (grid-strided,
+        # scheduler warp of every CTA) so no separate fill kernel is needed.
+        if cutlass.const_expr(zero_buf is not None):
+            if warp_idx == self.sched_warp_id:
+                grid_x, _, _ = cute.arch.grid_dim()
+                zero_lane = tidx % self.threads_per_warp
+                zero_words = cute.size(zero_buf)
+                for zi in cutlass.range(
+                    bidx * self.threads_per_warp + zero_lane,
+                    zero_words,
+                    grid_x * self.threads_per_warp,
+                ):
+                    zero_buf[zi] = cutlass.Int64(0)
 
         #
         # Scheduler warp: row groups >= num_valid_groups carry no work. Because
@@ -919,9 +871,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 expert_idx = tile_info[2]
                 # ((atom_v, rest_v), loopK)
                 tAgA_slice = tAgA[(None, m_tile, None, expert_idx)]
-                tBgB_slice = tBgB[(None, row_group, None, 0)]
                 tAgSFA_slice = tAgSFA[(None, m_tile, None, expert_idx)]
-                tBgSFB_slice = tBgSFB[(None, row_group, None, 0)]
 
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -931,21 +881,15 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     )
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
-                    tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
                     tAgSFA_k = tAgSFA_slice[(None, ab_producer_state.count)]
-                    tBgSFB_k = tBgSFB_slice[(None, ab_producer_state.count)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
-                    tBsB_pipe = tBsB[(None, ab_producer_state.index)]
                     tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
-                    tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
                     cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar_ptr=tma_bar)
-                    cute.copy(tma_atom_b, tBgB_k, tBsB_pipe, tma_bar_ptr=tma_bar)
                     cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_pipe, tma_bar_ptr=tma_bar)
-                    cute.copy(tma_atom_sfb, tBgSFB_k, tBsSFB_pipe, tma_bar_ptr=tma_bar)
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
@@ -961,6 +905,135 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
+
+        #
+        # Gather warp: row operand + scale factors via cp.async
+        #
+        if warp_idx == self.gather_warp_id:
+            b_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
+            )
+            tile_info_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_tile_stage
+            )
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for i in cutlass.range_constexpr(5):
+                tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
+            is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy("async.shared", space="cta")
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
+
+            lane_g = tidx % self.threads_per_warp
+            # Row tile in smem: SW128 K-major, 128 FP8 per row per stage
+            # (logical byte(row, k) = row*128 + k; the swizzled smem iterator
+            # applies the 128B XOR pattern).
+            chunk = lane_g % 8
+            row_in_pass = lane_g // 8
+            n_pass = n_tile // 4  # 4 rows x 8 16-byte chunks per warp pass
+            n_sf = max(1, n_tile // 32)  # 4-byte SF copies per lane per stage
+            k_stage = self.mma_tiler[2]
+            b_bytes_per_stage = n_tile * k_stage
+            sf_bytes_per_stage = 512
+            num_rows_b = mB.shape[0]
+            k_cols = mB.shape[1]
+            sf_cols = mSFB.shape[1]
+            b_atom_copy = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                self.b_dtype,
+                num_bits_per_copy=128,
+            )
+            sf_atom_copy = cute.make_copy_atom(
+                cpasync.CopyG2SOp(), self.sf_dtype, num_bits_per_copy=32
+            )
+            row_src = cute.make_rmem_tensor((n_pass,), cutlass.Int32)
+            row_ok = cute.make_rmem_tensor((n_pass,), cutlass.Boolean)
+            sf_src = cute.make_rmem_tensor((n_sf,), cutlass.Int32)
+            sf_ok = cute.make_rmem_tensor((n_sf,), cutlass.Boolean)
+            pred1 = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Boolean)
+
+            while is_valid_tile:
+                row_group = tile_info[1]
+                mn_limit = tile_info[4]
+                row_base = row_group * n_tile
+                # Source row per (pass, lane): the token row for GEMM1, the
+                # permuted row itself for GEMM2. Rows beyond mn_limit or with a
+                # garbage expanded index are skipped (their columns are dropped).
+                for p in cutlass.range_constexpr(n_pass):
+                    prow = row_base + p * 4 + row_in_pass
+                    ok = prow < mn_limit
+                    src_row = prow
+                    if cutlass.const_expr(self.gather_rows):
+                        expanded = permuted_idx_to_expanded_idx[prow]
+                        tok = expanded // self.top_k
+                        ok = ok & (expanded >= 0) & (tok < num_rows_b)
+                        src_row = tok
+                    row_src[p] = src_row * cutlass.Int32(ok)
+                    row_ok[p] = ok
+                for q in cutlass.range_constexpr(n_sf):
+                    srow = q * 32 + lane_g
+                    prow = row_base + srow
+                    ok = (prow < mn_limit) & (srow < n_tile)
+                    src_row = prow
+                    if cutlass.const_expr(self.gather_rows):
+                        safe_row = cutlass.min(prow, row_base + n_tile - 1)
+                        expanded = permuted_idx_to_expanded_idx[safe_row]
+                        tok = expanded // self.top_k
+                        ok = ok & (expanded >= 0) & (tok < num_rows_b)
+                        src_row = tok
+                    sf_src[q] = src_row * cutlass.Int32(ok)
+                    sf_ok[q] = ok
+
+                b_producer_state.reset_count()
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
+                    b_pipeline.producer_acquire(b_producer_state)
+                    stage = b_producer_state.index
+                    k0 = b_producer_state.count * k_stage
+                    sB_stage = sB.iterator + stage * b_bytes_per_stage
+                    sSFB_stage = sSFB.iterator + stage * sf_bytes_per_stage
+                    for p in cutlass.range_constexpr(n_pass):
+                        row = p * 4 + row_in_pass
+                        # sB.iterator carries the SW128 swizzle: address the
+                        # logical (row, 16-byte chunk) and let it apply the XOR.
+                        dst_off = row * 128 + chunk * 16
+                        src_off = cute.assume(
+                            row_src[p] * k_cols + k0 + chunk * 16, divby=16
+                        )
+                        g_b = cute.make_tensor(
+                            mB.iterator + src_off, layout=cute.make_layout((16,))
+                        )
+                        s_b = cute.make_tensor(
+                            sB_stage + dst_off, layout=cute.make_layout((16,))
+                        )
+                        pred1[0] = row_ok[p]
+                        cute.copy_atom_call(b_atom_copy, g_b, s_b, pred=pred1)
+                    # 4 UE8M0 bytes per row per 128-wide K tile -> SF atom row
+                    # (byte(row, kb) = row*16 + kb inside atom 0).
+                    for q in cutlass.range_constexpr(n_sf):
+                        srow = q * 32 + lane_g
+                        sf_src_off = cute.assume(
+                            sf_src[q] * sf_cols + b_producer_state.count * 4, divby=4
+                        )
+                        sf_g = cute.make_tensor(
+                            mSFB.iterator + sf_src_off, layout=cute.make_layout((4,))
+                        )
+                        sf_s = cute.make_tensor(
+                            sSFB_stage + srow * 16, layout=cute.make_layout((4,))
+                        )
+                        pred1[0] = sf_ok[q]
+                        cute.copy_atom_call(sf_atom_copy, sf_g, sf_s, pred=pred1)
+                    b_pipeline.producer_commit(b_producer_state)
+                    b_producer_state.advance()
+
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for i in cutlass.range_constexpr(5):
+                    tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy("async.shared", space="cta")
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+            b_pipeline.producer_tail(b_producer_state)
 
         #
         # MMA warp
@@ -1014,6 +1087,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
+            b_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+            )
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
@@ -1050,6 +1126,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
                 for k_tile in cutlass.range(k_tile_cnt):  # noqa: B007
                     ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                    b_pipeline.consumer_wait(b_consumer_state)
+                    # cp.async (generic proxy) writes -> tcgen05 (async proxy) reads
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
                     cute.copy(
                         tiled_copy_s2t_sfa,
@@ -1081,6 +1160,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                     ab_pipeline.consumer_release(ab_consumer_state)
                     ab_consumer_state.advance()
+                    b_pipeline.consumer_release(b_consumer_state)
+                    b_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
                         peek_ab_full_status = ab_pipeline.consumer_try_wait(
@@ -1183,13 +1264,14 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 tcgen05_fence_after_thread_sync()
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 vals = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
-                for sub in cutlass.range_constexpr(n_tile // 32):
+                epi_n = epi_tile[1]
+                for sub in cutlass.range_constexpr(n_tile // epi_n):
                     cute.copy(
                         tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc
                     )
                     acc_vec = tTR_rAcc.load()
-                    for c in cutlass.range_constexpr(32):
-                        vals[sub * 32 + c] = acc_vec[c] * alpha_val
+                    for c in cutlass.range_constexpr(epi_n):
+                        vals[sub * epi_n + c] = acc_vec[c] * alpha_val
                 cute.arch.fence_view_async_tmem_load()
                 tcgen05_fence_before_thread_sync()
                 acc_pipeline.consumer_release(acc_consumer_state)
@@ -1241,18 +1323,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 inv_scale = ue8m0_to_inv_scale_fast(scale_code)
                                 q = vals[c] * inv_scale
                                 out[(prow, j, 0)] = q.to(self.out_dtype)
-                                # Group-tiled SF layout (element-space index, the
-                                # 32-wide vector mode has stride 0): lane `lane`
-                                # writes replica `lane` of the row inside the
-                                # group's 128-row fake tile.
-                                if lane < 128 // n_tile:
-                                    fake_row = (
-                                        (prow // n_tile) * 128
-                                        + lane * n_tile
-                                        + (prow % n_tile)
-                                    )
-                                    out_sf[(fake_row, j, 0)] = scale_code.to(
-                                        cutlass.Uint8
+                                if lane == 0:
+                                    # plain (rows, I/32) scale bytes; j // 32
+                                    out_sf[(prow, m_tile * 2 + epi_tidx // 32)] = (
+                                        scale_code.to(cutlass.Uint8)
                                     )
                     self.epilog_sync_barrier.arrive_and_wait()
                 else:
@@ -1311,14 +1385,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         token_scales_ptr: Optional[cute.Pointer],
         beta_ptr: Optional[cute.Pointer],
         linear_beta_ptr: Optional[cute.Pointer],
+        zero_ptr: Optional[cute.Pointer],
         rows_w: cutlass.Int32,
         k: cutlass.Int32,
         num_local_experts: cutlass.Int32,
         rows_b: cutlass.Int32,
+        rows_perm: cutlass.Int32,
         out_rows: cutlass.Int32,
         out_cols: cutlass.Int32,
         num_tokens: cutlass.Int32,
         group_capacity: cutlass.Int32,
+        zero_words: cutlass.Int32,
         top_k: cutlass.Constexpr,
         beta_count: cutlass.Constexpr,
         linear_beta_count: cutlass.Constexpr,
@@ -1335,14 +1412,22 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             b_ptr, layout=cute.make_ordered_layout((rows_b, k, 1), order=(1, 0, 2))
         )
         sfa = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
-        sfb = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
+        sfb = cute.make_tensor(
+            sfb_ptr,
+            layout=cute.make_ordered_layout((rows_b, k // 32), order=(1, 0)),
+        )
         out = cute.make_tensor(
             out_ptr,
             layout=cute.make_ordered_layout((out_rows, out_cols, 1), order=(1, 0, 2)),
         )
         out_sf = None
         if cutlass.const_expr(out_sf_ptr is not None):
-            out_sf = cute.make_tensor(out_sf_ptr, layout=cute.make_layout((1,)))
+            out_sf = cute.make_tensor(
+                out_sf_ptr,
+                layout=cute.make_ordered_layout(
+                    (out_rows, out_cols // 32), order=(1, 0)
+                ),
+            )
         tile_expert = cute.make_tensor(
             tile_expert_ptr, layout=cute.make_layout((group_capacity,))
         )
@@ -1356,7 +1441,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         permuted_idx = None
         if cutlass.const_expr(permuted_idx_ptr is not None):
             permuted_idx = cute.make_tensor(
-                permuted_idx_ptr, layout=cute.make_layout((rows_b,))
+                permuted_idx_ptr, layout=cute.make_layout((rows_perm,))
+            )
+        zero_buf = None
+        if cutlass.const_expr(zero_ptr is not None):
+            zero_buf = cute.make_tensor(
+                zero_ptr, layout=cute.make_layout((zero_words,))
             )
         token_scales = None
         if cutlass.const_expr(token_scales_ptr is not None):
@@ -1387,6 +1477,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             token_scales,
             beta,
             linear_beta,
+            zero_buf,
+            top_k,
             max_active_clusters,
             stream,
         )

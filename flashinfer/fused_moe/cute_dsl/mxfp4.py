@@ -33,6 +33,7 @@ from ...tllm_enums import ActivationType
 from .fused_moe import _moe_core_impl, validate_w4a8_inputs
 from .moe_utils import get_max_num_tiles
 from .mxfp4_routing import _plan_route_preprocess
+from .swapab_moe import SWAP_ROW_TILE, swapab_gemm1_situ, swapab_gemm2
 from .tuner import DEFAULT_BLACKWELL_MOE_TACTIC, canonicalize_w4a8_tactic
 
 
@@ -396,6 +397,121 @@ class Mxfp4MoEPlan:
         return self.output
 
 
+class Mxfp4MoESwapAbPlan:
+    """Decode plan on the swap-AB path (T <= 16): fused route preprocessing
+    (ID unpack, FP32 weights, ``n_tile``-row expert groups, output zero-fill)
+    followed by the two swap-AB grouped GEMMs. Same contract as
+    :class:`Mxfp4MoEPlan`: fixed buffer addresses, graph-capturable ``run``.
+    """
+
+    def __init__(
+        self,
+        *,
+        wrapper,
+        buffers,
+        workspace,
+        x,
+        x_sf,
+        topk_ids,
+        topk_weights,
+        w1,
+        w1_sf,
+        w2,
+        w2_sf,
+        beta,
+        linear_beta,
+        output,
+        n_tile,
+    ):
+        self._wrapper = wrapper
+        self._buffers = buffers
+        self.workspace = workspace
+        self.output = output
+        self.device = output.device
+        self.n_tile = n_tile
+        self._inputs = (x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf)
+        self._beta = beta
+        self._linear_beta = linear_beta
+        self._route_ids = buffers["route_ids"] if topk_weights is None else topk_ids
+        self._route_weights = (
+            topk_weights
+            if topk_weights is not None and topk_weights.dtype == torch.float32
+            else buffers["route_weights"]
+        )
+
+    def _prepare(self):
+        w = self._wrapper
+        x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf = self._inputs
+        b = self._buffers
+        num_tokens = x.shape[0]
+        with torch.cuda.device(self.device):
+            self._route_preprocess = _plan_route_preprocess(
+                topk_ids,
+                topk_weights,
+                route_ids=self._route_ids,
+                route_weights=self._route_weights,
+                output=self.output,
+                moe_sort_buffers={
+                    name: value for name, value in b.items() if name.startswith("out_")
+                },
+                num_experts=w.num_experts,
+                num_local_experts=w.num_local_experts,
+                local_expert_offset=w.local_expert_offset,
+                tile_size=self.n_tile,
+                _single_tile_per_expert=self.n_tile >= num_tokens,
+            )
+            launches = {}
+            swapab_gemm1_situ(
+                w1=w1,
+                w1_sf=w1_sf,
+                x=x,
+                x_sf=x_sf,
+                permuted_idx_to_expanded_idx=b["out_permuted_idx_to_expanded_idx"],
+                act=b["gemm1_out"],
+                act_sf=b["gemm1_out_scale"],
+                tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"],
+                tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
+                num_non_exiting_tiles=b["out_num_non_exiting_tiles"],
+                alpha=b["w1_alpha"],
+                beta=self._beta,
+                linear_beta=self._linear_beta,
+                top_k=w.top_k,
+                zero_output=None,
+                n_tile=self.n_tile,
+                enable_pdl=w.enable_pdl,
+                _prepared_launches=launches,
+            )
+            swapab_gemm2(
+                w2=w2,
+                w2_sf=w2_sf,
+                act=b["gemm1_out"],
+                act_sf=b["gemm1_out_scale"],
+                out=self.output,
+                tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"],
+                tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
+                num_non_exiting_tiles=b["out_num_non_exiting_tiles"],
+                alpha=b["w2_alpha"],
+                permuted_idx_to_expanded_idx=b["out_permuted_idx_to_expanded_idx"],
+                token_final_scales=self._route_weights,
+                top_k=w.top_k,
+                finalize=True,
+                n_tile=self.n_tile,
+                enable_pdl=w.enable_pdl,
+                _prepared_launches=launches,
+            )
+            self._gemm1, self._gemm1_args = launches["swap_gemm1"]
+            self._gemm2, self._gemm2_args = launches["swap_gemm2"]
+
+    def run(self) -> torch.Tensor:
+        """Enqueue three launches on the caller's current stream."""
+        with torch.cuda.device(self.device):
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            self._route_preprocess.run(stream)
+            self._gemm1(*self._gemm1_args, stream=stream)
+            self._gemm2(*self._gemm2_args, stream=stream)
+        return self.output
+
+
 class CuteDslMxfp4MoEWrapper:
     """MXFP4 runner with offline tactics and explicit caller-owned workspace.
 
@@ -431,6 +547,8 @@ class CuteDslMxfp4MoEWrapper:
         quantization: str = "mxfp4_w4a8",
         enable_pdl: bool = False,
         offline_tactics: Optional[dict] = None,
+        swapab_max_tokens: int = 16,
+        swapab_n_tile: int = SWAP_ROW_TILE,
     ):
         self.num_experts = num_experts
         self.top_k = top_k
@@ -439,6 +557,15 @@ class CuteDslMxfp4MoEWrapper:
         self.activation_type = ActivationType(activation_type)
         self.quantization = quantization
         self.enable_pdl = enable_pdl
+        # Swap-AB decode path: token counts up to ``swapab_max_tokens`` (0
+        # disables) run weights-as-M grouped GEMMs with ``swapab_n_tile``-row
+        # expert groups; the fused route preprocess bounds it to T <= 16.
+        if not 0 <= swapab_max_tokens <= 16:
+            raise ValueError("swapab_max_tokens must be in [0, 16]")
+        if swapab_n_tile not in (8, 16, 32, 64, 128):
+            raise ValueError("swapab_n_tile must be 8, 16, 32, 64 or 128")
+        self.swapab_max_tokens = swapab_max_tokens
+        self.swapab_n_tile = swapab_n_tile
         supported = mxfp4_moe_capability(
             gpu_arch=103,
             hidden_size=hidden_size,
@@ -488,9 +615,53 @@ class CuteDslMxfp4MoEWrapper:
                 return tactic
         return DEFAULT_BLACKWELL_MOE_TACTIC
 
+    def _use_swapab(self, num_tokens):
+        return (
+            1 <= num_tokens <= self.swapab_max_tokens
+            and self.activation_type == ActivationType.Situ
+            and not self.enable_pdl
+        )
+
     def _workspace_fields(self, num_tokens):
         if num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
+        if self._use_swapab(num_tokens):
+            tile = self.swapab_n_tile
+            tiles = get_max_num_tiles(
+                num_tokens, self.top_k, self.num_local_experts, tile
+            )
+            rows = tiles * tile
+            specs = [
+                ("out_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
+                ("out_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
+                (
+                    "out_expanded_idx_to_permuted_idx",
+                    (num_tokens, self.top_k),
+                    torch.int32,
+                    4,
+                ),
+                ("out_permuted_idx_to_expanded_idx", (rows,), torch.int32, 4),
+                ("out_total_num_padded_tokens", (1,), torch.int32, 4),
+                ("out_num_non_exiting_tiles", (1,), torch.int32, 4),
+                ("gemm1_out", (rows, self.intermediate_shard), torch.float8_e4m3fn, 1),
+                (
+                    "gemm1_out_scale",
+                    (rows, self.intermediate_shard // 32),
+                    torch.uint8,
+                    1,
+                ),
+                ("route_ids", (num_tokens, self.top_k), torch.int32, 4),
+                ("route_weights", (num_tokens, self.top_k), torch.float32, 4),
+                ("w1_alpha", (self.num_local_experts,), torch.float32, 4),
+                ("w2_alpha", (self.num_local_experts,), torch.float32, 4),
+            ]
+            fields, offset = [], 0
+            for name, shape, dtype, itemsize in specs:
+                offset = _align(offset)
+                size = prod(shape) * itemsize
+                fields.append(_WorkspaceField(name, shape, dtype, offset, size))
+                offset += size
+            return fields, _align(offset)
         tile = self._tactic(num_tokens)[0]
         tiles = get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
         rows = tiles * tile
@@ -721,6 +892,28 @@ class CuteDslMxfp4MoEWrapper:
             validate_w4a8_inputs(x, x_sf, route_weights, w1, w1_sf, w2, w2_sf)
             if w1_sf.device != x.device or w2_sf.device != x.device:
                 raise ValueError("weight scales must be on the input device")
+            if self._use_swapab(num_tokens):
+                if (major, minor) not in ((10, 0), (10, 3)):
+                    raise ValueError("the swap-AB decode path requires SM100/SM103")
+                swap_plan = Mxfp4MoESwapAbPlan(
+                    wrapper=self,
+                    buffers=buffers,
+                    workspace=workspace,
+                    x=x,
+                    x_sf=x_sf,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    w1=w1,
+                    w1_sf=w1_sf,
+                    w2=w2,
+                    w2_sf=w2_sf,
+                    beta=beta,
+                    linear_beta=linear_beta,
+                    output=output,
+                    n_tile=self.swapab_n_tile,
+                )
+                swap_plan._prepare()
+                return swap_plan
             tile, gemm1, gemm2 = self._tactic(num_tokens)
             # The public routing contract requires distinct IDs per token,
             # so an expert has at most T rows. Restrict this specialization

@@ -224,8 +224,15 @@ def main():
         "--candidate-impl",
         choices=("cute_dsl", "swapab"),
         default="cute_dsl",
-        help="candidate implementation: the CuTe DSL wrapper plan, or the "
-        "experimental swap-AB decode path (separate routing only)",
+        help="candidate implementation: the CuTe DSL wrapper plan (which itself "
+        "takes the swap-AB decode path for T <= --swapab-max-tokens), or the "
+        "standalone moe_sort-based swap-AB forward (separate routing only)",
+    )
+    parser.add_argument(
+        "--swapab-max-tokens",
+        type=int,
+        default=16,
+        help="wrapper plan: largest token count routed to the swap-AB path (0 = off)",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
@@ -463,6 +470,7 @@ def main():
                     parallel_layout=parallel_layout,
                     enable_pdl=False,
                     offline_tactics=tactics,
+                    swapab_max_tokens=args.swapab_max_tokens,
                 )
                 workspace = torch.empty(
                     wrapper.get_workspace_size(count), device="cuda", dtype=torch.uint8
@@ -596,6 +604,7 @@ def main():
                         "routing_histogram": histogram,
                         "parallel_routing_histogram": rank_histogram,
                         "candidate_impl": args.candidate_impl,
+                        "swapab_max_tokens": args.swapab_max_tokens,
                         "workspace_bytes": workspace.numel(),
                         "output_bytes": output.numel() * output.element_size(),
                         "candidate_weight_bytes": candidate_weight_bytes,
