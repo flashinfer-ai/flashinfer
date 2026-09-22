@@ -24,7 +24,7 @@ rejected. Every rank output is a partial sum whose reduction is external.
 
 from dataclasses import dataclass
 from math import prod
-from typing import Optional
+from typing import Optional, Union
 
 import cuda.bindings.driver as cuda
 import os
@@ -880,7 +880,7 @@ class CuteDslMxfp4MoEWrapper:
         workspace: torch.Tensor,
         output: torch.Tensor,
         do_finalize: bool = True,
-    ) -> Mxfp4MoEPlan:
+    ) -> Union[Mxfp4MoEPlan, Mxfp4MoESwapAbPlan]:
         """Bind buffers and prepare kernels; all tensor contents must be valid.
 
         Weights use ``prepare_cute_dsl_mxfp4_weights`` layouts for this rank's
