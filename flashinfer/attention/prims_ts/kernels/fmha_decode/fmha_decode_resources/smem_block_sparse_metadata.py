@@ -1294,9 +1294,6 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         cfg = self.cfg
         groups = cfg.sage_summary_k_groups_per_fragment
         num_origins = self.staging_layout.num_origin_words
-        origins = cutlass.Array(Int32, num_origins, space=cutlass.AddressSpace.rmem)
-        for atom in cutlass.range_constexpr(num_origins):
-            origins[atom] = Int32(self._smem_words[stage_base + Int32(atom)])
         kv_head_idx, batch_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
@@ -1309,10 +1306,8 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             _ = word_idx
             atom_idx, token_offset = sage_word_position(cfg, half, lane_entry, groups)
             atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
-            origin = Int32(origins[0])
-            for atom in cutlass.range_constexpr(1, num_origins):
-                if atom_idx == Int32(atom):
-                    origin = Int32(origins[atom])
+            # The route stage stays owned until the scale tile has been filled.
+            origin = Int32(self._smem_words[stage_base + atom_idx])
             return load_k_scale(
                 cfg,
                 scale_addr,
