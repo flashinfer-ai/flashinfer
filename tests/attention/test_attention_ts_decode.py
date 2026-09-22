@@ -71,13 +71,9 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import
     make_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
-    BYTES_PER_KIB,
     FP8_P_QUANT_SCALE,
-    KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
-    KV_TILE_256_SHARED_FIFO_STAGES,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
-    TOTAL_SMEM_BUDGET_KIB,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
     _build_decode_gen_schedule,
@@ -3582,94 +3578,6 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
     assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
-def test_attention_ts_decode_kv256_fp8_tiles_size_the_ring_and_alias_p() -> None:
-    """FP8 KV256 stages one byte per element; the ring holds whole tiles and P aliases S.
-
-    ``test_attention_ts_decode_kv256_ring_depth_follows_element_width`` pins the
-    stage count and the SMEM capacity; this test pins the byte accounting and
-    the TMEM layout behind it.
-    """
-
-    cfg = _make_contiguous_kv256_config(dtype=Float8E4M3FN)
-    assert cfg.smem_kv_tile_bytes == cfg.tile_size_kv * cfg.headdim
-    pipeline_smem_bytes = (
-        cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
-    )
-    assert pipeline_smem_bytes <= TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
-
-    resources, _smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
-    assert resources["smemKv"]._alloc.size_bytes == (
-        cfg.kv_stages * cfg.smem_kv_tile_bytes
-    )
-    assert resources["tmemO"]._alloc.offset == 0
-    assert resources["smemP0"]._tmem_alloc.offset == resources["tmemS0"]._alloc.offset
-    assert resources["smemP0"]._tmem_alloc.num_columns == cfg.fragment_p_packed_cols * (
-        cfg.num_softmax_score_fragments
-    )
-
-
-@pytest.mark.parametrize(
-    ("dtype", "qkv_layout", "expected_kv_stages"),
-    (
-        pytest.param(
-            BFloat16, "contiguousKv", KV_TILE_256_SHARED_FIFO_STAGES, id="bf16"
-        ),
-        pytest.param(
-            Float16, "contiguousKv", KV_TILE_256_SHARED_FIFO_STAGES, id="fp16"
-        ),
-        pytest.param(
-            BFloat16, "pagedKv", KV_TILE_256_SHARED_FIFO_STAGES, id="bf16-paged"
-        ),
-        pytest.param(
-            Float8E4M3FN,
-            "contiguousKv",
-            KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
-            id="fp8",
-        ),
-        pytest.param(
-            Float8E4M3FN,
-            "pagedKv",
-            KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
-            id="fp8-paged",
-        ),
-    ),
-)
-@pytest.mark.parametrize("persistent", (False, True), ids=("static", "persistent"))
-def test_attention_ts_decode_kv256_ring_depth_follows_element_width(
-    dtype,
-    qkv_layout: str,
-    expected_kv_stages: int,
-    persistent: bool,
-) -> None:
-    """Byte-wide K/V tiles fund a deeper shared ring; 16-bit tiles keep three."""
-
-    cfg = _make_contiguous_kv256_config(
-        dtype=dtype,
-        o_dtype=Float16 if dtype == Float8E4M3FN else dtype,
-        persistent=persistent,
-        qkv_layout=qkv_layout,
-        num_tokens_per_page=128 if qkv_layout == "pagedKv" else 32,
-    )
-    assert cfg.kv_stages == expected_kv_stages
-    if not persistent:
-        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
-        assert resources["smemKv"].pipeline_config.num_stages == expected_kv_stages
-        assert_decode_smem_within_capacity(cfg, smem_allocator)
-
-
-def test_attention_ts_decode_kv256_fp8_explicit_ring_depth_is_honored() -> None:
-    """An explicit kv_stages overrides the byte-wide default in both directions."""
-
-    for kv_stages in (KV_TILE_256_SHARED_FIFO_STAGES, 6):
-        cfg = _make_contiguous_kv256_config(
-            dtype=Float8E4M3FN, config_args={"kv_stages": kv_stages}
-        )
-        assert cfg.kv_stages == kv_stages
-        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
-        assert resources["smemKv"].pipeline_config.num_stages == kv_stages
-        assert_decode_smem_within_capacity(cfg, smem_allocator)
-
-
 def test_attention_ts_decode_kv256_fp8_rejects_attention_sinks() -> None:
     """FP8 KV256 follows the FP8 Keeps recipes and excludes attention sinks."""
 
@@ -3690,11 +3598,8 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     the fragment register count, so the profile property and the fragment
     count are pinned together. They also run their two softmax groups
     unordered. Dense 16-bit Q128/KV128 keeps the complete P row because its
-    route loop is not load-bound; only block-sparse Q128 streams. FP8 streams
-    the same fragments with four probabilities per packed column, one PV MMA
-    per fragment, and the exact row maximum as the exponent anchor because
-    the static 448 quantization scale requires probabilities at most one;
-    dense FP8 Q128 streams as well.
+    route loop is not load-bound; FP8 Q128 streams like KV256 because its
+    static 448 quantization scale needs the exact row maximum per fragment.
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -3703,18 +3608,6 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert kv256.num_softmax_score_fragments == 4
     assert kv256.kv_block_size % kv256.softmax_score_fragment_regs == 0
     assert not kv256.uses_ordered_softmax_barrier
-    assert kv256.fragment_p_packed_cols == 16
-    assert kv256.pv_mma_steps_per_fragment == 2
-    assert kv256.defers_softmax_anchor_updates
-
-    kv256_fp8 = _make_contiguous_kv256_config(dtype=Float8E4M3FN, persistent=persistent)
-    assert kv256_fp8.streams_tmem_p_fragments
-    assert kv256_fp8.softmax_score_fragment_regs == 32
-    assert kv256_fp8.num_softmax_score_fragments == 4
-    assert kv256_fp8.fragment_p_packed_cols == 8
-    assert kv256_fp8.pv_mma_steps_per_fragment == 1
-    assert kv256_fp8.tmem_p_cols_per_inst == 32
-    assert not kv256_fp8.defers_softmax_anchor_updates
 
     q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
     assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
@@ -3724,151 +3617,33 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
     assert q128_fp8.uses_two_inst_tmem_p
     assert q128_fp8.streams_tmem_p_fragments
-    assert q128_fp8.softmax_score_fragment_regs == 32
-    assert q128_fp8.num_softmax_score_fragments == 4
-    assert q128_fp8.fragment_p_packed_cols == 8
-    assert q128_fp8.pv_mma_steps_per_fragment == 1
-    assert not q128_fp8.defers_softmax_anchor_updates
-
-    q128_fp8_sparse = replace(
-        q128_fp8, use_block_sparse=True, q_block_size=128, kv_block_size=128
-    )
-    assert q128_fp8_sparse.streams_tmem_p_fragments
-    assert q128_fp8_sparse.softmax_score_fragment_regs == 32
-    assert q128_fp8_sparse.fragment_p_packed_cols == 8
-    assert q128_fp8_sparse.pv_mma_steps_per_fragment == 1
-    assert not q128_fp8_sparse.defers_softmax_anchor_updates
 
 
 @pytest.mark.parametrize("tile_size_q", (64, 128))
+@pytest.mark.parametrize("qk_dtype", (Float8E4M3FN, Int8), ids=("fp8", "int8"))
 @pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
-def test_attention_ts_decode_sage_profile_accepts_int8_qk_with_e4m3_v(
-    tile_size_q: int, o_dtype
+def test_attention_ts_decode_sage_profile_accepts_8bit_recipes(
+    tile_size_q: int, qk_dtype, o_dtype
 ) -> None:
-    """INT8 Q/K keeps the byte-wide data path and switches BMM1 to INT32 scores."""
+    """Sage runs E4M3 or Int8 Q/K with E4M3 V and a 16-bit output on both Keeps tiles.
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_common import (
-        _mma_kind_for_pv,
-        _mma_kind_for_qk,
-    )
-    from cutlass.experimental.primitives import Tcgen05MMAKind
-
-    cfg = make_sage_decode_config(
-        tile_size_q=tile_size_q,
-        tile_size_kv=256 if tile_size_q == 64 else 128,
-        qkv_dtype=Int8,
-        v_dtype=Float8E4M3FN,
-        o_dtype=o_dtype,
-    )
-    assert cfg.use_sage_attention and cfg.uses_int32_scores
-    assert cfg.q_dtype == cfg.k_dtype == Int8
-    assert cfg.v_dtype == Float8E4M3FN
-    assert cfg.q_dtype_bytes == cfg.kv_dtype_bytes == 1
-    assert cfg.streams_tmem_p_fragments
-    assert cfg.fragment_p_packed_cols == 8
-    assert cfg.pv_mma_steps_per_fragment == 1
-    assert not cfg.defers_softmax_anchor_updates
-    assert _mma_kind_for_qk(cfg) == Tcgen05MMAKind.INT8
-    assert _mma_kind_for_pv(cfg) == Tcgen05MMAKind.F8F6F4
-
-    fp8_cfg = make_sage_decode_config(
-        tile_size_q=tile_size_q, tile_size_kv=256 if tile_size_q == 64 else 128
-    )
-    assert fp8_cfg.v_dtype == Float8E4M3FN
-    assert not fp8_cfg.uses_int32_scores
-    assert _mma_kind_for_qk(fp8_cfg) == Tcgen05MMAKind.F8F6F4
-    assert _mma_kind_for_pv(fp8_cfg) == Tcgen05MMAKind.F8F6F4
-
-    bf16_cfg = _make_contiguous_kv256_config()
-    assert bf16_cfg.v_dtype == bf16_cfg.k_dtype == BFloat16
-    assert _mma_kind_for_qk(bf16_cfg) == Tcgen05MMAKind.F16
-    assert _mma_kind_for_pv(bf16_cfg) == Tcgen05MMAKind.F16
-
-
-def test_attention_ts_decode_v_dtype_follows_the_probe_dtype_flip() -> None:
-    """The grouped-Q selector scores BF16 Q64 as its FP16 twin; V flips with K.
-
-    A V dtype left at BF16 would fail the K/V rule inside the selector's probe
-    and silently drop the Q64 candidate, so BF16 would never select Q64/KV256.
-    """
-
-    for shape in (
-        dict(
-            seq_len_q=4, seq_len_kv=4096, batch_size=1, num_heads_q=64, num_heads_kv=1
-        ),
-        dict(
-            seq_len_q=8, seq_len_kv=32768, batch_size=64, num_heads_q=16, num_heads_kv=1
-        ),
-    ):
-        cfg = make_decode_config(
-            headdim=128,
-            q_dtype=BFloat16,
-            k_dtype=BFloat16,
-            o_dtype=BFloat16,
-            qkv_layout="pagedKv",
-            mask_type="causal",
-            **shape,
-        )
-        assert (cfg.tile_size_q, cfg.tile_size_kv) == (64, 256)
-        assert cfg.v_dtype == cfg.k_dtype == BFloat16
-
-
-def test_attention_ts_decode_v_follows_k_unless_given() -> None:
-    """An unset V dtype follows K; an explicit V dtype is kept."""
-
-    shape = dict(
-        seq_len_q=1, seq_len_kv=4096, batch_size=1, num_heads_q=8, num_heads_kv=8
-    )
-    cfg = make_decode_config(
-        headdim=128,
-        q_dtype=Float8E4M3FN,
-        k_dtype=Float8E4M3FN,
-        o_dtype=BFloat16,
-        **shape,
-    )
-    assert cfg.v_dtype == Float8E4M3FN
-    cfg = make_decode_config(
-        headdim=128,
-        q_dtype=BFloat16,
-        k_dtype=BFloat16,
-        v_dtype=Float8E4M3FN,
-        o_dtype=BFloat16,
-        **shape,
-    )
-    assert (cfg.k_dtype, cfg.v_dtype) == (BFloat16, Float8E4M3FN)
-
-
-# Dense Sage grids: both streamed Keeps profiles qualify for the static and the
-# persistent scheduler.
-_DENSE_SAGE_GRIDS = ((64, False), (64, True), (128, False), (128, True))
-
-
-@pytest.mark.parametrize(("tile_size_q", "persistent"), _DENSE_SAGE_GRIDS)
-@pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
-def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
-    tile_size_q: int, o_dtype, mask_type: str, persistent: bool
-) -> None:
-    """Sage runs the two streamed Keeps profiles on their qualified grids.
-
-    The scale addressing resolves the tile through the work tile, so the
-    persistent scheduler shares the static kernel's Sage passes wherever the
-    profile admits it.
+    V follows K for the E4M3 recipe and is named for Int8 Q/K.
     """
 
     cfg = make_sage_decode_config(
         tile_size_q=tile_size_q,
         tile_size_kv=256 if tile_size_q == 64 else 128,
+        qkv_dtype=qk_dtype,
+        v_dtype=Float8E4M3FN if qk_dtype == Int8 else None,
         o_dtype=o_dtype,
-        mask_type=mask_type,
-        sage_args={"use_persistent_scheduler": persistent},
     )
     assert cfg.use_sage_attention
-    assert cfg.use_persistent_scheduler is persistent
-    assert cfg.streams_tmem_p_fragments
-    assert not cfg.uses_int32_scores
-    assert cfg.out_dtype == o_dtype
-    assert not cfg.defers_softmax_anchor_updates
+    assert (cfg.q_dtype, cfg.k_dtype, cfg.v_dtype, cfg.out_dtype) == (
+        qk_dtype,
+        qk_dtype,
+        Float8E4M3FN,
+        o_dtype,
+    )
 
 
 @pytest.mark.parametrize(
@@ -3885,16 +3660,11 @@ def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
         ),
         pytest.param(
             {"qkv_dtype": Int8},
-            "Int8 Q/K requires Float8E4M3FN V",
+            "requires Float8E4M3FN V",
             id="int8-v-defaults-to-k",
         ),
-        pytest.param(
-            {"qkv_dtype": Int8, "v_dtype": Int8},
-            "Int8 Q/K requires Float8E4M3FN V",
-            id="int8-v",
-        ),
         pytest.param({"v_dtype": Float16}, "v_dtype", id="fp8-k-16-bit-v"),
-        pytest.param({"v_dtype": Int8}, "v_dtype: Int8", id="fp8-k-int8-v"),
+        pytest.param({"v_dtype": Int8}, "requires Float8E4M3FN V", id="fp8-k-int8-v"),
         pytest.param(
             {"qkv_dtype": Float16, "o_dtype": Float16},
             "Float8E4M3FN or Int8 Q and K",

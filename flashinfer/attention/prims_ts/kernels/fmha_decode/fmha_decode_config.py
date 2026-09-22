@@ -1680,19 +1680,9 @@ class FmhaDecodeConfig:
         where INT8 Q/K pair with E4M3 V so that P stays E4M3 and the K/V ring
         keeps one element width.
         """
-        # The Int8 recipe's V rule comes first so an Int8 V is reported as the
-        # recipe violation it is, not as an unsupported V dtype.
-        if self.k_dtype == Int8:
-            if not self.use_sage_attention:
-                raise ValueError("Int8 Q/K requires Sage attention scales")
-            if self.v_dtype != Float8E4M3FN:
-                raise ValueError(
-                    f"Int8 Q/K requires Float8E4M3FN V, got v_dtype {self.v_dtype}"
-                )
         for name, dtype, supported in (
             ("q_dtype", self.q_dtype, SUPPORTED_QK_DTYPES),
             ("k_dtype", self.k_dtype, SUPPORTED_QK_DTYPES),
-            ("v_dtype", self.v_dtype, SUPPORTED_IO_DTYPES),
             ("out_dtype", self.out_dtype, SUPPORTED_IO_DTYPES),
             ("acc_dtype", self.acc_dtype, SUPPORTED_ACC_DTYPES),
         ):
@@ -1703,18 +1693,21 @@ class FmhaDecodeConfig:
                 f"q_dtype ({self.q_dtype}) must match k_dtype ({self.k_dtype}); "
                 "mixed Q/K element types are not supported"
             )
-        if (
-            self.use_sage_attention
-            and (self.q_dtype, self.k_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES
-        ):
-            raise ValueError(
-                "Sage attention requires Float8E4M3FN or Int8 Q and K with "
-                "Float16 or BFloat16 output"
-            )
-        if self.use_sage_attention and self.v_dtype != Float8E4M3FN:
-            raise ValueError(
-                f"Sage attention requires Float8E4M3FN V, got v_dtype {self.v_dtype}"
-            )
+        if self.use_sage_attention:
+            if (self.q_dtype, self.k_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES:
+                raise ValueError(
+                    "Sage attention requires Float8E4M3FN or Int8 Q and K with "
+                    "Float16 or BFloat16 output"
+                )
+            if self.v_dtype != Float8E4M3FN:
+                raise ValueError(
+                    "Sage attention requires Float8E4M3FN V, "
+                    f"got v_dtype {self.v_dtype}"
+                )
+        elif self.k_dtype == Int8:
+            raise ValueError("Int8 Q/K requires Sage attention scales")
+        elif self.v_dtype not in SUPPORTED_IO_DTYPES:
+            raise ValueError(f"Unsupported v_dtype: {self.v_dtype}")
 
     def validate_boolean_fields(self) -> None:
         """Require every boolean config field to carry a real Python bool."""

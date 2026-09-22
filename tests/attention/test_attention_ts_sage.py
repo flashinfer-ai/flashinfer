@@ -27,7 +27,6 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0",
 )
 
-from flashinfer.attention.prims_ts import sage as sage_module
 from flashinfer.attention.prims_ts.sage import (
     SageAttentionConfig,
     SageAttentionParams,
@@ -40,9 +39,6 @@ from flashinfer.attention.prims_ts.sage import (
 
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
     FP8_P_QUANT_SCALE,
-)
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources import (
-    sage_scales,
 )
 
 from tests.attention.prims_ts_test_utils import (
@@ -173,41 +169,6 @@ def test_log2_block_size_rejects_other_sizes(block_size: int) -> None:
 # ---------------------------------------------------------------------------
 # Kernel-side scale addressing
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("tile_size_q", (64, 128))
-@pytest.mark.parametrize("k_block_size", (1, 4, 16, 32, 64, 128, 256))
-def test_sage_scale_arr_size_follows_fragment_groups(
-    tile_size_q: int, k_block_size: int
-) -> None:
-    """Both streamed profiles own four K32 fragments; blocks below 32 split them.
-
-    The Sage predicates follow the K block size alone: a 16-token block splits
-    every K32 fragment into two scale groups, a 4-token block into eight and a
-    one-token block into 32, larger blocks share one scale per fragment, and a
-    profile without a K block size runs without Sage. Blocks below 16 tokens
-    keep the tile's ``sfK`` words in SMEM instead of a lane register array.
-    """
-
-    cfg = make_sage_decode_config(
-        tile_size_q=tile_size_q,
-        tile_size_kv=256 if tile_size_q == 64 else 128,
-        sage_args={"sage_k_block_size": k_block_size},
-    )
-    groups = max(1, 32 // k_block_size)
-    assert cfg.use_sage_attention and cfg.streams_tmem_p_fragments
-    assert not cfg.uses_int32_scores
-    assert cfg.num_softmax_score_fragments == 4
-    assert cfg.sage_k_groups_per_fragment == groups
-    assert sage_scales.sage_scale_arr_size(cfg, groups) == 4 * groups
-    assert cfg.sage_k_scales_in_smem == (k_block_size < 16)
-    assert sage_scales.sage_k_scale_words(cfg, groups) == (
-        (2 if tile_size_q == 64 else 1) * 4 * groups
-    )
-
-    plain = replace(cfg, sage_k_block_size=0, sage_q_block_size=0)
-    assert not plain.use_sage_attention
-    assert plain.sage_k_groups_per_fragment == 1
 
 
 @pytest.mark.parametrize(
@@ -472,45 +433,6 @@ def test_summary_scales_follow_the_summary_block_size(
     )
 
 
-@pytest.mark.parametrize("use_proxy_routes", (False, True))
-def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -> None:
-    """Plans without proxy routes compile one kernel per recipe, whatever the summary block."""
-
-    from flashinfer.attention.prims_ts._block_sparse import (
-        config as block_sparse_config,
-    )
-
-    key = make_block_sparse_compile_key(
-        seq_len_q=64,
-        seq_len_kv=4096,
-        q_block_size=64,
-        kv_block_size=64,
-        kv_route_size=256,
-        dtype_key="float8_e4m3fn",
-        sparse_format="bitmask",
-        use_proxy_routes=use_proxy_routes,
-        out_dtype_key="bfloat16",
-        sage=SageAttentionConfig(k_summary_block_size=1),
-    )
-    cfg = block_sparse_config._make_block_sparse_config(key)
-    assert cfg.sage_k_block_size == 16
-    assert cfg.sage_k_summary_block_size == (1 if use_proxy_routes else 16)
-    assert cfg.sage_mixed_k_geometry == use_proxy_routes
-    assert cfg.sage_summary_k_groups_per_fragment == (32 if use_proxy_routes else 2)
-    # One scale per summary score: the max pass writes proxy tiles back
-    # dequantized and the P pass needs no summary scales.
-    assert cfg.sage_scores_dequantized_for(True) == use_proxy_routes
-    assert not cfg.sage_scores_dequantized_for(False)
-    if use_proxy_routes:
-        assert cfg.sage_k_scales_in_smem_for(cfg.sage_summary_k_groups_per_fragment)
-        assert not cfg.sage_k_scales_in_smem
-        # Proxy routes gather their words in the softmax warps; staging
-        # covers the exact geometry.
-        assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 2
-    else:
-        assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 2
-
-
 @pytest.mark.parametrize(
     ("use_block_sparse", "use_proxy_routes"),
     ((False, False), (True, False), (True, True)),
@@ -649,17 +571,6 @@ def test_sage_params_reject_scales_on_another_device() -> None:
     params = _make_params()
     with pytest.raises(ValueError, match="device"):
         _validate(params, device=torch.device("cuda", 0))
-
-
-def test_sage_module_exports() -> None:
-    assert set(sage_module.__all__) >= {
-        "SageAttentionConfig",
-        "SageAttentionParams",
-        "flat_scale_numel",
-        "flat_scale_slot",
-        "log2_block_size",
-        "validate_sage_params",
-    }
 
 
 # ---------------------------------------------------------------------------

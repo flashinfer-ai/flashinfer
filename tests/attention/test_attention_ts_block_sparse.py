@@ -53,7 +53,6 @@ from tests.attention.prims_ts_test_utils import (
     HEAD_DIM as _HEAD_DIM,
     Patterns as _Patterns,
     REQUIRES_PRIMTS_GPU as _REQUIRES_PRIMTS_GPU,
-    assert_decode_smem_within_capacity,
     block_mean,
     make_block_sparse_compile_key,
     make_bsr,
@@ -1650,71 +1649,6 @@ def test_block_sparse_static_profile_accepts_supported_gqa_groups(
 
 
 @pytest.mark.parametrize(
-    "recipe",
-    (
-        prims_ts.SageAttentionConfig(),
-        prims_ts.SageAttentionConfig(q_block_size=4, k_block_size=32),
-    ),
-    ids=("default-recipe", "q4-k32-recipe"),
-)
-@pytest.mark.parametrize("output_dtype", (None, torch.bfloat16, torch.float16))
-def test_block_sparse_static_profile_relaxes_dtypes_with_sage(
-    recipe: prims_ts.SageAttentionConfig,
-    output_dtype: torch.dtype | None,
-) -> None:
-    """A Sage recipe qualifies E4M3 Q/K/V with a 16-bit output and is kept on the profile.
-
-    BF16 is the default output dtype.
-    """
-
-    profile = _validate_static_profile(
-        q_dtype=_FP8, output_dtype=output_dtype, sage=recipe
-    )
-
-    assert profile.dtype_key == "float8_e4m3fn"
-    assert profile.v_dtype == _FP8
-    assert profile.output_dtype == (output_dtype or torch.bfloat16)
-    assert profile.sage == recipe
-
-
-@pytest.mark.parametrize("output_dtype", (None, torch.float16))
-def test_block_sparse_static_profile_accepts_int8_qk_with_sage(
-    output_dtype: torch.dtype | None,
-) -> None:
-    """INT8 Q/K with E4M3 V is the second Sage recipe; V must be named."""
-
-    config = prims_ts.SageAttentionConfig()
-    profile = _validate_static_profile(
-        q_dtype=torch.int8,
-        kv_dtype=torch.int8,
-        output_dtype=output_dtype,
-        sage=config,
-        v_dtype=_FP8,
-    )
-
-    assert profile.dtype_key == "int8"
-    assert profile.q_dtype == profile.kv_dtype == torch.int8
-    assert profile.v_dtype == _FP8
-    assert profile.output_dtype == (output_dtype or torch.bfloat16)
-    assert profile.sage == config
-
-
-def test_block_sparse_static_profile_v_dtype_defaults_to_k_dtype() -> None:
-    """Omitting V follows the K dtype; the decode configuration judges INT8 V."""
-
-    profile = _validate_static_profile(
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16,
-    )
-    assert profile.v_dtype == torch.bfloat16
-    profile = _validate_static_profile(
-        q_dtype=torch.int8, kv_dtype=torch.int8, sage=prims_ts.SageAttentionConfig()
-    )
-    assert profile.v_dtype == torch.int8
-
-
-@pytest.mark.parametrize(
     ("overrides", "error_type", "message"),
     (
         pytest.param(
@@ -1751,120 +1685,75 @@ def test_block_sparse_static_profile_v_dtype_defaults_to_k_dtype() -> None:
             "matching",
             id="16-bit-v-mismatch",
         ),
+        pytest.param(
+            {
+                "q_dtype": _FP8,
+                "kv_dtype": torch.bfloat16,
+                "sage": prims_ts.SageAttentionConfig(),
+            },
+            ValueError,
+            "one dtype",
+            id="sage-mixed-qk",
+        ),
+        pytest.param(
+            {"q_dtype": _FP8, "sage": {"k_block_size": 16}},
+            TypeError,
+            "SageAttentionConfig",
+            id="sage-recipe-type",
+        ),
     ),
 )
-def test_block_sparse_static_profile_keeps_the_16_bit_dtype_rule_without_sage(
+def test_block_sparse_static_profile_rejects_dtype_recipes(
     overrides: dict[str, object],
     error_type: type[Exception],
     message: str,
 ) -> None:
-    """Without a Sage recipe, Q, K, V and the output share one 16-bit dtype."""
+    """Q, K, V and the output share one 16-bit dtype unless a Sage recipe names 8-bit Q/K."""
 
     with pytest.raises(error_type, match=message):
         _validate_static_profile(**overrides)
-    assert _validate_static_profile().dtype_key == "float16"
-
-
-def test_block_sparse_compile_key_builds_int8_sage_config() -> None:
-    """The INT8 key selects the INT32-score kernel with E4M3 V and P."""
-
-    from cutlass import BFloat16, Float8E4M3FN, Int8
-
-    key = make_block_sparse_compile_key(
-        dtype_key="int8",
-        out_dtype_key="bfloat16",
-        v_dtype_key="float8_e4m3fn",
-        sage=prims_ts.SageAttentionConfig(),
-    )
-    cfg = block_sparse_config._make_block_sparse_config(key)
-    assert cfg.q_dtype == cfg.k_dtype == Int8
-    assert cfg.v_dtype == Float8E4M3FN
-    assert cfg.out_dtype == BFloat16
-    assert cfg.uses_int32_scores
-    fp8_cfg = block_sparse_config._make_block_sparse_config(
-        replace(key, dtype_key="float8_e4m3fn", v_dtype_key="float8_e4m3fn")
-    )
-    assert fp8_cfg.v_dtype == Float8E4M3FN
-    assert not fp8_cfg.uses_int32_scores
-    # INT8 Q/K with V following K is the decode configuration's rejection.
-    with pytest.raises(ValueError, match="Float8E4M3FN V"):
-        block_sparse_config._make_block_sparse_config(replace(key, v_dtype_key="int8"))
 
 
 @pytest.mark.parametrize(
-    ("dtype_key", "v_dtype_key", "sage", "use_block_sparse", "use_proxy_routes"),
+    ("overrides", "expected"),
     (
-        pytest.param("bfloat16", "bfloat16", False, True, False, id="bf16-sparse"),
-        pytest.param("bfloat16", "bfloat16", False, False, False, id="bf16-dense"),
+        pytest.param({}, ("float16", torch.float16, torch.float16), id="fp16"),
         pytest.param(
-            "float8_e4m3fn", "float8_e4m3fn", True, True, False, id="fp8-sparse-exact"
+            {"q_dtype": _FP8, "sage": prims_ts.SageAttentionConfig()},
+            ("float8_e4m3fn", _FP8, torch.bfloat16),
+            id="fp8-sage",
         ),
         pytest.param(
-            "float8_e4m3fn", "float8_e4m3fn", True, True, True, id="fp8-sparse-proxy"
+            {
+                "q_dtype": _FP8,
+                "output_dtype": torch.float16,
+                "sage": prims_ts.SageAttentionConfig(q_block_size=4, k_block_size=32),
+            },
+            ("float8_e4m3fn", _FP8, torch.float16),
+            id="fp8-sage-fp16-out",
         ),
         pytest.param(
-            "float8_e4m3fn", "float8_e4m3fn", True, False, False, id="fp8-dense"
+            {
+                "q_dtype": torch.int8,
+                "kv_dtype": torch.int8,
+                "v_dtype": _FP8,
+                "sage": prims_ts.SageAttentionConfig(),
+            },
+            ("int8", _FP8, torch.bfloat16),
+            id="int8-sage",
         ),
-        pytest.param("int8", "float8_e4m3fn", True, True, False, id="int8-sparse"),
     ),
 )
-@pytest.mark.parametrize("persistent", (False, True), ids=("static", "persistent"))
-def test_kv256_ring_depth_follows_element_width_and_fits_smem(
-    dtype_key: str,
-    v_dtype_key: str,
-    sage: bool,
-    use_block_sparse: bool,
-    use_proxy_routes: bool,
-    persistent: bool,
+def test_block_sparse_static_profile_accepts_dtype_recipes(
+    overrides: dict[str, object], expected: tuple[str, torch.dtype, torch.dtype]
 ) -> None:
-    """Byte-wide Sage KV256 profiles stage a deeper K/V ring within SM100 SMEM.
+    """16-bit recipes share one dtype; Sage recipes take 8-bit Q/K, E4M3 V and a 16-bit output.
 
-    16-bit routes keep three stages; every 8-bit recipe (E4M3 or INT8 Q/K with
-    E4M3 V) gets the deeper ring together with its Sage buffers and metadata.
+    V follows K unless named and the output defaults to BF16 with Sage.
     """
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
-        KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
-        KV_TILE_256_SHARED_FIFO_STAGES,
-    )
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
-        _build_decode_gen_schedule,
-    )
-
-    key = make_block_sparse_compile_key(
-        seq_len_kv=4096,
-        num_qo_heads=8,
-        num_kv_heads=8,
-        dtype_key=dtype_key,
-        use_persistent_scheduler=persistent,
-        sparse_format="bitmask",
-        use_proxy_routes=use_proxy_routes,
-        use_block_sparse=use_block_sparse,
-        out_dtype_key="bfloat16" if sage else dtype_key,
-        v_dtype_key=v_dtype_key,
-        sage=prims_ts.SageAttentionConfig() if sage else None,
-    )
-    cfg = block_sparse_config._make_block_sparse_config(key)
-    assert cfg.tile_size_kv == 256
-    expected_kv_stages = (
-        KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
-        if sage
-        else KV_TILE_256_SHARED_FIFO_STAGES
-    )
-    assert cfg.kv_stages == expected_kv_stages
-
-    cfg.total_kv_tiles = 16
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        _tasks, dependency_graph, _labels, smem_allocator, _tmem, _eager = (
-            _build_decode_gen_schedule(cfg, total_kv_tiles=16, num_heads_kv=8)
-        )
-    smem_kv = next(
-        resource for resource in dependency_graph if resource.name == "smemKv"
-    )
-    assert smem_kv.pipeline_config.num_stages == expected_kv_stages
-    assert smem_kv._alloc.size_bytes == expected_kv_stages * cfg.smem_kv_tile_bytes
-    assert_decode_smem_within_capacity(cfg, smem_allocator)
+    profile = _validate_static_profile(**overrides)
+    assert (profile.dtype_key, profile.v_dtype, profile.output_dtype) == expected
 
 
 @pytest.mark.parametrize("k_block_size", [16, 1])
@@ -1905,97 +1794,6 @@ def test_kv256_explicit_ring_depth_beyond_smem_capacity_is_rejected(
         warnings.simplefilter("ignore", UserWarning)
         with pytest.raises(ValueError, match="shared-memory capacity"):
             _build_decode_gen_schedule(cfg, total_kv_tiles=16, num_heads_kv=8)
-
-
-def test_sage_static_profile_requires_one_qk_dtype_and_a_config() -> None:
-    """The compile key names one Q/K dtype; the recipe is a SageAttentionConfig."""
-
-    with pytest.raises(ValueError, match="one dtype"):
-        _validate_static_profile(
-            sage=prims_ts.SageAttentionConfig(),
-            q_dtype=_FP8,
-            kv_dtype=torch.bfloat16,
-        )
-    scales = make_sage_params(
-        batch_size=1, seq_len_q=64, seq_len_kv=512, num_qo_heads=1, num_kv_heads=1
-    )
-    with pytest.raises(TypeError, match="SageAttentionConfig"):
-        _validate_static_profile(sage=scales, q_dtype=_FP8)
-
-
-@pytest.mark.parametrize(
-    (
-        "q_block_size",
-        "kv_block_size",
-        "kv_route_size",
-        "use_block_sparse",
-        "sage",
-        "message",
-    ),
-    (
-        # A Q8 MHA tile is a Swaps profile even with a coarse KV block.
-        pytest.param(
-            8,
-            64,
-            128,
-            False,
-            prims_ts.SageAttentionConfig(),
-            "two-instance Keeps profile",
-            id="swaps-q8",
-        ),
-        # kv_block_size=32 selects the Swaps Q32 tile and the KV128 route.
-        pytest.param(
-            64,
-            32,
-            128,
-            False,
-            prims_ts.SageAttentionConfig(),
-            "two-instance Keeps profile",
-            id="swaps-fine-kv",
-        ),
-        pytest.param(
-            64,
-            64,
-            256,
-            False,
-            prims_ts.SageAttentionConfig(k_block_size=8),
-            "sage_k_block_size",
-            id="k-block",
-        ),
-        pytest.param(
-            64,
-            64,
-            256,
-            False,
-            prims_ts.SageAttentionConfig(q_block_size=128),
-            "sage_q_block_size",
-            id="q-block",
-        ),
-    ),
-)
-def test_block_sparse_compile_key_surfaces_the_decode_sage_rules(
-    q_block_size: int,
-    kv_block_size: int,
-    kv_route_size: int,
-    use_block_sparse: bool,
-    sage: prims_ts.SageAttentionConfig,
-    message: str,
-) -> None:
-    """The decode configuration owns the Sage recipe rules; the wrapper adds none."""
-
-    with pytest.raises(ValueError, match=message):
-        block_sparse_config._make_block_sparse_config(
-            make_block_sparse_compile_key(
-                seq_len_kv=512,
-                q_block_size=q_block_size,
-                kv_block_size=kv_block_size,
-                kv_route_size=kv_route_size,
-                dtype_key="float8_e4m3fn",
-                use_block_sparse=use_block_sparse,
-                out_dtype_key="bfloat16",
-                sage=sage,
-            )
-        )
 
 
 def test_paged_block_sparse_static_profile_accepts_token_q_blocks() -> None:

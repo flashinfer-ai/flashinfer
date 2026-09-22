@@ -154,11 +154,6 @@ def _swaps_routed_coordinate(
     return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
-    """Return the K dimension advanced by one tcgen05 MMA instruction."""
-    return 32 if cfg.use_fp8_qkv else 16
-
-
 def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
     """Select the tcgen05 MMA kind of the QK GEMM from ``qk_mma_dtype``.
 
