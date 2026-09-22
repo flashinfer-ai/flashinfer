@@ -4,6 +4,7 @@ from flashinfer.norm import (
     fused_dit_residual_layernorm_scale_shift,
     fused_qk_rmsnorm_rope,
 )
+from .cake_minimax_h3_dense_attention import minimax_h3_dense_attention
 from .minimax_h3 import minimax_h3_bf16_pre_attention
 
 from .cake_minimax_h3_mxfp8 import (
@@ -17,4 +18,5 @@ __all__ = [
     "fused_dit_residual_layernorm_scale_shift",
     "fused_qk_rmsnorm_rope",
     "minimax_h3_bf16_pre_attention",
+    "minimax_h3_dense_attention",
 ]

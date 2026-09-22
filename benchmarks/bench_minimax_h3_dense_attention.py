@@ -25,10 +25,13 @@ with the query pre-scaled in BF16 before the softmax::
 Inputs and output are contiguous BF16 ``[S, 7168]`` rows; ``S`` is dynamic
 (1 .. 131072).  Representative ``S`` values come from the model's request
 types (T2VA / FL2VA / REF2VA at 124 and 345 frames, normal and SR-base
-resolutions).  This script times FlashInfer ``single_prefill_with_kv_cache``
-(``auto`` selects the ``fmha_v2`` route on SM120, ``fa2`` is the generic FA2
-path) and PyTorch SDPA at the same boundary, i.e. including the BF16 Q-scale
-launch, and checks every backend against an FP32 oracle.
+resolutions).  This script times the fused single-kernel route
+``flashinfer.diffusion_ops.minimax_h3_dense_attention`` (``cake``: row<->head
+layout + BF16 Q-scale + attention in one launch), FlashInfer
+``single_prefill_with_kv_cache`` (``auto`` selects the ``fmha_v2`` route on
+SM120, ``fa2`` is the generic FA2 path) and PyTorch SDPA at the same boundary,
+i.e. including the BF16 Q-scale launch, and checks every backend against an
+FP32 oracle.
 
 Usage::
 
@@ -85,7 +88,9 @@ TORCH_BACKENDS = {
     "torch_flash": SDPBackend.FLASH_ATTENTION,
 }
 FLASHINFER_BACKENDS = {"flashinfer_auto": "auto", "flashinfer_fa2": "fa2"}
-ALL_BACKENDS = list(FLASHINFER_BACKENDS) + list(TORCH_BACKENDS)
+# Fused single-kernel route (row<->head layout + BF16 query scale + attention), SM120 target.
+CAKE_BACKEND = "cake"
+ALL_BACKENDS = [CAKE_BACKEND] + list(FLASHINFER_BACKENDS) + list(TORCH_BACKENDS)
 
 
 def synthetic_inputs(tokens: int, seed: int, device: torch.device):
@@ -187,7 +192,15 @@ def compare(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     }
 
 
+def run_cake(q, k, v) -> torch.Tensor:
+    from flashinfer.diffusion_ops import minimax_h3_dense_attention
+
+    return minimax_h3_dense_attention(q, k, v)
+
+
 def make_runner(name: str, q, k, v):
+    if name == CAKE_BACKEND:
+        return lambda: run_cake(q, k, v)
     if name in FLASHINFER_BACKENDS:
         return lambda: run_flashinfer(q, k, v, FLASHINFER_BACKENDS[name])
     if name in TORCH_BACKENDS:
