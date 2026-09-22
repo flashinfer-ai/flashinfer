@@ -224,7 +224,9 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
         )
         assert cake_sampling_route(probs, k, kmax) == "pipeline"
     else:
-        (cluster, ept), (threads, items) = variant
+        s1, (threads, items) = variant
+        cluster, ept = s1[0], s1[1]
+        stream_variant = 1 if len(s1) > 2 and s1[2] else 0
         arch = _require_blackwell()
         module = load_cake_sampling_module(arch)
         vals, idxs, cnt = ws
@@ -243,6 +245,7 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
             cnt,
             cluster,
             ept,
+            stream_variant,
             stream,
         )
         module.sparse_topp_sample(
@@ -479,12 +482,12 @@ def test_per_request_tensors_and_routes():
     assert cake_sampling_route(probs, vocab) == "fallback:top_k_disabled"
     assert cake_sampling_route(probs, 1025) == "fallback:top_k_gt_slab"
     assert cake_sampling_route(probs.half(), 50) == "fallback:dtype"
-    assert (
-        cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50)
-        == "fallback:large_batch"
-    )
-    assert choose_stage1(arch, 1, 128256) == (8, 32)
-    assert choose_stage1(arch, 64, 128256) == (4, 64)
+    assert cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
+    assert choose_stage1(arch, 1, 128256) == (8, 32, False)
+    assert choose_stage1(arch, 16, 128256) == (4, 64, False)
+    assert choose_stage1(arch, 64, 128256) == (2, 16, True)
+    assert choose_stage1(arch, 16, 262144) == (4, 16, True)
+    assert choose_stage1(arch, 64, 262144)[2] and choose_stage1(arch, 128, 151936)[2]
     assert choose_stage23(arch, 50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)

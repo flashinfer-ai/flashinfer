@@ -31,9 +31,9 @@ through the generator) follow the ``top_k_first`` route with two extra guarantee
 
 Requests the frozen kernels cannot serve are dispatched to the ``top_k_first`` route
 (``deterministic=True``): top-k disabled or ``k >= vocab``, ``k > 1024``, non-``float32`` or
-non-contiguous rows, ``batch * vocab >= 2**24`` (where the persistent FlashInfer radix top-k is
-faster), or a non-Blackwell device.  :func:`cake_sampling_route` reports the decision without
-launching.
+non-contiguous rows, or a non-Blackwell device.  Large ``batch * vocab`` launches run on the
+streaming stage-1 variants (a cluster of 1-4 CTAs walks the row in register chunks), so there is
+no size-based fallback.  :func:`cake_sampling_route` reports the decision without launching.
 
 The checked-in source product lives in ``csrc/cake_sampling/<arch>/`` with one manifest per
 architecture that records every frozen variant's launch resources; FlashInfer verifies the

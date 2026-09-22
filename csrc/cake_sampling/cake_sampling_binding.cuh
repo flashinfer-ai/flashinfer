@@ -20,7 +20,7 @@
 //   CAKE_SAMPLING_BODY_FILE     "<arch>/cake_sampling_kernels.cu"
 //   CAKE_SAMPLING_TARGET_MAJOR / CAKE_SAMPLING_TARGET_MINOR   exact compute capability
 //   CAKE_SAMPLING_SLAB          slab row stride (entries per row of the top-k slab)
-//   CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, threads, smem_bytes) ...
+//   CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads, smem_bytes) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
 #ifndef CAKE_SAMPLING_BODY_FILE
@@ -77,6 +77,7 @@ struct Stage1Variant {
   const void* kernel;
   int32_t cluster;
   int32_t ept;
+  int32_t stream;  // 1: streaming variant (any vocab, runtime chunk count); 0: register-resident
   int32_t threads;
   int32_t smem_bytes;
 };
@@ -88,15 +89,15 @@ struct Stage23Variant {
   int32_t smem_bytes;
 };
 
-#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, threads, smem) \
-  {reinterpret_cast<const void*>(&symbol), cluster, ept, threads, smem},
+#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem) \
+  {reinterpret_cast<const void*>(&symbol), cluster, ept, stream, threads, smem},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, smem},
 
-inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept) {
+inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream) {
   static const Stage1Variant kTable[] = {CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
   for (const Stage1Variant& v : kTable) {
-    if (v.cluster == cluster && v.ept == ept) return &v;
+    if (v.cluster == cluster && v.ept == ept && v.stream == stream) return &v;
   }
   return nullptr;
 }
@@ -138,10 +139,11 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 // Stage 1: exact top-k of every probability row into the [batch, kSlab] slab.
 //   probs      float32 [batch, vocab], row-major, unit inner stride
 //   topk_arr   int32 [batch] (only read when topk_kind == kTopKPerRow; pass any int32 CUDA tensor
-//   otherwise) cluster/ept select the frozen variant; cluster * ept * threads must cover vocab.
+//   otherwise) cluster/ept/stream_variant select the frozen variant; a register-resident variant
+//   (stream_variant == 0) needs cluster * ept * threads >= vocab, a streaming one covers any vocab.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
-               int64_t ept, int64_t cuda_stream) {
+               int64_t ept, int64_t stream_variant, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(probs);
   const int32_t device_id = probs.device().device_id;
@@ -169,10 +171,12 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
     TVM_FFI_ICHECK(topk_scalar >= 1 && topk_scalar <= kSlab)
         << "top_k must be in [1, " << kSlab << "]";
   }
-  const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept));
+  TVM_FFI_ICHECK(stream_variant == 0 || stream_variant == 1) << "stream_variant must be 0 or 1";
+  const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
+                                      static_cast<int32_t>(stream_variant));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-1 variant for cluster=" << cluster
-                               << " ept=" << ept;
-  TVM_FFI_ICHECK(static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
+                               << " ept=" << ept << " stream=" << stream_variant;
+  TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
   if (batch == 0) return;

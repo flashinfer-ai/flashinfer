@@ -44,9 +44,9 @@ guarantees on top:
 * ``top_p`` is clamped to ``(0, 1]`` per row (``p <= 0`` selects the argmax, ``p >= 1`` or NaN
   keeps every entry with mass); ``top_k`` is clamped to ``[1, min(vocab, 1024)]`` per row.
 
-Requests the kernels cannot serve (top-k disabled, ``k > 1024``, non-float32 rows, very large
-``batch * vocab``, or an unsupported GPU) are dispatched to
-:func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` (``deterministic=True``).
+Requests the kernels cannot serve (top-k disabled, ``k > 1024``, non-float32 rows, or an
+unsupported GPU) are dispatched to :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`
+(``deterministic=True``); large ``batch * vocab`` launches run on the streaming stage-1 variants.
 """
 
 from __future__ import annotations
@@ -71,8 +71,14 @@ _TOPP_SCALAR, _TOPP_PER_ROW = 1, 2
 # Clusters are co-scheduled inside one GPC; measured B200 single-wave CTA capacity per cluster size.
 _WAVE_CTAS = {1: 148, 2: 144, 4: 128, 8: 64}
 _PREFERRED_MIN_EPT = 16
-# batch * vocab beyond which the persistent FlashInfer radix top-k is faster than per-row clusters.
-_LARGE_BATCH_ELEMENTS = 1 << 24
+# Stage-1 cost model (B200 stage-1 microseconds, k = 50): a register-resident wave costs
+# _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per register entry; a streaming wave costs
+# _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x 16-entry chunk each CTA walks.  The
+# estimates only rank the frozen variants.
+_RESIDENT_BASE_US = 8.0
+_RESIDENT_PER_EPT_US = 0.27
+_STREAM_WAVE_BASE_US = 16.0
+_STREAM_CHUNK_US = 2.5
 
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -83,8 +89,10 @@ def _arch(device: torch.device) -> Optional[str]:
     return arch_dir_for_capability(torch.cuda.get_device_capability(device))
 
 
-def _stage1_variants(arch: str) -> list[tuple[int, int]]:
-    return [(v["cluster"], v["ept"]) for v in load_manifest(arch)["stage1"]]
+def _stage1_variants(arch: str) -> list[tuple[int, int, bool]]:
+    return [
+        (v["cluster"], v["ept"], bool(v["stream"])) for v in load_manifest(arch)["stage1"]
+    ]
 
 
 def _stage23_variants(arch: str) -> list[tuple[int, int]]:
@@ -95,11 +103,18 @@ def _slab(arch: str) -> int:
     return int(load_manifest(arch)["slab_entries"])
 
 
-def choose_stage1(arch: str, batch: int, vocab: int) -> tuple[int, int]:
-    """``(cluster, ept)`` for ``batch`` rows of ``vocab`` entries: fewest waves, then a register
-    chunk of at least 16 entries, then the larger cluster."""
-    epts = sorted({e for _, e in _stage1_variants(arch)})
-    available = set(_stage1_variants(arch))
+def choose_stage1(arch: str, batch: int, vocab: int) -> tuple[int, int, bool]:
+    """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries.
+
+    Register-resident candidates: fewest waves, then a register chunk of at least 16 entries,
+    then the larger cluster.  That resident choice is compared with every streaming variant
+    through the fitted cost model (resident ``waves * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US *
+    ept)`` against streaming ``waves * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)``); the
+    resident variant wins ties and streaming ties prefer the smaller cluster."""
+    variants = _stage1_variants(arch)
+    epts = sorted({e for _, e, st in variants if not st})
+    available = {(c, e) for c, e, st in variants if not st}
+    streaming = [(c, e) for c, e, st in variants if st]
     candidates = []
     for cluster in (1, 2, 4, 8):
         need = math.ceil(vocab / (_THREADS * cluster))
@@ -109,16 +124,31 @@ def choose_stage1(arch: str, batch: int, vocab: int) -> tuple[int, int]:
         if cluster > 1 and _THREADS * ept * (cluster // 2) >= vocab:
             continue
         candidates.append((cluster, ept))
-    if not candidates:
-        raise ValueError(f"vocab={vocab} exceeds the frozen stage-1 capacity")
 
     def waves(c: int) -> int:
         return -(-(batch * c) // _WAVE_CTAS[c])
 
-    return min(
-        candidates,
-        key=lambda ce: (waves(ce[0]), 0 if ce[1] >= _PREFERRED_MIN_EPT else 1, -ce[0]),
-    )
+    resident = None
+    if candidates:
+        resident = min(
+            candidates,
+            key=lambda ce: (waves(ce[0]), 0 if ce[1] >= _PREFERRED_MIN_EPT else 1, -ce[0]),
+        )
+    if not streaming:
+        if resident is None:
+            raise ValueError(f"vocab={vocab} exceeds the frozen stage-1 capacity")
+        return resident[0], resident[1], False
+
+    def stream_cost(ce: tuple[int, int]) -> float:
+        chunks = math.ceil(vocab / (ce[0] * _THREADS * ce[1]))
+        return waves(ce[0]) * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)
+
+    best = min(streaming, key=lambda ce: (stream_cost(ce), ce[0]))
+    if resident is not None:
+        resident_cost = waves(resident[0]) * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US * resident[1])
+        if resident_cost <= stream_cost(best):
+            return resident[0], resident[1], False
+    return best[0], best[1], True
 
 
 def choose_stage23(arch: str, top_k_max: int) -> tuple[int, int]:
@@ -162,8 +192,6 @@ def cake_sampling_route(
         choose_stage1(arch, batch, vocab)
     except ValueError:
         return "fallback:vocab_too_large"
-    if batch * vocab >= _LARGE_BATCH_ELEMENTS:
-        return "fallback:large_batch"
     return "pipeline"
 
 
@@ -253,7 +281,7 @@ def top_k_top_p_sampling_from_probs(
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept = choose_stage1(arch, batch, vocab)
+    cluster, ept, stream_variant = choose_stage1(arch, batch, vocab)
     threads, items = choose_stage23(arch, kmax)
     slab = _slab(arch)
     vals, idxs, cnt = (
@@ -281,7 +309,17 @@ def top_k_top_p_sampling_from_probs(
     module = load_cake_sampling_module(arch)
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
     module.radix_topk(
-        probs, k_arr, k_scalar, k_kind, vals, idxs, cnt, cluster, ept, stream
+        probs,
+        k_arr,
+        k_scalar,
+        k_kind,
+        vals,
+        idxs,
+        cnt,
+        cluster,
+        ept,
+        1 if stream_variant else 0,
+        stream,
     )
     module.sparse_topp_sample(
         vals,
@@ -317,14 +355,14 @@ def top_k_probs_to_slab(
     NaN/negative probabilities sanitized to ``+0``) into ``(values [batch, 1024], indices
     [batch, 1024], counts [batch])``.  The slab layout is deterministic (a pure function of the
     input) but *not* sorted; entries beyond ``count`` are undefined.  Same dispatch conditions as
-    :func:`top_k_top_p_sampling_from_probs` except that large batches are accepted."""
+    :func:`top_k_top_p_sampling_from_probs`."""
     route = cake_sampling_route(probs, top_k, top_k_max)
-    if route not in ("pipeline", "fallback:large_batch"):
+    if route != "pipeline":
         raise ValueError(f"frozen radix top-k cannot serve this request ({route})")
     arch = _arch(probs.device)
     batch, vocab = probs.shape
     slab = _slab(arch)
-    cluster, ept = choose_stage1(arch, batch, vocab)
+    cluster, ept, stream_variant = choose_stage1(arch, batch, vocab)
     vals = (
         out_vals
         if out_vals is not None
@@ -346,7 +384,17 @@ def top_k_probs_to_slab(
         k_arr, k_scalar, k_kind = top_k, 0, _TOPK_PER_ROW
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
     load_cake_sampling_module(arch).radix_topk(
-        probs, k_arr, k_scalar, k_kind, vals, idxs, cnt, cluster, ept, stream
+        probs,
+        k_arr,
+        k_scalar,
+        k_kind,
+        vals,
+        idxs,
+        cnt,
+        cluster,
+        ept,
+        1 if stream_variant else 0,
+        stream,
     )
     return vals, idxs, cnt
 

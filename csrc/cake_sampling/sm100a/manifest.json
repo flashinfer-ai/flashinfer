@@ -2,7 +2,7 @@
   "arch": "sm_100a",
   "buckets": 2048,
   "compile_flags": [],
-  "kernel_count": 25,
+  "kernel_count": 28,
   "kernel_symbols": [
     "kernel_cake_radix_topk_c1_e4",
     "kernel_cake_radix_topk_c1_e8",
@@ -23,6 +23,9 @@
     "kernel_cake_radix_topk_c8_e32",
     "kernel_cake_radix_topk_c8_e48",
     "kernel_cake_radix_topk_c8_e64",
+    "kernel_cake_radix_topk_c1_e16s",
+    "kernel_cake_radix_topk_c2_e16s",
+    "kernel_cake_radix_topk_c4_e16s",
     "kernel_cake_sparse_topp_sample_t32_i2",
     "kernel_cake_sparse_topp_sample_t64_i2",
     "kernel_cake_sparse_topp_sample_t128_i2",
@@ -39,7 +42,7 @@
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "7a67ffe841ee190e624641025b21cc458fd71e8f9590c2c39994ada03c345273",
+  "source_sha256": "23dd16a6b5a78e54b1867454eea5edcf6e1d521339ef3ebb6bc49780d3d20943",
   "stage1": [
     {
       "block_threads": 512,
@@ -47,6 +50,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 16768,
       "ept": 4,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e4"
     },
     {
@@ -55,6 +59,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 17024,
       "ept": 8,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e8"
     },
     {
@@ -63,6 +68,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 17536,
       "ept": 16,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e16"
     },
     {
@@ -71,6 +77,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 18560,
       "ept": 32,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e32"
     },
     {
@@ -79,6 +86,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 19584,
       "ept": 48,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e48"
     },
     {
@@ -87,6 +95,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 20608,
       "ept": 64,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e64"
     },
     {
@@ -95,6 +104,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 16768,
       "ept": 4,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e4"
     },
     {
@@ -103,6 +113,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 17536,
       "ept": 16,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e16"
     },
     {
@@ -111,6 +122,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 18560,
       "ept": 32,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e32"
     },
     {
@@ -119,6 +131,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 19584,
       "ept": 48,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e48"
     },
     {
@@ -127,6 +140,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 20608,
       "ept": 64,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e64"
     },
     {
@@ -135,6 +149,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 17536,
       "ept": 16,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e16"
     },
     {
@@ -143,6 +158,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 18560,
       "ept": 32,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e32"
     },
     {
@@ -151,6 +167,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 19584,
       "ept": 48,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e48"
     },
     {
@@ -159,6 +176,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 20608,
       "ept": 64,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e64"
     },
     {
@@ -167,6 +185,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 17536,
       "ept": 16,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e16"
     },
     {
@@ -175,6 +194,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 18560,
       "ept": 32,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e32"
     },
     {
@@ -183,6 +203,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 19584,
       "ept": 48,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e48"
     },
     {
@@ -191,7 +212,35 @@
       "cluster": 8,
       "dynamic_smem_bytes": 20608,
       "ept": 64,
+      "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e64"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 1,
+      "dynamic_smem_bytes": 148864,
+      "ept": 16,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c1_e16s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 2,
+      "dynamic_smem_bytes": 148864,
+      "ept": 16,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c2_e16s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 4,
+      "dynamic_smem_bytes": 148864,
+      "ept": 16,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c4_e16s"
     }
   ],
   "stage23": [

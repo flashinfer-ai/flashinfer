@@ -138,7 +138,8 @@ def load_manifest(arch: str) -> dict[str, Any]:
 def _binding_source(arch: str, manifest: dict[str, Any]) -> str:
     major, minor = {"sm100a": (10, 0), "sm103a": (10, 3)}[arch]
     stage1 = " ".join(
-        f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {v['block_threads']}, {v['dynamic_smem_bytes']})"
+        f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {1 if v['stream'] else 0}, "
+        f"{v['block_threads']}, {v['dynamic_smem_bytes']})"
         for v in manifest["stage1"]
     )
     stage23 = " ".join(

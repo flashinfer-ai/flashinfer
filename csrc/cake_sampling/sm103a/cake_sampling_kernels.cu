@@ -60480,6 +60480,21501 @@ kernel_cake_radix_topk_c8_e64(float* __restrict__ probs, int* __restrict__ topk_
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define SMEM_HIST0_OFF 0
+#define SMEM_HIST0_STAGE_BYTES 8192
+#define SMEM_HIST0_STRIDE 8192
+#define SMEM_HIST1_OFF 8192
+#define SMEM_HIST1_STAGE_BYTES 8192
+#define SMEM_HIST1_STRIDE 8192
+#define SMEM_WARP_SUMS_OFF 16384
+#define SMEM_WARP_SUMS_STAGE_BYTES 64
+#define SMEM_WARP_SUMS_STRIDE 64
+#define SMEM_SCAL_OFF 16448
+#define SMEM_SCAL_STAGE_BYTES 256
+#define SMEM_SCAL_STRIDE 256
+#define SMEM_CNT_OFF 16704
+#define SMEM_CNT_STAGE_BYTES 1024
+#define SMEM_CNT_STRIDE 1024
+#define SMEM_LKEYS_OFF 17728
+#define SMEM_LKEYS_STAGE_BYTES 65536
+#define SMEM_LKEYS_STRIDE 65536
+#define SMEM_LIDX_OFF 83264
+#define SMEM_LIDX_STAGE_BYTES 65536
+#define SMEM_LIDX_STRIDE 65536
+#define SMEM_TOTAL 148864
+#define THREADS 512
+
+extern "C" {
+
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const int cta_rank = 0;
+
+    // Kernel setup ops
+    unsigned int* hist0 = reinterpret_cast<unsigned int*>(smem_raw + 0);
+    const int hist0_addr = smem + 0;
+    unsigned int* hist1 = reinterpret_cast<unsigned int*>(smem_raw + 8192);
+    const int hist1_addr = smem + 8192;
+    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 16384);
+    const int warp_sums_addr = smem + 16384;
+    unsigned int* scal = reinterpret_cast<unsigned int*>(smem_raw + 16448);
+    const int scal_addr = smem + 16448;
+    unsigned int* cnt = reinterpret_cast<unsigned int*>(smem_raw + 16704);
+    const int cnt_addr = smem + 16704;
+    unsigned int* lkeys = reinterpret_cast<unsigned int*>(smem_raw + 17728);
+    const int lkeys_addr = smem + 17728;
+    int* lidx = reinterpret_cast<int*>(smem_raw + 83264);
+    const int lidx_addr = smem + 83264;
+
+    // === Task calls (dependency order) ===
+    int row = 0;
+    int rank = 0;
+    {
+        row = bid;
+    }
+    int k_req = ((topk_kind == 2) ? topk_arr[row] : topk_scalar);
+    int _min_0 = ((k_req) < (vocab) ? (k_req) : (vocab));
+    int _min_1 = ((_min_0) < (1024) ? (_min_0) : (1024));
+    int _max_0 = ((_min_1) > (1) ? (_min_1) : (1));
+    int k = _max_0;
+    unsigned int k_u = (unsigned int)k;
+    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab;
+    unsigned long long out_base = (unsigned long long)row * 1024;
+    int nchunks = (vocab + 8191) / 8192;
+    int start = rank * (nchunks * 8192);
+    int span_end = start + nchunks * 8192;
+    unsigned int pad = ((span_end > vocab) ? (unsigned int)(span_end - vocab) : 0);
+    bool aligned = (vocab & 3) == 0;
+    int wstart = start + warp * (nchunks * 512);
+    int seg_base = warp * 1024;
+    float vals_a[16];
+    float vals_b[16];
+    for (int i = tid; i < 2048; i += 512) {
+        hist1[i] = 0;
+    }
+    for (int i_1 = tid; i_1 < 2048; i_1 += 512) {
+        hist0[i_1] = 0;
+    }
+    if (tid < 64) {
+        scal[tid] = 0;
+    }
+    __syncthreads();
+    for (int c = 0; c < nchunks; c++) {
+        int i_2 = start + c * 8192 + tid * 4;
+        if (i_2 < vocab) {
+            float v = probs[row_base + (unsigned long long)i_2];
+            unsigned int bits = __as_u32(v);
+            unsigned int key = ((bits <= 2139095040) ? bits : 0);
+            unsigned int bucket = key >> 21;
+            atomicAdd(&hist0[bucket], 1);
+        }
+        int i_0 = start + c * 8192 + (512 + tid) * 4;
+        if (i_0 < vocab) {
+            float v_1 = probs[row_base + (unsigned long long)i_0];
+            unsigned int bits_1 = __as_u32(v_1);
+            unsigned int key_1 = ((bits_1 <= 2139095040) ? bits_1 : 0);
+            unsigned int bucket_1 = key_1 >> 21;
+            atomicAdd(&hist0[bucket_1], 1);
+        }
+        int i_1_1 = start + c * 8192 + (1024 + tid) * 4;
+        if (i_1_1 < vocab) {
+            float v_2 = probs[row_base + (unsigned long long)i_1_1];
+            unsigned int bits_2 = __as_u32(v_2);
+            unsigned int key_2 = ((bits_2 <= 2139095040) ? bits_2 : 0);
+            unsigned int bucket_2 = key_2 >> 21;
+            atomicAdd(&hist0[bucket_2], 1);
+        }
+        int i_2_1 = start + c * 8192 + (1536 + tid) * 4;
+        if (i_2_1 < vocab) {
+            float v_3 = probs[row_base + (unsigned long long)i_2_1];
+            unsigned int bits_3 = __as_u32(v_3);
+            unsigned int key_3 = ((bits_3 <= 2139095040) ? bits_3 : 0);
+            unsigned int bucket_3 = key_3 >> 21;
+            atomicAdd(&hist0[bucket_3], 1);
+        }
+    }
+    __syncthreads();
+    unsigned int c0 = 0;
+    unsigned int c1 = 0;
+    unsigned int c2 = 0;
+    unsigned int c3 = 0;
+    {
+        c0 = hist0[tid * 4];
+        c1 = hist0[tid * 4 + 1];
+        c2 = hist0[tid * 4 + 2];
+        c3 = hist0[tid * 4 + 3];
+    }
+    unsigned int need = 2 * k_u + 64;
+    unsigned int local = c0 + c1 + c2 + c3;
+    uint32_t _warp_scan_sum_u32_0 = local;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(16));
+    unsigned int lane_suffix = _warp_scan_sum_u32_0 - local;
+    unsigned int _warp_redux_u32_0;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local));
+    unsigned int warp_total = _warp_redux_u32_0;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total;
+    }
+    __syncthreads();
+    unsigned int peer = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above = ((lane > warp) ? peer : 0);
+    unsigned int _warp_redux_u32_1;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(above));
+    unsigned int warps_above = _warp_redux_u32_1;
+    unsigned int suffix = lane_suffix + warps_above;
+    unsigned int a3 = suffix + c3;
+    unsigned int a2 = a3 + c2;
+    unsigned int a1 = a2 + c1;
+    unsigned int a0 = a1 + c0;
+    unsigned int five = 5;
+    if (need > five * suffix) {
+        if (need <= five * a3) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+        } else if (need <= five * a2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+        } else {
+            if (need <= five * a1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+            } else if (need <= five * a0) {
+                scal[0] = (unsigned int)(tid * 4);
+            }
+        }
+    }
+    if (a0 > 1024) {
+        if (suffix <= 1024) {
+            if (a3 <= 1024) {
+                if (a2 <= 1024) {
+                    if (a1 <= 1024) {
+                        scal[1] = (unsigned int)(tid * 4 + 1);
+                    } else {
+                        scal[1] = (unsigned int)(tid * 4 + 2);
+                    }
+                } else {
+                    scal[1] = (unsigned int)(tid * 4 + 3);
+                }
+            } else {
+                scal[1] = (unsigned int)(tid * 4 + 4);
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int b_need = scal[0];
+    unsigned int b_cap = scal[1];
+    if (tid == 0) {
+        unsigned int _max_1 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
+        scal[0] = _max_1;
+        scal[1] = 0;
+    }
+    __syncthreads();
+    unsigned int b_lo = scal[0];
+    unsigned int n_w = 0;
+    if ((vocab & 3) == 0) {
+        int i_3 = wstart + lane * 4;
+        if (i_3 < vocab) {
+            float _vec_load_0[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3);
+                _vec_load_0[0 + 0] = _v4.x;
+                _vec_load_0[0 + 1] = _v4.y;
+                _vec_load_0[0 + 2] = _v4.z;
+                _vec_load_0[0 + 3] = _v4.w;
+            }
+            vals_a[0] = _vec_load_0[0];
+            vals_a[1] = _vec_load_0[1];
+            vals_a[2] = _vec_load_0[2];
+            vals_a[3] = _vec_load_0[3];
+        } else {
+            vals_a[0] = 0.0f;
+            vals_a[1] = 0.0f;
+            vals_a[2] = 0.0f;
+            vals_a[3] = 0.0f;
+        }
+        int i_0_1 = wstart + 128 + lane * 4;
+        if (i_0_1 < vocab) {
+            float _vec_load_1[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_1);
+                _vec_load_1[0 + 0] = _v4.x;
+                _vec_load_1[0 + 1] = _v4.y;
+                _vec_load_1[0 + 2] = _v4.z;
+                _vec_load_1[0 + 3] = _v4.w;
+            }
+            vals_a[4] = _vec_load_1[0];
+            vals_a[5] = _vec_load_1[1];
+            vals_a[6] = _vec_load_1[2];
+            vals_a[7] = _vec_load_1[3];
+        } else {
+            vals_a[4] = 0.0f;
+            vals_a[5] = 0.0f;
+            vals_a[6] = 0.0f;
+            vals_a[7] = 0.0f;
+        }
+        int i_1_2 = wstart + 256 + lane * 4;
+        if (i_1_2 < vocab) {
+            float _vec_load_2[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_2);
+                _vec_load_2[0 + 0] = _v4.x;
+                _vec_load_2[0 + 1] = _v4.y;
+                _vec_load_2[0 + 2] = _v4.z;
+                _vec_load_2[0 + 3] = _v4.w;
+            }
+            vals_a[8] = _vec_load_2[0];
+            vals_a[9] = _vec_load_2[1];
+            vals_a[10] = _vec_load_2[2];
+            vals_a[11] = _vec_load_2[3];
+        } else {
+            vals_a[8] = 0.0f;
+            vals_a[9] = 0.0f;
+            vals_a[10] = 0.0f;
+            vals_a[11] = 0.0f;
+        }
+        int i_2_2 = wstart + 384 + lane * 4;
+        if (i_2_2 < vocab) {
+            float _vec_load_3[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_2);
+                _vec_load_3[0 + 0] = _v4.x;
+                _vec_load_3[0 + 1] = _v4.y;
+                _vec_load_3[0 + 2] = _v4.z;
+                _vec_load_3[0 + 3] = _v4.w;
+            }
+            vals_a[12] = _vec_load_3[0];
+            vals_a[13] = _vec_load_3[1];
+            vals_a[14] = _vec_load_3[2];
+            vals_a[15] = _vec_load_3[3];
+        } else {
+            vals_a[12] = 0.0f;
+            vals_a[13] = 0.0f;
+            vals_a[14] = 0.0f;
+            vals_a[15] = 0.0f;
+        }
+    } else {
+        int i2 = wstart + lane;
+        if (i2 < vocab) {
+            vals_a[0] = probs[row_base + (unsigned long long)i2];
+        } else {
+            vals_a[0] = 0.0f;
+        }
+        int i2_0 = wstart + 32 + lane;
+        if (i2_0 < vocab) {
+            vals_a[1] = probs[row_base + (unsigned long long)i2_0];
+        } else {
+            vals_a[1] = 0.0f;
+        }
+        int i2_1 = wstart + 64 + lane;
+        if (i2_1 < vocab) {
+            vals_a[2] = probs[row_base + (unsigned long long)i2_1];
+        } else {
+            vals_a[2] = 0.0f;
+        }
+        int i2_2 = wstart + 96 + lane;
+        if (i2_2 < vocab) {
+            vals_a[3] = probs[row_base + (unsigned long long)i2_2];
+        } else {
+            vals_a[3] = 0.0f;
+        }
+        int i2_3 = wstart + 128 + lane;
+        if (i2_3 < vocab) {
+            vals_a[4] = probs[row_base + (unsigned long long)i2_3];
+        } else {
+            vals_a[4] = 0.0f;
+        }
+        int i2_4 = wstart + 160 + lane;
+        if (i2_4 < vocab) {
+            vals_a[5] = probs[row_base + (unsigned long long)i2_4];
+        } else {
+            vals_a[5] = 0.0f;
+        }
+        int i2_5 = wstart + 192 + lane;
+        if (i2_5 < vocab) {
+            vals_a[6] = probs[row_base + (unsigned long long)i2_5];
+        } else {
+            vals_a[6] = 0.0f;
+        }
+        int i2_6 = wstart + 224 + lane;
+        if (i2_6 < vocab) {
+            vals_a[7] = probs[row_base + (unsigned long long)i2_6];
+        } else {
+            vals_a[7] = 0.0f;
+        }
+        int i2_7 = wstart + 256 + lane;
+        if (i2_7 < vocab) {
+            vals_a[8] = probs[row_base + (unsigned long long)i2_7];
+        } else {
+            vals_a[8] = 0.0f;
+        }
+        int i2_8 = wstart + 288 + lane;
+        if (i2_8 < vocab) {
+            vals_a[9] = probs[row_base + (unsigned long long)i2_8];
+        } else {
+            vals_a[9] = 0.0f;
+        }
+        int i2_9 = wstart + 320 + lane;
+        if (i2_9 < vocab) {
+            vals_a[10] = probs[row_base + (unsigned long long)i2_9];
+        } else {
+            vals_a[10] = 0.0f;
+        }
+        int i2_10 = wstart + 352 + lane;
+        if (i2_10 < vocab) {
+            vals_a[11] = probs[row_base + (unsigned long long)i2_10];
+        } else {
+            vals_a[11] = 0.0f;
+        }
+        int i2_11 = wstart + 384 + lane;
+        if (i2_11 < vocab) {
+            vals_a[12] = probs[row_base + (unsigned long long)i2_11];
+        } else {
+            vals_a[12] = 0.0f;
+        }
+        int i2_12 = wstart + 416 + lane;
+        if (i2_12 < vocab) {
+            vals_a[13] = probs[row_base + (unsigned long long)i2_12];
+        } else {
+            vals_a[13] = 0.0f;
+        }
+        int i2_13 = wstart + 448 + lane;
+        if (i2_13 < vocab) {
+            vals_a[14] = probs[row_base + (unsigned long long)i2_13];
+        } else {
+            vals_a[14] = 0.0f;
+        }
+        int i2_14 = wstart + 480 + lane;
+        if (i2_14 < vocab) {
+            vals_a[15] = probs[row_base + (unsigned long long)i2_14];
+        } else {
+            vals_a[15] = 0.0f;
+        }
+    }
+    for (int c_1 = 0; c_1 < nchunks; c_1 += 2) {
+        if (nchunks > c_1 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_4 = wstart + (c_1 + 1) * 512 + lane * 4;
+                if (i_4 < vocab) {
+                    float _vec_load_4[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4);
+                        _vec_load_4[0 + 0] = _v4.x;
+                        _vec_load_4[0 + 1] = _v4.y;
+                        _vec_load_4[0 + 2] = _v4.z;
+                        _vec_load_4[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_4[0];
+                    vals_b[1] = _vec_load_4[1];
+                    vals_b[2] = _vec_load_4[2];
+                    vals_b[3] = _vec_load_4[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_2 = wstart + (c_1 + 1) * 512 + 128 + lane * 4;
+                if (i_0_2 < vocab) {
+                    float _vec_load_5[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_2);
+                        _vec_load_5[0 + 0] = _v4.x;
+                        _vec_load_5[0 + 1] = _v4.y;
+                        _vec_load_5[0 + 2] = _v4.z;
+                        _vec_load_5[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_5[0];
+                    vals_b[5] = _vec_load_5[1];
+                    vals_b[6] = _vec_load_5[2];
+                    vals_b[7] = _vec_load_5[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_3 = wstart + (c_1 + 1) * 512 + 256 + lane * 4;
+                if (i_1_3 < vocab) {
+                    float _vec_load_6[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_3);
+                        _vec_load_6[0 + 0] = _v4.x;
+                        _vec_load_6[0 + 1] = _v4.y;
+                        _vec_load_6[0 + 2] = _v4.z;
+                        _vec_load_6[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_6[0];
+                    vals_b[9] = _vec_load_6[1];
+                    vals_b[10] = _vec_load_6[2];
+                    vals_b[11] = _vec_load_6[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_3 = wstart + (c_1 + 1) * 512 + 384 + lane * 4;
+                if (i_2_3 < vocab) {
+                    float _vec_load_7[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_3);
+                        _vec_load_7[0 + 0] = _v4.x;
+                        _vec_load_7[0 + 1] = _v4.y;
+                        _vec_load_7[0 + 2] = _v4.z;
+                        _vec_load_7[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_7[0];
+                    vals_b[13] = _vec_load_7[1];
+                    vals_b[14] = _vec_load_7[2];
+                    vals_b[15] = _vec_load_7[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_15 = wstart + (c_1 + 1) * 512 + lane;
+                if (i2_15 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_15];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_1 = wstart + (c_1 + 1) * 512 + 32 + lane;
+                if (i2_0_1 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_1];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_1 = wstart + (c_1 + 1) * 512 + 64 + lane;
+                if (i2_1_1 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_1];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_1 = wstart + (c_1 + 1) * 512 + 96 + lane;
+                if (i2_2_1 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_1];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_1 = wstart + (c_1 + 1) * 512 + 128 + lane;
+                if (i2_3_1 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_1];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_1 = wstart + (c_1 + 1) * 512 + 160 + lane;
+                if (i2_4_1 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_1];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_1 = wstart + (c_1 + 1) * 512 + 192 + lane;
+                if (i2_5_1 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_1];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_1 = wstart + (c_1 + 1) * 512 + 224 + lane;
+                if (i2_6_1 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_1];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_1 = wstart + (c_1 + 1) * 512 + 256 + lane;
+                if (i2_7_1 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_1];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_1 = wstart + (c_1 + 1) * 512 + 288 + lane;
+                if (i2_8_1 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_1];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_1 = wstart + (c_1 + 1) * 512 + 320 + lane;
+                if (i2_9_1 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_1];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_1 = wstart + (c_1 + 1) * 512 + 352 + lane;
+                if (i2_10_1 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_1];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_1 = wstart + (c_1 + 1) * 512 + 384 + lane;
+                if (i2_11_1 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_1];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_1 = wstart + (c_1 + 1) * 512 + 416 + lane;
+                if (i2_12_1 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_1];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_1 = wstart + (c_1 + 1) * 512 + 448 + lane;
+                if (i2_13_1 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_1];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_1 = wstart + (c_1 + 1) * 512 + 480 + lane;
+                if (i2_14_1 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_1];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int lt_mask = (1 << (unsigned int)lane) - 1;
+        bool aligned_0 = (vocab & 3) == 0;
+        unsigned int n = n_w;
+        unsigned int keys[4];
+        int idxs[4];
+        bool cands[4];
+        unsigned int before = 0;
+        unsigned int total = 0;
+        unsigned int bits_4 = __as_u32(vals_a[0]);
+        unsigned int key_4 = ((bits_4 <= 2139095040) ? bits_4 : 0);
+        keys[0] = key_4;
+        int i_vec = wstart + c_1 * 512 + lane * 4;
+        int i_str = wstart + c_1 * 512 + lane;
+        idxs[0] = ((aligned_0) ? i_vec : i_str);
+        cands[0] = b_lo <= keys[0] >> 21 && idxs[0] < vocab;
+        unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, cands[0]);
+        unsigned int m = _vote_0;
+        int _popc_0 = __popc(m & lt_mask);
+        before = before + (unsigned int)_popc_0;
+        int _popc_1 = __popc(m);
+        total = total + (unsigned int)_popc_1;
+        unsigned int bits_1_1 = __as_u32(vals_a[1]);
+        unsigned int key_2_1 = ((bits_1_1 <= 2139095040) ? bits_1_1 : 0);
+        keys[1] = key_2_1;
+        int i_vec_3 = wstart + c_1 * 512 + lane * 4 + 1;
+        int i_str_4 = wstart + c_1 * 512 + 32 + lane;
+        idxs[1] = ((aligned_0) ? i_vec_3 : i_str_4);
+        cands[1] = b_lo <= keys[1] >> 21 && idxs[1] < vocab;
+        unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, cands[1]);
+        unsigned int m_5 = _vote_1;
+        int _popc_2 = __popc(m_5 & lt_mask);
+        before = before + (unsigned int)_popc_2;
+        int _popc_3 = __popc(m_5);
+        total = total + (unsigned int)_popc_3;
+        unsigned int bits_6 = __as_u32(vals_a[2]);
+        unsigned int key_7 = ((bits_6 <= 2139095040) ? bits_6 : 0);
+        keys[2] = key_7;
+        int i_vec_8 = wstart + c_1 * 512 + lane * 4 + 2;
+        int i_str_9 = wstart + c_1 * 512 + 64 + lane;
+        idxs[2] = ((aligned_0) ? i_vec_8 : i_str_9);
+        cands[2] = b_lo <= keys[2] >> 21 && idxs[2] < vocab;
+        unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, cands[2]);
+        unsigned int m_10 = _vote_2;
+        int _popc_4 = __popc(m_10 & lt_mask);
+        before = before + (unsigned int)_popc_4;
+        int _popc_5 = __popc(m_10);
+        total = total + (unsigned int)_popc_5;
+        unsigned int bits_11 = __as_u32(vals_a[3]);
+        unsigned int key_12 = ((bits_11 <= 2139095040) ? bits_11 : 0);
+        keys[3] = key_12;
+        int i_vec_13 = wstart + c_1 * 512 + lane * 4 + 3;
+        int i_str_14 = wstart + c_1 * 512 + 96 + lane;
+        idxs[3] = ((aligned_0) ? i_vec_13 : i_str_14);
+        cands[3] = b_lo <= keys[3] >> 21 && idxs[3] < vocab;
+        unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, cands[3]);
+        unsigned int m_15 = _vote_3;
+        int _popc_6 = __popc(m_15 & lt_mask);
+        before = before + (unsigned int)_popc_6;
+        int _popc_7 = __popc(m_15);
+        total = total + (unsigned int)_popc_7;
+        unsigned int own = 0;
+        unsigned int pos = n + before + own;
+        if (cands[0] && pos < 1024) {
+            int slot = seg_base + (int)pos;
+            lkeys[slot] = keys[0];
+            lidx[slot] = idxs[0];
+        }
+        if (cands[0]) {
+            own = own + 1;
+        }
+        unsigned int pos_16 = n + before + own;
+        if (cands[1] && pos_16 < 1024) {
+            int slot_1 = seg_base + (int)pos_16;
+            lkeys[slot_1] = keys[1];
+            lidx[slot_1] = idxs[1];
+        }
+        if (cands[1]) {
+            own = own + 1;
+        }
+        unsigned int pos_17 = n + before + own;
+        if (cands[2] && pos_17 < 1024) {
+            int slot_2 = seg_base + (int)pos_17;
+            lkeys[slot_2] = keys[2];
+            lidx[slot_2] = idxs[2];
+        }
+        if (cands[2]) {
+            own = own + 1;
+        }
+        unsigned int pos_18 = n + before + own;
+        if (cands[3] && pos_18 < 1024) {
+            int slot_3 = seg_base + (int)pos_18;
+            lkeys[slot_3] = keys[3];
+            lidx[slot_3] = idxs[3];
+        }
+        if (cands[3]) {
+            own = own + 1;
+        }
+        n = n + total;
+        unsigned int keys_19[4];
+        int idxs_20[4];
+        bool cands_21[4];
+        unsigned int before_22 = 0;
+        unsigned int total_23 = 0;
+        unsigned int bits_24 = __as_u32(vals_a[4]);
+        unsigned int key_25 = ((bits_24 <= 2139095040) ? bits_24 : 0);
+        keys_19[0] = key_25;
+        int i_vec_26 = wstart + c_1 * 512 + 128 + lane * 4;
+        int i_str_27 = wstart + c_1 * 512 + 128 + lane;
+        idxs_20[0] = ((aligned_0) ? i_vec_26 : i_str_27);
+        cands_21[0] = b_lo <= keys_19[0] >> 21 && idxs_20[0] < vocab;
+        unsigned int _vote_4 = __ballot_sync(0xFFFFFFFF, cands_21[0]);
+        unsigned int m_28 = _vote_4;
+        int _popc_8 = __popc(m_28 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_8;
+        int _popc_9 = __popc(m_28);
+        total_23 = total_23 + (unsigned int)_popc_9;
+        unsigned int bits_29 = __as_u32(vals_a[5]);
+        unsigned int key_30 = ((bits_29 <= 2139095040) ? bits_29 : 0);
+        keys_19[1] = key_30;
+        int i_vec_31 = wstart + c_1 * 512 + 128 + lane * 4 + 1;
+        int i_str_32 = wstart + c_1 * 512 + 160 + lane;
+        idxs_20[1] = ((aligned_0) ? i_vec_31 : i_str_32);
+        cands_21[1] = b_lo <= keys_19[1] >> 21 && idxs_20[1] < vocab;
+        unsigned int _vote_5 = __ballot_sync(0xFFFFFFFF, cands_21[1]);
+        unsigned int m_33 = _vote_5;
+        int _popc_10 = __popc(m_33 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_10;
+        int _popc_11 = __popc(m_33);
+        total_23 = total_23 + (unsigned int)_popc_11;
+        unsigned int bits_34 = __as_u32(vals_a[6]);
+        unsigned int key_35 = ((bits_34 <= 2139095040) ? bits_34 : 0);
+        keys_19[2] = key_35;
+        int i_vec_36 = wstart + c_1 * 512 + 128 + lane * 4 + 2;
+        int i_str_37 = wstart + c_1 * 512 + 192 + lane;
+        idxs_20[2] = ((aligned_0) ? i_vec_36 : i_str_37);
+        cands_21[2] = b_lo <= keys_19[2] >> 21 && idxs_20[2] < vocab;
+        unsigned int _vote_6 = __ballot_sync(0xFFFFFFFF, cands_21[2]);
+        unsigned int m_38 = _vote_6;
+        int _popc_12 = __popc(m_38 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_12;
+        int _popc_13 = __popc(m_38);
+        total_23 = total_23 + (unsigned int)_popc_13;
+        unsigned int bits_39 = __as_u32(vals_a[7]);
+        unsigned int key_40 = ((bits_39 <= 2139095040) ? bits_39 : 0);
+        keys_19[3] = key_40;
+        int i_vec_41 = wstart + c_1 * 512 + 128 + lane * 4 + 3;
+        int i_str_42 = wstart + c_1 * 512 + 224 + lane;
+        idxs_20[3] = ((aligned_0) ? i_vec_41 : i_str_42);
+        cands_21[3] = b_lo <= keys_19[3] >> 21 && idxs_20[3] < vocab;
+        unsigned int _vote_7 = __ballot_sync(0xFFFFFFFF, cands_21[3]);
+        unsigned int m_43 = _vote_7;
+        int _popc_14 = __popc(m_43 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_14;
+        int _popc_15 = __popc(m_43);
+        total_23 = total_23 + (unsigned int)_popc_15;
+        unsigned int own_44 = 0;
+        unsigned int pos_45 = n + before_22 + own_44;
+        if (cands_21[0] && pos_45 < 1024) {
+            int slot_4 = seg_base + (int)pos_45;
+            lkeys[slot_4] = keys_19[0];
+            lidx[slot_4] = idxs_20[0];
+        }
+        if (cands_21[0]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_46 = n + before_22 + own_44;
+        if (cands_21[1] && pos_46 < 1024) {
+            int slot_5 = seg_base + (int)pos_46;
+            lkeys[slot_5] = keys_19[1];
+            lidx[slot_5] = idxs_20[1];
+        }
+        if (cands_21[1]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_47 = n + before_22 + own_44;
+        if (cands_21[2] && pos_47 < 1024) {
+            int slot_6 = seg_base + (int)pos_47;
+            lkeys[slot_6] = keys_19[2];
+            lidx[slot_6] = idxs_20[2];
+        }
+        if (cands_21[2]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_48 = n + before_22 + own_44;
+        if (cands_21[3] && pos_48 < 1024) {
+            int slot_7 = seg_base + (int)pos_48;
+            lkeys[slot_7] = keys_19[3];
+            lidx[slot_7] = idxs_20[3];
+        }
+        if (cands_21[3]) {
+            own_44 = own_44 + 1;
+        }
+        n = n + total_23;
+        unsigned int keys_49[4];
+        int idxs_50[4];
+        bool cands_51[4];
+        unsigned int before_52 = 0;
+        unsigned int total_53 = 0;
+        unsigned int bits_54 = __as_u32(vals_a[8]);
+        unsigned int key_55 = ((bits_54 <= 2139095040) ? bits_54 : 0);
+        keys_49[0] = key_55;
+        int i_vec_56 = wstart + c_1 * 512 + 256 + lane * 4;
+        int i_str_57 = wstart + c_1 * 512 + 256 + lane;
+        idxs_50[0] = ((aligned_0) ? i_vec_56 : i_str_57);
+        cands_51[0] = b_lo <= keys_49[0] >> 21 && idxs_50[0] < vocab;
+        unsigned int _vote_8 = __ballot_sync(0xFFFFFFFF, cands_51[0]);
+        unsigned int m_58 = _vote_8;
+        int _popc_16 = __popc(m_58 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_16;
+        int _popc_17 = __popc(m_58);
+        total_53 = total_53 + (unsigned int)_popc_17;
+        unsigned int bits_59 = __as_u32(vals_a[9]);
+        unsigned int key_60 = ((bits_59 <= 2139095040) ? bits_59 : 0);
+        keys_49[1] = key_60;
+        int i_vec_61 = wstart + c_1 * 512 + 256 + lane * 4 + 1;
+        int i_str_62 = wstart + c_1 * 512 + 288 + lane;
+        idxs_50[1] = ((aligned_0) ? i_vec_61 : i_str_62);
+        cands_51[1] = b_lo <= keys_49[1] >> 21 && idxs_50[1] < vocab;
+        unsigned int _vote_9 = __ballot_sync(0xFFFFFFFF, cands_51[1]);
+        unsigned int m_63 = _vote_9;
+        int _popc_18 = __popc(m_63 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_18;
+        int _popc_19 = __popc(m_63);
+        total_53 = total_53 + (unsigned int)_popc_19;
+        unsigned int bits_64 = __as_u32(vals_a[10]);
+        unsigned int key_65 = ((bits_64 <= 2139095040) ? bits_64 : 0);
+        keys_49[2] = key_65;
+        int i_vec_66 = wstart + c_1 * 512 + 256 + lane * 4 + 2;
+        int i_str_67 = wstart + c_1 * 512 + 320 + lane;
+        idxs_50[2] = ((aligned_0) ? i_vec_66 : i_str_67);
+        cands_51[2] = b_lo <= keys_49[2] >> 21 && idxs_50[2] < vocab;
+        unsigned int _vote_10 = __ballot_sync(0xFFFFFFFF, cands_51[2]);
+        unsigned int m_68 = _vote_10;
+        int _popc_20 = __popc(m_68 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_20;
+        int _popc_21 = __popc(m_68);
+        total_53 = total_53 + (unsigned int)_popc_21;
+        unsigned int bits_69 = __as_u32(vals_a[11]);
+        unsigned int key_70 = ((bits_69 <= 2139095040) ? bits_69 : 0);
+        keys_49[3] = key_70;
+        int i_vec_71 = wstart + c_1 * 512 + 256 + lane * 4 + 3;
+        int i_str_72 = wstart + c_1 * 512 + 352 + lane;
+        idxs_50[3] = ((aligned_0) ? i_vec_71 : i_str_72);
+        cands_51[3] = b_lo <= keys_49[3] >> 21 && idxs_50[3] < vocab;
+        unsigned int _vote_11 = __ballot_sync(0xFFFFFFFF, cands_51[3]);
+        unsigned int m_73 = _vote_11;
+        int _popc_22 = __popc(m_73 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_22;
+        int _popc_23 = __popc(m_73);
+        total_53 = total_53 + (unsigned int)_popc_23;
+        unsigned int own_74 = 0;
+        unsigned int pos_75 = n + before_52 + own_74;
+        if (cands_51[0] && pos_75 < 1024) {
+            int slot_8 = seg_base + (int)pos_75;
+            lkeys[slot_8] = keys_49[0];
+            lidx[slot_8] = idxs_50[0];
+        }
+        if (cands_51[0]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_76 = n + before_52 + own_74;
+        if (cands_51[1] && pos_76 < 1024) {
+            int slot_9 = seg_base + (int)pos_76;
+            lkeys[slot_9] = keys_49[1];
+            lidx[slot_9] = idxs_50[1];
+        }
+        if (cands_51[1]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_77 = n + before_52 + own_74;
+        if (cands_51[2] && pos_77 < 1024) {
+            int slot_10 = seg_base + (int)pos_77;
+            lkeys[slot_10] = keys_49[2];
+            lidx[slot_10] = idxs_50[2];
+        }
+        if (cands_51[2]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_78 = n + before_52 + own_74;
+        if (cands_51[3] && pos_78 < 1024) {
+            int slot_11 = seg_base + (int)pos_78;
+            lkeys[slot_11] = keys_49[3];
+            lidx[slot_11] = idxs_50[3];
+        }
+        if (cands_51[3]) {
+            own_74 = own_74 + 1;
+        }
+        n = n + total_53;
+        unsigned int keys_79[4];
+        int idxs_80[4];
+        bool cands_81[4];
+        unsigned int before_82 = 0;
+        unsigned int total_83 = 0;
+        unsigned int bits_84 = __as_u32(vals_a[12]);
+        unsigned int key_85 = ((bits_84 <= 2139095040) ? bits_84 : 0);
+        keys_79[0] = key_85;
+        int i_vec_86 = wstart + c_1 * 512 + 384 + lane * 4;
+        int i_str_87 = wstart + c_1 * 512 + 384 + lane;
+        idxs_80[0] = ((aligned_0) ? i_vec_86 : i_str_87);
+        cands_81[0] = b_lo <= keys_79[0] >> 21 && idxs_80[0] < vocab;
+        unsigned int _vote_12 = __ballot_sync(0xFFFFFFFF, cands_81[0]);
+        unsigned int m_88 = _vote_12;
+        int _popc_24 = __popc(m_88 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_24;
+        int _popc_25 = __popc(m_88);
+        total_83 = total_83 + (unsigned int)_popc_25;
+        unsigned int bits_89 = __as_u32(vals_a[13]);
+        unsigned int key_90 = ((bits_89 <= 2139095040) ? bits_89 : 0);
+        keys_79[1] = key_90;
+        int i_vec_91 = wstart + c_1 * 512 + 384 + lane * 4 + 1;
+        int i_str_92 = wstart + c_1 * 512 + 416 + lane;
+        idxs_80[1] = ((aligned_0) ? i_vec_91 : i_str_92);
+        cands_81[1] = b_lo <= keys_79[1] >> 21 && idxs_80[1] < vocab;
+        unsigned int _vote_13 = __ballot_sync(0xFFFFFFFF, cands_81[1]);
+        unsigned int m_93 = _vote_13;
+        int _popc_26 = __popc(m_93 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_26;
+        int _popc_27 = __popc(m_93);
+        total_83 = total_83 + (unsigned int)_popc_27;
+        unsigned int bits_94 = __as_u32(vals_a[14]);
+        unsigned int key_95 = ((bits_94 <= 2139095040) ? bits_94 : 0);
+        keys_79[2] = key_95;
+        int i_vec_96 = wstart + c_1 * 512 + 384 + lane * 4 + 2;
+        int i_str_97 = wstart + c_1 * 512 + 448 + lane;
+        idxs_80[2] = ((aligned_0) ? i_vec_96 : i_str_97);
+        cands_81[2] = b_lo <= keys_79[2] >> 21 && idxs_80[2] < vocab;
+        unsigned int _vote_14 = __ballot_sync(0xFFFFFFFF, cands_81[2]);
+        unsigned int m_98 = _vote_14;
+        int _popc_28 = __popc(m_98 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_28;
+        int _popc_29 = __popc(m_98);
+        total_83 = total_83 + (unsigned int)_popc_29;
+        unsigned int bits_99 = __as_u32(vals_a[15]);
+        unsigned int key_100 = ((bits_99 <= 2139095040) ? bits_99 : 0);
+        keys_79[3] = key_100;
+        int i_vec_101 = wstart + c_1 * 512 + 384 + lane * 4 + 3;
+        int i_str_102 = wstart + c_1 * 512 + 480 + lane;
+        idxs_80[3] = ((aligned_0) ? i_vec_101 : i_str_102);
+        cands_81[3] = b_lo <= keys_79[3] >> 21 && idxs_80[3] < vocab;
+        unsigned int _vote_15 = __ballot_sync(0xFFFFFFFF, cands_81[3]);
+        unsigned int m_103 = _vote_15;
+        int _popc_30 = __popc(m_103 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_30;
+        int _popc_31 = __popc(m_103);
+        total_83 = total_83 + (unsigned int)_popc_31;
+        unsigned int own_104 = 0;
+        unsigned int pos_105 = n + before_82 + own_104;
+        if (cands_81[0] && pos_105 < 1024) {
+            int slot_12 = seg_base + (int)pos_105;
+            lkeys[slot_12] = keys_79[0];
+            lidx[slot_12] = idxs_80[0];
+        }
+        if (cands_81[0]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_106 = n + before_82 + own_104;
+        if (cands_81[1] && pos_106 < 1024) {
+            int slot_13 = seg_base + (int)pos_106;
+            lkeys[slot_13] = keys_79[1];
+            lidx[slot_13] = idxs_80[1];
+        }
+        if (cands_81[1]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_107 = n + before_82 + own_104;
+        if (cands_81[2] && pos_107 < 1024) {
+            int slot_14 = seg_base + (int)pos_107;
+            lkeys[slot_14] = keys_79[2];
+            lidx[slot_14] = idxs_80[2];
+        }
+        if (cands_81[2]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_108 = n + before_82 + own_104;
+        if (cands_81[3] && pos_108 < 1024) {
+            int slot_15 = seg_base + (int)pos_108;
+            lkeys[slot_15] = keys_79[3];
+            lidx[slot_15] = idxs_80[3];
+        }
+        if (cands_81[3]) {
+            own_104 = own_104 + 1;
+        }
+        n = n + total_83;
+        n_w = n;
+        if (nchunks > c_1 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_5 = wstart + (c_1 + 2) * 512 + lane * 4;
+                if (i_5 < vocab) {
+                    float _vec_load_8[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_5);
+                        _vec_load_8[0 + 0] = _v4.x;
+                        _vec_load_8[0 + 1] = _v4.y;
+                        _vec_load_8[0 + 2] = _v4.z;
+                        _vec_load_8[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_8[0];
+                    vals_a[1] = _vec_load_8[1];
+                    vals_a[2] = _vec_load_8[2];
+                    vals_a[3] = _vec_load_8[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_3 = wstart + (c_1 + 2) * 512 + 128 + lane * 4;
+                if (i_0_3 < vocab) {
+                    float _vec_load_9[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_3);
+                        _vec_load_9[0 + 0] = _v4.x;
+                        _vec_load_9[0 + 1] = _v4.y;
+                        _vec_load_9[0 + 2] = _v4.z;
+                        _vec_load_9[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_9[0];
+                    vals_a[5] = _vec_load_9[1];
+                    vals_a[6] = _vec_load_9[2];
+                    vals_a[7] = _vec_load_9[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_4 = wstart + (c_1 + 2) * 512 + 256 + lane * 4;
+                if (i_1_4 < vocab) {
+                    float _vec_load_10[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_4);
+                        _vec_load_10[0 + 0] = _v4.x;
+                        _vec_load_10[0 + 1] = _v4.y;
+                        _vec_load_10[0 + 2] = _v4.z;
+                        _vec_load_10[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_10[0];
+                    vals_a[9] = _vec_load_10[1];
+                    vals_a[10] = _vec_load_10[2];
+                    vals_a[11] = _vec_load_10[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_4 = wstart + (c_1 + 2) * 512 + 384 + lane * 4;
+                if (i_2_4 < vocab) {
+                    float _vec_load_11[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_4);
+                        _vec_load_11[0 + 0] = _v4.x;
+                        _vec_load_11[0 + 1] = _v4.y;
+                        _vec_load_11[0 + 2] = _v4.z;
+                        _vec_load_11[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_11[0];
+                    vals_a[13] = _vec_load_11[1];
+                    vals_a[14] = _vec_load_11[2];
+                    vals_a[15] = _vec_load_11[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_16 = wstart + (c_1 + 2) * 512 + lane;
+                if (i2_16 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_16];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_2 = wstart + (c_1 + 2) * 512 + 32 + lane;
+                if (i2_0_2 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_2];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_2 = wstart + (c_1 + 2) * 512 + 64 + lane;
+                if (i2_1_2 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_2];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_2 = wstart + (c_1 + 2) * 512 + 96 + lane;
+                if (i2_2_2 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_2];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_2 = wstart + (c_1 + 2) * 512 + 128 + lane;
+                if (i2_3_2 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_2];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_2 = wstart + (c_1 + 2) * 512 + 160 + lane;
+                if (i2_4_2 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_2];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_2 = wstart + (c_1 + 2) * 512 + 192 + lane;
+                if (i2_5_2 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_2];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_2 = wstart + (c_1 + 2) * 512 + 224 + lane;
+                if (i2_6_2 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_2];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_2 = wstart + (c_1 + 2) * 512 + 256 + lane;
+                if (i2_7_2 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_2];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_2 = wstart + (c_1 + 2) * 512 + 288 + lane;
+                if (i2_8_2 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_2];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_2 = wstart + (c_1 + 2) * 512 + 320 + lane;
+                if (i2_9_2 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_2];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_2 = wstart + (c_1 + 2) * 512 + 352 + lane;
+                if (i2_10_2 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_2];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_2 = wstart + (c_1 + 2) * 512 + 384 + lane;
+                if (i2_11_2 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_2];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_2 = wstart + (c_1 + 2) * 512 + 416 + lane;
+                if (i2_12_2 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_2];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_2 = wstart + (c_1 + 2) * 512 + 448 + lane;
+                if (i2_13_2 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_2];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_2 = wstart + (c_1 + 2) * 512 + 480 + lane;
+                if (i2_14_2 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_2];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nchunks > c_1 + 1) {
+            unsigned int lt_mask_0 = (1 << (unsigned int)lane) - 1;
+            bool aligned_1 = (vocab & 3) == 0;
+            unsigned int n_2 = n_w;
+            unsigned int keys_3[4];
+            int idxs_4[4];
+            bool cands_5[4];
+            unsigned int before_6 = 0;
+            unsigned int total_7 = 0;
+            unsigned int bits_8 = __as_u32(vals_b[0]);
+            unsigned int key_9 = ((bits_8 <= 2139095040) ? bits_8 : 0);
+            keys_3[0] = key_9;
+            int i_vec_10 = wstart + (c_1 + 1) * 512 + lane * 4;
+            int i_str_11 = wstart + (c_1 + 1) * 512 + lane;
+            idxs_4[0] = ((aligned_1) ? i_vec_10 : i_str_11);
+            cands_5[0] = b_lo <= keys_3[0] >> 21 && idxs_4[0] < vocab;
+            unsigned int _vote_16 = __ballot_sync(0xFFFFFFFF, cands_5[0]);
+            unsigned int m_12 = _vote_16;
+            int _popc_32 = __popc(m_12 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_32;
+            int _popc_33 = __popc(m_12);
+            total_7 = total_7 + (unsigned int)_popc_33;
+            unsigned int bits_13 = __as_u32(vals_b[1]);
+            unsigned int key_14 = ((bits_13 <= 2139095040) ? bits_13 : 0);
+            keys_3[1] = key_14;
+            int i_vec_15 = wstart + (c_1 + 1) * 512 + lane * 4 + 1;
+            int i_str_16 = wstart + (c_1 + 1) * 512 + 32 + lane;
+            idxs_4[1] = ((aligned_1) ? i_vec_15 : i_str_16);
+            cands_5[1] = b_lo <= keys_3[1] >> 21 && idxs_4[1] < vocab;
+            unsigned int _vote_17 = __ballot_sync(0xFFFFFFFF, cands_5[1]);
+            unsigned int m_17 = _vote_17;
+            int _popc_34 = __popc(m_17 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_34;
+            int _popc_35 = __popc(m_17);
+            total_7 = total_7 + (unsigned int)_popc_35;
+            unsigned int bits_18 = __as_u32(vals_b[2]);
+            unsigned int key_19 = ((bits_18 <= 2139095040) ? bits_18 : 0);
+            keys_3[2] = key_19;
+            int i_vec_20 = wstart + (c_1 + 1) * 512 + lane * 4 + 2;
+            int i_str_21 = wstart + (c_1 + 1) * 512 + 64 + lane;
+            idxs_4[2] = ((aligned_1) ? i_vec_20 : i_str_21);
+            cands_5[2] = b_lo <= keys_3[2] >> 21 && idxs_4[2] < vocab;
+            unsigned int _vote_18 = __ballot_sync(0xFFFFFFFF, cands_5[2]);
+            unsigned int m_22 = _vote_18;
+            int _popc_36 = __popc(m_22 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_36;
+            int _popc_37 = __popc(m_22);
+            total_7 = total_7 + (unsigned int)_popc_37;
+            unsigned int bits_23 = __as_u32(vals_b[3]);
+            unsigned int key_24 = ((bits_23 <= 2139095040) ? bits_23 : 0);
+            keys_3[3] = key_24;
+            int i_vec_25 = wstart + (c_1 + 1) * 512 + lane * 4 + 3;
+            int i_str_26 = wstart + (c_1 + 1) * 512 + 96 + lane;
+            idxs_4[3] = ((aligned_1) ? i_vec_25 : i_str_26);
+            cands_5[3] = b_lo <= keys_3[3] >> 21 && idxs_4[3] < vocab;
+            unsigned int _vote_19 = __ballot_sync(0xFFFFFFFF, cands_5[3]);
+            unsigned int m_27 = _vote_19;
+            int _popc_38 = __popc(m_27 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_38;
+            int _popc_39 = __popc(m_27);
+            total_7 = total_7 + (unsigned int)_popc_39;
+            unsigned int own_28 = 0;
+            unsigned int pos_29 = n_2 + before_6 + own_28;
+            if (cands_5[0] && pos_29 < 1024) {
+                int slot_16 = seg_base + (int)pos_29;
+                lkeys[slot_16] = keys_3[0];
+                lidx[slot_16] = idxs_4[0];
+            }
+            if (cands_5[0]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_30 = n_2 + before_6 + own_28;
+            if (cands_5[1] && pos_30 < 1024) {
+                int slot_17 = seg_base + (int)pos_30;
+                lkeys[slot_17] = keys_3[1];
+                lidx[slot_17] = idxs_4[1];
+            }
+            if (cands_5[1]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_31 = n_2 + before_6 + own_28;
+            if (cands_5[2] && pos_31 < 1024) {
+                int slot_18 = seg_base + (int)pos_31;
+                lkeys[slot_18] = keys_3[2];
+                lidx[slot_18] = idxs_4[2];
+            }
+            if (cands_5[2]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_32 = n_2 + before_6 + own_28;
+            if (cands_5[3] && pos_32 < 1024) {
+                int slot_19 = seg_base + (int)pos_32;
+                lkeys[slot_19] = keys_3[3];
+                lidx[slot_19] = idxs_4[3];
+            }
+            if (cands_5[3]) {
+                own_28 = own_28 + 1;
+            }
+            n_2 = n_2 + total_7;
+            unsigned int keys_33[4];
+            int idxs_34[4];
+            bool cands_35[4];
+            unsigned int before_36 = 0;
+            unsigned int total_37 = 0;
+            unsigned int bits_38 = __as_u32(vals_b[4]);
+            unsigned int key_39 = ((bits_38 <= 2139095040) ? bits_38 : 0);
+            keys_33[0] = key_39;
+            int i_vec_40 = wstart + (c_1 + 1) * 512 + 128 + lane * 4;
+            int i_str_41 = wstart + (c_1 + 1) * 512 + 128 + lane;
+            idxs_34[0] = ((aligned_1) ? i_vec_40 : i_str_41);
+            cands_35[0] = b_lo <= keys_33[0] >> 21 && idxs_34[0] < vocab;
+            unsigned int _vote_20 = __ballot_sync(0xFFFFFFFF, cands_35[0]);
+            unsigned int m_42 = _vote_20;
+            int _popc_40 = __popc(m_42 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_40;
+            int _popc_41 = __popc(m_42);
+            total_37 = total_37 + (unsigned int)_popc_41;
+            unsigned int bits_43 = __as_u32(vals_b[5]);
+            unsigned int key_44 = ((bits_43 <= 2139095040) ? bits_43 : 0);
+            keys_33[1] = key_44;
+            int i_vec_45 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 1;
+            int i_str_46 = wstart + (c_1 + 1) * 512 + 160 + lane;
+            idxs_34[1] = ((aligned_1) ? i_vec_45 : i_str_46);
+            cands_35[1] = b_lo <= keys_33[1] >> 21 && idxs_34[1] < vocab;
+            unsigned int _vote_21 = __ballot_sync(0xFFFFFFFF, cands_35[1]);
+            unsigned int m_47 = _vote_21;
+            int _popc_42 = __popc(m_47 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_42;
+            int _popc_43 = __popc(m_47);
+            total_37 = total_37 + (unsigned int)_popc_43;
+            unsigned int bits_48 = __as_u32(vals_b[6]);
+            unsigned int key_49 = ((bits_48 <= 2139095040) ? bits_48 : 0);
+            keys_33[2] = key_49;
+            int i_vec_50 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 2;
+            int i_str_51 = wstart + (c_1 + 1) * 512 + 192 + lane;
+            idxs_34[2] = ((aligned_1) ? i_vec_50 : i_str_51);
+            cands_35[2] = b_lo <= keys_33[2] >> 21 && idxs_34[2] < vocab;
+            unsigned int _vote_22 = __ballot_sync(0xFFFFFFFF, cands_35[2]);
+            unsigned int m_52 = _vote_22;
+            int _popc_44 = __popc(m_52 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_44;
+            int _popc_45 = __popc(m_52);
+            total_37 = total_37 + (unsigned int)_popc_45;
+            unsigned int bits_53 = __as_u32(vals_b[7]);
+            unsigned int key_54 = ((bits_53 <= 2139095040) ? bits_53 : 0);
+            keys_33[3] = key_54;
+            int i_vec_55 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 3;
+            int i_str_56 = wstart + (c_1 + 1) * 512 + 224 + lane;
+            idxs_34[3] = ((aligned_1) ? i_vec_55 : i_str_56);
+            cands_35[3] = b_lo <= keys_33[3] >> 21 && idxs_34[3] < vocab;
+            unsigned int _vote_23 = __ballot_sync(0xFFFFFFFF, cands_35[3]);
+            unsigned int m_57 = _vote_23;
+            int _popc_46 = __popc(m_57 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_46;
+            int _popc_47 = __popc(m_57);
+            total_37 = total_37 + (unsigned int)_popc_47;
+            unsigned int own_58 = 0;
+            unsigned int pos_59 = n_2 + before_36 + own_58;
+            if (cands_35[0] && pos_59 < 1024) {
+                int slot_20 = seg_base + (int)pos_59;
+                lkeys[slot_20] = keys_33[0];
+                lidx[slot_20] = idxs_34[0];
+            }
+            if (cands_35[0]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_60 = n_2 + before_36 + own_58;
+            if (cands_35[1] && pos_60 < 1024) {
+                int slot_21 = seg_base + (int)pos_60;
+                lkeys[slot_21] = keys_33[1];
+                lidx[slot_21] = idxs_34[1];
+            }
+            if (cands_35[1]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_61 = n_2 + before_36 + own_58;
+            if (cands_35[2] && pos_61 < 1024) {
+                int slot_22 = seg_base + (int)pos_61;
+                lkeys[slot_22] = keys_33[2];
+                lidx[slot_22] = idxs_34[2];
+            }
+            if (cands_35[2]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_62 = n_2 + before_36 + own_58;
+            if (cands_35[3] && pos_62 < 1024) {
+                int slot_23 = seg_base + (int)pos_62;
+                lkeys[slot_23] = keys_33[3];
+                lidx[slot_23] = idxs_34[3];
+            }
+            if (cands_35[3]) {
+                own_58 = own_58 + 1;
+            }
+            n_2 = n_2 + total_37;
+            unsigned int keys_63[4];
+            int idxs_64[4];
+            bool cands_65[4];
+            unsigned int before_66 = 0;
+            unsigned int total_67 = 0;
+            unsigned int bits_68 = __as_u32(vals_b[8]);
+            unsigned int key_69 = ((bits_68 <= 2139095040) ? bits_68 : 0);
+            keys_63[0] = key_69;
+            int i_vec_70 = wstart + (c_1 + 1) * 512 + 256 + lane * 4;
+            int i_str_71 = wstart + (c_1 + 1) * 512 + 256 + lane;
+            idxs_64[0] = ((aligned_1) ? i_vec_70 : i_str_71);
+            cands_65[0] = b_lo <= keys_63[0] >> 21 && idxs_64[0] < vocab;
+            unsigned int _vote_24 = __ballot_sync(0xFFFFFFFF, cands_65[0]);
+            unsigned int m_72 = _vote_24;
+            int _popc_48 = __popc(m_72 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_48;
+            int _popc_49 = __popc(m_72);
+            total_67 = total_67 + (unsigned int)_popc_49;
+            unsigned int bits_73 = __as_u32(vals_b[9]);
+            unsigned int key_74 = ((bits_73 <= 2139095040) ? bits_73 : 0);
+            keys_63[1] = key_74;
+            int i_vec_75 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 1;
+            int i_str_76 = wstart + (c_1 + 1) * 512 + 288 + lane;
+            idxs_64[1] = ((aligned_1) ? i_vec_75 : i_str_76);
+            cands_65[1] = b_lo <= keys_63[1] >> 21 && idxs_64[1] < vocab;
+            unsigned int _vote_25 = __ballot_sync(0xFFFFFFFF, cands_65[1]);
+            unsigned int m_77 = _vote_25;
+            int _popc_50 = __popc(m_77 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_50;
+            int _popc_51 = __popc(m_77);
+            total_67 = total_67 + (unsigned int)_popc_51;
+            unsigned int bits_78 = __as_u32(vals_b[10]);
+            unsigned int key_79 = ((bits_78 <= 2139095040) ? bits_78 : 0);
+            keys_63[2] = key_79;
+            int i_vec_80 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 2;
+            int i_str_81 = wstart + (c_1 + 1) * 512 + 320 + lane;
+            idxs_64[2] = ((aligned_1) ? i_vec_80 : i_str_81);
+            cands_65[2] = b_lo <= keys_63[2] >> 21 && idxs_64[2] < vocab;
+            unsigned int _vote_26 = __ballot_sync(0xFFFFFFFF, cands_65[2]);
+            unsigned int m_82 = _vote_26;
+            int _popc_52 = __popc(m_82 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_52;
+            int _popc_53 = __popc(m_82);
+            total_67 = total_67 + (unsigned int)_popc_53;
+            unsigned int bits_83 = __as_u32(vals_b[11]);
+            unsigned int key_84 = ((bits_83 <= 2139095040) ? bits_83 : 0);
+            keys_63[3] = key_84;
+            int i_vec_85 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 3;
+            int i_str_86 = wstart + (c_1 + 1) * 512 + 352 + lane;
+            idxs_64[3] = ((aligned_1) ? i_vec_85 : i_str_86);
+            cands_65[3] = b_lo <= keys_63[3] >> 21 && idxs_64[3] < vocab;
+            unsigned int _vote_27 = __ballot_sync(0xFFFFFFFF, cands_65[3]);
+            unsigned int m_87 = _vote_27;
+            int _popc_54 = __popc(m_87 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_54;
+            int _popc_55 = __popc(m_87);
+            total_67 = total_67 + (unsigned int)_popc_55;
+            unsigned int own_88 = 0;
+            unsigned int pos_89 = n_2 + before_66 + own_88;
+            if (cands_65[0] && pos_89 < 1024) {
+                int slot_24 = seg_base + (int)pos_89;
+                lkeys[slot_24] = keys_63[0];
+                lidx[slot_24] = idxs_64[0];
+            }
+            if (cands_65[0]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_90 = n_2 + before_66 + own_88;
+            if (cands_65[1] && pos_90 < 1024) {
+                int slot_25 = seg_base + (int)pos_90;
+                lkeys[slot_25] = keys_63[1];
+                lidx[slot_25] = idxs_64[1];
+            }
+            if (cands_65[1]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_91 = n_2 + before_66 + own_88;
+            if (cands_65[2] && pos_91 < 1024) {
+                int slot_26 = seg_base + (int)pos_91;
+                lkeys[slot_26] = keys_63[2];
+                lidx[slot_26] = idxs_64[2];
+            }
+            if (cands_65[2]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_92 = n_2 + before_66 + own_88;
+            if (cands_65[3] && pos_92 < 1024) {
+                int slot_27 = seg_base + (int)pos_92;
+                lkeys[slot_27] = keys_63[3];
+                lidx[slot_27] = idxs_64[3];
+            }
+            if (cands_65[3]) {
+                own_88 = own_88 + 1;
+            }
+            n_2 = n_2 + total_67;
+            unsigned int keys_93[4];
+            int idxs_94[4];
+            bool cands_95[4];
+            unsigned int before_96 = 0;
+            unsigned int total_97 = 0;
+            unsigned int bits_98 = __as_u32(vals_b[12]);
+            unsigned int key_99 = ((bits_98 <= 2139095040) ? bits_98 : 0);
+            keys_93[0] = key_99;
+            int i_vec_100 = wstart + (c_1 + 1) * 512 + 384 + lane * 4;
+            int i_str_101 = wstart + (c_1 + 1) * 512 + 384 + lane;
+            idxs_94[0] = ((aligned_1) ? i_vec_100 : i_str_101);
+            cands_95[0] = b_lo <= keys_93[0] >> 21 && idxs_94[0] < vocab;
+            unsigned int _vote_28 = __ballot_sync(0xFFFFFFFF, cands_95[0]);
+            unsigned int m_102 = _vote_28;
+            int _popc_56 = __popc(m_102 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_56;
+            int _popc_57 = __popc(m_102);
+            total_97 = total_97 + (unsigned int)_popc_57;
+            unsigned int bits_103 = __as_u32(vals_b[13]);
+            unsigned int key_104 = ((bits_103 <= 2139095040) ? bits_103 : 0);
+            keys_93[1] = key_104;
+            int i_vec_105 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 1;
+            int i_str_106 = wstart + (c_1 + 1) * 512 + 416 + lane;
+            idxs_94[1] = ((aligned_1) ? i_vec_105 : i_str_106);
+            cands_95[1] = b_lo <= keys_93[1] >> 21 && idxs_94[1] < vocab;
+            unsigned int _vote_29 = __ballot_sync(0xFFFFFFFF, cands_95[1]);
+            unsigned int m_107 = _vote_29;
+            int _popc_58 = __popc(m_107 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_58;
+            int _popc_59 = __popc(m_107);
+            total_97 = total_97 + (unsigned int)_popc_59;
+            unsigned int bits_108 = __as_u32(vals_b[14]);
+            unsigned int key_109 = ((bits_108 <= 2139095040) ? bits_108 : 0);
+            keys_93[2] = key_109;
+            int i_vec_110 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 2;
+            int i_str_111 = wstart + (c_1 + 1) * 512 + 448 + lane;
+            idxs_94[2] = ((aligned_1) ? i_vec_110 : i_str_111);
+            cands_95[2] = b_lo <= keys_93[2] >> 21 && idxs_94[2] < vocab;
+            unsigned int _vote_30 = __ballot_sync(0xFFFFFFFF, cands_95[2]);
+            unsigned int m_112 = _vote_30;
+            int _popc_60 = __popc(m_112 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_60;
+            int _popc_61 = __popc(m_112);
+            total_97 = total_97 + (unsigned int)_popc_61;
+            unsigned int bits_113 = __as_u32(vals_b[15]);
+            unsigned int key_114 = ((bits_113 <= 2139095040) ? bits_113 : 0);
+            keys_93[3] = key_114;
+            int i_vec_115 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 3;
+            int i_str_116 = wstart + (c_1 + 1) * 512 + 480 + lane;
+            idxs_94[3] = ((aligned_1) ? i_vec_115 : i_str_116);
+            cands_95[3] = b_lo <= keys_93[3] >> 21 && idxs_94[3] < vocab;
+            unsigned int _vote_31 = __ballot_sync(0xFFFFFFFF, cands_95[3]);
+            unsigned int m_117 = _vote_31;
+            int _popc_62 = __popc(m_117 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_62;
+            int _popc_63 = __popc(m_117);
+            total_97 = total_97 + (unsigned int)_popc_63;
+            unsigned int own_118 = 0;
+            unsigned int pos_119 = n_2 + before_96 + own_118;
+            if (cands_95[0] && pos_119 < 1024) {
+                int slot_28 = seg_base + (int)pos_119;
+                lkeys[slot_28] = keys_93[0];
+                lidx[slot_28] = idxs_94[0];
+            }
+            if (cands_95[0]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_120 = n_2 + before_96 + own_118;
+            if (cands_95[1] && pos_120 < 1024) {
+                int slot_29 = seg_base + (int)pos_120;
+                lkeys[slot_29] = keys_93[1];
+                lidx[slot_29] = idxs_94[1];
+            }
+            if (cands_95[1]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_121 = n_2 + before_96 + own_118;
+            if (cands_95[2] && pos_121 < 1024) {
+                int slot_30 = seg_base + (int)pos_121;
+                lkeys[slot_30] = keys_93[2];
+                lidx[slot_30] = idxs_94[2];
+            }
+            if (cands_95[2]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_122 = n_2 + before_96 + own_118;
+            if (cands_95[3] && pos_122 < 1024) {
+                int slot_31 = seg_base + (int)pos_122;
+                lkeys[slot_31] = keys_93[3];
+                lidx[slot_31] = idxs_94[3];
+            }
+            if (cands_95[3]) {
+                own_118 = own_118 + 1;
+            }
+            n_2 = n_2 + total_97;
+            n_w = n_2;
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (lane == 0) {
+        scal[16 + warp] = n_w;
+    }
+    __syncthreads();
+    unsigned int before_1 = 0;
+    unsigned int total_1 = 0;
+    unsigned int v_4 = scal[16];
+    total_1 = total_1 + v_4;
+    if (warp > 0) {
+        before_1 = before_1 + v_4;
+    }
+    unsigned int v_0 = scal[17];
+    total_1 = total_1 + v_0;
+    if (warp > 1) {
+        before_1 = before_1 + v_0;
+    }
+    unsigned int v_1_1 = scal[18];
+    total_1 = total_1 + v_1_1;
+    if (warp > 2) {
+        before_1 = before_1 + v_1_1;
+    }
+    unsigned int v_2_1 = scal[19];
+    total_1 = total_1 + v_2_1;
+    if (warp > 3) {
+        before_1 = before_1 + v_2_1;
+    }
+    unsigned int v_3_1 = scal[20];
+    total_1 = total_1 + v_3_1;
+    if (warp > 4) {
+        before_1 = before_1 + v_3_1;
+    }
+    unsigned int v_4_1 = scal[21];
+    total_1 = total_1 + v_4_1;
+    if (warp > 5) {
+        before_1 = before_1 + v_4_1;
+    }
+    unsigned int v_5 = scal[22];
+    total_1 = total_1 + v_5;
+    if (warp > 6) {
+        before_1 = before_1 + v_5;
+    }
+    unsigned int v_6 = scal[23];
+    total_1 = total_1 + v_6;
+    if (warp > 7) {
+        before_1 = before_1 + v_6;
+    }
+    unsigned int v_7 = scal[24];
+    total_1 = total_1 + v_7;
+    if (warp > 8) {
+        before_1 = before_1 + v_7;
+    }
+    unsigned int v_8 = scal[25];
+    total_1 = total_1 + v_8;
+    if (warp > 9) {
+        before_1 = before_1 + v_8;
+    }
+    unsigned int v_9 = scal[26];
+    total_1 = total_1 + v_9;
+    if (warp > 10) {
+        before_1 = before_1 + v_9;
+    }
+    unsigned int v_10 = scal[27];
+    total_1 = total_1 + v_10;
+    if (warp > 11) {
+        before_1 = before_1 + v_10;
+    }
+    unsigned int v_11 = scal[28];
+    total_1 = total_1 + v_11;
+    if (warp > 12) {
+        before_1 = before_1 + v_11;
+    }
+    unsigned int v_12 = scal[29];
+    total_1 = total_1 + v_12;
+    if (warp > 13) {
+        before_1 = before_1 + v_12;
+    }
+    unsigned int v_13 = scal[30];
+    total_1 = total_1 + v_13;
+    if (warp > 14) {
+        before_1 = before_1 + v_13;
+    }
+    unsigned int v_14 = scal[31];
+    total_1 = total_1 + v_14;
+    if (warp > 15) {
+        before_1 = before_1 + v_14;
+    }
+    unsigned int _vote_32 = __ballot_sync(0xFFFFFFFF, n_w > 1024);
+    unsigned int ovf_w = _vote_32;
+    if (tid == 0) {
+        scal[6] = total_1;
+    }
+    if (lane == 0) {
+        if (ovf_w != 0) {
+            scal[5] = 1;
+        }
+    }
+    __syncthreads();
+    unsigned int any_ovf = scal[5];
+    unsigned int cand_total = total_1;
+    bool use_list = any_ovf == 0 && cand_total >= k_u;
+    unsigned int n_eff = ((use_list) ? n_w : 0);
+    int nch_stream = ((use_list) ? 0 : nchunks);
+    for (int i_6 = tid; i_6 < 2048; i_6 += 512) {
+        hist0[i_6] = 0;
+    }
+    __syncthreads();
+    unsigned int prefix = 0;
+    unsigned int remaining = k_u;
+    unsigned int gt_local = 0;
+    unsigned int eq_local = 0;
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_7 = start + tid * 4;
+            if (i_7 < vocab) {
+                float _vec_load_12[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_7);
+                    _vec_load_12[0 + 0] = _v4.x;
+                    _vec_load_12[0 + 1] = _v4.y;
+                    _vec_load_12[0 + 2] = _v4.z;
+                    _vec_load_12[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_12[0];
+                vals_a[1] = _vec_load_12[1];
+                vals_a[2] = _vec_load_12[2];
+                vals_a[3] = _vec_load_12[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_4 = start + 2048 + tid * 4;
+            if (i_0_4 < vocab) {
+                float _vec_load_13[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_4);
+                    _vec_load_13[0 + 0] = _v4.x;
+                    _vec_load_13[0 + 1] = _v4.y;
+                    _vec_load_13[0 + 2] = _v4.z;
+                    _vec_load_13[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_13[0];
+                vals_a[5] = _vec_load_13[1];
+                vals_a[6] = _vec_load_13[2];
+                vals_a[7] = _vec_load_13[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_5 = start + 4096 + tid * 4;
+            if (i_1_5 < vocab) {
+                float _vec_load_14[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_5);
+                    _vec_load_14[0 + 0] = _v4.x;
+                    _vec_load_14[0 + 1] = _v4.y;
+                    _vec_load_14[0 + 2] = _v4.z;
+                    _vec_load_14[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_14[0];
+                vals_a[9] = _vec_load_14[1];
+                vals_a[10] = _vec_load_14[2];
+                vals_a[11] = _vec_load_14[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_5 = start + 6144 + tid * 4;
+            if (i_2_5 < vocab) {
+                float _vec_load_15[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_5);
+                    _vec_load_15[0 + 0] = _v4.x;
+                    _vec_load_15[0 + 1] = _v4.y;
+                    _vec_load_15[0 + 2] = _v4.z;
+                    _vec_load_15[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_15[0];
+                vals_a[13] = _vec_load_15[1];
+                vals_a[14] = _vec_load_15[2];
+                vals_a[15] = _vec_load_15[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_17 = start + tid;
+            if (i2_17 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_17];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_3 = start + 512 + tid;
+            if (i2_0_3 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_3];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_3 = start + 1024 + tid;
+            if (i2_1_3 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_3];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_3 = start + 1536 + tid;
+            if (i2_2_3 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_3];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_3 = start + 2048 + tid;
+            if (i2_3_3 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_3];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_3 = start + 2560 + tid;
+            if (i2_4_3 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_3];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_3 = start + 3072 + tid;
+            if (i2_5_3 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_3];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_3 = start + 3584 + tid;
+            if (i2_6_3 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_3];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_3 = start + 4096 + tid;
+            if (i2_7_3 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_3];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_3 = start + 4608 + tid;
+            if (i2_8_3 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_3];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_3 = start + 5120 + tid;
+            if (i2_9_3 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_3];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_3 = start + 5632 + tid;
+            if (i2_10_3 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_3];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_3 = start + 6144 + tid;
+            if (i2_11_3 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_3];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_3 = start + 6656 + tid;
+            if (i2_12_3 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_3];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_3 = start + 7168 + tid;
+            if (i2_13_3 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_3];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_3 = start + 7680 + tid;
+            if (i2_14_3 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_3];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_2 = 0; c_2 < nch_stream; c_2 += 2) {
+        if (nch_stream > c_2 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_8 = start + (c_2 + 1) * 8192 + tid * 4;
+                if (i_8 < vocab) {
+                    float _vec_load_16[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_8);
+                        _vec_load_16[0 + 0] = _v4.x;
+                        _vec_load_16[0 + 1] = _v4.y;
+                        _vec_load_16[0 + 2] = _v4.z;
+                        _vec_load_16[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_16[0];
+                    vals_b[1] = _vec_load_16[1];
+                    vals_b[2] = _vec_load_16[2];
+                    vals_b[3] = _vec_load_16[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_5 = start + (c_2 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_5 < vocab) {
+                    float _vec_load_17[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_5);
+                        _vec_load_17[0 + 0] = _v4.x;
+                        _vec_load_17[0 + 1] = _v4.y;
+                        _vec_load_17[0 + 2] = _v4.z;
+                        _vec_load_17[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_17[0];
+                    vals_b[5] = _vec_load_17[1];
+                    vals_b[6] = _vec_load_17[2];
+                    vals_b[7] = _vec_load_17[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_6 = start + (c_2 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_6 < vocab) {
+                    float _vec_load_18[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_6);
+                        _vec_load_18[0 + 0] = _v4.x;
+                        _vec_load_18[0 + 1] = _v4.y;
+                        _vec_load_18[0 + 2] = _v4.z;
+                        _vec_load_18[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_18[0];
+                    vals_b[9] = _vec_load_18[1];
+                    vals_b[10] = _vec_load_18[2];
+                    vals_b[11] = _vec_load_18[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_6 = start + (c_2 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_6 < vocab) {
+                    float _vec_load_19[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_6);
+                        _vec_load_19[0 + 0] = _v4.x;
+                        _vec_load_19[0 + 1] = _v4.y;
+                        _vec_load_19[0 + 2] = _v4.z;
+                        _vec_load_19[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_19[0];
+                    vals_b[13] = _vec_load_19[1];
+                    vals_b[14] = _vec_load_19[2];
+                    vals_b[15] = _vec_load_19[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_18 = start + (c_2 + 1) * 8192 + tid;
+                if (i2_18 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_18];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_4 = start + (c_2 + 1) * 8192 + 512 + tid;
+                if (i2_0_4 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_4];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_4 = start + (c_2 + 1) * 8192 + 1024 + tid;
+                if (i2_1_4 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_4];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_4 = start + (c_2 + 1) * 8192 + 1536 + tid;
+                if (i2_2_4 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_4];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_4 = start + (c_2 + 1) * 8192 + 2048 + tid;
+                if (i2_3_4 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_4];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_4 = start + (c_2 + 1) * 8192 + 2560 + tid;
+                if (i2_4_4 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_4];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_4 = start + (c_2 + 1) * 8192 + 3072 + tid;
+                if (i2_5_4 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_4];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_4 = start + (c_2 + 1) * 8192 + 3584 + tid;
+                if (i2_6_4 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_4];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_4 = start + (c_2 + 1) * 8192 + 4096 + tid;
+                if (i2_7_4 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_4];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_4 = start + (c_2 + 1) * 8192 + 4608 + tid;
+                if (i2_8_4 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_4];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_4 = start + (c_2 + 1) * 8192 + 5120 + tid;
+                if (i2_9_4 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_4];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_4 = start + (c_2 + 1) * 8192 + 5632 + tid;
+                if (i2_10_4 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_4];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_4 = start + (c_2 + 1) * 8192 + 6144 + tid;
+                if (i2_11_4 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_4];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_4 = start + (c_2 + 1) * 8192 + 6656 + tid;
+                if (i2_12_4 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_4];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_4 = start + (c_2 + 1) * 8192 + 7168 + tid;
+                if (i2_13_4 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_4];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_4 = start + (c_2 + 1) * 8192 + 7680 + tid;
+                if (i2_14_4 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_4];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_5 = __as_u32(vals_a[0]);
+        unsigned int key_5 = ((bits_5 <= 2139095040) ? bits_5 : 0);
+        unsigned int bucket_4 = key_5 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_4], 1);
+        unsigned int bits_0 = __as_u32(vals_a[1]);
+        unsigned int key_1_1 = ((bits_0 <= 2139095040) ? bits_0 : 0);
+        unsigned int bucket_2_1 = key_1_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_2_1], 1);
+        unsigned int bits_3_1 = __as_u32(vals_a[2]);
+        unsigned int key_4_1 = ((bits_3_1 <= 2139095040) ? bits_3_1 : 0);
+        unsigned int bucket_5 = key_4_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_5], 1);
+        unsigned int bits_6_1 = __as_u32(vals_a[3]);
+        unsigned int key_7_1 = ((bits_6_1 <= 2139095040) ? bits_6_1 : 0);
+        unsigned int bucket_8 = key_7_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_8], 1);
+        unsigned int bits_9 = __as_u32(vals_a[4]);
+        unsigned int key_10 = ((bits_9 <= 2139095040) ? bits_9 : 0);
+        unsigned int bucket_11 = key_10 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_11], 1);
+        unsigned int bits_12 = __as_u32(vals_a[5]);
+        unsigned int key_13 = ((bits_12 <= 2139095040) ? bits_12 : 0);
+        unsigned int bucket_14 = key_13 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_14], 1);
+        unsigned int bits_15 = __as_u32(vals_a[6]);
+        unsigned int key_16 = ((bits_15 <= 2139095040) ? bits_15 : 0);
+        unsigned int bucket_17 = key_16 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_17], 1);
+        unsigned int bits_18_1 = __as_u32(vals_a[7]);
+        unsigned int key_19_1 = ((bits_18_1 <= 2139095040) ? bits_18_1 : 0);
+        unsigned int bucket_20 = key_19_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_20], 1);
+        unsigned int bits_21 = __as_u32(vals_a[8]);
+        unsigned int key_22 = ((bits_21 <= 2139095040) ? bits_21 : 0);
+        unsigned int bucket_23 = key_22 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_23], 1);
+        unsigned int bits_24_1 = __as_u32(vals_a[9]);
+        unsigned int key_25_1 = ((bits_24_1 <= 2139095040) ? bits_24_1 : 0);
+        unsigned int bucket_26 = key_25_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_26], 1);
+        unsigned int bits_27 = __as_u32(vals_a[10]);
+        unsigned int key_28 = ((bits_27 <= 2139095040) ? bits_27 : 0);
+        unsigned int bucket_29 = key_28 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_29], 1);
+        unsigned int bits_30 = __as_u32(vals_a[11]);
+        unsigned int key_31 = ((bits_30 <= 2139095040) ? bits_30 : 0);
+        unsigned int bucket_32 = key_31 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_32], 1);
+        unsigned int bits_33 = __as_u32(vals_a[12]);
+        unsigned int key_34 = ((bits_33 <= 2139095040) ? bits_33 : 0);
+        unsigned int bucket_35 = key_34 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_35], 1);
+        unsigned int bits_36 = __as_u32(vals_a[13]);
+        unsigned int key_37 = ((bits_36 <= 2139095040) ? bits_36 : 0);
+        unsigned int bucket_38 = key_37 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_38], 1);
+        unsigned int bits_39_1 = __as_u32(vals_a[14]);
+        unsigned int key_40_1 = ((bits_39_1 <= 2139095040) ? bits_39_1 : 0);
+        unsigned int bucket_41 = key_40_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_41], 1);
+        unsigned int bits_42 = __as_u32(vals_a[15]);
+        unsigned int key_43 = ((bits_42 <= 2139095040) ? bits_42 : 0);
+        unsigned int bucket_44 = key_43 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_44], 1);
+        if (nch_stream > c_2 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_9 = start + (c_2 + 2) * 8192 + tid * 4;
+                if (i_9 < vocab) {
+                    float _vec_load_20[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_9);
+                        _vec_load_20[0 + 0] = _v4.x;
+                        _vec_load_20[0 + 1] = _v4.y;
+                        _vec_load_20[0 + 2] = _v4.z;
+                        _vec_load_20[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_20[0];
+                    vals_a[1] = _vec_load_20[1];
+                    vals_a[2] = _vec_load_20[2];
+                    vals_a[3] = _vec_load_20[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_6 = start + (c_2 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_6 < vocab) {
+                    float _vec_load_21[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_6);
+                        _vec_load_21[0 + 0] = _v4.x;
+                        _vec_load_21[0 + 1] = _v4.y;
+                        _vec_load_21[0 + 2] = _v4.z;
+                        _vec_load_21[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_21[0];
+                    vals_a[5] = _vec_load_21[1];
+                    vals_a[6] = _vec_load_21[2];
+                    vals_a[7] = _vec_load_21[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_7 = start + (c_2 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_7 < vocab) {
+                    float _vec_load_22[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_7);
+                        _vec_load_22[0 + 0] = _v4.x;
+                        _vec_load_22[0 + 1] = _v4.y;
+                        _vec_load_22[0 + 2] = _v4.z;
+                        _vec_load_22[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_22[0];
+                    vals_a[9] = _vec_load_22[1];
+                    vals_a[10] = _vec_load_22[2];
+                    vals_a[11] = _vec_load_22[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_7 = start + (c_2 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_7 < vocab) {
+                    float _vec_load_23[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_7);
+                        _vec_load_23[0 + 0] = _v4.x;
+                        _vec_load_23[0 + 1] = _v4.y;
+                        _vec_load_23[0 + 2] = _v4.z;
+                        _vec_load_23[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_23[0];
+                    vals_a[13] = _vec_load_23[1];
+                    vals_a[14] = _vec_load_23[2];
+                    vals_a[15] = _vec_load_23[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_19 = start + (c_2 + 2) * 8192 + tid;
+                if (i2_19 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_19];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_5 = start + (c_2 + 2) * 8192 + 512 + tid;
+                if (i2_0_5 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_5];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_5 = start + (c_2 + 2) * 8192 + 1024 + tid;
+                if (i2_1_5 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_5];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_5 = start + (c_2 + 2) * 8192 + 1536 + tid;
+                if (i2_2_5 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_5];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_5 = start + (c_2 + 2) * 8192 + 2048 + tid;
+                if (i2_3_5 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_5];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_5 = start + (c_2 + 2) * 8192 + 2560 + tid;
+                if (i2_4_5 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_5];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_5 = start + (c_2 + 2) * 8192 + 3072 + tid;
+                if (i2_5_5 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_5];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_5 = start + (c_2 + 2) * 8192 + 3584 + tid;
+                if (i2_6_5 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_5];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_5 = start + (c_2 + 2) * 8192 + 4096 + tid;
+                if (i2_7_5 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_5];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_5 = start + (c_2 + 2) * 8192 + 4608 + tid;
+                if (i2_8_5 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_5];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_5 = start + (c_2 + 2) * 8192 + 5120 + tid;
+                if (i2_9_5 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_5];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_5 = start + (c_2 + 2) * 8192 + 5632 + tid;
+                if (i2_10_5 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_5];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_5 = start + (c_2 + 2) * 8192 + 6144 + tid;
+                if (i2_11_5 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_5];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_5 = start + (c_2 + 2) * 8192 + 6656 + tid;
+                if (i2_12_5 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_5];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_5 = start + (c_2 + 2) * 8192 + 7168 + tid;
+                if (i2_13_5 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_5];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_5 = start + (c_2 + 2) * 8192 + 7680 + tid;
+                if (i2_14_5 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_5];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_2 + 1) {
+            unsigned int bits_1_2 = __as_u32(vals_b[0]);
+            unsigned int key_2_2 = ((bits_1_2 <= 2139095040) ? bits_1_2 : 0);
+            unsigned int bucket_3_1 = key_2_2 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_3_1], 1);
+            unsigned int bits_4_1 = __as_u32(vals_b[1]);
+            unsigned int key_5_1 = ((bits_4_1 <= 2139095040) ? bits_4_1 : 0);
+            unsigned int bucket_6 = key_5_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_6], 1);
+            unsigned int bits_7 = __as_u32(vals_b[2]);
+            unsigned int key_8 = ((bits_7 <= 2139095040) ? bits_7 : 0);
+            unsigned int bucket_9 = key_8 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_9], 1);
+            unsigned int bits_10 = __as_u32(vals_b[3]);
+            unsigned int key_11 = ((bits_10 <= 2139095040) ? bits_10 : 0);
+            unsigned int bucket_12 = key_11 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_12], 1);
+            unsigned int bits_13_1 = __as_u32(vals_b[4]);
+            unsigned int key_14_1 = ((bits_13_1 <= 2139095040) ? bits_13_1 : 0);
+            unsigned int bucket_15 = key_14_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_15], 1);
+            unsigned int bits_16 = __as_u32(vals_b[5]);
+            unsigned int key_17 = ((bits_16 <= 2139095040) ? bits_16 : 0);
+            unsigned int bucket_18 = key_17 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_18], 1);
+            unsigned int bits_19 = __as_u32(vals_b[6]);
+            unsigned int key_20 = ((bits_19 <= 2139095040) ? bits_19 : 0);
+            unsigned int bucket_21 = key_20 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_21], 1);
+            unsigned int bits_22 = __as_u32(vals_b[7]);
+            unsigned int key_23 = ((bits_22 <= 2139095040) ? bits_22 : 0);
+            unsigned int bucket_24 = key_23 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_24], 1);
+            unsigned int bits_25 = __as_u32(vals_b[8]);
+            unsigned int key_26 = ((bits_25 <= 2139095040) ? bits_25 : 0);
+            unsigned int bucket_27 = key_26 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_27], 1);
+            unsigned int bits_28 = __as_u32(vals_b[9]);
+            unsigned int key_29 = ((bits_28 <= 2139095040) ? bits_28 : 0);
+            unsigned int bucket_30 = key_29 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_30], 1);
+            unsigned int bits_31 = __as_u32(vals_b[10]);
+            unsigned int key_32 = ((bits_31 <= 2139095040) ? bits_31 : 0);
+            unsigned int bucket_33 = key_32 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_33], 1);
+            unsigned int bits_34_1 = __as_u32(vals_b[11]);
+            unsigned int key_35_1 = ((bits_34_1 <= 2139095040) ? bits_34_1 : 0);
+            unsigned int bucket_36 = key_35_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_36], 1);
+            unsigned int bits_37 = __as_u32(vals_b[12]);
+            unsigned int key_38 = ((bits_37 <= 2139095040) ? bits_37 : 0);
+            unsigned int bucket_39 = key_38 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_39], 1);
+            unsigned int bits_40 = __as_u32(vals_b[13]);
+            unsigned int key_41 = ((bits_40 <= 2139095040) ? bits_40 : 0);
+            unsigned int bucket_42 = key_41 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_42], 1);
+            unsigned int bits_43_1 = __as_u32(vals_b[14]);
+            unsigned int key_44_1 = ((bits_43_1 <= 2139095040) ? bits_43_1 : 0);
+            unsigned int bucket_45 = key_44_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_45], 1);
+            unsigned int bits_46 = __as_u32(vals_b[15]);
+            unsigned int key_47 = ((bits_46 <= 2139095040) ? bits_46 : 0);
+            unsigned int bucket_48 = key_47 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_48], 1);
+        }
+    }
+    int niter = (int)(n_eff + 31 >> 5);
+    for (int j = 0; j < niter; j++) {
+        unsigned int e = (unsigned int)(j * 32 + lane);
+        if (e < n_eff) {
+            unsigned int key_6 = lkeys[seg_base + j * 32 + lane];
+            unsigned int bucket_7 = key_6 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_7], 1);
+        }
+    }
+    __syncthreads();
+    unsigned int c0_15 = 0;
+    unsigned int c1_16 = 0;
+    unsigned int c2_17 = 0;
+    unsigned int c3_18 = 0;
+    {
+        c0_15 = hist0[tid * 4];
+        c1_16 = hist0[tid * 4 + 1];
+        c2_17 = hist0[tid * 4 + 2];
+        c3_18 = hist0[tid * 4 + 3];
+    }
+    unsigned int local_19 = c0_15 + c1_16 + c2_17 + c3_18;
+    uint32_t _warp_scan_sum_u32_1 = local_19;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(16));
+    unsigned int lane_suffix_20 = _warp_scan_sum_u32_1 - local_19;
+    unsigned int _warp_redux_u32_2;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_2) : "r"(local_19));
+    unsigned int warp_total_21 = _warp_redux_u32_2;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_21;
+    }
+    __syncthreads();
+    unsigned int peer_22 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_23 = ((lane > warp) ? peer_22 : 0);
+    unsigned int _warp_redux_u32_3;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_3) : "r"(above_23));
+    unsigned int warps_above_24 = _warp_redux_u32_3;
+    unsigned int suffix_25 = lane_suffix_20 + warps_above_24;
+    if (suffix_25 < remaining && remaining <= suffix_25 + local_19) {
+        unsigned int s3 = suffix_25 + c3_18;
+        unsigned int s2 = s3 + c2_17;
+        unsigned int s1 = s2 + c1_16;
+        if (remaining <= s3) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_25;
+        } else if (remaining <= s2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3;
+        } else {
+            if (remaining <= s1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 11 | bucket_sel;
+    unsigned int b0 = (unsigned int)(tid * 4);
+    unsigned int h0 = hist0[tid * 4];
+    unsigned int h1 = hist0[tid * 4 + 1];
+    unsigned int h2 = hist0[tid * 4 + 2];
+    unsigned int h3 = hist0[tid * 4 + 3];
+    unsigned int above_26 = 0;
+    unsigned int own_1 = 0;
+    if (b0 > bucket_sel) {
+        above_26 = above_26 + h0;
+    }
+    if (bucket_sel < b0 + 1) {
+        above_26 = above_26 + h1;
+    }
+    if (bucket_sel < b0 + 2) {
+        above_26 = above_26 + h2;
+    }
+    if (bucket_sel < b0 + 3) {
+        above_26 = above_26 + h3;
+    }
+    if (b0 == bucket_sel) {
+        own_1 = h0;
+    }
+    if (b0 + 1 == bucket_sel) {
+        own_1 = h1;
+    }
+    if (b0 + 2 == bucket_sel) {
+        own_1 = h2;
+    }
+    if (b0 + 3 == bucket_sel) {
+        own_1 = h3;
+    }
+    uint32_t _warp_scan_sum_u32_2 = above_26;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(16));
+    unsigned int incl = _warp_scan_sum_u32_2;
+    if (lane == 31) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    unsigned int before_27 = 0;
+    unsigned int total_28 = 0;
+    unsigned int ws = warp_sums[0];
+    total_28 = total_28 + ws;
+    if (warp > 0) {
+        before_27 = before_27 + ws;
+    }
+    unsigned int ws_29 = warp_sums[1];
+    total_28 = total_28 + ws_29;
+    if (warp > 1) {
+        before_27 = before_27 + ws_29;
+    }
+    unsigned int ws_30 = warp_sums[2];
+    total_28 = total_28 + ws_30;
+    if (warp > 2) {
+        before_27 = before_27 + ws_30;
+    }
+    unsigned int ws_31 = warp_sums[3];
+    total_28 = total_28 + ws_31;
+    if (warp > 3) {
+        before_27 = before_27 + ws_31;
+    }
+    unsigned int ws_32 = warp_sums[4];
+    total_28 = total_28 + ws_32;
+    if (warp > 4) {
+        before_27 = before_27 + ws_32;
+    }
+    unsigned int ws_33 = warp_sums[5];
+    total_28 = total_28 + ws_33;
+    if (warp > 5) {
+        before_27 = before_27 + ws_33;
+    }
+    unsigned int ws_34 = warp_sums[6];
+    total_28 = total_28 + ws_34;
+    if (warp > 6) {
+        before_27 = before_27 + ws_34;
+    }
+    unsigned int ws_35 = warp_sums[7];
+    total_28 = total_28 + ws_35;
+    if (warp > 7) {
+        before_27 = before_27 + ws_35;
+    }
+    unsigned int ws_36 = warp_sums[8];
+    total_28 = total_28 + ws_36;
+    if (warp > 8) {
+        before_27 = before_27 + ws_36;
+    }
+    unsigned int ws_37 = warp_sums[9];
+    total_28 = total_28 + ws_37;
+    if (warp > 9) {
+        before_27 = before_27 + ws_37;
+    }
+    unsigned int ws_38 = warp_sums[10];
+    total_28 = total_28 + ws_38;
+    if (warp > 10) {
+        before_27 = before_27 + ws_38;
+    }
+    unsigned int ws_39 = warp_sums[11];
+    total_28 = total_28 + ws_39;
+    if (warp > 11) {
+        before_27 = before_27 + ws_39;
+    }
+    unsigned int ws_40 = warp_sums[12];
+    total_28 = total_28 + ws_40;
+    if (warp > 12) {
+        before_27 = before_27 + ws_40;
+    }
+    unsigned int ws_41 = warp_sums[13];
+    total_28 = total_28 + ws_41;
+    if (warp > 13) {
+        before_27 = before_27 + ws_41;
+    }
+    unsigned int ws_42 = warp_sums[14];
+    total_28 = total_28 + ws_42;
+    if (warp > 14) {
+        before_27 = before_27 + ws_42;
+    }
+    unsigned int ws_43 = warp_sums[15];
+    total_28 = total_28 + ws_43;
+    if (warp > 15) {
+        before_27 = before_27 + ws_43;
+    }
+    unsigned int excl = before_27 + incl - above_26;
+    __syncthreads();
+    gt_local = gt_local + total_28;
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_10 = start + tid * 4;
+            if (i_10 < vocab) {
+                float _vec_load_24[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_10);
+                    _vec_load_24[0 + 0] = _v4.x;
+                    _vec_load_24[0 + 1] = _v4.y;
+                    _vec_load_24[0 + 2] = _v4.z;
+                    _vec_load_24[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_24[0];
+                vals_a[1] = _vec_load_24[1];
+                vals_a[2] = _vec_load_24[2];
+                vals_a[3] = _vec_load_24[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_7 = start + 2048 + tid * 4;
+            if (i_0_7 < vocab) {
+                float _vec_load_25[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_7);
+                    _vec_load_25[0 + 0] = _v4.x;
+                    _vec_load_25[0 + 1] = _v4.y;
+                    _vec_load_25[0 + 2] = _v4.z;
+                    _vec_load_25[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_25[0];
+                vals_a[5] = _vec_load_25[1];
+                vals_a[6] = _vec_load_25[2];
+                vals_a[7] = _vec_load_25[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_8 = start + 4096 + tid * 4;
+            if (i_1_8 < vocab) {
+                float _vec_load_26[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_8);
+                    _vec_load_26[0 + 0] = _v4.x;
+                    _vec_load_26[0 + 1] = _v4.y;
+                    _vec_load_26[0 + 2] = _v4.z;
+                    _vec_load_26[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_26[0];
+                vals_a[9] = _vec_load_26[1];
+                vals_a[10] = _vec_load_26[2];
+                vals_a[11] = _vec_load_26[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_8 = start + 6144 + tid * 4;
+            if (i_2_8 < vocab) {
+                float _vec_load_27[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_8);
+                    _vec_load_27[0 + 0] = _v4.x;
+                    _vec_load_27[0 + 1] = _v4.y;
+                    _vec_load_27[0 + 2] = _v4.z;
+                    _vec_load_27[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_27[0];
+                vals_a[13] = _vec_load_27[1];
+                vals_a[14] = _vec_load_27[2];
+                vals_a[15] = _vec_load_27[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_20 = start + tid;
+            if (i2_20 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_20];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_6 = start + 512 + tid;
+            if (i2_0_6 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_6];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_6 = start + 1024 + tid;
+            if (i2_1_6 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_6];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_6 = start + 1536 + tid;
+            if (i2_2_6 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_6];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_6 = start + 2048 + tid;
+            if (i2_3_6 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_6];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_6 = start + 2560 + tid;
+            if (i2_4_6 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_6];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_6 = start + 3072 + tid;
+            if (i2_5_6 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_6];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_6 = start + 3584 + tid;
+            if (i2_6_6 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_6];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_6 = start + 4096 + tid;
+            if (i2_7_6 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_6];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_6 = start + 4608 + tid;
+            if (i2_8_6 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_6];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_6 = start + 5120 + tid;
+            if (i2_9_6 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_6];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_6 = start + 5632 + tid;
+            if (i2_10_6 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_6];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_6 = start + 6144 + tid;
+            if (i2_11_6 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_6];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_6 = start + 6656 + tid;
+            if (i2_12_6 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_6];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_6 = start + 7168 + tid;
+            if (i2_13_6 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_6];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_6 = start + 7680 + tid;
+            if (i2_14_6 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_6];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_3 = 0; c_3 < nch_stream; c_3 += 2) {
+        if (nch_stream > c_3 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_11 = start + (c_3 + 1) * 8192 + tid * 4;
+                if (i_11 < vocab) {
+                    float _vec_load_28[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_11);
+                        _vec_load_28[0 + 0] = _v4.x;
+                        _vec_load_28[0 + 1] = _v4.y;
+                        _vec_load_28[0 + 2] = _v4.z;
+                        _vec_load_28[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_28[0];
+                    vals_b[1] = _vec_load_28[1];
+                    vals_b[2] = _vec_load_28[2];
+                    vals_b[3] = _vec_load_28[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_8 = start + (c_3 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_8 < vocab) {
+                    float _vec_load_29[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_8);
+                        _vec_load_29[0 + 0] = _v4.x;
+                        _vec_load_29[0 + 1] = _v4.y;
+                        _vec_load_29[0 + 2] = _v4.z;
+                        _vec_load_29[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_29[0];
+                    vals_b[5] = _vec_load_29[1];
+                    vals_b[6] = _vec_load_29[2];
+                    vals_b[7] = _vec_load_29[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_9 = start + (c_3 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_9 < vocab) {
+                    float _vec_load_30[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_9);
+                        _vec_load_30[0 + 0] = _v4.x;
+                        _vec_load_30[0 + 1] = _v4.y;
+                        _vec_load_30[0 + 2] = _v4.z;
+                        _vec_load_30[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_30[0];
+                    vals_b[9] = _vec_load_30[1];
+                    vals_b[10] = _vec_load_30[2];
+                    vals_b[11] = _vec_load_30[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_9 = start + (c_3 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_9 < vocab) {
+                    float _vec_load_31[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_9);
+                        _vec_load_31[0 + 0] = _v4.x;
+                        _vec_load_31[0 + 1] = _v4.y;
+                        _vec_load_31[0 + 2] = _v4.z;
+                        _vec_load_31[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_31[0];
+                    vals_b[13] = _vec_load_31[1];
+                    vals_b[14] = _vec_load_31[2];
+                    vals_b[15] = _vec_load_31[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_21 = start + (c_3 + 1) * 8192 + tid;
+                if (i2_21 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_21];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_7 = start + (c_3 + 1) * 8192 + 512 + tid;
+                if (i2_0_7 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_7];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_7 = start + (c_3 + 1) * 8192 + 1024 + tid;
+                if (i2_1_7 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_7];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_7 = start + (c_3 + 1) * 8192 + 1536 + tid;
+                if (i2_2_7 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_7];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_7 = start + (c_3 + 1) * 8192 + 2048 + tid;
+                if (i2_3_7 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_7];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_7 = start + (c_3 + 1) * 8192 + 2560 + tid;
+                if (i2_4_7 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_7];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_7 = start + (c_3 + 1) * 8192 + 3072 + tid;
+                if (i2_5_7 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_7];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_7 = start + (c_3 + 1) * 8192 + 3584 + tid;
+                if (i2_6_7 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_7];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_7 = start + (c_3 + 1) * 8192 + 4096 + tid;
+                if (i2_7_7 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_7];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_7 = start + (c_3 + 1) * 8192 + 4608 + tid;
+                if (i2_8_7 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_7];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_7 = start + (c_3 + 1) * 8192 + 5120 + tid;
+                if (i2_9_7 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_7];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_7 = start + (c_3 + 1) * 8192 + 5632 + tid;
+                if (i2_10_7 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_7];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_7 = start + (c_3 + 1) * 8192 + 6144 + tid;
+                if (i2_11_7 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_7];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_7 = start + (c_3 + 1) * 8192 + 6656 + tid;
+                if (i2_12_7 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_7];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_7 = start + (c_3 + 1) * 8192 + 7168 + tid;
+                if (i2_13_7 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_7];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_7 = start + (c_3 + 1) * 8192 + 7680 + tid;
+                if (i2_14_7 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_7];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_14 = __as_u32(vals_a[0]);
+        unsigned int key_15 = ((bits_14 <= 2139095040) ? bits_14 : 0);
+        unsigned int bucket_10 = key_15 >> 10 & 2047;
+        if (key_15 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_10], 1);
+        }
+        unsigned int bits_0_1 = __as_u32(vals_a[1]);
+        unsigned int key_1_2 = ((bits_0_1 <= 2139095040) ? bits_0_1 : 0);
+        unsigned int bucket_2_2 = key_1_2 >> 10 & 2047;
+        if (key_1_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_2_2], 1);
+        }
+        unsigned int bits_3_2 = __as_u32(vals_a[2]);
+        unsigned int key_4_2 = ((bits_3_2 <= 2139095040) ? bits_3_2 : 0);
+        unsigned int bucket_5_1 = key_4_2 >> 10 & 2047;
+        if (key_4_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_5_1], 1);
+        }
+        unsigned int bits_6_2 = __as_u32(vals_a[3]);
+        unsigned int key_7_2 = ((bits_6_2 <= 2139095040) ? bits_6_2 : 0);
+        unsigned int bucket_8_1 = key_7_2 >> 10 & 2047;
+        if (key_7_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_8_1], 1);
+        }
+        unsigned int bits_9_1 = __as_u32(vals_a[4]);
+        unsigned int key_10_1 = ((bits_9_1 <= 2139095040) ? bits_9_1 : 0);
+        unsigned int bucket_11_1 = key_10_1 >> 10 & 2047;
+        if (key_10_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_11_1], 1);
+        }
+        unsigned int bits_12_1 = __as_u32(vals_a[5]);
+        unsigned int key_13_1 = ((bits_12_1 <= 2139095040) ? bits_12_1 : 0);
+        unsigned int bucket_14_1 = key_13_1 >> 10 & 2047;
+        if (key_13_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_14_1], 1);
+        }
+        unsigned int bits_15_1 = __as_u32(vals_a[6]);
+        unsigned int key_16_1 = ((bits_15_1 <= 2139095040) ? bits_15_1 : 0);
+        unsigned int bucket_17_1 = key_16_1 >> 10 & 2047;
+        if (key_16_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_17_1], 1);
+        }
+        unsigned int bits_18_2 = __as_u32(vals_a[7]);
+        unsigned int key_19_2 = ((bits_18_2 <= 2139095040) ? bits_18_2 : 0);
+        unsigned int bucket_20_1 = key_19_2 >> 10 & 2047;
+        if (key_19_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_20_1], 1);
+        }
+        unsigned int bits_21_1 = __as_u32(vals_a[8]);
+        unsigned int key_22_1 = ((bits_21_1 <= 2139095040) ? bits_21_1 : 0);
+        unsigned int bucket_23_1 = key_22_1 >> 10 & 2047;
+        if (key_22_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_23_1], 1);
+        }
+        unsigned int bits_24_2 = __as_u32(vals_a[9]);
+        unsigned int key_25_2 = ((bits_24_2 <= 2139095040) ? bits_24_2 : 0);
+        unsigned int bucket_26_1 = key_25_2 >> 10 & 2047;
+        if (key_25_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_26_1], 1);
+        }
+        unsigned int bits_27_1 = __as_u32(vals_a[10]);
+        unsigned int key_28_1 = ((bits_27_1 <= 2139095040) ? bits_27_1 : 0);
+        unsigned int bucket_29_1 = key_28_1 >> 10 & 2047;
+        if (key_28_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_29_1], 1);
+        }
+        unsigned int bits_30_1 = __as_u32(vals_a[11]);
+        unsigned int key_31_1 = ((bits_30_1 <= 2139095040) ? bits_30_1 : 0);
+        unsigned int bucket_32_1 = key_31_1 >> 10 & 2047;
+        if (key_31_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_32_1], 1);
+        }
+        unsigned int bits_33_1 = __as_u32(vals_a[12]);
+        unsigned int key_34_1 = ((bits_33_1 <= 2139095040) ? bits_33_1 : 0);
+        unsigned int bucket_35_1 = key_34_1 >> 10 & 2047;
+        if (key_34_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_35_1], 1);
+        }
+        unsigned int bits_36_1 = __as_u32(vals_a[13]);
+        unsigned int key_37_1 = ((bits_36_1 <= 2139095040) ? bits_36_1 : 0);
+        unsigned int bucket_38_1 = key_37_1 >> 10 & 2047;
+        if (key_37_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_38_1], 1);
+        }
+        unsigned int bits_39_2 = __as_u32(vals_a[14]);
+        unsigned int key_40_2 = ((bits_39_2 <= 2139095040) ? bits_39_2 : 0);
+        unsigned int bucket_41_1 = key_40_2 >> 10 & 2047;
+        if (key_40_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_41_1], 1);
+        }
+        unsigned int bits_42_1 = __as_u32(vals_a[15]);
+        unsigned int key_43_1 = ((bits_42_1 <= 2139095040) ? bits_42_1 : 0);
+        unsigned int bucket_44_1 = key_43_1 >> 10 & 2047;
+        if (key_43_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_44_1], 1);
+        }
+        if (nch_stream > c_3 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_12 = start + (c_3 + 2) * 8192 + tid * 4;
+                if (i_12 < vocab) {
+                    float _vec_load_32[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_12);
+                        _vec_load_32[0 + 0] = _v4.x;
+                        _vec_load_32[0 + 1] = _v4.y;
+                        _vec_load_32[0 + 2] = _v4.z;
+                        _vec_load_32[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_32[0];
+                    vals_a[1] = _vec_load_32[1];
+                    vals_a[2] = _vec_load_32[2];
+                    vals_a[3] = _vec_load_32[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_9 = start + (c_3 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_9 < vocab) {
+                    float _vec_load_33[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_9);
+                        _vec_load_33[0 + 0] = _v4.x;
+                        _vec_load_33[0 + 1] = _v4.y;
+                        _vec_load_33[0 + 2] = _v4.z;
+                        _vec_load_33[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_33[0];
+                    vals_a[5] = _vec_load_33[1];
+                    vals_a[6] = _vec_load_33[2];
+                    vals_a[7] = _vec_load_33[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_10 = start + (c_3 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_10 < vocab) {
+                    float _vec_load_34[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_10);
+                        _vec_load_34[0 + 0] = _v4.x;
+                        _vec_load_34[0 + 1] = _v4.y;
+                        _vec_load_34[0 + 2] = _v4.z;
+                        _vec_load_34[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_34[0];
+                    vals_a[9] = _vec_load_34[1];
+                    vals_a[10] = _vec_load_34[2];
+                    vals_a[11] = _vec_load_34[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_10 = start + (c_3 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_10 < vocab) {
+                    float _vec_load_35[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_10);
+                        _vec_load_35[0 + 0] = _v4.x;
+                        _vec_load_35[0 + 1] = _v4.y;
+                        _vec_load_35[0 + 2] = _v4.z;
+                        _vec_load_35[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_35[0];
+                    vals_a[13] = _vec_load_35[1];
+                    vals_a[14] = _vec_load_35[2];
+                    vals_a[15] = _vec_load_35[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_22 = start + (c_3 + 2) * 8192 + tid;
+                if (i2_22 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_22];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_8 = start + (c_3 + 2) * 8192 + 512 + tid;
+                if (i2_0_8 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_8];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_8 = start + (c_3 + 2) * 8192 + 1024 + tid;
+                if (i2_1_8 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_8];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_8 = start + (c_3 + 2) * 8192 + 1536 + tid;
+                if (i2_2_8 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_8];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_8 = start + (c_3 + 2) * 8192 + 2048 + tid;
+                if (i2_3_8 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_8];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_8 = start + (c_3 + 2) * 8192 + 2560 + tid;
+                if (i2_4_8 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_8];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_8 = start + (c_3 + 2) * 8192 + 3072 + tid;
+                if (i2_5_8 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_8];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_8 = start + (c_3 + 2) * 8192 + 3584 + tid;
+                if (i2_6_8 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_8];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_8 = start + (c_3 + 2) * 8192 + 4096 + tid;
+                if (i2_7_8 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_8];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_8 = start + (c_3 + 2) * 8192 + 4608 + tid;
+                if (i2_8_8 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_8];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_8 = start + (c_3 + 2) * 8192 + 5120 + tid;
+                if (i2_9_8 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_8];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_8 = start + (c_3 + 2) * 8192 + 5632 + tid;
+                if (i2_10_8 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_8];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_8 = start + (c_3 + 2) * 8192 + 6144 + tid;
+                if (i2_11_8 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_8];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_8 = start + (c_3 + 2) * 8192 + 6656 + tid;
+                if (i2_12_8 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_8];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_8 = start + (c_3 + 2) * 8192 + 7168 + tid;
+                if (i2_13_8 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_8];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_8 = start + (c_3 + 2) * 8192 + 7680 + tid;
+                if (i2_14_8 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_8];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_3 + 1) {
+            unsigned int bits_1_3 = __as_u32(vals_b[0]);
+            unsigned int key_2_3 = ((bits_1_3 <= 2139095040) ? bits_1_3 : 0);
+            unsigned int bucket_3_2 = key_2_3 >> 10 & 2047;
+            if (key_2_3 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_3_2], 1);
+            }
+            unsigned int bits_4_2 = __as_u32(vals_b[1]);
+            unsigned int key_5_2 = ((bits_4_2 <= 2139095040) ? bits_4_2 : 0);
+            unsigned int bucket_6_1 = key_5_2 >> 10 & 2047;
+            if (key_5_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_6_1], 1);
+            }
+            unsigned int bits_7_1 = __as_u32(vals_b[2]);
+            unsigned int key_8_1 = ((bits_7_1 <= 2139095040) ? bits_7_1 : 0);
+            unsigned int bucket_9_1 = key_8_1 >> 10 & 2047;
+            if (key_8_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_9_1], 1);
+            }
+            unsigned int bits_10_1 = __as_u32(vals_b[3]);
+            unsigned int key_11_1 = ((bits_10_1 <= 2139095040) ? bits_10_1 : 0);
+            unsigned int bucket_12_1 = key_11_1 >> 10 & 2047;
+            if (key_11_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_12_1], 1);
+            }
+            unsigned int bits_13_2 = __as_u32(vals_b[4]);
+            unsigned int key_14_2 = ((bits_13_2 <= 2139095040) ? bits_13_2 : 0);
+            unsigned int bucket_15_1 = key_14_2 >> 10 & 2047;
+            if (key_14_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_15_1], 1);
+            }
+            unsigned int bits_16_1 = __as_u32(vals_b[5]);
+            unsigned int key_17_1 = ((bits_16_1 <= 2139095040) ? bits_16_1 : 0);
+            unsigned int bucket_18_1 = key_17_1 >> 10 & 2047;
+            if (key_17_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_18_1], 1);
+            }
+            unsigned int bits_19_1 = __as_u32(vals_b[6]);
+            unsigned int key_20_1 = ((bits_19_1 <= 2139095040) ? bits_19_1 : 0);
+            unsigned int bucket_21_1 = key_20_1 >> 10 & 2047;
+            if (key_20_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_21_1], 1);
+            }
+            unsigned int bits_22_1 = __as_u32(vals_b[7]);
+            unsigned int key_23_1 = ((bits_22_1 <= 2139095040) ? bits_22_1 : 0);
+            unsigned int bucket_24_1 = key_23_1 >> 10 & 2047;
+            if (key_23_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_24_1], 1);
+            }
+            unsigned int bits_25_1 = __as_u32(vals_b[8]);
+            unsigned int key_26_1 = ((bits_25_1 <= 2139095040) ? bits_25_1 : 0);
+            unsigned int bucket_27_1 = key_26_1 >> 10 & 2047;
+            if (key_26_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_27_1], 1);
+            }
+            unsigned int bits_28_1 = __as_u32(vals_b[9]);
+            unsigned int key_29_1 = ((bits_28_1 <= 2139095040) ? bits_28_1 : 0);
+            unsigned int bucket_30_1 = key_29_1 >> 10 & 2047;
+            if (key_29_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_30_1], 1);
+            }
+            unsigned int bits_31_1 = __as_u32(vals_b[10]);
+            unsigned int key_32_1 = ((bits_31_1 <= 2139095040) ? bits_31_1 : 0);
+            unsigned int bucket_33_1 = key_32_1 >> 10 & 2047;
+            if (key_32_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_33_1], 1);
+            }
+            unsigned int bits_34_2 = __as_u32(vals_b[11]);
+            unsigned int key_35_2 = ((bits_34_2 <= 2139095040) ? bits_34_2 : 0);
+            unsigned int bucket_36_1 = key_35_2 >> 10 & 2047;
+            if (key_35_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_36_1], 1);
+            }
+            unsigned int bits_37_1 = __as_u32(vals_b[12]);
+            unsigned int key_38_1 = ((bits_37_1 <= 2139095040) ? bits_37_1 : 0);
+            unsigned int bucket_39_1 = key_38_1 >> 10 & 2047;
+            if (key_38_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_39_1], 1);
+            }
+            unsigned int bits_40_1 = __as_u32(vals_b[13]);
+            unsigned int key_41_1 = ((bits_40_1 <= 2139095040) ? bits_40_1 : 0);
+            unsigned int bucket_42_1 = key_41_1 >> 10 & 2047;
+            if (key_41_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_42_1], 1);
+            }
+            unsigned int bits_43_2 = __as_u32(vals_b[14]);
+            unsigned int key_44_2 = ((bits_43_2 <= 2139095040) ? bits_43_2 : 0);
+            unsigned int bucket_45_1 = key_44_2 >> 10 & 2047;
+            if (key_44_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_45_1], 1);
+            }
+            unsigned int bits_46_1 = __as_u32(vals_b[15]);
+            unsigned int key_47_1 = ((bits_46_1 <= 2139095040) ? bits_46_1 : 0);
+            unsigned int bucket_48_1 = key_47_1 >> 10 & 2047;
+            if (key_47_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_48_1], 1);
+            }
+        }
+    }
+    int niter_44 = (int)(n_eff + 31 >> 5);
+    for (int j_1 = 0; j_1 < niter_44; j_1++) {
+        unsigned int e_1 = (unsigned int)(j_1 * 32 + lane);
+        if (e_1 < n_eff) {
+            unsigned int key_18 = lkeys[seg_base + j_1 * 32 + lane];
+            unsigned int bucket_13 = key_18 >> 10 & 2047;
+            if (key_18 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_13], 1);
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int c0_45 = 0;
+    unsigned int c1_46 = 0;
+    unsigned int c2_47 = 0;
+    unsigned int c3_48 = 0;
+    {
+        c0_45 = hist1[tid * 4];
+        c1_46 = hist1[tid * 4 + 1];
+        c2_47 = hist1[tid * 4 + 2];
+        c3_48 = hist1[tid * 4 + 3];
+    }
+    unsigned int local_49 = c0_45 + c1_46 + c2_47 + c3_48;
+    uint32_t _warp_scan_sum_u32_3 = local_49;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(16));
+    unsigned int lane_suffix_50 = _warp_scan_sum_u32_3 - local_49;
+    unsigned int _warp_redux_u32_4;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_4) : "r"(local_49));
+    unsigned int warp_total_51 = _warp_redux_u32_4;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_51;
+    }
+    __syncthreads();
+    unsigned int peer_52 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_53 = ((lane > warp) ? peer_52 : 0);
+    unsigned int _warp_redux_u32_5;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_5) : "r"(above_53));
+    unsigned int warps_above_54 = _warp_redux_u32_5;
+    unsigned int suffix_55 = lane_suffix_50 + warps_above_54;
+    if (suffix_55 < remaining && remaining <= suffix_55 + local_49) {
+        unsigned int s3_1 = suffix_55 + c3_48;
+        unsigned int s2_1 = s3_1 + c2_47;
+        unsigned int s1_1 = s2_1 + c1_46;
+        if (remaining <= s3_1) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_55;
+        } else if (remaining <= s2_1) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3_1;
+        } else {
+            if (remaining <= s1_1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2_1;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1_1;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel_56 = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 11 | bucket_sel_56;
+    unsigned int b0_57 = (unsigned int)(tid * 4);
+    unsigned int h0_58 = hist1[tid * 4];
+    unsigned int h1_59 = hist1[tid * 4 + 1];
+    unsigned int h2_60 = hist1[tid * 4 + 2];
+    unsigned int h3_61 = hist1[tid * 4 + 3];
+    unsigned int above_62 = 0;
+    unsigned int own_63 = 0;
+    if (b0_57 > bucket_sel_56) {
+        above_62 = above_62 + h0_58;
+    }
+    if (bucket_sel_56 < b0_57 + 1) {
+        above_62 = above_62 + h1_59;
+    }
+    if (bucket_sel_56 < b0_57 + 2) {
+        above_62 = above_62 + h2_60;
+    }
+    if (bucket_sel_56 < b0_57 + 3) {
+        above_62 = above_62 + h3_61;
+    }
+    if (b0_57 == bucket_sel_56) {
+        own_63 = h0_58;
+    }
+    if (b0_57 + 1 == bucket_sel_56) {
+        own_63 = h1_59;
+    }
+    if (b0_57 + 2 == bucket_sel_56) {
+        own_63 = h2_60;
+    }
+    if (b0_57 + 3 == bucket_sel_56) {
+        own_63 = h3_61;
+    }
+    uint32_t _warp_scan_sum_u32_4 = above_62;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(16));
+    unsigned int incl_64 = _warp_scan_sum_u32_4;
+    if (lane == 31) {
+        warp_sums[warp] = incl_64;
+    }
+    __syncthreads();
+    unsigned int before_65 = 0;
+    unsigned int total_66 = 0;
+    unsigned int ws_67 = warp_sums[0];
+    total_66 = total_66 + ws_67;
+    if (warp > 0) {
+        before_65 = before_65 + ws_67;
+    }
+    unsigned int ws_68 = warp_sums[1];
+    total_66 = total_66 + ws_68;
+    if (warp > 1) {
+        before_65 = before_65 + ws_68;
+    }
+    unsigned int ws_69 = warp_sums[2];
+    total_66 = total_66 + ws_69;
+    if (warp > 2) {
+        before_65 = before_65 + ws_69;
+    }
+    unsigned int ws_70 = warp_sums[3];
+    total_66 = total_66 + ws_70;
+    if (warp > 3) {
+        before_65 = before_65 + ws_70;
+    }
+    unsigned int ws_71 = warp_sums[4];
+    total_66 = total_66 + ws_71;
+    if (warp > 4) {
+        before_65 = before_65 + ws_71;
+    }
+    unsigned int ws_72 = warp_sums[5];
+    total_66 = total_66 + ws_72;
+    if (warp > 5) {
+        before_65 = before_65 + ws_72;
+    }
+    unsigned int ws_73 = warp_sums[6];
+    total_66 = total_66 + ws_73;
+    if (warp > 6) {
+        before_65 = before_65 + ws_73;
+    }
+    unsigned int ws_74 = warp_sums[7];
+    total_66 = total_66 + ws_74;
+    if (warp > 7) {
+        before_65 = before_65 + ws_74;
+    }
+    unsigned int ws_75 = warp_sums[8];
+    total_66 = total_66 + ws_75;
+    if (warp > 8) {
+        before_65 = before_65 + ws_75;
+    }
+    unsigned int ws_76 = warp_sums[9];
+    total_66 = total_66 + ws_76;
+    if (warp > 9) {
+        before_65 = before_65 + ws_76;
+    }
+    unsigned int ws_77 = warp_sums[10];
+    total_66 = total_66 + ws_77;
+    if (warp > 10) {
+        before_65 = before_65 + ws_77;
+    }
+    unsigned int ws_78 = warp_sums[11];
+    total_66 = total_66 + ws_78;
+    if (warp > 11) {
+        before_65 = before_65 + ws_78;
+    }
+    unsigned int ws_79 = warp_sums[12];
+    total_66 = total_66 + ws_79;
+    if (warp > 12) {
+        before_65 = before_65 + ws_79;
+    }
+    unsigned int ws_80 = warp_sums[13];
+    total_66 = total_66 + ws_80;
+    if (warp > 13) {
+        before_65 = before_65 + ws_80;
+    }
+    unsigned int ws_81 = warp_sums[14];
+    total_66 = total_66 + ws_81;
+    if (warp > 14) {
+        before_65 = before_65 + ws_81;
+    }
+    unsigned int ws_82 = warp_sums[15];
+    total_66 = total_66 + ws_82;
+    if (warp > 15) {
+        before_65 = before_65 + ws_82;
+    }
+    unsigned int excl_83 = before_65 + incl_64 - above_62;
+    __syncthreads();
+    gt_local = gt_local + total_66;
+    {
+        for (int i_13 = tid; i_13 < 2048; i_13 += 512) {
+            hist0[i_13] = 0;
+        }
+        __syncthreads();
+    }
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_14 = start + tid * 4;
+            if (i_14 < vocab) {
+                float _vec_load_36[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_14);
+                    _vec_load_36[0 + 0] = _v4.x;
+                    _vec_load_36[0 + 1] = _v4.y;
+                    _vec_load_36[0 + 2] = _v4.z;
+                    _vec_load_36[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_36[0];
+                vals_a[1] = _vec_load_36[1];
+                vals_a[2] = _vec_load_36[2];
+                vals_a[3] = _vec_load_36[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_10 = start + 2048 + tid * 4;
+            if (i_0_10 < vocab) {
+                float _vec_load_37[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_10);
+                    _vec_load_37[0 + 0] = _v4.x;
+                    _vec_load_37[0 + 1] = _v4.y;
+                    _vec_load_37[0 + 2] = _v4.z;
+                    _vec_load_37[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_37[0];
+                vals_a[5] = _vec_load_37[1];
+                vals_a[6] = _vec_load_37[2];
+                vals_a[7] = _vec_load_37[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_11 = start + 4096 + tid * 4;
+            if (i_1_11 < vocab) {
+                float _vec_load_38[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_11);
+                    _vec_load_38[0 + 0] = _v4.x;
+                    _vec_load_38[0 + 1] = _v4.y;
+                    _vec_load_38[0 + 2] = _v4.z;
+                    _vec_load_38[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_38[0];
+                vals_a[9] = _vec_load_38[1];
+                vals_a[10] = _vec_load_38[2];
+                vals_a[11] = _vec_load_38[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_11 = start + 6144 + tid * 4;
+            if (i_2_11 < vocab) {
+                float _vec_load_39[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_11);
+                    _vec_load_39[0 + 0] = _v4.x;
+                    _vec_load_39[0 + 1] = _v4.y;
+                    _vec_load_39[0 + 2] = _v4.z;
+                    _vec_load_39[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_39[0];
+                vals_a[13] = _vec_load_39[1];
+                vals_a[14] = _vec_load_39[2];
+                vals_a[15] = _vec_load_39[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_23 = start + tid;
+            if (i2_23 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_23];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_9 = start + 512 + tid;
+            if (i2_0_9 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_9];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_9 = start + 1024 + tid;
+            if (i2_1_9 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_9];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_9 = start + 1536 + tid;
+            if (i2_2_9 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_9];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_9 = start + 2048 + tid;
+            if (i2_3_9 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_9];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_9 = start + 2560 + tid;
+            if (i2_4_9 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_9];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_9 = start + 3072 + tid;
+            if (i2_5_9 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_9];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_9 = start + 3584 + tid;
+            if (i2_6_9 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_9];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_9 = start + 4096 + tid;
+            if (i2_7_9 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_9];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_9 = start + 4608 + tid;
+            if (i2_8_9 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_9];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_9 = start + 5120 + tid;
+            if (i2_9_9 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_9];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_9 = start + 5632 + tid;
+            if (i2_10_9 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_9];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_9 = start + 6144 + tid;
+            if (i2_11_9 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_9];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_9 = start + 6656 + tid;
+            if (i2_12_9 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_9];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_9 = start + 7168 + tid;
+            if (i2_13_9 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_9];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_9 = start + 7680 + tid;
+            if (i2_14_9 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_9];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_4 = 0; c_4 < nch_stream; c_4 += 2) {
+        if (nch_stream > c_4 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_15 = start + (c_4 + 1) * 8192 + tid * 4;
+                if (i_15 < vocab) {
+                    float _vec_load_40[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_15);
+                        _vec_load_40[0 + 0] = _v4.x;
+                        _vec_load_40[0 + 1] = _v4.y;
+                        _vec_load_40[0 + 2] = _v4.z;
+                        _vec_load_40[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_40[0];
+                    vals_b[1] = _vec_load_40[1];
+                    vals_b[2] = _vec_load_40[2];
+                    vals_b[3] = _vec_load_40[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_11 = start + (c_4 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_11 < vocab) {
+                    float _vec_load_41[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_11);
+                        _vec_load_41[0 + 0] = _v4.x;
+                        _vec_load_41[0 + 1] = _v4.y;
+                        _vec_load_41[0 + 2] = _v4.z;
+                        _vec_load_41[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_41[0];
+                    vals_b[5] = _vec_load_41[1];
+                    vals_b[6] = _vec_load_41[2];
+                    vals_b[7] = _vec_load_41[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_12 = start + (c_4 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_12 < vocab) {
+                    float _vec_load_42[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_12);
+                        _vec_load_42[0 + 0] = _v4.x;
+                        _vec_load_42[0 + 1] = _v4.y;
+                        _vec_load_42[0 + 2] = _v4.z;
+                        _vec_load_42[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_42[0];
+                    vals_b[9] = _vec_load_42[1];
+                    vals_b[10] = _vec_load_42[2];
+                    vals_b[11] = _vec_load_42[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_12 = start + (c_4 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_12 < vocab) {
+                    float _vec_load_43[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_12);
+                        _vec_load_43[0 + 0] = _v4.x;
+                        _vec_load_43[0 + 1] = _v4.y;
+                        _vec_load_43[0 + 2] = _v4.z;
+                        _vec_load_43[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_43[0];
+                    vals_b[13] = _vec_load_43[1];
+                    vals_b[14] = _vec_load_43[2];
+                    vals_b[15] = _vec_load_43[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_24 = start + (c_4 + 1) * 8192 + tid;
+                if (i2_24 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_24];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_10 = start + (c_4 + 1) * 8192 + 512 + tid;
+                if (i2_0_10 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_10];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_10 = start + (c_4 + 1) * 8192 + 1024 + tid;
+                if (i2_1_10 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_10];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_10 = start + (c_4 + 1) * 8192 + 1536 + tid;
+                if (i2_2_10 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_10];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_10 = start + (c_4 + 1) * 8192 + 2048 + tid;
+                if (i2_3_10 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_10];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_10 = start + (c_4 + 1) * 8192 + 2560 + tid;
+                if (i2_4_10 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_10];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_10 = start + (c_4 + 1) * 8192 + 3072 + tid;
+                if (i2_5_10 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_10];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_10 = start + (c_4 + 1) * 8192 + 3584 + tid;
+                if (i2_6_10 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_10];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_10 = start + (c_4 + 1) * 8192 + 4096 + tid;
+                if (i2_7_10 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_10];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_10 = start + (c_4 + 1) * 8192 + 4608 + tid;
+                if (i2_8_10 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_10];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_10 = start + (c_4 + 1) * 8192 + 5120 + tid;
+                if (i2_9_10 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_10];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_10 = start + (c_4 + 1) * 8192 + 5632 + tid;
+                if (i2_10_10 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_10];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_10 = start + (c_4 + 1) * 8192 + 6144 + tid;
+                if (i2_11_10 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_10];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_10 = start + (c_4 + 1) * 8192 + 6656 + tid;
+                if (i2_12_10 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_10];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_10 = start + (c_4 + 1) * 8192 + 7168 + tid;
+                if (i2_13_10 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_10];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_10 = start + (c_4 + 1) * 8192 + 7680 + tid;
+                if (i2_14_10 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_10];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_17 = __as_u32(vals_a[0]);
+        unsigned int key_21 = ((bits_17 <= 2139095040) ? bits_17 : 0);
+        unsigned int bucket_16 = key_21 & 1023;
+        if (key_21 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_16], 1);
+        }
+        unsigned int bits_0_2 = __as_u32(vals_a[1]);
+        unsigned int key_1_3 = ((bits_0_2 <= 2139095040) ? bits_0_2 : 0);
+        unsigned int bucket_2_3 = key_1_3 & 1023;
+        if (key_1_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_2_3], 1);
+        }
+        unsigned int bits_3_3 = __as_u32(vals_a[2]);
+        unsigned int key_4_3 = ((bits_3_3 <= 2139095040) ? bits_3_3 : 0);
+        unsigned int bucket_5_2 = key_4_3 & 1023;
+        if (key_4_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_5_2], 1);
+        }
+        unsigned int bits_6_3 = __as_u32(vals_a[3]);
+        unsigned int key_7_3 = ((bits_6_3 <= 2139095040) ? bits_6_3 : 0);
+        unsigned int bucket_8_2 = key_7_3 & 1023;
+        if (key_7_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_8_2], 1);
+        }
+        unsigned int bits_9_2 = __as_u32(vals_a[4]);
+        unsigned int key_10_2 = ((bits_9_2 <= 2139095040) ? bits_9_2 : 0);
+        unsigned int bucket_11_2 = key_10_2 & 1023;
+        if (key_10_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_11_2], 1);
+        }
+        unsigned int bits_12_2 = __as_u32(vals_a[5]);
+        unsigned int key_13_2 = ((bits_12_2 <= 2139095040) ? bits_12_2 : 0);
+        unsigned int bucket_14_2 = key_13_2 & 1023;
+        if (key_13_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_14_2], 1);
+        }
+        unsigned int bits_15_2 = __as_u32(vals_a[6]);
+        unsigned int key_16_2 = ((bits_15_2 <= 2139095040) ? bits_15_2 : 0);
+        unsigned int bucket_17_2 = key_16_2 & 1023;
+        if (key_16_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_17_2], 1);
+        }
+        unsigned int bits_18_3 = __as_u32(vals_a[7]);
+        unsigned int key_19_3 = ((bits_18_3 <= 2139095040) ? bits_18_3 : 0);
+        unsigned int bucket_20_2 = key_19_3 & 1023;
+        if (key_19_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_20_2], 1);
+        }
+        unsigned int bits_21_2 = __as_u32(vals_a[8]);
+        unsigned int key_22_2 = ((bits_21_2 <= 2139095040) ? bits_21_2 : 0);
+        unsigned int bucket_23_2 = key_22_2 & 1023;
+        if (key_22_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_23_2], 1);
+        }
+        unsigned int bits_24_3 = __as_u32(vals_a[9]);
+        unsigned int key_25_3 = ((bits_24_3 <= 2139095040) ? bits_24_3 : 0);
+        unsigned int bucket_26_2 = key_25_3 & 1023;
+        if (key_25_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_26_2], 1);
+        }
+        unsigned int bits_27_2 = __as_u32(vals_a[10]);
+        unsigned int key_28_2 = ((bits_27_2 <= 2139095040) ? bits_27_2 : 0);
+        unsigned int bucket_29_2 = key_28_2 & 1023;
+        if (key_28_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_29_2], 1);
+        }
+        unsigned int bits_30_2 = __as_u32(vals_a[11]);
+        unsigned int key_31_2 = ((bits_30_2 <= 2139095040) ? bits_30_2 : 0);
+        unsigned int bucket_32_2 = key_31_2 & 1023;
+        if (key_31_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_32_2], 1);
+        }
+        unsigned int bits_33_2 = __as_u32(vals_a[12]);
+        unsigned int key_34_2 = ((bits_33_2 <= 2139095040) ? bits_33_2 : 0);
+        unsigned int bucket_35_2 = key_34_2 & 1023;
+        if (key_34_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_35_2], 1);
+        }
+        unsigned int bits_36_2 = __as_u32(vals_a[13]);
+        unsigned int key_37_2 = ((bits_36_2 <= 2139095040) ? bits_36_2 : 0);
+        unsigned int bucket_38_2 = key_37_2 & 1023;
+        if (key_37_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_38_2], 1);
+        }
+        unsigned int bits_39_3 = __as_u32(vals_a[14]);
+        unsigned int key_40_3 = ((bits_39_3 <= 2139095040) ? bits_39_3 : 0);
+        unsigned int bucket_41_2 = key_40_3 & 1023;
+        if (key_40_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_41_2], 1);
+        }
+        unsigned int bits_42_2 = __as_u32(vals_a[15]);
+        unsigned int key_43_2 = ((bits_42_2 <= 2139095040) ? bits_42_2 : 0);
+        unsigned int bucket_44_2 = key_43_2 & 1023;
+        if (key_43_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_44_2], 1);
+        }
+        if (nch_stream > c_4 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_16 = start + (c_4 + 2) * 8192 + tid * 4;
+                if (i_16 < vocab) {
+                    float _vec_load_44[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_16);
+                        _vec_load_44[0 + 0] = _v4.x;
+                        _vec_load_44[0 + 1] = _v4.y;
+                        _vec_load_44[0 + 2] = _v4.z;
+                        _vec_load_44[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_44[0];
+                    vals_a[1] = _vec_load_44[1];
+                    vals_a[2] = _vec_load_44[2];
+                    vals_a[3] = _vec_load_44[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_12 = start + (c_4 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_12 < vocab) {
+                    float _vec_load_45[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_12);
+                        _vec_load_45[0 + 0] = _v4.x;
+                        _vec_load_45[0 + 1] = _v4.y;
+                        _vec_load_45[0 + 2] = _v4.z;
+                        _vec_load_45[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_45[0];
+                    vals_a[5] = _vec_load_45[1];
+                    vals_a[6] = _vec_load_45[2];
+                    vals_a[7] = _vec_load_45[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_13 = start + (c_4 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_13 < vocab) {
+                    float _vec_load_46[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_13);
+                        _vec_load_46[0 + 0] = _v4.x;
+                        _vec_load_46[0 + 1] = _v4.y;
+                        _vec_load_46[0 + 2] = _v4.z;
+                        _vec_load_46[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_46[0];
+                    vals_a[9] = _vec_load_46[1];
+                    vals_a[10] = _vec_load_46[2];
+                    vals_a[11] = _vec_load_46[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_13 = start + (c_4 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_13 < vocab) {
+                    float _vec_load_47[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_13);
+                        _vec_load_47[0 + 0] = _v4.x;
+                        _vec_load_47[0 + 1] = _v4.y;
+                        _vec_load_47[0 + 2] = _v4.z;
+                        _vec_load_47[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_47[0];
+                    vals_a[13] = _vec_load_47[1];
+                    vals_a[14] = _vec_load_47[2];
+                    vals_a[15] = _vec_load_47[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_25 = start + (c_4 + 2) * 8192 + tid;
+                if (i2_25 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_25];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_11 = start + (c_4 + 2) * 8192 + 512 + tid;
+                if (i2_0_11 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_11];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_11 = start + (c_4 + 2) * 8192 + 1024 + tid;
+                if (i2_1_11 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_11];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_11 = start + (c_4 + 2) * 8192 + 1536 + tid;
+                if (i2_2_11 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_11];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_11 = start + (c_4 + 2) * 8192 + 2048 + tid;
+                if (i2_3_11 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_11];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_11 = start + (c_4 + 2) * 8192 + 2560 + tid;
+                if (i2_4_11 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_11];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_11 = start + (c_4 + 2) * 8192 + 3072 + tid;
+                if (i2_5_11 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_11];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_11 = start + (c_4 + 2) * 8192 + 3584 + tid;
+                if (i2_6_11 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_11];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_11 = start + (c_4 + 2) * 8192 + 4096 + tid;
+                if (i2_7_11 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_11];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_11 = start + (c_4 + 2) * 8192 + 4608 + tid;
+                if (i2_8_11 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_11];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_11 = start + (c_4 + 2) * 8192 + 5120 + tid;
+                if (i2_9_11 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_11];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_11 = start + (c_4 + 2) * 8192 + 5632 + tid;
+                if (i2_10_11 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_11];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_11 = start + (c_4 + 2) * 8192 + 6144 + tid;
+                if (i2_11_11 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_11];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_11 = start + (c_4 + 2) * 8192 + 6656 + tid;
+                if (i2_12_11 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_11];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_11 = start + (c_4 + 2) * 8192 + 7168 + tid;
+                if (i2_13_11 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_11];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_11 = start + (c_4 + 2) * 8192 + 7680 + tid;
+                if (i2_14_11 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_11];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_4 + 1) {
+            unsigned int bits_1_4 = __as_u32(vals_b[0]);
+            unsigned int key_2_4 = ((bits_1_4 <= 2139095040) ? bits_1_4 : 0);
+            unsigned int bucket_3_3 = key_2_4 & 1023;
+            if (key_2_4 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_3_3], 1);
+            }
+            unsigned int bits_4_3 = __as_u32(vals_b[1]);
+            unsigned int key_5_3 = ((bits_4_3 <= 2139095040) ? bits_4_3 : 0);
+            unsigned int bucket_6_2 = key_5_3 & 1023;
+            if (key_5_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_6_2], 1);
+            }
+            unsigned int bits_7_2 = __as_u32(vals_b[2]);
+            unsigned int key_8_2 = ((bits_7_2 <= 2139095040) ? bits_7_2 : 0);
+            unsigned int bucket_9_2 = key_8_2 & 1023;
+            if (key_8_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_9_2], 1);
+            }
+            unsigned int bits_10_2 = __as_u32(vals_b[3]);
+            unsigned int key_11_2 = ((bits_10_2 <= 2139095040) ? bits_10_2 : 0);
+            unsigned int bucket_12_2 = key_11_2 & 1023;
+            if (key_11_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_12_2], 1);
+            }
+            unsigned int bits_13_3 = __as_u32(vals_b[4]);
+            unsigned int key_14_3 = ((bits_13_3 <= 2139095040) ? bits_13_3 : 0);
+            unsigned int bucket_15_2 = key_14_3 & 1023;
+            if (key_14_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_15_2], 1);
+            }
+            unsigned int bits_16_2 = __as_u32(vals_b[5]);
+            unsigned int key_17_2 = ((bits_16_2 <= 2139095040) ? bits_16_2 : 0);
+            unsigned int bucket_18_2 = key_17_2 & 1023;
+            if (key_17_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_18_2], 1);
+            }
+            unsigned int bits_19_2 = __as_u32(vals_b[6]);
+            unsigned int key_20_2 = ((bits_19_2 <= 2139095040) ? bits_19_2 : 0);
+            unsigned int bucket_21_2 = key_20_2 & 1023;
+            if (key_20_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_21_2], 1);
+            }
+            unsigned int bits_22_2 = __as_u32(vals_b[7]);
+            unsigned int key_23_2 = ((bits_22_2 <= 2139095040) ? bits_22_2 : 0);
+            unsigned int bucket_24_2 = key_23_2 & 1023;
+            if (key_23_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_24_2], 1);
+            }
+            unsigned int bits_25_2 = __as_u32(vals_b[8]);
+            unsigned int key_26_2 = ((bits_25_2 <= 2139095040) ? bits_25_2 : 0);
+            unsigned int bucket_27_2 = key_26_2 & 1023;
+            if (key_26_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_27_2], 1);
+            }
+            unsigned int bits_28_2 = __as_u32(vals_b[9]);
+            unsigned int key_29_2 = ((bits_28_2 <= 2139095040) ? bits_28_2 : 0);
+            unsigned int bucket_30_2 = key_29_2 & 1023;
+            if (key_29_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_30_2], 1);
+            }
+            unsigned int bits_31_2 = __as_u32(vals_b[10]);
+            unsigned int key_32_2 = ((bits_31_2 <= 2139095040) ? bits_31_2 : 0);
+            unsigned int bucket_33_2 = key_32_2 & 1023;
+            if (key_32_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_33_2], 1);
+            }
+            unsigned int bits_34_3 = __as_u32(vals_b[11]);
+            unsigned int key_35_3 = ((bits_34_3 <= 2139095040) ? bits_34_3 : 0);
+            unsigned int bucket_36_2 = key_35_3 & 1023;
+            if (key_35_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_36_2], 1);
+            }
+            unsigned int bits_37_2 = __as_u32(vals_b[12]);
+            unsigned int key_38_2 = ((bits_37_2 <= 2139095040) ? bits_37_2 : 0);
+            unsigned int bucket_39_2 = key_38_2 & 1023;
+            if (key_38_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_39_2], 1);
+            }
+            unsigned int bits_40_2 = __as_u32(vals_b[13]);
+            unsigned int key_41_2 = ((bits_40_2 <= 2139095040) ? bits_40_2 : 0);
+            unsigned int bucket_42_2 = key_41_2 & 1023;
+            if (key_41_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_42_2], 1);
+            }
+            unsigned int bits_43_3 = __as_u32(vals_b[14]);
+            unsigned int key_44_3 = ((bits_43_3 <= 2139095040) ? bits_43_3 : 0);
+            unsigned int bucket_45_2 = key_44_3 & 1023;
+            if (key_44_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_45_2], 1);
+            }
+            unsigned int bits_46_2 = __as_u32(vals_b[15]);
+            unsigned int key_47_2 = ((bits_46_2 <= 2139095040) ? bits_46_2 : 0);
+            unsigned int bucket_48_2 = key_47_2 & 1023;
+            if (key_47_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_48_2], 1);
+            }
+        }
+    }
+    int niter_84 = (int)(n_eff + 31 >> 5);
+    for (int j_2 = 0; j_2 < niter_84; j_2++) {
+        unsigned int e_2 = (unsigned int)(j_2 * 32 + lane);
+        if (e_2 < n_eff) {
+            unsigned int key_27 = lkeys[seg_base + j_2 * 32 + lane];
+            unsigned int bucket_19 = key_27 & 1023;
+            if (key_27 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_19], 1);
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int c0_85 = 0;
+    unsigned int c1_86 = 0;
+    unsigned int c2_87 = 0;
+    unsigned int c3_88 = 0;
+    {
+        c0_85 = hist0[tid * 4];
+        c1_86 = hist0[tid * 4 + 1];
+        c2_87 = hist0[tid * 4 + 2];
+        c3_88 = hist0[tid * 4 + 3];
+    }
+    unsigned int local_89 = c0_85 + c1_86 + c2_87 + c3_88;
+    uint32_t _warp_scan_sum_u32_5 = local_89;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(16));
+    unsigned int lane_suffix_90 = _warp_scan_sum_u32_5 - local_89;
+    unsigned int _warp_redux_u32_6;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_6) : "r"(local_89));
+    unsigned int warp_total_91 = _warp_redux_u32_6;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_91;
+    }
+    __syncthreads();
+    unsigned int peer_92 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_93 = ((lane > warp) ? peer_92 : 0);
+    unsigned int _warp_redux_u32_7;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_7) : "r"(above_93));
+    unsigned int warps_above_94 = _warp_redux_u32_7;
+    unsigned int suffix_95 = lane_suffix_90 + warps_above_94;
+    if (suffix_95 < remaining && remaining <= suffix_95 + local_89) {
+        unsigned int s3_2 = suffix_95 + c3_88;
+        unsigned int s2_2 = s3_2 + c2_87;
+        unsigned int s1_2 = s2_2 + c1_86;
+        if (remaining <= s3_2) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_95;
+        } else if (remaining <= s2_2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3_2;
+        } else {
+            if (remaining <= s1_2) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2_2;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1_2;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel_96 = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 10 | bucket_sel_96;
+    unsigned int b0_97 = (unsigned int)(tid * 4);
+    unsigned int h0_98 = hist0[tid * 4];
+    unsigned int h1_99 = hist0[tid * 4 + 1];
+    unsigned int h2_100 = hist0[tid * 4 + 2];
+    unsigned int h3_101 = hist0[tid * 4 + 3];
+    unsigned int above_102 = 0;
+    unsigned int own_103 = 0;
+    if (b0_97 > bucket_sel_96) {
+        above_102 = above_102 + h0_98;
+    }
+    if (bucket_sel_96 < b0_97 + 1) {
+        above_102 = above_102 + h1_99;
+    }
+    if (bucket_sel_96 < b0_97 + 2) {
+        above_102 = above_102 + h2_100;
+    }
+    if (bucket_sel_96 < b0_97 + 3) {
+        above_102 = above_102 + h3_101;
+    }
+    if (b0_97 == bucket_sel_96) {
+        own_103 = h0_98;
+    }
+    if (b0_97 + 1 == bucket_sel_96) {
+        own_103 = h1_99;
+    }
+    if (b0_97 + 2 == bucket_sel_96) {
+        own_103 = h2_100;
+    }
+    if (b0_97 + 3 == bucket_sel_96) {
+        own_103 = h3_101;
+    }
+    uint32_t _warp_scan_sum_u32_6 = above_102;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(16));
+    unsigned int incl_104 = _warp_scan_sum_u32_6;
+    if (lane == 31) {
+        warp_sums[warp] = incl_104;
+    }
+    __syncthreads();
+    unsigned int before_105 = 0;
+    unsigned int total_106 = 0;
+    unsigned int ws_107 = warp_sums[0];
+    total_106 = total_106 + ws_107;
+    if (warp > 0) {
+        before_105 = before_105 + ws_107;
+    }
+    unsigned int ws_108 = warp_sums[1];
+    total_106 = total_106 + ws_108;
+    if (warp > 1) {
+        before_105 = before_105 + ws_108;
+    }
+    unsigned int ws_109 = warp_sums[2];
+    total_106 = total_106 + ws_109;
+    if (warp > 2) {
+        before_105 = before_105 + ws_109;
+    }
+    unsigned int ws_110 = warp_sums[3];
+    total_106 = total_106 + ws_110;
+    if (warp > 3) {
+        before_105 = before_105 + ws_110;
+    }
+    unsigned int ws_111 = warp_sums[4];
+    total_106 = total_106 + ws_111;
+    if (warp > 4) {
+        before_105 = before_105 + ws_111;
+    }
+    unsigned int ws_112 = warp_sums[5];
+    total_106 = total_106 + ws_112;
+    if (warp > 5) {
+        before_105 = before_105 + ws_112;
+    }
+    unsigned int ws_113 = warp_sums[6];
+    total_106 = total_106 + ws_113;
+    if (warp > 6) {
+        before_105 = before_105 + ws_113;
+    }
+    unsigned int ws_114 = warp_sums[7];
+    total_106 = total_106 + ws_114;
+    if (warp > 7) {
+        before_105 = before_105 + ws_114;
+    }
+    unsigned int ws_115 = warp_sums[8];
+    total_106 = total_106 + ws_115;
+    if (warp > 8) {
+        before_105 = before_105 + ws_115;
+    }
+    unsigned int ws_116 = warp_sums[9];
+    total_106 = total_106 + ws_116;
+    if (warp > 9) {
+        before_105 = before_105 + ws_116;
+    }
+    unsigned int ws_117 = warp_sums[10];
+    total_106 = total_106 + ws_117;
+    if (warp > 10) {
+        before_105 = before_105 + ws_117;
+    }
+    unsigned int ws_118 = warp_sums[11];
+    total_106 = total_106 + ws_118;
+    if (warp > 11) {
+        before_105 = before_105 + ws_118;
+    }
+    unsigned int ws_119 = warp_sums[12];
+    total_106 = total_106 + ws_119;
+    if (warp > 12) {
+        before_105 = before_105 + ws_119;
+    }
+    unsigned int ws_120 = warp_sums[13];
+    total_106 = total_106 + ws_120;
+    if (warp > 13) {
+        before_105 = before_105 + ws_120;
+    }
+    unsigned int ws_121 = warp_sums[14];
+    total_106 = total_106 + ws_121;
+    if (warp > 14) {
+        before_105 = before_105 + ws_121;
+    }
+    unsigned int ws_122 = warp_sums[15];
+    total_106 = total_106 + ws_122;
+    if (warp > 15) {
+        before_105 = before_105 + ws_122;
+    }
+    unsigned int excl_123 = before_105 + incl_104 - above_102;
+    __syncthreads();
+    gt_local = gt_local + total_106;
+    {
+        if (own_103 > 0) {
+            scal[4] = own_103;
+        }
+        __syncthreads();
+        eq_local = scal[4];
+    }
+    unsigned int threshold = prefix;
+    if (threshold == 0) {
+        if (nch_stream > 0) {
+            eq_local = eq_local - pad;
+        }
+    }
+    unsigned int gt = 0;
+    unsigned int ties = 0;
+    int niter_124 = (int)(n_eff + 31 >> 5);
+    for (int j_3 = 0; j_3 < niter_124; j_3++) {
+        unsigned int e_3 = (unsigned int)(j_3 * 32 + lane);
+        bool valid = e_3 < n_eff;
+        unsigned int key_33 = ((valid) ? lkeys[seg_base + j_3 * 32 + lane] : 0);
+        unsigned int _vote_33 = __ballot_sync(0xFFFFFFFF, valid && key_33 > threshold);
+        unsigned int mg = _vote_33;
+        unsigned int _vote_34 = __ballot_sync(0xFFFFFFFF, valid && key_33 == threshold);
+        unsigned int mt = _vote_34;
+        int _popc_64 = __popc(mg);
+        gt = gt + (unsigned int)_popc_64;
+        int _popc_65 = __popc(mt);
+        ties = ties + (unsigned int)_popc_65;
+    }
+    if (lane == 0) {
+        scal[32 + warp] = gt;
+        scal[48 + warp] = ties;
+    }
+    __syncthreads();
+    unsigned int before_125 = 0;
+    unsigned int total_126 = 0;
+    unsigned int v_127 = scal[32];
+    total_126 = total_126 + v_127;
+    if (warp > 0) {
+        before_125 = before_125 + v_127;
+    }
+    unsigned int v_128 = scal[33];
+    total_126 = total_126 + v_128;
+    if (warp > 1) {
+        before_125 = before_125 + v_128;
+    }
+    unsigned int v_129 = scal[34];
+    total_126 = total_126 + v_129;
+    if (warp > 2) {
+        before_125 = before_125 + v_129;
+    }
+    unsigned int v_130 = scal[35];
+    total_126 = total_126 + v_130;
+    if (warp > 3) {
+        before_125 = before_125 + v_130;
+    }
+    unsigned int v_131 = scal[36];
+    total_126 = total_126 + v_131;
+    if (warp > 4) {
+        before_125 = before_125 + v_131;
+    }
+    unsigned int v_132 = scal[37];
+    total_126 = total_126 + v_132;
+    if (warp > 5) {
+        before_125 = before_125 + v_132;
+    }
+    unsigned int v_133 = scal[38];
+    total_126 = total_126 + v_133;
+    if (warp > 6) {
+        before_125 = before_125 + v_133;
+    }
+    unsigned int v_134 = scal[39];
+    total_126 = total_126 + v_134;
+    if (warp > 7) {
+        before_125 = before_125 + v_134;
+    }
+    unsigned int v_135 = scal[40];
+    total_126 = total_126 + v_135;
+    if (warp > 8) {
+        before_125 = before_125 + v_135;
+    }
+    unsigned int v_136 = scal[41];
+    total_126 = total_126 + v_136;
+    if (warp > 9) {
+        before_125 = before_125 + v_136;
+    }
+    unsigned int v_137 = scal[42];
+    total_126 = total_126 + v_137;
+    if (warp > 10) {
+        before_125 = before_125 + v_137;
+    }
+    unsigned int v_138 = scal[43];
+    total_126 = total_126 + v_138;
+    if (warp > 11) {
+        before_125 = before_125 + v_138;
+    }
+    unsigned int v_139 = scal[44];
+    total_126 = total_126 + v_139;
+    if (warp > 12) {
+        before_125 = before_125 + v_139;
+    }
+    unsigned int v_140 = scal[45];
+    total_126 = total_126 + v_140;
+    if (warp > 13) {
+        before_125 = before_125 + v_140;
+    }
+    unsigned int v_141 = scal[46];
+    total_126 = total_126 + v_141;
+    if (warp > 14) {
+        before_125 = before_125 + v_141;
+    }
+    unsigned int v_142 = scal[47];
+    total_126 = total_126 + v_142;
+    if (warp > 15) {
+        before_125 = before_125 + v_142;
+    }
+    unsigned int before_143 = 0;
+    unsigned int total_144 = 0;
+    unsigned int v_145 = scal[48];
+    total_144 = total_144 + v_145;
+    if (warp > 0) {
+        before_143 = before_143 + v_145;
+    }
+    unsigned int v_146 = scal[49];
+    total_144 = total_144 + v_146;
+    if (warp > 1) {
+        before_143 = before_143 + v_146;
+    }
+    unsigned int v_147 = scal[50];
+    total_144 = total_144 + v_147;
+    if (warp > 2) {
+        before_143 = before_143 + v_147;
+    }
+    unsigned int v_148 = scal[51];
+    total_144 = total_144 + v_148;
+    if (warp > 3) {
+        before_143 = before_143 + v_148;
+    }
+    unsigned int v_149 = scal[52];
+    total_144 = total_144 + v_149;
+    if (warp > 4) {
+        before_143 = before_143 + v_149;
+    }
+    unsigned int v_150 = scal[53];
+    total_144 = total_144 + v_150;
+    if (warp > 5) {
+        before_143 = before_143 + v_150;
+    }
+    unsigned int v_151 = scal[54];
+    total_144 = total_144 + v_151;
+    if (warp > 6) {
+        before_143 = before_143 + v_151;
+    }
+    unsigned int v_152 = scal[55];
+    total_144 = total_144 + v_152;
+    if (warp > 7) {
+        before_143 = before_143 + v_152;
+    }
+    unsigned int v_153 = scal[56];
+    total_144 = total_144 + v_153;
+    if (warp > 8) {
+        before_143 = before_143 + v_153;
+    }
+    unsigned int v_154 = scal[57];
+    total_144 = total_144 + v_154;
+    if (warp > 9) {
+        before_143 = before_143 + v_154;
+    }
+    unsigned int v_155 = scal[58];
+    total_144 = total_144 + v_155;
+    if (warp > 10) {
+        before_143 = before_143 + v_155;
+    }
+    unsigned int v_156 = scal[59];
+    total_144 = total_144 + v_156;
+    if (warp > 11) {
+        before_143 = before_143 + v_156;
+    }
+    unsigned int v_157 = scal[60];
+    total_144 = total_144 + v_157;
+    if (warp > 12) {
+        before_143 = before_143 + v_157;
+    }
+    unsigned int v_158 = scal[61];
+    total_144 = total_144 + v_158;
+    if (warp > 13) {
+        before_143 = before_143 + v_158;
+    }
+    unsigned int v_159 = scal[62];
+    total_144 = total_144 + v_159;
+    if (warp > 14) {
+        before_143 = before_143 + v_159;
+    }
+    unsigned int v_160 = scal[63];
+    total_144 = total_144 + v_160;
+    if (warp > 15) {
+        before_143 = before_143 + v_160;
+    }
+    unsigned int gt_n = ((use_list) ? total_126 : gt_local);
+    unsigned int eq_n = ((use_list) ? total_144 : eq_local);
+    if (tid == 0) {
+        scal[2] = gt_n;
+        scal[3] = eq_n;
+    }
+    __syncthreads();
+    unsigned int gt_prefix = 0;
+    unsigned int eq_prefix = 0;
+    unsigned int gt_total = k_u - remaining;
+    unsigned int _min_2 = ((eq_n) < (remaining - eq_prefix) ? (eq_n) : (remaining - eq_prefix));
+    unsigned int take_rem = ((eq_prefix < remaining) ? _min_2 : 0);
+    unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
+    unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_17 = start + tid * 4;
+            if (i_17 < vocab) {
+                float _vec_load_48[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_17);
+                    _vec_load_48[0 + 0] = _v4.x;
+                    _vec_load_48[0 + 1] = _v4.y;
+                    _vec_load_48[0 + 2] = _v4.z;
+                    _vec_load_48[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_48[0];
+                vals_a[1] = _vec_load_48[1];
+                vals_a[2] = _vec_load_48[2];
+                vals_a[3] = _vec_load_48[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_13 = start + 2048 + tid * 4;
+            if (i_0_13 < vocab) {
+                float _vec_load_49[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_13);
+                    _vec_load_49[0 + 0] = _v4.x;
+                    _vec_load_49[0 + 1] = _v4.y;
+                    _vec_load_49[0 + 2] = _v4.z;
+                    _vec_load_49[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_49[0];
+                vals_a[5] = _vec_load_49[1];
+                vals_a[6] = _vec_load_49[2];
+                vals_a[7] = _vec_load_49[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_14 = start + 4096 + tid * 4;
+            if (i_1_14 < vocab) {
+                float _vec_load_50[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_14);
+                    _vec_load_50[0 + 0] = _v4.x;
+                    _vec_load_50[0 + 1] = _v4.y;
+                    _vec_load_50[0 + 2] = _v4.z;
+                    _vec_load_50[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_50[0];
+                vals_a[9] = _vec_load_50[1];
+                vals_a[10] = _vec_load_50[2];
+                vals_a[11] = _vec_load_50[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_14 = start + 6144 + tid * 4;
+            if (i_2_14 < vocab) {
+                float _vec_load_51[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_14);
+                    _vec_load_51[0 + 0] = _v4.x;
+                    _vec_load_51[0 + 1] = _v4.y;
+                    _vec_load_51[0 + 2] = _v4.z;
+                    _vec_load_51[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_51[0];
+                vals_a[13] = _vec_load_51[1];
+                vals_a[14] = _vec_load_51[2];
+                vals_a[15] = _vec_load_51[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_26 = start + tid;
+            if (i2_26 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_26];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_12 = start + 512 + tid;
+            if (i2_0_12 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_12];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_12 = start + 1024 + tid;
+            if (i2_1_12 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_12];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_12 = start + 1536 + tid;
+            if (i2_2_12 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_12];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_12 = start + 2048 + tid;
+            if (i2_3_12 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_12];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_12 = start + 2560 + tid;
+            if (i2_4_12 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_12];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_12 = start + 3072 + tid;
+            if (i2_5_12 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_12];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_12 = start + 3584 + tid;
+            if (i2_6_12 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_12];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_12 = start + 4096 + tid;
+            if (i2_7_12 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_12];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_12 = start + 4608 + tid;
+            if (i2_8_12 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_12];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_12 = start + 5120 + tid;
+            if (i2_9_12 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_12];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_12 = start + 5632 + tid;
+            if (i2_10_12 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_12];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_12 = start + 6144 + tid;
+            if (i2_11_12 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_12];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_12 = start + 6656 + tid;
+            if (i2_12_12 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_12];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_12 = start + 7168 + tid;
+            if (i2_13_12 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_12];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_12 = start + 7680 + tid;
+            if (i2_14_12 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_12];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_5 = 0; c_5 < nch_stream; c_5 += 2) {
+        if (nch_stream > c_5 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_18 = start + (c_5 + 1) * 8192 + tid * 4;
+                if (i_18 < vocab) {
+                    float _vec_load_52[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_18);
+                        _vec_load_52[0 + 0] = _v4.x;
+                        _vec_load_52[0 + 1] = _v4.y;
+                        _vec_load_52[0 + 2] = _v4.z;
+                        _vec_load_52[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_52[0];
+                    vals_b[1] = _vec_load_52[1];
+                    vals_b[2] = _vec_load_52[2];
+                    vals_b[3] = _vec_load_52[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_14 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_14 < vocab) {
+                    float _vec_load_53[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_14);
+                        _vec_load_53[0 + 0] = _v4.x;
+                        _vec_load_53[0 + 1] = _v4.y;
+                        _vec_load_53[0 + 2] = _v4.z;
+                        _vec_load_53[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_53[0];
+                    vals_b[5] = _vec_load_53[1];
+                    vals_b[6] = _vec_load_53[2];
+                    vals_b[7] = _vec_load_53[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_15 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_15 < vocab) {
+                    float _vec_load_54[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_15);
+                        _vec_load_54[0 + 0] = _v4.x;
+                        _vec_load_54[0 + 1] = _v4.y;
+                        _vec_load_54[0 + 2] = _v4.z;
+                        _vec_load_54[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_54[0];
+                    vals_b[9] = _vec_load_54[1];
+                    vals_b[10] = _vec_load_54[2];
+                    vals_b[11] = _vec_load_54[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_15 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_15 < vocab) {
+                    float _vec_load_55[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_15);
+                        _vec_load_55[0 + 0] = _v4.x;
+                        _vec_load_55[0 + 1] = _v4.y;
+                        _vec_load_55[0 + 2] = _v4.z;
+                        _vec_load_55[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_55[0];
+                    vals_b[13] = _vec_load_55[1];
+                    vals_b[14] = _vec_load_55[2];
+                    vals_b[15] = _vec_load_55[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_27 = start + (c_5 + 1) * 8192 + tid;
+                if (i2_27 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_27];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_13 = start + (c_5 + 1) * 8192 + 512 + tid;
+                if (i2_0_13 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_13];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_13 = start + (c_5 + 1) * 8192 + 1024 + tid;
+                if (i2_1_13 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_13];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_13 = start + (c_5 + 1) * 8192 + 1536 + tid;
+                if (i2_2_13 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_13];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_13 = start + (c_5 + 1) * 8192 + 2048 + tid;
+                if (i2_3_13 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_13];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_13 = start + (c_5 + 1) * 8192 + 2560 + tid;
+                if (i2_4_13 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_13];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_13 = start + (c_5 + 1) * 8192 + 3072 + tid;
+                if (i2_5_13 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_13];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_13 = start + (c_5 + 1) * 8192 + 3584 + tid;
+                if (i2_6_13 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_13];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_13 = start + (c_5 + 1) * 8192 + 4096 + tid;
+                if (i2_7_13 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_13];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_13 = start + (c_5 + 1) * 8192 + 4608 + tid;
+                if (i2_8_13 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_13];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_13 = start + (c_5 + 1) * 8192 + 5120 + tid;
+                if (i2_9_13 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_13];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_13 = start + (c_5 + 1) * 8192 + 5632 + tid;
+                if (i2_10_13 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_13];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_13 = start + (c_5 + 1) * 8192 + 6144 + tid;
+                if (i2_11_13 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_13];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_13 = start + (c_5 + 1) * 8192 + 6656 + tid;
+                if (i2_12_13 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_13];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_13 = start + (c_5 + 1) * 8192 + 7168 + tid;
+                if (i2_13_13 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_13];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_13 = start + (c_5 + 1) * 8192 + 7680 + tid;
+                if (i2_14_13 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_13];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int gt_0 = 0;
+        unsigned int bits_20 = __as_u32(vals_a[0]);
+        unsigned int key_36 = ((bits_20 <= 2139095040) ? bits_20 : 0);
+        int i_vec_1 = start + c_5 * 8192 + tid * 4;
+        int i_str_1 = start + c_5 * 8192 + tid;
+        int i_19 = ((aligned) ? i_vec_1 : i_str_1);
+        int i_1_16 = i_19;
+        bool tie = key_36 == threshold && i_1_16 < vocab;
+        unsigned int _vote_35 = __ballot_sync(0xFFFFFFFF, tie);
+        unsigned int m_1 = _vote_35;
+        if (lane == 0) {
+            int _popc_66 = __popc(m_1);
+            cnt[warp] = (unsigned int)_popc_66;
+        }
+        if (key_36 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_2_1 = __as_u32(vals_a[1]);
+        unsigned int key_3_1 = ((bits_2_1 <= 2139095040) ? bits_2_1 : 0);
+        int i_vec_4 = start + c_5 * 8192 + tid * 4 + 1;
+        int i_str_5 = start + c_5 * 8192 + 512 + tid;
+        int i_6_1 = ((aligned) ? i_vec_4 : i_str_5);
+        int i_7_1 = i_6_1;
+        bool tie_8 = key_3_1 == threshold && i_7_1 < vocab;
+        unsigned int _vote_36 = __ballot_sync(0xFFFFFFFF, tie_8);
+        unsigned int m_9 = _vote_36;
+        if (lane == 0) {
+            int _popc_67 = __popc(m_9);
+            cnt[16 + warp] = (unsigned int)_popc_67;
+        }
+        if (key_3_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_10_3 = __as_u32(vals_a[2]);
+        unsigned int key_11_3 = ((bits_10_3 <= 2139095040) ? bits_10_3 : 0);
+        int i_vec_12 = start + c_5 * 8192 + tid * 4 + 2;
+        int i_str_13 = start + c_5 * 8192 + 1024 + tid;
+        int i_14_1 = ((aligned) ? i_vec_12 : i_str_13);
+        int i_15_1 = i_14_1;
+        bool tie_16 = key_11_3 == threshold && i_15_1 < vocab;
+        unsigned int _vote_37 = __ballot_sync(0xFFFFFFFF, tie_16);
+        unsigned int m_17_1 = _vote_37;
+        if (lane == 0) {
+            int _popc_68 = __popc(m_17_1);
+            cnt[32 + warp] = (unsigned int)_popc_68;
+        }
+        if (key_11_3 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_18_4 = __as_u32(vals_a[3]);
+        unsigned int key_19_4 = ((bits_18_4 <= 2139095040) ? bits_18_4 : 0);
+        int i_vec_20_1 = start + c_5 * 8192 + tid * 4 + 3;
+        int i_str_21_1 = start + c_5 * 8192 + 1536 + tid;
+        int i_22 = ((aligned) ? i_vec_20_1 : i_str_21_1);
+        int i_23 = i_22;
+        bool tie_24 = key_19_4 == threshold && i_23 < vocab;
+        unsigned int _vote_38 = __ballot_sync(0xFFFFFFFF, tie_24);
+        unsigned int m_25 = _vote_38;
+        if (lane == 0) {
+            int _popc_69 = __popc(m_25);
+            cnt[48 + warp] = (unsigned int)_popc_69;
+        }
+        if (key_19_4 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_26 = __as_u32(vals_a[4]);
+        unsigned int key_27_1 = ((bits_26 <= 2139095040) ? bits_26 : 0);
+        int i_vec_28 = start + c_5 * 8192 + 2048 + tid * 4;
+        int i_str_29 = start + c_5 * 8192 + 2048 + tid;
+        int i_30 = ((aligned) ? i_vec_28 : i_str_29);
+        int i_31 = i_30;
+        bool tie_32 = key_27_1 == threshold && i_31 < vocab;
+        unsigned int _vote_39 = __ballot_sync(0xFFFFFFFF, tie_32);
+        unsigned int m_33_1 = _vote_39;
+        if (lane == 0) {
+            int _popc_70 = __popc(m_33_1);
+            cnt[64 + warp] = (unsigned int)_popc_70;
+        }
+        if (key_27_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_34_4 = __as_u32(vals_a[5]);
+        unsigned int key_35_4 = ((bits_34_4 <= 2139095040) ? bits_34_4 : 0);
+        int i_vec_36_1 = start + c_5 * 8192 + 2048 + tid * 4 + 1;
+        int i_str_37_1 = start + c_5 * 8192 + 2560 + tid;
+        int i_38 = ((aligned) ? i_vec_36_1 : i_str_37_1);
+        int i_39 = i_38;
+        bool tie_40 = key_35_4 == threshold && i_39 < vocab;
+        unsigned int _vote_40 = __ballot_sync(0xFFFFFFFF, tie_40);
+        unsigned int m_41 = _vote_40;
+        if (lane == 0) {
+            int _popc_71 = __popc(m_41);
+            cnt[80 + warp] = (unsigned int)_popc_71;
+        }
+        if (key_35_4 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_42_3 = __as_u32(vals_a[6]);
+        unsigned int key_43_3 = ((bits_42_3 <= 2139095040) ? bits_42_3 : 0);
+        int i_vec_44 = start + c_5 * 8192 + 2048 + tid * 4 + 2;
+        int i_str_45 = start + c_5 * 8192 + 3072 + tid;
+        int i_46 = ((aligned) ? i_vec_44 : i_str_45);
+        int i_47 = i_46;
+        bool tie_48 = key_43_3 == threshold && i_47 < vocab;
+        unsigned int _vote_41 = __ballot_sync(0xFFFFFFFF, tie_48);
+        unsigned int m_49 = _vote_41;
+        if (lane == 0) {
+            int _popc_72 = __popc(m_49);
+            cnt[96 + warp] = (unsigned int)_popc_72;
+        }
+        if (key_43_3 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_50 = __as_u32(vals_a[7]);
+        unsigned int key_51 = ((bits_50 <= 2139095040) ? bits_50 : 0);
+        int i_vec_52 = start + c_5 * 8192 + 2048 + tid * 4 + 3;
+        int i_str_53 = start + c_5 * 8192 + 3584 + tid;
+        int i_54 = ((aligned) ? i_vec_52 : i_str_53);
+        int i_55 = i_54;
+        bool tie_56 = key_51 == threshold && i_55 < vocab;
+        unsigned int _vote_42 = __ballot_sync(0xFFFFFFFF, tie_56);
+        unsigned int m_57_1 = _vote_42;
+        if (lane == 0) {
+            int _popc_73 = __popc(m_57_1);
+            cnt[112 + warp] = (unsigned int)_popc_73;
+        }
+        if (key_51 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_58 = __as_u32(vals_a[8]);
+        unsigned int key_59 = ((bits_58 <= 2139095040) ? bits_58 : 0);
+        int i_vec_60 = start + c_5 * 8192 + 4096 + tid * 4;
+        int i_str_61 = start + c_5 * 8192 + 4096 + tid;
+        int i_62 = ((aligned) ? i_vec_60 : i_str_61);
+        int i_63 = i_62;
+        bool tie_64 = key_59 == threshold && i_63 < vocab;
+        unsigned int _vote_43 = __ballot_sync(0xFFFFFFFF, tie_64);
+        unsigned int m_65 = _vote_43;
+        if (lane == 0) {
+            int _popc_74 = __popc(m_65);
+            cnt[128 + warp] = (unsigned int)_popc_74;
+        }
+        if (key_59 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_66 = __as_u32(vals_a[9]);
+        unsigned int key_67 = ((bits_66 <= 2139095040) ? bits_66 : 0);
+        int i_vec_68 = start + c_5 * 8192 + 4096 + tid * 4 + 1;
+        int i_str_69 = start + c_5 * 8192 + 4608 + tid;
+        int i_70 = ((aligned) ? i_vec_68 : i_str_69);
+        int i_71 = i_70;
+        bool tie_72 = key_67 == threshold && i_71 < vocab;
+        unsigned int _vote_44 = __ballot_sync(0xFFFFFFFF, tie_72);
+        unsigned int m_73_1 = _vote_44;
+        if (lane == 0) {
+            int _popc_75 = __popc(m_73_1);
+            cnt[144 + warp] = (unsigned int)_popc_75;
+        }
+        if (key_67 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_74 = __as_u32(vals_a[10]);
+        unsigned int key_75 = ((bits_74 <= 2139095040) ? bits_74 : 0);
+        int i_vec_76 = start + c_5 * 8192 + 4096 + tid * 4 + 2;
+        int i_str_77 = start + c_5 * 8192 + 5120 + tid;
+        int i_78 = ((aligned) ? i_vec_76 : i_str_77);
+        int i_79 = i_78;
+        bool tie_80 = key_75 == threshold && i_79 < vocab;
+        unsigned int _vote_45 = __ballot_sync(0xFFFFFFFF, tie_80);
+        unsigned int m_81 = _vote_45;
+        if (lane == 0) {
+            int _popc_76 = __popc(m_81);
+            cnt[160 + warp] = (unsigned int)_popc_76;
+        }
+        if (key_75 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_82 = __as_u32(vals_a[11]);
+        unsigned int key_83 = ((bits_82 <= 2139095040) ? bits_82 : 0);
+        int i_vec_84 = start + c_5 * 8192 + 4096 + tid * 4 + 3;
+        int i_str_85 = start + c_5 * 8192 + 5632 + tid;
+        int i_86 = ((aligned) ? i_vec_84 : i_str_85);
+        int i_87 = i_86;
+        bool tie_88 = key_83 == threshold && i_87 < vocab;
+        unsigned int _vote_46 = __ballot_sync(0xFFFFFFFF, tie_88);
+        unsigned int m_89 = _vote_46;
+        if (lane == 0) {
+            int _popc_77 = __popc(m_89);
+            cnt[176 + warp] = (unsigned int)_popc_77;
+        }
+        if (key_83 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_90 = __as_u32(vals_a[12]);
+        unsigned int key_91 = ((bits_90 <= 2139095040) ? bits_90 : 0);
+        int i_vec_92 = start + c_5 * 8192 + 6144 + tid * 4;
+        int i_str_93 = start + c_5 * 8192 + 6144 + tid;
+        int i_94 = ((aligned) ? i_vec_92 : i_str_93);
+        int i_95 = i_94;
+        bool tie_96 = key_91 == threshold && i_95 < vocab;
+        unsigned int _vote_47 = __ballot_sync(0xFFFFFFFF, tie_96);
+        unsigned int m_97 = _vote_47;
+        if (lane == 0) {
+            int _popc_78 = __popc(m_97);
+            cnt[192 + warp] = (unsigned int)_popc_78;
+        }
+        if (key_91 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_98_1 = __as_u32(vals_a[13]);
+        unsigned int key_99_1 = ((bits_98_1 <= 2139095040) ? bits_98_1 : 0);
+        int i_vec_100_1 = start + c_5 * 8192 + 6144 + tid * 4 + 1;
+        int i_str_101_1 = start + c_5 * 8192 + 6656 + tid;
+        int i_102 = ((aligned) ? i_vec_100_1 : i_str_101_1);
+        int i_103 = i_102;
+        bool tie_104 = key_99_1 == threshold && i_103 < vocab;
+        unsigned int _vote_48 = __ballot_sync(0xFFFFFFFF, tie_104);
+        unsigned int m_105 = _vote_48;
+        if (lane == 0) {
+            int _popc_79 = __popc(m_105);
+            cnt[208 + warp] = (unsigned int)_popc_79;
+        }
+        if (key_99_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_106 = __as_u32(vals_a[14]);
+        unsigned int key_107 = ((bits_106 <= 2139095040) ? bits_106 : 0);
+        int i_vec_108 = start + c_5 * 8192 + 6144 + tid * 4 + 2;
+        int i_str_109 = start + c_5 * 8192 + 7168 + tid;
+        int i_110 = ((aligned) ? i_vec_108 : i_str_109);
+        int i_111 = i_110;
+        bool tie_112 = key_107 == threshold && i_111 < vocab;
+        unsigned int _vote_49 = __ballot_sync(0xFFFFFFFF, tie_112);
+        unsigned int m_113 = _vote_49;
+        if (lane == 0) {
+            int _popc_80 = __popc(m_113);
+            cnt[224 + warp] = (unsigned int)_popc_80;
+        }
+        if (key_107 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_114 = __as_u32(vals_a[15]);
+        unsigned int key_115 = ((bits_114 <= 2139095040) ? bits_114 : 0);
+        int i_vec_116 = start + c_5 * 8192 + 6144 + tid * 4 + 3;
+        int i_str_117 = start + c_5 * 8192 + 7680 + tid;
+        int i_118 = ((aligned) ? i_vec_116 : i_str_117);
+        int i_119 = i_118;
+        bool tie_120 = key_115 == threshold && i_119 < vocab;
+        unsigned int _vote_50 = __ballot_sync(0xFFFFFFFF, tie_120);
+        unsigned int m_121 = _vote_50;
+        if (lane == 0) {
+            int _popc_81 = __popc(m_121);
+            cnt[240 + warp] = (unsigned int)_popc_81;
+        }
+        if (key_115 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int gt_cnt = gt_0;
+        __syncthreads();
+        unsigned int local_122 = 0;
+        int f = tid;
+        if (f < 256) {
+            local_122 = local_122 + cnt[f];
+        }
+        unsigned int packed = gt_cnt | local_122 << 12;
+        uint32_t _warp_scan_sum_u32_7 = packed;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(16));
+        unsigned int incl_123 = _warp_scan_sum_u32_7;
+        if (lane == 31) {
+            warp_sums[warp] = incl_123;
+        }
+        __syncthreads();
+        unsigned int before_124 = 0;
+        unsigned int total_125 = 0;
+        unsigned int ws_126 = warp_sums[0];
+        total_125 = total_125 + ws_126;
+        if (warp > 0) {
+            before_124 = before_124 + ws_126;
+        }
+        unsigned int ws_127 = warp_sums[1];
+        total_125 = total_125 + ws_127;
+        if (warp > 1) {
+            before_124 = before_124 + ws_127;
+        }
+        unsigned int ws_128 = warp_sums[2];
+        total_125 = total_125 + ws_128;
+        if (warp > 2) {
+            before_124 = before_124 + ws_128;
+        }
+        unsigned int ws_129 = warp_sums[3];
+        total_125 = total_125 + ws_129;
+        if (warp > 3) {
+            before_124 = before_124 + ws_129;
+        }
+        unsigned int ws_130 = warp_sums[4];
+        total_125 = total_125 + ws_130;
+        if (warp > 4) {
+            before_124 = before_124 + ws_130;
+        }
+        unsigned int ws_131 = warp_sums[5];
+        total_125 = total_125 + ws_131;
+        if (warp > 5) {
+            before_124 = before_124 + ws_131;
+        }
+        unsigned int ws_132 = warp_sums[6];
+        total_125 = total_125 + ws_132;
+        if (warp > 6) {
+            before_124 = before_124 + ws_132;
+        }
+        unsigned int ws_133 = warp_sums[7];
+        total_125 = total_125 + ws_133;
+        if (warp > 7) {
+            before_124 = before_124 + ws_133;
+        }
+        unsigned int ws_134 = warp_sums[8];
+        total_125 = total_125 + ws_134;
+        if (warp > 8) {
+            before_124 = before_124 + ws_134;
+        }
+        unsigned int ws_135 = warp_sums[9];
+        total_125 = total_125 + ws_135;
+        if (warp > 9) {
+            before_124 = before_124 + ws_135;
+        }
+        unsigned int ws_136 = warp_sums[10];
+        total_125 = total_125 + ws_136;
+        if (warp > 10) {
+            before_124 = before_124 + ws_136;
+        }
+        unsigned int ws_137 = warp_sums[11];
+        total_125 = total_125 + ws_137;
+        if (warp > 11) {
+            before_124 = before_124 + ws_137;
+        }
+        unsigned int ws_138 = warp_sums[12];
+        total_125 = total_125 + ws_138;
+        if (warp > 12) {
+            before_124 = before_124 + ws_138;
+        }
+        unsigned int ws_139 = warp_sums[13];
+        total_125 = total_125 + ws_139;
+        if (warp > 13) {
+            before_124 = before_124 + ws_139;
+        }
+        unsigned int ws_140 = warp_sums[14];
+        total_125 = total_125 + ws_140;
+        if (warp > 14) {
+            before_124 = before_124 + ws_140;
+        }
+        unsigned int ws_141 = warp_sums[15];
+        total_125 = total_125 + ws_141;
+        if (warp > 15) {
+            before_124 = before_124 + ws_141;
+        }
+        unsigned int excl_142 = before_124 + incl_123 - packed;
+        __syncthreads();
+        unsigned int running = excl_142 >> 12;
+        int f2 = tid;
+        if (f2 < 256) {
+            unsigned int c_0 = cnt[f2];
+            cnt[f2] = running;
+            running = running + c_0;
+        }
+        __syncthreads();
+        unsigned int gt_slot = excl_142 & 4095;
+        unsigned int gt_total_143 = total_125 & 4095;
+        unsigned int eq_total = total_125 >> 12;
+        unsigned int _min_3 = ((eq_total) < (take_rem) ? (eq_total) : (take_rem));
+        unsigned int take_c = _min_3;
+        unsigned int lt_mask_1 = (1 << (unsigned int)lane) - 1;
+        unsigned int g = gt_slot;
+        unsigned int keys_1[4];
+        int idxs_1[4];
+        bool ties_144[4];
+        unsigned int strided[4];
+        unsigned int grp_warp = 0;
+        unsigned int grp_lane = 0;
+        unsigned int bits_145 = __as_u32(vals_a[0]);
+        unsigned int key_146 = ((bits_145 <= 2139095040) ? bits_145 : 0);
+        keys_1[0] = key_146;
+        int i_vec_147 = start + c_5 * 8192 + tid * 4;
+        int i_str_148 = start + c_5 * 8192 + tid;
+        int i_149 = ((aligned) ? i_vec_147 : i_str_148);
+        idxs_1[0] = i_149;
+        ties_144[0] = keys_1[0] == threshold && idxs_1[0] < vocab;
+        unsigned int _vote_51 = __ballot_sync(0xFFFFFFFF, ties_144[0]);
+        unsigned int m_150 = _vote_51;
+        int _popc_82 = __popc(m_150 & lt_mask_1);
+        unsigned int lane_before = (unsigned int)_popc_82;
+        unsigned int warp_off = cnt[warp];
+        strided[0] = warp_off + lane_before;
+        grp_warp = grp_warp + (warp_off - cnt[0]);
+        grp_lane = grp_lane + lane_before;
+        unsigned int bits_151 = __as_u32(vals_a[1]);
+        unsigned int key_152 = ((bits_151 <= 2139095040) ? bits_151 : 0);
+        keys_1[1] = key_152;
+        int i_vec_153 = start + c_5 * 8192 + tid * 4 + 1;
+        int i_str_154 = start + c_5 * 8192 + 512 + tid;
+        int i_155 = ((aligned) ? i_vec_153 : i_str_154);
+        idxs_1[1] = i_155;
+        ties_144[1] = keys_1[1] == threshold && idxs_1[1] < vocab;
+        unsigned int _vote_52 = __ballot_sync(0xFFFFFFFF, ties_144[1]);
+        unsigned int m_156 = _vote_52;
+        int _popc_83 = __popc(m_156 & lt_mask_1);
+        unsigned int lane_before_157 = (unsigned int)_popc_83;
+        unsigned int warp_off_158 = cnt[16 + warp];
+        strided[1] = warp_off_158 + lane_before_157;
+        grp_warp = grp_warp + (warp_off_158 - cnt[16]);
+        grp_lane = grp_lane + lane_before_157;
+        unsigned int bits_159 = __as_u32(vals_a[2]);
+        unsigned int key_160 = ((bits_159 <= 2139095040) ? bits_159 : 0);
+        keys_1[2] = key_160;
+        int i_vec_161 = start + c_5 * 8192 + tid * 4 + 2;
+        int i_str_162 = start + c_5 * 8192 + 1024 + tid;
+        int i_163 = ((aligned) ? i_vec_161 : i_str_162);
+        idxs_1[2] = i_163;
+        ties_144[2] = keys_1[2] == threshold && idxs_1[2] < vocab;
+        unsigned int _vote_53 = __ballot_sync(0xFFFFFFFF, ties_144[2]);
+        unsigned int m_164 = _vote_53;
+        int _popc_84 = __popc(m_164 & lt_mask_1);
+        unsigned int lane_before_165 = (unsigned int)_popc_84;
+        unsigned int warp_off_166 = cnt[32 + warp];
+        strided[2] = warp_off_166 + lane_before_165;
+        grp_warp = grp_warp + (warp_off_166 - cnt[32]);
+        grp_lane = grp_lane + lane_before_165;
+        unsigned int bits_167 = __as_u32(vals_a[3]);
+        unsigned int key_168 = ((bits_167 <= 2139095040) ? bits_167 : 0);
+        keys_1[3] = key_168;
+        int i_vec_169 = start + c_5 * 8192 + tid * 4 + 3;
+        int i_str_170 = start + c_5 * 8192 + 1536 + tid;
+        int i_171 = ((aligned) ? i_vec_169 : i_str_170);
+        idxs_1[3] = i_171;
+        ties_144[3] = keys_1[3] == threshold && idxs_1[3] < vocab;
+        unsigned int _vote_54 = __ballot_sync(0xFFFFFFFF, ties_144[3]);
+        unsigned int m_172 = _vote_54;
+        int _popc_85 = __popc(m_172 & lt_mask_1);
+        unsigned int lane_before_173 = (unsigned int)_popc_85;
+        unsigned int warp_off_174 = cnt[48 + warp];
+        strided[3] = warp_off_174 + lane_before_173;
+        grp_warp = grp_warp + (warp_off_174 - cnt[48]);
+        grp_lane = grp_lane + lane_before_173;
+        unsigned int grp_base = cnt[0];
+        unsigned int own_175 = 0;
+        unsigned int vec_rank = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_176 = ((aligned) ? vec_rank : strided[0]);
+        if (keys_1[0] > threshold) {
+            unsigned long long dst = gt_run + (unsigned long long)g;
+            out_vals[dst] = __uint_as_float(keys_1[0]);
+            out_idx[dst] = idxs_1[0];
+            g = g + 1;
+        } else if (ties_144[0] && rank_176 < take_c) {
+            unsigned long long dst2 = eq_run + (unsigned long long)rank_176;
+            out_vals[dst2] = __uint_as_float(keys_1[0]);
+            out_idx[dst2] = idxs_1[0];
+        }
+        if (ties_144[0]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_177 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_178 = ((aligned) ? vec_rank_177 : strided[1]);
+        if (keys_1[1] > threshold) {
+            unsigned long long dst_1 = gt_run + (unsigned long long)g;
+            out_vals[dst_1] = __uint_as_float(keys_1[1]);
+            out_idx[dst_1] = idxs_1[1];
+            g = g + 1;
+        } else if (ties_144[1] && rank_178 < take_c) {
+            unsigned long long dst2_1 = eq_run + (unsigned long long)rank_178;
+            out_vals[dst2_1] = __uint_as_float(keys_1[1]);
+            out_idx[dst2_1] = idxs_1[1];
+        }
+        if (ties_144[1]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_179 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_180 = ((aligned) ? vec_rank_179 : strided[2]);
+        if (keys_1[2] > threshold) {
+            unsigned long long dst_2 = gt_run + (unsigned long long)g;
+            out_vals[dst_2] = __uint_as_float(keys_1[2]);
+            out_idx[dst_2] = idxs_1[2];
+            g = g + 1;
+        } else if (ties_144[2] && rank_180 < take_c) {
+            unsigned long long dst2_2 = eq_run + (unsigned long long)rank_180;
+            out_vals[dst2_2] = __uint_as_float(keys_1[2]);
+            out_idx[dst2_2] = idxs_1[2];
+        }
+        if (ties_144[2]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_181 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_182 = ((aligned) ? vec_rank_181 : strided[3]);
+        if (keys_1[3] > threshold) {
+            unsigned long long dst_3 = gt_run + (unsigned long long)g;
+            out_vals[dst_3] = __uint_as_float(keys_1[3]);
+            out_idx[dst_3] = idxs_1[3];
+            g = g + 1;
+        } else if (ties_144[3] && rank_182 < take_c) {
+            unsigned long long dst2_3 = eq_run + (unsigned long long)rank_182;
+            out_vals[dst2_3] = __uint_as_float(keys_1[3]);
+            out_idx[dst2_3] = idxs_1[3];
+        }
+        if (ties_144[3]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int keys_183[4];
+        int idxs_184[4];
+        bool ties_185[4];
+        unsigned int strided_186[4];
+        unsigned int grp_warp_187 = 0;
+        unsigned int grp_lane_188 = 0;
+        unsigned int bits_189 = __as_u32(vals_a[4]);
+        unsigned int key_190 = ((bits_189 <= 2139095040) ? bits_189 : 0);
+        keys_183[0] = key_190;
+        int i_vec_191 = start + c_5 * 8192 + 2048 + tid * 4;
+        int i_str_192 = start + c_5 * 8192 + 2048 + tid;
+        int i_193 = ((aligned) ? i_vec_191 : i_str_192);
+        idxs_184[0] = i_193;
+        ties_185[0] = keys_183[0] == threshold && idxs_184[0] < vocab;
+        unsigned int _vote_55 = __ballot_sync(0xFFFFFFFF, ties_185[0]);
+        unsigned int m_194 = _vote_55;
+        int _popc_86 = __popc(m_194 & lt_mask_1);
+        unsigned int lane_before_195 = (unsigned int)_popc_86;
+        unsigned int warp_off_196 = cnt[64 + warp];
+        strided_186[0] = warp_off_196 + lane_before_195;
+        grp_warp_187 = grp_warp_187 + (warp_off_196 - cnt[64]);
+        grp_lane_188 = grp_lane_188 + lane_before_195;
+        unsigned int bits_197 = __as_u32(vals_a[5]);
+        unsigned int key_198 = ((bits_197 <= 2139095040) ? bits_197 : 0);
+        keys_183[1] = key_198;
+        int i_vec_199 = start + c_5 * 8192 + 2048 + tid * 4 + 1;
+        int i_str_200 = start + c_5 * 8192 + 2560 + tid;
+        int i_201 = ((aligned) ? i_vec_199 : i_str_200);
+        idxs_184[1] = i_201;
+        ties_185[1] = keys_183[1] == threshold && idxs_184[1] < vocab;
+        unsigned int _vote_56 = __ballot_sync(0xFFFFFFFF, ties_185[1]);
+        unsigned int m_202 = _vote_56;
+        int _popc_87 = __popc(m_202 & lt_mask_1);
+        unsigned int lane_before_203 = (unsigned int)_popc_87;
+        unsigned int warp_off_204 = cnt[80 + warp];
+        strided_186[1] = warp_off_204 + lane_before_203;
+        grp_warp_187 = grp_warp_187 + (warp_off_204 - cnt[80]);
+        grp_lane_188 = grp_lane_188 + lane_before_203;
+        unsigned int bits_205 = __as_u32(vals_a[6]);
+        unsigned int key_206 = ((bits_205 <= 2139095040) ? bits_205 : 0);
+        keys_183[2] = key_206;
+        int i_vec_207 = start + c_5 * 8192 + 2048 + tid * 4 + 2;
+        int i_str_208 = start + c_5 * 8192 + 3072 + tid;
+        int i_209 = ((aligned) ? i_vec_207 : i_str_208);
+        idxs_184[2] = i_209;
+        ties_185[2] = keys_183[2] == threshold && idxs_184[2] < vocab;
+        unsigned int _vote_57 = __ballot_sync(0xFFFFFFFF, ties_185[2]);
+        unsigned int m_210 = _vote_57;
+        int _popc_88 = __popc(m_210 & lt_mask_1);
+        unsigned int lane_before_211 = (unsigned int)_popc_88;
+        unsigned int warp_off_212 = cnt[96 + warp];
+        strided_186[2] = warp_off_212 + lane_before_211;
+        grp_warp_187 = grp_warp_187 + (warp_off_212 - cnt[96]);
+        grp_lane_188 = grp_lane_188 + lane_before_211;
+        unsigned int bits_213 = __as_u32(vals_a[7]);
+        unsigned int key_214 = ((bits_213 <= 2139095040) ? bits_213 : 0);
+        keys_183[3] = key_214;
+        int i_vec_215 = start + c_5 * 8192 + 2048 + tid * 4 + 3;
+        int i_str_216 = start + c_5 * 8192 + 3584 + tid;
+        int i_217 = ((aligned) ? i_vec_215 : i_str_216);
+        idxs_184[3] = i_217;
+        ties_185[3] = keys_183[3] == threshold && idxs_184[3] < vocab;
+        unsigned int _vote_58 = __ballot_sync(0xFFFFFFFF, ties_185[3]);
+        unsigned int m_218 = _vote_58;
+        int _popc_89 = __popc(m_218 & lt_mask_1);
+        unsigned int lane_before_219 = (unsigned int)_popc_89;
+        unsigned int warp_off_220 = cnt[112 + warp];
+        strided_186[3] = warp_off_220 + lane_before_219;
+        grp_warp_187 = grp_warp_187 + (warp_off_220 - cnt[112]);
+        grp_lane_188 = grp_lane_188 + lane_before_219;
+        unsigned int grp_base_221 = cnt[64];
+        unsigned int own_222 = 0;
+        unsigned int vec_rank_223 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_224 = ((aligned) ? vec_rank_223 : strided_186[0]);
+        if (keys_183[0] > threshold) {
+            unsigned long long dst_4 = gt_run + (unsigned long long)g;
+            out_vals[dst_4] = __uint_as_float(keys_183[0]);
+            out_idx[dst_4] = idxs_184[0];
+            g = g + 1;
+        } else if (ties_185[0] && rank_224 < take_c) {
+            unsigned long long dst2_4 = eq_run + (unsigned long long)rank_224;
+            out_vals[dst2_4] = __uint_as_float(keys_183[0]);
+            out_idx[dst2_4] = idxs_184[0];
+        }
+        if (ties_185[0]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_225 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_226 = ((aligned) ? vec_rank_225 : strided_186[1]);
+        if (keys_183[1] > threshold) {
+            unsigned long long dst_5 = gt_run + (unsigned long long)g;
+            out_vals[dst_5] = __uint_as_float(keys_183[1]);
+            out_idx[dst_5] = idxs_184[1];
+            g = g + 1;
+        } else if (ties_185[1] && rank_226 < take_c) {
+            unsigned long long dst2_5 = eq_run + (unsigned long long)rank_226;
+            out_vals[dst2_5] = __uint_as_float(keys_183[1]);
+            out_idx[dst2_5] = idxs_184[1];
+        }
+        if (ties_185[1]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_227 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_228 = ((aligned) ? vec_rank_227 : strided_186[2]);
+        if (keys_183[2] > threshold) {
+            unsigned long long dst_6 = gt_run + (unsigned long long)g;
+            out_vals[dst_6] = __uint_as_float(keys_183[2]);
+            out_idx[dst_6] = idxs_184[2];
+            g = g + 1;
+        } else if (ties_185[2] && rank_228 < take_c) {
+            unsigned long long dst2_6 = eq_run + (unsigned long long)rank_228;
+            out_vals[dst2_6] = __uint_as_float(keys_183[2]);
+            out_idx[dst2_6] = idxs_184[2];
+        }
+        if (ties_185[2]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_229 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_230 = ((aligned) ? vec_rank_229 : strided_186[3]);
+        if (keys_183[3] > threshold) {
+            unsigned long long dst_7 = gt_run + (unsigned long long)g;
+            out_vals[dst_7] = __uint_as_float(keys_183[3]);
+            out_idx[dst_7] = idxs_184[3];
+            g = g + 1;
+        } else if (ties_185[3] && rank_230 < take_c) {
+            unsigned long long dst2_7 = eq_run + (unsigned long long)rank_230;
+            out_vals[dst2_7] = __uint_as_float(keys_183[3]);
+            out_idx[dst2_7] = idxs_184[3];
+        }
+        if (ties_185[3]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int keys_231[4];
+        int idxs_232[4];
+        bool ties_233[4];
+        unsigned int strided_234[4];
+        unsigned int grp_warp_235 = 0;
+        unsigned int grp_lane_236 = 0;
+        unsigned int bits_237 = __as_u32(vals_a[8]);
+        unsigned int key_238 = ((bits_237 <= 2139095040) ? bits_237 : 0);
+        keys_231[0] = key_238;
+        int i_vec_239 = start + c_5 * 8192 + 4096 + tid * 4;
+        int i_str_240 = start + c_5 * 8192 + 4096 + tid;
+        int i_241 = ((aligned) ? i_vec_239 : i_str_240);
+        idxs_232[0] = i_241;
+        ties_233[0] = keys_231[0] == threshold && idxs_232[0] < vocab;
+        unsigned int _vote_59 = __ballot_sync(0xFFFFFFFF, ties_233[0]);
+        unsigned int m_242 = _vote_59;
+        int _popc_90 = __popc(m_242 & lt_mask_1);
+        unsigned int lane_before_243 = (unsigned int)_popc_90;
+        unsigned int warp_off_244 = cnt[128 + warp];
+        strided_234[0] = warp_off_244 + lane_before_243;
+        grp_warp_235 = grp_warp_235 + (warp_off_244 - cnt[128]);
+        grp_lane_236 = grp_lane_236 + lane_before_243;
+        unsigned int bits_245 = __as_u32(vals_a[9]);
+        unsigned int key_246 = ((bits_245 <= 2139095040) ? bits_245 : 0);
+        keys_231[1] = key_246;
+        int i_vec_247 = start + c_5 * 8192 + 4096 + tid * 4 + 1;
+        int i_str_248 = start + c_5 * 8192 + 4608 + tid;
+        int i_249 = ((aligned) ? i_vec_247 : i_str_248);
+        idxs_232[1] = i_249;
+        ties_233[1] = keys_231[1] == threshold && idxs_232[1] < vocab;
+        unsigned int _vote_60 = __ballot_sync(0xFFFFFFFF, ties_233[1]);
+        unsigned int m_250 = _vote_60;
+        int _popc_91 = __popc(m_250 & lt_mask_1);
+        unsigned int lane_before_251 = (unsigned int)_popc_91;
+        unsigned int warp_off_252 = cnt[144 + warp];
+        strided_234[1] = warp_off_252 + lane_before_251;
+        grp_warp_235 = grp_warp_235 + (warp_off_252 - cnt[144]);
+        grp_lane_236 = grp_lane_236 + lane_before_251;
+        unsigned int bits_253 = __as_u32(vals_a[10]);
+        unsigned int key_254 = ((bits_253 <= 2139095040) ? bits_253 : 0);
+        keys_231[2] = key_254;
+        int i_vec_255 = start + c_5 * 8192 + 4096 + tid * 4 + 2;
+        int i_str_256 = start + c_5 * 8192 + 5120 + tid;
+        int i_257 = ((aligned) ? i_vec_255 : i_str_256);
+        idxs_232[2] = i_257;
+        ties_233[2] = keys_231[2] == threshold && idxs_232[2] < vocab;
+        unsigned int _vote_61 = __ballot_sync(0xFFFFFFFF, ties_233[2]);
+        unsigned int m_258 = _vote_61;
+        int _popc_92 = __popc(m_258 & lt_mask_1);
+        unsigned int lane_before_259 = (unsigned int)_popc_92;
+        unsigned int warp_off_260 = cnt[160 + warp];
+        strided_234[2] = warp_off_260 + lane_before_259;
+        grp_warp_235 = grp_warp_235 + (warp_off_260 - cnt[160]);
+        grp_lane_236 = grp_lane_236 + lane_before_259;
+        unsigned int bits_261 = __as_u32(vals_a[11]);
+        unsigned int key_262 = ((bits_261 <= 2139095040) ? bits_261 : 0);
+        keys_231[3] = key_262;
+        int i_vec_263 = start + c_5 * 8192 + 4096 + tid * 4 + 3;
+        int i_str_264 = start + c_5 * 8192 + 5632 + tid;
+        int i_265 = ((aligned) ? i_vec_263 : i_str_264);
+        idxs_232[3] = i_265;
+        ties_233[3] = keys_231[3] == threshold && idxs_232[3] < vocab;
+        unsigned int _vote_62 = __ballot_sync(0xFFFFFFFF, ties_233[3]);
+        unsigned int m_266 = _vote_62;
+        int _popc_93 = __popc(m_266 & lt_mask_1);
+        unsigned int lane_before_267 = (unsigned int)_popc_93;
+        unsigned int warp_off_268 = cnt[176 + warp];
+        strided_234[3] = warp_off_268 + lane_before_267;
+        grp_warp_235 = grp_warp_235 + (warp_off_268 - cnt[176]);
+        grp_lane_236 = grp_lane_236 + lane_before_267;
+        unsigned int grp_base_269 = cnt[128];
+        unsigned int own_270 = 0;
+        unsigned int vec_rank_271 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_272 = ((aligned) ? vec_rank_271 : strided_234[0]);
+        if (keys_231[0] > threshold) {
+            unsigned long long dst_8 = gt_run + (unsigned long long)g;
+            out_vals[dst_8] = __uint_as_float(keys_231[0]);
+            out_idx[dst_8] = idxs_232[0];
+            g = g + 1;
+        } else if (ties_233[0] && rank_272 < take_c) {
+            unsigned long long dst2_8 = eq_run + (unsigned long long)rank_272;
+            out_vals[dst2_8] = __uint_as_float(keys_231[0]);
+            out_idx[dst2_8] = idxs_232[0];
+        }
+        if (ties_233[0]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_273 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_274 = ((aligned) ? vec_rank_273 : strided_234[1]);
+        if (keys_231[1] > threshold) {
+            unsigned long long dst_9 = gt_run + (unsigned long long)g;
+            out_vals[dst_9] = __uint_as_float(keys_231[1]);
+            out_idx[dst_9] = idxs_232[1];
+            g = g + 1;
+        } else if (ties_233[1] && rank_274 < take_c) {
+            unsigned long long dst2_9 = eq_run + (unsigned long long)rank_274;
+            out_vals[dst2_9] = __uint_as_float(keys_231[1]);
+            out_idx[dst2_9] = idxs_232[1];
+        }
+        if (ties_233[1]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_275 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_276 = ((aligned) ? vec_rank_275 : strided_234[2]);
+        if (keys_231[2] > threshold) {
+            unsigned long long dst_10 = gt_run + (unsigned long long)g;
+            out_vals[dst_10] = __uint_as_float(keys_231[2]);
+            out_idx[dst_10] = idxs_232[2];
+            g = g + 1;
+        } else if (ties_233[2] && rank_276 < take_c) {
+            unsigned long long dst2_10 = eq_run + (unsigned long long)rank_276;
+            out_vals[dst2_10] = __uint_as_float(keys_231[2]);
+            out_idx[dst2_10] = idxs_232[2];
+        }
+        if (ties_233[2]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_277 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_278 = ((aligned) ? vec_rank_277 : strided_234[3]);
+        if (keys_231[3] > threshold) {
+            unsigned long long dst_11 = gt_run + (unsigned long long)g;
+            out_vals[dst_11] = __uint_as_float(keys_231[3]);
+            out_idx[dst_11] = idxs_232[3];
+            g = g + 1;
+        } else if (ties_233[3] && rank_278 < take_c) {
+            unsigned long long dst2_11 = eq_run + (unsigned long long)rank_278;
+            out_vals[dst2_11] = __uint_as_float(keys_231[3]);
+            out_idx[dst2_11] = idxs_232[3];
+        }
+        if (ties_233[3]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int keys_279[4];
+        int idxs_280[4];
+        bool ties_281[4];
+        unsigned int strided_282[4];
+        unsigned int grp_warp_283 = 0;
+        unsigned int grp_lane_284 = 0;
+        unsigned int bits_285 = __as_u32(vals_a[12]);
+        unsigned int key_286 = ((bits_285 <= 2139095040) ? bits_285 : 0);
+        keys_279[0] = key_286;
+        int i_vec_287 = start + c_5 * 8192 + 6144 + tid * 4;
+        int i_str_288 = start + c_5 * 8192 + 6144 + tid;
+        int i_289 = ((aligned) ? i_vec_287 : i_str_288);
+        idxs_280[0] = i_289;
+        ties_281[0] = keys_279[0] == threshold && idxs_280[0] < vocab;
+        unsigned int _vote_63 = __ballot_sync(0xFFFFFFFF, ties_281[0]);
+        unsigned int m_290 = _vote_63;
+        int _popc_94 = __popc(m_290 & lt_mask_1);
+        unsigned int lane_before_291 = (unsigned int)_popc_94;
+        unsigned int warp_off_292 = cnt[192 + warp];
+        strided_282[0] = warp_off_292 + lane_before_291;
+        grp_warp_283 = grp_warp_283 + (warp_off_292 - cnt[192]);
+        grp_lane_284 = grp_lane_284 + lane_before_291;
+        unsigned int bits_293 = __as_u32(vals_a[13]);
+        unsigned int key_294 = ((bits_293 <= 2139095040) ? bits_293 : 0);
+        keys_279[1] = key_294;
+        int i_vec_295 = start + c_5 * 8192 + 6144 + tid * 4 + 1;
+        int i_str_296 = start + c_5 * 8192 + 6656 + tid;
+        int i_297 = ((aligned) ? i_vec_295 : i_str_296);
+        idxs_280[1] = i_297;
+        ties_281[1] = keys_279[1] == threshold && idxs_280[1] < vocab;
+        unsigned int _vote_64 = __ballot_sync(0xFFFFFFFF, ties_281[1]);
+        unsigned int m_298 = _vote_64;
+        int _popc_95 = __popc(m_298 & lt_mask_1);
+        unsigned int lane_before_299 = (unsigned int)_popc_95;
+        unsigned int warp_off_300 = cnt[208 + warp];
+        strided_282[1] = warp_off_300 + lane_before_299;
+        grp_warp_283 = grp_warp_283 + (warp_off_300 - cnt[208]);
+        grp_lane_284 = grp_lane_284 + lane_before_299;
+        unsigned int bits_301 = __as_u32(vals_a[14]);
+        unsigned int key_302 = ((bits_301 <= 2139095040) ? bits_301 : 0);
+        keys_279[2] = key_302;
+        int i_vec_303 = start + c_5 * 8192 + 6144 + tid * 4 + 2;
+        int i_str_304 = start + c_5 * 8192 + 7168 + tid;
+        int i_305 = ((aligned) ? i_vec_303 : i_str_304);
+        idxs_280[2] = i_305;
+        ties_281[2] = keys_279[2] == threshold && idxs_280[2] < vocab;
+        unsigned int _vote_65 = __ballot_sync(0xFFFFFFFF, ties_281[2]);
+        unsigned int m_306 = _vote_65;
+        int _popc_96 = __popc(m_306 & lt_mask_1);
+        unsigned int lane_before_307 = (unsigned int)_popc_96;
+        unsigned int warp_off_308 = cnt[224 + warp];
+        strided_282[2] = warp_off_308 + lane_before_307;
+        grp_warp_283 = grp_warp_283 + (warp_off_308 - cnt[224]);
+        grp_lane_284 = grp_lane_284 + lane_before_307;
+        unsigned int bits_309 = __as_u32(vals_a[15]);
+        unsigned int key_310 = ((bits_309 <= 2139095040) ? bits_309 : 0);
+        keys_279[3] = key_310;
+        int i_vec_311 = start + c_5 * 8192 + 6144 + tid * 4 + 3;
+        int i_str_312 = start + c_5 * 8192 + 7680 + tid;
+        int i_313 = ((aligned) ? i_vec_311 : i_str_312);
+        idxs_280[3] = i_313;
+        ties_281[3] = keys_279[3] == threshold && idxs_280[3] < vocab;
+        unsigned int _vote_66 = __ballot_sync(0xFFFFFFFF, ties_281[3]);
+        unsigned int m_314 = _vote_66;
+        int _popc_97 = __popc(m_314 & lt_mask_1);
+        unsigned int lane_before_315 = (unsigned int)_popc_97;
+        unsigned int warp_off_316 = cnt[240 + warp];
+        strided_282[3] = warp_off_316 + lane_before_315;
+        grp_warp_283 = grp_warp_283 + (warp_off_316 - cnt[240]);
+        grp_lane_284 = grp_lane_284 + lane_before_315;
+        unsigned int grp_base_317 = cnt[192];
+        unsigned int own_318 = 0;
+        unsigned int vec_rank_319 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_320 = ((aligned) ? vec_rank_319 : strided_282[0]);
+        if (keys_279[0] > threshold) {
+            unsigned long long dst_12 = gt_run + (unsigned long long)g;
+            out_vals[dst_12] = __uint_as_float(keys_279[0]);
+            out_idx[dst_12] = idxs_280[0];
+            g = g + 1;
+        } else if (ties_281[0] && rank_320 < take_c) {
+            unsigned long long dst2_12 = eq_run + (unsigned long long)rank_320;
+            out_vals[dst2_12] = __uint_as_float(keys_279[0]);
+            out_idx[dst2_12] = idxs_280[0];
+        }
+        if (ties_281[0]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_321 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_322 = ((aligned) ? vec_rank_321 : strided_282[1]);
+        if (keys_279[1] > threshold) {
+            unsigned long long dst_13 = gt_run + (unsigned long long)g;
+            out_vals[dst_13] = __uint_as_float(keys_279[1]);
+            out_idx[dst_13] = idxs_280[1];
+            g = g + 1;
+        } else if (ties_281[1] && rank_322 < take_c) {
+            unsigned long long dst2_13 = eq_run + (unsigned long long)rank_322;
+            out_vals[dst2_13] = __uint_as_float(keys_279[1]);
+            out_idx[dst2_13] = idxs_280[1];
+        }
+        if (ties_281[1]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_323 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_324 = ((aligned) ? vec_rank_323 : strided_282[2]);
+        if (keys_279[2] > threshold) {
+            unsigned long long dst_14 = gt_run + (unsigned long long)g;
+            out_vals[dst_14] = __uint_as_float(keys_279[2]);
+            out_idx[dst_14] = idxs_280[2];
+            g = g + 1;
+        } else if (ties_281[2] && rank_324 < take_c) {
+            unsigned long long dst2_14 = eq_run + (unsigned long long)rank_324;
+            out_vals[dst2_14] = __uint_as_float(keys_279[2]);
+            out_idx[dst2_14] = idxs_280[2];
+        }
+        if (ties_281[2]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_325 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_326 = ((aligned) ? vec_rank_325 : strided_282[3]);
+        if (keys_279[3] > threshold) {
+            unsigned long long dst_15 = gt_run + (unsigned long long)g;
+            out_vals[dst_15] = __uint_as_float(keys_279[3]);
+            out_idx[dst_15] = idxs_280[3];
+            g = g + 1;
+        } else if (ties_281[3] && rank_326 < take_c) {
+            unsigned long long dst2_15 = eq_run + (unsigned long long)rank_326;
+            out_vals[dst2_15] = __uint_as_float(keys_279[3]);
+            out_idx[dst2_15] = idxs_280[3];
+        }
+        if (ties_281[3]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned long long gt_next = gt_run + (unsigned long long)gt_total_143;
+        unsigned long long eq_next = eq_run + (unsigned long long)take_c;
+        unsigned int rem_next = take_rem - take_c;
+        __syncthreads();
+        gt_run = gt_next;
+        eq_run = eq_next;
+        take_rem = rem_next;
+        if (nch_stream > c_5 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_0_15 = start + (c_5 + 2) * 8192 + tid * 4;
+                if (i_0_15 < vocab) {
+                    float _vec_load_56[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_15);
+                        _vec_load_56[0 + 0] = _v4.x;
+                        _vec_load_56[0 + 1] = _v4.y;
+                        _vec_load_56[0 + 2] = _v4.z;
+                        _vec_load_56[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_56[0];
+                    vals_a[1] = _vec_load_56[1];
+                    vals_a[2] = _vec_load_56[2];
+                    vals_a[3] = _vec_load_56[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_2_16 = start + (c_5 + 2) * 8192 + 2048 + tid * 4;
+                if (i_2_16 < vocab) {
+                    float _vec_load_57[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_16);
+                        _vec_load_57[0 + 0] = _v4.x;
+                        _vec_load_57[0 + 1] = _v4.y;
+                        _vec_load_57[0 + 2] = _v4.z;
+                        _vec_load_57[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_57[0];
+                    vals_a[5] = _vec_load_57[1];
+                    vals_a[6] = _vec_load_57[2];
+                    vals_a[7] = _vec_load_57[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_3_1 = start + (c_5 + 2) * 8192 + 4096 + tid * 4;
+                if (i_3_1 < vocab) {
+                    float _vec_load_58[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3_1);
+                        _vec_load_58[0 + 0] = _v4.x;
+                        _vec_load_58[0 + 1] = _v4.y;
+                        _vec_load_58[0 + 2] = _v4.z;
+                        _vec_load_58[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_58[0];
+                    vals_a[9] = _vec_load_58[1];
+                    vals_a[10] = _vec_load_58[2];
+                    vals_a[11] = _vec_load_58[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_4_1 = start + (c_5 + 2) * 8192 + 6144 + tid * 4;
+                if (i_4_1 < vocab) {
+                    float _vec_load_59[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4_1);
+                        _vec_load_59[0 + 0] = _v4.x;
+                        _vec_load_59[0 + 1] = _v4.y;
+                        _vec_load_59[0 + 2] = _v4.z;
+                        _vec_load_59[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_59[0];
+                    vals_a[13] = _vec_load_59[1];
+                    vals_a[14] = _vec_load_59[2];
+                    vals_a[15] = _vec_load_59[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_28 = start + (c_5 + 2) * 8192 + tid;
+                if (i2_28 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_28];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_14 = start + (c_5 + 2) * 8192 + 512 + tid;
+                if (i2_0_14 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_14];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_14 = start + (c_5 + 2) * 8192 + 1024 + tid;
+                if (i2_1_14 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_14];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_14 = start + (c_5 + 2) * 8192 + 1536 + tid;
+                if (i2_2_14 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_14];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_14 = start + (c_5 + 2) * 8192 + 2048 + tid;
+                if (i2_3_14 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_14];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_14 = start + (c_5 + 2) * 8192 + 2560 + tid;
+                if (i2_4_14 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_14];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_14 = start + (c_5 + 2) * 8192 + 3072 + tid;
+                if (i2_5_14 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_14];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_14 = start + (c_5 + 2) * 8192 + 3584 + tid;
+                if (i2_6_14 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_14];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_14 = start + (c_5 + 2) * 8192 + 4096 + tid;
+                if (i2_7_14 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_14];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_14 = start + (c_5 + 2) * 8192 + 4608 + tid;
+                if (i2_8_14 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_14];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_14 = start + (c_5 + 2) * 8192 + 5120 + tid;
+                if (i2_9_14 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_14];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_14 = start + (c_5 + 2) * 8192 + 5632 + tid;
+                if (i2_10_14 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_14];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_14 = start + (c_5 + 2) * 8192 + 6144 + tid;
+                if (i2_11_14 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_14];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_14 = start + (c_5 + 2) * 8192 + 6656 + tid;
+                if (i2_12_14 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_14];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_14 = start + (c_5 + 2) * 8192 + 7168 + tid;
+                if (i2_13_14 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_14];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_14 = start + (c_5 + 2) * 8192 + 7680 + tid;
+                if (i2_14_14 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_14];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_5 + 1) {
+            unsigned int gt_1 = 0;
+            unsigned int bits_3_4 = __as_u32(vals_b[0]);
+            unsigned int key_4_4 = ((bits_3_4 <= 2139095040) ? bits_3_4 : 0);
+            int i_vec_5 = start + (c_5 + 1) * 8192 + tid * 4;
+            int i_str_6 = start + (c_5 + 1) * 8192 + tid;
+            int i_8_1 = ((aligned) ? i_vec_5 : i_str_6);
+            int i_9_1 = i_8_1;
+            bool tie_10 = key_4_4 == threshold && i_9_1 < vocab;
+            unsigned int _vote_67 = __ballot_sync(0xFFFFFFFF, tie_10);
+            unsigned int m_11 = _vote_67;
+            if (lane == 0) {
+                int _popc_98 = __popc(m_11);
+                cnt[warp] = (unsigned int)_popc_98;
+            }
+            if (key_4_4 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_12_3 = __as_u32(vals_b[1]);
+            unsigned int key_13_3 = ((bits_12_3 <= 2139095040) ? bits_12_3 : 0);
+            int i_vec_14 = start + (c_5 + 1) * 8192 + tid * 4 + 1;
+            int i_str_15 = start + (c_5 + 1) * 8192 + 512 + tid;
+            int i_16_1 = ((aligned) ? i_vec_14 : i_str_15);
+            int i_17_1 = i_16_1;
+            bool tie_18 = key_13_3 == threshold && i_17_1 < vocab;
+            unsigned int _vote_68 = __ballot_sync(0xFFFFFFFF, tie_18);
+            unsigned int m_19 = _vote_68;
+            if (lane == 0) {
+                int _popc_99 = __popc(m_19);
+                cnt[16 + warp] = (unsigned int)_popc_99;
+            }
+            if (key_13_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_20_1 = __as_u32(vals_b[2]);
+            unsigned int key_21_1 = ((bits_20_1 <= 2139095040) ? bits_20_1 : 0);
+            int i_vec_22 = start + (c_5 + 1) * 8192 + tid * 4 + 2;
+            int i_str_23 = start + (c_5 + 1) * 8192 + 1024 + tid;
+            int i_24 = ((aligned) ? i_vec_22 : i_str_23);
+            int i_25 = i_24;
+            bool tie_26 = key_21_1 == threshold && i_25 < vocab;
+            unsigned int _vote_69 = __ballot_sync(0xFFFFFFFF, tie_26);
+            unsigned int m_27_1 = _vote_69;
+            if (lane == 0) {
+                int _popc_100 = __popc(m_27_1);
+                cnt[32 + warp] = (unsigned int)_popc_100;
+            }
+            if (key_21_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_28_3 = __as_u32(vals_b[3]);
+            unsigned int key_29_3 = ((bits_28_3 <= 2139095040) ? bits_28_3 : 0);
+            int i_vec_30 = start + (c_5 + 1) * 8192 + tid * 4 + 3;
+            int i_str_31 = start + (c_5 + 1) * 8192 + 1536 + tid;
+            int i_32 = ((aligned) ? i_vec_30 : i_str_31);
+            int i_33 = i_32;
+            bool tie_34 = key_29_3 == threshold && i_33 < vocab;
+            unsigned int _vote_70 = __ballot_sync(0xFFFFFFFF, tie_34);
+            unsigned int m_35 = _vote_70;
+            if (lane == 0) {
+                int _popc_101 = __popc(m_35);
+                cnt[48 + warp] = (unsigned int)_popc_101;
+            }
+            if (key_29_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_36_3 = __as_u32(vals_b[4]);
+            unsigned int key_37_3 = ((bits_36_3 <= 2139095040) ? bits_36_3 : 0);
+            int i_vec_38 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+            int i_str_39 = start + (c_5 + 1) * 8192 + 2048 + tid;
+            int i_40 = ((aligned) ? i_vec_38 : i_str_39);
+            int i_41 = i_40;
+            bool tie_42 = key_37_3 == threshold && i_41 < vocab;
+            unsigned int _vote_71 = __ballot_sync(0xFFFFFFFF, tie_42);
+            unsigned int m_43_1 = _vote_71;
+            if (lane == 0) {
+                int _popc_102 = __popc(m_43_1);
+                cnt[64 + warp] = (unsigned int)_popc_102;
+            }
+            if (key_37_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_44 = __as_u32(vals_b[5]);
+            unsigned int key_45 = ((bits_44 <= 2139095040) ? bits_44 : 0);
+            int i_vec_46 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 1;
+            int i_str_47 = start + (c_5 + 1) * 8192 + 2560 + tid;
+            int i_48 = ((aligned) ? i_vec_46 : i_str_47);
+            int i_49 = i_48;
+            bool tie_50 = key_45 == threshold && i_49 < vocab;
+            unsigned int _vote_72 = __ballot_sync(0xFFFFFFFF, tie_50);
+            unsigned int m_51 = _vote_72;
+            if (lane == 0) {
+                int _popc_103 = __popc(m_51);
+                cnt[80 + warp] = (unsigned int)_popc_103;
+            }
+            if (key_45 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_52 = __as_u32(vals_b[6]);
+            unsigned int key_53 = ((bits_52 <= 2139095040) ? bits_52 : 0);
+            int i_vec_54 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 2;
+            int i_str_55 = start + (c_5 + 1) * 8192 + 3072 + tid;
+            int i_56 = ((aligned) ? i_vec_54 : i_str_55);
+            int i_57 = i_56;
+            bool tie_58 = key_53 == threshold && i_57 < vocab;
+            unsigned int _vote_73 = __ballot_sync(0xFFFFFFFF, tie_58);
+            unsigned int m_59 = _vote_73;
+            if (lane == 0) {
+                int _popc_104 = __popc(m_59);
+                cnt[96 + warp] = (unsigned int)_popc_104;
+            }
+            if (key_53 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_60 = __as_u32(vals_b[7]);
+            unsigned int key_61 = ((bits_60 <= 2139095040) ? bits_60 : 0);
+            int i_vec_62 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 3;
+            int i_str_63 = start + (c_5 + 1) * 8192 + 3584 + tid;
+            int i_64 = ((aligned) ? i_vec_62 : i_str_63);
+            int i_65 = i_64;
+            bool tie_66 = key_61 == threshold && i_65 < vocab;
+            unsigned int _vote_74 = __ballot_sync(0xFFFFFFFF, tie_66);
+            unsigned int m_67 = _vote_74;
+            if (lane == 0) {
+                int _popc_105 = __popc(m_67);
+                cnt[112 + warp] = (unsigned int)_popc_105;
+            }
+            if (key_61 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_68_1 = __as_u32(vals_b[8]);
+            unsigned int key_69_1 = ((bits_68_1 <= 2139095040) ? bits_68_1 : 0);
+            int i_vec_70_1 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+            int i_str_71_1 = start + (c_5 + 1) * 8192 + 4096 + tid;
+            int i_72 = ((aligned) ? i_vec_70_1 : i_str_71_1);
+            int i_73 = i_72;
+            bool tie_74 = key_69_1 == threshold && i_73 < vocab;
+            unsigned int _vote_75 = __ballot_sync(0xFFFFFFFF, tie_74);
+            unsigned int m_75 = _vote_75;
+            if (lane == 0) {
+                int _popc_106 = __popc(m_75);
+                cnt[128 + warp] = (unsigned int)_popc_106;
+            }
+            if (key_69_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_76 = __as_u32(vals_b[9]);
+            unsigned int key_77 = ((bits_76 <= 2139095040) ? bits_76 : 0);
+            int i_vec_78 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 1;
+            int i_str_79 = start + (c_5 + 1) * 8192 + 4608 + tid;
+            int i_80 = ((aligned) ? i_vec_78 : i_str_79);
+            int i_81 = i_80;
+            bool tie_82 = key_77 == threshold && i_81 < vocab;
+            unsigned int _vote_76 = __ballot_sync(0xFFFFFFFF, tie_82);
+            unsigned int m_83 = _vote_76;
+            if (lane == 0) {
+                int _popc_107 = __popc(m_83);
+                cnt[144 + warp] = (unsigned int)_popc_107;
+            }
+            if (key_77 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_84_1 = __as_u32(vals_b[10]);
+            unsigned int key_85_1 = ((bits_84_1 <= 2139095040) ? bits_84_1 : 0);
+            int i_vec_86_1 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 2;
+            int i_str_87_1 = start + (c_5 + 1) * 8192 + 5120 + tid;
+            int i_88 = ((aligned) ? i_vec_86_1 : i_str_87_1);
+            int i_89 = i_88;
+            bool tie_90 = key_85_1 == threshold && i_89 < vocab;
+            unsigned int _vote_77 = __ballot_sync(0xFFFFFFFF, tie_90);
+            unsigned int m_91 = _vote_77;
+            if (lane == 0) {
+                int _popc_108 = __popc(m_91);
+                cnt[160 + warp] = (unsigned int)_popc_108;
+            }
+            if (key_85_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_92 = __as_u32(vals_b[11]);
+            unsigned int key_93 = ((bits_92 <= 2139095040) ? bits_92 : 0);
+            int i_vec_94 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 3;
+            int i_str_95 = start + (c_5 + 1) * 8192 + 5632 + tid;
+            int i_96 = ((aligned) ? i_vec_94 : i_str_95);
+            int i_97 = i_96;
+            bool tie_98 = key_93 == threshold && i_97 < vocab;
+            unsigned int _vote_78 = __ballot_sync(0xFFFFFFFF, tie_98);
+            unsigned int m_99 = _vote_78;
+            if (lane == 0) {
+                int _popc_109 = __popc(m_99);
+                cnt[176 + warp] = (unsigned int)_popc_109;
+            }
+            if (key_93 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_100 = __as_u32(vals_b[12]);
+            unsigned int key_101 = ((bits_100 <= 2139095040) ? bits_100 : 0);
+            int i_vec_102 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+            int i_str_103 = start + (c_5 + 1) * 8192 + 6144 + tid;
+            int i_104 = ((aligned) ? i_vec_102 : i_str_103);
+            int i_105 = i_104;
+            bool tie_106 = key_101 == threshold && i_105 < vocab;
+            unsigned int _vote_79 = __ballot_sync(0xFFFFFFFF, tie_106);
+            unsigned int m_107_1 = _vote_79;
+            if (lane == 0) {
+                int _popc_110 = __popc(m_107_1);
+                cnt[192 + warp] = (unsigned int)_popc_110;
+            }
+            if (key_101 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_108_1 = __as_u32(vals_b[13]);
+            unsigned int key_109_1 = ((bits_108_1 <= 2139095040) ? bits_108_1 : 0);
+            int i_vec_110_1 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 1;
+            int i_str_111_1 = start + (c_5 + 1) * 8192 + 6656 + tid;
+            int i_112 = ((aligned) ? i_vec_110_1 : i_str_111_1);
+            int i_113 = i_112;
+            bool tie_114 = key_109_1 == threshold && i_113 < vocab;
+            unsigned int _vote_80 = __ballot_sync(0xFFFFFFFF, tie_114);
+            unsigned int m_115 = _vote_80;
+            if (lane == 0) {
+                int _popc_111 = __popc(m_115);
+                cnt[208 + warp] = (unsigned int)_popc_111;
+            }
+            if (key_109_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_116 = __as_u32(vals_b[14]);
+            unsigned int key_117 = ((bits_116 <= 2139095040) ? bits_116 : 0);
+            int i_vec_118 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 2;
+            int i_str_119 = start + (c_5 + 1) * 8192 + 7168 + tid;
+            int i_120 = ((aligned) ? i_vec_118 : i_str_119);
+            int i_121 = i_120;
+            bool tie_122 = key_117 == threshold && i_121 < vocab;
+            unsigned int _vote_81 = __ballot_sync(0xFFFFFFFF, tie_122);
+            unsigned int m_123 = _vote_81;
+            if (lane == 0) {
+                int _popc_112 = __popc(m_123);
+                cnt[224 + warp] = (unsigned int)_popc_112;
+            }
+            if (key_117 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_124 = __as_u32(vals_b[15]);
+            unsigned int key_125 = ((bits_124 <= 2139095040) ? bits_124 : 0);
+            int i_vec_126 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 3;
+            int i_str_127 = start + (c_5 + 1) * 8192 + 7680 + tid;
+            int i_128 = ((aligned) ? i_vec_126 : i_str_127);
+            int i_129 = i_128;
+            bool tie_130 = key_125 == threshold && i_129 < vocab;
+            unsigned int _vote_82 = __ballot_sync(0xFFFFFFFF, tie_130);
+            unsigned int m_131 = _vote_82;
+            if (lane == 0) {
+                int _popc_113 = __popc(m_131);
+                cnt[240 + warp] = (unsigned int)_popc_113;
+            }
+            if (key_125 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int gt_cnt_132 = gt_1;
+            __syncthreads();
+            unsigned int local_133 = 0;
+            int f_134 = tid;
+            if (f_134 < 256) {
+                local_133 = local_133 + cnt[f_134];
+            }
+            unsigned int packed_135 = gt_cnt_132 | local_133 << 12;
+            uint32_t _warp_scan_sum_u32_8 = packed_135;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(16));
+            unsigned int incl_136 = _warp_scan_sum_u32_8;
+            if (lane == 31) {
+                warp_sums[warp] = incl_136;
+            }
+            __syncthreads();
+            unsigned int before_137 = 0;
+            unsigned int total_138 = 0;
+            unsigned int ws_142 = warp_sums[0];
+            total_138 = total_138 + ws_142;
+            if (warp > 0) {
+                before_137 = before_137 + ws_142;
+            }
+            unsigned int ws_143 = warp_sums[1];
+            total_138 = total_138 + ws_143;
+            if (warp > 1) {
+                before_137 = before_137 + ws_143;
+            }
+            unsigned int ws_144 = warp_sums[2];
+            total_138 = total_138 + ws_144;
+            if (warp > 2) {
+                before_137 = before_137 + ws_144;
+            }
+            unsigned int ws_145 = warp_sums[3];
+            total_138 = total_138 + ws_145;
+            if (warp > 3) {
+                before_137 = before_137 + ws_145;
+            }
+            unsigned int ws_146 = warp_sums[4];
+            total_138 = total_138 + ws_146;
+            if (warp > 4) {
+                before_137 = before_137 + ws_146;
+            }
+            unsigned int ws_147 = warp_sums[5];
+            total_138 = total_138 + ws_147;
+            if (warp > 5) {
+                before_137 = before_137 + ws_147;
+            }
+            unsigned int ws_148 = warp_sums[6];
+            total_138 = total_138 + ws_148;
+            if (warp > 6) {
+                before_137 = before_137 + ws_148;
+            }
+            unsigned int ws_149 = warp_sums[7];
+            total_138 = total_138 + ws_149;
+            if (warp > 7) {
+                before_137 = before_137 + ws_149;
+            }
+            unsigned int ws_150 = warp_sums[8];
+            total_138 = total_138 + ws_150;
+            if (warp > 8) {
+                before_137 = before_137 + ws_150;
+            }
+            unsigned int ws_151 = warp_sums[9];
+            total_138 = total_138 + ws_151;
+            if (warp > 9) {
+                before_137 = before_137 + ws_151;
+            }
+            unsigned int ws_152 = warp_sums[10];
+            total_138 = total_138 + ws_152;
+            if (warp > 10) {
+                before_137 = before_137 + ws_152;
+            }
+            unsigned int ws_153 = warp_sums[11];
+            total_138 = total_138 + ws_153;
+            if (warp > 11) {
+                before_137 = before_137 + ws_153;
+            }
+            unsigned int ws_154 = warp_sums[12];
+            total_138 = total_138 + ws_154;
+            if (warp > 12) {
+                before_137 = before_137 + ws_154;
+            }
+            unsigned int ws_155 = warp_sums[13];
+            total_138 = total_138 + ws_155;
+            if (warp > 13) {
+                before_137 = before_137 + ws_155;
+            }
+            unsigned int ws_156 = warp_sums[14];
+            total_138 = total_138 + ws_156;
+            if (warp > 14) {
+                before_137 = before_137 + ws_156;
+            }
+            unsigned int ws_157 = warp_sums[15];
+            total_138 = total_138 + ws_157;
+            if (warp > 15) {
+                before_137 = before_137 + ws_157;
+            }
+            unsigned int excl_158 = before_137 + incl_136 - packed_135;
+            __syncthreads();
+            unsigned int running_159 = excl_158 >> 12;
+            int f2_160 = tid;
+            if (f2_160 < 256) {
+                unsigned int c_0_1 = cnt[f2_160];
+                cnt[f2_160] = running_159;
+                running_159 = running_159 + c_0_1;
+            }
+            __syncthreads();
+            unsigned int gt_slot_161 = excl_158 & 4095;
+            unsigned int gt_total_162 = total_138 & 4095;
+            unsigned int eq_total_163 = total_138 >> 12;
+            unsigned int _min_4 = ((eq_total_163) < (take_rem) ? (eq_total_163) : (take_rem));
+            unsigned int take_c_164 = _min_4;
+            unsigned int lt_mask_165 = (1 << (unsigned int)lane) - 1;
+            unsigned int g_166 = gt_slot_161;
+            unsigned int keys_167[4];
+            int idxs_168[4];
+            bool ties_169[4];
+            unsigned int strided_170[4];
+            unsigned int grp_warp_171 = 0;
+            unsigned int grp_lane_172 = 0;
+            unsigned int bits_173 = __as_u32(vals_b[0]);
+            unsigned int key_174 = ((bits_173 <= 2139095040) ? bits_173 : 0);
+            keys_167[0] = key_174;
+            int i_vec_175 = start + (c_5 + 1) * 8192 + tid * 4;
+            int i_str_176 = start + (c_5 + 1) * 8192 + tid;
+            int i_177 = ((aligned) ? i_vec_175 : i_str_176);
+            idxs_168[0] = i_177;
+            ties_169[0] = keys_167[0] == threshold && idxs_168[0] < vocab;
+            unsigned int _vote_83 = __ballot_sync(0xFFFFFFFF, ties_169[0]);
+            unsigned int m_178 = _vote_83;
+            int _popc_114 = __popc(m_178 & lt_mask_165);
+            unsigned int lane_before_179 = (unsigned int)_popc_114;
+            unsigned int warp_off_180 = cnt[warp];
+            strided_170[0] = warp_off_180 + lane_before_179;
+            grp_warp_171 = grp_warp_171 + (warp_off_180 - cnt[0]);
+            grp_lane_172 = grp_lane_172 + lane_before_179;
+            unsigned int bits_181 = __as_u32(vals_b[1]);
+            unsigned int key_182 = ((bits_181 <= 2139095040) ? bits_181 : 0);
+            keys_167[1] = key_182;
+            int i_vec_183 = start + (c_5 + 1) * 8192 + tid * 4 + 1;
+            int i_str_184 = start + (c_5 + 1) * 8192 + 512 + tid;
+            int i_185 = ((aligned) ? i_vec_183 : i_str_184);
+            idxs_168[1] = i_185;
+            ties_169[1] = keys_167[1] == threshold && idxs_168[1] < vocab;
+            unsigned int _vote_84 = __ballot_sync(0xFFFFFFFF, ties_169[1]);
+            unsigned int m_186 = _vote_84;
+            int _popc_115 = __popc(m_186 & lt_mask_165);
+            unsigned int lane_before_187 = (unsigned int)_popc_115;
+            unsigned int warp_off_188 = cnt[16 + warp];
+            strided_170[1] = warp_off_188 + lane_before_187;
+            grp_warp_171 = grp_warp_171 + (warp_off_188 - cnt[16]);
+            grp_lane_172 = grp_lane_172 + lane_before_187;
+            unsigned int bits_190 = __as_u32(vals_b[2]);
+            unsigned int key_191 = ((bits_190 <= 2139095040) ? bits_190 : 0);
+            keys_167[2] = key_191;
+            int i_vec_192 = start + (c_5 + 1) * 8192 + tid * 4 + 2;
+            int i_str_193 = start + (c_5 + 1) * 8192 + 1024 + tid;
+            int i_194 = ((aligned) ? i_vec_192 : i_str_193);
+            idxs_168[2] = i_194;
+            ties_169[2] = keys_167[2] == threshold && idxs_168[2] < vocab;
+            unsigned int _vote_85 = __ballot_sync(0xFFFFFFFF, ties_169[2]);
+            unsigned int m_195 = _vote_85;
+            int _popc_116 = __popc(m_195 & lt_mask_165);
+            unsigned int lane_before_196 = (unsigned int)_popc_116;
+            unsigned int warp_off_197 = cnt[32 + warp];
+            strided_170[2] = warp_off_197 + lane_before_196;
+            grp_warp_171 = grp_warp_171 + (warp_off_197 - cnt[32]);
+            grp_lane_172 = grp_lane_172 + lane_before_196;
+            unsigned int bits_198 = __as_u32(vals_b[3]);
+            unsigned int key_199 = ((bits_198 <= 2139095040) ? bits_198 : 0);
+            keys_167[3] = key_199;
+            int i_vec_200 = start + (c_5 + 1) * 8192 + tid * 4 + 3;
+            int i_str_201 = start + (c_5 + 1) * 8192 + 1536 + tid;
+            int i_202 = ((aligned) ? i_vec_200 : i_str_201);
+            idxs_168[3] = i_202;
+            ties_169[3] = keys_167[3] == threshold && idxs_168[3] < vocab;
+            unsigned int _vote_86 = __ballot_sync(0xFFFFFFFF, ties_169[3]);
+            unsigned int m_203 = _vote_86;
+            int _popc_117 = __popc(m_203 & lt_mask_165);
+            unsigned int lane_before_204 = (unsigned int)_popc_117;
+            unsigned int warp_off_205 = cnt[48 + warp];
+            strided_170[3] = warp_off_205 + lane_before_204;
+            grp_warp_171 = grp_warp_171 + (warp_off_205 - cnt[48]);
+            grp_lane_172 = grp_lane_172 + lane_before_204;
+            unsigned int grp_base_206 = cnt[0];
+            unsigned int own_207 = 0;
+            unsigned int vec_rank_208 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_209 = ((aligned) ? vec_rank_208 : strided_170[0]);
+            if (keys_167[0] > threshold) {
+                unsigned long long dst_16 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_16] = __uint_as_float(keys_167[0]);
+                out_idx[dst_16] = idxs_168[0];
+                g_166 = g_166 + 1;
+            } else if (ties_169[0] && rank_209 < take_c_164) {
+                unsigned long long dst2_16 = eq_run + (unsigned long long)rank_209;
+                out_vals[dst2_16] = __uint_as_float(keys_167[0]);
+                out_idx[dst2_16] = idxs_168[0];
+            }
+            if (ties_169[0]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_210 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_211 = ((aligned) ? vec_rank_210 : strided_170[1]);
+            if (keys_167[1] > threshold) {
+                unsigned long long dst_17 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_17] = __uint_as_float(keys_167[1]);
+                out_idx[dst_17] = idxs_168[1];
+                g_166 = g_166 + 1;
+            } else if (ties_169[1] && rank_211 < take_c_164) {
+                unsigned long long dst2_17 = eq_run + (unsigned long long)rank_211;
+                out_vals[dst2_17] = __uint_as_float(keys_167[1]);
+                out_idx[dst2_17] = idxs_168[1];
+            }
+            if (ties_169[1]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_212 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_213 = ((aligned) ? vec_rank_212 : strided_170[2]);
+            if (keys_167[2] > threshold) {
+                unsigned long long dst_18 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_18] = __uint_as_float(keys_167[2]);
+                out_idx[dst_18] = idxs_168[2];
+                g_166 = g_166 + 1;
+            } else if (ties_169[2] && rank_213 < take_c_164) {
+                unsigned long long dst2_18 = eq_run + (unsigned long long)rank_213;
+                out_vals[dst2_18] = __uint_as_float(keys_167[2]);
+                out_idx[dst2_18] = idxs_168[2];
+            }
+            if (ties_169[2]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_214 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_215 = ((aligned) ? vec_rank_214 : strided_170[3]);
+            if (keys_167[3] > threshold) {
+                unsigned long long dst_19 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_19] = __uint_as_float(keys_167[3]);
+                out_idx[dst_19] = idxs_168[3];
+                g_166 = g_166 + 1;
+            } else if (ties_169[3] && rank_215 < take_c_164) {
+                unsigned long long dst2_19 = eq_run + (unsigned long long)rank_215;
+                out_vals[dst2_19] = __uint_as_float(keys_167[3]);
+                out_idx[dst2_19] = idxs_168[3];
+            }
+            if (ties_169[3]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int keys_216[4];
+            int idxs_217[4];
+            bool ties_218[4];
+            unsigned int strided_219[4];
+            unsigned int grp_warp_220 = 0;
+            unsigned int grp_lane_221 = 0;
+            unsigned int bits_222 = __as_u32(vals_b[4]);
+            unsigned int key_223 = ((bits_222 <= 2139095040) ? bits_222 : 0);
+            keys_216[0] = key_223;
+            int i_vec_224 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+            int i_str_225 = start + (c_5 + 1) * 8192 + 2048 + tid;
+            int i_226 = ((aligned) ? i_vec_224 : i_str_225);
+            idxs_217[0] = i_226;
+            ties_218[0] = keys_216[0] == threshold && idxs_217[0] < vocab;
+            unsigned int _vote_87 = __ballot_sync(0xFFFFFFFF, ties_218[0]);
+            unsigned int m_227 = _vote_87;
+            int _popc_118 = __popc(m_227 & lt_mask_165);
+            unsigned int lane_before_228 = (unsigned int)_popc_118;
+            unsigned int warp_off_229 = cnt[64 + warp];
+            strided_219[0] = warp_off_229 + lane_before_228;
+            grp_warp_220 = grp_warp_220 + (warp_off_229 - cnt[64]);
+            grp_lane_221 = grp_lane_221 + lane_before_228;
+            unsigned int bits_230 = __as_u32(vals_b[5]);
+            unsigned int key_231 = ((bits_230 <= 2139095040) ? bits_230 : 0);
+            keys_216[1] = key_231;
+            int i_vec_232 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 1;
+            int i_str_233 = start + (c_5 + 1) * 8192 + 2560 + tid;
+            int i_234 = ((aligned) ? i_vec_232 : i_str_233);
+            idxs_217[1] = i_234;
+            ties_218[1] = keys_216[1] == threshold && idxs_217[1] < vocab;
+            unsigned int _vote_88 = __ballot_sync(0xFFFFFFFF, ties_218[1]);
+            unsigned int m_235 = _vote_88;
+            int _popc_119 = __popc(m_235 & lt_mask_165);
+            unsigned int lane_before_236 = (unsigned int)_popc_119;
+            unsigned int warp_off_237 = cnt[80 + warp];
+            strided_219[1] = warp_off_237 + lane_before_236;
+            grp_warp_220 = grp_warp_220 + (warp_off_237 - cnt[80]);
+            grp_lane_221 = grp_lane_221 + lane_before_236;
+            unsigned int bits_238 = __as_u32(vals_b[6]);
+            unsigned int key_239 = ((bits_238 <= 2139095040) ? bits_238 : 0);
+            keys_216[2] = key_239;
+            int i_vec_240 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 2;
+            int i_str_241 = start + (c_5 + 1) * 8192 + 3072 + tid;
+            int i_242 = ((aligned) ? i_vec_240 : i_str_241);
+            idxs_217[2] = i_242;
+            ties_218[2] = keys_216[2] == threshold && idxs_217[2] < vocab;
+            unsigned int _vote_89 = __ballot_sync(0xFFFFFFFF, ties_218[2]);
+            unsigned int m_243 = _vote_89;
+            int _popc_120 = __popc(m_243 & lt_mask_165);
+            unsigned int lane_before_244 = (unsigned int)_popc_120;
+            unsigned int warp_off_245 = cnt[96 + warp];
+            strided_219[2] = warp_off_245 + lane_before_244;
+            grp_warp_220 = grp_warp_220 + (warp_off_245 - cnt[96]);
+            grp_lane_221 = grp_lane_221 + lane_before_244;
+            unsigned int bits_246 = __as_u32(vals_b[7]);
+            unsigned int key_247 = ((bits_246 <= 2139095040) ? bits_246 : 0);
+            keys_216[3] = key_247;
+            int i_vec_248 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 3;
+            int i_str_249 = start + (c_5 + 1) * 8192 + 3584 + tid;
+            int i_250 = ((aligned) ? i_vec_248 : i_str_249);
+            idxs_217[3] = i_250;
+            ties_218[3] = keys_216[3] == threshold && idxs_217[3] < vocab;
+            unsigned int _vote_90 = __ballot_sync(0xFFFFFFFF, ties_218[3]);
+            unsigned int m_251 = _vote_90;
+            int _popc_121 = __popc(m_251 & lt_mask_165);
+            unsigned int lane_before_252 = (unsigned int)_popc_121;
+            unsigned int warp_off_253 = cnt[112 + warp];
+            strided_219[3] = warp_off_253 + lane_before_252;
+            grp_warp_220 = grp_warp_220 + (warp_off_253 - cnt[112]);
+            grp_lane_221 = grp_lane_221 + lane_before_252;
+            unsigned int grp_base_254 = cnt[64];
+            unsigned int own_255 = 0;
+            unsigned int vec_rank_256 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_257 = ((aligned) ? vec_rank_256 : strided_219[0]);
+            if (keys_216[0] > threshold) {
+                unsigned long long dst_20 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_20] = __uint_as_float(keys_216[0]);
+                out_idx[dst_20] = idxs_217[0];
+                g_166 = g_166 + 1;
+            } else if (ties_218[0] && rank_257 < take_c_164) {
+                unsigned long long dst2_20 = eq_run + (unsigned long long)rank_257;
+                out_vals[dst2_20] = __uint_as_float(keys_216[0]);
+                out_idx[dst2_20] = idxs_217[0];
+            }
+            if (ties_218[0]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_258 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_259 = ((aligned) ? vec_rank_258 : strided_219[1]);
+            if (keys_216[1] > threshold) {
+                unsigned long long dst_21 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_21] = __uint_as_float(keys_216[1]);
+                out_idx[dst_21] = idxs_217[1];
+                g_166 = g_166 + 1;
+            } else if (ties_218[1] && rank_259 < take_c_164) {
+                unsigned long long dst2_21 = eq_run + (unsigned long long)rank_259;
+                out_vals[dst2_21] = __uint_as_float(keys_216[1]);
+                out_idx[dst2_21] = idxs_217[1];
+            }
+            if (ties_218[1]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_260 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_261 = ((aligned) ? vec_rank_260 : strided_219[2]);
+            if (keys_216[2] > threshold) {
+                unsigned long long dst_22 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_22] = __uint_as_float(keys_216[2]);
+                out_idx[dst_22] = idxs_217[2];
+                g_166 = g_166 + 1;
+            } else if (ties_218[2] && rank_261 < take_c_164) {
+                unsigned long long dst2_22 = eq_run + (unsigned long long)rank_261;
+                out_vals[dst2_22] = __uint_as_float(keys_216[2]);
+                out_idx[dst2_22] = idxs_217[2];
+            }
+            if (ties_218[2]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_262 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_263 = ((aligned) ? vec_rank_262 : strided_219[3]);
+            if (keys_216[3] > threshold) {
+                unsigned long long dst_23 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_23] = __uint_as_float(keys_216[3]);
+                out_idx[dst_23] = idxs_217[3];
+                g_166 = g_166 + 1;
+            } else if (ties_218[3] && rank_263 < take_c_164) {
+                unsigned long long dst2_23 = eq_run + (unsigned long long)rank_263;
+                out_vals[dst2_23] = __uint_as_float(keys_216[3]);
+                out_idx[dst2_23] = idxs_217[3];
+            }
+            if (ties_218[3]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int keys_264[4];
+            int idxs_265[4];
+            bool ties_266[4];
+            unsigned int strided_267[4];
+            unsigned int grp_warp_268 = 0;
+            unsigned int grp_lane_269 = 0;
+            unsigned int bits_270 = __as_u32(vals_b[8]);
+            unsigned int key_271 = ((bits_270 <= 2139095040) ? bits_270 : 0);
+            keys_264[0] = key_271;
+            int i_vec_272 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+            int i_str_273 = start + (c_5 + 1) * 8192 + 4096 + tid;
+            int i_274 = ((aligned) ? i_vec_272 : i_str_273);
+            idxs_265[0] = i_274;
+            ties_266[0] = keys_264[0] == threshold && idxs_265[0] < vocab;
+            unsigned int _vote_91 = __ballot_sync(0xFFFFFFFF, ties_266[0]);
+            unsigned int m_275 = _vote_91;
+            int _popc_122 = __popc(m_275 & lt_mask_165);
+            unsigned int lane_before_276 = (unsigned int)_popc_122;
+            unsigned int warp_off_277 = cnt[128 + warp];
+            strided_267[0] = warp_off_277 + lane_before_276;
+            grp_warp_268 = grp_warp_268 + (warp_off_277 - cnt[128]);
+            grp_lane_269 = grp_lane_269 + lane_before_276;
+            unsigned int bits_278 = __as_u32(vals_b[9]);
+            unsigned int key_279 = ((bits_278 <= 2139095040) ? bits_278 : 0);
+            keys_264[1] = key_279;
+            int i_vec_280 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 1;
+            int i_str_281 = start + (c_5 + 1) * 8192 + 4608 + tid;
+            int i_282 = ((aligned) ? i_vec_280 : i_str_281);
+            idxs_265[1] = i_282;
+            ties_266[1] = keys_264[1] == threshold && idxs_265[1] < vocab;
+            unsigned int _vote_92 = __ballot_sync(0xFFFFFFFF, ties_266[1]);
+            unsigned int m_283 = _vote_92;
+            int _popc_123 = __popc(m_283 & lt_mask_165);
+            unsigned int lane_before_284 = (unsigned int)_popc_123;
+            unsigned int warp_off_285 = cnt[144 + warp];
+            strided_267[1] = warp_off_285 + lane_before_284;
+            grp_warp_268 = grp_warp_268 + (warp_off_285 - cnt[144]);
+            grp_lane_269 = grp_lane_269 + lane_before_284;
+            unsigned int bits_286 = __as_u32(vals_b[10]);
+            unsigned int key_287 = ((bits_286 <= 2139095040) ? bits_286 : 0);
+            keys_264[2] = key_287;
+            int i_vec_288 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 2;
+            int i_str_289 = start + (c_5 + 1) * 8192 + 5120 + tid;
+            int i_290 = ((aligned) ? i_vec_288 : i_str_289);
+            idxs_265[2] = i_290;
+            ties_266[2] = keys_264[2] == threshold && idxs_265[2] < vocab;
+            unsigned int _vote_93 = __ballot_sync(0xFFFFFFFF, ties_266[2]);
+            unsigned int m_291 = _vote_93;
+            int _popc_124 = __popc(m_291 & lt_mask_165);
+            unsigned int lane_before_292 = (unsigned int)_popc_124;
+            unsigned int warp_off_293 = cnt[160 + warp];
+            strided_267[2] = warp_off_293 + lane_before_292;
+            grp_warp_268 = grp_warp_268 + (warp_off_293 - cnt[160]);
+            grp_lane_269 = grp_lane_269 + lane_before_292;
+            unsigned int bits_294 = __as_u32(vals_b[11]);
+            unsigned int key_295 = ((bits_294 <= 2139095040) ? bits_294 : 0);
+            keys_264[3] = key_295;
+            int i_vec_296 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 3;
+            int i_str_297 = start + (c_5 + 1) * 8192 + 5632 + tid;
+            int i_298 = ((aligned) ? i_vec_296 : i_str_297);
+            idxs_265[3] = i_298;
+            ties_266[3] = keys_264[3] == threshold && idxs_265[3] < vocab;
+            unsigned int _vote_94 = __ballot_sync(0xFFFFFFFF, ties_266[3]);
+            unsigned int m_299 = _vote_94;
+            int _popc_125 = __popc(m_299 & lt_mask_165);
+            unsigned int lane_before_300 = (unsigned int)_popc_125;
+            unsigned int warp_off_301 = cnt[176 + warp];
+            strided_267[3] = warp_off_301 + lane_before_300;
+            grp_warp_268 = grp_warp_268 + (warp_off_301 - cnt[176]);
+            grp_lane_269 = grp_lane_269 + lane_before_300;
+            unsigned int grp_base_302 = cnt[128];
+            unsigned int own_303 = 0;
+            unsigned int vec_rank_304 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_305 = ((aligned) ? vec_rank_304 : strided_267[0]);
+            if (keys_264[0] > threshold) {
+                unsigned long long dst_24 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_24] = __uint_as_float(keys_264[0]);
+                out_idx[dst_24] = idxs_265[0];
+                g_166 = g_166 + 1;
+            } else if (ties_266[0] && rank_305 < take_c_164) {
+                unsigned long long dst2_24 = eq_run + (unsigned long long)rank_305;
+                out_vals[dst2_24] = __uint_as_float(keys_264[0]);
+                out_idx[dst2_24] = idxs_265[0];
+            }
+            if (ties_266[0]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_306 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_307 = ((aligned) ? vec_rank_306 : strided_267[1]);
+            if (keys_264[1] > threshold) {
+                unsigned long long dst_25 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_25] = __uint_as_float(keys_264[1]);
+                out_idx[dst_25] = idxs_265[1];
+                g_166 = g_166 + 1;
+            } else if (ties_266[1] && rank_307 < take_c_164) {
+                unsigned long long dst2_25 = eq_run + (unsigned long long)rank_307;
+                out_vals[dst2_25] = __uint_as_float(keys_264[1]);
+                out_idx[dst2_25] = idxs_265[1];
+            }
+            if (ties_266[1]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_308 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_309 = ((aligned) ? vec_rank_308 : strided_267[2]);
+            if (keys_264[2] > threshold) {
+                unsigned long long dst_26 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_26] = __uint_as_float(keys_264[2]);
+                out_idx[dst_26] = idxs_265[2];
+                g_166 = g_166 + 1;
+            } else if (ties_266[2] && rank_309 < take_c_164) {
+                unsigned long long dst2_26 = eq_run + (unsigned long long)rank_309;
+                out_vals[dst2_26] = __uint_as_float(keys_264[2]);
+                out_idx[dst2_26] = idxs_265[2];
+            }
+            if (ties_266[2]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_310 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_311 = ((aligned) ? vec_rank_310 : strided_267[3]);
+            if (keys_264[3] > threshold) {
+                unsigned long long dst_27 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_27] = __uint_as_float(keys_264[3]);
+                out_idx[dst_27] = idxs_265[3];
+                g_166 = g_166 + 1;
+            } else if (ties_266[3] && rank_311 < take_c_164) {
+                unsigned long long dst2_27 = eq_run + (unsigned long long)rank_311;
+                out_vals[dst2_27] = __uint_as_float(keys_264[3]);
+                out_idx[dst2_27] = idxs_265[3];
+            }
+            if (ties_266[3]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int keys_312[4];
+            int idxs_313[4];
+            bool ties_314[4];
+            unsigned int strided_315[4];
+            unsigned int grp_warp_316 = 0;
+            unsigned int grp_lane_317 = 0;
+            unsigned int bits_318 = __as_u32(vals_b[12]);
+            unsigned int key_319 = ((bits_318 <= 2139095040) ? bits_318 : 0);
+            keys_312[0] = key_319;
+            int i_vec_320 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+            int i_str_321 = start + (c_5 + 1) * 8192 + 6144 + tid;
+            int i_322 = ((aligned) ? i_vec_320 : i_str_321);
+            idxs_313[0] = i_322;
+            ties_314[0] = keys_312[0] == threshold && idxs_313[0] < vocab;
+            unsigned int _vote_95 = __ballot_sync(0xFFFFFFFF, ties_314[0]);
+            unsigned int m_323 = _vote_95;
+            int _popc_126 = __popc(m_323 & lt_mask_165);
+            unsigned int lane_before_324 = (unsigned int)_popc_126;
+            unsigned int warp_off_325 = cnt[192 + warp];
+            strided_315[0] = warp_off_325 + lane_before_324;
+            grp_warp_316 = grp_warp_316 + (warp_off_325 - cnt[192]);
+            grp_lane_317 = grp_lane_317 + lane_before_324;
+            unsigned int bits_326 = __as_u32(vals_b[13]);
+            unsigned int key_327 = ((bits_326 <= 2139095040) ? bits_326 : 0);
+            keys_312[1] = key_327;
+            int i_vec_328 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 1;
+            int i_str_329 = start + (c_5 + 1) * 8192 + 6656 + tid;
+            int i_330 = ((aligned) ? i_vec_328 : i_str_329);
+            idxs_313[1] = i_330;
+            ties_314[1] = keys_312[1] == threshold && idxs_313[1] < vocab;
+            unsigned int _vote_96 = __ballot_sync(0xFFFFFFFF, ties_314[1]);
+            unsigned int m_331 = _vote_96;
+            int _popc_127 = __popc(m_331 & lt_mask_165);
+            unsigned int lane_before_332 = (unsigned int)_popc_127;
+            unsigned int warp_off_333 = cnt[208 + warp];
+            strided_315[1] = warp_off_333 + lane_before_332;
+            grp_warp_316 = grp_warp_316 + (warp_off_333 - cnt[208]);
+            grp_lane_317 = grp_lane_317 + lane_before_332;
+            unsigned int bits_334 = __as_u32(vals_b[14]);
+            unsigned int key_335 = ((bits_334 <= 2139095040) ? bits_334 : 0);
+            keys_312[2] = key_335;
+            int i_vec_336 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 2;
+            int i_str_337 = start + (c_5 + 1) * 8192 + 7168 + tid;
+            int i_338 = ((aligned) ? i_vec_336 : i_str_337);
+            idxs_313[2] = i_338;
+            ties_314[2] = keys_312[2] == threshold && idxs_313[2] < vocab;
+            unsigned int _vote_97 = __ballot_sync(0xFFFFFFFF, ties_314[2]);
+            unsigned int m_339 = _vote_97;
+            int _popc_128 = __popc(m_339 & lt_mask_165);
+            unsigned int lane_before_340 = (unsigned int)_popc_128;
+            unsigned int warp_off_341 = cnt[224 + warp];
+            strided_315[2] = warp_off_341 + lane_before_340;
+            grp_warp_316 = grp_warp_316 + (warp_off_341 - cnt[224]);
+            grp_lane_317 = grp_lane_317 + lane_before_340;
+            unsigned int bits_342 = __as_u32(vals_b[15]);
+            unsigned int key_343 = ((bits_342 <= 2139095040) ? bits_342 : 0);
+            keys_312[3] = key_343;
+            int i_vec_344 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 3;
+            int i_str_345 = start + (c_5 + 1) * 8192 + 7680 + tid;
+            int i_346 = ((aligned) ? i_vec_344 : i_str_345);
+            idxs_313[3] = i_346;
+            ties_314[3] = keys_312[3] == threshold && idxs_313[3] < vocab;
+            unsigned int _vote_98 = __ballot_sync(0xFFFFFFFF, ties_314[3]);
+            unsigned int m_347 = _vote_98;
+            int _popc_129 = __popc(m_347 & lt_mask_165);
+            unsigned int lane_before_348 = (unsigned int)_popc_129;
+            unsigned int warp_off_349 = cnt[240 + warp];
+            strided_315[3] = warp_off_349 + lane_before_348;
+            grp_warp_316 = grp_warp_316 + (warp_off_349 - cnt[240]);
+            grp_lane_317 = grp_lane_317 + lane_before_348;
+            unsigned int grp_base_350 = cnt[192];
+            unsigned int own_351 = 0;
+            unsigned int vec_rank_352 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_353 = ((aligned) ? vec_rank_352 : strided_315[0]);
+            if (keys_312[0] > threshold) {
+                unsigned long long dst_28 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_28] = __uint_as_float(keys_312[0]);
+                out_idx[dst_28] = idxs_313[0];
+                g_166 = g_166 + 1;
+            } else if (ties_314[0] && rank_353 < take_c_164) {
+                unsigned long long dst2_28 = eq_run + (unsigned long long)rank_353;
+                out_vals[dst2_28] = __uint_as_float(keys_312[0]);
+                out_idx[dst2_28] = idxs_313[0];
+            }
+            if (ties_314[0]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_354 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_355 = ((aligned) ? vec_rank_354 : strided_315[1]);
+            if (keys_312[1] > threshold) {
+                unsigned long long dst_29 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_29] = __uint_as_float(keys_312[1]);
+                out_idx[dst_29] = idxs_313[1];
+                g_166 = g_166 + 1;
+            } else if (ties_314[1] && rank_355 < take_c_164) {
+                unsigned long long dst2_29 = eq_run + (unsigned long long)rank_355;
+                out_vals[dst2_29] = __uint_as_float(keys_312[1]);
+                out_idx[dst2_29] = idxs_313[1];
+            }
+            if (ties_314[1]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_356 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_357 = ((aligned) ? vec_rank_356 : strided_315[2]);
+            if (keys_312[2] > threshold) {
+                unsigned long long dst_30 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_30] = __uint_as_float(keys_312[2]);
+                out_idx[dst_30] = idxs_313[2];
+                g_166 = g_166 + 1;
+            } else if (ties_314[2] && rank_357 < take_c_164) {
+                unsigned long long dst2_30 = eq_run + (unsigned long long)rank_357;
+                out_vals[dst2_30] = __uint_as_float(keys_312[2]);
+                out_idx[dst2_30] = idxs_313[2];
+            }
+            if (ties_314[2]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_358 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_359 = ((aligned) ? vec_rank_358 : strided_315[3]);
+            if (keys_312[3] > threshold) {
+                unsigned long long dst_31 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_31] = __uint_as_float(keys_312[3]);
+                out_idx[dst_31] = idxs_313[3];
+                g_166 = g_166 + 1;
+            } else if (ties_314[3] && rank_359 < take_c_164) {
+                unsigned long long dst2_31 = eq_run + (unsigned long long)rank_359;
+                out_vals[dst2_31] = __uint_as_float(keys_312[3]);
+                out_idx[dst2_31] = idxs_313[3];
+            }
+            if (ties_314[3]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned long long gt_next_360 = gt_run + (unsigned long long)gt_total_162;
+            unsigned long long eq_next_361 = eq_run + (unsigned long long)take_c_164;
+            unsigned int rem_next_362 = take_rem - take_c_164;
+            __syncthreads();
+            gt_run = gt_next_360;
+            eq_run = eq_next_361;
+            take_rem = rem_next_362;
+        }
+    }
+    unsigned long long gt_base_w = gt_run + (unsigned long long)before_125;
+    unsigned long long eq_base_w = eq_run + (unsigned long long)before_143;
+    unsigned int eq_take_w = ((before_143 < take_rem) ? take_rem - before_143 : 0);
+    unsigned int lt_mask_2 = (1 << (unsigned int)lane) - 1;
+    unsigned int g_1 = 0;
+    unsigned int t = 0;
+    int niter_161 = (int)(n_eff + 31 >> 5);
+    for (int j_4 = 0; j_4 < niter_161; j_4++) {
+        unsigned int e_4 = (unsigned int)(j_4 * 32 + lane);
+        bool valid_1 = e_4 < n_eff;
+        unsigned int key_42 = ((valid_1) ? lkeys[seg_base + j_4 * 32 + lane] : 0);
+        int idx = ((valid_1) ? lidx[seg_base + j_4 * 32 + lane] : 0);
+        bool is_gt = valid_1 && key_42 > threshold;
+        bool is_tie = valid_1 && key_42 == threshold;
+        unsigned int _vote_99 = __ballot_sync(0xFFFFFFFF, is_gt);
+        unsigned int mg_1 = _vote_99;
+        unsigned int _vote_100 = __ballot_sync(0xFFFFFFFF, is_tie);
+        unsigned int mt_1 = _vote_100;
+        if (valid_1 && key_42 > threshold) {
+            int _popc_130 = __popc(mg_1 & lt_mask_2);
+            unsigned long long dst_32 = gt_base_w + (unsigned long long)(g_1 + (unsigned int)_popc_130);
+            out_vals[dst_32] = __uint_as_float(key_42);
+            out_idx[dst_32] = idx;
+        }
+        if (valid_1 && key_42 == threshold) {
+            int _popc_131 = __popc(mt_1 & lt_mask_2);
+            unsigned int rank_0 = t + (unsigned int)_popc_131;
+            if (rank_0 < eq_take_w) {
+                unsigned long long dst2_32 = eq_base_w + (unsigned long long)rank_0;
+                out_vals[dst2_32] = __uint_as_float(key_42);
+                out_idx[dst2_32] = idx;
+            }
+        }
+        int _popc_132 = __popc(mg_1);
+        g_1 = g_1 + (unsigned int)_popc_132;
+        int _popc_133 = __popc(mt_1);
+        t = t + (unsigned int)_popc_133;
+    }
+    if (rank == 0 && tid == 0) {
+        out_count[row] = k;
+    }
+}
+
+} // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_CNT_OFF
+#undef SMEM_CNT_STAGE_BYTES
+#undef SMEM_CNT_STRIDE
+#undef SMEM_HIST0_OFF
+#undef SMEM_HIST0_STAGE_BYTES
+#undef SMEM_HIST0_STRIDE
+#undef SMEM_HIST1_OFF
+#undef SMEM_HIST1_STAGE_BYTES
+#undef SMEM_HIST1_STRIDE
+#undef SMEM_LIDX_OFF
+#undef SMEM_LIDX_STAGE_BYTES
+#undef SMEM_LIDX_STRIDE
+#undef SMEM_LKEYS_OFF
+#undef SMEM_LKEYS_STAGE_BYTES
+#undef SMEM_LKEYS_STRIDE
+#undef SMEM_SCAL_OFF
+#undef SMEM_SCAL_STAGE_BYTES
+#undef SMEM_SCAL_STRIDE
+#undef SMEM_TOTAL
+#undef SMEM_WARP_SUMS_OFF
+#undef SMEM_WARP_SUMS_STAGE_BYTES
+#undef SMEM_WARP_SUMS_STRIDE
+#undef THREADS
+#undef cnt_addr
+#undef hist0_addr
+#undef hist1_addr
+#undef lidx_addr
+#undef lkeys_addr
+#undef scal_addr
+#undef warp_sums_addr
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_HIST0_OFF 0
+#define SMEM_HIST0_STAGE_BYTES 8192
+#define SMEM_HIST0_STRIDE 8192
+#define SMEM_HIST1_OFF 8192
+#define SMEM_HIST1_STAGE_BYTES 8192
+#define SMEM_HIST1_STRIDE 8192
+#define SMEM_WARP_SUMS_OFF 16384
+#define SMEM_WARP_SUMS_STAGE_BYTES 64
+#define SMEM_WARP_SUMS_STRIDE 64
+#define SMEM_SCAL_OFF 16448
+#define SMEM_SCAL_STAGE_BYTES 256
+#define SMEM_SCAL_STRIDE 256
+#define SMEM_CNT_OFF 16704
+#define SMEM_CNT_STAGE_BYTES 1024
+#define SMEM_CNT_STRIDE 1024
+#define SMEM_LKEYS_OFF 17728
+#define SMEM_LKEYS_STAGE_BYTES 65536
+#define SMEM_LKEYS_STRIDE 65536
+#define SMEM_LIDX_OFF 83264
+#define SMEM_LIDX_STAGE_BYTES 65536
+#define SMEM_LIDX_STRIDE 65536
+#define SMEM_TOTAL 148864
+#define THREADS 512
+
+extern "C" {
+
+__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
+kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 2;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    // Kernel setup ops
+    unsigned int* hist0 = reinterpret_cast<unsigned int*>(smem_raw + 0);
+    const int hist0_addr = smem + 0;
+    unsigned int* hist1 = reinterpret_cast<unsigned int*>(smem_raw + 8192);
+    const int hist1_addr = smem + 8192;
+    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 16384);
+    const int warp_sums_addr = smem + 16384;
+    unsigned int* scal = reinterpret_cast<unsigned int*>(smem_raw + 16448);
+    const int scal_addr = smem + 16448;
+    unsigned int* cnt = reinterpret_cast<unsigned int*>(smem_raw + 16704);
+    const int cnt_addr = smem + 16704;
+    unsigned int* lkeys = reinterpret_cast<unsigned int*>(smem_raw + 17728);
+    const int lkeys_addr = smem + 17728;
+    int* lidx = reinterpret_cast<int*>(smem_raw + 83264);
+    const int lidx_addr = smem + 83264;
+
+    // === Task calls (dependency order) ===
+    int row = 0;
+    int rank = 0;
+    {
+        row = cluster_id;
+        rank = cta_rank;
+    }
+    int k_req = ((topk_kind == 2) ? topk_arr[row] : topk_scalar);
+    int _min_0 = ((k_req) < (vocab) ? (k_req) : (vocab));
+    int _min_1 = ((_min_0) < (1024) ? (_min_0) : (1024));
+    int _max_0 = ((_min_1) > (1) ? (_min_1) : (1));
+    int k = _max_0;
+    unsigned int k_u = (unsigned int)k;
+    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab;
+    unsigned long long out_base = (unsigned long long)row * 1024;
+    int nchunks = (vocab + 16383) / 16384;
+    int start = rank * (nchunks * 8192);
+    int span_end = start + nchunks * 8192;
+    unsigned int pad = ((span_end > vocab) ? (unsigned int)(span_end - vocab) : 0);
+    bool aligned = (vocab & 3) == 0;
+    int wstart = start + warp * (nchunks * 512);
+    int seg_base = warp * 1024;
+    float vals_a[16];
+    float vals_b[16];
+    for (int i = tid; i < 2048; i += 512) {
+        hist1[i] = 0;
+    }
+    for (int i_1 = tid; i_1 < 2048; i_1 += 512) {
+        hist0[i_1] = 0;
+    }
+    if (tid < 64) {
+        scal[tid] = 0;
+    }
+    __syncthreads();
+    for (int c = 0; c < nchunks; c++) {
+        int i_2 = start + c * 8192 + tid * 4;
+        if (i_2 < vocab) {
+            float v = probs[row_base + (unsigned long long)i_2];
+            unsigned int bits = __as_u32(v);
+            unsigned int key = ((bits <= 2139095040) ? bits : 0);
+            unsigned int bucket = key >> 21;
+            atomicAdd(&hist0[bucket], 1);
+        }
+        int i_0 = start + c * 8192 + (512 + tid) * 4;
+        if (i_0 < vocab) {
+            float v_1 = probs[row_base + (unsigned long long)i_0];
+            unsigned int bits_1 = __as_u32(v_1);
+            unsigned int key_1 = ((bits_1 <= 2139095040) ? bits_1 : 0);
+            unsigned int bucket_1 = key_1 >> 21;
+            atomicAdd(&hist0[bucket_1], 1);
+        }
+        int i_1_1 = start + c * 8192 + (1024 + tid) * 4;
+        if (i_1_1 < vocab) {
+            float v_2 = probs[row_base + (unsigned long long)i_1_1];
+            unsigned int bits_2 = __as_u32(v_2);
+            unsigned int key_2 = ((bits_2 <= 2139095040) ? bits_2 : 0);
+            unsigned int bucket_2 = key_2 >> 21;
+            atomicAdd(&hist0[bucket_2], 1);
+        }
+        int i_2_1 = start + c * 8192 + (1536 + tid) * 4;
+        if (i_2_1 < vocab) {
+            float v_3 = probs[row_base + (unsigned long long)i_2_1];
+            unsigned int bits_3 = __as_u32(v_3);
+            unsigned int key_3 = ((bits_3 <= 2139095040) ? bits_3 : 0);
+            unsigned int bucket_3 = key_3 >> 21;
+            atomicAdd(&hist0[bucket_3], 1);
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0 = 0;
+    unsigned int c1 = 0;
+    unsigned int c2 = 0;
+    unsigned int c3 = 0;
+    {
+        unsigned int words[4];
+        uint32_t _mapa_0;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_0) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 3]))
+            : "r"(_mapa_0));
+        c0 = c0 + words[0];
+        c1 = c1 + words[1];
+        c2 = c2 + words[2];
+        c3 = c3 + words[3];
+        unsigned int words_0[4];
+        uint32_t _mapa_1;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_1) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 3]))
+            : "r"(_mapa_1));
+        c0 = c0 + words_0[0];
+        c1 = c1 + words_0[1];
+        c2 = c2 + words_0[2];
+        c3 = c3 + words_0[3];
+    }
+    unsigned int need = 2 * k_u + 64;
+    unsigned int local = c0 + c1 + c2 + c3;
+    uint32_t _warp_scan_sum_u32_0 = local;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(16));
+    unsigned int lane_suffix = _warp_scan_sum_u32_0 - local;
+    unsigned int _warp_redux_u32_0;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local));
+    unsigned int warp_total = _warp_redux_u32_0;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total;
+    }
+    __syncthreads();
+    unsigned int peer = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above = ((lane > warp) ? peer : 0);
+    unsigned int _warp_redux_u32_1;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(above));
+    unsigned int warps_above = _warp_redux_u32_1;
+    unsigned int suffix = lane_suffix + warps_above;
+    unsigned int a3 = suffix + c3;
+    unsigned int a2 = a3 + c2;
+    unsigned int a1 = a2 + c1;
+    unsigned int a0 = a1 + c0;
+    unsigned int five = 5;
+    if (need > five * suffix) {
+        if (need <= five * a3) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+        } else if (need <= five * a2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+        } else {
+            if (need <= five * a1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+            } else if (need <= five * a0) {
+                scal[0] = (unsigned int)(tid * 4);
+            }
+        }
+    }
+    if (a0 > 2048) {
+        if (suffix <= 2048) {
+            if (a3 <= 2048) {
+                if (a2 <= 2048) {
+                    if (a1 <= 2048) {
+                        scal[1] = (unsigned int)(tid * 4 + 1);
+                    } else {
+                        scal[1] = (unsigned int)(tid * 4 + 2);
+                    }
+                } else {
+                    scal[1] = (unsigned int)(tid * 4 + 3);
+                }
+            } else {
+                scal[1] = (unsigned int)(tid * 4 + 4);
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int b_need = scal[0];
+    unsigned int b_cap = scal[1];
+    if (tid == 0) {
+        unsigned int _max_1 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
+        scal[0] = _max_1;
+        scal[1] = 0;
+    }
+    __syncthreads();
+    unsigned int b_lo = scal[0];
+    unsigned int n_w = 0;
+    if ((vocab & 3) == 0) {
+        int i_3 = wstart + lane * 4;
+        if (i_3 < vocab) {
+            float _vec_load_0[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3);
+                _vec_load_0[0 + 0] = _v4.x;
+                _vec_load_0[0 + 1] = _v4.y;
+                _vec_load_0[0 + 2] = _v4.z;
+                _vec_load_0[0 + 3] = _v4.w;
+            }
+            vals_a[0] = _vec_load_0[0];
+            vals_a[1] = _vec_load_0[1];
+            vals_a[2] = _vec_load_0[2];
+            vals_a[3] = _vec_load_0[3];
+        } else {
+            vals_a[0] = 0.0f;
+            vals_a[1] = 0.0f;
+            vals_a[2] = 0.0f;
+            vals_a[3] = 0.0f;
+        }
+        int i_0_1 = wstart + 128 + lane * 4;
+        if (i_0_1 < vocab) {
+            float _vec_load_1[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_1);
+                _vec_load_1[0 + 0] = _v4.x;
+                _vec_load_1[0 + 1] = _v4.y;
+                _vec_load_1[0 + 2] = _v4.z;
+                _vec_load_1[0 + 3] = _v4.w;
+            }
+            vals_a[4] = _vec_load_1[0];
+            vals_a[5] = _vec_load_1[1];
+            vals_a[6] = _vec_load_1[2];
+            vals_a[7] = _vec_load_1[3];
+        } else {
+            vals_a[4] = 0.0f;
+            vals_a[5] = 0.0f;
+            vals_a[6] = 0.0f;
+            vals_a[7] = 0.0f;
+        }
+        int i_1_2 = wstart + 256 + lane * 4;
+        if (i_1_2 < vocab) {
+            float _vec_load_2[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_2);
+                _vec_load_2[0 + 0] = _v4.x;
+                _vec_load_2[0 + 1] = _v4.y;
+                _vec_load_2[0 + 2] = _v4.z;
+                _vec_load_2[0 + 3] = _v4.w;
+            }
+            vals_a[8] = _vec_load_2[0];
+            vals_a[9] = _vec_load_2[1];
+            vals_a[10] = _vec_load_2[2];
+            vals_a[11] = _vec_load_2[3];
+        } else {
+            vals_a[8] = 0.0f;
+            vals_a[9] = 0.0f;
+            vals_a[10] = 0.0f;
+            vals_a[11] = 0.0f;
+        }
+        int i_2_2 = wstart + 384 + lane * 4;
+        if (i_2_2 < vocab) {
+            float _vec_load_3[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_2);
+                _vec_load_3[0 + 0] = _v4.x;
+                _vec_load_3[0 + 1] = _v4.y;
+                _vec_load_3[0 + 2] = _v4.z;
+                _vec_load_3[0 + 3] = _v4.w;
+            }
+            vals_a[12] = _vec_load_3[0];
+            vals_a[13] = _vec_load_3[1];
+            vals_a[14] = _vec_load_3[2];
+            vals_a[15] = _vec_load_3[3];
+        } else {
+            vals_a[12] = 0.0f;
+            vals_a[13] = 0.0f;
+            vals_a[14] = 0.0f;
+            vals_a[15] = 0.0f;
+        }
+    } else {
+        int i2 = wstart + lane;
+        if (i2 < vocab) {
+            vals_a[0] = probs[row_base + (unsigned long long)i2];
+        } else {
+            vals_a[0] = 0.0f;
+        }
+        int i2_0 = wstart + 32 + lane;
+        if (i2_0 < vocab) {
+            vals_a[1] = probs[row_base + (unsigned long long)i2_0];
+        } else {
+            vals_a[1] = 0.0f;
+        }
+        int i2_1 = wstart + 64 + lane;
+        if (i2_1 < vocab) {
+            vals_a[2] = probs[row_base + (unsigned long long)i2_1];
+        } else {
+            vals_a[2] = 0.0f;
+        }
+        int i2_2 = wstart + 96 + lane;
+        if (i2_2 < vocab) {
+            vals_a[3] = probs[row_base + (unsigned long long)i2_2];
+        } else {
+            vals_a[3] = 0.0f;
+        }
+        int i2_3 = wstart + 128 + lane;
+        if (i2_3 < vocab) {
+            vals_a[4] = probs[row_base + (unsigned long long)i2_3];
+        } else {
+            vals_a[4] = 0.0f;
+        }
+        int i2_4 = wstart + 160 + lane;
+        if (i2_4 < vocab) {
+            vals_a[5] = probs[row_base + (unsigned long long)i2_4];
+        } else {
+            vals_a[5] = 0.0f;
+        }
+        int i2_5 = wstart + 192 + lane;
+        if (i2_5 < vocab) {
+            vals_a[6] = probs[row_base + (unsigned long long)i2_5];
+        } else {
+            vals_a[6] = 0.0f;
+        }
+        int i2_6 = wstart + 224 + lane;
+        if (i2_6 < vocab) {
+            vals_a[7] = probs[row_base + (unsigned long long)i2_6];
+        } else {
+            vals_a[7] = 0.0f;
+        }
+        int i2_7 = wstart + 256 + lane;
+        if (i2_7 < vocab) {
+            vals_a[8] = probs[row_base + (unsigned long long)i2_7];
+        } else {
+            vals_a[8] = 0.0f;
+        }
+        int i2_8 = wstart + 288 + lane;
+        if (i2_8 < vocab) {
+            vals_a[9] = probs[row_base + (unsigned long long)i2_8];
+        } else {
+            vals_a[9] = 0.0f;
+        }
+        int i2_9 = wstart + 320 + lane;
+        if (i2_9 < vocab) {
+            vals_a[10] = probs[row_base + (unsigned long long)i2_9];
+        } else {
+            vals_a[10] = 0.0f;
+        }
+        int i2_10 = wstart + 352 + lane;
+        if (i2_10 < vocab) {
+            vals_a[11] = probs[row_base + (unsigned long long)i2_10];
+        } else {
+            vals_a[11] = 0.0f;
+        }
+        int i2_11 = wstart + 384 + lane;
+        if (i2_11 < vocab) {
+            vals_a[12] = probs[row_base + (unsigned long long)i2_11];
+        } else {
+            vals_a[12] = 0.0f;
+        }
+        int i2_12 = wstart + 416 + lane;
+        if (i2_12 < vocab) {
+            vals_a[13] = probs[row_base + (unsigned long long)i2_12];
+        } else {
+            vals_a[13] = 0.0f;
+        }
+        int i2_13 = wstart + 448 + lane;
+        if (i2_13 < vocab) {
+            vals_a[14] = probs[row_base + (unsigned long long)i2_13];
+        } else {
+            vals_a[14] = 0.0f;
+        }
+        int i2_14 = wstart + 480 + lane;
+        if (i2_14 < vocab) {
+            vals_a[15] = probs[row_base + (unsigned long long)i2_14];
+        } else {
+            vals_a[15] = 0.0f;
+        }
+    }
+    for (int c_1 = 0; c_1 < nchunks; c_1 += 2) {
+        if (nchunks > c_1 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_4 = wstart + (c_1 + 1) * 512 + lane * 4;
+                if (i_4 < vocab) {
+                    float _vec_load_4[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4);
+                        _vec_load_4[0 + 0] = _v4.x;
+                        _vec_load_4[0 + 1] = _v4.y;
+                        _vec_load_4[0 + 2] = _v4.z;
+                        _vec_load_4[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_4[0];
+                    vals_b[1] = _vec_load_4[1];
+                    vals_b[2] = _vec_load_4[2];
+                    vals_b[3] = _vec_load_4[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_2 = wstart + (c_1 + 1) * 512 + 128 + lane * 4;
+                if (i_0_2 < vocab) {
+                    float _vec_load_5[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_2);
+                        _vec_load_5[0 + 0] = _v4.x;
+                        _vec_load_5[0 + 1] = _v4.y;
+                        _vec_load_5[0 + 2] = _v4.z;
+                        _vec_load_5[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_5[0];
+                    vals_b[5] = _vec_load_5[1];
+                    vals_b[6] = _vec_load_5[2];
+                    vals_b[7] = _vec_load_5[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_3 = wstart + (c_1 + 1) * 512 + 256 + lane * 4;
+                if (i_1_3 < vocab) {
+                    float _vec_load_6[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_3);
+                        _vec_load_6[0 + 0] = _v4.x;
+                        _vec_load_6[0 + 1] = _v4.y;
+                        _vec_load_6[0 + 2] = _v4.z;
+                        _vec_load_6[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_6[0];
+                    vals_b[9] = _vec_load_6[1];
+                    vals_b[10] = _vec_load_6[2];
+                    vals_b[11] = _vec_load_6[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_3 = wstart + (c_1 + 1) * 512 + 384 + lane * 4;
+                if (i_2_3 < vocab) {
+                    float _vec_load_7[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_3);
+                        _vec_load_7[0 + 0] = _v4.x;
+                        _vec_load_7[0 + 1] = _v4.y;
+                        _vec_load_7[0 + 2] = _v4.z;
+                        _vec_load_7[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_7[0];
+                    vals_b[13] = _vec_load_7[1];
+                    vals_b[14] = _vec_load_7[2];
+                    vals_b[15] = _vec_load_7[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_15 = wstart + (c_1 + 1) * 512 + lane;
+                if (i2_15 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_15];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_1 = wstart + (c_1 + 1) * 512 + 32 + lane;
+                if (i2_0_1 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_1];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_1 = wstart + (c_1 + 1) * 512 + 64 + lane;
+                if (i2_1_1 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_1];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_1 = wstart + (c_1 + 1) * 512 + 96 + lane;
+                if (i2_2_1 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_1];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_1 = wstart + (c_1 + 1) * 512 + 128 + lane;
+                if (i2_3_1 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_1];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_1 = wstart + (c_1 + 1) * 512 + 160 + lane;
+                if (i2_4_1 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_1];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_1 = wstart + (c_1 + 1) * 512 + 192 + lane;
+                if (i2_5_1 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_1];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_1 = wstart + (c_1 + 1) * 512 + 224 + lane;
+                if (i2_6_1 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_1];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_1 = wstart + (c_1 + 1) * 512 + 256 + lane;
+                if (i2_7_1 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_1];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_1 = wstart + (c_1 + 1) * 512 + 288 + lane;
+                if (i2_8_1 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_1];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_1 = wstart + (c_1 + 1) * 512 + 320 + lane;
+                if (i2_9_1 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_1];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_1 = wstart + (c_1 + 1) * 512 + 352 + lane;
+                if (i2_10_1 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_1];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_1 = wstart + (c_1 + 1) * 512 + 384 + lane;
+                if (i2_11_1 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_1];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_1 = wstart + (c_1 + 1) * 512 + 416 + lane;
+                if (i2_12_1 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_1];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_1 = wstart + (c_1 + 1) * 512 + 448 + lane;
+                if (i2_13_1 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_1];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_1 = wstart + (c_1 + 1) * 512 + 480 + lane;
+                if (i2_14_1 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_1];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int lt_mask = (1 << (unsigned int)lane) - 1;
+        bool aligned_0 = (vocab & 3) == 0;
+        unsigned int n = n_w;
+        unsigned int keys[4];
+        int idxs[4];
+        bool cands[4];
+        unsigned int before = 0;
+        unsigned int total = 0;
+        unsigned int bits_4 = __as_u32(vals_a[0]);
+        unsigned int key_4 = ((bits_4 <= 2139095040) ? bits_4 : 0);
+        keys[0] = key_4;
+        int i_vec = wstart + c_1 * 512 + lane * 4;
+        int i_str = wstart + c_1 * 512 + lane;
+        idxs[0] = ((aligned_0) ? i_vec : i_str);
+        cands[0] = b_lo <= keys[0] >> 21 && idxs[0] < vocab;
+        unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, cands[0]);
+        unsigned int m = _vote_0;
+        int _popc_0 = __popc(m & lt_mask);
+        before = before + (unsigned int)_popc_0;
+        int _popc_1 = __popc(m);
+        total = total + (unsigned int)_popc_1;
+        unsigned int bits_1_1 = __as_u32(vals_a[1]);
+        unsigned int key_2_1 = ((bits_1_1 <= 2139095040) ? bits_1_1 : 0);
+        keys[1] = key_2_1;
+        int i_vec_3 = wstart + c_1 * 512 + lane * 4 + 1;
+        int i_str_4 = wstart + c_1 * 512 + 32 + lane;
+        idxs[1] = ((aligned_0) ? i_vec_3 : i_str_4);
+        cands[1] = b_lo <= keys[1] >> 21 && idxs[1] < vocab;
+        unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, cands[1]);
+        unsigned int m_5 = _vote_1;
+        int _popc_2 = __popc(m_5 & lt_mask);
+        before = before + (unsigned int)_popc_2;
+        int _popc_3 = __popc(m_5);
+        total = total + (unsigned int)_popc_3;
+        unsigned int bits_6 = __as_u32(vals_a[2]);
+        unsigned int key_7 = ((bits_6 <= 2139095040) ? bits_6 : 0);
+        keys[2] = key_7;
+        int i_vec_8 = wstart + c_1 * 512 + lane * 4 + 2;
+        int i_str_9 = wstart + c_1 * 512 + 64 + lane;
+        idxs[2] = ((aligned_0) ? i_vec_8 : i_str_9);
+        cands[2] = b_lo <= keys[2] >> 21 && idxs[2] < vocab;
+        unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, cands[2]);
+        unsigned int m_10 = _vote_2;
+        int _popc_4 = __popc(m_10 & lt_mask);
+        before = before + (unsigned int)_popc_4;
+        int _popc_5 = __popc(m_10);
+        total = total + (unsigned int)_popc_5;
+        unsigned int bits_11 = __as_u32(vals_a[3]);
+        unsigned int key_12 = ((bits_11 <= 2139095040) ? bits_11 : 0);
+        keys[3] = key_12;
+        int i_vec_13 = wstart + c_1 * 512 + lane * 4 + 3;
+        int i_str_14 = wstart + c_1 * 512 + 96 + lane;
+        idxs[3] = ((aligned_0) ? i_vec_13 : i_str_14);
+        cands[3] = b_lo <= keys[3] >> 21 && idxs[3] < vocab;
+        unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, cands[3]);
+        unsigned int m_15 = _vote_3;
+        int _popc_6 = __popc(m_15 & lt_mask);
+        before = before + (unsigned int)_popc_6;
+        int _popc_7 = __popc(m_15);
+        total = total + (unsigned int)_popc_7;
+        unsigned int own = 0;
+        unsigned int pos = n + before + own;
+        if (cands[0] && pos < 1024) {
+            int slot = seg_base + (int)pos;
+            lkeys[slot] = keys[0];
+            lidx[slot] = idxs[0];
+        }
+        if (cands[0]) {
+            own = own + 1;
+        }
+        unsigned int pos_16 = n + before + own;
+        if (cands[1] && pos_16 < 1024) {
+            int slot_1 = seg_base + (int)pos_16;
+            lkeys[slot_1] = keys[1];
+            lidx[slot_1] = idxs[1];
+        }
+        if (cands[1]) {
+            own = own + 1;
+        }
+        unsigned int pos_17 = n + before + own;
+        if (cands[2] && pos_17 < 1024) {
+            int slot_2 = seg_base + (int)pos_17;
+            lkeys[slot_2] = keys[2];
+            lidx[slot_2] = idxs[2];
+        }
+        if (cands[2]) {
+            own = own + 1;
+        }
+        unsigned int pos_18 = n + before + own;
+        if (cands[3] && pos_18 < 1024) {
+            int slot_3 = seg_base + (int)pos_18;
+            lkeys[slot_3] = keys[3];
+            lidx[slot_3] = idxs[3];
+        }
+        if (cands[3]) {
+            own = own + 1;
+        }
+        n = n + total;
+        unsigned int keys_19[4];
+        int idxs_20[4];
+        bool cands_21[4];
+        unsigned int before_22 = 0;
+        unsigned int total_23 = 0;
+        unsigned int bits_24 = __as_u32(vals_a[4]);
+        unsigned int key_25 = ((bits_24 <= 2139095040) ? bits_24 : 0);
+        keys_19[0] = key_25;
+        int i_vec_26 = wstart + c_1 * 512 + 128 + lane * 4;
+        int i_str_27 = wstart + c_1 * 512 + 128 + lane;
+        idxs_20[0] = ((aligned_0) ? i_vec_26 : i_str_27);
+        cands_21[0] = b_lo <= keys_19[0] >> 21 && idxs_20[0] < vocab;
+        unsigned int _vote_4 = __ballot_sync(0xFFFFFFFF, cands_21[0]);
+        unsigned int m_28 = _vote_4;
+        int _popc_8 = __popc(m_28 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_8;
+        int _popc_9 = __popc(m_28);
+        total_23 = total_23 + (unsigned int)_popc_9;
+        unsigned int bits_29 = __as_u32(vals_a[5]);
+        unsigned int key_30 = ((bits_29 <= 2139095040) ? bits_29 : 0);
+        keys_19[1] = key_30;
+        int i_vec_31 = wstart + c_1 * 512 + 128 + lane * 4 + 1;
+        int i_str_32 = wstart + c_1 * 512 + 160 + lane;
+        idxs_20[1] = ((aligned_0) ? i_vec_31 : i_str_32);
+        cands_21[1] = b_lo <= keys_19[1] >> 21 && idxs_20[1] < vocab;
+        unsigned int _vote_5 = __ballot_sync(0xFFFFFFFF, cands_21[1]);
+        unsigned int m_33 = _vote_5;
+        int _popc_10 = __popc(m_33 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_10;
+        int _popc_11 = __popc(m_33);
+        total_23 = total_23 + (unsigned int)_popc_11;
+        unsigned int bits_34 = __as_u32(vals_a[6]);
+        unsigned int key_35 = ((bits_34 <= 2139095040) ? bits_34 : 0);
+        keys_19[2] = key_35;
+        int i_vec_36 = wstart + c_1 * 512 + 128 + lane * 4 + 2;
+        int i_str_37 = wstart + c_1 * 512 + 192 + lane;
+        idxs_20[2] = ((aligned_0) ? i_vec_36 : i_str_37);
+        cands_21[2] = b_lo <= keys_19[2] >> 21 && idxs_20[2] < vocab;
+        unsigned int _vote_6 = __ballot_sync(0xFFFFFFFF, cands_21[2]);
+        unsigned int m_38 = _vote_6;
+        int _popc_12 = __popc(m_38 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_12;
+        int _popc_13 = __popc(m_38);
+        total_23 = total_23 + (unsigned int)_popc_13;
+        unsigned int bits_39 = __as_u32(vals_a[7]);
+        unsigned int key_40 = ((bits_39 <= 2139095040) ? bits_39 : 0);
+        keys_19[3] = key_40;
+        int i_vec_41 = wstart + c_1 * 512 + 128 + lane * 4 + 3;
+        int i_str_42 = wstart + c_1 * 512 + 224 + lane;
+        idxs_20[3] = ((aligned_0) ? i_vec_41 : i_str_42);
+        cands_21[3] = b_lo <= keys_19[3] >> 21 && idxs_20[3] < vocab;
+        unsigned int _vote_7 = __ballot_sync(0xFFFFFFFF, cands_21[3]);
+        unsigned int m_43 = _vote_7;
+        int _popc_14 = __popc(m_43 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_14;
+        int _popc_15 = __popc(m_43);
+        total_23 = total_23 + (unsigned int)_popc_15;
+        unsigned int own_44 = 0;
+        unsigned int pos_45 = n + before_22 + own_44;
+        if (cands_21[0] && pos_45 < 1024) {
+            int slot_4 = seg_base + (int)pos_45;
+            lkeys[slot_4] = keys_19[0];
+            lidx[slot_4] = idxs_20[0];
+        }
+        if (cands_21[0]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_46 = n + before_22 + own_44;
+        if (cands_21[1] && pos_46 < 1024) {
+            int slot_5 = seg_base + (int)pos_46;
+            lkeys[slot_5] = keys_19[1];
+            lidx[slot_5] = idxs_20[1];
+        }
+        if (cands_21[1]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_47 = n + before_22 + own_44;
+        if (cands_21[2] && pos_47 < 1024) {
+            int slot_6 = seg_base + (int)pos_47;
+            lkeys[slot_6] = keys_19[2];
+            lidx[slot_6] = idxs_20[2];
+        }
+        if (cands_21[2]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_48 = n + before_22 + own_44;
+        if (cands_21[3] && pos_48 < 1024) {
+            int slot_7 = seg_base + (int)pos_48;
+            lkeys[slot_7] = keys_19[3];
+            lidx[slot_7] = idxs_20[3];
+        }
+        if (cands_21[3]) {
+            own_44 = own_44 + 1;
+        }
+        n = n + total_23;
+        unsigned int keys_49[4];
+        int idxs_50[4];
+        bool cands_51[4];
+        unsigned int before_52 = 0;
+        unsigned int total_53 = 0;
+        unsigned int bits_54 = __as_u32(vals_a[8]);
+        unsigned int key_55 = ((bits_54 <= 2139095040) ? bits_54 : 0);
+        keys_49[0] = key_55;
+        int i_vec_56 = wstart + c_1 * 512 + 256 + lane * 4;
+        int i_str_57 = wstart + c_1 * 512 + 256 + lane;
+        idxs_50[0] = ((aligned_0) ? i_vec_56 : i_str_57);
+        cands_51[0] = b_lo <= keys_49[0] >> 21 && idxs_50[0] < vocab;
+        unsigned int _vote_8 = __ballot_sync(0xFFFFFFFF, cands_51[0]);
+        unsigned int m_58 = _vote_8;
+        int _popc_16 = __popc(m_58 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_16;
+        int _popc_17 = __popc(m_58);
+        total_53 = total_53 + (unsigned int)_popc_17;
+        unsigned int bits_59 = __as_u32(vals_a[9]);
+        unsigned int key_60 = ((bits_59 <= 2139095040) ? bits_59 : 0);
+        keys_49[1] = key_60;
+        int i_vec_61 = wstart + c_1 * 512 + 256 + lane * 4 + 1;
+        int i_str_62 = wstart + c_1 * 512 + 288 + lane;
+        idxs_50[1] = ((aligned_0) ? i_vec_61 : i_str_62);
+        cands_51[1] = b_lo <= keys_49[1] >> 21 && idxs_50[1] < vocab;
+        unsigned int _vote_9 = __ballot_sync(0xFFFFFFFF, cands_51[1]);
+        unsigned int m_63 = _vote_9;
+        int _popc_18 = __popc(m_63 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_18;
+        int _popc_19 = __popc(m_63);
+        total_53 = total_53 + (unsigned int)_popc_19;
+        unsigned int bits_64 = __as_u32(vals_a[10]);
+        unsigned int key_65 = ((bits_64 <= 2139095040) ? bits_64 : 0);
+        keys_49[2] = key_65;
+        int i_vec_66 = wstart + c_1 * 512 + 256 + lane * 4 + 2;
+        int i_str_67 = wstart + c_1 * 512 + 320 + lane;
+        idxs_50[2] = ((aligned_0) ? i_vec_66 : i_str_67);
+        cands_51[2] = b_lo <= keys_49[2] >> 21 && idxs_50[2] < vocab;
+        unsigned int _vote_10 = __ballot_sync(0xFFFFFFFF, cands_51[2]);
+        unsigned int m_68 = _vote_10;
+        int _popc_20 = __popc(m_68 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_20;
+        int _popc_21 = __popc(m_68);
+        total_53 = total_53 + (unsigned int)_popc_21;
+        unsigned int bits_69 = __as_u32(vals_a[11]);
+        unsigned int key_70 = ((bits_69 <= 2139095040) ? bits_69 : 0);
+        keys_49[3] = key_70;
+        int i_vec_71 = wstart + c_1 * 512 + 256 + lane * 4 + 3;
+        int i_str_72 = wstart + c_1 * 512 + 352 + lane;
+        idxs_50[3] = ((aligned_0) ? i_vec_71 : i_str_72);
+        cands_51[3] = b_lo <= keys_49[3] >> 21 && idxs_50[3] < vocab;
+        unsigned int _vote_11 = __ballot_sync(0xFFFFFFFF, cands_51[3]);
+        unsigned int m_73 = _vote_11;
+        int _popc_22 = __popc(m_73 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_22;
+        int _popc_23 = __popc(m_73);
+        total_53 = total_53 + (unsigned int)_popc_23;
+        unsigned int own_74 = 0;
+        unsigned int pos_75 = n + before_52 + own_74;
+        if (cands_51[0] && pos_75 < 1024) {
+            int slot_8 = seg_base + (int)pos_75;
+            lkeys[slot_8] = keys_49[0];
+            lidx[slot_8] = idxs_50[0];
+        }
+        if (cands_51[0]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_76 = n + before_52 + own_74;
+        if (cands_51[1] && pos_76 < 1024) {
+            int slot_9 = seg_base + (int)pos_76;
+            lkeys[slot_9] = keys_49[1];
+            lidx[slot_9] = idxs_50[1];
+        }
+        if (cands_51[1]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_77 = n + before_52 + own_74;
+        if (cands_51[2] && pos_77 < 1024) {
+            int slot_10 = seg_base + (int)pos_77;
+            lkeys[slot_10] = keys_49[2];
+            lidx[slot_10] = idxs_50[2];
+        }
+        if (cands_51[2]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_78 = n + before_52 + own_74;
+        if (cands_51[3] && pos_78 < 1024) {
+            int slot_11 = seg_base + (int)pos_78;
+            lkeys[slot_11] = keys_49[3];
+            lidx[slot_11] = idxs_50[3];
+        }
+        if (cands_51[3]) {
+            own_74 = own_74 + 1;
+        }
+        n = n + total_53;
+        unsigned int keys_79[4];
+        int idxs_80[4];
+        bool cands_81[4];
+        unsigned int before_82 = 0;
+        unsigned int total_83 = 0;
+        unsigned int bits_84 = __as_u32(vals_a[12]);
+        unsigned int key_85 = ((bits_84 <= 2139095040) ? bits_84 : 0);
+        keys_79[0] = key_85;
+        int i_vec_86 = wstart + c_1 * 512 + 384 + lane * 4;
+        int i_str_87 = wstart + c_1 * 512 + 384 + lane;
+        idxs_80[0] = ((aligned_0) ? i_vec_86 : i_str_87);
+        cands_81[0] = b_lo <= keys_79[0] >> 21 && idxs_80[0] < vocab;
+        unsigned int _vote_12 = __ballot_sync(0xFFFFFFFF, cands_81[0]);
+        unsigned int m_88 = _vote_12;
+        int _popc_24 = __popc(m_88 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_24;
+        int _popc_25 = __popc(m_88);
+        total_83 = total_83 + (unsigned int)_popc_25;
+        unsigned int bits_89 = __as_u32(vals_a[13]);
+        unsigned int key_90 = ((bits_89 <= 2139095040) ? bits_89 : 0);
+        keys_79[1] = key_90;
+        int i_vec_91 = wstart + c_1 * 512 + 384 + lane * 4 + 1;
+        int i_str_92 = wstart + c_1 * 512 + 416 + lane;
+        idxs_80[1] = ((aligned_0) ? i_vec_91 : i_str_92);
+        cands_81[1] = b_lo <= keys_79[1] >> 21 && idxs_80[1] < vocab;
+        unsigned int _vote_13 = __ballot_sync(0xFFFFFFFF, cands_81[1]);
+        unsigned int m_93 = _vote_13;
+        int _popc_26 = __popc(m_93 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_26;
+        int _popc_27 = __popc(m_93);
+        total_83 = total_83 + (unsigned int)_popc_27;
+        unsigned int bits_94 = __as_u32(vals_a[14]);
+        unsigned int key_95 = ((bits_94 <= 2139095040) ? bits_94 : 0);
+        keys_79[2] = key_95;
+        int i_vec_96 = wstart + c_1 * 512 + 384 + lane * 4 + 2;
+        int i_str_97 = wstart + c_1 * 512 + 448 + lane;
+        idxs_80[2] = ((aligned_0) ? i_vec_96 : i_str_97);
+        cands_81[2] = b_lo <= keys_79[2] >> 21 && idxs_80[2] < vocab;
+        unsigned int _vote_14 = __ballot_sync(0xFFFFFFFF, cands_81[2]);
+        unsigned int m_98 = _vote_14;
+        int _popc_28 = __popc(m_98 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_28;
+        int _popc_29 = __popc(m_98);
+        total_83 = total_83 + (unsigned int)_popc_29;
+        unsigned int bits_99 = __as_u32(vals_a[15]);
+        unsigned int key_100 = ((bits_99 <= 2139095040) ? bits_99 : 0);
+        keys_79[3] = key_100;
+        int i_vec_101 = wstart + c_1 * 512 + 384 + lane * 4 + 3;
+        int i_str_102 = wstart + c_1 * 512 + 480 + lane;
+        idxs_80[3] = ((aligned_0) ? i_vec_101 : i_str_102);
+        cands_81[3] = b_lo <= keys_79[3] >> 21 && idxs_80[3] < vocab;
+        unsigned int _vote_15 = __ballot_sync(0xFFFFFFFF, cands_81[3]);
+        unsigned int m_103 = _vote_15;
+        int _popc_30 = __popc(m_103 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_30;
+        int _popc_31 = __popc(m_103);
+        total_83 = total_83 + (unsigned int)_popc_31;
+        unsigned int own_104 = 0;
+        unsigned int pos_105 = n + before_82 + own_104;
+        if (cands_81[0] && pos_105 < 1024) {
+            int slot_12 = seg_base + (int)pos_105;
+            lkeys[slot_12] = keys_79[0];
+            lidx[slot_12] = idxs_80[0];
+        }
+        if (cands_81[0]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_106 = n + before_82 + own_104;
+        if (cands_81[1] && pos_106 < 1024) {
+            int slot_13 = seg_base + (int)pos_106;
+            lkeys[slot_13] = keys_79[1];
+            lidx[slot_13] = idxs_80[1];
+        }
+        if (cands_81[1]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_107 = n + before_82 + own_104;
+        if (cands_81[2] && pos_107 < 1024) {
+            int slot_14 = seg_base + (int)pos_107;
+            lkeys[slot_14] = keys_79[2];
+            lidx[slot_14] = idxs_80[2];
+        }
+        if (cands_81[2]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_108 = n + before_82 + own_104;
+        if (cands_81[3] && pos_108 < 1024) {
+            int slot_15 = seg_base + (int)pos_108;
+            lkeys[slot_15] = keys_79[3];
+            lidx[slot_15] = idxs_80[3];
+        }
+        if (cands_81[3]) {
+            own_104 = own_104 + 1;
+        }
+        n = n + total_83;
+        n_w = n;
+        if (nchunks > c_1 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_5 = wstart + (c_1 + 2) * 512 + lane * 4;
+                if (i_5 < vocab) {
+                    float _vec_load_8[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_5);
+                        _vec_load_8[0 + 0] = _v4.x;
+                        _vec_load_8[0 + 1] = _v4.y;
+                        _vec_load_8[0 + 2] = _v4.z;
+                        _vec_load_8[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_8[0];
+                    vals_a[1] = _vec_load_8[1];
+                    vals_a[2] = _vec_load_8[2];
+                    vals_a[3] = _vec_load_8[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_3 = wstart + (c_1 + 2) * 512 + 128 + lane * 4;
+                if (i_0_3 < vocab) {
+                    float _vec_load_9[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_3);
+                        _vec_load_9[0 + 0] = _v4.x;
+                        _vec_load_9[0 + 1] = _v4.y;
+                        _vec_load_9[0 + 2] = _v4.z;
+                        _vec_load_9[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_9[0];
+                    vals_a[5] = _vec_load_9[1];
+                    vals_a[6] = _vec_load_9[2];
+                    vals_a[7] = _vec_load_9[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_4 = wstart + (c_1 + 2) * 512 + 256 + lane * 4;
+                if (i_1_4 < vocab) {
+                    float _vec_load_10[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_4);
+                        _vec_load_10[0 + 0] = _v4.x;
+                        _vec_load_10[0 + 1] = _v4.y;
+                        _vec_load_10[0 + 2] = _v4.z;
+                        _vec_load_10[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_10[0];
+                    vals_a[9] = _vec_load_10[1];
+                    vals_a[10] = _vec_load_10[2];
+                    vals_a[11] = _vec_load_10[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_4 = wstart + (c_1 + 2) * 512 + 384 + lane * 4;
+                if (i_2_4 < vocab) {
+                    float _vec_load_11[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_4);
+                        _vec_load_11[0 + 0] = _v4.x;
+                        _vec_load_11[0 + 1] = _v4.y;
+                        _vec_load_11[0 + 2] = _v4.z;
+                        _vec_load_11[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_11[0];
+                    vals_a[13] = _vec_load_11[1];
+                    vals_a[14] = _vec_load_11[2];
+                    vals_a[15] = _vec_load_11[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_16 = wstart + (c_1 + 2) * 512 + lane;
+                if (i2_16 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_16];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_2 = wstart + (c_1 + 2) * 512 + 32 + lane;
+                if (i2_0_2 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_2];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_2 = wstart + (c_1 + 2) * 512 + 64 + lane;
+                if (i2_1_2 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_2];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_2 = wstart + (c_1 + 2) * 512 + 96 + lane;
+                if (i2_2_2 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_2];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_2 = wstart + (c_1 + 2) * 512 + 128 + lane;
+                if (i2_3_2 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_2];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_2 = wstart + (c_1 + 2) * 512 + 160 + lane;
+                if (i2_4_2 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_2];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_2 = wstart + (c_1 + 2) * 512 + 192 + lane;
+                if (i2_5_2 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_2];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_2 = wstart + (c_1 + 2) * 512 + 224 + lane;
+                if (i2_6_2 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_2];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_2 = wstart + (c_1 + 2) * 512 + 256 + lane;
+                if (i2_7_2 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_2];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_2 = wstart + (c_1 + 2) * 512 + 288 + lane;
+                if (i2_8_2 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_2];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_2 = wstart + (c_1 + 2) * 512 + 320 + lane;
+                if (i2_9_2 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_2];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_2 = wstart + (c_1 + 2) * 512 + 352 + lane;
+                if (i2_10_2 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_2];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_2 = wstart + (c_1 + 2) * 512 + 384 + lane;
+                if (i2_11_2 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_2];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_2 = wstart + (c_1 + 2) * 512 + 416 + lane;
+                if (i2_12_2 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_2];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_2 = wstart + (c_1 + 2) * 512 + 448 + lane;
+                if (i2_13_2 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_2];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_2 = wstart + (c_1 + 2) * 512 + 480 + lane;
+                if (i2_14_2 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_2];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nchunks > c_1 + 1) {
+            unsigned int lt_mask_0 = (1 << (unsigned int)lane) - 1;
+            bool aligned_1 = (vocab & 3) == 0;
+            unsigned int n_2 = n_w;
+            unsigned int keys_3[4];
+            int idxs_4[4];
+            bool cands_5[4];
+            unsigned int before_6 = 0;
+            unsigned int total_7 = 0;
+            unsigned int bits_8 = __as_u32(vals_b[0]);
+            unsigned int key_9 = ((bits_8 <= 2139095040) ? bits_8 : 0);
+            keys_3[0] = key_9;
+            int i_vec_10 = wstart + (c_1 + 1) * 512 + lane * 4;
+            int i_str_11 = wstart + (c_1 + 1) * 512 + lane;
+            idxs_4[0] = ((aligned_1) ? i_vec_10 : i_str_11);
+            cands_5[0] = b_lo <= keys_3[0] >> 21 && idxs_4[0] < vocab;
+            unsigned int _vote_16 = __ballot_sync(0xFFFFFFFF, cands_5[0]);
+            unsigned int m_12 = _vote_16;
+            int _popc_32 = __popc(m_12 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_32;
+            int _popc_33 = __popc(m_12);
+            total_7 = total_7 + (unsigned int)_popc_33;
+            unsigned int bits_13 = __as_u32(vals_b[1]);
+            unsigned int key_14 = ((bits_13 <= 2139095040) ? bits_13 : 0);
+            keys_3[1] = key_14;
+            int i_vec_15 = wstart + (c_1 + 1) * 512 + lane * 4 + 1;
+            int i_str_16 = wstart + (c_1 + 1) * 512 + 32 + lane;
+            idxs_4[1] = ((aligned_1) ? i_vec_15 : i_str_16);
+            cands_5[1] = b_lo <= keys_3[1] >> 21 && idxs_4[1] < vocab;
+            unsigned int _vote_17 = __ballot_sync(0xFFFFFFFF, cands_5[1]);
+            unsigned int m_17 = _vote_17;
+            int _popc_34 = __popc(m_17 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_34;
+            int _popc_35 = __popc(m_17);
+            total_7 = total_7 + (unsigned int)_popc_35;
+            unsigned int bits_18 = __as_u32(vals_b[2]);
+            unsigned int key_19 = ((bits_18 <= 2139095040) ? bits_18 : 0);
+            keys_3[2] = key_19;
+            int i_vec_20 = wstart + (c_1 + 1) * 512 + lane * 4 + 2;
+            int i_str_21 = wstart + (c_1 + 1) * 512 + 64 + lane;
+            idxs_4[2] = ((aligned_1) ? i_vec_20 : i_str_21);
+            cands_5[2] = b_lo <= keys_3[2] >> 21 && idxs_4[2] < vocab;
+            unsigned int _vote_18 = __ballot_sync(0xFFFFFFFF, cands_5[2]);
+            unsigned int m_22 = _vote_18;
+            int _popc_36 = __popc(m_22 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_36;
+            int _popc_37 = __popc(m_22);
+            total_7 = total_7 + (unsigned int)_popc_37;
+            unsigned int bits_23 = __as_u32(vals_b[3]);
+            unsigned int key_24 = ((bits_23 <= 2139095040) ? bits_23 : 0);
+            keys_3[3] = key_24;
+            int i_vec_25 = wstart + (c_1 + 1) * 512 + lane * 4 + 3;
+            int i_str_26 = wstart + (c_1 + 1) * 512 + 96 + lane;
+            idxs_4[3] = ((aligned_1) ? i_vec_25 : i_str_26);
+            cands_5[3] = b_lo <= keys_3[3] >> 21 && idxs_4[3] < vocab;
+            unsigned int _vote_19 = __ballot_sync(0xFFFFFFFF, cands_5[3]);
+            unsigned int m_27 = _vote_19;
+            int _popc_38 = __popc(m_27 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_38;
+            int _popc_39 = __popc(m_27);
+            total_7 = total_7 + (unsigned int)_popc_39;
+            unsigned int own_28 = 0;
+            unsigned int pos_29 = n_2 + before_6 + own_28;
+            if (cands_5[0] && pos_29 < 1024) {
+                int slot_16 = seg_base + (int)pos_29;
+                lkeys[slot_16] = keys_3[0];
+                lidx[slot_16] = idxs_4[0];
+            }
+            if (cands_5[0]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_30 = n_2 + before_6 + own_28;
+            if (cands_5[1] && pos_30 < 1024) {
+                int slot_17 = seg_base + (int)pos_30;
+                lkeys[slot_17] = keys_3[1];
+                lidx[slot_17] = idxs_4[1];
+            }
+            if (cands_5[1]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_31 = n_2 + before_6 + own_28;
+            if (cands_5[2] && pos_31 < 1024) {
+                int slot_18 = seg_base + (int)pos_31;
+                lkeys[slot_18] = keys_3[2];
+                lidx[slot_18] = idxs_4[2];
+            }
+            if (cands_5[2]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_32 = n_2 + before_6 + own_28;
+            if (cands_5[3] && pos_32 < 1024) {
+                int slot_19 = seg_base + (int)pos_32;
+                lkeys[slot_19] = keys_3[3];
+                lidx[slot_19] = idxs_4[3];
+            }
+            if (cands_5[3]) {
+                own_28 = own_28 + 1;
+            }
+            n_2 = n_2 + total_7;
+            unsigned int keys_33[4];
+            int idxs_34[4];
+            bool cands_35[4];
+            unsigned int before_36 = 0;
+            unsigned int total_37 = 0;
+            unsigned int bits_38 = __as_u32(vals_b[4]);
+            unsigned int key_39 = ((bits_38 <= 2139095040) ? bits_38 : 0);
+            keys_33[0] = key_39;
+            int i_vec_40 = wstart + (c_1 + 1) * 512 + 128 + lane * 4;
+            int i_str_41 = wstart + (c_1 + 1) * 512 + 128 + lane;
+            idxs_34[0] = ((aligned_1) ? i_vec_40 : i_str_41);
+            cands_35[0] = b_lo <= keys_33[0] >> 21 && idxs_34[0] < vocab;
+            unsigned int _vote_20 = __ballot_sync(0xFFFFFFFF, cands_35[0]);
+            unsigned int m_42 = _vote_20;
+            int _popc_40 = __popc(m_42 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_40;
+            int _popc_41 = __popc(m_42);
+            total_37 = total_37 + (unsigned int)_popc_41;
+            unsigned int bits_43 = __as_u32(vals_b[5]);
+            unsigned int key_44 = ((bits_43 <= 2139095040) ? bits_43 : 0);
+            keys_33[1] = key_44;
+            int i_vec_45 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 1;
+            int i_str_46 = wstart + (c_1 + 1) * 512 + 160 + lane;
+            idxs_34[1] = ((aligned_1) ? i_vec_45 : i_str_46);
+            cands_35[1] = b_lo <= keys_33[1] >> 21 && idxs_34[1] < vocab;
+            unsigned int _vote_21 = __ballot_sync(0xFFFFFFFF, cands_35[1]);
+            unsigned int m_47 = _vote_21;
+            int _popc_42 = __popc(m_47 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_42;
+            int _popc_43 = __popc(m_47);
+            total_37 = total_37 + (unsigned int)_popc_43;
+            unsigned int bits_48 = __as_u32(vals_b[6]);
+            unsigned int key_49 = ((bits_48 <= 2139095040) ? bits_48 : 0);
+            keys_33[2] = key_49;
+            int i_vec_50 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 2;
+            int i_str_51 = wstart + (c_1 + 1) * 512 + 192 + lane;
+            idxs_34[2] = ((aligned_1) ? i_vec_50 : i_str_51);
+            cands_35[2] = b_lo <= keys_33[2] >> 21 && idxs_34[2] < vocab;
+            unsigned int _vote_22 = __ballot_sync(0xFFFFFFFF, cands_35[2]);
+            unsigned int m_52 = _vote_22;
+            int _popc_44 = __popc(m_52 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_44;
+            int _popc_45 = __popc(m_52);
+            total_37 = total_37 + (unsigned int)_popc_45;
+            unsigned int bits_53 = __as_u32(vals_b[7]);
+            unsigned int key_54 = ((bits_53 <= 2139095040) ? bits_53 : 0);
+            keys_33[3] = key_54;
+            int i_vec_55 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 3;
+            int i_str_56 = wstart + (c_1 + 1) * 512 + 224 + lane;
+            idxs_34[3] = ((aligned_1) ? i_vec_55 : i_str_56);
+            cands_35[3] = b_lo <= keys_33[3] >> 21 && idxs_34[3] < vocab;
+            unsigned int _vote_23 = __ballot_sync(0xFFFFFFFF, cands_35[3]);
+            unsigned int m_57 = _vote_23;
+            int _popc_46 = __popc(m_57 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_46;
+            int _popc_47 = __popc(m_57);
+            total_37 = total_37 + (unsigned int)_popc_47;
+            unsigned int own_58 = 0;
+            unsigned int pos_59 = n_2 + before_36 + own_58;
+            if (cands_35[0] && pos_59 < 1024) {
+                int slot_20 = seg_base + (int)pos_59;
+                lkeys[slot_20] = keys_33[0];
+                lidx[slot_20] = idxs_34[0];
+            }
+            if (cands_35[0]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_60 = n_2 + before_36 + own_58;
+            if (cands_35[1] && pos_60 < 1024) {
+                int slot_21 = seg_base + (int)pos_60;
+                lkeys[slot_21] = keys_33[1];
+                lidx[slot_21] = idxs_34[1];
+            }
+            if (cands_35[1]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_61 = n_2 + before_36 + own_58;
+            if (cands_35[2] && pos_61 < 1024) {
+                int slot_22 = seg_base + (int)pos_61;
+                lkeys[slot_22] = keys_33[2];
+                lidx[slot_22] = idxs_34[2];
+            }
+            if (cands_35[2]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_62 = n_2 + before_36 + own_58;
+            if (cands_35[3] && pos_62 < 1024) {
+                int slot_23 = seg_base + (int)pos_62;
+                lkeys[slot_23] = keys_33[3];
+                lidx[slot_23] = idxs_34[3];
+            }
+            if (cands_35[3]) {
+                own_58 = own_58 + 1;
+            }
+            n_2 = n_2 + total_37;
+            unsigned int keys_63[4];
+            int idxs_64[4];
+            bool cands_65[4];
+            unsigned int before_66 = 0;
+            unsigned int total_67 = 0;
+            unsigned int bits_68 = __as_u32(vals_b[8]);
+            unsigned int key_69 = ((bits_68 <= 2139095040) ? bits_68 : 0);
+            keys_63[0] = key_69;
+            int i_vec_70 = wstart + (c_1 + 1) * 512 + 256 + lane * 4;
+            int i_str_71 = wstart + (c_1 + 1) * 512 + 256 + lane;
+            idxs_64[0] = ((aligned_1) ? i_vec_70 : i_str_71);
+            cands_65[0] = b_lo <= keys_63[0] >> 21 && idxs_64[0] < vocab;
+            unsigned int _vote_24 = __ballot_sync(0xFFFFFFFF, cands_65[0]);
+            unsigned int m_72 = _vote_24;
+            int _popc_48 = __popc(m_72 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_48;
+            int _popc_49 = __popc(m_72);
+            total_67 = total_67 + (unsigned int)_popc_49;
+            unsigned int bits_73 = __as_u32(vals_b[9]);
+            unsigned int key_74 = ((bits_73 <= 2139095040) ? bits_73 : 0);
+            keys_63[1] = key_74;
+            int i_vec_75 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 1;
+            int i_str_76 = wstart + (c_1 + 1) * 512 + 288 + lane;
+            idxs_64[1] = ((aligned_1) ? i_vec_75 : i_str_76);
+            cands_65[1] = b_lo <= keys_63[1] >> 21 && idxs_64[1] < vocab;
+            unsigned int _vote_25 = __ballot_sync(0xFFFFFFFF, cands_65[1]);
+            unsigned int m_77 = _vote_25;
+            int _popc_50 = __popc(m_77 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_50;
+            int _popc_51 = __popc(m_77);
+            total_67 = total_67 + (unsigned int)_popc_51;
+            unsigned int bits_78 = __as_u32(vals_b[10]);
+            unsigned int key_79 = ((bits_78 <= 2139095040) ? bits_78 : 0);
+            keys_63[2] = key_79;
+            int i_vec_80 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 2;
+            int i_str_81 = wstart + (c_1 + 1) * 512 + 320 + lane;
+            idxs_64[2] = ((aligned_1) ? i_vec_80 : i_str_81);
+            cands_65[2] = b_lo <= keys_63[2] >> 21 && idxs_64[2] < vocab;
+            unsigned int _vote_26 = __ballot_sync(0xFFFFFFFF, cands_65[2]);
+            unsigned int m_82 = _vote_26;
+            int _popc_52 = __popc(m_82 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_52;
+            int _popc_53 = __popc(m_82);
+            total_67 = total_67 + (unsigned int)_popc_53;
+            unsigned int bits_83 = __as_u32(vals_b[11]);
+            unsigned int key_84 = ((bits_83 <= 2139095040) ? bits_83 : 0);
+            keys_63[3] = key_84;
+            int i_vec_85 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 3;
+            int i_str_86 = wstart + (c_1 + 1) * 512 + 352 + lane;
+            idxs_64[3] = ((aligned_1) ? i_vec_85 : i_str_86);
+            cands_65[3] = b_lo <= keys_63[3] >> 21 && idxs_64[3] < vocab;
+            unsigned int _vote_27 = __ballot_sync(0xFFFFFFFF, cands_65[3]);
+            unsigned int m_87 = _vote_27;
+            int _popc_54 = __popc(m_87 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_54;
+            int _popc_55 = __popc(m_87);
+            total_67 = total_67 + (unsigned int)_popc_55;
+            unsigned int own_88 = 0;
+            unsigned int pos_89 = n_2 + before_66 + own_88;
+            if (cands_65[0] && pos_89 < 1024) {
+                int slot_24 = seg_base + (int)pos_89;
+                lkeys[slot_24] = keys_63[0];
+                lidx[slot_24] = idxs_64[0];
+            }
+            if (cands_65[0]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_90 = n_2 + before_66 + own_88;
+            if (cands_65[1] && pos_90 < 1024) {
+                int slot_25 = seg_base + (int)pos_90;
+                lkeys[slot_25] = keys_63[1];
+                lidx[slot_25] = idxs_64[1];
+            }
+            if (cands_65[1]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_91 = n_2 + before_66 + own_88;
+            if (cands_65[2] && pos_91 < 1024) {
+                int slot_26 = seg_base + (int)pos_91;
+                lkeys[slot_26] = keys_63[2];
+                lidx[slot_26] = idxs_64[2];
+            }
+            if (cands_65[2]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_92 = n_2 + before_66 + own_88;
+            if (cands_65[3] && pos_92 < 1024) {
+                int slot_27 = seg_base + (int)pos_92;
+                lkeys[slot_27] = keys_63[3];
+                lidx[slot_27] = idxs_64[3];
+            }
+            if (cands_65[3]) {
+                own_88 = own_88 + 1;
+            }
+            n_2 = n_2 + total_67;
+            unsigned int keys_93[4];
+            int idxs_94[4];
+            bool cands_95[4];
+            unsigned int before_96 = 0;
+            unsigned int total_97 = 0;
+            unsigned int bits_98 = __as_u32(vals_b[12]);
+            unsigned int key_99 = ((bits_98 <= 2139095040) ? bits_98 : 0);
+            keys_93[0] = key_99;
+            int i_vec_100 = wstart + (c_1 + 1) * 512 + 384 + lane * 4;
+            int i_str_101 = wstart + (c_1 + 1) * 512 + 384 + lane;
+            idxs_94[0] = ((aligned_1) ? i_vec_100 : i_str_101);
+            cands_95[0] = b_lo <= keys_93[0] >> 21 && idxs_94[0] < vocab;
+            unsigned int _vote_28 = __ballot_sync(0xFFFFFFFF, cands_95[0]);
+            unsigned int m_102 = _vote_28;
+            int _popc_56 = __popc(m_102 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_56;
+            int _popc_57 = __popc(m_102);
+            total_97 = total_97 + (unsigned int)_popc_57;
+            unsigned int bits_103 = __as_u32(vals_b[13]);
+            unsigned int key_104 = ((bits_103 <= 2139095040) ? bits_103 : 0);
+            keys_93[1] = key_104;
+            int i_vec_105 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 1;
+            int i_str_106 = wstart + (c_1 + 1) * 512 + 416 + lane;
+            idxs_94[1] = ((aligned_1) ? i_vec_105 : i_str_106);
+            cands_95[1] = b_lo <= keys_93[1] >> 21 && idxs_94[1] < vocab;
+            unsigned int _vote_29 = __ballot_sync(0xFFFFFFFF, cands_95[1]);
+            unsigned int m_107 = _vote_29;
+            int _popc_58 = __popc(m_107 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_58;
+            int _popc_59 = __popc(m_107);
+            total_97 = total_97 + (unsigned int)_popc_59;
+            unsigned int bits_108 = __as_u32(vals_b[14]);
+            unsigned int key_109 = ((bits_108 <= 2139095040) ? bits_108 : 0);
+            keys_93[2] = key_109;
+            int i_vec_110 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 2;
+            int i_str_111 = wstart + (c_1 + 1) * 512 + 448 + lane;
+            idxs_94[2] = ((aligned_1) ? i_vec_110 : i_str_111);
+            cands_95[2] = b_lo <= keys_93[2] >> 21 && idxs_94[2] < vocab;
+            unsigned int _vote_30 = __ballot_sync(0xFFFFFFFF, cands_95[2]);
+            unsigned int m_112 = _vote_30;
+            int _popc_60 = __popc(m_112 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_60;
+            int _popc_61 = __popc(m_112);
+            total_97 = total_97 + (unsigned int)_popc_61;
+            unsigned int bits_113 = __as_u32(vals_b[15]);
+            unsigned int key_114 = ((bits_113 <= 2139095040) ? bits_113 : 0);
+            keys_93[3] = key_114;
+            int i_vec_115 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 3;
+            int i_str_116 = wstart + (c_1 + 1) * 512 + 480 + lane;
+            idxs_94[3] = ((aligned_1) ? i_vec_115 : i_str_116);
+            cands_95[3] = b_lo <= keys_93[3] >> 21 && idxs_94[3] < vocab;
+            unsigned int _vote_31 = __ballot_sync(0xFFFFFFFF, cands_95[3]);
+            unsigned int m_117 = _vote_31;
+            int _popc_62 = __popc(m_117 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_62;
+            int _popc_63 = __popc(m_117);
+            total_97 = total_97 + (unsigned int)_popc_63;
+            unsigned int own_118 = 0;
+            unsigned int pos_119 = n_2 + before_96 + own_118;
+            if (cands_95[0] && pos_119 < 1024) {
+                int slot_28 = seg_base + (int)pos_119;
+                lkeys[slot_28] = keys_93[0];
+                lidx[slot_28] = idxs_94[0];
+            }
+            if (cands_95[0]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_120 = n_2 + before_96 + own_118;
+            if (cands_95[1] && pos_120 < 1024) {
+                int slot_29 = seg_base + (int)pos_120;
+                lkeys[slot_29] = keys_93[1];
+                lidx[slot_29] = idxs_94[1];
+            }
+            if (cands_95[1]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_121 = n_2 + before_96 + own_118;
+            if (cands_95[2] && pos_121 < 1024) {
+                int slot_30 = seg_base + (int)pos_121;
+                lkeys[slot_30] = keys_93[2];
+                lidx[slot_30] = idxs_94[2];
+            }
+            if (cands_95[2]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_122 = n_2 + before_96 + own_118;
+            if (cands_95[3] && pos_122 < 1024) {
+                int slot_31 = seg_base + (int)pos_122;
+                lkeys[slot_31] = keys_93[3];
+                lidx[slot_31] = idxs_94[3];
+            }
+            if (cands_95[3]) {
+                own_118 = own_118 + 1;
+            }
+            n_2 = n_2 + total_97;
+            n_w = n_2;
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (lane == 0) {
+        scal[16 + warp] = n_w;
+    }
+    __syncthreads();
+    unsigned int before_1 = 0;
+    unsigned int total_1 = 0;
+    unsigned int v_4 = scal[16];
+    total_1 = total_1 + v_4;
+    if (warp > 0) {
+        before_1 = before_1 + v_4;
+    }
+    unsigned int v_0 = scal[17];
+    total_1 = total_1 + v_0;
+    if (warp > 1) {
+        before_1 = before_1 + v_0;
+    }
+    unsigned int v_1_1 = scal[18];
+    total_1 = total_1 + v_1_1;
+    if (warp > 2) {
+        before_1 = before_1 + v_1_1;
+    }
+    unsigned int v_2_1 = scal[19];
+    total_1 = total_1 + v_2_1;
+    if (warp > 3) {
+        before_1 = before_1 + v_2_1;
+    }
+    unsigned int v_3_1 = scal[20];
+    total_1 = total_1 + v_3_1;
+    if (warp > 4) {
+        before_1 = before_1 + v_3_1;
+    }
+    unsigned int v_4_1 = scal[21];
+    total_1 = total_1 + v_4_1;
+    if (warp > 5) {
+        before_1 = before_1 + v_4_1;
+    }
+    unsigned int v_5 = scal[22];
+    total_1 = total_1 + v_5;
+    if (warp > 6) {
+        before_1 = before_1 + v_5;
+    }
+    unsigned int v_6 = scal[23];
+    total_1 = total_1 + v_6;
+    if (warp > 7) {
+        before_1 = before_1 + v_6;
+    }
+    unsigned int v_7 = scal[24];
+    total_1 = total_1 + v_7;
+    if (warp > 8) {
+        before_1 = before_1 + v_7;
+    }
+    unsigned int v_8 = scal[25];
+    total_1 = total_1 + v_8;
+    if (warp > 9) {
+        before_1 = before_1 + v_8;
+    }
+    unsigned int v_9 = scal[26];
+    total_1 = total_1 + v_9;
+    if (warp > 10) {
+        before_1 = before_1 + v_9;
+    }
+    unsigned int v_10 = scal[27];
+    total_1 = total_1 + v_10;
+    if (warp > 11) {
+        before_1 = before_1 + v_10;
+    }
+    unsigned int v_11 = scal[28];
+    total_1 = total_1 + v_11;
+    if (warp > 12) {
+        before_1 = before_1 + v_11;
+    }
+    unsigned int v_12 = scal[29];
+    total_1 = total_1 + v_12;
+    if (warp > 13) {
+        before_1 = before_1 + v_12;
+    }
+    unsigned int v_13 = scal[30];
+    total_1 = total_1 + v_13;
+    if (warp > 14) {
+        before_1 = before_1 + v_13;
+    }
+    unsigned int v_14 = scal[31];
+    total_1 = total_1 + v_14;
+    if (warp > 15) {
+        before_1 = before_1 + v_14;
+    }
+    unsigned int _vote_32 = __ballot_sync(0xFFFFFFFF, n_w > 1024);
+    unsigned int ovf_w = _vote_32;
+    if (tid == 0) {
+        scal[6] = total_1;
+    }
+    if (lane == 0) {
+        if (ovf_w != 0) {
+            scal[5] = 1;
+        }
+    }
+    __syncthreads();
+    unsigned int any_ovf = scal[5];
+    unsigned int cand_total = total_1;
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        for (int r = 0; r < 2; r++) {
+            if (r != rank) {
+                uint32_t _mapa_2;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_2) : "r"(scal_addr + 20), "r"(r));
+                unsigned int _cluster_ld_0;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_0) : "r"(_mapa_2) : "memory");
+                unsigned int ovf_peer = _cluster_ld_0;
+                uint32_t _mapa_3;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_3) : "r"(scal_addr + 24), "r"(r));
+                unsigned int _cluster_ld_1;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_1) : "r"(_mapa_3) : "memory");
+                unsigned int n_peer = _cluster_ld_1;
+                any_ovf = any_ovf | ovf_peer;
+                cand_total = cand_total + n_peer;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    bool use_list = any_ovf == 0 && cand_total >= k_u;
+    unsigned int n_eff = ((use_list) ? n_w : 0);
+    int nch_stream = ((use_list) ? 0 : nchunks);
+    for (int i_6 = tid; i_6 < 2048; i_6 += 512) {
+        hist0[i_6] = 0;
+    }
+    __syncthreads();
+    unsigned int prefix = 0;
+    unsigned int remaining = k_u;
+    unsigned int gt_local = 0;
+    unsigned int eq_local = 0;
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_7 = start + tid * 4;
+            if (i_7 < vocab) {
+                float _vec_load_12[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_7);
+                    _vec_load_12[0 + 0] = _v4.x;
+                    _vec_load_12[0 + 1] = _v4.y;
+                    _vec_load_12[0 + 2] = _v4.z;
+                    _vec_load_12[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_12[0];
+                vals_a[1] = _vec_load_12[1];
+                vals_a[2] = _vec_load_12[2];
+                vals_a[3] = _vec_load_12[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_4 = start + 2048 + tid * 4;
+            if (i_0_4 < vocab) {
+                float _vec_load_13[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_4);
+                    _vec_load_13[0 + 0] = _v4.x;
+                    _vec_load_13[0 + 1] = _v4.y;
+                    _vec_load_13[0 + 2] = _v4.z;
+                    _vec_load_13[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_13[0];
+                vals_a[5] = _vec_load_13[1];
+                vals_a[6] = _vec_load_13[2];
+                vals_a[7] = _vec_load_13[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_5 = start + 4096 + tid * 4;
+            if (i_1_5 < vocab) {
+                float _vec_load_14[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_5);
+                    _vec_load_14[0 + 0] = _v4.x;
+                    _vec_load_14[0 + 1] = _v4.y;
+                    _vec_load_14[0 + 2] = _v4.z;
+                    _vec_load_14[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_14[0];
+                vals_a[9] = _vec_load_14[1];
+                vals_a[10] = _vec_load_14[2];
+                vals_a[11] = _vec_load_14[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_5 = start + 6144 + tid * 4;
+            if (i_2_5 < vocab) {
+                float _vec_load_15[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_5);
+                    _vec_load_15[0 + 0] = _v4.x;
+                    _vec_load_15[0 + 1] = _v4.y;
+                    _vec_load_15[0 + 2] = _v4.z;
+                    _vec_load_15[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_15[0];
+                vals_a[13] = _vec_load_15[1];
+                vals_a[14] = _vec_load_15[2];
+                vals_a[15] = _vec_load_15[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_17 = start + tid;
+            if (i2_17 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_17];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_3 = start + 512 + tid;
+            if (i2_0_3 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_3];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_3 = start + 1024 + tid;
+            if (i2_1_3 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_3];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_3 = start + 1536 + tid;
+            if (i2_2_3 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_3];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_3 = start + 2048 + tid;
+            if (i2_3_3 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_3];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_3 = start + 2560 + tid;
+            if (i2_4_3 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_3];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_3 = start + 3072 + tid;
+            if (i2_5_3 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_3];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_3 = start + 3584 + tid;
+            if (i2_6_3 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_3];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_3 = start + 4096 + tid;
+            if (i2_7_3 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_3];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_3 = start + 4608 + tid;
+            if (i2_8_3 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_3];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_3 = start + 5120 + tid;
+            if (i2_9_3 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_3];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_3 = start + 5632 + tid;
+            if (i2_10_3 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_3];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_3 = start + 6144 + tid;
+            if (i2_11_3 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_3];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_3 = start + 6656 + tid;
+            if (i2_12_3 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_3];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_3 = start + 7168 + tid;
+            if (i2_13_3 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_3];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_3 = start + 7680 + tid;
+            if (i2_14_3 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_3];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_2 = 0; c_2 < nch_stream; c_2 += 2) {
+        if (nch_stream > c_2 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_8 = start + (c_2 + 1) * 8192 + tid * 4;
+                if (i_8 < vocab) {
+                    float _vec_load_16[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_8);
+                        _vec_load_16[0 + 0] = _v4.x;
+                        _vec_load_16[0 + 1] = _v4.y;
+                        _vec_load_16[0 + 2] = _v4.z;
+                        _vec_load_16[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_16[0];
+                    vals_b[1] = _vec_load_16[1];
+                    vals_b[2] = _vec_load_16[2];
+                    vals_b[3] = _vec_load_16[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_5 = start + (c_2 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_5 < vocab) {
+                    float _vec_load_17[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_5);
+                        _vec_load_17[0 + 0] = _v4.x;
+                        _vec_load_17[0 + 1] = _v4.y;
+                        _vec_load_17[0 + 2] = _v4.z;
+                        _vec_load_17[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_17[0];
+                    vals_b[5] = _vec_load_17[1];
+                    vals_b[6] = _vec_load_17[2];
+                    vals_b[7] = _vec_load_17[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_6 = start + (c_2 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_6 < vocab) {
+                    float _vec_load_18[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_6);
+                        _vec_load_18[0 + 0] = _v4.x;
+                        _vec_load_18[0 + 1] = _v4.y;
+                        _vec_load_18[0 + 2] = _v4.z;
+                        _vec_load_18[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_18[0];
+                    vals_b[9] = _vec_load_18[1];
+                    vals_b[10] = _vec_load_18[2];
+                    vals_b[11] = _vec_load_18[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_6 = start + (c_2 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_6 < vocab) {
+                    float _vec_load_19[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_6);
+                        _vec_load_19[0 + 0] = _v4.x;
+                        _vec_load_19[0 + 1] = _v4.y;
+                        _vec_load_19[0 + 2] = _v4.z;
+                        _vec_load_19[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_19[0];
+                    vals_b[13] = _vec_load_19[1];
+                    vals_b[14] = _vec_load_19[2];
+                    vals_b[15] = _vec_load_19[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_18 = start + (c_2 + 1) * 8192 + tid;
+                if (i2_18 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_18];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_4 = start + (c_2 + 1) * 8192 + 512 + tid;
+                if (i2_0_4 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_4];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_4 = start + (c_2 + 1) * 8192 + 1024 + tid;
+                if (i2_1_4 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_4];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_4 = start + (c_2 + 1) * 8192 + 1536 + tid;
+                if (i2_2_4 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_4];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_4 = start + (c_2 + 1) * 8192 + 2048 + tid;
+                if (i2_3_4 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_4];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_4 = start + (c_2 + 1) * 8192 + 2560 + tid;
+                if (i2_4_4 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_4];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_4 = start + (c_2 + 1) * 8192 + 3072 + tid;
+                if (i2_5_4 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_4];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_4 = start + (c_2 + 1) * 8192 + 3584 + tid;
+                if (i2_6_4 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_4];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_4 = start + (c_2 + 1) * 8192 + 4096 + tid;
+                if (i2_7_4 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_4];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_4 = start + (c_2 + 1) * 8192 + 4608 + tid;
+                if (i2_8_4 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_4];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_4 = start + (c_2 + 1) * 8192 + 5120 + tid;
+                if (i2_9_4 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_4];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_4 = start + (c_2 + 1) * 8192 + 5632 + tid;
+                if (i2_10_4 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_4];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_4 = start + (c_2 + 1) * 8192 + 6144 + tid;
+                if (i2_11_4 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_4];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_4 = start + (c_2 + 1) * 8192 + 6656 + tid;
+                if (i2_12_4 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_4];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_4 = start + (c_2 + 1) * 8192 + 7168 + tid;
+                if (i2_13_4 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_4];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_4 = start + (c_2 + 1) * 8192 + 7680 + tid;
+                if (i2_14_4 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_4];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_5 = __as_u32(vals_a[0]);
+        unsigned int key_5 = ((bits_5 <= 2139095040) ? bits_5 : 0);
+        unsigned int bucket_4 = key_5 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_4], 1);
+        unsigned int bits_0 = __as_u32(vals_a[1]);
+        unsigned int key_1_1 = ((bits_0 <= 2139095040) ? bits_0 : 0);
+        unsigned int bucket_2_1 = key_1_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_2_1], 1);
+        unsigned int bits_3_1 = __as_u32(vals_a[2]);
+        unsigned int key_4_1 = ((bits_3_1 <= 2139095040) ? bits_3_1 : 0);
+        unsigned int bucket_5 = key_4_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_5], 1);
+        unsigned int bits_6_1 = __as_u32(vals_a[3]);
+        unsigned int key_7_1 = ((bits_6_1 <= 2139095040) ? bits_6_1 : 0);
+        unsigned int bucket_8 = key_7_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_8], 1);
+        unsigned int bits_9 = __as_u32(vals_a[4]);
+        unsigned int key_10 = ((bits_9 <= 2139095040) ? bits_9 : 0);
+        unsigned int bucket_11 = key_10 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_11], 1);
+        unsigned int bits_12 = __as_u32(vals_a[5]);
+        unsigned int key_13 = ((bits_12 <= 2139095040) ? bits_12 : 0);
+        unsigned int bucket_14 = key_13 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_14], 1);
+        unsigned int bits_15 = __as_u32(vals_a[6]);
+        unsigned int key_16 = ((bits_15 <= 2139095040) ? bits_15 : 0);
+        unsigned int bucket_17 = key_16 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_17], 1);
+        unsigned int bits_18_1 = __as_u32(vals_a[7]);
+        unsigned int key_19_1 = ((bits_18_1 <= 2139095040) ? bits_18_1 : 0);
+        unsigned int bucket_20 = key_19_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_20], 1);
+        unsigned int bits_21 = __as_u32(vals_a[8]);
+        unsigned int key_22 = ((bits_21 <= 2139095040) ? bits_21 : 0);
+        unsigned int bucket_23 = key_22 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_23], 1);
+        unsigned int bits_24_1 = __as_u32(vals_a[9]);
+        unsigned int key_25_1 = ((bits_24_1 <= 2139095040) ? bits_24_1 : 0);
+        unsigned int bucket_26 = key_25_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_26], 1);
+        unsigned int bits_27 = __as_u32(vals_a[10]);
+        unsigned int key_28 = ((bits_27 <= 2139095040) ? bits_27 : 0);
+        unsigned int bucket_29 = key_28 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_29], 1);
+        unsigned int bits_30 = __as_u32(vals_a[11]);
+        unsigned int key_31 = ((bits_30 <= 2139095040) ? bits_30 : 0);
+        unsigned int bucket_32 = key_31 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_32], 1);
+        unsigned int bits_33 = __as_u32(vals_a[12]);
+        unsigned int key_34 = ((bits_33 <= 2139095040) ? bits_33 : 0);
+        unsigned int bucket_35 = key_34 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_35], 1);
+        unsigned int bits_36 = __as_u32(vals_a[13]);
+        unsigned int key_37 = ((bits_36 <= 2139095040) ? bits_36 : 0);
+        unsigned int bucket_38 = key_37 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_38], 1);
+        unsigned int bits_39_1 = __as_u32(vals_a[14]);
+        unsigned int key_40_1 = ((bits_39_1 <= 2139095040) ? bits_39_1 : 0);
+        unsigned int bucket_41 = key_40_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_41], 1);
+        unsigned int bits_42 = __as_u32(vals_a[15]);
+        unsigned int key_43 = ((bits_42 <= 2139095040) ? bits_42 : 0);
+        unsigned int bucket_44 = key_43 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_44], 1);
+        if (nch_stream > c_2 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_9 = start + (c_2 + 2) * 8192 + tid * 4;
+                if (i_9 < vocab) {
+                    float _vec_load_20[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_9);
+                        _vec_load_20[0 + 0] = _v4.x;
+                        _vec_load_20[0 + 1] = _v4.y;
+                        _vec_load_20[0 + 2] = _v4.z;
+                        _vec_load_20[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_20[0];
+                    vals_a[1] = _vec_load_20[1];
+                    vals_a[2] = _vec_load_20[2];
+                    vals_a[3] = _vec_load_20[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_6 = start + (c_2 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_6 < vocab) {
+                    float _vec_load_21[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_6);
+                        _vec_load_21[0 + 0] = _v4.x;
+                        _vec_load_21[0 + 1] = _v4.y;
+                        _vec_load_21[0 + 2] = _v4.z;
+                        _vec_load_21[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_21[0];
+                    vals_a[5] = _vec_load_21[1];
+                    vals_a[6] = _vec_load_21[2];
+                    vals_a[7] = _vec_load_21[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_7 = start + (c_2 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_7 < vocab) {
+                    float _vec_load_22[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_7);
+                        _vec_load_22[0 + 0] = _v4.x;
+                        _vec_load_22[0 + 1] = _v4.y;
+                        _vec_load_22[0 + 2] = _v4.z;
+                        _vec_load_22[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_22[0];
+                    vals_a[9] = _vec_load_22[1];
+                    vals_a[10] = _vec_load_22[2];
+                    vals_a[11] = _vec_load_22[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_7 = start + (c_2 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_7 < vocab) {
+                    float _vec_load_23[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_7);
+                        _vec_load_23[0 + 0] = _v4.x;
+                        _vec_load_23[0 + 1] = _v4.y;
+                        _vec_load_23[0 + 2] = _v4.z;
+                        _vec_load_23[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_23[0];
+                    vals_a[13] = _vec_load_23[1];
+                    vals_a[14] = _vec_load_23[2];
+                    vals_a[15] = _vec_load_23[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_19 = start + (c_2 + 2) * 8192 + tid;
+                if (i2_19 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_19];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_5 = start + (c_2 + 2) * 8192 + 512 + tid;
+                if (i2_0_5 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_5];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_5 = start + (c_2 + 2) * 8192 + 1024 + tid;
+                if (i2_1_5 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_5];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_5 = start + (c_2 + 2) * 8192 + 1536 + tid;
+                if (i2_2_5 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_5];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_5 = start + (c_2 + 2) * 8192 + 2048 + tid;
+                if (i2_3_5 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_5];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_5 = start + (c_2 + 2) * 8192 + 2560 + tid;
+                if (i2_4_5 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_5];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_5 = start + (c_2 + 2) * 8192 + 3072 + tid;
+                if (i2_5_5 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_5];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_5 = start + (c_2 + 2) * 8192 + 3584 + tid;
+                if (i2_6_5 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_5];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_5 = start + (c_2 + 2) * 8192 + 4096 + tid;
+                if (i2_7_5 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_5];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_5 = start + (c_2 + 2) * 8192 + 4608 + tid;
+                if (i2_8_5 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_5];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_5 = start + (c_2 + 2) * 8192 + 5120 + tid;
+                if (i2_9_5 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_5];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_5 = start + (c_2 + 2) * 8192 + 5632 + tid;
+                if (i2_10_5 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_5];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_5 = start + (c_2 + 2) * 8192 + 6144 + tid;
+                if (i2_11_5 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_5];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_5 = start + (c_2 + 2) * 8192 + 6656 + tid;
+                if (i2_12_5 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_5];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_5 = start + (c_2 + 2) * 8192 + 7168 + tid;
+                if (i2_13_5 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_5];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_5 = start + (c_2 + 2) * 8192 + 7680 + tid;
+                if (i2_14_5 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_5];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_2 + 1) {
+            unsigned int bits_1_2 = __as_u32(vals_b[0]);
+            unsigned int key_2_2 = ((bits_1_2 <= 2139095040) ? bits_1_2 : 0);
+            unsigned int bucket_3_1 = key_2_2 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_3_1], 1);
+            unsigned int bits_4_1 = __as_u32(vals_b[1]);
+            unsigned int key_5_1 = ((bits_4_1 <= 2139095040) ? bits_4_1 : 0);
+            unsigned int bucket_6 = key_5_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_6], 1);
+            unsigned int bits_7 = __as_u32(vals_b[2]);
+            unsigned int key_8 = ((bits_7 <= 2139095040) ? bits_7 : 0);
+            unsigned int bucket_9 = key_8 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_9], 1);
+            unsigned int bits_10 = __as_u32(vals_b[3]);
+            unsigned int key_11 = ((bits_10 <= 2139095040) ? bits_10 : 0);
+            unsigned int bucket_12 = key_11 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_12], 1);
+            unsigned int bits_13_1 = __as_u32(vals_b[4]);
+            unsigned int key_14_1 = ((bits_13_1 <= 2139095040) ? bits_13_1 : 0);
+            unsigned int bucket_15 = key_14_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_15], 1);
+            unsigned int bits_16 = __as_u32(vals_b[5]);
+            unsigned int key_17 = ((bits_16 <= 2139095040) ? bits_16 : 0);
+            unsigned int bucket_18 = key_17 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_18], 1);
+            unsigned int bits_19 = __as_u32(vals_b[6]);
+            unsigned int key_20 = ((bits_19 <= 2139095040) ? bits_19 : 0);
+            unsigned int bucket_21 = key_20 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_21], 1);
+            unsigned int bits_22 = __as_u32(vals_b[7]);
+            unsigned int key_23 = ((bits_22 <= 2139095040) ? bits_22 : 0);
+            unsigned int bucket_24 = key_23 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_24], 1);
+            unsigned int bits_25 = __as_u32(vals_b[8]);
+            unsigned int key_26 = ((bits_25 <= 2139095040) ? bits_25 : 0);
+            unsigned int bucket_27 = key_26 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_27], 1);
+            unsigned int bits_28 = __as_u32(vals_b[9]);
+            unsigned int key_29 = ((bits_28 <= 2139095040) ? bits_28 : 0);
+            unsigned int bucket_30 = key_29 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_30], 1);
+            unsigned int bits_31 = __as_u32(vals_b[10]);
+            unsigned int key_32 = ((bits_31 <= 2139095040) ? bits_31 : 0);
+            unsigned int bucket_33 = key_32 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_33], 1);
+            unsigned int bits_34_1 = __as_u32(vals_b[11]);
+            unsigned int key_35_1 = ((bits_34_1 <= 2139095040) ? bits_34_1 : 0);
+            unsigned int bucket_36 = key_35_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_36], 1);
+            unsigned int bits_37 = __as_u32(vals_b[12]);
+            unsigned int key_38 = ((bits_37 <= 2139095040) ? bits_37 : 0);
+            unsigned int bucket_39 = key_38 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_39], 1);
+            unsigned int bits_40 = __as_u32(vals_b[13]);
+            unsigned int key_41 = ((bits_40 <= 2139095040) ? bits_40 : 0);
+            unsigned int bucket_42 = key_41 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_42], 1);
+            unsigned int bits_43_1 = __as_u32(vals_b[14]);
+            unsigned int key_44_1 = ((bits_43_1 <= 2139095040) ? bits_43_1 : 0);
+            unsigned int bucket_45 = key_44_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_45], 1);
+            unsigned int bits_46 = __as_u32(vals_b[15]);
+            unsigned int key_47 = ((bits_46 <= 2139095040) ? bits_46 : 0);
+            unsigned int bucket_48 = key_47 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_48], 1);
+        }
+    }
+    int niter = (int)(n_eff + 31 >> 5);
+    for (int j = 0; j < niter; j++) {
+        unsigned int e = (unsigned int)(j * 32 + lane);
+        if (e < n_eff) {
+            unsigned int key_6 = lkeys[seg_base + j * 32 + lane];
+            unsigned int bucket_7 = key_6 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_7], 1);
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0_15 = 0;
+    unsigned int c1_16 = 0;
+    unsigned int c2_17 = 0;
+    unsigned int c3_18 = 0;
+    {
+        unsigned int words_1[4];
+        uint32_t _mapa_4;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_4) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
+            : "r"(_mapa_4));
+        c0_15 = c0_15 + words_1[0];
+        c1_16 = c1_16 + words_1[1];
+        c2_17 = c2_17 + words_1[2];
+        c3_18 = c3_18 + words_1[3];
+        unsigned int words_0_1[4];
+        uint32_t _mapa_5;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_5) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[(0) + 3]))
+            : "r"(_mapa_5));
+        c0_15 = c0_15 + words_0_1[0];
+        c1_16 = c1_16 + words_0_1[1];
+        c2_17 = c2_17 + words_0_1[2];
+        c3_18 = c3_18 + words_0_1[3];
+    }
+    unsigned int local_19 = c0_15 + c1_16 + c2_17 + c3_18;
+    uint32_t _warp_scan_sum_u32_1 = local_19;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(16));
+    unsigned int lane_suffix_20 = _warp_scan_sum_u32_1 - local_19;
+    unsigned int _warp_redux_u32_2;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_2) : "r"(local_19));
+    unsigned int warp_total_21 = _warp_redux_u32_2;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_21;
+    }
+    __syncthreads();
+    unsigned int peer_22 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_23 = ((lane > warp) ? peer_22 : 0);
+    unsigned int _warp_redux_u32_3;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_3) : "r"(above_23));
+    unsigned int warps_above_24 = _warp_redux_u32_3;
+    unsigned int suffix_25 = lane_suffix_20 + warps_above_24;
+    if (suffix_25 < remaining && remaining <= suffix_25 + local_19) {
+        unsigned int s3 = suffix_25 + c3_18;
+        unsigned int s2 = s3 + c2_17;
+        unsigned int s1 = s2 + c1_16;
+        if (remaining <= s3) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_25;
+        } else if (remaining <= s2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3;
+        } else {
+            if (remaining <= s1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 11 | bucket_sel;
+    unsigned int b0 = (unsigned int)(tid * 4);
+    unsigned int h0 = hist0[tid * 4];
+    unsigned int h1 = hist0[tid * 4 + 1];
+    unsigned int h2 = hist0[tid * 4 + 2];
+    unsigned int h3 = hist0[tid * 4 + 3];
+    unsigned int above_26 = 0;
+    unsigned int own_1 = 0;
+    if (b0 > bucket_sel) {
+        above_26 = above_26 + h0;
+    }
+    if (bucket_sel < b0 + 1) {
+        above_26 = above_26 + h1;
+    }
+    if (bucket_sel < b0 + 2) {
+        above_26 = above_26 + h2;
+    }
+    if (bucket_sel < b0 + 3) {
+        above_26 = above_26 + h3;
+    }
+    if (b0 == bucket_sel) {
+        own_1 = h0;
+    }
+    if (b0 + 1 == bucket_sel) {
+        own_1 = h1;
+    }
+    if (b0 + 2 == bucket_sel) {
+        own_1 = h2;
+    }
+    if (b0 + 3 == bucket_sel) {
+        own_1 = h3;
+    }
+    uint32_t _warp_scan_sum_u32_2 = above_26;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(16));
+    unsigned int incl = _warp_scan_sum_u32_2;
+    if (lane == 31) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    unsigned int before_27 = 0;
+    unsigned int total_28 = 0;
+    unsigned int ws = warp_sums[0];
+    total_28 = total_28 + ws;
+    if (warp > 0) {
+        before_27 = before_27 + ws;
+    }
+    unsigned int ws_29 = warp_sums[1];
+    total_28 = total_28 + ws_29;
+    if (warp > 1) {
+        before_27 = before_27 + ws_29;
+    }
+    unsigned int ws_30 = warp_sums[2];
+    total_28 = total_28 + ws_30;
+    if (warp > 2) {
+        before_27 = before_27 + ws_30;
+    }
+    unsigned int ws_31 = warp_sums[3];
+    total_28 = total_28 + ws_31;
+    if (warp > 3) {
+        before_27 = before_27 + ws_31;
+    }
+    unsigned int ws_32 = warp_sums[4];
+    total_28 = total_28 + ws_32;
+    if (warp > 4) {
+        before_27 = before_27 + ws_32;
+    }
+    unsigned int ws_33 = warp_sums[5];
+    total_28 = total_28 + ws_33;
+    if (warp > 5) {
+        before_27 = before_27 + ws_33;
+    }
+    unsigned int ws_34 = warp_sums[6];
+    total_28 = total_28 + ws_34;
+    if (warp > 6) {
+        before_27 = before_27 + ws_34;
+    }
+    unsigned int ws_35 = warp_sums[7];
+    total_28 = total_28 + ws_35;
+    if (warp > 7) {
+        before_27 = before_27 + ws_35;
+    }
+    unsigned int ws_36 = warp_sums[8];
+    total_28 = total_28 + ws_36;
+    if (warp > 8) {
+        before_27 = before_27 + ws_36;
+    }
+    unsigned int ws_37 = warp_sums[9];
+    total_28 = total_28 + ws_37;
+    if (warp > 9) {
+        before_27 = before_27 + ws_37;
+    }
+    unsigned int ws_38 = warp_sums[10];
+    total_28 = total_28 + ws_38;
+    if (warp > 10) {
+        before_27 = before_27 + ws_38;
+    }
+    unsigned int ws_39 = warp_sums[11];
+    total_28 = total_28 + ws_39;
+    if (warp > 11) {
+        before_27 = before_27 + ws_39;
+    }
+    unsigned int ws_40 = warp_sums[12];
+    total_28 = total_28 + ws_40;
+    if (warp > 12) {
+        before_27 = before_27 + ws_40;
+    }
+    unsigned int ws_41 = warp_sums[13];
+    total_28 = total_28 + ws_41;
+    if (warp > 13) {
+        before_27 = before_27 + ws_41;
+    }
+    unsigned int ws_42 = warp_sums[14];
+    total_28 = total_28 + ws_42;
+    if (warp > 14) {
+        before_27 = before_27 + ws_42;
+    }
+    unsigned int ws_43 = warp_sums[15];
+    total_28 = total_28 + ws_43;
+    if (warp > 15) {
+        before_27 = before_27 + ws_43;
+    }
+    unsigned int excl = before_27 + incl - above_26;
+    __syncthreads();
+    gt_local = gt_local + total_28;
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_10 = start + tid * 4;
+            if (i_10 < vocab) {
+                float _vec_load_24[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_10);
+                    _vec_load_24[0 + 0] = _v4.x;
+                    _vec_load_24[0 + 1] = _v4.y;
+                    _vec_load_24[0 + 2] = _v4.z;
+                    _vec_load_24[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_24[0];
+                vals_a[1] = _vec_load_24[1];
+                vals_a[2] = _vec_load_24[2];
+                vals_a[3] = _vec_load_24[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_7 = start + 2048 + tid * 4;
+            if (i_0_7 < vocab) {
+                float _vec_load_25[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_7);
+                    _vec_load_25[0 + 0] = _v4.x;
+                    _vec_load_25[0 + 1] = _v4.y;
+                    _vec_load_25[0 + 2] = _v4.z;
+                    _vec_load_25[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_25[0];
+                vals_a[5] = _vec_load_25[1];
+                vals_a[6] = _vec_load_25[2];
+                vals_a[7] = _vec_load_25[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_8 = start + 4096 + tid * 4;
+            if (i_1_8 < vocab) {
+                float _vec_load_26[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_8);
+                    _vec_load_26[0 + 0] = _v4.x;
+                    _vec_load_26[0 + 1] = _v4.y;
+                    _vec_load_26[0 + 2] = _v4.z;
+                    _vec_load_26[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_26[0];
+                vals_a[9] = _vec_load_26[1];
+                vals_a[10] = _vec_load_26[2];
+                vals_a[11] = _vec_load_26[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_8 = start + 6144 + tid * 4;
+            if (i_2_8 < vocab) {
+                float _vec_load_27[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_8);
+                    _vec_load_27[0 + 0] = _v4.x;
+                    _vec_load_27[0 + 1] = _v4.y;
+                    _vec_load_27[0 + 2] = _v4.z;
+                    _vec_load_27[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_27[0];
+                vals_a[13] = _vec_load_27[1];
+                vals_a[14] = _vec_load_27[2];
+                vals_a[15] = _vec_load_27[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_20 = start + tid;
+            if (i2_20 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_20];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_6 = start + 512 + tid;
+            if (i2_0_6 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_6];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_6 = start + 1024 + tid;
+            if (i2_1_6 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_6];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_6 = start + 1536 + tid;
+            if (i2_2_6 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_6];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_6 = start + 2048 + tid;
+            if (i2_3_6 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_6];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_6 = start + 2560 + tid;
+            if (i2_4_6 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_6];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_6 = start + 3072 + tid;
+            if (i2_5_6 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_6];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_6 = start + 3584 + tid;
+            if (i2_6_6 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_6];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_6 = start + 4096 + tid;
+            if (i2_7_6 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_6];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_6 = start + 4608 + tid;
+            if (i2_8_6 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_6];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_6 = start + 5120 + tid;
+            if (i2_9_6 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_6];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_6 = start + 5632 + tid;
+            if (i2_10_6 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_6];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_6 = start + 6144 + tid;
+            if (i2_11_6 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_6];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_6 = start + 6656 + tid;
+            if (i2_12_6 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_6];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_6 = start + 7168 + tid;
+            if (i2_13_6 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_6];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_6 = start + 7680 + tid;
+            if (i2_14_6 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_6];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_3 = 0; c_3 < nch_stream; c_3 += 2) {
+        if (nch_stream > c_3 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_11 = start + (c_3 + 1) * 8192 + tid * 4;
+                if (i_11 < vocab) {
+                    float _vec_load_28[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_11);
+                        _vec_load_28[0 + 0] = _v4.x;
+                        _vec_load_28[0 + 1] = _v4.y;
+                        _vec_load_28[0 + 2] = _v4.z;
+                        _vec_load_28[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_28[0];
+                    vals_b[1] = _vec_load_28[1];
+                    vals_b[2] = _vec_load_28[2];
+                    vals_b[3] = _vec_load_28[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_8 = start + (c_3 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_8 < vocab) {
+                    float _vec_load_29[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_8);
+                        _vec_load_29[0 + 0] = _v4.x;
+                        _vec_load_29[0 + 1] = _v4.y;
+                        _vec_load_29[0 + 2] = _v4.z;
+                        _vec_load_29[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_29[0];
+                    vals_b[5] = _vec_load_29[1];
+                    vals_b[6] = _vec_load_29[2];
+                    vals_b[7] = _vec_load_29[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_9 = start + (c_3 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_9 < vocab) {
+                    float _vec_load_30[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_9);
+                        _vec_load_30[0 + 0] = _v4.x;
+                        _vec_load_30[0 + 1] = _v4.y;
+                        _vec_load_30[0 + 2] = _v4.z;
+                        _vec_load_30[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_30[0];
+                    vals_b[9] = _vec_load_30[1];
+                    vals_b[10] = _vec_load_30[2];
+                    vals_b[11] = _vec_load_30[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_9 = start + (c_3 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_9 < vocab) {
+                    float _vec_load_31[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_9);
+                        _vec_load_31[0 + 0] = _v4.x;
+                        _vec_load_31[0 + 1] = _v4.y;
+                        _vec_load_31[0 + 2] = _v4.z;
+                        _vec_load_31[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_31[0];
+                    vals_b[13] = _vec_load_31[1];
+                    vals_b[14] = _vec_load_31[2];
+                    vals_b[15] = _vec_load_31[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_21 = start + (c_3 + 1) * 8192 + tid;
+                if (i2_21 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_21];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_7 = start + (c_3 + 1) * 8192 + 512 + tid;
+                if (i2_0_7 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_7];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_7 = start + (c_3 + 1) * 8192 + 1024 + tid;
+                if (i2_1_7 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_7];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_7 = start + (c_3 + 1) * 8192 + 1536 + tid;
+                if (i2_2_7 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_7];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_7 = start + (c_3 + 1) * 8192 + 2048 + tid;
+                if (i2_3_7 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_7];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_7 = start + (c_3 + 1) * 8192 + 2560 + tid;
+                if (i2_4_7 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_7];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_7 = start + (c_3 + 1) * 8192 + 3072 + tid;
+                if (i2_5_7 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_7];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_7 = start + (c_3 + 1) * 8192 + 3584 + tid;
+                if (i2_6_7 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_7];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_7 = start + (c_3 + 1) * 8192 + 4096 + tid;
+                if (i2_7_7 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_7];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_7 = start + (c_3 + 1) * 8192 + 4608 + tid;
+                if (i2_8_7 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_7];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_7 = start + (c_3 + 1) * 8192 + 5120 + tid;
+                if (i2_9_7 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_7];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_7 = start + (c_3 + 1) * 8192 + 5632 + tid;
+                if (i2_10_7 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_7];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_7 = start + (c_3 + 1) * 8192 + 6144 + tid;
+                if (i2_11_7 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_7];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_7 = start + (c_3 + 1) * 8192 + 6656 + tid;
+                if (i2_12_7 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_7];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_7 = start + (c_3 + 1) * 8192 + 7168 + tid;
+                if (i2_13_7 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_7];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_7 = start + (c_3 + 1) * 8192 + 7680 + tid;
+                if (i2_14_7 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_7];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_14 = __as_u32(vals_a[0]);
+        unsigned int key_15 = ((bits_14 <= 2139095040) ? bits_14 : 0);
+        unsigned int bucket_10 = key_15 >> 10 & 2047;
+        if (key_15 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_10], 1);
+        }
+        unsigned int bits_0_1 = __as_u32(vals_a[1]);
+        unsigned int key_1_2 = ((bits_0_1 <= 2139095040) ? bits_0_1 : 0);
+        unsigned int bucket_2_2 = key_1_2 >> 10 & 2047;
+        if (key_1_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_2_2], 1);
+        }
+        unsigned int bits_3_2 = __as_u32(vals_a[2]);
+        unsigned int key_4_2 = ((bits_3_2 <= 2139095040) ? bits_3_2 : 0);
+        unsigned int bucket_5_1 = key_4_2 >> 10 & 2047;
+        if (key_4_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_5_1], 1);
+        }
+        unsigned int bits_6_2 = __as_u32(vals_a[3]);
+        unsigned int key_7_2 = ((bits_6_2 <= 2139095040) ? bits_6_2 : 0);
+        unsigned int bucket_8_1 = key_7_2 >> 10 & 2047;
+        if (key_7_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_8_1], 1);
+        }
+        unsigned int bits_9_1 = __as_u32(vals_a[4]);
+        unsigned int key_10_1 = ((bits_9_1 <= 2139095040) ? bits_9_1 : 0);
+        unsigned int bucket_11_1 = key_10_1 >> 10 & 2047;
+        if (key_10_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_11_1], 1);
+        }
+        unsigned int bits_12_1 = __as_u32(vals_a[5]);
+        unsigned int key_13_1 = ((bits_12_1 <= 2139095040) ? bits_12_1 : 0);
+        unsigned int bucket_14_1 = key_13_1 >> 10 & 2047;
+        if (key_13_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_14_1], 1);
+        }
+        unsigned int bits_15_1 = __as_u32(vals_a[6]);
+        unsigned int key_16_1 = ((bits_15_1 <= 2139095040) ? bits_15_1 : 0);
+        unsigned int bucket_17_1 = key_16_1 >> 10 & 2047;
+        if (key_16_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_17_1], 1);
+        }
+        unsigned int bits_18_2 = __as_u32(vals_a[7]);
+        unsigned int key_19_2 = ((bits_18_2 <= 2139095040) ? bits_18_2 : 0);
+        unsigned int bucket_20_1 = key_19_2 >> 10 & 2047;
+        if (key_19_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_20_1], 1);
+        }
+        unsigned int bits_21_1 = __as_u32(vals_a[8]);
+        unsigned int key_22_1 = ((bits_21_1 <= 2139095040) ? bits_21_1 : 0);
+        unsigned int bucket_23_1 = key_22_1 >> 10 & 2047;
+        if (key_22_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_23_1], 1);
+        }
+        unsigned int bits_24_2 = __as_u32(vals_a[9]);
+        unsigned int key_25_2 = ((bits_24_2 <= 2139095040) ? bits_24_2 : 0);
+        unsigned int bucket_26_1 = key_25_2 >> 10 & 2047;
+        if (key_25_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_26_1], 1);
+        }
+        unsigned int bits_27_1 = __as_u32(vals_a[10]);
+        unsigned int key_28_1 = ((bits_27_1 <= 2139095040) ? bits_27_1 : 0);
+        unsigned int bucket_29_1 = key_28_1 >> 10 & 2047;
+        if (key_28_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_29_1], 1);
+        }
+        unsigned int bits_30_1 = __as_u32(vals_a[11]);
+        unsigned int key_31_1 = ((bits_30_1 <= 2139095040) ? bits_30_1 : 0);
+        unsigned int bucket_32_1 = key_31_1 >> 10 & 2047;
+        if (key_31_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_32_1], 1);
+        }
+        unsigned int bits_33_1 = __as_u32(vals_a[12]);
+        unsigned int key_34_1 = ((bits_33_1 <= 2139095040) ? bits_33_1 : 0);
+        unsigned int bucket_35_1 = key_34_1 >> 10 & 2047;
+        if (key_34_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_35_1], 1);
+        }
+        unsigned int bits_36_1 = __as_u32(vals_a[13]);
+        unsigned int key_37_1 = ((bits_36_1 <= 2139095040) ? bits_36_1 : 0);
+        unsigned int bucket_38_1 = key_37_1 >> 10 & 2047;
+        if (key_37_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_38_1], 1);
+        }
+        unsigned int bits_39_2 = __as_u32(vals_a[14]);
+        unsigned int key_40_2 = ((bits_39_2 <= 2139095040) ? bits_39_2 : 0);
+        unsigned int bucket_41_1 = key_40_2 >> 10 & 2047;
+        if (key_40_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_41_1], 1);
+        }
+        unsigned int bits_42_1 = __as_u32(vals_a[15]);
+        unsigned int key_43_1 = ((bits_42_1 <= 2139095040) ? bits_42_1 : 0);
+        unsigned int bucket_44_1 = key_43_1 >> 10 & 2047;
+        if (key_43_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_44_1], 1);
+        }
+        if (nch_stream > c_3 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_12 = start + (c_3 + 2) * 8192 + tid * 4;
+                if (i_12 < vocab) {
+                    float _vec_load_32[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_12);
+                        _vec_load_32[0 + 0] = _v4.x;
+                        _vec_load_32[0 + 1] = _v4.y;
+                        _vec_load_32[0 + 2] = _v4.z;
+                        _vec_load_32[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_32[0];
+                    vals_a[1] = _vec_load_32[1];
+                    vals_a[2] = _vec_load_32[2];
+                    vals_a[3] = _vec_load_32[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_9 = start + (c_3 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_9 < vocab) {
+                    float _vec_load_33[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_9);
+                        _vec_load_33[0 + 0] = _v4.x;
+                        _vec_load_33[0 + 1] = _v4.y;
+                        _vec_load_33[0 + 2] = _v4.z;
+                        _vec_load_33[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_33[0];
+                    vals_a[5] = _vec_load_33[1];
+                    vals_a[6] = _vec_load_33[2];
+                    vals_a[7] = _vec_load_33[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_10 = start + (c_3 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_10 < vocab) {
+                    float _vec_load_34[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_10);
+                        _vec_load_34[0 + 0] = _v4.x;
+                        _vec_load_34[0 + 1] = _v4.y;
+                        _vec_load_34[0 + 2] = _v4.z;
+                        _vec_load_34[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_34[0];
+                    vals_a[9] = _vec_load_34[1];
+                    vals_a[10] = _vec_load_34[2];
+                    vals_a[11] = _vec_load_34[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_10 = start + (c_3 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_10 < vocab) {
+                    float _vec_load_35[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_10);
+                        _vec_load_35[0 + 0] = _v4.x;
+                        _vec_load_35[0 + 1] = _v4.y;
+                        _vec_load_35[0 + 2] = _v4.z;
+                        _vec_load_35[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_35[0];
+                    vals_a[13] = _vec_load_35[1];
+                    vals_a[14] = _vec_load_35[2];
+                    vals_a[15] = _vec_load_35[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_22 = start + (c_3 + 2) * 8192 + tid;
+                if (i2_22 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_22];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_8 = start + (c_3 + 2) * 8192 + 512 + tid;
+                if (i2_0_8 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_8];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_8 = start + (c_3 + 2) * 8192 + 1024 + tid;
+                if (i2_1_8 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_8];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_8 = start + (c_3 + 2) * 8192 + 1536 + tid;
+                if (i2_2_8 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_8];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_8 = start + (c_3 + 2) * 8192 + 2048 + tid;
+                if (i2_3_8 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_8];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_8 = start + (c_3 + 2) * 8192 + 2560 + tid;
+                if (i2_4_8 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_8];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_8 = start + (c_3 + 2) * 8192 + 3072 + tid;
+                if (i2_5_8 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_8];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_8 = start + (c_3 + 2) * 8192 + 3584 + tid;
+                if (i2_6_8 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_8];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_8 = start + (c_3 + 2) * 8192 + 4096 + tid;
+                if (i2_7_8 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_8];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_8 = start + (c_3 + 2) * 8192 + 4608 + tid;
+                if (i2_8_8 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_8];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_8 = start + (c_3 + 2) * 8192 + 5120 + tid;
+                if (i2_9_8 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_8];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_8 = start + (c_3 + 2) * 8192 + 5632 + tid;
+                if (i2_10_8 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_8];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_8 = start + (c_3 + 2) * 8192 + 6144 + tid;
+                if (i2_11_8 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_8];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_8 = start + (c_3 + 2) * 8192 + 6656 + tid;
+                if (i2_12_8 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_8];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_8 = start + (c_3 + 2) * 8192 + 7168 + tid;
+                if (i2_13_8 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_8];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_8 = start + (c_3 + 2) * 8192 + 7680 + tid;
+                if (i2_14_8 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_8];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_3 + 1) {
+            unsigned int bits_1_3 = __as_u32(vals_b[0]);
+            unsigned int key_2_3 = ((bits_1_3 <= 2139095040) ? bits_1_3 : 0);
+            unsigned int bucket_3_2 = key_2_3 >> 10 & 2047;
+            if (key_2_3 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_3_2], 1);
+            }
+            unsigned int bits_4_2 = __as_u32(vals_b[1]);
+            unsigned int key_5_2 = ((bits_4_2 <= 2139095040) ? bits_4_2 : 0);
+            unsigned int bucket_6_1 = key_5_2 >> 10 & 2047;
+            if (key_5_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_6_1], 1);
+            }
+            unsigned int bits_7_1 = __as_u32(vals_b[2]);
+            unsigned int key_8_1 = ((bits_7_1 <= 2139095040) ? bits_7_1 : 0);
+            unsigned int bucket_9_1 = key_8_1 >> 10 & 2047;
+            if (key_8_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_9_1], 1);
+            }
+            unsigned int bits_10_1 = __as_u32(vals_b[3]);
+            unsigned int key_11_1 = ((bits_10_1 <= 2139095040) ? bits_10_1 : 0);
+            unsigned int bucket_12_1 = key_11_1 >> 10 & 2047;
+            if (key_11_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_12_1], 1);
+            }
+            unsigned int bits_13_2 = __as_u32(vals_b[4]);
+            unsigned int key_14_2 = ((bits_13_2 <= 2139095040) ? bits_13_2 : 0);
+            unsigned int bucket_15_1 = key_14_2 >> 10 & 2047;
+            if (key_14_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_15_1], 1);
+            }
+            unsigned int bits_16_1 = __as_u32(vals_b[5]);
+            unsigned int key_17_1 = ((bits_16_1 <= 2139095040) ? bits_16_1 : 0);
+            unsigned int bucket_18_1 = key_17_1 >> 10 & 2047;
+            if (key_17_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_18_1], 1);
+            }
+            unsigned int bits_19_1 = __as_u32(vals_b[6]);
+            unsigned int key_20_1 = ((bits_19_1 <= 2139095040) ? bits_19_1 : 0);
+            unsigned int bucket_21_1 = key_20_1 >> 10 & 2047;
+            if (key_20_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_21_1], 1);
+            }
+            unsigned int bits_22_1 = __as_u32(vals_b[7]);
+            unsigned int key_23_1 = ((bits_22_1 <= 2139095040) ? bits_22_1 : 0);
+            unsigned int bucket_24_1 = key_23_1 >> 10 & 2047;
+            if (key_23_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_24_1], 1);
+            }
+            unsigned int bits_25_1 = __as_u32(vals_b[8]);
+            unsigned int key_26_1 = ((bits_25_1 <= 2139095040) ? bits_25_1 : 0);
+            unsigned int bucket_27_1 = key_26_1 >> 10 & 2047;
+            if (key_26_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_27_1], 1);
+            }
+            unsigned int bits_28_1 = __as_u32(vals_b[9]);
+            unsigned int key_29_1 = ((bits_28_1 <= 2139095040) ? bits_28_1 : 0);
+            unsigned int bucket_30_1 = key_29_1 >> 10 & 2047;
+            if (key_29_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_30_1], 1);
+            }
+            unsigned int bits_31_1 = __as_u32(vals_b[10]);
+            unsigned int key_32_1 = ((bits_31_1 <= 2139095040) ? bits_31_1 : 0);
+            unsigned int bucket_33_1 = key_32_1 >> 10 & 2047;
+            if (key_32_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_33_1], 1);
+            }
+            unsigned int bits_34_2 = __as_u32(vals_b[11]);
+            unsigned int key_35_2 = ((bits_34_2 <= 2139095040) ? bits_34_2 : 0);
+            unsigned int bucket_36_1 = key_35_2 >> 10 & 2047;
+            if (key_35_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_36_1], 1);
+            }
+            unsigned int bits_37_1 = __as_u32(vals_b[12]);
+            unsigned int key_38_1 = ((bits_37_1 <= 2139095040) ? bits_37_1 : 0);
+            unsigned int bucket_39_1 = key_38_1 >> 10 & 2047;
+            if (key_38_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_39_1], 1);
+            }
+            unsigned int bits_40_1 = __as_u32(vals_b[13]);
+            unsigned int key_41_1 = ((bits_40_1 <= 2139095040) ? bits_40_1 : 0);
+            unsigned int bucket_42_1 = key_41_1 >> 10 & 2047;
+            if (key_41_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_42_1], 1);
+            }
+            unsigned int bits_43_2 = __as_u32(vals_b[14]);
+            unsigned int key_44_2 = ((bits_43_2 <= 2139095040) ? bits_43_2 : 0);
+            unsigned int bucket_45_1 = key_44_2 >> 10 & 2047;
+            if (key_44_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_45_1], 1);
+            }
+            unsigned int bits_46_1 = __as_u32(vals_b[15]);
+            unsigned int key_47_1 = ((bits_46_1 <= 2139095040) ? bits_46_1 : 0);
+            unsigned int bucket_48_1 = key_47_1 >> 10 & 2047;
+            if (key_47_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_48_1], 1);
+            }
+        }
+    }
+    int niter_44 = (int)(n_eff + 31 >> 5);
+    for (int j_1 = 0; j_1 < niter_44; j_1++) {
+        unsigned int e_1 = (unsigned int)(j_1 * 32 + lane);
+        if (e_1 < n_eff) {
+            unsigned int key_18 = lkeys[seg_base + j_1 * 32 + lane];
+            unsigned int bucket_13 = key_18 >> 10 & 2047;
+            if (key_18 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_13], 1);
+            }
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0_45 = 0;
+    unsigned int c1_46 = 0;
+    unsigned int c2_47 = 0;
+    unsigned int c3_48 = 0;
+    {
+        unsigned int words_2[4];
+        uint32_t _mapa_6;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_6) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 3]))
+            : "r"(_mapa_6));
+        c0_45 = c0_45 + words_2[0];
+        c1_46 = c1_46 + words_2[1];
+        c2_47 = c2_47 + words_2[2];
+        c3_48 = c3_48 + words_2[3];
+        unsigned int words_0_2[4];
+        uint32_t _mapa_7;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_7) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[(0) + 3]))
+            : "r"(_mapa_7));
+        c0_45 = c0_45 + words_0_2[0];
+        c1_46 = c1_46 + words_0_2[1];
+        c2_47 = c2_47 + words_0_2[2];
+        c3_48 = c3_48 + words_0_2[3];
+    }
+    unsigned int local_49 = c0_45 + c1_46 + c2_47 + c3_48;
+    uint32_t _warp_scan_sum_u32_3 = local_49;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(16));
+    unsigned int lane_suffix_50 = _warp_scan_sum_u32_3 - local_49;
+    unsigned int _warp_redux_u32_4;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_4) : "r"(local_49));
+    unsigned int warp_total_51 = _warp_redux_u32_4;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_51;
+    }
+    __syncthreads();
+    unsigned int peer_52 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_53 = ((lane > warp) ? peer_52 : 0);
+    unsigned int _warp_redux_u32_5;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_5) : "r"(above_53));
+    unsigned int warps_above_54 = _warp_redux_u32_5;
+    unsigned int suffix_55 = lane_suffix_50 + warps_above_54;
+    if (suffix_55 < remaining && remaining <= suffix_55 + local_49) {
+        unsigned int s3_1 = suffix_55 + c3_48;
+        unsigned int s2_1 = s3_1 + c2_47;
+        unsigned int s1_1 = s2_1 + c1_46;
+        if (remaining <= s3_1) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_55;
+        } else if (remaining <= s2_1) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3_1;
+        } else {
+            if (remaining <= s1_1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2_1;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1_1;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel_56 = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 11 | bucket_sel_56;
+    unsigned int b0_57 = (unsigned int)(tid * 4);
+    unsigned int h0_58 = hist1[tid * 4];
+    unsigned int h1_59 = hist1[tid * 4 + 1];
+    unsigned int h2_60 = hist1[tid * 4 + 2];
+    unsigned int h3_61 = hist1[tid * 4 + 3];
+    unsigned int above_62 = 0;
+    unsigned int own_63 = 0;
+    if (b0_57 > bucket_sel_56) {
+        above_62 = above_62 + h0_58;
+    }
+    if (bucket_sel_56 < b0_57 + 1) {
+        above_62 = above_62 + h1_59;
+    }
+    if (bucket_sel_56 < b0_57 + 2) {
+        above_62 = above_62 + h2_60;
+    }
+    if (bucket_sel_56 < b0_57 + 3) {
+        above_62 = above_62 + h3_61;
+    }
+    if (b0_57 == bucket_sel_56) {
+        own_63 = h0_58;
+    }
+    if (b0_57 + 1 == bucket_sel_56) {
+        own_63 = h1_59;
+    }
+    if (b0_57 + 2 == bucket_sel_56) {
+        own_63 = h2_60;
+    }
+    if (b0_57 + 3 == bucket_sel_56) {
+        own_63 = h3_61;
+    }
+    uint32_t _warp_scan_sum_u32_4 = above_62;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(16));
+    unsigned int incl_64 = _warp_scan_sum_u32_4;
+    if (lane == 31) {
+        warp_sums[warp] = incl_64;
+    }
+    __syncthreads();
+    unsigned int before_65 = 0;
+    unsigned int total_66 = 0;
+    unsigned int ws_67 = warp_sums[0];
+    total_66 = total_66 + ws_67;
+    if (warp > 0) {
+        before_65 = before_65 + ws_67;
+    }
+    unsigned int ws_68 = warp_sums[1];
+    total_66 = total_66 + ws_68;
+    if (warp > 1) {
+        before_65 = before_65 + ws_68;
+    }
+    unsigned int ws_69 = warp_sums[2];
+    total_66 = total_66 + ws_69;
+    if (warp > 2) {
+        before_65 = before_65 + ws_69;
+    }
+    unsigned int ws_70 = warp_sums[3];
+    total_66 = total_66 + ws_70;
+    if (warp > 3) {
+        before_65 = before_65 + ws_70;
+    }
+    unsigned int ws_71 = warp_sums[4];
+    total_66 = total_66 + ws_71;
+    if (warp > 4) {
+        before_65 = before_65 + ws_71;
+    }
+    unsigned int ws_72 = warp_sums[5];
+    total_66 = total_66 + ws_72;
+    if (warp > 5) {
+        before_65 = before_65 + ws_72;
+    }
+    unsigned int ws_73 = warp_sums[6];
+    total_66 = total_66 + ws_73;
+    if (warp > 6) {
+        before_65 = before_65 + ws_73;
+    }
+    unsigned int ws_74 = warp_sums[7];
+    total_66 = total_66 + ws_74;
+    if (warp > 7) {
+        before_65 = before_65 + ws_74;
+    }
+    unsigned int ws_75 = warp_sums[8];
+    total_66 = total_66 + ws_75;
+    if (warp > 8) {
+        before_65 = before_65 + ws_75;
+    }
+    unsigned int ws_76 = warp_sums[9];
+    total_66 = total_66 + ws_76;
+    if (warp > 9) {
+        before_65 = before_65 + ws_76;
+    }
+    unsigned int ws_77 = warp_sums[10];
+    total_66 = total_66 + ws_77;
+    if (warp > 10) {
+        before_65 = before_65 + ws_77;
+    }
+    unsigned int ws_78 = warp_sums[11];
+    total_66 = total_66 + ws_78;
+    if (warp > 11) {
+        before_65 = before_65 + ws_78;
+    }
+    unsigned int ws_79 = warp_sums[12];
+    total_66 = total_66 + ws_79;
+    if (warp > 12) {
+        before_65 = before_65 + ws_79;
+    }
+    unsigned int ws_80 = warp_sums[13];
+    total_66 = total_66 + ws_80;
+    if (warp > 13) {
+        before_65 = before_65 + ws_80;
+    }
+    unsigned int ws_81 = warp_sums[14];
+    total_66 = total_66 + ws_81;
+    if (warp > 14) {
+        before_65 = before_65 + ws_81;
+    }
+    unsigned int ws_82 = warp_sums[15];
+    total_66 = total_66 + ws_82;
+    if (warp > 15) {
+        before_65 = before_65 + ws_82;
+    }
+    unsigned int excl_83 = before_65 + incl_64 - above_62;
+    __syncthreads();
+    gt_local = gt_local + total_66;
+    {
+        for (int i_13 = tid; i_13 < 2048; i_13 += 512) {
+            hist0[i_13] = 0;
+        }
+        __syncthreads();
+    }
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_14 = start + tid * 4;
+            if (i_14 < vocab) {
+                float _vec_load_36[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_14);
+                    _vec_load_36[0 + 0] = _v4.x;
+                    _vec_load_36[0 + 1] = _v4.y;
+                    _vec_load_36[0 + 2] = _v4.z;
+                    _vec_load_36[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_36[0];
+                vals_a[1] = _vec_load_36[1];
+                vals_a[2] = _vec_load_36[2];
+                vals_a[3] = _vec_load_36[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_10 = start + 2048 + tid * 4;
+            if (i_0_10 < vocab) {
+                float _vec_load_37[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_10);
+                    _vec_load_37[0 + 0] = _v4.x;
+                    _vec_load_37[0 + 1] = _v4.y;
+                    _vec_load_37[0 + 2] = _v4.z;
+                    _vec_load_37[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_37[0];
+                vals_a[5] = _vec_load_37[1];
+                vals_a[6] = _vec_load_37[2];
+                vals_a[7] = _vec_load_37[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_11 = start + 4096 + tid * 4;
+            if (i_1_11 < vocab) {
+                float _vec_load_38[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_11);
+                    _vec_load_38[0 + 0] = _v4.x;
+                    _vec_load_38[0 + 1] = _v4.y;
+                    _vec_load_38[0 + 2] = _v4.z;
+                    _vec_load_38[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_38[0];
+                vals_a[9] = _vec_load_38[1];
+                vals_a[10] = _vec_load_38[2];
+                vals_a[11] = _vec_load_38[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_11 = start + 6144 + tid * 4;
+            if (i_2_11 < vocab) {
+                float _vec_load_39[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_11);
+                    _vec_load_39[0 + 0] = _v4.x;
+                    _vec_load_39[0 + 1] = _v4.y;
+                    _vec_load_39[0 + 2] = _v4.z;
+                    _vec_load_39[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_39[0];
+                vals_a[13] = _vec_load_39[1];
+                vals_a[14] = _vec_load_39[2];
+                vals_a[15] = _vec_load_39[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_23 = start + tid;
+            if (i2_23 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_23];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_9 = start + 512 + tid;
+            if (i2_0_9 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_9];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_9 = start + 1024 + tid;
+            if (i2_1_9 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_9];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_9 = start + 1536 + tid;
+            if (i2_2_9 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_9];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_9 = start + 2048 + tid;
+            if (i2_3_9 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_9];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_9 = start + 2560 + tid;
+            if (i2_4_9 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_9];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_9 = start + 3072 + tid;
+            if (i2_5_9 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_9];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_9 = start + 3584 + tid;
+            if (i2_6_9 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_9];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_9 = start + 4096 + tid;
+            if (i2_7_9 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_9];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_9 = start + 4608 + tid;
+            if (i2_8_9 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_9];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_9 = start + 5120 + tid;
+            if (i2_9_9 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_9];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_9 = start + 5632 + tid;
+            if (i2_10_9 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_9];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_9 = start + 6144 + tid;
+            if (i2_11_9 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_9];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_9 = start + 6656 + tid;
+            if (i2_12_9 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_9];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_9 = start + 7168 + tid;
+            if (i2_13_9 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_9];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_9 = start + 7680 + tid;
+            if (i2_14_9 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_9];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_4 = 0; c_4 < nch_stream; c_4 += 2) {
+        if (nch_stream > c_4 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_15 = start + (c_4 + 1) * 8192 + tid * 4;
+                if (i_15 < vocab) {
+                    float _vec_load_40[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_15);
+                        _vec_load_40[0 + 0] = _v4.x;
+                        _vec_load_40[0 + 1] = _v4.y;
+                        _vec_load_40[0 + 2] = _v4.z;
+                        _vec_load_40[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_40[0];
+                    vals_b[1] = _vec_load_40[1];
+                    vals_b[2] = _vec_load_40[2];
+                    vals_b[3] = _vec_load_40[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_11 = start + (c_4 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_11 < vocab) {
+                    float _vec_load_41[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_11);
+                        _vec_load_41[0 + 0] = _v4.x;
+                        _vec_load_41[0 + 1] = _v4.y;
+                        _vec_load_41[0 + 2] = _v4.z;
+                        _vec_load_41[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_41[0];
+                    vals_b[5] = _vec_load_41[1];
+                    vals_b[6] = _vec_load_41[2];
+                    vals_b[7] = _vec_load_41[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_12 = start + (c_4 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_12 < vocab) {
+                    float _vec_load_42[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_12);
+                        _vec_load_42[0 + 0] = _v4.x;
+                        _vec_load_42[0 + 1] = _v4.y;
+                        _vec_load_42[0 + 2] = _v4.z;
+                        _vec_load_42[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_42[0];
+                    vals_b[9] = _vec_load_42[1];
+                    vals_b[10] = _vec_load_42[2];
+                    vals_b[11] = _vec_load_42[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_12 = start + (c_4 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_12 < vocab) {
+                    float _vec_load_43[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_12);
+                        _vec_load_43[0 + 0] = _v4.x;
+                        _vec_load_43[0 + 1] = _v4.y;
+                        _vec_load_43[0 + 2] = _v4.z;
+                        _vec_load_43[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_43[0];
+                    vals_b[13] = _vec_load_43[1];
+                    vals_b[14] = _vec_load_43[2];
+                    vals_b[15] = _vec_load_43[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_24 = start + (c_4 + 1) * 8192 + tid;
+                if (i2_24 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_24];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_10 = start + (c_4 + 1) * 8192 + 512 + tid;
+                if (i2_0_10 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_10];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_10 = start + (c_4 + 1) * 8192 + 1024 + tid;
+                if (i2_1_10 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_10];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_10 = start + (c_4 + 1) * 8192 + 1536 + tid;
+                if (i2_2_10 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_10];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_10 = start + (c_4 + 1) * 8192 + 2048 + tid;
+                if (i2_3_10 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_10];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_10 = start + (c_4 + 1) * 8192 + 2560 + tid;
+                if (i2_4_10 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_10];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_10 = start + (c_4 + 1) * 8192 + 3072 + tid;
+                if (i2_5_10 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_10];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_10 = start + (c_4 + 1) * 8192 + 3584 + tid;
+                if (i2_6_10 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_10];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_10 = start + (c_4 + 1) * 8192 + 4096 + tid;
+                if (i2_7_10 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_10];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_10 = start + (c_4 + 1) * 8192 + 4608 + tid;
+                if (i2_8_10 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_10];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_10 = start + (c_4 + 1) * 8192 + 5120 + tid;
+                if (i2_9_10 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_10];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_10 = start + (c_4 + 1) * 8192 + 5632 + tid;
+                if (i2_10_10 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_10];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_10 = start + (c_4 + 1) * 8192 + 6144 + tid;
+                if (i2_11_10 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_10];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_10 = start + (c_4 + 1) * 8192 + 6656 + tid;
+                if (i2_12_10 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_10];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_10 = start + (c_4 + 1) * 8192 + 7168 + tid;
+                if (i2_13_10 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_10];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_10 = start + (c_4 + 1) * 8192 + 7680 + tid;
+                if (i2_14_10 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_10];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_17 = __as_u32(vals_a[0]);
+        unsigned int key_21 = ((bits_17 <= 2139095040) ? bits_17 : 0);
+        unsigned int bucket_16 = key_21 & 1023;
+        if (key_21 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_16], 1);
+        }
+        unsigned int bits_0_2 = __as_u32(vals_a[1]);
+        unsigned int key_1_3 = ((bits_0_2 <= 2139095040) ? bits_0_2 : 0);
+        unsigned int bucket_2_3 = key_1_3 & 1023;
+        if (key_1_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_2_3], 1);
+        }
+        unsigned int bits_3_3 = __as_u32(vals_a[2]);
+        unsigned int key_4_3 = ((bits_3_3 <= 2139095040) ? bits_3_3 : 0);
+        unsigned int bucket_5_2 = key_4_3 & 1023;
+        if (key_4_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_5_2], 1);
+        }
+        unsigned int bits_6_3 = __as_u32(vals_a[3]);
+        unsigned int key_7_3 = ((bits_6_3 <= 2139095040) ? bits_6_3 : 0);
+        unsigned int bucket_8_2 = key_7_3 & 1023;
+        if (key_7_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_8_2], 1);
+        }
+        unsigned int bits_9_2 = __as_u32(vals_a[4]);
+        unsigned int key_10_2 = ((bits_9_2 <= 2139095040) ? bits_9_2 : 0);
+        unsigned int bucket_11_2 = key_10_2 & 1023;
+        if (key_10_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_11_2], 1);
+        }
+        unsigned int bits_12_2 = __as_u32(vals_a[5]);
+        unsigned int key_13_2 = ((bits_12_2 <= 2139095040) ? bits_12_2 : 0);
+        unsigned int bucket_14_2 = key_13_2 & 1023;
+        if (key_13_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_14_2], 1);
+        }
+        unsigned int bits_15_2 = __as_u32(vals_a[6]);
+        unsigned int key_16_2 = ((bits_15_2 <= 2139095040) ? bits_15_2 : 0);
+        unsigned int bucket_17_2 = key_16_2 & 1023;
+        if (key_16_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_17_2], 1);
+        }
+        unsigned int bits_18_3 = __as_u32(vals_a[7]);
+        unsigned int key_19_3 = ((bits_18_3 <= 2139095040) ? bits_18_3 : 0);
+        unsigned int bucket_20_2 = key_19_3 & 1023;
+        if (key_19_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_20_2], 1);
+        }
+        unsigned int bits_21_2 = __as_u32(vals_a[8]);
+        unsigned int key_22_2 = ((bits_21_2 <= 2139095040) ? bits_21_2 : 0);
+        unsigned int bucket_23_2 = key_22_2 & 1023;
+        if (key_22_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_23_2], 1);
+        }
+        unsigned int bits_24_3 = __as_u32(vals_a[9]);
+        unsigned int key_25_3 = ((bits_24_3 <= 2139095040) ? bits_24_3 : 0);
+        unsigned int bucket_26_2 = key_25_3 & 1023;
+        if (key_25_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_26_2], 1);
+        }
+        unsigned int bits_27_2 = __as_u32(vals_a[10]);
+        unsigned int key_28_2 = ((bits_27_2 <= 2139095040) ? bits_27_2 : 0);
+        unsigned int bucket_29_2 = key_28_2 & 1023;
+        if (key_28_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_29_2], 1);
+        }
+        unsigned int bits_30_2 = __as_u32(vals_a[11]);
+        unsigned int key_31_2 = ((bits_30_2 <= 2139095040) ? bits_30_2 : 0);
+        unsigned int bucket_32_2 = key_31_2 & 1023;
+        if (key_31_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_32_2], 1);
+        }
+        unsigned int bits_33_2 = __as_u32(vals_a[12]);
+        unsigned int key_34_2 = ((bits_33_2 <= 2139095040) ? bits_33_2 : 0);
+        unsigned int bucket_35_2 = key_34_2 & 1023;
+        if (key_34_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_35_2], 1);
+        }
+        unsigned int bits_36_2 = __as_u32(vals_a[13]);
+        unsigned int key_37_2 = ((bits_36_2 <= 2139095040) ? bits_36_2 : 0);
+        unsigned int bucket_38_2 = key_37_2 & 1023;
+        if (key_37_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_38_2], 1);
+        }
+        unsigned int bits_39_3 = __as_u32(vals_a[14]);
+        unsigned int key_40_3 = ((bits_39_3 <= 2139095040) ? bits_39_3 : 0);
+        unsigned int bucket_41_2 = key_40_3 & 1023;
+        if (key_40_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_41_2], 1);
+        }
+        unsigned int bits_42_2 = __as_u32(vals_a[15]);
+        unsigned int key_43_2 = ((bits_42_2 <= 2139095040) ? bits_42_2 : 0);
+        unsigned int bucket_44_2 = key_43_2 & 1023;
+        if (key_43_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_44_2], 1);
+        }
+        if (nch_stream > c_4 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_16 = start + (c_4 + 2) * 8192 + tid * 4;
+                if (i_16 < vocab) {
+                    float _vec_load_44[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_16);
+                        _vec_load_44[0 + 0] = _v4.x;
+                        _vec_load_44[0 + 1] = _v4.y;
+                        _vec_load_44[0 + 2] = _v4.z;
+                        _vec_load_44[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_44[0];
+                    vals_a[1] = _vec_load_44[1];
+                    vals_a[2] = _vec_load_44[2];
+                    vals_a[3] = _vec_load_44[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_12 = start + (c_4 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_12 < vocab) {
+                    float _vec_load_45[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_12);
+                        _vec_load_45[0 + 0] = _v4.x;
+                        _vec_load_45[0 + 1] = _v4.y;
+                        _vec_load_45[0 + 2] = _v4.z;
+                        _vec_load_45[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_45[0];
+                    vals_a[5] = _vec_load_45[1];
+                    vals_a[6] = _vec_load_45[2];
+                    vals_a[7] = _vec_load_45[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_13 = start + (c_4 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_13 < vocab) {
+                    float _vec_load_46[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_13);
+                        _vec_load_46[0 + 0] = _v4.x;
+                        _vec_load_46[0 + 1] = _v4.y;
+                        _vec_load_46[0 + 2] = _v4.z;
+                        _vec_load_46[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_46[0];
+                    vals_a[9] = _vec_load_46[1];
+                    vals_a[10] = _vec_load_46[2];
+                    vals_a[11] = _vec_load_46[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_13 = start + (c_4 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_13 < vocab) {
+                    float _vec_load_47[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_13);
+                        _vec_load_47[0 + 0] = _v4.x;
+                        _vec_load_47[0 + 1] = _v4.y;
+                        _vec_load_47[0 + 2] = _v4.z;
+                        _vec_load_47[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_47[0];
+                    vals_a[13] = _vec_load_47[1];
+                    vals_a[14] = _vec_load_47[2];
+                    vals_a[15] = _vec_load_47[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_25 = start + (c_4 + 2) * 8192 + tid;
+                if (i2_25 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_25];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_11 = start + (c_4 + 2) * 8192 + 512 + tid;
+                if (i2_0_11 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_11];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_11 = start + (c_4 + 2) * 8192 + 1024 + tid;
+                if (i2_1_11 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_11];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_11 = start + (c_4 + 2) * 8192 + 1536 + tid;
+                if (i2_2_11 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_11];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_11 = start + (c_4 + 2) * 8192 + 2048 + tid;
+                if (i2_3_11 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_11];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_11 = start + (c_4 + 2) * 8192 + 2560 + tid;
+                if (i2_4_11 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_11];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_11 = start + (c_4 + 2) * 8192 + 3072 + tid;
+                if (i2_5_11 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_11];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_11 = start + (c_4 + 2) * 8192 + 3584 + tid;
+                if (i2_6_11 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_11];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_11 = start + (c_4 + 2) * 8192 + 4096 + tid;
+                if (i2_7_11 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_11];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_11 = start + (c_4 + 2) * 8192 + 4608 + tid;
+                if (i2_8_11 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_11];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_11 = start + (c_4 + 2) * 8192 + 5120 + tid;
+                if (i2_9_11 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_11];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_11 = start + (c_4 + 2) * 8192 + 5632 + tid;
+                if (i2_10_11 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_11];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_11 = start + (c_4 + 2) * 8192 + 6144 + tid;
+                if (i2_11_11 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_11];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_11 = start + (c_4 + 2) * 8192 + 6656 + tid;
+                if (i2_12_11 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_11];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_11 = start + (c_4 + 2) * 8192 + 7168 + tid;
+                if (i2_13_11 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_11];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_11 = start + (c_4 + 2) * 8192 + 7680 + tid;
+                if (i2_14_11 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_11];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_4 + 1) {
+            unsigned int bits_1_4 = __as_u32(vals_b[0]);
+            unsigned int key_2_4 = ((bits_1_4 <= 2139095040) ? bits_1_4 : 0);
+            unsigned int bucket_3_3 = key_2_4 & 1023;
+            if (key_2_4 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_3_3], 1);
+            }
+            unsigned int bits_4_3 = __as_u32(vals_b[1]);
+            unsigned int key_5_3 = ((bits_4_3 <= 2139095040) ? bits_4_3 : 0);
+            unsigned int bucket_6_2 = key_5_3 & 1023;
+            if (key_5_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_6_2], 1);
+            }
+            unsigned int bits_7_2 = __as_u32(vals_b[2]);
+            unsigned int key_8_2 = ((bits_7_2 <= 2139095040) ? bits_7_2 : 0);
+            unsigned int bucket_9_2 = key_8_2 & 1023;
+            if (key_8_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_9_2], 1);
+            }
+            unsigned int bits_10_2 = __as_u32(vals_b[3]);
+            unsigned int key_11_2 = ((bits_10_2 <= 2139095040) ? bits_10_2 : 0);
+            unsigned int bucket_12_2 = key_11_2 & 1023;
+            if (key_11_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_12_2], 1);
+            }
+            unsigned int bits_13_3 = __as_u32(vals_b[4]);
+            unsigned int key_14_3 = ((bits_13_3 <= 2139095040) ? bits_13_3 : 0);
+            unsigned int bucket_15_2 = key_14_3 & 1023;
+            if (key_14_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_15_2], 1);
+            }
+            unsigned int bits_16_2 = __as_u32(vals_b[5]);
+            unsigned int key_17_2 = ((bits_16_2 <= 2139095040) ? bits_16_2 : 0);
+            unsigned int bucket_18_2 = key_17_2 & 1023;
+            if (key_17_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_18_2], 1);
+            }
+            unsigned int bits_19_2 = __as_u32(vals_b[6]);
+            unsigned int key_20_2 = ((bits_19_2 <= 2139095040) ? bits_19_2 : 0);
+            unsigned int bucket_21_2 = key_20_2 & 1023;
+            if (key_20_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_21_2], 1);
+            }
+            unsigned int bits_22_2 = __as_u32(vals_b[7]);
+            unsigned int key_23_2 = ((bits_22_2 <= 2139095040) ? bits_22_2 : 0);
+            unsigned int bucket_24_2 = key_23_2 & 1023;
+            if (key_23_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_24_2], 1);
+            }
+            unsigned int bits_25_2 = __as_u32(vals_b[8]);
+            unsigned int key_26_2 = ((bits_25_2 <= 2139095040) ? bits_25_2 : 0);
+            unsigned int bucket_27_2 = key_26_2 & 1023;
+            if (key_26_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_27_2], 1);
+            }
+            unsigned int bits_28_2 = __as_u32(vals_b[9]);
+            unsigned int key_29_2 = ((bits_28_2 <= 2139095040) ? bits_28_2 : 0);
+            unsigned int bucket_30_2 = key_29_2 & 1023;
+            if (key_29_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_30_2], 1);
+            }
+            unsigned int bits_31_2 = __as_u32(vals_b[10]);
+            unsigned int key_32_2 = ((bits_31_2 <= 2139095040) ? bits_31_2 : 0);
+            unsigned int bucket_33_2 = key_32_2 & 1023;
+            if (key_32_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_33_2], 1);
+            }
+            unsigned int bits_34_3 = __as_u32(vals_b[11]);
+            unsigned int key_35_3 = ((bits_34_3 <= 2139095040) ? bits_34_3 : 0);
+            unsigned int bucket_36_2 = key_35_3 & 1023;
+            if (key_35_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_36_2], 1);
+            }
+            unsigned int bits_37_2 = __as_u32(vals_b[12]);
+            unsigned int key_38_2 = ((bits_37_2 <= 2139095040) ? bits_37_2 : 0);
+            unsigned int bucket_39_2 = key_38_2 & 1023;
+            if (key_38_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_39_2], 1);
+            }
+            unsigned int bits_40_2 = __as_u32(vals_b[13]);
+            unsigned int key_41_2 = ((bits_40_2 <= 2139095040) ? bits_40_2 : 0);
+            unsigned int bucket_42_2 = key_41_2 & 1023;
+            if (key_41_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_42_2], 1);
+            }
+            unsigned int bits_43_3 = __as_u32(vals_b[14]);
+            unsigned int key_44_3 = ((bits_43_3 <= 2139095040) ? bits_43_3 : 0);
+            unsigned int bucket_45_2 = key_44_3 & 1023;
+            if (key_44_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_45_2], 1);
+            }
+            unsigned int bits_46_2 = __as_u32(vals_b[15]);
+            unsigned int key_47_2 = ((bits_46_2 <= 2139095040) ? bits_46_2 : 0);
+            unsigned int bucket_48_2 = key_47_2 & 1023;
+            if (key_47_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_48_2], 1);
+            }
+        }
+    }
+    int niter_84 = (int)(n_eff + 31 >> 5);
+    for (int j_2 = 0; j_2 < niter_84; j_2++) {
+        unsigned int e_2 = (unsigned int)(j_2 * 32 + lane);
+        if (e_2 < n_eff) {
+            unsigned int key_27 = lkeys[seg_base + j_2 * 32 + lane];
+            unsigned int bucket_19 = key_27 & 1023;
+            if (key_27 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_19], 1);
+            }
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0_85 = 0;
+    unsigned int c1_86 = 0;
+    unsigned int c2_87 = 0;
+    unsigned int c3_88 = 0;
+    {
+        unsigned int words_3[4];
+        uint32_t _mapa_8;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_8) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 3]))
+            : "r"(_mapa_8));
+        c0_85 = c0_85 + words_3[0];
+        c1_86 = c1_86 + words_3[1];
+        c2_87 = c2_87 + words_3[2];
+        c3_88 = c3_88 + words_3[3];
+        unsigned int words_0_3[4];
+        uint32_t _mapa_9;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_9) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[(0) + 3]))
+            : "r"(_mapa_9));
+        c0_85 = c0_85 + words_0_3[0];
+        c1_86 = c1_86 + words_0_3[1];
+        c2_87 = c2_87 + words_0_3[2];
+        c3_88 = c3_88 + words_0_3[3];
+    }
+    unsigned int local_89 = c0_85 + c1_86 + c2_87 + c3_88;
+    uint32_t _warp_scan_sum_u32_5 = local_89;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(16));
+    unsigned int lane_suffix_90 = _warp_scan_sum_u32_5 - local_89;
+    unsigned int _warp_redux_u32_6;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_6) : "r"(local_89));
+    unsigned int warp_total_91 = _warp_redux_u32_6;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_91;
+    }
+    __syncthreads();
+    unsigned int peer_92 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_93 = ((lane > warp) ? peer_92 : 0);
+    unsigned int _warp_redux_u32_7;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_7) : "r"(above_93));
+    unsigned int warps_above_94 = _warp_redux_u32_7;
+    unsigned int suffix_95 = lane_suffix_90 + warps_above_94;
+    if (suffix_95 < remaining && remaining <= suffix_95 + local_89) {
+        unsigned int s3_2 = suffix_95 + c3_88;
+        unsigned int s2_2 = s3_2 + c2_87;
+        unsigned int s1_2 = s2_2 + c1_86;
+        if (remaining <= s3_2) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_95;
+        } else if (remaining <= s2_2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3_2;
+        } else {
+            if (remaining <= s1_2) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2_2;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1_2;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel_96 = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 10 | bucket_sel_96;
+    unsigned int b0_97 = (unsigned int)(tid * 4);
+    unsigned int h0_98 = hist0[tid * 4];
+    unsigned int h1_99 = hist0[tid * 4 + 1];
+    unsigned int h2_100 = hist0[tid * 4 + 2];
+    unsigned int h3_101 = hist0[tid * 4 + 3];
+    unsigned int above_102 = 0;
+    unsigned int own_103 = 0;
+    if (b0_97 > bucket_sel_96) {
+        above_102 = above_102 + h0_98;
+    }
+    if (bucket_sel_96 < b0_97 + 1) {
+        above_102 = above_102 + h1_99;
+    }
+    if (bucket_sel_96 < b0_97 + 2) {
+        above_102 = above_102 + h2_100;
+    }
+    if (bucket_sel_96 < b0_97 + 3) {
+        above_102 = above_102 + h3_101;
+    }
+    if (b0_97 == bucket_sel_96) {
+        own_103 = h0_98;
+    }
+    if (b0_97 + 1 == bucket_sel_96) {
+        own_103 = h1_99;
+    }
+    if (b0_97 + 2 == bucket_sel_96) {
+        own_103 = h2_100;
+    }
+    if (b0_97 + 3 == bucket_sel_96) {
+        own_103 = h3_101;
+    }
+    uint32_t _warp_scan_sum_u32_6 = above_102;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(16));
+    unsigned int incl_104 = _warp_scan_sum_u32_6;
+    if (lane == 31) {
+        warp_sums[warp] = incl_104;
+    }
+    __syncthreads();
+    unsigned int before_105 = 0;
+    unsigned int total_106 = 0;
+    unsigned int ws_107 = warp_sums[0];
+    total_106 = total_106 + ws_107;
+    if (warp > 0) {
+        before_105 = before_105 + ws_107;
+    }
+    unsigned int ws_108 = warp_sums[1];
+    total_106 = total_106 + ws_108;
+    if (warp > 1) {
+        before_105 = before_105 + ws_108;
+    }
+    unsigned int ws_109 = warp_sums[2];
+    total_106 = total_106 + ws_109;
+    if (warp > 2) {
+        before_105 = before_105 + ws_109;
+    }
+    unsigned int ws_110 = warp_sums[3];
+    total_106 = total_106 + ws_110;
+    if (warp > 3) {
+        before_105 = before_105 + ws_110;
+    }
+    unsigned int ws_111 = warp_sums[4];
+    total_106 = total_106 + ws_111;
+    if (warp > 4) {
+        before_105 = before_105 + ws_111;
+    }
+    unsigned int ws_112 = warp_sums[5];
+    total_106 = total_106 + ws_112;
+    if (warp > 5) {
+        before_105 = before_105 + ws_112;
+    }
+    unsigned int ws_113 = warp_sums[6];
+    total_106 = total_106 + ws_113;
+    if (warp > 6) {
+        before_105 = before_105 + ws_113;
+    }
+    unsigned int ws_114 = warp_sums[7];
+    total_106 = total_106 + ws_114;
+    if (warp > 7) {
+        before_105 = before_105 + ws_114;
+    }
+    unsigned int ws_115 = warp_sums[8];
+    total_106 = total_106 + ws_115;
+    if (warp > 8) {
+        before_105 = before_105 + ws_115;
+    }
+    unsigned int ws_116 = warp_sums[9];
+    total_106 = total_106 + ws_116;
+    if (warp > 9) {
+        before_105 = before_105 + ws_116;
+    }
+    unsigned int ws_117 = warp_sums[10];
+    total_106 = total_106 + ws_117;
+    if (warp > 10) {
+        before_105 = before_105 + ws_117;
+    }
+    unsigned int ws_118 = warp_sums[11];
+    total_106 = total_106 + ws_118;
+    if (warp > 11) {
+        before_105 = before_105 + ws_118;
+    }
+    unsigned int ws_119 = warp_sums[12];
+    total_106 = total_106 + ws_119;
+    if (warp > 12) {
+        before_105 = before_105 + ws_119;
+    }
+    unsigned int ws_120 = warp_sums[13];
+    total_106 = total_106 + ws_120;
+    if (warp > 13) {
+        before_105 = before_105 + ws_120;
+    }
+    unsigned int ws_121 = warp_sums[14];
+    total_106 = total_106 + ws_121;
+    if (warp > 14) {
+        before_105 = before_105 + ws_121;
+    }
+    unsigned int ws_122 = warp_sums[15];
+    total_106 = total_106 + ws_122;
+    if (warp > 15) {
+        before_105 = before_105 + ws_122;
+    }
+    unsigned int excl_123 = before_105 + incl_104 - above_102;
+    __syncthreads();
+    gt_local = gt_local + total_106;
+    {
+        if (own_103 > 0) {
+            scal[4] = own_103;
+        }
+        __syncthreads();
+        eq_local = scal[4];
+    }
+    unsigned int threshold = prefix;
+    if (threshold == 0) {
+        if (nch_stream > 0) {
+            eq_local = eq_local - pad;
+        }
+    }
+    unsigned int gt = 0;
+    unsigned int ties = 0;
+    int niter_124 = (int)(n_eff + 31 >> 5);
+    for (int j_3 = 0; j_3 < niter_124; j_3++) {
+        unsigned int e_3 = (unsigned int)(j_3 * 32 + lane);
+        bool valid = e_3 < n_eff;
+        unsigned int key_33 = ((valid) ? lkeys[seg_base + j_3 * 32 + lane] : 0);
+        unsigned int _vote_33 = __ballot_sync(0xFFFFFFFF, valid && key_33 > threshold);
+        unsigned int mg = _vote_33;
+        unsigned int _vote_34 = __ballot_sync(0xFFFFFFFF, valid && key_33 == threshold);
+        unsigned int mt = _vote_34;
+        int _popc_64 = __popc(mg);
+        gt = gt + (unsigned int)_popc_64;
+        int _popc_65 = __popc(mt);
+        ties = ties + (unsigned int)_popc_65;
+    }
+    if (lane == 0) {
+        scal[32 + warp] = gt;
+        scal[48 + warp] = ties;
+    }
+    __syncthreads();
+    unsigned int before_125 = 0;
+    unsigned int total_126 = 0;
+    unsigned int v_127 = scal[32];
+    total_126 = total_126 + v_127;
+    if (warp > 0) {
+        before_125 = before_125 + v_127;
+    }
+    unsigned int v_128 = scal[33];
+    total_126 = total_126 + v_128;
+    if (warp > 1) {
+        before_125 = before_125 + v_128;
+    }
+    unsigned int v_129 = scal[34];
+    total_126 = total_126 + v_129;
+    if (warp > 2) {
+        before_125 = before_125 + v_129;
+    }
+    unsigned int v_130 = scal[35];
+    total_126 = total_126 + v_130;
+    if (warp > 3) {
+        before_125 = before_125 + v_130;
+    }
+    unsigned int v_131 = scal[36];
+    total_126 = total_126 + v_131;
+    if (warp > 4) {
+        before_125 = before_125 + v_131;
+    }
+    unsigned int v_132 = scal[37];
+    total_126 = total_126 + v_132;
+    if (warp > 5) {
+        before_125 = before_125 + v_132;
+    }
+    unsigned int v_133 = scal[38];
+    total_126 = total_126 + v_133;
+    if (warp > 6) {
+        before_125 = before_125 + v_133;
+    }
+    unsigned int v_134 = scal[39];
+    total_126 = total_126 + v_134;
+    if (warp > 7) {
+        before_125 = before_125 + v_134;
+    }
+    unsigned int v_135 = scal[40];
+    total_126 = total_126 + v_135;
+    if (warp > 8) {
+        before_125 = before_125 + v_135;
+    }
+    unsigned int v_136 = scal[41];
+    total_126 = total_126 + v_136;
+    if (warp > 9) {
+        before_125 = before_125 + v_136;
+    }
+    unsigned int v_137 = scal[42];
+    total_126 = total_126 + v_137;
+    if (warp > 10) {
+        before_125 = before_125 + v_137;
+    }
+    unsigned int v_138 = scal[43];
+    total_126 = total_126 + v_138;
+    if (warp > 11) {
+        before_125 = before_125 + v_138;
+    }
+    unsigned int v_139 = scal[44];
+    total_126 = total_126 + v_139;
+    if (warp > 12) {
+        before_125 = before_125 + v_139;
+    }
+    unsigned int v_140 = scal[45];
+    total_126 = total_126 + v_140;
+    if (warp > 13) {
+        before_125 = before_125 + v_140;
+    }
+    unsigned int v_141 = scal[46];
+    total_126 = total_126 + v_141;
+    if (warp > 14) {
+        before_125 = before_125 + v_141;
+    }
+    unsigned int v_142 = scal[47];
+    total_126 = total_126 + v_142;
+    if (warp > 15) {
+        before_125 = before_125 + v_142;
+    }
+    unsigned int before_143 = 0;
+    unsigned int total_144 = 0;
+    unsigned int v_145 = scal[48];
+    total_144 = total_144 + v_145;
+    if (warp > 0) {
+        before_143 = before_143 + v_145;
+    }
+    unsigned int v_146 = scal[49];
+    total_144 = total_144 + v_146;
+    if (warp > 1) {
+        before_143 = before_143 + v_146;
+    }
+    unsigned int v_147 = scal[50];
+    total_144 = total_144 + v_147;
+    if (warp > 2) {
+        before_143 = before_143 + v_147;
+    }
+    unsigned int v_148 = scal[51];
+    total_144 = total_144 + v_148;
+    if (warp > 3) {
+        before_143 = before_143 + v_148;
+    }
+    unsigned int v_149 = scal[52];
+    total_144 = total_144 + v_149;
+    if (warp > 4) {
+        before_143 = before_143 + v_149;
+    }
+    unsigned int v_150 = scal[53];
+    total_144 = total_144 + v_150;
+    if (warp > 5) {
+        before_143 = before_143 + v_150;
+    }
+    unsigned int v_151 = scal[54];
+    total_144 = total_144 + v_151;
+    if (warp > 6) {
+        before_143 = before_143 + v_151;
+    }
+    unsigned int v_152 = scal[55];
+    total_144 = total_144 + v_152;
+    if (warp > 7) {
+        before_143 = before_143 + v_152;
+    }
+    unsigned int v_153 = scal[56];
+    total_144 = total_144 + v_153;
+    if (warp > 8) {
+        before_143 = before_143 + v_153;
+    }
+    unsigned int v_154 = scal[57];
+    total_144 = total_144 + v_154;
+    if (warp > 9) {
+        before_143 = before_143 + v_154;
+    }
+    unsigned int v_155 = scal[58];
+    total_144 = total_144 + v_155;
+    if (warp > 10) {
+        before_143 = before_143 + v_155;
+    }
+    unsigned int v_156 = scal[59];
+    total_144 = total_144 + v_156;
+    if (warp > 11) {
+        before_143 = before_143 + v_156;
+    }
+    unsigned int v_157 = scal[60];
+    total_144 = total_144 + v_157;
+    if (warp > 12) {
+        before_143 = before_143 + v_157;
+    }
+    unsigned int v_158 = scal[61];
+    total_144 = total_144 + v_158;
+    if (warp > 13) {
+        before_143 = before_143 + v_158;
+    }
+    unsigned int v_159 = scal[62];
+    total_144 = total_144 + v_159;
+    if (warp > 14) {
+        before_143 = before_143 + v_159;
+    }
+    unsigned int v_160 = scal[63];
+    total_144 = total_144 + v_160;
+    if (warp > 15) {
+        before_143 = before_143 + v_160;
+    }
+    unsigned int gt_n = ((use_list) ? total_126 : gt_local);
+    unsigned int eq_n = ((use_list) ? total_144 : eq_local);
+    if (tid == 0) {
+        scal[2] = gt_n;
+        scal[3] = eq_n;
+    }
+    __syncthreads();
+    unsigned int gt_prefix = 0;
+    unsigned int eq_prefix = 0;
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        for (int r_1 = 0; r_1 < 2; r_1++) {
+            if (rank > r_1) {
+                uint32_t _mapa_10;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_10) : "r"(scal_addr + 8), "r"(r_1));
+                unsigned int _cluster_ld_2;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_2) : "r"(_mapa_10) : "memory");
+                unsigned int gt_peer = _cluster_ld_2;
+                uint32_t _mapa_11;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_11) : "r"(scal_addr + 12), "r"(r_1));
+                unsigned int _cluster_ld_3;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_3) : "r"(_mapa_11) : "memory");
+                unsigned int eq_peer = _cluster_ld_3;
+                gt_prefix = gt_prefix + gt_peer;
+                eq_prefix = eq_prefix + eq_peer;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int gt_total = k_u - remaining;
+    unsigned int _min_2 = ((eq_n) < (remaining - eq_prefix) ? (eq_n) : (remaining - eq_prefix));
+    unsigned int take_rem = ((eq_prefix < remaining) ? _min_2 : 0);
+    unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
+    unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_17 = start + tid * 4;
+            if (i_17 < vocab) {
+                float _vec_load_48[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_17);
+                    _vec_load_48[0 + 0] = _v4.x;
+                    _vec_load_48[0 + 1] = _v4.y;
+                    _vec_load_48[0 + 2] = _v4.z;
+                    _vec_load_48[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_48[0];
+                vals_a[1] = _vec_load_48[1];
+                vals_a[2] = _vec_load_48[2];
+                vals_a[3] = _vec_load_48[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_13 = start + 2048 + tid * 4;
+            if (i_0_13 < vocab) {
+                float _vec_load_49[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_13);
+                    _vec_load_49[0 + 0] = _v4.x;
+                    _vec_load_49[0 + 1] = _v4.y;
+                    _vec_load_49[0 + 2] = _v4.z;
+                    _vec_load_49[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_49[0];
+                vals_a[5] = _vec_load_49[1];
+                vals_a[6] = _vec_load_49[2];
+                vals_a[7] = _vec_load_49[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_14 = start + 4096 + tid * 4;
+            if (i_1_14 < vocab) {
+                float _vec_load_50[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_14);
+                    _vec_load_50[0 + 0] = _v4.x;
+                    _vec_load_50[0 + 1] = _v4.y;
+                    _vec_load_50[0 + 2] = _v4.z;
+                    _vec_load_50[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_50[0];
+                vals_a[9] = _vec_load_50[1];
+                vals_a[10] = _vec_load_50[2];
+                vals_a[11] = _vec_load_50[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_14 = start + 6144 + tid * 4;
+            if (i_2_14 < vocab) {
+                float _vec_load_51[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_14);
+                    _vec_load_51[0 + 0] = _v4.x;
+                    _vec_load_51[0 + 1] = _v4.y;
+                    _vec_load_51[0 + 2] = _v4.z;
+                    _vec_load_51[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_51[0];
+                vals_a[13] = _vec_load_51[1];
+                vals_a[14] = _vec_load_51[2];
+                vals_a[15] = _vec_load_51[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_26 = start + tid;
+            if (i2_26 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_26];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_12 = start + 512 + tid;
+            if (i2_0_12 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_12];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_12 = start + 1024 + tid;
+            if (i2_1_12 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_12];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_12 = start + 1536 + tid;
+            if (i2_2_12 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_12];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_12 = start + 2048 + tid;
+            if (i2_3_12 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_12];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_12 = start + 2560 + tid;
+            if (i2_4_12 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_12];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_12 = start + 3072 + tid;
+            if (i2_5_12 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_12];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_12 = start + 3584 + tid;
+            if (i2_6_12 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_12];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_12 = start + 4096 + tid;
+            if (i2_7_12 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_12];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_12 = start + 4608 + tid;
+            if (i2_8_12 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_12];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_12 = start + 5120 + tid;
+            if (i2_9_12 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_12];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_12 = start + 5632 + tid;
+            if (i2_10_12 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_12];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_12 = start + 6144 + tid;
+            if (i2_11_12 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_12];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_12 = start + 6656 + tid;
+            if (i2_12_12 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_12];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_12 = start + 7168 + tid;
+            if (i2_13_12 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_12];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_12 = start + 7680 + tid;
+            if (i2_14_12 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_12];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_5 = 0; c_5 < nch_stream; c_5 += 2) {
+        if (nch_stream > c_5 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_18 = start + (c_5 + 1) * 8192 + tid * 4;
+                if (i_18 < vocab) {
+                    float _vec_load_52[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_18);
+                        _vec_load_52[0 + 0] = _v4.x;
+                        _vec_load_52[0 + 1] = _v4.y;
+                        _vec_load_52[0 + 2] = _v4.z;
+                        _vec_load_52[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_52[0];
+                    vals_b[1] = _vec_load_52[1];
+                    vals_b[2] = _vec_load_52[2];
+                    vals_b[3] = _vec_load_52[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_14 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_14 < vocab) {
+                    float _vec_load_53[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_14);
+                        _vec_load_53[0 + 0] = _v4.x;
+                        _vec_load_53[0 + 1] = _v4.y;
+                        _vec_load_53[0 + 2] = _v4.z;
+                        _vec_load_53[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_53[0];
+                    vals_b[5] = _vec_load_53[1];
+                    vals_b[6] = _vec_load_53[2];
+                    vals_b[7] = _vec_load_53[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_15 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_15 < vocab) {
+                    float _vec_load_54[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_15);
+                        _vec_load_54[0 + 0] = _v4.x;
+                        _vec_load_54[0 + 1] = _v4.y;
+                        _vec_load_54[0 + 2] = _v4.z;
+                        _vec_load_54[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_54[0];
+                    vals_b[9] = _vec_load_54[1];
+                    vals_b[10] = _vec_load_54[2];
+                    vals_b[11] = _vec_load_54[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_15 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_15 < vocab) {
+                    float _vec_load_55[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_15);
+                        _vec_load_55[0 + 0] = _v4.x;
+                        _vec_load_55[0 + 1] = _v4.y;
+                        _vec_load_55[0 + 2] = _v4.z;
+                        _vec_load_55[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_55[0];
+                    vals_b[13] = _vec_load_55[1];
+                    vals_b[14] = _vec_load_55[2];
+                    vals_b[15] = _vec_load_55[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_27 = start + (c_5 + 1) * 8192 + tid;
+                if (i2_27 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_27];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_13 = start + (c_5 + 1) * 8192 + 512 + tid;
+                if (i2_0_13 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_13];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_13 = start + (c_5 + 1) * 8192 + 1024 + tid;
+                if (i2_1_13 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_13];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_13 = start + (c_5 + 1) * 8192 + 1536 + tid;
+                if (i2_2_13 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_13];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_13 = start + (c_5 + 1) * 8192 + 2048 + tid;
+                if (i2_3_13 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_13];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_13 = start + (c_5 + 1) * 8192 + 2560 + tid;
+                if (i2_4_13 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_13];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_13 = start + (c_5 + 1) * 8192 + 3072 + tid;
+                if (i2_5_13 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_13];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_13 = start + (c_5 + 1) * 8192 + 3584 + tid;
+                if (i2_6_13 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_13];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_13 = start + (c_5 + 1) * 8192 + 4096 + tid;
+                if (i2_7_13 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_13];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_13 = start + (c_5 + 1) * 8192 + 4608 + tid;
+                if (i2_8_13 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_13];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_13 = start + (c_5 + 1) * 8192 + 5120 + tid;
+                if (i2_9_13 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_13];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_13 = start + (c_5 + 1) * 8192 + 5632 + tid;
+                if (i2_10_13 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_13];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_13 = start + (c_5 + 1) * 8192 + 6144 + tid;
+                if (i2_11_13 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_13];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_13 = start + (c_5 + 1) * 8192 + 6656 + tid;
+                if (i2_12_13 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_13];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_13 = start + (c_5 + 1) * 8192 + 7168 + tid;
+                if (i2_13_13 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_13];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_13 = start + (c_5 + 1) * 8192 + 7680 + tid;
+                if (i2_14_13 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_13];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int gt_0 = 0;
+        unsigned int bits_20 = __as_u32(vals_a[0]);
+        unsigned int key_36 = ((bits_20 <= 2139095040) ? bits_20 : 0);
+        int i_vec_1 = start + c_5 * 8192 + tid * 4;
+        int i_str_1 = start + c_5 * 8192 + tid;
+        int i_19 = ((aligned) ? i_vec_1 : i_str_1);
+        int i_1_16 = i_19;
+        bool tie = key_36 == threshold && i_1_16 < vocab;
+        unsigned int _vote_35 = __ballot_sync(0xFFFFFFFF, tie);
+        unsigned int m_1 = _vote_35;
+        if (lane == 0) {
+            int _popc_66 = __popc(m_1);
+            cnt[warp] = (unsigned int)_popc_66;
+        }
+        if (key_36 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_2_1 = __as_u32(vals_a[1]);
+        unsigned int key_3_1 = ((bits_2_1 <= 2139095040) ? bits_2_1 : 0);
+        int i_vec_4 = start + c_5 * 8192 + tid * 4 + 1;
+        int i_str_5 = start + c_5 * 8192 + 512 + tid;
+        int i_6_1 = ((aligned) ? i_vec_4 : i_str_5);
+        int i_7_1 = i_6_1;
+        bool tie_8 = key_3_1 == threshold && i_7_1 < vocab;
+        unsigned int _vote_36 = __ballot_sync(0xFFFFFFFF, tie_8);
+        unsigned int m_9 = _vote_36;
+        if (lane == 0) {
+            int _popc_67 = __popc(m_9);
+            cnt[16 + warp] = (unsigned int)_popc_67;
+        }
+        if (key_3_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_10_3 = __as_u32(vals_a[2]);
+        unsigned int key_11_3 = ((bits_10_3 <= 2139095040) ? bits_10_3 : 0);
+        int i_vec_12 = start + c_5 * 8192 + tid * 4 + 2;
+        int i_str_13 = start + c_5 * 8192 + 1024 + tid;
+        int i_14_1 = ((aligned) ? i_vec_12 : i_str_13);
+        int i_15_1 = i_14_1;
+        bool tie_16 = key_11_3 == threshold && i_15_1 < vocab;
+        unsigned int _vote_37 = __ballot_sync(0xFFFFFFFF, tie_16);
+        unsigned int m_17_1 = _vote_37;
+        if (lane == 0) {
+            int _popc_68 = __popc(m_17_1);
+            cnt[32 + warp] = (unsigned int)_popc_68;
+        }
+        if (key_11_3 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_18_4 = __as_u32(vals_a[3]);
+        unsigned int key_19_4 = ((bits_18_4 <= 2139095040) ? bits_18_4 : 0);
+        int i_vec_20_1 = start + c_5 * 8192 + tid * 4 + 3;
+        int i_str_21_1 = start + c_5 * 8192 + 1536 + tid;
+        int i_22 = ((aligned) ? i_vec_20_1 : i_str_21_1);
+        int i_23 = i_22;
+        bool tie_24 = key_19_4 == threshold && i_23 < vocab;
+        unsigned int _vote_38 = __ballot_sync(0xFFFFFFFF, tie_24);
+        unsigned int m_25 = _vote_38;
+        if (lane == 0) {
+            int _popc_69 = __popc(m_25);
+            cnt[48 + warp] = (unsigned int)_popc_69;
+        }
+        if (key_19_4 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_26 = __as_u32(vals_a[4]);
+        unsigned int key_27_1 = ((bits_26 <= 2139095040) ? bits_26 : 0);
+        int i_vec_28 = start + c_5 * 8192 + 2048 + tid * 4;
+        int i_str_29 = start + c_5 * 8192 + 2048 + tid;
+        int i_30 = ((aligned) ? i_vec_28 : i_str_29);
+        int i_31 = i_30;
+        bool tie_32 = key_27_1 == threshold && i_31 < vocab;
+        unsigned int _vote_39 = __ballot_sync(0xFFFFFFFF, tie_32);
+        unsigned int m_33_1 = _vote_39;
+        if (lane == 0) {
+            int _popc_70 = __popc(m_33_1);
+            cnt[64 + warp] = (unsigned int)_popc_70;
+        }
+        if (key_27_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_34_4 = __as_u32(vals_a[5]);
+        unsigned int key_35_4 = ((bits_34_4 <= 2139095040) ? bits_34_4 : 0);
+        int i_vec_36_1 = start + c_5 * 8192 + 2048 + tid * 4 + 1;
+        int i_str_37_1 = start + c_5 * 8192 + 2560 + tid;
+        int i_38 = ((aligned) ? i_vec_36_1 : i_str_37_1);
+        int i_39 = i_38;
+        bool tie_40 = key_35_4 == threshold && i_39 < vocab;
+        unsigned int _vote_40 = __ballot_sync(0xFFFFFFFF, tie_40);
+        unsigned int m_41 = _vote_40;
+        if (lane == 0) {
+            int _popc_71 = __popc(m_41);
+            cnt[80 + warp] = (unsigned int)_popc_71;
+        }
+        if (key_35_4 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_42_3 = __as_u32(vals_a[6]);
+        unsigned int key_43_3 = ((bits_42_3 <= 2139095040) ? bits_42_3 : 0);
+        int i_vec_44 = start + c_5 * 8192 + 2048 + tid * 4 + 2;
+        int i_str_45 = start + c_5 * 8192 + 3072 + tid;
+        int i_46 = ((aligned) ? i_vec_44 : i_str_45);
+        int i_47 = i_46;
+        bool tie_48 = key_43_3 == threshold && i_47 < vocab;
+        unsigned int _vote_41 = __ballot_sync(0xFFFFFFFF, tie_48);
+        unsigned int m_49 = _vote_41;
+        if (lane == 0) {
+            int _popc_72 = __popc(m_49);
+            cnt[96 + warp] = (unsigned int)_popc_72;
+        }
+        if (key_43_3 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_50 = __as_u32(vals_a[7]);
+        unsigned int key_51 = ((bits_50 <= 2139095040) ? bits_50 : 0);
+        int i_vec_52 = start + c_5 * 8192 + 2048 + tid * 4 + 3;
+        int i_str_53 = start + c_5 * 8192 + 3584 + tid;
+        int i_54 = ((aligned) ? i_vec_52 : i_str_53);
+        int i_55 = i_54;
+        bool tie_56 = key_51 == threshold && i_55 < vocab;
+        unsigned int _vote_42 = __ballot_sync(0xFFFFFFFF, tie_56);
+        unsigned int m_57_1 = _vote_42;
+        if (lane == 0) {
+            int _popc_73 = __popc(m_57_1);
+            cnt[112 + warp] = (unsigned int)_popc_73;
+        }
+        if (key_51 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_58 = __as_u32(vals_a[8]);
+        unsigned int key_59 = ((bits_58 <= 2139095040) ? bits_58 : 0);
+        int i_vec_60 = start + c_5 * 8192 + 4096 + tid * 4;
+        int i_str_61 = start + c_5 * 8192 + 4096 + tid;
+        int i_62 = ((aligned) ? i_vec_60 : i_str_61);
+        int i_63 = i_62;
+        bool tie_64 = key_59 == threshold && i_63 < vocab;
+        unsigned int _vote_43 = __ballot_sync(0xFFFFFFFF, tie_64);
+        unsigned int m_65 = _vote_43;
+        if (lane == 0) {
+            int _popc_74 = __popc(m_65);
+            cnt[128 + warp] = (unsigned int)_popc_74;
+        }
+        if (key_59 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_66 = __as_u32(vals_a[9]);
+        unsigned int key_67 = ((bits_66 <= 2139095040) ? bits_66 : 0);
+        int i_vec_68 = start + c_5 * 8192 + 4096 + tid * 4 + 1;
+        int i_str_69 = start + c_5 * 8192 + 4608 + tid;
+        int i_70 = ((aligned) ? i_vec_68 : i_str_69);
+        int i_71 = i_70;
+        bool tie_72 = key_67 == threshold && i_71 < vocab;
+        unsigned int _vote_44 = __ballot_sync(0xFFFFFFFF, tie_72);
+        unsigned int m_73_1 = _vote_44;
+        if (lane == 0) {
+            int _popc_75 = __popc(m_73_1);
+            cnt[144 + warp] = (unsigned int)_popc_75;
+        }
+        if (key_67 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_74 = __as_u32(vals_a[10]);
+        unsigned int key_75 = ((bits_74 <= 2139095040) ? bits_74 : 0);
+        int i_vec_76 = start + c_5 * 8192 + 4096 + tid * 4 + 2;
+        int i_str_77 = start + c_5 * 8192 + 5120 + tid;
+        int i_78 = ((aligned) ? i_vec_76 : i_str_77);
+        int i_79 = i_78;
+        bool tie_80 = key_75 == threshold && i_79 < vocab;
+        unsigned int _vote_45 = __ballot_sync(0xFFFFFFFF, tie_80);
+        unsigned int m_81 = _vote_45;
+        if (lane == 0) {
+            int _popc_76 = __popc(m_81);
+            cnt[160 + warp] = (unsigned int)_popc_76;
+        }
+        if (key_75 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_82 = __as_u32(vals_a[11]);
+        unsigned int key_83 = ((bits_82 <= 2139095040) ? bits_82 : 0);
+        int i_vec_84 = start + c_5 * 8192 + 4096 + tid * 4 + 3;
+        int i_str_85 = start + c_5 * 8192 + 5632 + tid;
+        int i_86 = ((aligned) ? i_vec_84 : i_str_85);
+        int i_87 = i_86;
+        bool tie_88 = key_83 == threshold && i_87 < vocab;
+        unsigned int _vote_46 = __ballot_sync(0xFFFFFFFF, tie_88);
+        unsigned int m_89 = _vote_46;
+        if (lane == 0) {
+            int _popc_77 = __popc(m_89);
+            cnt[176 + warp] = (unsigned int)_popc_77;
+        }
+        if (key_83 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_90 = __as_u32(vals_a[12]);
+        unsigned int key_91 = ((bits_90 <= 2139095040) ? bits_90 : 0);
+        int i_vec_92 = start + c_5 * 8192 + 6144 + tid * 4;
+        int i_str_93 = start + c_5 * 8192 + 6144 + tid;
+        int i_94 = ((aligned) ? i_vec_92 : i_str_93);
+        int i_95 = i_94;
+        bool tie_96 = key_91 == threshold && i_95 < vocab;
+        unsigned int _vote_47 = __ballot_sync(0xFFFFFFFF, tie_96);
+        unsigned int m_97 = _vote_47;
+        if (lane == 0) {
+            int _popc_78 = __popc(m_97);
+            cnt[192 + warp] = (unsigned int)_popc_78;
+        }
+        if (key_91 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_98_1 = __as_u32(vals_a[13]);
+        unsigned int key_99_1 = ((bits_98_1 <= 2139095040) ? bits_98_1 : 0);
+        int i_vec_100_1 = start + c_5 * 8192 + 6144 + tid * 4 + 1;
+        int i_str_101_1 = start + c_5 * 8192 + 6656 + tid;
+        int i_102 = ((aligned) ? i_vec_100_1 : i_str_101_1);
+        int i_103 = i_102;
+        bool tie_104 = key_99_1 == threshold && i_103 < vocab;
+        unsigned int _vote_48 = __ballot_sync(0xFFFFFFFF, tie_104);
+        unsigned int m_105 = _vote_48;
+        if (lane == 0) {
+            int _popc_79 = __popc(m_105);
+            cnt[208 + warp] = (unsigned int)_popc_79;
+        }
+        if (key_99_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_106 = __as_u32(vals_a[14]);
+        unsigned int key_107 = ((bits_106 <= 2139095040) ? bits_106 : 0);
+        int i_vec_108 = start + c_5 * 8192 + 6144 + tid * 4 + 2;
+        int i_str_109 = start + c_5 * 8192 + 7168 + tid;
+        int i_110 = ((aligned) ? i_vec_108 : i_str_109);
+        int i_111 = i_110;
+        bool tie_112 = key_107 == threshold && i_111 < vocab;
+        unsigned int _vote_49 = __ballot_sync(0xFFFFFFFF, tie_112);
+        unsigned int m_113 = _vote_49;
+        if (lane == 0) {
+            int _popc_80 = __popc(m_113);
+            cnt[224 + warp] = (unsigned int)_popc_80;
+        }
+        if (key_107 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_114 = __as_u32(vals_a[15]);
+        unsigned int key_115 = ((bits_114 <= 2139095040) ? bits_114 : 0);
+        int i_vec_116 = start + c_5 * 8192 + 6144 + tid * 4 + 3;
+        int i_str_117 = start + c_5 * 8192 + 7680 + tid;
+        int i_118 = ((aligned) ? i_vec_116 : i_str_117);
+        int i_119 = i_118;
+        bool tie_120 = key_115 == threshold && i_119 < vocab;
+        unsigned int _vote_50 = __ballot_sync(0xFFFFFFFF, tie_120);
+        unsigned int m_121 = _vote_50;
+        if (lane == 0) {
+            int _popc_81 = __popc(m_121);
+            cnt[240 + warp] = (unsigned int)_popc_81;
+        }
+        if (key_115 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int gt_cnt = gt_0;
+        __syncthreads();
+        unsigned int local_122 = 0;
+        int f = tid;
+        if (f < 256) {
+            local_122 = local_122 + cnt[f];
+        }
+        unsigned int packed = gt_cnt | local_122 << 12;
+        uint32_t _warp_scan_sum_u32_7 = packed;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(16));
+        unsigned int incl_123 = _warp_scan_sum_u32_7;
+        if (lane == 31) {
+            warp_sums[warp] = incl_123;
+        }
+        __syncthreads();
+        unsigned int before_124 = 0;
+        unsigned int total_125 = 0;
+        unsigned int ws_126 = warp_sums[0];
+        total_125 = total_125 + ws_126;
+        if (warp > 0) {
+            before_124 = before_124 + ws_126;
+        }
+        unsigned int ws_127 = warp_sums[1];
+        total_125 = total_125 + ws_127;
+        if (warp > 1) {
+            before_124 = before_124 + ws_127;
+        }
+        unsigned int ws_128 = warp_sums[2];
+        total_125 = total_125 + ws_128;
+        if (warp > 2) {
+            before_124 = before_124 + ws_128;
+        }
+        unsigned int ws_129 = warp_sums[3];
+        total_125 = total_125 + ws_129;
+        if (warp > 3) {
+            before_124 = before_124 + ws_129;
+        }
+        unsigned int ws_130 = warp_sums[4];
+        total_125 = total_125 + ws_130;
+        if (warp > 4) {
+            before_124 = before_124 + ws_130;
+        }
+        unsigned int ws_131 = warp_sums[5];
+        total_125 = total_125 + ws_131;
+        if (warp > 5) {
+            before_124 = before_124 + ws_131;
+        }
+        unsigned int ws_132 = warp_sums[6];
+        total_125 = total_125 + ws_132;
+        if (warp > 6) {
+            before_124 = before_124 + ws_132;
+        }
+        unsigned int ws_133 = warp_sums[7];
+        total_125 = total_125 + ws_133;
+        if (warp > 7) {
+            before_124 = before_124 + ws_133;
+        }
+        unsigned int ws_134 = warp_sums[8];
+        total_125 = total_125 + ws_134;
+        if (warp > 8) {
+            before_124 = before_124 + ws_134;
+        }
+        unsigned int ws_135 = warp_sums[9];
+        total_125 = total_125 + ws_135;
+        if (warp > 9) {
+            before_124 = before_124 + ws_135;
+        }
+        unsigned int ws_136 = warp_sums[10];
+        total_125 = total_125 + ws_136;
+        if (warp > 10) {
+            before_124 = before_124 + ws_136;
+        }
+        unsigned int ws_137 = warp_sums[11];
+        total_125 = total_125 + ws_137;
+        if (warp > 11) {
+            before_124 = before_124 + ws_137;
+        }
+        unsigned int ws_138 = warp_sums[12];
+        total_125 = total_125 + ws_138;
+        if (warp > 12) {
+            before_124 = before_124 + ws_138;
+        }
+        unsigned int ws_139 = warp_sums[13];
+        total_125 = total_125 + ws_139;
+        if (warp > 13) {
+            before_124 = before_124 + ws_139;
+        }
+        unsigned int ws_140 = warp_sums[14];
+        total_125 = total_125 + ws_140;
+        if (warp > 14) {
+            before_124 = before_124 + ws_140;
+        }
+        unsigned int ws_141 = warp_sums[15];
+        total_125 = total_125 + ws_141;
+        if (warp > 15) {
+            before_124 = before_124 + ws_141;
+        }
+        unsigned int excl_142 = before_124 + incl_123 - packed;
+        __syncthreads();
+        unsigned int running = excl_142 >> 12;
+        int f2 = tid;
+        if (f2 < 256) {
+            unsigned int c_0 = cnt[f2];
+            cnt[f2] = running;
+            running = running + c_0;
+        }
+        __syncthreads();
+        unsigned int gt_slot = excl_142 & 4095;
+        unsigned int gt_total_143 = total_125 & 4095;
+        unsigned int eq_total = total_125 >> 12;
+        unsigned int _min_3 = ((eq_total) < (take_rem) ? (eq_total) : (take_rem));
+        unsigned int take_c = _min_3;
+        unsigned int lt_mask_1 = (1 << (unsigned int)lane) - 1;
+        unsigned int g = gt_slot;
+        unsigned int keys_1[4];
+        int idxs_1[4];
+        bool ties_144[4];
+        unsigned int strided[4];
+        unsigned int grp_warp = 0;
+        unsigned int grp_lane = 0;
+        unsigned int bits_145 = __as_u32(vals_a[0]);
+        unsigned int key_146 = ((bits_145 <= 2139095040) ? bits_145 : 0);
+        keys_1[0] = key_146;
+        int i_vec_147 = start + c_5 * 8192 + tid * 4;
+        int i_str_148 = start + c_5 * 8192 + tid;
+        int i_149 = ((aligned) ? i_vec_147 : i_str_148);
+        idxs_1[0] = i_149;
+        ties_144[0] = keys_1[0] == threshold && idxs_1[0] < vocab;
+        unsigned int _vote_51 = __ballot_sync(0xFFFFFFFF, ties_144[0]);
+        unsigned int m_150 = _vote_51;
+        int _popc_82 = __popc(m_150 & lt_mask_1);
+        unsigned int lane_before = (unsigned int)_popc_82;
+        unsigned int warp_off = cnt[warp];
+        strided[0] = warp_off + lane_before;
+        grp_warp = grp_warp + (warp_off - cnt[0]);
+        grp_lane = grp_lane + lane_before;
+        unsigned int bits_151 = __as_u32(vals_a[1]);
+        unsigned int key_152 = ((bits_151 <= 2139095040) ? bits_151 : 0);
+        keys_1[1] = key_152;
+        int i_vec_153 = start + c_5 * 8192 + tid * 4 + 1;
+        int i_str_154 = start + c_5 * 8192 + 512 + tid;
+        int i_155 = ((aligned) ? i_vec_153 : i_str_154);
+        idxs_1[1] = i_155;
+        ties_144[1] = keys_1[1] == threshold && idxs_1[1] < vocab;
+        unsigned int _vote_52 = __ballot_sync(0xFFFFFFFF, ties_144[1]);
+        unsigned int m_156 = _vote_52;
+        int _popc_83 = __popc(m_156 & lt_mask_1);
+        unsigned int lane_before_157 = (unsigned int)_popc_83;
+        unsigned int warp_off_158 = cnt[16 + warp];
+        strided[1] = warp_off_158 + lane_before_157;
+        grp_warp = grp_warp + (warp_off_158 - cnt[16]);
+        grp_lane = grp_lane + lane_before_157;
+        unsigned int bits_159 = __as_u32(vals_a[2]);
+        unsigned int key_160 = ((bits_159 <= 2139095040) ? bits_159 : 0);
+        keys_1[2] = key_160;
+        int i_vec_161 = start + c_5 * 8192 + tid * 4 + 2;
+        int i_str_162 = start + c_5 * 8192 + 1024 + tid;
+        int i_163 = ((aligned) ? i_vec_161 : i_str_162);
+        idxs_1[2] = i_163;
+        ties_144[2] = keys_1[2] == threshold && idxs_1[2] < vocab;
+        unsigned int _vote_53 = __ballot_sync(0xFFFFFFFF, ties_144[2]);
+        unsigned int m_164 = _vote_53;
+        int _popc_84 = __popc(m_164 & lt_mask_1);
+        unsigned int lane_before_165 = (unsigned int)_popc_84;
+        unsigned int warp_off_166 = cnt[32 + warp];
+        strided[2] = warp_off_166 + lane_before_165;
+        grp_warp = grp_warp + (warp_off_166 - cnt[32]);
+        grp_lane = grp_lane + lane_before_165;
+        unsigned int bits_167 = __as_u32(vals_a[3]);
+        unsigned int key_168 = ((bits_167 <= 2139095040) ? bits_167 : 0);
+        keys_1[3] = key_168;
+        int i_vec_169 = start + c_5 * 8192 + tid * 4 + 3;
+        int i_str_170 = start + c_5 * 8192 + 1536 + tid;
+        int i_171 = ((aligned) ? i_vec_169 : i_str_170);
+        idxs_1[3] = i_171;
+        ties_144[3] = keys_1[3] == threshold && idxs_1[3] < vocab;
+        unsigned int _vote_54 = __ballot_sync(0xFFFFFFFF, ties_144[3]);
+        unsigned int m_172 = _vote_54;
+        int _popc_85 = __popc(m_172 & lt_mask_1);
+        unsigned int lane_before_173 = (unsigned int)_popc_85;
+        unsigned int warp_off_174 = cnt[48 + warp];
+        strided[3] = warp_off_174 + lane_before_173;
+        grp_warp = grp_warp + (warp_off_174 - cnt[48]);
+        grp_lane = grp_lane + lane_before_173;
+        unsigned int grp_base = cnt[0];
+        unsigned int own_175 = 0;
+        unsigned int vec_rank = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_176 = ((aligned) ? vec_rank : strided[0]);
+        if (keys_1[0] > threshold) {
+            unsigned long long dst = gt_run + (unsigned long long)g;
+            out_vals[dst] = __uint_as_float(keys_1[0]);
+            out_idx[dst] = idxs_1[0];
+            g = g + 1;
+        } else if (ties_144[0] && rank_176 < take_c) {
+            unsigned long long dst2 = eq_run + (unsigned long long)rank_176;
+            out_vals[dst2] = __uint_as_float(keys_1[0]);
+            out_idx[dst2] = idxs_1[0];
+        }
+        if (ties_144[0]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_177 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_178 = ((aligned) ? vec_rank_177 : strided[1]);
+        if (keys_1[1] > threshold) {
+            unsigned long long dst_1 = gt_run + (unsigned long long)g;
+            out_vals[dst_1] = __uint_as_float(keys_1[1]);
+            out_idx[dst_1] = idxs_1[1];
+            g = g + 1;
+        } else if (ties_144[1] && rank_178 < take_c) {
+            unsigned long long dst2_1 = eq_run + (unsigned long long)rank_178;
+            out_vals[dst2_1] = __uint_as_float(keys_1[1]);
+            out_idx[dst2_1] = idxs_1[1];
+        }
+        if (ties_144[1]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_179 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_180 = ((aligned) ? vec_rank_179 : strided[2]);
+        if (keys_1[2] > threshold) {
+            unsigned long long dst_2 = gt_run + (unsigned long long)g;
+            out_vals[dst_2] = __uint_as_float(keys_1[2]);
+            out_idx[dst_2] = idxs_1[2];
+            g = g + 1;
+        } else if (ties_144[2] && rank_180 < take_c) {
+            unsigned long long dst2_2 = eq_run + (unsigned long long)rank_180;
+            out_vals[dst2_2] = __uint_as_float(keys_1[2]);
+            out_idx[dst2_2] = idxs_1[2];
+        }
+        if (ties_144[2]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_181 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_182 = ((aligned) ? vec_rank_181 : strided[3]);
+        if (keys_1[3] > threshold) {
+            unsigned long long dst_3 = gt_run + (unsigned long long)g;
+            out_vals[dst_3] = __uint_as_float(keys_1[3]);
+            out_idx[dst_3] = idxs_1[3];
+            g = g + 1;
+        } else if (ties_144[3] && rank_182 < take_c) {
+            unsigned long long dst2_3 = eq_run + (unsigned long long)rank_182;
+            out_vals[dst2_3] = __uint_as_float(keys_1[3]);
+            out_idx[dst2_3] = idxs_1[3];
+        }
+        if (ties_144[3]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int keys_183[4];
+        int idxs_184[4];
+        bool ties_185[4];
+        unsigned int strided_186[4];
+        unsigned int grp_warp_187 = 0;
+        unsigned int grp_lane_188 = 0;
+        unsigned int bits_189 = __as_u32(vals_a[4]);
+        unsigned int key_190 = ((bits_189 <= 2139095040) ? bits_189 : 0);
+        keys_183[0] = key_190;
+        int i_vec_191 = start + c_5 * 8192 + 2048 + tid * 4;
+        int i_str_192 = start + c_5 * 8192 + 2048 + tid;
+        int i_193 = ((aligned) ? i_vec_191 : i_str_192);
+        idxs_184[0] = i_193;
+        ties_185[0] = keys_183[0] == threshold && idxs_184[0] < vocab;
+        unsigned int _vote_55 = __ballot_sync(0xFFFFFFFF, ties_185[0]);
+        unsigned int m_194 = _vote_55;
+        int _popc_86 = __popc(m_194 & lt_mask_1);
+        unsigned int lane_before_195 = (unsigned int)_popc_86;
+        unsigned int warp_off_196 = cnt[64 + warp];
+        strided_186[0] = warp_off_196 + lane_before_195;
+        grp_warp_187 = grp_warp_187 + (warp_off_196 - cnt[64]);
+        grp_lane_188 = grp_lane_188 + lane_before_195;
+        unsigned int bits_197 = __as_u32(vals_a[5]);
+        unsigned int key_198 = ((bits_197 <= 2139095040) ? bits_197 : 0);
+        keys_183[1] = key_198;
+        int i_vec_199 = start + c_5 * 8192 + 2048 + tid * 4 + 1;
+        int i_str_200 = start + c_5 * 8192 + 2560 + tid;
+        int i_201 = ((aligned) ? i_vec_199 : i_str_200);
+        idxs_184[1] = i_201;
+        ties_185[1] = keys_183[1] == threshold && idxs_184[1] < vocab;
+        unsigned int _vote_56 = __ballot_sync(0xFFFFFFFF, ties_185[1]);
+        unsigned int m_202 = _vote_56;
+        int _popc_87 = __popc(m_202 & lt_mask_1);
+        unsigned int lane_before_203 = (unsigned int)_popc_87;
+        unsigned int warp_off_204 = cnt[80 + warp];
+        strided_186[1] = warp_off_204 + lane_before_203;
+        grp_warp_187 = grp_warp_187 + (warp_off_204 - cnt[80]);
+        grp_lane_188 = grp_lane_188 + lane_before_203;
+        unsigned int bits_205 = __as_u32(vals_a[6]);
+        unsigned int key_206 = ((bits_205 <= 2139095040) ? bits_205 : 0);
+        keys_183[2] = key_206;
+        int i_vec_207 = start + c_5 * 8192 + 2048 + tid * 4 + 2;
+        int i_str_208 = start + c_5 * 8192 + 3072 + tid;
+        int i_209 = ((aligned) ? i_vec_207 : i_str_208);
+        idxs_184[2] = i_209;
+        ties_185[2] = keys_183[2] == threshold && idxs_184[2] < vocab;
+        unsigned int _vote_57 = __ballot_sync(0xFFFFFFFF, ties_185[2]);
+        unsigned int m_210 = _vote_57;
+        int _popc_88 = __popc(m_210 & lt_mask_1);
+        unsigned int lane_before_211 = (unsigned int)_popc_88;
+        unsigned int warp_off_212 = cnt[96 + warp];
+        strided_186[2] = warp_off_212 + lane_before_211;
+        grp_warp_187 = grp_warp_187 + (warp_off_212 - cnt[96]);
+        grp_lane_188 = grp_lane_188 + lane_before_211;
+        unsigned int bits_213 = __as_u32(vals_a[7]);
+        unsigned int key_214 = ((bits_213 <= 2139095040) ? bits_213 : 0);
+        keys_183[3] = key_214;
+        int i_vec_215 = start + c_5 * 8192 + 2048 + tid * 4 + 3;
+        int i_str_216 = start + c_5 * 8192 + 3584 + tid;
+        int i_217 = ((aligned) ? i_vec_215 : i_str_216);
+        idxs_184[3] = i_217;
+        ties_185[3] = keys_183[3] == threshold && idxs_184[3] < vocab;
+        unsigned int _vote_58 = __ballot_sync(0xFFFFFFFF, ties_185[3]);
+        unsigned int m_218 = _vote_58;
+        int _popc_89 = __popc(m_218 & lt_mask_1);
+        unsigned int lane_before_219 = (unsigned int)_popc_89;
+        unsigned int warp_off_220 = cnt[112 + warp];
+        strided_186[3] = warp_off_220 + lane_before_219;
+        grp_warp_187 = grp_warp_187 + (warp_off_220 - cnt[112]);
+        grp_lane_188 = grp_lane_188 + lane_before_219;
+        unsigned int grp_base_221 = cnt[64];
+        unsigned int own_222 = 0;
+        unsigned int vec_rank_223 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_224 = ((aligned) ? vec_rank_223 : strided_186[0]);
+        if (keys_183[0] > threshold) {
+            unsigned long long dst_4 = gt_run + (unsigned long long)g;
+            out_vals[dst_4] = __uint_as_float(keys_183[0]);
+            out_idx[dst_4] = idxs_184[0];
+            g = g + 1;
+        } else if (ties_185[0] && rank_224 < take_c) {
+            unsigned long long dst2_4 = eq_run + (unsigned long long)rank_224;
+            out_vals[dst2_4] = __uint_as_float(keys_183[0]);
+            out_idx[dst2_4] = idxs_184[0];
+        }
+        if (ties_185[0]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_225 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_226 = ((aligned) ? vec_rank_225 : strided_186[1]);
+        if (keys_183[1] > threshold) {
+            unsigned long long dst_5 = gt_run + (unsigned long long)g;
+            out_vals[dst_5] = __uint_as_float(keys_183[1]);
+            out_idx[dst_5] = idxs_184[1];
+            g = g + 1;
+        } else if (ties_185[1] && rank_226 < take_c) {
+            unsigned long long dst2_5 = eq_run + (unsigned long long)rank_226;
+            out_vals[dst2_5] = __uint_as_float(keys_183[1]);
+            out_idx[dst2_5] = idxs_184[1];
+        }
+        if (ties_185[1]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_227 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_228 = ((aligned) ? vec_rank_227 : strided_186[2]);
+        if (keys_183[2] > threshold) {
+            unsigned long long dst_6 = gt_run + (unsigned long long)g;
+            out_vals[dst_6] = __uint_as_float(keys_183[2]);
+            out_idx[dst_6] = idxs_184[2];
+            g = g + 1;
+        } else if (ties_185[2] && rank_228 < take_c) {
+            unsigned long long dst2_6 = eq_run + (unsigned long long)rank_228;
+            out_vals[dst2_6] = __uint_as_float(keys_183[2]);
+            out_idx[dst2_6] = idxs_184[2];
+        }
+        if (ties_185[2]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_229 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_230 = ((aligned) ? vec_rank_229 : strided_186[3]);
+        if (keys_183[3] > threshold) {
+            unsigned long long dst_7 = gt_run + (unsigned long long)g;
+            out_vals[dst_7] = __uint_as_float(keys_183[3]);
+            out_idx[dst_7] = idxs_184[3];
+            g = g + 1;
+        } else if (ties_185[3] && rank_230 < take_c) {
+            unsigned long long dst2_7 = eq_run + (unsigned long long)rank_230;
+            out_vals[dst2_7] = __uint_as_float(keys_183[3]);
+            out_idx[dst2_7] = idxs_184[3];
+        }
+        if (ties_185[3]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int keys_231[4];
+        int idxs_232[4];
+        bool ties_233[4];
+        unsigned int strided_234[4];
+        unsigned int grp_warp_235 = 0;
+        unsigned int grp_lane_236 = 0;
+        unsigned int bits_237 = __as_u32(vals_a[8]);
+        unsigned int key_238 = ((bits_237 <= 2139095040) ? bits_237 : 0);
+        keys_231[0] = key_238;
+        int i_vec_239 = start + c_5 * 8192 + 4096 + tid * 4;
+        int i_str_240 = start + c_5 * 8192 + 4096 + tid;
+        int i_241 = ((aligned) ? i_vec_239 : i_str_240);
+        idxs_232[0] = i_241;
+        ties_233[0] = keys_231[0] == threshold && idxs_232[0] < vocab;
+        unsigned int _vote_59 = __ballot_sync(0xFFFFFFFF, ties_233[0]);
+        unsigned int m_242 = _vote_59;
+        int _popc_90 = __popc(m_242 & lt_mask_1);
+        unsigned int lane_before_243 = (unsigned int)_popc_90;
+        unsigned int warp_off_244 = cnt[128 + warp];
+        strided_234[0] = warp_off_244 + lane_before_243;
+        grp_warp_235 = grp_warp_235 + (warp_off_244 - cnt[128]);
+        grp_lane_236 = grp_lane_236 + lane_before_243;
+        unsigned int bits_245 = __as_u32(vals_a[9]);
+        unsigned int key_246 = ((bits_245 <= 2139095040) ? bits_245 : 0);
+        keys_231[1] = key_246;
+        int i_vec_247 = start + c_5 * 8192 + 4096 + tid * 4 + 1;
+        int i_str_248 = start + c_5 * 8192 + 4608 + tid;
+        int i_249 = ((aligned) ? i_vec_247 : i_str_248);
+        idxs_232[1] = i_249;
+        ties_233[1] = keys_231[1] == threshold && idxs_232[1] < vocab;
+        unsigned int _vote_60 = __ballot_sync(0xFFFFFFFF, ties_233[1]);
+        unsigned int m_250 = _vote_60;
+        int _popc_91 = __popc(m_250 & lt_mask_1);
+        unsigned int lane_before_251 = (unsigned int)_popc_91;
+        unsigned int warp_off_252 = cnt[144 + warp];
+        strided_234[1] = warp_off_252 + lane_before_251;
+        grp_warp_235 = grp_warp_235 + (warp_off_252 - cnt[144]);
+        grp_lane_236 = grp_lane_236 + lane_before_251;
+        unsigned int bits_253 = __as_u32(vals_a[10]);
+        unsigned int key_254 = ((bits_253 <= 2139095040) ? bits_253 : 0);
+        keys_231[2] = key_254;
+        int i_vec_255 = start + c_5 * 8192 + 4096 + tid * 4 + 2;
+        int i_str_256 = start + c_5 * 8192 + 5120 + tid;
+        int i_257 = ((aligned) ? i_vec_255 : i_str_256);
+        idxs_232[2] = i_257;
+        ties_233[2] = keys_231[2] == threshold && idxs_232[2] < vocab;
+        unsigned int _vote_61 = __ballot_sync(0xFFFFFFFF, ties_233[2]);
+        unsigned int m_258 = _vote_61;
+        int _popc_92 = __popc(m_258 & lt_mask_1);
+        unsigned int lane_before_259 = (unsigned int)_popc_92;
+        unsigned int warp_off_260 = cnt[160 + warp];
+        strided_234[2] = warp_off_260 + lane_before_259;
+        grp_warp_235 = grp_warp_235 + (warp_off_260 - cnt[160]);
+        grp_lane_236 = grp_lane_236 + lane_before_259;
+        unsigned int bits_261 = __as_u32(vals_a[11]);
+        unsigned int key_262 = ((bits_261 <= 2139095040) ? bits_261 : 0);
+        keys_231[3] = key_262;
+        int i_vec_263 = start + c_5 * 8192 + 4096 + tid * 4 + 3;
+        int i_str_264 = start + c_5 * 8192 + 5632 + tid;
+        int i_265 = ((aligned) ? i_vec_263 : i_str_264);
+        idxs_232[3] = i_265;
+        ties_233[3] = keys_231[3] == threshold && idxs_232[3] < vocab;
+        unsigned int _vote_62 = __ballot_sync(0xFFFFFFFF, ties_233[3]);
+        unsigned int m_266 = _vote_62;
+        int _popc_93 = __popc(m_266 & lt_mask_1);
+        unsigned int lane_before_267 = (unsigned int)_popc_93;
+        unsigned int warp_off_268 = cnt[176 + warp];
+        strided_234[3] = warp_off_268 + lane_before_267;
+        grp_warp_235 = grp_warp_235 + (warp_off_268 - cnt[176]);
+        grp_lane_236 = grp_lane_236 + lane_before_267;
+        unsigned int grp_base_269 = cnt[128];
+        unsigned int own_270 = 0;
+        unsigned int vec_rank_271 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_272 = ((aligned) ? vec_rank_271 : strided_234[0]);
+        if (keys_231[0] > threshold) {
+            unsigned long long dst_8 = gt_run + (unsigned long long)g;
+            out_vals[dst_8] = __uint_as_float(keys_231[0]);
+            out_idx[dst_8] = idxs_232[0];
+            g = g + 1;
+        } else if (ties_233[0] && rank_272 < take_c) {
+            unsigned long long dst2_8 = eq_run + (unsigned long long)rank_272;
+            out_vals[dst2_8] = __uint_as_float(keys_231[0]);
+            out_idx[dst2_8] = idxs_232[0];
+        }
+        if (ties_233[0]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_273 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_274 = ((aligned) ? vec_rank_273 : strided_234[1]);
+        if (keys_231[1] > threshold) {
+            unsigned long long dst_9 = gt_run + (unsigned long long)g;
+            out_vals[dst_9] = __uint_as_float(keys_231[1]);
+            out_idx[dst_9] = idxs_232[1];
+            g = g + 1;
+        } else if (ties_233[1] && rank_274 < take_c) {
+            unsigned long long dst2_9 = eq_run + (unsigned long long)rank_274;
+            out_vals[dst2_9] = __uint_as_float(keys_231[1]);
+            out_idx[dst2_9] = idxs_232[1];
+        }
+        if (ties_233[1]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_275 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_276 = ((aligned) ? vec_rank_275 : strided_234[2]);
+        if (keys_231[2] > threshold) {
+            unsigned long long dst_10 = gt_run + (unsigned long long)g;
+            out_vals[dst_10] = __uint_as_float(keys_231[2]);
+            out_idx[dst_10] = idxs_232[2];
+            g = g + 1;
+        } else if (ties_233[2] && rank_276 < take_c) {
+            unsigned long long dst2_10 = eq_run + (unsigned long long)rank_276;
+            out_vals[dst2_10] = __uint_as_float(keys_231[2]);
+            out_idx[dst2_10] = idxs_232[2];
+        }
+        if (ties_233[2]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_277 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_278 = ((aligned) ? vec_rank_277 : strided_234[3]);
+        if (keys_231[3] > threshold) {
+            unsigned long long dst_11 = gt_run + (unsigned long long)g;
+            out_vals[dst_11] = __uint_as_float(keys_231[3]);
+            out_idx[dst_11] = idxs_232[3];
+            g = g + 1;
+        } else if (ties_233[3] && rank_278 < take_c) {
+            unsigned long long dst2_11 = eq_run + (unsigned long long)rank_278;
+            out_vals[dst2_11] = __uint_as_float(keys_231[3]);
+            out_idx[dst2_11] = idxs_232[3];
+        }
+        if (ties_233[3]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int keys_279[4];
+        int idxs_280[4];
+        bool ties_281[4];
+        unsigned int strided_282[4];
+        unsigned int grp_warp_283 = 0;
+        unsigned int grp_lane_284 = 0;
+        unsigned int bits_285 = __as_u32(vals_a[12]);
+        unsigned int key_286 = ((bits_285 <= 2139095040) ? bits_285 : 0);
+        keys_279[0] = key_286;
+        int i_vec_287 = start + c_5 * 8192 + 6144 + tid * 4;
+        int i_str_288 = start + c_5 * 8192 + 6144 + tid;
+        int i_289 = ((aligned) ? i_vec_287 : i_str_288);
+        idxs_280[0] = i_289;
+        ties_281[0] = keys_279[0] == threshold && idxs_280[0] < vocab;
+        unsigned int _vote_63 = __ballot_sync(0xFFFFFFFF, ties_281[0]);
+        unsigned int m_290 = _vote_63;
+        int _popc_94 = __popc(m_290 & lt_mask_1);
+        unsigned int lane_before_291 = (unsigned int)_popc_94;
+        unsigned int warp_off_292 = cnt[192 + warp];
+        strided_282[0] = warp_off_292 + lane_before_291;
+        grp_warp_283 = grp_warp_283 + (warp_off_292 - cnt[192]);
+        grp_lane_284 = grp_lane_284 + lane_before_291;
+        unsigned int bits_293 = __as_u32(vals_a[13]);
+        unsigned int key_294 = ((bits_293 <= 2139095040) ? bits_293 : 0);
+        keys_279[1] = key_294;
+        int i_vec_295 = start + c_5 * 8192 + 6144 + tid * 4 + 1;
+        int i_str_296 = start + c_5 * 8192 + 6656 + tid;
+        int i_297 = ((aligned) ? i_vec_295 : i_str_296);
+        idxs_280[1] = i_297;
+        ties_281[1] = keys_279[1] == threshold && idxs_280[1] < vocab;
+        unsigned int _vote_64 = __ballot_sync(0xFFFFFFFF, ties_281[1]);
+        unsigned int m_298 = _vote_64;
+        int _popc_95 = __popc(m_298 & lt_mask_1);
+        unsigned int lane_before_299 = (unsigned int)_popc_95;
+        unsigned int warp_off_300 = cnt[208 + warp];
+        strided_282[1] = warp_off_300 + lane_before_299;
+        grp_warp_283 = grp_warp_283 + (warp_off_300 - cnt[208]);
+        grp_lane_284 = grp_lane_284 + lane_before_299;
+        unsigned int bits_301 = __as_u32(vals_a[14]);
+        unsigned int key_302 = ((bits_301 <= 2139095040) ? bits_301 : 0);
+        keys_279[2] = key_302;
+        int i_vec_303 = start + c_5 * 8192 + 6144 + tid * 4 + 2;
+        int i_str_304 = start + c_5 * 8192 + 7168 + tid;
+        int i_305 = ((aligned) ? i_vec_303 : i_str_304);
+        idxs_280[2] = i_305;
+        ties_281[2] = keys_279[2] == threshold && idxs_280[2] < vocab;
+        unsigned int _vote_65 = __ballot_sync(0xFFFFFFFF, ties_281[2]);
+        unsigned int m_306 = _vote_65;
+        int _popc_96 = __popc(m_306 & lt_mask_1);
+        unsigned int lane_before_307 = (unsigned int)_popc_96;
+        unsigned int warp_off_308 = cnt[224 + warp];
+        strided_282[2] = warp_off_308 + lane_before_307;
+        grp_warp_283 = grp_warp_283 + (warp_off_308 - cnt[224]);
+        grp_lane_284 = grp_lane_284 + lane_before_307;
+        unsigned int bits_309 = __as_u32(vals_a[15]);
+        unsigned int key_310 = ((bits_309 <= 2139095040) ? bits_309 : 0);
+        keys_279[3] = key_310;
+        int i_vec_311 = start + c_5 * 8192 + 6144 + tid * 4 + 3;
+        int i_str_312 = start + c_5 * 8192 + 7680 + tid;
+        int i_313 = ((aligned) ? i_vec_311 : i_str_312);
+        idxs_280[3] = i_313;
+        ties_281[3] = keys_279[3] == threshold && idxs_280[3] < vocab;
+        unsigned int _vote_66 = __ballot_sync(0xFFFFFFFF, ties_281[3]);
+        unsigned int m_314 = _vote_66;
+        int _popc_97 = __popc(m_314 & lt_mask_1);
+        unsigned int lane_before_315 = (unsigned int)_popc_97;
+        unsigned int warp_off_316 = cnt[240 + warp];
+        strided_282[3] = warp_off_316 + lane_before_315;
+        grp_warp_283 = grp_warp_283 + (warp_off_316 - cnt[240]);
+        grp_lane_284 = grp_lane_284 + lane_before_315;
+        unsigned int grp_base_317 = cnt[192];
+        unsigned int own_318 = 0;
+        unsigned int vec_rank_319 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_320 = ((aligned) ? vec_rank_319 : strided_282[0]);
+        if (keys_279[0] > threshold) {
+            unsigned long long dst_12 = gt_run + (unsigned long long)g;
+            out_vals[dst_12] = __uint_as_float(keys_279[0]);
+            out_idx[dst_12] = idxs_280[0];
+            g = g + 1;
+        } else if (ties_281[0] && rank_320 < take_c) {
+            unsigned long long dst2_12 = eq_run + (unsigned long long)rank_320;
+            out_vals[dst2_12] = __uint_as_float(keys_279[0]);
+            out_idx[dst2_12] = idxs_280[0];
+        }
+        if (ties_281[0]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_321 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_322 = ((aligned) ? vec_rank_321 : strided_282[1]);
+        if (keys_279[1] > threshold) {
+            unsigned long long dst_13 = gt_run + (unsigned long long)g;
+            out_vals[dst_13] = __uint_as_float(keys_279[1]);
+            out_idx[dst_13] = idxs_280[1];
+            g = g + 1;
+        } else if (ties_281[1] && rank_322 < take_c) {
+            unsigned long long dst2_13 = eq_run + (unsigned long long)rank_322;
+            out_vals[dst2_13] = __uint_as_float(keys_279[1]);
+            out_idx[dst2_13] = idxs_280[1];
+        }
+        if (ties_281[1]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_323 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_324 = ((aligned) ? vec_rank_323 : strided_282[2]);
+        if (keys_279[2] > threshold) {
+            unsigned long long dst_14 = gt_run + (unsigned long long)g;
+            out_vals[dst_14] = __uint_as_float(keys_279[2]);
+            out_idx[dst_14] = idxs_280[2];
+            g = g + 1;
+        } else if (ties_281[2] && rank_324 < take_c) {
+            unsigned long long dst2_14 = eq_run + (unsigned long long)rank_324;
+            out_vals[dst2_14] = __uint_as_float(keys_279[2]);
+            out_idx[dst2_14] = idxs_280[2];
+        }
+        if (ties_281[2]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_325 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_326 = ((aligned) ? vec_rank_325 : strided_282[3]);
+        if (keys_279[3] > threshold) {
+            unsigned long long dst_15 = gt_run + (unsigned long long)g;
+            out_vals[dst_15] = __uint_as_float(keys_279[3]);
+            out_idx[dst_15] = idxs_280[3];
+            g = g + 1;
+        } else if (ties_281[3] && rank_326 < take_c) {
+            unsigned long long dst2_15 = eq_run + (unsigned long long)rank_326;
+            out_vals[dst2_15] = __uint_as_float(keys_279[3]);
+            out_idx[dst2_15] = idxs_280[3];
+        }
+        if (ties_281[3]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned long long gt_next = gt_run + (unsigned long long)gt_total_143;
+        unsigned long long eq_next = eq_run + (unsigned long long)take_c;
+        unsigned int rem_next = take_rem - take_c;
+        __syncthreads();
+        gt_run = gt_next;
+        eq_run = eq_next;
+        take_rem = rem_next;
+        if (nch_stream > c_5 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_0_15 = start + (c_5 + 2) * 8192 + tid * 4;
+                if (i_0_15 < vocab) {
+                    float _vec_load_56[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_15);
+                        _vec_load_56[0 + 0] = _v4.x;
+                        _vec_load_56[0 + 1] = _v4.y;
+                        _vec_load_56[0 + 2] = _v4.z;
+                        _vec_load_56[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_56[0];
+                    vals_a[1] = _vec_load_56[1];
+                    vals_a[2] = _vec_load_56[2];
+                    vals_a[3] = _vec_load_56[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_2_16 = start + (c_5 + 2) * 8192 + 2048 + tid * 4;
+                if (i_2_16 < vocab) {
+                    float _vec_load_57[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_16);
+                        _vec_load_57[0 + 0] = _v4.x;
+                        _vec_load_57[0 + 1] = _v4.y;
+                        _vec_load_57[0 + 2] = _v4.z;
+                        _vec_load_57[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_57[0];
+                    vals_a[5] = _vec_load_57[1];
+                    vals_a[6] = _vec_load_57[2];
+                    vals_a[7] = _vec_load_57[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_3_1 = start + (c_5 + 2) * 8192 + 4096 + tid * 4;
+                if (i_3_1 < vocab) {
+                    float _vec_load_58[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3_1);
+                        _vec_load_58[0 + 0] = _v4.x;
+                        _vec_load_58[0 + 1] = _v4.y;
+                        _vec_load_58[0 + 2] = _v4.z;
+                        _vec_load_58[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_58[0];
+                    vals_a[9] = _vec_load_58[1];
+                    vals_a[10] = _vec_load_58[2];
+                    vals_a[11] = _vec_load_58[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_4_1 = start + (c_5 + 2) * 8192 + 6144 + tid * 4;
+                if (i_4_1 < vocab) {
+                    float _vec_load_59[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4_1);
+                        _vec_load_59[0 + 0] = _v4.x;
+                        _vec_load_59[0 + 1] = _v4.y;
+                        _vec_load_59[0 + 2] = _v4.z;
+                        _vec_load_59[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_59[0];
+                    vals_a[13] = _vec_load_59[1];
+                    vals_a[14] = _vec_load_59[2];
+                    vals_a[15] = _vec_load_59[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_28 = start + (c_5 + 2) * 8192 + tid;
+                if (i2_28 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_28];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_14 = start + (c_5 + 2) * 8192 + 512 + tid;
+                if (i2_0_14 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_14];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_14 = start + (c_5 + 2) * 8192 + 1024 + tid;
+                if (i2_1_14 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_14];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_14 = start + (c_5 + 2) * 8192 + 1536 + tid;
+                if (i2_2_14 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_14];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_14 = start + (c_5 + 2) * 8192 + 2048 + tid;
+                if (i2_3_14 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_14];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_14 = start + (c_5 + 2) * 8192 + 2560 + tid;
+                if (i2_4_14 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_14];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_14 = start + (c_5 + 2) * 8192 + 3072 + tid;
+                if (i2_5_14 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_14];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_14 = start + (c_5 + 2) * 8192 + 3584 + tid;
+                if (i2_6_14 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_14];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_14 = start + (c_5 + 2) * 8192 + 4096 + tid;
+                if (i2_7_14 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_14];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_14 = start + (c_5 + 2) * 8192 + 4608 + tid;
+                if (i2_8_14 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_14];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_14 = start + (c_5 + 2) * 8192 + 5120 + tid;
+                if (i2_9_14 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_14];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_14 = start + (c_5 + 2) * 8192 + 5632 + tid;
+                if (i2_10_14 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_14];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_14 = start + (c_5 + 2) * 8192 + 6144 + tid;
+                if (i2_11_14 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_14];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_14 = start + (c_5 + 2) * 8192 + 6656 + tid;
+                if (i2_12_14 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_14];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_14 = start + (c_5 + 2) * 8192 + 7168 + tid;
+                if (i2_13_14 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_14];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_14 = start + (c_5 + 2) * 8192 + 7680 + tid;
+                if (i2_14_14 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_14];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_5 + 1) {
+            unsigned int gt_1 = 0;
+            unsigned int bits_3_4 = __as_u32(vals_b[0]);
+            unsigned int key_4_4 = ((bits_3_4 <= 2139095040) ? bits_3_4 : 0);
+            int i_vec_5 = start + (c_5 + 1) * 8192 + tid * 4;
+            int i_str_6 = start + (c_5 + 1) * 8192 + tid;
+            int i_8_1 = ((aligned) ? i_vec_5 : i_str_6);
+            int i_9_1 = i_8_1;
+            bool tie_10 = key_4_4 == threshold && i_9_1 < vocab;
+            unsigned int _vote_67 = __ballot_sync(0xFFFFFFFF, tie_10);
+            unsigned int m_11 = _vote_67;
+            if (lane == 0) {
+                int _popc_98 = __popc(m_11);
+                cnt[warp] = (unsigned int)_popc_98;
+            }
+            if (key_4_4 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_12_3 = __as_u32(vals_b[1]);
+            unsigned int key_13_3 = ((bits_12_3 <= 2139095040) ? bits_12_3 : 0);
+            int i_vec_14 = start + (c_5 + 1) * 8192 + tid * 4 + 1;
+            int i_str_15 = start + (c_5 + 1) * 8192 + 512 + tid;
+            int i_16_1 = ((aligned) ? i_vec_14 : i_str_15);
+            int i_17_1 = i_16_1;
+            bool tie_18 = key_13_3 == threshold && i_17_1 < vocab;
+            unsigned int _vote_68 = __ballot_sync(0xFFFFFFFF, tie_18);
+            unsigned int m_19 = _vote_68;
+            if (lane == 0) {
+                int _popc_99 = __popc(m_19);
+                cnt[16 + warp] = (unsigned int)_popc_99;
+            }
+            if (key_13_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_20_1 = __as_u32(vals_b[2]);
+            unsigned int key_21_1 = ((bits_20_1 <= 2139095040) ? bits_20_1 : 0);
+            int i_vec_22 = start + (c_5 + 1) * 8192 + tid * 4 + 2;
+            int i_str_23 = start + (c_5 + 1) * 8192 + 1024 + tid;
+            int i_24 = ((aligned) ? i_vec_22 : i_str_23);
+            int i_25 = i_24;
+            bool tie_26 = key_21_1 == threshold && i_25 < vocab;
+            unsigned int _vote_69 = __ballot_sync(0xFFFFFFFF, tie_26);
+            unsigned int m_27_1 = _vote_69;
+            if (lane == 0) {
+                int _popc_100 = __popc(m_27_1);
+                cnt[32 + warp] = (unsigned int)_popc_100;
+            }
+            if (key_21_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_28_3 = __as_u32(vals_b[3]);
+            unsigned int key_29_3 = ((bits_28_3 <= 2139095040) ? bits_28_3 : 0);
+            int i_vec_30 = start + (c_5 + 1) * 8192 + tid * 4 + 3;
+            int i_str_31 = start + (c_5 + 1) * 8192 + 1536 + tid;
+            int i_32 = ((aligned) ? i_vec_30 : i_str_31);
+            int i_33 = i_32;
+            bool tie_34 = key_29_3 == threshold && i_33 < vocab;
+            unsigned int _vote_70 = __ballot_sync(0xFFFFFFFF, tie_34);
+            unsigned int m_35 = _vote_70;
+            if (lane == 0) {
+                int _popc_101 = __popc(m_35);
+                cnt[48 + warp] = (unsigned int)_popc_101;
+            }
+            if (key_29_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_36_3 = __as_u32(vals_b[4]);
+            unsigned int key_37_3 = ((bits_36_3 <= 2139095040) ? bits_36_3 : 0);
+            int i_vec_38 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+            int i_str_39 = start + (c_5 + 1) * 8192 + 2048 + tid;
+            int i_40 = ((aligned) ? i_vec_38 : i_str_39);
+            int i_41 = i_40;
+            bool tie_42 = key_37_3 == threshold && i_41 < vocab;
+            unsigned int _vote_71 = __ballot_sync(0xFFFFFFFF, tie_42);
+            unsigned int m_43_1 = _vote_71;
+            if (lane == 0) {
+                int _popc_102 = __popc(m_43_1);
+                cnt[64 + warp] = (unsigned int)_popc_102;
+            }
+            if (key_37_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_44 = __as_u32(vals_b[5]);
+            unsigned int key_45 = ((bits_44 <= 2139095040) ? bits_44 : 0);
+            int i_vec_46 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 1;
+            int i_str_47 = start + (c_5 + 1) * 8192 + 2560 + tid;
+            int i_48 = ((aligned) ? i_vec_46 : i_str_47);
+            int i_49 = i_48;
+            bool tie_50 = key_45 == threshold && i_49 < vocab;
+            unsigned int _vote_72 = __ballot_sync(0xFFFFFFFF, tie_50);
+            unsigned int m_51 = _vote_72;
+            if (lane == 0) {
+                int _popc_103 = __popc(m_51);
+                cnt[80 + warp] = (unsigned int)_popc_103;
+            }
+            if (key_45 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_52 = __as_u32(vals_b[6]);
+            unsigned int key_53 = ((bits_52 <= 2139095040) ? bits_52 : 0);
+            int i_vec_54 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 2;
+            int i_str_55 = start + (c_5 + 1) * 8192 + 3072 + tid;
+            int i_56 = ((aligned) ? i_vec_54 : i_str_55);
+            int i_57 = i_56;
+            bool tie_58 = key_53 == threshold && i_57 < vocab;
+            unsigned int _vote_73 = __ballot_sync(0xFFFFFFFF, tie_58);
+            unsigned int m_59 = _vote_73;
+            if (lane == 0) {
+                int _popc_104 = __popc(m_59);
+                cnt[96 + warp] = (unsigned int)_popc_104;
+            }
+            if (key_53 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_60 = __as_u32(vals_b[7]);
+            unsigned int key_61 = ((bits_60 <= 2139095040) ? bits_60 : 0);
+            int i_vec_62 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 3;
+            int i_str_63 = start + (c_5 + 1) * 8192 + 3584 + tid;
+            int i_64 = ((aligned) ? i_vec_62 : i_str_63);
+            int i_65 = i_64;
+            bool tie_66 = key_61 == threshold && i_65 < vocab;
+            unsigned int _vote_74 = __ballot_sync(0xFFFFFFFF, tie_66);
+            unsigned int m_67 = _vote_74;
+            if (lane == 0) {
+                int _popc_105 = __popc(m_67);
+                cnt[112 + warp] = (unsigned int)_popc_105;
+            }
+            if (key_61 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_68_1 = __as_u32(vals_b[8]);
+            unsigned int key_69_1 = ((bits_68_1 <= 2139095040) ? bits_68_1 : 0);
+            int i_vec_70_1 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+            int i_str_71_1 = start + (c_5 + 1) * 8192 + 4096 + tid;
+            int i_72 = ((aligned) ? i_vec_70_1 : i_str_71_1);
+            int i_73 = i_72;
+            bool tie_74 = key_69_1 == threshold && i_73 < vocab;
+            unsigned int _vote_75 = __ballot_sync(0xFFFFFFFF, tie_74);
+            unsigned int m_75 = _vote_75;
+            if (lane == 0) {
+                int _popc_106 = __popc(m_75);
+                cnt[128 + warp] = (unsigned int)_popc_106;
+            }
+            if (key_69_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_76 = __as_u32(vals_b[9]);
+            unsigned int key_77 = ((bits_76 <= 2139095040) ? bits_76 : 0);
+            int i_vec_78 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 1;
+            int i_str_79 = start + (c_5 + 1) * 8192 + 4608 + tid;
+            int i_80 = ((aligned) ? i_vec_78 : i_str_79);
+            int i_81 = i_80;
+            bool tie_82 = key_77 == threshold && i_81 < vocab;
+            unsigned int _vote_76 = __ballot_sync(0xFFFFFFFF, tie_82);
+            unsigned int m_83 = _vote_76;
+            if (lane == 0) {
+                int _popc_107 = __popc(m_83);
+                cnt[144 + warp] = (unsigned int)_popc_107;
+            }
+            if (key_77 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_84_1 = __as_u32(vals_b[10]);
+            unsigned int key_85_1 = ((bits_84_1 <= 2139095040) ? bits_84_1 : 0);
+            int i_vec_86_1 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 2;
+            int i_str_87_1 = start + (c_5 + 1) * 8192 + 5120 + tid;
+            int i_88 = ((aligned) ? i_vec_86_1 : i_str_87_1);
+            int i_89 = i_88;
+            bool tie_90 = key_85_1 == threshold && i_89 < vocab;
+            unsigned int _vote_77 = __ballot_sync(0xFFFFFFFF, tie_90);
+            unsigned int m_91 = _vote_77;
+            if (lane == 0) {
+                int _popc_108 = __popc(m_91);
+                cnt[160 + warp] = (unsigned int)_popc_108;
+            }
+            if (key_85_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_92 = __as_u32(vals_b[11]);
+            unsigned int key_93 = ((bits_92 <= 2139095040) ? bits_92 : 0);
+            int i_vec_94 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 3;
+            int i_str_95 = start + (c_5 + 1) * 8192 + 5632 + tid;
+            int i_96 = ((aligned) ? i_vec_94 : i_str_95);
+            int i_97 = i_96;
+            bool tie_98 = key_93 == threshold && i_97 < vocab;
+            unsigned int _vote_78 = __ballot_sync(0xFFFFFFFF, tie_98);
+            unsigned int m_99 = _vote_78;
+            if (lane == 0) {
+                int _popc_109 = __popc(m_99);
+                cnt[176 + warp] = (unsigned int)_popc_109;
+            }
+            if (key_93 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_100 = __as_u32(vals_b[12]);
+            unsigned int key_101 = ((bits_100 <= 2139095040) ? bits_100 : 0);
+            int i_vec_102 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+            int i_str_103 = start + (c_5 + 1) * 8192 + 6144 + tid;
+            int i_104 = ((aligned) ? i_vec_102 : i_str_103);
+            int i_105 = i_104;
+            bool tie_106 = key_101 == threshold && i_105 < vocab;
+            unsigned int _vote_79 = __ballot_sync(0xFFFFFFFF, tie_106);
+            unsigned int m_107_1 = _vote_79;
+            if (lane == 0) {
+                int _popc_110 = __popc(m_107_1);
+                cnt[192 + warp] = (unsigned int)_popc_110;
+            }
+            if (key_101 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_108_1 = __as_u32(vals_b[13]);
+            unsigned int key_109_1 = ((bits_108_1 <= 2139095040) ? bits_108_1 : 0);
+            int i_vec_110_1 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 1;
+            int i_str_111_1 = start + (c_5 + 1) * 8192 + 6656 + tid;
+            int i_112 = ((aligned) ? i_vec_110_1 : i_str_111_1);
+            int i_113 = i_112;
+            bool tie_114 = key_109_1 == threshold && i_113 < vocab;
+            unsigned int _vote_80 = __ballot_sync(0xFFFFFFFF, tie_114);
+            unsigned int m_115 = _vote_80;
+            if (lane == 0) {
+                int _popc_111 = __popc(m_115);
+                cnt[208 + warp] = (unsigned int)_popc_111;
+            }
+            if (key_109_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_116 = __as_u32(vals_b[14]);
+            unsigned int key_117 = ((bits_116 <= 2139095040) ? bits_116 : 0);
+            int i_vec_118 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 2;
+            int i_str_119 = start + (c_5 + 1) * 8192 + 7168 + tid;
+            int i_120 = ((aligned) ? i_vec_118 : i_str_119);
+            int i_121 = i_120;
+            bool tie_122 = key_117 == threshold && i_121 < vocab;
+            unsigned int _vote_81 = __ballot_sync(0xFFFFFFFF, tie_122);
+            unsigned int m_123 = _vote_81;
+            if (lane == 0) {
+                int _popc_112 = __popc(m_123);
+                cnt[224 + warp] = (unsigned int)_popc_112;
+            }
+            if (key_117 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_124 = __as_u32(vals_b[15]);
+            unsigned int key_125 = ((bits_124 <= 2139095040) ? bits_124 : 0);
+            int i_vec_126 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 3;
+            int i_str_127 = start + (c_5 + 1) * 8192 + 7680 + tid;
+            int i_128 = ((aligned) ? i_vec_126 : i_str_127);
+            int i_129 = i_128;
+            bool tie_130 = key_125 == threshold && i_129 < vocab;
+            unsigned int _vote_82 = __ballot_sync(0xFFFFFFFF, tie_130);
+            unsigned int m_131 = _vote_82;
+            if (lane == 0) {
+                int _popc_113 = __popc(m_131);
+                cnt[240 + warp] = (unsigned int)_popc_113;
+            }
+            if (key_125 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int gt_cnt_132 = gt_1;
+            __syncthreads();
+            unsigned int local_133 = 0;
+            int f_134 = tid;
+            if (f_134 < 256) {
+                local_133 = local_133 + cnt[f_134];
+            }
+            unsigned int packed_135 = gt_cnt_132 | local_133 << 12;
+            uint32_t _warp_scan_sum_u32_8 = packed_135;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(16));
+            unsigned int incl_136 = _warp_scan_sum_u32_8;
+            if (lane == 31) {
+                warp_sums[warp] = incl_136;
+            }
+            __syncthreads();
+            unsigned int before_137 = 0;
+            unsigned int total_138 = 0;
+            unsigned int ws_142 = warp_sums[0];
+            total_138 = total_138 + ws_142;
+            if (warp > 0) {
+                before_137 = before_137 + ws_142;
+            }
+            unsigned int ws_143 = warp_sums[1];
+            total_138 = total_138 + ws_143;
+            if (warp > 1) {
+                before_137 = before_137 + ws_143;
+            }
+            unsigned int ws_144 = warp_sums[2];
+            total_138 = total_138 + ws_144;
+            if (warp > 2) {
+                before_137 = before_137 + ws_144;
+            }
+            unsigned int ws_145 = warp_sums[3];
+            total_138 = total_138 + ws_145;
+            if (warp > 3) {
+                before_137 = before_137 + ws_145;
+            }
+            unsigned int ws_146 = warp_sums[4];
+            total_138 = total_138 + ws_146;
+            if (warp > 4) {
+                before_137 = before_137 + ws_146;
+            }
+            unsigned int ws_147 = warp_sums[5];
+            total_138 = total_138 + ws_147;
+            if (warp > 5) {
+                before_137 = before_137 + ws_147;
+            }
+            unsigned int ws_148 = warp_sums[6];
+            total_138 = total_138 + ws_148;
+            if (warp > 6) {
+                before_137 = before_137 + ws_148;
+            }
+            unsigned int ws_149 = warp_sums[7];
+            total_138 = total_138 + ws_149;
+            if (warp > 7) {
+                before_137 = before_137 + ws_149;
+            }
+            unsigned int ws_150 = warp_sums[8];
+            total_138 = total_138 + ws_150;
+            if (warp > 8) {
+                before_137 = before_137 + ws_150;
+            }
+            unsigned int ws_151 = warp_sums[9];
+            total_138 = total_138 + ws_151;
+            if (warp > 9) {
+                before_137 = before_137 + ws_151;
+            }
+            unsigned int ws_152 = warp_sums[10];
+            total_138 = total_138 + ws_152;
+            if (warp > 10) {
+                before_137 = before_137 + ws_152;
+            }
+            unsigned int ws_153 = warp_sums[11];
+            total_138 = total_138 + ws_153;
+            if (warp > 11) {
+                before_137 = before_137 + ws_153;
+            }
+            unsigned int ws_154 = warp_sums[12];
+            total_138 = total_138 + ws_154;
+            if (warp > 12) {
+                before_137 = before_137 + ws_154;
+            }
+            unsigned int ws_155 = warp_sums[13];
+            total_138 = total_138 + ws_155;
+            if (warp > 13) {
+                before_137 = before_137 + ws_155;
+            }
+            unsigned int ws_156 = warp_sums[14];
+            total_138 = total_138 + ws_156;
+            if (warp > 14) {
+                before_137 = before_137 + ws_156;
+            }
+            unsigned int ws_157 = warp_sums[15];
+            total_138 = total_138 + ws_157;
+            if (warp > 15) {
+                before_137 = before_137 + ws_157;
+            }
+            unsigned int excl_158 = before_137 + incl_136 - packed_135;
+            __syncthreads();
+            unsigned int running_159 = excl_158 >> 12;
+            int f2_160 = tid;
+            if (f2_160 < 256) {
+                unsigned int c_0_1 = cnt[f2_160];
+                cnt[f2_160] = running_159;
+                running_159 = running_159 + c_0_1;
+            }
+            __syncthreads();
+            unsigned int gt_slot_161 = excl_158 & 4095;
+            unsigned int gt_total_162 = total_138 & 4095;
+            unsigned int eq_total_163 = total_138 >> 12;
+            unsigned int _min_4 = ((eq_total_163) < (take_rem) ? (eq_total_163) : (take_rem));
+            unsigned int take_c_164 = _min_4;
+            unsigned int lt_mask_165 = (1 << (unsigned int)lane) - 1;
+            unsigned int g_166 = gt_slot_161;
+            unsigned int keys_167[4];
+            int idxs_168[4];
+            bool ties_169[4];
+            unsigned int strided_170[4];
+            unsigned int grp_warp_171 = 0;
+            unsigned int grp_lane_172 = 0;
+            unsigned int bits_173 = __as_u32(vals_b[0]);
+            unsigned int key_174 = ((bits_173 <= 2139095040) ? bits_173 : 0);
+            keys_167[0] = key_174;
+            int i_vec_175 = start + (c_5 + 1) * 8192 + tid * 4;
+            int i_str_176 = start + (c_5 + 1) * 8192 + tid;
+            int i_177 = ((aligned) ? i_vec_175 : i_str_176);
+            idxs_168[0] = i_177;
+            ties_169[0] = keys_167[0] == threshold && idxs_168[0] < vocab;
+            unsigned int _vote_83 = __ballot_sync(0xFFFFFFFF, ties_169[0]);
+            unsigned int m_178 = _vote_83;
+            int _popc_114 = __popc(m_178 & lt_mask_165);
+            unsigned int lane_before_179 = (unsigned int)_popc_114;
+            unsigned int warp_off_180 = cnt[warp];
+            strided_170[0] = warp_off_180 + lane_before_179;
+            grp_warp_171 = grp_warp_171 + (warp_off_180 - cnt[0]);
+            grp_lane_172 = grp_lane_172 + lane_before_179;
+            unsigned int bits_181 = __as_u32(vals_b[1]);
+            unsigned int key_182 = ((bits_181 <= 2139095040) ? bits_181 : 0);
+            keys_167[1] = key_182;
+            int i_vec_183 = start + (c_5 + 1) * 8192 + tid * 4 + 1;
+            int i_str_184 = start + (c_5 + 1) * 8192 + 512 + tid;
+            int i_185 = ((aligned) ? i_vec_183 : i_str_184);
+            idxs_168[1] = i_185;
+            ties_169[1] = keys_167[1] == threshold && idxs_168[1] < vocab;
+            unsigned int _vote_84 = __ballot_sync(0xFFFFFFFF, ties_169[1]);
+            unsigned int m_186 = _vote_84;
+            int _popc_115 = __popc(m_186 & lt_mask_165);
+            unsigned int lane_before_187 = (unsigned int)_popc_115;
+            unsigned int warp_off_188 = cnt[16 + warp];
+            strided_170[1] = warp_off_188 + lane_before_187;
+            grp_warp_171 = grp_warp_171 + (warp_off_188 - cnt[16]);
+            grp_lane_172 = grp_lane_172 + lane_before_187;
+            unsigned int bits_190 = __as_u32(vals_b[2]);
+            unsigned int key_191 = ((bits_190 <= 2139095040) ? bits_190 : 0);
+            keys_167[2] = key_191;
+            int i_vec_192 = start + (c_5 + 1) * 8192 + tid * 4 + 2;
+            int i_str_193 = start + (c_5 + 1) * 8192 + 1024 + tid;
+            int i_194 = ((aligned) ? i_vec_192 : i_str_193);
+            idxs_168[2] = i_194;
+            ties_169[2] = keys_167[2] == threshold && idxs_168[2] < vocab;
+            unsigned int _vote_85 = __ballot_sync(0xFFFFFFFF, ties_169[2]);
+            unsigned int m_195 = _vote_85;
+            int _popc_116 = __popc(m_195 & lt_mask_165);
+            unsigned int lane_before_196 = (unsigned int)_popc_116;
+            unsigned int warp_off_197 = cnt[32 + warp];
+            strided_170[2] = warp_off_197 + lane_before_196;
+            grp_warp_171 = grp_warp_171 + (warp_off_197 - cnt[32]);
+            grp_lane_172 = grp_lane_172 + lane_before_196;
+            unsigned int bits_198 = __as_u32(vals_b[3]);
+            unsigned int key_199 = ((bits_198 <= 2139095040) ? bits_198 : 0);
+            keys_167[3] = key_199;
+            int i_vec_200 = start + (c_5 + 1) * 8192 + tid * 4 + 3;
+            int i_str_201 = start + (c_5 + 1) * 8192 + 1536 + tid;
+            int i_202 = ((aligned) ? i_vec_200 : i_str_201);
+            idxs_168[3] = i_202;
+            ties_169[3] = keys_167[3] == threshold && idxs_168[3] < vocab;
+            unsigned int _vote_86 = __ballot_sync(0xFFFFFFFF, ties_169[3]);
+            unsigned int m_203 = _vote_86;
+            int _popc_117 = __popc(m_203 & lt_mask_165);
+            unsigned int lane_before_204 = (unsigned int)_popc_117;
+            unsigned int warp_off_205 = cnt[48 + warp];
+            strided_170[3] = warp_off_205 + lane_before_204;
+            grp_warp_171 = grp_warp_171 + (warp_off_205 - cnt[48]);
+            grp_lane_172 = grp_lane_172 + lane_before_204;
+            unsigned int grp_base_206 = cnt[0];
+            unsigned int own_207 = 0;
+            unsigned int vec_rank_208 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_209 = ((aligned) ? vec_rank_208 : strided_170[0]);
+            if (keys_167[0] > threshold) {
+                unsigned long long dst_16 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_16] = __uint_as_float(keys_167[0]);
+                out_idx[dst_16] = idxs_168[0];
+                g_166 = g_166 + 1;
+            } else if (ties_169[0] && rank_209 < take_c_164) {
+                unsigned long long dst2_16 = eq_run + (unsigned long long)rank_209;
+                out_vals[dst2_16] = __uint_as_float(keys_167[0]);
+                out_idx[dst2_16] = idxs_168[0];
+            }
+            if (ties_169[0]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_210 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_211 = ((aligned) ? vec_rank_210 : strided_170[1]);
+            if (keys_167[1] > threshold) {
+                unsigned long long dst_17 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_17] = __uint_as_float(keys_167[1]);
+                out_idx[dst_17] = idxs_168[1];
+                g_166 = g_166 + 1;
+            } else if (ties_169[1] && rank_211 < take_c_164) {
+                unsigned long long dst2_17 = eq_run + (unsigned long long)rank_211;
+                out_vals[dst2_17] = __uint_as_float(keys_167[1]);
+                out_idx[dst2_17] = idxs_168[1];
+            }
+            if (ties_169[1]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_212 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_213 = ((aligned) ? vec_rank_212 : strided_170[2]);
+            if (keys_167[2] > threshold) {
+                unsigned long long dst_18 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_18] = __uint_as_float(keys_167[2]);
+                out_idx[dst_18] = idxs_168[2];
+                g_166 = g_166 + 1;
+            } else if (ties_169[2] && rank_213 < take_c_164) {
+                unsigned long long dst2_18 = eq_run + (unsigned long long)rank_213;
+                out_vals[dst2_18] = __uint_as_float(keys_167[2]);
+                out_idx[dst2_18] = idxs_168[2];
+            }
+            if (ties_169[2]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_214 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_215 = ((aligned) ? vec_rank_214 : strided_170[3]);
+            if (keys_167[3] > threshold) {
+                unsigned long long dst_19 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_19] = __uint_as_float(keys_167[3]);
+                out_idx[dst_19] = idxs_168[3];
+                g_166 = g_166 + 1;
+            } else if (ties_169[3] && rank_215 < take_c_164) {
+                unsigned long long dst2_19 = eq_run + (unsigned long long)rank_215;
+                out_vals[dst2_19] = __uint_as_float(keys_167[3]);
+                out_idx[dst2_19] = idxs_168[3];
+            }
+            if (ties_169[3]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int keys_216[4];
+            int idxs_217[4];
+            bool ties_218[4];
+            unsigned int strided_219[4];
+            unsigned int grp_warp_220 = 0;
+            unsigned int grp_lane_221 = 0;
+            unsigned int bits_222 = __as_u32(vals_b[4]);
+            unsigned int key_223 = ((bits_222 <= 2139095040) ? bits_222 : 0);
+            keys_216[0] = key_223;
+            int i_vec_224 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+            int i_str_225 = start + (c_5 + 1) * 8192 + 2048 + tid;
+            int i_226 = ((aligned) ? i_vec_224 : i_str_225);
+            idxs_217[0] = i_226;
+            ties_218[0] = keys_216[0] == threshold && idxs_217[0] < vocab;
+            unsigned int _vote_87 = __ballot_sync(0xFFFFFFFF, ties_218[0]);
+            unsigned int m_227 = _vote_87;
+            int _popc_118 = __popc(m_227 & lt_mask_165);
+            unsigned int lane_before_228 = (unsigned int)_popc_118;
+            unsigned int warp_off_229 = cnt[64 + warp];
+            strided_219[0] = warp_off_229 + lane_before_228;
+            grp_warp_220 = grp_warp_220 + (warp_off_229 - cnt[64]);
+            grp_lane_221 = grp_lane_221 + lane_before_228;
+            unsigned int bits_230 = __as_u32(vals_b[5]);
+            unsigned int key_231 = ((bits_230 <= 2139095040) ? bits_230 : 0);
+            keys_216[1] = key_231;
+            int i_vec_232 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 1;
+            int i_str_233 = start + (c_5 + 1) * 8192 + 2560 + tid;
+            int i_234 = ((aligned) ? i_vec_232 : i_str_233);
+            idxs_217[1] = i_234;
+            ties_218[1] = keys_216[1] == threshold && idxs_217[1] < vocab;
+            unsigned int _vote_88 = __ballot_sync(0xFFFFFFFF, ties_218[1]);
+            unsigned int m_235 = _vote_88;
+            int _popc_119 = __popc(m_235 & lt_mask_165);
+            unsigned int lane_before_236 = (unsigned int)_popc_119;
+            unsigned int warp_off_237 = cnt[80 + warp];
+            strided_219[1] = warp_off_237 + lane_before_236;
+            grp_warp_220 = grp_warp_220 + (warp_off_237 - cnt[80]);
+            grp_lane_221 = grp_lane_221 + lane_before_236;
+            unsigned int bits_238 = __as_u32(vals_b[6]);
+            unsigned int key_239 = ((bits_238 <= 2139095040) ? bits_238 : 0);
+            keys_216[2] = key_239;
+            int i_vec_240 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 2;
+            int i_str_241 = start + (c_5 + 1) * 8192 + 3072 + tid;
+            int i_242 = ((aligned) ? i_vec_240 : i_str_241);
+            idxs_217[2] = i_242;
+            ties_218[2] = keys_216[2] == threshold && idxs_217[2] < vocab;
+            unsigned int _vote_89 = __ballot_sync(0xFFFFFFFF, ties_218[2]);
+            unsigned int m_243 = _vote_89;
+            int _popc_120 = __popc(m_243 & lt_mask_165);
+            unsigned int lane_before_244 = (unsigned int)_popc_120;
+            unsigned int warp_off_245 = cnt[96 + warp];
+            strided_219[2] = warp_off_245 + lane_before_244;
+            grp_warp_220 = grp_warp_220 + (warp_off_245 - cnt[96]);
+            grp_lane_221 = grp_lane_221 + lane_before_244;
+            unsigned int bits_246 = __as_u32(vals_b[7]);
+            unsigned int key_247 = ((bits_246 <= 2139095040) ? bits_246 : 0);
+            keys_216[3] = key_247;
+            int i_vec_248 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 3;
+            int i_str_249 = start + (c_5 + 1) * 8192 + 3584 + tid;
+            int i_250 = ((aligned) ? i_vec_248 : i_str_249);
+            idxs_217[3] = i_250;
+            ties_218[3] = keys_216[3] == threshold && idxs_217[3] < vocab;
+            unsigned int _vote_90 = __ballot_sync(0xFFFFFFFF, ties_218[3]);
+            unsigned int m_251 = _vote_90;
+            int _popc_121 = __popc(m_251 & lt_mask_165);
+            unsigned int lane_before_252 = (unsigned int)_popc_121;
+            unsigned int warp_off_253 = cnt[112 + warp];
+            strided_219[3] = warp_off_253 + lane_before_252;
+            grp_warp_220 = grp_warp_220 + (warp_off_253 - cnt[112]);
+            grp_lane_221 = grp_lane_221 + lane_before_252;
+            unsigned int grp_base_254 = cnt[64];
+            unsigned int own_255 = 0;
+            unsigned int vec_rank_256 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_257 = ((aligned) ? vec_rank_256 : strided_219[0]);
+            if (keys_216[0] > threshold) {
+                unsigned long long dst_20 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_20] = __uint_as_float(keys_216[0]);
+                out_idx[dst_20] = idxs_217[0];
+                g_166 = g_166 + 1;
+            } else if (ties_218[0] && rank_257 < take_c_164) {
+                unsigned long long dst2_20 = eq_run + (unsigned long long)rank_257;
+                out_vals[dst2_20] = __uint_as_float(keys_216[0]);
+                out_idx[dst2_20] = idxs_217[0];
+            }
+            if (ties_218[0]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_258 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_259 = ((aligned) ? vec_rank_258 : strided_219[1]);
+            if (keys_216[1] > threshold) {
+                unsigned long long dst_21 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_21] = __uint_as_float(keys_216[1]);
+                out_idx[dst_21] = idxs_217[1];
+                g_166 = g_166 + 1;
+            } else if (ties_218[1] && rank_259 < take_c_164) {
+                unsigned long long dst2_21 = eq_run + (unsigned long long)rank_259;
+                out_vals[dst2_21] = __uint_as_float(keys_216[1]);
+                out_idx[dst2_21] = idxs_217[1];
+            }
+            if (ties_218[1]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_260 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_261 = ((aligned) ? vec_rank_260 : strided_219[2]);
+            if (keys_216[2] > threshold) {
+                unsigned long long dst_22 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_22] = __uint_as_float(keys_216[2]);
+                out_idx[dst_22] = idxs_217[2];
+                g_166 = g_166 + 1;
+            } else if (ties_218[2] && rank_261 < take_c_164) {
+                unsigned long long dst2_22 = eq_run + (unsigned long long)rank_261;
+                out_vals[dst2_22] = __uint_as_float(keys_216[2]);
+                out_idx[dst2_22] = idxs_217[2];
+            }
+            if (ties_218[2]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_262 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_263 = ((aligned) ? vec_rank_262 : strided_219[3]);
+            if (keys_216[3] > threshold) {
+                unsigned long long dst_23 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_23] = __uint_as_float(keys_216[3]);
+                out_idx[dst_23] = idxs_217[3];
+                g_166 = g_166 + 1;
+            } else if (ties_218[3] && rank_263 < take_c_164) {
+                unsigned long long dst2_23 = eq_run + (unsigned long long)rank_263;
+                out_vals[dst2_23] = __uint_as_float(keys_216[3]);
+                out_idx[dst2_23] = idxs_217[3];
+            }
+            if (ties_218[3]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int keys_264[4];
+            int idxs_265[4];
+            bool ties_266[4];
+            unsigned int strided_267[4];
+            unsigned int grp_warp_268 = 0;
+            unsigned int grp_lane_269 = 0;
+            unsigned int bits_270 = __as_u32(vals_b[8]);
+            unsigned int key_271 = ((bits_270 <= 2139095040) ? bits_270 : 0);
+            keys_264[0] = key_271;
+            int i_vec_272 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+            int i_str_273 = start + (c_5 + 1) * 8192 + 4096 + tid;
+            int i_274 = ((aligned) ? i_vec_272 : i_str_273);
+            idxs_265[0] = i_274;
+            ties_266[0] = keys_264[0] == threshold && idxs_265[0] < vocab;
+            unsigned int _vote_91 = __ballot_sync(0xFFFFFFFF, ties_266[0]);
+            unsigned int m_275 = _vote_91;
+            int _popc_122 = __popc(m_275 & lt_mask_165);
+            unsigned int lane_before_276 = (unsigned int)_popc_122;
+            unsigned int warp_off_277 = cnt[128 + warp];
+            strided_267[0] = warp_off_277 + lane_before_276;
+            grp_warp_268 = grp_warp_268 + (warp_off_277 - cnt[128]);
+            grp_lane_269 = grp_lane_269 + lane_before_276;
+            unsigned int bits_278 = __as_u32(vals_b[9]);
+            unsigned int key_279 = ((bits_278 <= 2139095040) ? bits_278 : 0);
+            keys_264[1] = key_279;
+            int i_vec_280 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 1;
+            int i_str_281 = start + (c_5 + 1) * 8192 + 4608 + tid;
+            int i_282 = ((aligned) ? i_vec_280 : i_str_281);
+            idxs_265[1] = i_282;
+            ties_266[1] = keys_264[1] == threshold && idxs_265[1] < vocab;
+            unsigned int _vote_92 = __ballot_sync(0xFFFFFFFF, ties_266[1]);
+            unsigned int m_283 = _vote_92;
+            int _popc_123 = __popc(m_283 & lt_mask_165);
+            unsigned int lane_before_284 = (unsigned int)_popc_123;
+            unsigned int warp_off_285 = cnt[144 + warp];
+            strided_267[1] = warp_off_285 + lane_before_284;
+            grp_warp_268 = grp_warp_268 + (warp_off_285 - cnt[144]);
+            grp_lane_269 = grp_lane_269 + lane_before_284;
+            unsigned int bits_286 = __as_u32(vals_b[10]);
+            unsigned int key_287 = ((bits_286 <= 2139095040) ? bits_286 : 0);
+            keys_264[2] = key_287;
+            int i_vec_288 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 2;
+            int i_str_289 = start + (c_5 + 1) * 8192 + 5120 + tid;
+            int i_290 = ((aligned) ? i_vec_288 : i_str_289);
+            idxs_265[2] = i_290;
+            ties_266[2] = keys_264[2] == threshold && idxs_265[2] < vocab;
+            unsigned int _vote_93 = __ballot_sync(0xFFFFFFFF, ties_266[2]);
+            unsigned int m_291 = _vote_93;
+            int _popc_124 = __popc(m_291 & lt_mask_165);
+            unsigned int lane_before_292 = (unsigned int)_popc_124;
+            unsigned int warp_off_293 = cnt[160 + warp];
+            strided_267[2] = warp_off_293 + lane_before_292;
+            grp_warp_268 = grp_warp_268 + (warp_off_293 - cnt[160]);
+            grp_lane_269 = grp_lane_269 + lane_before_292;
+            unsigned int bits_294 = __as_u32(vals_b[11]);
+            unsigned int key_295 = ((bits_294 <= 2139095040) ? bits_294 : 0);
+            keys_264[3] = key_295;
+            int i_vec_296 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 3;
+            int i_str_297 = start + (c_5 + 1) * 8192 + 5632 + tid;
+            int i_298 = ((aligned) ? i_vec_296 : i_str_297);
+            idxs_265[3] = i_298;
+            ties_266[3] = keys_264[3] == threshold && idxs_265[3] < vocab;
+            unsigned int _vote_94 = __ballot_sync(0xFFFFFFFF, ties_266[3]);
+            unsigned int m_299 = _vote_94;
+            int _popc_125 = __popc(m_299 & lt_mask_165);
+            unsigned int lane_before_300 = (unsigned int)_popc_125;
+            unsigned int warp_off_301 = cnt[176 + warp];
+            strided_267[3] = warp_off_301 + lane_before_300;
+            grp_warp_268 = grp_warp_268 + (warp_off_301 - cnt[176]);
+            grp_lane_269 = grp_lane_269 + lane_before_300;
+            unsigned int grp_base_302 = cnt[128];
+            unsigned int own_303 = 0;
+            unsigned int vec_rank_304 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_305 = ((aligned) ? vec_rank_304 : strided_267[0]);
+            if (keys_264[0] > threshold) {
+                unsigned long long dst_24 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_24] = __uint_as_float(keys_264[0]);
+                out_idx[dst_24] = idxs_265[0];
+                g_166 = g_166 + 1;
+            } else if (ties_266[0] && rank_305 < take_c_164) {
+                unsigned long long dst2_24 = eq_run + (unsigned long long)rank_305;
+                out_vals[dst2_24] = __uint_as_float(keys_264[0]);
+                out_idx[dst2_24] = idxs_265[0];
+            }
+            if (ties_266[0]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_306 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_307 = ((aligned) ? vec_rank_306 : strided_267[1]);
+            if (keys_264[1] > threshold) {
+                unsigned long long dst_25 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_25] = __uint_as_float(keys_264[1]);
+                out_idx[dst_25] = idxs_265[1];
+                g_166 = g_166 + 1;
+            } else if (ties_266[1] && rank_307 < take_c_164) {
+                unsigned long long dst2_25 = eq_run + (unsigned long long)rank_307;
+                out_vals[dst2_25] = __uint_as_float(keys_264[1]);
+                out_idx[dst2_25] = idxs_265[1];
+            }
+            if (ties_266[1]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_308 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_309 = ((aligned) ? vec_rank_308 : strided_267[2]);
+            if (keys_264[2] > threshold) {
+                unsigned long long dst_26 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_26] = __uint_as_float(keys_264[2]);
+                out_idx[dst_26] = idxs_265[2];
+                g_166 = g_166 + 1;
+            } else if (ties_266[2] && rank_309 < take_c_164) {
+                unsigned long long dst2_26 = eq_run + (unsigned long long)rank_309;
+                out_vals[dst2_26] = __uint_as_float(keys_264[2]);
+                out_idx[dst2_26] = idxs_265[2];
+            }
+            if (ties_266[2]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_310 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_311 = ((aligned) ? vec_rank_310 : strided_267[3]);
+            if (keys_264[3] > threshold) {
+                unsigned long long dst_27 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_27] = __uint_as_float(keys_264[3]);
+                out_idx[dst_27] = idxs_265[3];
+                g_166 = g_166 + 1;
+            } else if (ties_266[3] && rank_311 < take_c_164) {
+                unsigned long long dst2_27 = eq_run + (unsigned long long)rank_311;
+                out_vals[dst2_27] = __uint_as_float(keys_264[3]);
+                out_idx[dst2_27] = idxs_265[3];
+            }
+            if (ties_266[3]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int keys_312[4];
+            int idxs_313[4];
+            bool ties_314[4];
+            unsigned int strided_315[4];
+            unsigned int grp_warp_316 = 0;
+            unsigned int grp_lane_317 = 0;
+            unsigned int bits_318 = __as_u32(vals_b[12]);
+            unsigned int key_319 = ((bits_318 <= 2139095040) ? bits_318 : 0);
+            keys_312[0] = key_319;
+            int i_vec_320 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+            int i_str_321 = start + (c_5 + 1) * 8192 + 6144 + tid;
+            int i_322 = ((aligned) ? i_vec_320 : i_str_321);
+            idxs_313[0] = i_322;
+            ties_314[0] = keys_312[0] == threshold && idxs_313[0] < vocab;
+            unsigned int _vote_95 = __ballot_sync(0xFFFFFFFF, ties_314[0]);
+            unsigned int m_323 = _vote_95;
+            int _popc_126 = __popc(m_323 & lt_mask_165);
+            unsigned int lane_before_324 = (unsigned int)_popc_126;
+            unsigned int warp_off_325 = cnt[192 + warp];
+            strided_315[0] = warp_off_325 + lane_before_324;
+            grp_warp_316 = grp_warp_316 + (warp_off_325 - cnt[192]);
+            grp_lane_317 = grp_lane_317 + lane_before_324;
+            unsigned int bits_326 = __as_u32(vals_b[13]);
+            unsigned int key_327 = ((bits_326 <= 2139095040) ? bits_326 : 0);
+            keys_312[1] = key_327;
+            int i_vec_328 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 1;
+            int i_str_329 = start + (c_5 + 1) * 8192 + 6656 + tid;
+            int i_330 = ((aligned) ? i_vec_328 : i_str_329);
+            idxs_313[1] = i_330;
+            ties_314[1] = keys_312[1] == threshold && idxs_313[1] < vocab;
+            unsigned int _vote_96 = __ballot_sync(0xFFFFFFFF, ties_314[1]);
+            unsigned int m_331 = _vote_96;
+            int _popc_127 = __popc(m_331 & lt_mask_165);
+            unsigned int lane_before_332 = (unsigned int)_popc_127;
+            unsigned int warp_off_333 = cnt[208 + warp];
+            strided_315[1] = warp_off_333 + lane_before_332;
+            grp_warp_316 = grp_warp_316 + (warp_off_333 - cnt[208]);
+            grp_lane_317 = grp_lane_317 + lane_before_332;
+            unsigned int bits_334 = __as_u32(vals_b[14]);
+            unsigned int key_335 = ((bits_334 <= 2139095040) ? bits_334 : 0);
+            keys_312[2] = key_335;
+            int i_vec_336 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 2;
+            int i_str_337 = start + (c_5 + 1) * 8192 + 7168 + tid;
+            int i_338 = ((aligned) ? i_vec_336 : i_str_337);
+            idxs_313[2] = i_338;
+            ties_314[2] = keys_312[2] == threshold && idxs_313[2] < vocab;
+            unsigned int _vote_97 = __ballot_sync(0xFFFFFFFF, ties_314[2]);
+            unsigned int m_339 = _vote_97;
+            int _popc_128 = __popc(m_339 & lt_mask_165);
+            unsigned int lane_before_340 = (unsigned int)_popc_128;
+            unsigned int warp_off_341 = cnt[224 + warp];
+            strided_315[2] = warp_off_341 + lane_before_340;
+            grp_warp_316 = grp_warp_316 + (warp_off_341 - cnt[224]);
+            grp_lane_317 = grp_lane_317 + lane_before_340;
+            unsigned int bits_342 = __as_u32(vals_b[15]);
+            unsigned int key_343 = ((bits_342 <= 2139095040) ? bits_342 : 0);
+            keys_312[3] = key_343;
+            int i_vec_344 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 3;
+            int i_str_345 = start + (c_5 + 1) * 8192 + 7680 + tid;
+            int i_346 = ((aligned) ? i_vec_344 : i_str_345);
+            idxs_313[3] = i_346;
+            ties_314[3] = keys_312[3] == threshold && idxs_313[3] < vocab;
+            unsigned int _vote_98 = __ballot_sync(0xFFFFFFFF, ties_314[3]);
+            unsigned int m_347 = _vote_98;
+            int _popc_129 = __popc(m_347 & lt_mask_165);
+            unsigned int lane_before_348 = (unsigned int)_popc_129;
+            unsigned int warp_off_349 = cnt[240 + warp];
+            strided_315[3] = warp_off_349 + lane_before_348;
+            grp_warp_316 = grp_warp_316 + (warp_off_349 - cnt[240]);
+            grp_lane_317 = grp_lane_317 + lane_before_348;
+            unsigned int grp_base_350 = cnt[192];
+            unsigned int own_351 = 0;
+            unsigned int vec_rank_352 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_353 = ((aligned) ? vec_rank_352 : strided_315[0]);
+            if (keys_312[0] > threshold) {
+                unsigned long long dst_28 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_28] = __uint_as_float(keys_312[0]);
+                out_idx[dst_28] = idxs_313[0];
+                g_166 = g_166 + 1;
+            } else if (ties_314[0] && rank_353 < take_c_164) {
+                unsigned long long dst2_28 = eq_run + (unsigned long long)rank_353;
+                out_vals[dst2_28] = __uint_as_float(keys_312[0]);
+                out_idx[dst2_28] = idxs_313[0];
+            }
+            if (ties_314[0]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_354 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_355 = ((aligned) ? vec_rank_354 : strided_315[1]);
+            if (keys_312[1] > threshold) {
+                unsigned long long dst_29 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_29] = __uint_as_float(keys_312[1]);
+                out_idx[dst_29] = idxs_313[1];
+                g_166 = g_166 + 1;
+            } else if (ties_314[1] && rank_355 < take_c_164) {
+                unsigned long long dst2_29 = eq_run + (unsigned long long)rank_355;
+                out_vals[dst2_29] = __uint_as_float(keys_312[1]);
+                out_idx[dst2_29] = idxs_313[1];
+            }
+            if (ties_314[1]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_356 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_357 = ((aligned) ? vec_rank_356 : strided_315[2]);
+            if (keys_312[2] > threshold) {
+                unsigned long long dst_30 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_30] = __uint_as_float(keys_312[2]);
+                out_idx[dst_30] = idxs_313[2];
+                g_166 = g_166 + 1;
+            } else if (ties_314[2] && rank_357 < take_c_164) {
+                unsigned long long dst2_30 = eq_run + (unsigned long long)rank_357;
+                out_vals[dst2_30] = __uint_as_float(keys_312[2]);
+                out_idx[dst2_30] = idxs_313[2];
+            }
+            if (ties_314[2]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_358 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_359 = ((aligned) ? vec_rank_358 : strided_315[3]);
+            if (keys_312[3] > threshold) {
+                unsigned long long dst_31 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_31] = __uint_as_float(keys_312[3]);
+                out_idx[dst_31] = idxs_313[3];
+                g_166 = g_166 + 1;
+            } else if (ties_314[3] && rank_359 < take_c_164) {
+                unsigned long long dst2_31 = eq_run + (unsigned long long)rank_359;
+                out_vals[dst2_31] = __uint_as_float(keys_312[3]);
+                out_idx[dst2_31] = idxs_313[3];
+            }
+            if (ties_314[3]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned long long gt_next_360 = gt_run + (unsigned long long)gt_total_162;
+            unsigned long long eq_next_361 = eq_run + (unsigned long long)take_c_164;
+            unsigned int rem_next_362 = take_rem - take_c_164;
+            __syncthreads();
+            gt_run = gt_next_360;
+            eq_run = eq_next_361;
+            take_rem = rem_next_362;
+        }
+    }
+    unsigned long long gt_base_w = gt_run + (unsigned long long)before_125;
+    unsigned long long eq_base_w = eq_run + (unsigned long long)before_143;
+    unsigned int eq_take_w = ((before_143 < take_rem) ? take_rem - before_143 : 0);
+    unsigned int lt_mask_2 = (1 << (unsigned int)lane) - 1;
+    unsigned int g_1 = 0;
+    unsigned int t = 0;
+    int niter_161 = (int)(n_eff + 31 >> 5);
+    for (int j_4 = 0; j_4 < niter_161; j_4++) {
+        unsigned int e_4 = (unsigned int)(j_4 * 32 + lane);
+        bool valid_1 = e_4 < n_eff;
+        unsigned int key_42 = ((valid_1) ? lkeys[seg_base + j_4 * 32 + lane] : 0);
+        int idx = ((valid_1) ? lidx[seg_base + j_4 * 32 + lane] : 0);
+        bool is_gt = valid_1 && key_42 > threshold;
+        bool is_tie = valid_1 && key_42 == threshold;
+        unsigned int _vote_99 = __ballot_sync(0xFFFFFFFF, is_gt);
+        unsigned int mg_1 = _vote_99;
+        unsigned int _vote_100 = __ballot_sync(0xFFFFFFFF, is_tie);
+        unsigned int mt_1 = _vote_100;
+        if (valid_1 && key_42 > threshold) {
+            int _popc_130 = __popc(mg_1 & lt_mask_2);
+            unsigned long long dst_32 = gt_base_w + (unsigned long long)(g_1 + (unsigned int)_popc_130);
+            out_vals[dst_32] = __uint_as_float(key_42);
+            out_idx[dst_32] = idx;
+        }
+        if (valid_1 && key_42 == threshold) {
+            int _popc_131 = __popc(mt_1 & lt_mask_2);
+            unsigned int rank_0 = t + (unsigned int)_popc_131;
+            if (rank_0 < eq_take_w) {
+                unsigned long long dst2_32 = eq_base_w + (unsigned long long)rank_0;
+                out_vals[dst2_32] = __uint_as_float(key_42);
+                out_idx[dst2_32] = idx;
+            }
+        }
+        int _popc_132 = __popc(mg_1);
+        g_1 = g_1 + (unsigned int)_popc_132;
+        int _popc_133 = __popc(mt_1);
+        t = t + (unsigned int)_popc_133;
+    }
+    if (rank == 0 && tid == 0) {
+        out_count[row] = k;
+    }
+}
+
+} // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_CNT_OFF
+#undef SMEM_CNT_STAGE_BYTES
+#undef SMEM_CNT_STRIDE
+#undef SMEM_HIST0_OFF
+#undef SMEM_HIST0_STAGE_BYTES
+#undef SMEM_HIST0_STRIDE
+#undef SMEM_HIST1_OFF
+#undef SMEM_HIST1_STAGE_BYTES
+#undef SMEM_HIST1_STRIDE
+#undef SMEM_LIDX_OFF
+#undef SMEM_LIDX_STAGE_BYTES
+#undef SMEM_LIDX_STRIDE
+#undef SMEM_LKEYS_OFF
+#undef SMEM_LKEYS_STAGE_BYTES
+#undef SMEM_LKEYS_STRIDE
+#undef SMEM_SCAL_OFF
+#undef SMEM_SCAL_STAGE_BYTES
+#undef SMEM_SCAL_STRIDE
+#undef SMEM_TOTAL
+#undef SMEM_WARP_SUMS_OFF
+#undef SMEM_WARP_SUMS_STAGE_BYTES
+#undef SMEM_WARP_SUMS_STRIDE
+#undef THREADS
+#undef cnt_addr
+#undef hist0_addr
+#undef hist1_addr
+#undef lidx_addr
+#undef lkeys_addr
+#undef scal_addr
+#undef warp_sums_addr
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_HIST0_OFF 0
+#define SMEM_HIST0_STAGE_BYTES 8192
+#define SMEM_HIST0_STRIDE 8192
+#define SMEM_HIST1_OFF 8192
+#define SMEM_HIST1_STAGE_BYTES 8192
+#define SMEM_HIST1_STRIDE 8192
+#define SMEM_WARP_SUMS_OFF 16384
+#define SMEM_WARP_SUMS_STAGE_BYTES 64
+#define SMEM_WARP_SUMS_STRIDE 64
+#define SMEM_SCAL_OFF 16448
+#define SMEM_SCAL_STAGE_BYTES 256
+#define SMEM_SCAL_STRIDE 256
+#define SMEM_CNT_OFF 16704
+#define SMEM_CNT_STAGE_BYTES 1024
+#define SMEM_CNT_STRIDE 1024
+#define SMEM_LKEYS_OFF 17728
+#define SMEM_LKEYS_STAGE_BYTES 65536
+#define SMEM_LKEYS_STRIDE 65536
+#define SMEM_LIDX_OFF 83264
+#define SMEM_LIDX_STAGE_BYTES 65536
+#define SMEM_LIDX_STRIDE 65536
+#define SMEM_TOTAL 148864
+#define THREADS 512
+
+extern "C" {
+
+__global__ __launch_bounds__(512, 1) __cluster_dims__(4,1,1) void
+kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 4;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 4;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    // Kernel setup ops
+    unsigned int* hist0 = reinterpret_cast<unsigned int*>(smem_raw + 0);
+    const int hist0_addr = smem + 0;
+    unsigned int* hist1 = reinterpret_cast<unsigned int*>(smem_raw + 8192);
+    const int hist1_addr = smem + 8192;
+    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 16384);
+    const int warp_sums_addr = smem + 16384;
+    unsigned int* scal = reinterpret_cast<unsigned int*>(smem_raw + 16448);
+    const int scal_addr = smem + 16448;
+    unsigned int* cnt = reinterpret_cast<unsigned int*>(smem_raw + 16704);
+    const int cnt_addr = smem + 16704;
+    unsigned int* lkeys = reinterpret_cast<unsigned int*>(smem_raw + 17728);
+    const int lkeys_addr = smem + 17728;
+    int* lidx = reinterpret_cast<int*>(smem_raw + 83264);
+    const int lidx_addr = smem + 83264;
+
+    // === Task calls (dependency order) ===
+    int row = 0;
+    int rank = 0;
+    {
+        row = cluster_id;
+        rank = cta_rank;
+    }
+    int k_req = ((topk_kind == 2) ? topk_arr[row] : topk_scalar);
+    int _min_0 = ((k_req) < (vocab) ? (k_req) : (vocab));
+    int _min_1 = ((_min_0) < (1024) ? (_min_0) : (1024));
+    int _max_0 = ((_min_1) > (1) ? (_min_1) : (1));
+    int k = _max_0;
+    unsigned int k_u = (unsigned int)k;
+    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab;
+    unsigned long long out_base = (unsigned long long)row * 1024;
+    int nchunks = (vocab + 32767) / 32768;
+    int start = rank * (nchunks * 8192);
+    int span_end = start + nchunks * 8192;
+    unsigned int pad = ((span_end > vocab) ? (unsigned int)(span_end - vocab) : 0);
+    bool aligned = (vocab & 3) == 0;
+    int wstart = start + warp * (nchunks * 512);
+    int seg_base = warp * 1024;
+    float vals_a[16];
+    float vals_b[16];
+    for (int i = tid; i < 2048; i += 512) {
+        hist1[i] = 0;
+    }
+    for (int i_1 = tid; i_1 < 2048; i_1 += 512) {
+        hist0[i_1] = 0;
+    }
+    if (tid < 64) {
+        scal[tid] = 0;
+    }
+    __syncthreads();
+    for (int c = 0; c < nchunks; c++) {
+        int i_2 = start + c * 8192 + tid * 4;
+        if (i_2 < vocab) {
+            float v = probs[row_base + (unsigned long long)i_2];
+            unsigned int bits = __as_u32(v);
+            unsigned int key = ((bits <= 2139095040) ? bits : 0);
+            unsigned int bucket = key >> 21;
+            atomicAdd(&hist0[bucket], 1);
+        }
+        int i_0 = start + c * 8192 + (512 + tid) * 4;
+        if (i_0 < vocab) {
+            float v_1 = probs[row_base + (unsigned long long)i_0];
+            unsigned int bits_1 = __as_u32(v_1);
+            unsigned int key_1 = ((bits_1 <= 2139095040) ? bits_1 : 0);
+            unsigned int bucket_1 = key_1 >> 21;
+            atomicAdd(&hist0[bucket_1], 1);
+        }
+        int i_1_1 = start + c * 8192 + (1024 + tid) * 4;
+        if (i_1_1 < vocab) {
+            float v_2 = probs[row_base + (unsigned long long)i_1_1];
+            unsigned int bits_2 = __as_u32(v_2);
+            unsigned int key_2 = ((bits_2 <= 2139095040) ? bits_2 : 0);
+            unsigned int bucket_2 = key_2 >> 21;
+            atomicAdd(&hist0[bucket_2], 1);
+        }
+        int i_2_1 = start + c * 8192 + (1536 + tid) * 4;
+        if (i_2_1 < vocab) {
+            float v_3 = probs[row_base + (unsigned long long)i_2_1];
+            unsigned int bits_3 = __as_u32(v_3);
+            unsigned int key_3 = ((bits_3 <= 2139095040) ? bits_3 : 0);
+            unsigned int bucket_3 = key_3 >> 21;
+            atomicAdd(&hist0[bucket_3], 1);
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0 = 0;
+    unsigned int c1 = 0;
+    unsigned int c2 = 0;
+    unsigned int c3 = 0;
+    {
+        unsigned int words[4];
+        uint32_t _mapa_0;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_0) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 3]))
+            : "r"(_mapa_0));
+        c0 = c0 + words[0];
+        c1 = c1 + words[1];
+        c2 = c2 + words[2];
+        c3 = c3 + words[3];
+        unsigned int words_0[4];
+        uint32_t _mapa_1;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_1) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 3]))
+            : "r"(_mapa_1));
+        c0 = c0 + words_0[0];
+        c1 = c1 + words_0[1];
+        c2 = c2 + words_0[2];
+        c3 = c3 + words_0[3];
+        unsigned int words_1[4];
+        uint32_t _mapa_2;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_2) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
+            : "r"(_mapa_2));
+        c0 = c0 + words_1[0];
+        c1 = c1 + words_1[1];
+        c2 = c2 + words_1[2];
+        c3 = c3 + words_1[3];
+        unsigned int words_2[4];
+        uint32_t _mapa_3;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_3) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 3]))
+            : "r"(_mapa_3));
+        c0 = c0 + words_2[0];
+        c1 = c1 + words_2[1];
+        c2 = c2 + words_2[2];
+        c3 = c3 + words_2[3];
+    }
+    unsigned int need = 2 * k_u + 64;
+    unsigned int local = c0 + c1 + c2 + c3;
+    uint32_t _warp_scan_sum_u32_0 = local;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(16));
+    unsigned int lane_suffix = _warp_scan_sum_u32_0 - local;
+    unsigned int _warp_redux_u32_0;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local));
+    unsigned int warp_total = _warp_redux_u32_0;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total;
+    }
+    __syncthreads();
+    unsigned int peer = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above = ((lane > warp) ? peer : 0);
+    unsigned int _warp_redux_u32_1;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(above));
+    unsigned int warps_above = _warp_redux_u32_1;
+    unsigned int suffix = lane_suffix + warps_above;
+    unsigned int a3 = suffix + c3;
+    unsigned int a2 = a3 + c2;
+    unsigned int a1 = a2 + c1;
+    unsigned int a0 = a1 + c0;
+    unsigned int five = 5;
+    if (need > five * suffix) {
+        if (need <= five * a3) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+        } else if (need <= five * a2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+        } else {
+            if (need <= five * a1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+            } else if (need <= five * a0) {
+                scal[0] = (unsigned int)(tid * 4);
+            }
+        }
+    }
+    if (a0 > 4096) {
+        if (suffix <= 4096) {
+            if (a3 <= 4096) {
+                if (a2 <= 4096) {
+                    if (a1 <= 4096) {
+                        scal[1] = (unsigned int)(tid * 4 + 1);
+                    } else {
+                        scal[1] = (unsigned int)(tid * 4 + 2);
+                    }
+                } else {
+                    scal[1] = (unsigned int)(tid * 4 + 3);
+                }
+            } else {
+                scal[1] = (unsigned int)(tid * 4 + 4);
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int b_need = scal[0];
+    unsigned int b_cap = scal[1];
+    if (tid == 0) {
+        unsigned int _max_1 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
+        scal[0] = _max_1;
+        scal[1] = 0;
+    }
+    __syncthreads();
+    unsigned int b_lo = scal[0];
+    unsigned int n_w = 0;
+    if ((vocab & 3) == 0) {
+        int i_3 = wstart + lane * 4;
+        if (i_3 < vocab) {
+            float _vec_load_0[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3);
+                _vec_load_0[0 + 0] = _v4.x;
+                _vec_load_0[0 + 1] = _v4.y;
+                _vec_load_0[0 + 2] = _v4.z;
+                _vec_load_0[0 + 3] = _v4.w;
+            }
+            vals_a[0] = _vec_load_0[0];
+            vals_a[1] = _vec_load_0[1];
+            vals_a[2] = _vec_load_0[2];
+            vals_a[3] = _vec_load_0[3];
+        } else {
+            vals_a[0] = 0.0f;
+            vals_a[1] = 0.0f;
+            vals_a[2] = 0.0f;
+            vals_a[3] = 0.0f;
+        }
+        int i_0_1 = wstart + 128 + lane * 4;
+        if (i_0_1 < vocab) {
+            float _vec_load_1[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_1);
+                _vec_load_1[0 + 0] = _v4.x;
+                _vec_load_1[0 + 1] = _v4.y;
+                _vec_load_1[0 + 2] = _v4.z;
+                _vec_load_1[0 + 3] = _v4.w;
+            }
+            vals_a[4] = _vec_load_1[0];
+            vals_a[5] = _vec_load_1[1];
+            vals_a[6] = _vec_load_1[2];
+            vals_a[7] = _vec_load_1[3];
+        } else {
+            vals_a[4] = 0.0f;
+            vals_a[5] = 0.0f;
+            vals_a[6] = 0.0f;
+            vals_a[7] = 0.0f;
+        }
+        int i_1_2 = wstart + 256 + lane * 4;
+        if (i_1_2 < vocab) {
+            float _vec_load_2[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_2);
+                _vec_load_2[0 + 0] = _v4.x;
+                _vec_load_2[0 + 1] = _v4.y;
+                _vec_load_2[0 + 2] = _v4.z;
+                _vec_load_2[0 + 3] = _v4.w;
+            }
+            vals_a[8] = _vec_load_2[0];
+            vals_a[9] = _vec_load_2[1];
+            vals_a[10] = _vec_load_2[2];
+            vals_a[11] = _vec_load_2[3];
+        } else {
+            vals_a[8] = 0.0f;
+            vals_a[9] = 0.0f;
+            vals_a[10] = 0.0f;
+            vals_a[11] = 0.0f;
+        }
+        int i_2_2 = wstart + 384 + lane * 4;
+        if (i_2_2 < vocab) {
+            float _vec_load_3[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_2);
+                _vec_load_3[0 + 0] = _v4.x;
+                _vec_load_3[0 + 1] = _v4.y;
+                _vec_load_3[0 + 2] = _v4.z;
+                _vec_load_3[0 + 3] = _v4.w;
+            }
+            vals_a[12] = _vec_load_3[0];
+            vals_a[13] = _vec_load_3[1];
+            vals_a[14] = _vec_load_3[2];
+            vals_a[15] = _vec_load_3[3];
+        } else {
+            vals_a[12] = 0.0f;
+            vals_a[13] = 0.0f;
+            vals_a[14] = 0.0f;
+            vals_a[15] = 0.0f;
+        }
+    } else {
+        int i2 = wstart + lane;
+        if (i2 < vocab) {
+            vals_a[0] = probs[row_base + (unsigned long long)i2];
+        } else {
+            vals_a[0] = 0.0f;
+        }
+        int i2_0 = wstart + 32 + lane;
+        if (i2_0 < vocab) {
+            vals_a[1] = probs[row_base + (unsigned long long)i2_0];
+        } else {
+            vals_a[1] = 0.0f;
+        }
+        int i2_1 = wstart + 64 + lane;
+        if (i2_1 < vocab) {
+            vals_a[2] = probs[row_base + (unsigned long long)i2_1];
+        } else {
+            vals_a[2] = 0.0f;
+        }
+        int i2_2 = wstart + 96 + lane;
+        if (i2_2 < vocab) {
+            vals_a[3] = probs[row_base + (unsigned long long)i2_2];
+        } else {
+            vals_a[3] = 0.0f;
+        }
+        int i2_3 = wstart + 128 + lane;
+        if (i2_3 < vocab) {
+            vals_a[4] = probs[row_base + (unsigned long long)i2_3];
+        } else {
+            vals_a[4] = 0.0f;
+        }
+        int i2_4 = wstart + 160 + lane;
+        if (i2_4 < vocab) {
+            vals_a[5] = probs[row_base + (unsigned long long)i2_4];
+        } else {
+            vals_a[5] = 0.0f;
+        }
+        int i2_5 = wstart + 192 + lane;
+        if (i2_5 < vocab) {
+            vals_a[6] = probs[row_base + (unsigned long long)i2_5];
+        } else {
+            vals_a[6] = 0.0f;
+        }
+        int i2_6 = wstart + 224 + lane;
+        if (i2_6 < vocab) {
+            vals_a[7] = probs[row_base + (unsigned long long)i2_6];
+        } else {
+            vals_a[7] = 0.0f;
+        }
+        int i2_7 = wstart + 256 + lane;
+        if (i2_7 < vocab) {
+            vals_a[8] = probs[row_base + (unsigned long long)i2_7];
+        } else {
+            vals_a[8] = 0.0f;
+        }
+        int i2_8 = wstart + 288 + lane;
+        if (i2_8 < vocab) {
+            vals_a[9] = probs[row_base + (unsigned long long)i2_8];
+        } else {
+            vals_a[9] = 0.0f;
+        }
+        int i2_9 = wstart + 320 + lane;
+        if (i2_9 < vocab) {
+            vals_a[10] = probs[row_base + (unsigned long long)i2_9];
+        } else {
+            vals_a[10] = 0.0f;
+        }
+        int i2_10 = wstart + 352 + lane;
+        if (i2_10 < vocab) {
+            vals_a[11] = probs[row_base + (unsigned long long)i2_10];
+        } else {
+            vals_a[11] = 0.0f;
+        }
+        int i2_11 = wstart + 384 + lane;
+        if (i2_11 < vocab) {
+            vals_a[12] = probs[row_base + (unsigned long long)i2_11];
+        } else {
+            vals_a[12] = 0.0f;
+        }
+        int i2_12 = wstart + 416 + lane;
+        if (i2_12 < vocab) {
+            vals_a[13] = probs[row_base + (unsigned long long)i2_12];
+        } else {
+            vals_a[13] = 0.0f;
+        }
+        int i2_13 = wstart + 448 + lane;
+        if (i2_13 < vocab) {
+            vals_a[14] = probs[row_base + (unsigned long long)i2_13];
+        } else {
+            vals_a[14] = 0.0f;
+        }
+        int i2_14 = wstart + 480 + lane;
+        if (i2_14 < vocab) {
+            vals_a[15] = probs[row_base + (unsigned long long)i2_14];
+        } else {
+            vals_a[15] = 0.0f;
+        }
+    }
+    for (int c_1 = 0; c_1 < nchunks; c_1 += 2) {
+        if (nchunks > c_1 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_4 = wstart + (c_1 + 1) * 512 + lane * 4;
+                if (i_4 < vocab) {
+                    float _vec_load_4[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4);
+                        _vec_load_4[0 + 0] = _v4.x;
+                        _vec_load_4[0 + 1] = _v4.y;
+                        _vec_load_4[0 + 2] = _v4.z;
+                        _vec_load_4[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_4[0];
+                    vals_b[1] = _vec_load_4[1];
+                    vals_b[2] = _vec_load_4[2];
+                    vals_b[3] = _vec_load_4[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_2 = wstart + (c_1 + 1) * 512 + 128 + lane * 4;
+                if (i_0_2 < vocab) {
+                    float _vec_load_5[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_2);
+                        _vec_load_5[0 + 0] = _v4.x;
+                        _vec_load_5[0 + 1] = _v4.y;
+                        _vec_load_5[0 + 2] = _v4.z;
+                        _vec_load_5[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_5[0];
+                    vals_b[5] = _vec_load_5[1];
+                    vals_b[6] = _vec_load_5[2];
+                    vals_b[7] = _vec_load_5[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_3 = wstart + (c_1 + 1) * 512 + 256 + lane * 4;
+                if (i_1_3 < vocab) {
+                    float _vec_load_6[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_3);
+                        _vec_load_6[0 + 0] = _v4.x;
+                        _vec_load_6[0 + 1] = _v4.y;
+                        _vec_load_6[0 + 2] = _v4.z;
+                        _vec_load_6[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_6[0];
+                    vals_b[9] = _vec_load_6[1];
+                    vals_b[10] = _vec_load_6[2];
+                    vals_b[11] = _vec_load_6[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_3 = wstart + (c_1 + 1) * 512 + 384 + lane * 4;
+                if (i_2_3 < vocab) {
+                    float _vec_load_7[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_3);
+                        _vec_load_7[0 + 0] = _v4.x;
+                        _vec_load_7[0 + 1] = _v4.y;
+                        _vec_load_7[0 + 2] = _v4.z;
+                        _vec_load_7[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_7[0];
+                    vals_b[13] = _vec_load_7[1];
+                    vals_b[14] = _vec_load_7[2];
+                    vals_b[15] = _vec_load_7[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_15 = wstart + (c_1 + 1) * 512 + lane;
+                if (i2_15 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_15];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_1 = wstart + (c_1 + 1) * 512 + 32 + lane;
+                if (i2_0_1 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_1];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_1 = wstart + (c_1 + 1) * 512 + 64 + lane;
+                if (i2_1_1 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_1];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_1 = wstart + (c_1 + 1) * 512 + 96 + lane;
+                if (i2_2_1 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_1];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_1 = wstart + (c_1 + 1) * 512 + 128 + lane;
+                if (i2_3_1 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_1];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_1 = wstart + (c_1 + 1) * 512 + 160 + lane;
+                if (i2_4_1 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_1];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_1 = wstart + (c_1 + 1) * 512 + 192 + lane;
+                if (i2_5_1 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_1];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_1 = wstart + (c_1 + 1) * 512 + 224 + lane;
+                if (i2_6_1 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_1];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_1 = wstart + (c_1 + 1) * 512 + 256 + lane;
+                if (i2_7_1 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_1];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_1 = wstart + (c_1 + 1) * 512 + 288 + lane;
+                if (i2_8_1 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_1];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_1 = wstart + (c_1 + 1) * 512 + 320 + lane;
+                if (i2_9_1 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_1];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_1 = wstart + (c_1 + 1) * 512 + 352 + lane;
+                if (i2_10_1 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_1];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_1 = wstart + (c_1 + 1) * 512 + 384 + lane;
+                if (i2_11_1 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_1];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_1 = wstart + (c_1 + 1) * 512 + 416 + lane;
+                if (i2_12_1 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_1];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_1 = wstart + (c_1 + 1) * 512 + 448 + lane;
+                if (i2_13_1 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_1];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_1 = wstart + (c_1 + 1) * 512 + 480 + lane;
+                if (i2_14_1 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_1];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int lt_mask = (1 << (unsigned int)lane) - 1;
+        bool aligned_0 = (vocab & 3) == 0;
+        unsigned int n = n_w;
+        unsigned int keys[4];
+        int idxs[4];
+        bool cands[4];
+        unsigned int before = 0;
+        unsigned int total = 0;
+        unsigned int bits_4 = __as_u32(vals_a[0]);
+        unsigned int key_4 = ((bits_4 <= 2139095040) ? bits_4 : 0);
+        keys[0] = key_4;
+        int i_vec = wstart + c_1 * 512 + lane * 4;
+        int i_str = wstart + c_1 * 512 + lane;
+        idxs[0] = ((aligned_0) ? i_vec : i_str);
+        cands[0] = b_lo <= keys[0] >> 21 && idxs[0] < vocab;
+        unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, cands[0]);
+        unsigned int m = _vote_0;
+        int _popc_0 = __popc(m & lt_mask);
+        before = before + (unsigned int)_popc_0;
+        int _popc_1 = __popc(m);
+        total = total + (unsigned int)_popc_1;
+        unsigned int bits_1_1 = __as_u32(vals_a[1]);
+        unsigned int key_2_1 = ((bits_1_1 <= 2139095040) ? bits_1_1 : 0);
+        keys[1] = key_2_1;
+        int i_vec_3 = wstart + c_1 * 512 + lane * 4 + 1;
+        int i_str_4 = wstart + c_1 * 512 + 32 + lane;
+        idxs[1] = ((aligned_0) ? i_vec_3 : i_str_4);
+        cands[1] = b_lo <= keys[1] >> 21 && idxs[1] < vocab;
+        unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, cands[1]);
+        unsigned int m_5 = _vote_1;
+        int _popc_2 = __popc(m_5 & lt_mask);
+        before = before + (unsigned int)_popc_2;
+        int _popc_3 = __popc(m_5);
+        total = total + (unsigned int)_popc_3;
+        unsigned int bits_6 = __as_u32(vals_a[2]);
+        unsigned int key_7 = ((bits_6 <= 2139095040) ? bits_6 : 0);
+        keys[2] = key_7;
+        int i_vec_8 = wstart + c_1 * 512 + lane * 4 + 2;
+        int i_str_9 = wstart + c_1 * 512 + 64 + lane;
+        idxs[2] = ((aligned_0) ? i_vec_8 : i_str_9);
+        cands[2] = b_lo <= keys[2] >> 21 && idxs[2] < vocab;
+        unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, cands[2]);
+        unsigned int m_10 = _vote_2;
+        int _popc_4 = __popc(m_10 & lt_mask);
+        before = before + (unsigned int)_popc_4;
+        int _popc_5 = __popc(m_10);
+        total = total + (unsigned int)_popc_5;
+        unsigned int bits_11 = __as_u32(vals_a[3]);
+        unsigned int key_12 = ((bits_11 <= 2139095040) ? bits_11 : 0);
+        keys[3] = key_12;
+        int i_vec_13 = wstart + c_1 * 512 + lane * 4 + 3;
+        int i_str_14 = wstart + c_1 * 512 + 96 + lane;
+        idxs[3] = ((aligned_0) ? i_vec_13 : i_str_14);
+        cands[3] = b_lo <= keys[3] >> 21 && idxs[3] < vocab;
+        unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, cands[3]);
+        unsigned int m_15 = _vote_3;
+        int _popc_6 = __popc(m_15 & lt_mask);
+        before = before + (unsigned int)_popc_6;
+        int _popc_7 = __popc(m_15);
+        total = total + (unsigned int)_popc_7;
+        unsigned int own = 0;
+        unsigned int pos = n + before + own;
+        if (cands[0] && pos < 1024) {
+            int slot = seg_base + (int)pos;
+            lkeys[slot] = keys[0];
+            lidx[slot] = idxs[0];
+        }
+        if (cands[0]) {
+            own = own + 1;
+        }
+        unsigned int pos_16 = n + before + own;
+        if (cands[1] && pos_16 < 1024) {
+            int slot_1 = seg_base + (int)pos_16;
+            lkeys[slot_1] = keys[1];
+            lidx[slot_1] = idxs[1];
+        }
+        if (cands[1]) {
+            own = own + 1;
+        }
+        unsigned int pos_17 = n + before + own;
+        if (cands[2] && pos_17 < 1024) {
+            int slot_2 = seg_base + (int)pos_17;
+            lkeys[slot_2] = keys[2];
+            lidx[slot_2] = idxs[2];
+        }
+        if (cands[2]) {
+            own = own + 1;
+        }
+        unsigned int pos_18 = n + before + own;
+        if (cands[3] && pos_18 < 1024) {
+            int slot_3 = seg_base + (int)pos_18;
+            lkeys[slot_3] = keys[3];
+            lidx[slot_3] = idxs[3];
+        }
+        if (cands[3]) {
+            own = own + 1;
+        }
+        n = n + total;
+        unsigned int keys_19[4];
+        int idxs_20[4];
+        bool cands_21[4];
+        unsigned int before_22 = 0;
+        unsigned int total_23 = 0;
+        unsigned int bits_24 = __as_u32(vals_a[4]);
+        unsigned int key_25 = ((bits_24 <= 2139095040) ? bits_24 : 0);
+        keys_19[0] = key_25;
+        int i_vec_26 = wstart + c_1 * 512 + 128 + lane * 4;
+        int i_str_27 = wstart + c_1 * 512 + 128 + lane;
+        idxs_20[0] = ((aligned_0) ? i_vec_26 : i_str_27);
+        cands_21[0] = b_lo <= keys_19[0] >> 21 && idxs_20[0] < vocab;
+        unsigned int _vote_4 = __ballot_sync(0xFFFFFFFF, cands_21[0]);
+        unsigned int m_28 = _vote_4;
+        int _popc_8 = __popc(m_28 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_8;
+        int _popc_9 = __popc(m_28);
+        total_23 = total_23 + (unsigned int)_popc_9;
+        unsigned int bits_29 = __as_u32(vals_a[5]);
+        unsigned int key_30 = ((bits_29 <= 2139095040) ? bits_29 : 0);
+        keys_19[1] = key_30;
+        int i_vec_31 = wstart + c_1 * 512 + 128 + lane * 4 + 1;
+        int i_str_32 = wstart + c_1 * 512 + 160 + lane;
+        idxs_20[1] = ((aligned_0) ? i_vec_31 : i_str_32);
+        cands_21[1] = b_lo <= keys_19[1] >> 21 && idxs_20[1] < vocab;
+        unsigned int _vote_5 = __ballot_sync(0xFFFFFFFF, cands_21[1]);
+        unsigned int m_33 = _vote_5;
+        int _popc_10 = __popc(m_33 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_10;
+        int _popc_11 = __popc(m_33);
+        total_23 = total_23 + (unsigned int)_popc_11;
+        unsigned int bits_34 = __as_u32(vals_a[6]);
+        unsigned int key_35 = ((bits_34 <= 2139095040) ? bits_34 : 0);
+        keys_19[2] = key_35;
+        int i_vec_36 = wstart + c_1 * 512 + 128 + lane * 4 + 2;
+        int i_str_37 = wstart + c_1 * 512 + 192 + lane;
+        idxs_20[2] = ((aligned_0) ? i_vec_36 : i_str_37);
+        cands_21[2] = b_lo <= keys_19[2] >> 21 && idxs_20[2] < vocab;
+        unsigned int _vote_6 = __ballot_sync(0xFFFFFFFF, cands_21[2]);
+        unsigned int m_38 = _vote_6;
+        int _popc_12 = __popc(m_38 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_12;
+        int _popc_13 = __popc(m_38);
+        total_23 = total_23 + (unsigned int)_popc_13;
+        unsigned int bits_39 = __as_u32(vals_a[7]);
+        unsigned int key_40 = ((bits_39 <= 2139095040) ? bits_39 : 0);
+        keys_19[3] = key_40;
+        int i_vec_41 = wstart + c_1 * 512 + 128 + lane * 4 + 3;
+        int i_str_42 = wstart + c_1 * 512 + 224 + lane;
+        idxs_20[3] = ((aligned_0) ? i_vec_41 : i_str_42);
+        cands_21[3] = b_lo <= keys_19[3] >> 21 && idxs_20[3] < vocab;
+        unsigned int _vote_7 = __ballot_sync(0xFFFFFFFF, cands_21[3]);
+        unsigned int m_43 = _vote_7;
+        int _popc_14 = __popc(m_43 & lt_mask);
+        before_22 = before_22 + (unsigned int)_popc_14;
+        int _popc_15 = __popc(m_43);
+        total_23 = total_23 + (unsigned int)_popc_15;
+        unsigned int own_44 = 0;
+        unsigned int pos_45 = n + before_22 + own_44;
+        if (cands_21[0] && pos_45 < 1024) {
+            int slot_4 = seg_base + (int)pos_45;
+            lkeys[slot_4] = keys_19[0];
+            lidx[slot_4] = idxs_20[0];
+        }
+        if (cands_21[0]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_46 = n + before_22 + own_44;
+        if (cands_21[1] && pos_46 < 1024) {
+            int slot_5 = seg_base + (int)pos_46;
+            lkeys[slot_5] = keys_19[1];
+            lidx[slot_5] = idxs_20[1];
+        }
+        if (cands_21[1]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_47 = n + before_22 + own_44;
+        if (cands_21[2] && pos_47 < 1024) {
+            int slot_6 = seg_base + (int)pos_47;
+            lkeys[slot_6] = keys_19[2];
+            lidx[slot_6] = idxs_20[2];
+        }
+        if (cands_21[2]) {
+            own_44 = own_44 + 1;
+        }
+        unsigned int pos_48 = n + before_22 + own_44;
+        if (cands_21[3] && pos_48 < 1024) {
+            int slot_7 = seg_base + (int)pos_48;
+            lkeys[slot_7] = keys_19[3];
+            lidx[slot_7] = idxs_20[3];
+        }
+        if (cands_21[3]) {
+            own_44 = own_44 + 1;
+        }
+        n = n + total_23;
+        unsigned int keys_49[4];
+        int idxs_50[4];
+        bool cands_51[4];
+        unsigned int before_52 = 0;
+        unsigned int total_53 = 0;
+        unsigned int bits_54 = __as_u32(vals_a[8]);
+        unsigned int key_55 = ((bits_54 <= 2139095040) ? bits_54 : 0);
+        keys_49[0] = key_55;
+        int i_vec_56 = wstart + c_1 * 512 + 256 + lane * 4;
+        int i_str_57 = wstart + c_1 * 512 + 256 + lane;
+        idxs_50[0] = ((aligned_0) ? i_vec_56 : i_str_57);
+        cands_51[0] = b_lo <= keys_49[0] >> 21 && idxs_50[0] < vocab;
+        unsigned int _vote_8 = __ballot_sync(0xFFFFFFFF, cands_51[0]);
+        unsigned int m_58 = _vote_8;
+        int _popc_16 = __popc(m_58 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_16;
+        int _popc_17 = __popc(m_58);
+        total_53 = total_53 + (unsigned int)_popc_17;
+        unsigned int bits_59 = __as_u32(vals_a[9]);
+        unsigned int key_60 = ((bits_59 <= 2139095040) ? bits_59 : 0);
+        keys_49[1] = key_60;
+        int i_vec_61 = wstart + c_1 * 512 + 256 + lane * 4 + 1;
+        int i_str_62 = wstart + c_1 * 512 + 288 + lane;
+        idxs_50[1] = ((aligned_0) ? i_vec_61 : i_str_62);
+        cands_51[1] = b_lo <= keys_49[1] >> 21 && idxs_50[1] < vocab;
+        unsigned int _vote_9 = __ballot_sync(0xFFFFFFFF, cands_51[1]);
+        unsigned int m_63 = _vote_9;
+        int _popc_18 = __popc(m_63 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_18;
+        int _popc_19 = __popc(m_63);
+        total_53 = total_53 + (unsigned int)_popc_19;
+        unsigned int bits_64 = __as_u32(vals_a[10]);
+        unsigned int key_65 = ((bits_64 <= 2139095040) ? bits_64 : 0);
+        keys_49[2] = key_65;
+        int i_vec_66 = wstart + c_1 * 512 + 256 + lane * 4 + 2;
+        int i_str_67 = wstart + c_1 * 512 + 320 + lane;
+        idxs_50[2] = ((aligned_0) ? i_vec_66 : i_str_67);
+        cands_51[2] = b_lo <= keys_49[2] >> 21 && idxs_50[2] < vocab;
+        unsigned int _vote_10 = __ballot_sync(0xFFFFFFFF, cands_51[2]);
+        unsigned int m_68 = _vote_10;
+        int _popc_20 = __popc(m_68 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_20;
+        int _popc_21 = __popc(m_68);
+        total_53 = total_53 + (unsigned int)_popc_21;
+        unsigned int bits_69 = __as_u32(vals_a[11]);
+        unsigned int key_70 = ((bits_69 <= 2139095040) ? bits_69 : 0);
+        keys_49[3] = key_70;
+        int i_vec_71 = wstart + c_1 * 512 + 256 + lane * 4 + 3;
+        int i_str_72 = wstart + c_1 * 512 + 352 + lane;
+        idxs_50[3] = ((aligned_0) ? i_vec_71 : i_str_72);
+        cands_51[3] = b_lo <= keys_49[3] >> 21 && idxs_50[3] < vocab;
+        unsigned int _vote_11 = __ballot_sync(0xFFFFFFFF, cands_51[3]);
+        unsigned int m_73 = _vote_11;
+        int _popc_22 = __popc(m_73 & lt_mask);
+        before_52 = before_52 + (unsigned int)_popc_22;
+        int _popc_23 = __popc(m_73);
+        total_53 = total_53 + (unsigned int)_popc_23;
+        unsigned int own_74 = 0;
+        unsigned int pos_75 = n + before_52 + own_74;
+        if (cands_51[0] && pos_75 < 1024) {
+            int slot_8 = seg_base + (int)pos_75;
+            lkeys[slot_8] = keys_49[0];
+            lidx[slot_8] = idxs_50[0];
+        }
+        if (cands_51[0]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_76 = n + before_52 + own_74;
+        if (cands_51[1] && pos_76 < 1024) {
+            int slot_9 = seg_base + (int)pos_76;
+            lkeys[slot_9] = keys_49[1];
+            lidx[slot_9] = idxs_50[1];
+        }
+        if (cands_51[1]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_77 = n + before_52 + own_74;
+        if (cands_51[2] && pos_77 < 1024) {
+            int slot_10 = seg_base + (int)pos_77;
+            lkeys[slot_10] = keys_49[2];
+            lidx[slot_10] = idxs_50[2];
+        }
+        if (cands_51[2]) {
+            own_74 = own_74 + 1;
+        }
+        unsigned int pos_78 = n + before_52 + own_74;
+        if (cands_51[3] && pos_78 < 1024) {
+            int slot_11 = seg_base + (int)pos_78;
+            lkeys[slot_11] = keys_49[3];
+            lidx[slot_11] = idxs_50[3];
+        }
+        if (cands_51[3]) {
+            own_74 = own_74 + 1;
+        }
+        n = n + total_53;
+        unsigned int keys_79[4];
+        int idxs_80[4];
+        bool cands_81[4];
+        unsigned int before_82 = 0;
+        unsigned int total_83 = 0;
+        unsigned int bits_84 = __as_u32(vals_a[12]);
+        unsigned int key_85 = ((bits_84 <= 2139095040) ? bits_84 : 0);
+        keys_79[0] = key_85;
+        int i_vec_86 = wstart + c_1 * 512 + 384 + lane * 4;
+        int i_str_87 = wstart + c_1 * 512 + 384 + lane;
+        idxs_80[0] = ((aligned_0) ? i_vec_86 : i_str_87);
+        cands_81[0] = b_lo <= keys_79[0] >> 21 && idxs_80[0] < vocab;
+        unsigned int _vote_12 = __ballot_sync(0xFFFFFFFF, cands_81[0]);
+        unsigned int m_88 = _vote_12;
+        int _popc_24 = __popc(m_88 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_24;
+        int _popc_25 = __popc(m_88);
+        total_83 = total_83 + (unsigned int)_popc_25;
+        unsigned int bits_89 = __as_u32(vals_a[13]);
+        unsigned int key_90 = ((bits_89 <= 2139095040) ? bits_89 : 0);
+        keys_79[1] = key_90;
+        int i_vec_91 = wstart + c_1 * 512 + 384 + lane * 4 + 1;
+        int i_str_92 = wstart + c_1 * 512 + 416 + lane;
+        idxs_80[1] = ((aligned_0) ? i_vec_91 : i_str_92);
+        cands_81[1] = b_lo <= keys_79[1] >> 21 && idxs_80[1] < vocab;
+        unsigned int _vote_13 = __ballot_sync(0xFFFFFFFF, cands_81[1]);
+        unsigned int m_93 = _vote_13;
+        int _popc_26 = __popc(m_93 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_26;
+        int _popc_27 = __popc(m_93);
+        total_83 = total_83 + (unsigned int)_popc_27;
+        unsigned int bits_94 = __as_u32(vals_a[14]);
+        unsigned int key_95 = ((bits_94 <= 2139095040) ? bits_94 : 0);
+        keys_79[2] = key_95;
+        int i_vec_96 = wstart + c_1 * 512 + 384 + lane * 4 + 2;
+        int i_str_97 = wstart + c_1 * 512 + 448 + lane;
+        idxs_80[2] = ((aligned_0) ? i_vec_96 : i_str_97);
+        cands_81[2] = b_lo <= keys_79[2] >> 21 && idxs_80[2] < vocab;
+        unsigned int _vote_14 = __ballot_sync(0xFFFFFFFF, cands_81[2]);
+        unsigned int m_98 = _vote_14;
+        int _popc_28 = __popc(m_98 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_28;
+        int _popc_29 = __popc(m_98);
+        total_83 = total_83 + (unsigned int)_popc_29;
+        unsigned int bits_99 = __as_u32(vals_a[15]);
+        unsigned int key_100 = ((bits_99 <= 2139095040) ? bits_99 : 0);
+        keys_79[3] = key_100;
+        int i_vec_101 = wstart + c_1 * 512 + 384 + lane * 4 + 3;
+        int i_str_102 = wstart + c_1 * 512 + 480 + lane;
+        idxs_80[3] = ((aligned_0) ? i_vec_101 : i_str_102);
+        cands_81[3] = b_lo <= keys_79[3] >> 21 && idxs_80[3] < vocab;
+        unsigned int _vote_15 = __ballot_sync(0xFFFFFFFF, cands_81[3]);
+        unsigned int m_103 = _vote_15;
+        int _popc_30 = __popc(m_103 & lt_mask);
+        before_82 = before_82 + (unsigned int)_popc_30;
+        int _popc_31 = __popc(m_103);
+        total_83 = total_83 + (unsigned int)_popc_31;
+        unsigned int own_104 = 0;
+        unsigned int pos_105 = n + before_82 + own_104;
+        if (cands_81[0] && pos_105 < 1024) {
+            int slot_12 = seg_base + (int)pos_105;
+            lkeys[slot_12] = keys_79[0];
+            lidx[slot_12] = idxs_80[0];
+        }
+        if (cands_81[0]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_106 = n + before_82 + own_104;
+        if (cands_81[1] && pos_106 < 1024) {
+            int slot_13 = seg_base + (int)pos_106;
+            lkeys[slot_13] = keys_79[1];
+            lidx[slot_13] = idxs_80[1];
+        }
+        if (cands_81[1]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_107 = n + before_82 + own_104;
+        if (cands_81[2] && pos_107 < 1024) {
+            int slot_14 = seg_base + (int)pos_107;
+            lkeys[slot_14] = keys_79[2];
+            lidx[slot_14] = idxs_80[2];
+        }
+        if (cands_81[2]) {
+            own_104 = own_104 + 1;
+        }
+        unsigned int pos_108 = n + before_82 + own_104;
+        if (cands_81[3] && pos_108 < 1024) {
+            int slot_15 = seg_base + (int)pos_108;
+            lkeys[slot_15] = keys_79[3];
+            lidx[slot_15] = idxs_80[3];
+        }
+        if (cands_81[3]) {
+            own_104 = own_104 + 1;
+        }
+        n = n + total_83;
+        n_w = n;
+        if (nchunks > c_1 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_5 = wstart + (c_1 + 2) * 512 + lane * 4;
+                if (i_5 < vocab) {
+                    float _vec_load_8[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_5);
+                        _vec_load_8[0 + 0] = _v4.x;
+                        _vec_load_8[0 + 1] = _v4.y;
+                        _vec_load_8[0 + 2] = _v4.z;
+                        _vec_load_8[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_8[0];
+                    vals_a[1] = _vec_load_8[1];
+                    vals_a[2] = _vec_load_8[2];
+                    vals_a[3] = _vec_load_8[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_3 = wstart + (c_1 + 2) * 512 + 128 + lane * 4;
+                if (i_0_3 < vocab) {
+                    float _vec_load_9[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_3);
+                        _vec_load_9[0 + 0] = _v4.x;
+                        _vec_load_9[0 + 1] = _v4.y;
+                        _vec_load_9[0 + 2] = _v4.z;
+                        _vec_load_9[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_9[0];
+                    vals_a[5] = _vec_load_9[1];
+                    vals_a[6] = _vec_load_9[2];
+                    vals_a[7] = _vec_load_9[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_4 = wstart + (c_1 + 2) * 512 + 256 + lane * 4;
+                if (i_1_4 < vocab) {
+                    float _vec_load_10[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_4);
+                        _vec_load_10[0 + 0] = _v4.x;
+                        _vec_load_10[0 + 1] = _v4.y;
+                        _vec_load_10[0 + 2] = _v4.z;
+                        _vec_load_10[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_10[0];
+                    vals_a[9] = _vec_load_10[1];
+                    vals_a[10] = _vec_load_10[2];
+                    vals_a[11] = _vec_load_10[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_4 = wstart + (c_1 + 2) * 512 + 384 + lane * 4;
+                if (i_2_4 < vocab) {
+                    float _vec_load_11[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_4);
+                        _vec_load_11[0 + 0] = _v4.x;
+                        _vec_load_11[0 + 1] = _v4.y;
+                        _vec_load_11[0 + 2] = _v4.z;
+                        _vec_load_11[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_11[0];
+                    vals_a[13] = _vec_load_11[1];
+                    vals_a[14] = _vec_load_11[2];
+                    vals_a[15] = _vec_load_11[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_16 = wstart + (c_1 + 2) * 512 + lane;
+                if (i2_16 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_16];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_2 = wstart + (c_1 + 2) * 512 + 32 + lane;
+                if (i2_0_2 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_2];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_2 = wstart + (c_1 + 2) * 512 + 64 + lane;
+                if (i2_1_2 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_2];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_2 = wstart + (c_1 + 2) * 512 + 96 + lane;
+                if (i2_2_2 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_2];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_2 = wstart + (c_1 + 2) * 512 + 128 + lane;
+                if (i2_3_2 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_2];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_2 = wstart + (c_1 + 2) * 512 + 160 + lane;
+                if (i2_4_2 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_2];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_2 = wstart + (c_1 + 2) * 512 + 192 + lane;
+                if (i2_5_2 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_2];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_2 = wstart + (c_1 + 2) * 512 + 224 + lane;
+                if (i2_6_2 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_2];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_2 = wstart + (c_1 + 2) * 512 + 256 + lane;
+                if (i2_7_2 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_2];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_2 = wstart + (c_1 + 2) * 512 + 288 + lane;
+                if (i2_8_2 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_2];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_2 = wstart + (c_1 + 2) * 512 + 320 + lane;
+                if (i2_9_2 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_2];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_2 = wstart + (c_1 + 2) * 512 + 352 + lane;
+                if (i2_10_2 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_2];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_2 = wstart + (c_1 + 2) * 512 + 384 + lane;
+                if (i2_11_2 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_2];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_2 = wstart + (c_1 + 2) * 512 + 416 + lane;
+                if (i2_12_2 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_2];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_2 = wstart + (c_1 + 2) * 512 + 448 + lane;
+                if (i2_13_2 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_2];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_2 = wstart + (c_1 + 2) * 512 + 480 + lane;
+                if (i2_14_2 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_2];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nchunks > c_1 + 1) {
+            unsigned int lt_mask_0 = (1 << (unsigned int)lane) - 1;
+            bool aligned_1 = (vocab & 3) == 0;
+            unsigned int n_2 = n_w;
+            unsigned int keys_3[4];
+            int idxs_4[4];
+            bool cands_5[4];
+            unsigned int before_6 = 0;
+            unsigned int total_7 = 0;
+            unsigned int bits_8 = __as_u32(vals_b[0]);
+            unsigned int key_9 = ((bits_8 <= 2139095040) ? bits_8 : 0);
+            keys_3[0] = key_9;
+            int i_vec_10 = wstart + (c_1 + 1) * 512 + lane * 4;
+            int i_str_11 = wstart + (c_1 + 1) * 512 + lane;
+            idxs_4[0] = ((aligned_1) ? i_vec_10 : i_str_11);
+            cands_5[0] = b_lo <= keys_3[0] >> 21 && idxs_4[0] < vocab;
+            unsigned int _vote_16 = __ballot_sync(0xFFFFFFFF, cands_5[0]);
+            unsigned int m_12 = _vote_16;
+            int _popc_32 = __popc(m_12 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_32;
+            int _popc_33 = __popc(m_12);
+            total_7 = total_7 + (unsigned int)_popc_33;
+            unsigned int bits_13 = __as_u32(vals_b[1]);
+            unsigned int key_14 = ((bits_13 <= 2139095040) ? bits_13 : 0);
+            keys_3[1] = key_14;
+            int i_vec_15 = wstart + (c_1 + 1) * 512 + lane * 4 + 1;
+            int i_str_16 = wstart + (c_1 + 1) * 512 + 32 + lane;
+            idxs_4[1] = ((aligned_1) ? i_vec_15 : i_str_16);
+            cands_5[1] = b_lo <= keys_3[1] >> 21 && idxs_4[1] < vocab;
+            unsigned int _vote_17 = __ballot_sync(0xFFFFFFFF, cands_5[1]);
+            unsigned int m_17 = _vote_17;
+            int _popc_34 = __popc(m_17 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_34;
+            int _popc_35 = __popc(m_17);
+            total_7 = total_7 + (unsigned int)_popc_35;
+            unsigned int bits_18 = __as_u32(vals_b[2]);
+            unsigned int key_19 = ((bits_18 <= 2139095040) ? bits_18 : 0);
+            keys_3[2] = key_19;
+            int i_vec_20 = wstart + (c_1 + 1) * 512 + lane * 4 + 2;
+            int i_str_21 = wstart + (c_1 + 1) * 512 + 64 + lane;
+            idxs_4[2] = ((aligned_1) ? i_vec_20 : i_str_21);
+            cands_5[2] = b_lo <= keys_3[2] >> 21 && idxs_4[2] < vocab;
+            unsigned int _vote_18 = __ballot_sync(0xFFFFFFFF, cands_5[2]);
+            unsigned int m_22 = _vote_18;
+            int _popc_36 = __popc(m_22 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_36;
+            int _popc_37 = __popc(m_22);
+            total_7 = total_7 + (unsigned int)_popc_37;
+            unsigned int bits_23 = __as_u32(vals_b[3]);
+            unsigned int key_24 = ((bits_23 <= 2139095040) ? bits_23 : 0);
+            keys_3[3] = key_24;
+            int i_vec_25 = wstart + (c_1 + 1) * 512 + lane * 4 + 3;
+            int i_str_26 = wstart + (c_1 + 1) * 512 + 96 + lane;
+            idxs_4[3] = ((aligned_1) ? i_vec_25 : i_str_26);
+            cands_5[3] = b_lo <= keys_3[3] >> 21 && idxs_4[3] < vocab;
+            unsigned int _vote_19 = __ballot_sync(0xFFFFFFFF, cands_5[3]);
+            unsigned int m_27 = _vote_19;
+            int _popc_38 = __popc(m_27 & lt_mask_0);
+            before_6 = before_6 + (unsigned int)_popc_38;
+            int _popc_39 = __popc(m_27);
+            total_7 = total_7 + (unsigned int)_popc_39;
+            unsigned int own_28 = 0;
+            unsigned int pos_29 = n_2 + before_6 + own_28;
+            if (cands_5[0] && pos_29 < 1024) {
+                int slot_16 = seg_base + (int)pos_29;
+                lkeys[slot_16] = keys_3[0];
+                lidx[slot_16] = idxs_4[0];
+            }
+            if (cands_5[0]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_30 = n_2 + before_6 + own_28;
+            if (cands_5[1] && pos_30 < 1024) {
+                int slot_17 = seg_base + (int)pos_30;
+                lkeys[slot_17] = keys_3[1];
+                lidx[slot_17] = idxs_4[1];
+            }
+            if (cands_5[1]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_31 = n_2 + before_6 + own_28;
+            if (cands_5[2] && pos_31 < 1024) {
+                int slot_18 = seg_base + (int)pos_31;
+                lkeys[slot_18] = keys_3[2];
+                lidx[slot_18] = idxs_4[2];
+            }
+            if (cands_5[2]) {
+                own_28 = own_28 + 1;
+            }
+            unsigned int pos_32 = n_2 + before_6 + own_28;
+            if (cands_5[3] && pos_32 < 1024) {
+                int slot_19 = seg_base + (int)pos_32;
+                lkeys[slot_19] = keys_3[3];
+                lidx[slot_19] = idxs_4[3];
+            }
+            if (cands_5[3]) {
+                own_28 = own_28 + 1;
+            }
+            n_2 = n_2 + total_7;
+            unsigned int keys_33[4];
+            int idxs_34[4];
+            bool cands_35[4];
+            unsigned int before_36 = 0;
+            unsigned int total_37 = 0;
+            unsigned int bits_38 = __as_u32(vals_b[4]);
+            unsigned int key_39 = ((bits_38 <= 2139095040) ? bits_38 : 0);
+            keys_33[0] = key_39;
+            int i_vec_40 = wstart + (c_1 + 1) * 512 + 128 + lane * 4;
+            int i_str_41 = wstart + (c_1 + 1) * 512 + 128 + lane;
+            idxs_34[0] = ((aligned_1) ? i_vec_40 : i_str_41);
+            cands_35[0] = b_lo <= keys_33[0] >> 21 && idxs_34[0] < vocab;
+            unsigned int _vote_20 = __ballot_sync(0xFFFFFFFF, cands_35[0]);
+            unsigned int m_42 = _vote_20;
+            int _popc_40 = __popc(m_42 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_40;
+            int _popc_41 = __popc(m_42);
+            total_37 = total_37 + (unsigned int)_popc_41;
+            unsigned int bits_43 = __as_u32(vals_b[5]);
+            unsigned int key_44 = ((bits_43 <= 2139095040) ? bits_43 : 0);
+            keys_33[1] = key_44;
+            int i_vec_45 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 1;
+            int i_str_46 = wstart + (c_1 + 1) * 512 + 160 + lane;
+            idxs_34[1] = ((aligned_1) ? i_vec_45 : i_str_46);
+            cands_35[1] = b_lo <= keys_33[1] >> 21 && idxs_34[1] < vocab;
+            unsigned int _vote_21 = __ballot_sync(0xFFFFFFFF, cands_35[1]);
+            unsigned int m_47 = _vote_21;
+            int _popc_42 = __popc(m_47 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_42;
+            int _popc_43 = __popc(m_47);
+            total_37 = total_37 + (unsigned int)_popc_43;
+            unsigned int bits_48 = __as_u32(vals_b[6]);
+            unsigned int key_49 = ((bits_48 <= 2139095040) ? bits_48 : 0);
+            keys_33[2] = key_49;
+            int i_vec_50 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 2;
+            int i_str_51 = wstart + (c_1 + 1) * 512 + 192 + lane;
+            idxs_34[2] = ((aligned_1) ? i_vec_50 : i_str_51);
+            cands_35[2] = b_lo <= keys_33[2] >> 21 && idxs_34[2] < vocab;
+            unsigned int _vote_22 = __ballot_sync(0xFFFFFFFF, cands_35[2]);
+            unsigned int m_52 = _vote_22;
+            int _popc_44 = __popc(m_52 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_44;
+            int _popc_45 = __popc(m_52);
+            total_37 = total_37 + (unsigned int)_popc_45;
+            unsigned int bits_53 = __as_u32(vals_b[7]);
+            unsigned int key_54 = ((bits_53 <= 2139095040) ? bits_53 : 0);
+            keys_33[3] = key_54;
+            int i_vec_55 = wstart + (c_1 + 1) * 512 + 128 + lane * 4 + 3;
+            int i_str_56 = wstart + (c_1 + 1) * 512 + 224 + lane;
+            idxs_34[3] = ((aligned_1) ? i_vec_55 : i_str_56);
+            cands_35[3] = b_lo <= keys_33[3] >> 21 && idxs_34[3] < vocab;
+            unsigned int _vote_23 = __ballot_sync(0xFFFFFFFF, cands_35[3]);
+            unsigned int m_57 = _vote_23;
+            int _popc_46 = __popc(m_57 & lt_mask_0);
+            before_36 = before_36 + (unsigned int)_popc_46;
+            int _popc_47 = __popc(m_57);
+            total_37 = total_37 + (unsigned int)_popc_47;
+            unsigned int own_58 = 0;
+            unsigned int pos_59 = n_2 + before_36 + own_58;
+            if (cands_35[0] && pos_59 < 1024) {
+                int slot_20 = seg_base + (int)pos_59;
+                lkeys[slot_20] = keys_33[0];
+                lidx[slot_20] = idxs_34[0];
+            }
+            if (cands_35[0]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_60 = n_2 + before_36 + own_58;
+            if (cands_35[1] && pos_60 < 1024) {
+                int slot_21 = seg_base + (int)pos_60;
+                lkeys[slot_21] = keys_33[1];
+                lidx[slot_21] = idxs_34[1];
+            }
+            if (cands_35[1]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_61 = n_2 + before_36 + own_58;
+            if (cands_35[2] && pos_61 < 1024) {
+                int slot_22 = seg_base + (int)pos_61;
+                lkeys[slot_22] = keys_33[2];
+                lidx[slot_22] = idxs_34[2];
+            }
+            if (cands_35[2]) {
+                own_58 = own_58 + 1;
+            }
+            unsigned int pos_62 = n_2 + before_36 + own_58;
+            if (cands_35[3] && pos_62 < 1024) {
+                int slot_23 = seg_base + (int)pos_62;
+                lkeys[slot_23] = keys_33[3];
+                lidx[slot_23] = idxs_34[3];
+            }
+            if (cands_35[3]) {
+                own_58 = own_58 + 1;
+            }
+            n_2 = n_2 + total_37;
+            unsigned int keys_63[4];
+            int idxs_64[4];
+            bool cands_65[4];
+            unsigned int before_66 = 0;
+            unsigned int total_67 = 0;
+            unsigned int bits_68 = __as_u32(vals_b[8]);
+            unsigned int key_69 = ((bits_68 <= 2139095040) ? bits_68 : 0);
+            keys_63[0] = key_69;
+            int i_vec_70 = wstart + (c_1 + 1) * 512 + 256 + lane * 4;
+            int i_str_71 = wstart + (c_1 + 1) * 512 + 256 + lane;
+            idxs_64[0] = ((aligned_1) ? i_vec_70 : i_str_71);
+            cands_65[0] = b_lo <= keys_63[0] >> 21 && idxs_64[0] < vocab;
+            unsigned int _vote_24 = __ballot_sync(0xFFFFFFFF, cands_65[0]);
+            unsigned int m_72 = _vote_24;
+            int _popc_48 = __popc(m_72 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_48;
+            int _popc_49 = __popc(m_72);
+            total_67 = total_67 + (unsigned int)_popc_49;
+            unsigned int bits_73 = __as_u32(vals_b[9]);
+            unsigned int key_74 = ((bits_73 <= 2139095040) ? bits_73 : 0);
+            keys_63[1] = key_74;
+            int i_vec_75 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 1;
+            int i_str_76 = wstart + (c_1 + 1) * 512 + 288 + lane;
+            idxs_64[1] = ((aligned_1) ? i_vec_75 : i_str_76);
+            cands_65[1] = b_lo <= keys_63[1] >> 21 && idxs_64[1] < vocab;
+            unsigned int _vote_25 = __ballot_sync(0xFFFFFFFF, cands_65[1]);
+            unsigned int m_77 = _vote_25;
+            int _popc_50 = __popc(m_77 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_50;
+            int _popc_51 = __popc(m_77);
+            total_67 = total_67 + (unsigned int)_popc_51;
+            unsigned int bits_78 = __as_u32(vals_b[10]);
+            unsigned int key_79 = ((bits_78 <= 2139095040) ? bits_78 : 0);
+            keys_63[2] = key_79;
+            int i_vec_80 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 2;
+            int i_str_81 = wstart + (c_1 + 1) * 512 + 320 + lane;
+            idxs_64[2] = ((aligned_1) ? i_vec_80 : i_str_81);
+            cands_65[2] = b_lo <= keys_63[2] >> 21 && idxs_64[2] < vocab;
+            unsigned int _vote_26 = __ballot_sync(0xFFFFFFFF, cands_65[2]);
+            unsigned int m_82 = _vote_26;
+            int _popc_52 = __popc(m_82 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_52;
+            int _popc_53 = __popc(m_82);
+            total_67 = total_67 + (unsigned int)_popc_53;
+            unsigned int bits_83 = __as_u32(vals_b[11]);
+            unsigned int key_84 = ((bits_83 <= 2139095040) ? bits_83 : 0);
+            keys_63[3] = key_84;
+            int i_vec_85 = wstart + (c_1 + 1) * 512 + 256 + lane * 4 + 3;
+            int i_str_86 = wstart + (c_1 + 1) * 512 + 352 + lane;
+            idxs_64[3] = ((aligned_1) ? i_vec_85 : i_str_86);
+            cands_65[3] = b_lo <= keys_63[3] >> 21 && idxs_64[3] < vocab;
+            unsigned int _vote_27 = __ballot_sync(0xFFFFFFFF, cands_65[3]);
+            unsigned int m_87 = _vote_27;
+            int _popc_54 = __popc(m_87 & lt_mask_0);
+            before_66 = before_66 + (unsigned int)_popc_54;
+            int _popc_55 = __popc(m_87);
+            total_67 = total_67 + (unsigned int)_popc_55;
+            unsigned int own_88 = 0;
+            unsigned int pos_89 = n_2 + before_66 + own_88;
+            if (cands_65[0] && pos_89 < 1024) {
+                int slot_24 = seg_base + (int)pos_89;
+                lkeys[slot_24] = keys_63[0];
+                lidx[slot_24] = idxs_64[0];
+            }
+            if (cands_65[0]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_90 = n_2 + before_66 + own_88;
+            if (cands_65[1] && pos_90 < 1024) {
+                int slot_25 = seg_base + (int)pos_90;
+                lkeys[slot_25] = keys_63[1];
+                lidx[slot_25] = idxs_64[1];
+            }
+            if (cands_65[1]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_91 = n_2 + before_66 + own_88;
+            if (cands_65[2] && pos_91 < 1024) {
+                int slot_26 = seg_base + (int)pos_91;
+                lkeys[slot_26] = keys_63[2];
+                lidx[slot_26] = idxs_64[2];
+            }
+            if (cands_65[2]) {
+                own_88 = own_88 + 1;
+            }
+            unsigned int pos_92 = n_2 + before_66 + own_88;
+            if (cands_65[3] && pos_92 < 1024) {
+                int slot_27 = seg_base + (int)pos_92;
+                lkeys[slot_27] = keys_63[3];
+                lidx[slot_27] = idxs_64[3];
+            }
+            if (cands_65[3]) {
+                own_88 = own_88 + 1;
+            }
+            n_2 = n_2 + total_67;
+            unsigned int keys_93[4];
+            int idxs_94[4];
+            bool cands_95[4];
+            unsigned int before_96 = 0;
+            unsigned int total_97 = 0;
+            unsigned int bits_98 = __as_u32(vals_b[12]);
+            unsigned int key_99 = ((bits_98 <= 2139095040) ? bits_98 : 0);
+            keys_93[0] = key_99;
+            int i_vec_100 = wstart + (c_1 + 1) * 512 + 384 + lane * 4;
+            int i_str_101 = wstart + (c_1 + 1) * 512 + 384 + lane;
+            idxs_94[0] = ((aligned_1) ? i_vec_100 : i_str_101);
+            cands_95[0] = b_lo <= keys_93[0] >> 21 && idxs_94[0] < vocab;
+            unsigned int _vote_28 = __ballot_sync(0xFFFFFFFF, cands_95[0]);
+            unsigned int m_102 = _vote_28;
+            int _popc_56 = __popc(m_102 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_56;
+            int _popc_57 = __popc(m_102);
+            total_97 = total_97 + (unsigned int)_popc_57;
+            unsigned int bits_103 = __as_u32(vals_b[13]);
+            unsigned int key_104 = ((bits_103 <= 2139095040) ? bits_103 : 0);
+            keys_93[1] = key_104;
+            int i_vec_105 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 1;
+            int i_str_106 = wstart + (c_1 + 1) * 512 + 416 + lane;
+            idxs_94[1] = ((aligned_1) ? i_vec_105 : i_str_106);
+            cands_95[1] = b_lo <= keys_93[1] >> 21 && idxs_94[1] < vocab;
+            unsigned int _vote_29 = __ballot_sync(0xFFFFFFFF, cands_95[1]);
+            unsigned int m_107 = _vote_29;
+            int _popc_58 = __popc(m_107 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_58;
+            int _popc_59 = __popc(m_107);
+            total_97 = total_97 + (unsigned int)_popc_59;
+            unsigned int bits_108 = __as_u32(vals_b[14]);
+            unsigned int key_109 = ((bits_108 <= 2139095040) ? bits_108 : 0);
+            keys_93[2] = key_109;
+            int i_vec_110 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 2;
+            int i_str_111 = wstart + (c_1 + 1) * 512 + 448 + lane;
+            idxs_94[2] = ((aligned_1) ? i_vec_110 : i_str_111);
+            cands_95[2] = b_lo <= keys_93[2] >> 21 && idxs_94[2] < vocab;
+            unsigned int _vote_30 = __ballot_sync(0xFFFFFFFF, cands_95[2]);
+            unsigned int m_112 = _vote_30;
+            int _popc_60 = __popc(m_112 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_60;
+            int _popc_61 = __popc(m_112);
+            total_97 = total_97 + (unsigned int)_popc_61;
+            unsigned int bits_113 = __as_u32(vals_b[15]);
+            unsigned int key_114 = ((bits_113 <= 2139095040) ? bits_113 : 0);
+            keys_93[3] = key_114;
+            int i_vec_115 = wstart + (c_1 + 1) * 512 + 384 + lane * 4 + 3;
+            int i_str_116 = wstart + (c_1 + 1) * 512 + 480 + lane;
+            idxs_94[3] = ((aligned_1) ? i_vec_115 : i_str_116);
+            cands_95[3] = b_lo <= keys_93[3] >> 21 && idxs_94[3] < vocab;
+            unsigned int _vote_31 = __ballot_sync(0xFFFFFFFF, cands_95[3]);
+            unsigned int m_117 = _vote_31;
+            int _popc_62 = __popc(m_117 & lt_mask_0);
+            before_96 = before_96 + (unsigned int)_popc_62;
+            int _popc_63 = __popc(m_117);
+            total_97 = total_97 + (unsigned int)_popc_63;
+            unsigned int own_118 = 0;
+            unsigned int pos_119 = n_2 + before_96 + own_118;
+            if (cands_95[0] && pos_119 < 1024) {
+                int slot_28 = seg_base + (int)pos_119;
+                lkeys[slot_28] = keys_93[0];
+                lidx[slot_28] = idxs_94[0];
+            }
+            if (cands_95[0]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_120 = n_2 + before_96 + own_118;
+            if (cands_95[1] && pos_120 < 1024) {
+                int slot_29 = seg_base + (int)pos_120;
+                lkeys[slot_29] = keys_93[1];
+                lidx[slot_29] = idxs_94[1];
+            }
+            if (cands_95[1]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_121 = n_2 + before_96 + own_118;
+            if (cands_95[2] && pos_121 < 1024) {
+                int slot_30 = seg_base + (int)pos_121;
+                lkeys[slot_30] = keys_93[2];
+                lidx[slot_30] = idxs_94[2];
+            }
+            if (cands_95[2]) {
+                own_118 = own_118 + 1;
+            }
+            unsigned int pos_122 = n_2 + before_96 + own_118;
+            if (cands_95[3] && pos_122 < 1024) {
+                int slot_31 = seg_base + (int)pos_122;
+                lkeys[slot_31] = keys_93[3];
+                lidx[slot_31] = idxs_94[3];
+            }
+            if (cands_95[3]) {
+                own_118 = own_118 + 1;
+            }
+            n_2 = n_2 + total_97;
+            n_w = n_2;
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (lane == 0) {
+        scal[16 + warp] = n_w;
+    }
+    __syncthreads();
+    unsigned int before_1 = 0;
+    unsigned int total_1 = 0;
+    unsigned int v_4 = scal[16];
+    total_1 = total_1 + v_4;
+    if (warp > 0) {
+        before_1 = before_1 + v_4;
+    }
+    unsigned int v_0 = scal[17];
+    total_1 = total_1 + v_0;
+    if (warp > 1) {
+        before_1 = before_1 + v_0;
+    }
+    unsigned int v_1_1 = scal[18];
+    total_1 = total_1 + v_1_1;
+    if (warp > 2) {
+        before_1 = before_1 + v_1_1;
+    }
+    unsigned int v_2_1 = scal[19];
+    total_1 = total_1 + v_2_1;
+    if (warp > 3) {
+        before_1 = before_1 + v_2_1;
+    }
+    unsigned int v_3_1 = scal[20];
+    total_1 = total_1 + v_3_1;
+    if (warp > 4) {
+        before_1 = before_1 + v_3_1;
+    }
+    unsigned int v_4_1 = scal[21];
+    total_1 = total_1 + v_4_1;
+    if (warp > 5) {
+        before_1 = before_1 + v_4_1;
+    }
+    unsigned int v_5 = scal[22];
+    total_1 = total_1 + v_5;
+    if (warp > 6) {
+        before_1 = before_1 + v_5;
+    }
+    unsigned int v_6 = scal[23];
+    total_1 = total_1 + v_6;
+    if (warp > 7) {
+        before_1 = before_1 + v_6;
+    }
+    unsigned int v_7 = scal[24];
+    total_1 = total_1 + v_7;
+    if (warp > 8) {
+        before_1 = before_1 + v_7;
+    }
+    unsigned int v_8 = scal[25];
+    total_1 = total_1 + v_8;
+    if (warp > 9) {
+        before_1 = before_1 + v_8;
+    }
+    unsigned int v_9 = scal[26];
+    total_1 = total_1 + v_9;
+    if (warp > 10) {
+        before_1 = before_1 + v_9;
+    }
+    unsigned int v_10 = scal[27];
+    total_1 = total_1 + v_10;
+    if (warp > 11) {
+        before_1 = before_1 + v_10;
+    }
+    unsigned int v_11 = scal[28];
+    total_1 = total_1 + v_11;
+    if (warp > 12) {
+        before_1 = before_1 + v_11;
+    }
+    unsigned int v_12 = scal[29];
+    total_1 = total_1 + v_12;
+    if (warp > 13) {
+        before_1 = before_1 + v_12;
+    }
+    unsigned int v_13 = scal[30];
+    total_1 = total_1 + v_13;
+    if (warp > 14) {
+        before_1 = before_1 + v_13;
+    }
+    unsigned int v_14 = scal[31];
+    total_1 = total_1 + v_14;
+    if (warp > 15) {
+        before_1 = before_1 + v_14;
+    }
+    unsigned int _vote_32 = __ballot_sync(0xFFFFFFFF, n_w > 1024);
+    unsigned int ovf_w = _vote_32;
+    if (tid == 0) {
+        scal[6] = total_1;
+    }
+    if (lane == 0) {
+        if (ovf_w != 0) {
+            scal[5] = 1;
+        }
+    }
+    __syncthreads();
+    unsigned int any_ovf = scal[5];
+    unsigned int cand_total = total_1;
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        for (int r = 0; r < 4; r++) {
+            if (r != rank) {
+                uint32_t _mapa_4;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_4) : "r"(scal_addr + 20), "r"(r));
+                unsigned int _cluster_ld_0;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_0) : "r"(_mapa_4) : "memory");
+                unsigned int ovf_peer = _cluster_ld_0;
+                uint32_t _mapa_5;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_5) : "r"(scal_addr + 24), "r"(r));
+                unsigned int _cluster_ld_1;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_1) : "r"(_mapa_5) : "memory");
+                unsigned int n_peer = _cluster_ld_1;
+                any_ovf = any_ovf | ovf_peer;
+                cand_total = cand_total + n_peer;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    bool use_list = any_ovf == 0 && cand_total >= k_u;
+    unsigned int n_eff = ((use_list) ? n_w : 0);
+    int nch_stream = ((use_list) ? 0 : nchunks);
+    for (int i_6 = tid; i_6 < 2048; i_6 += 512) {
+        hist0[i_6] = 0;
+    }
+    __syncthreads();
+    unsigned int prefix = 0;
+    unsigned int remaining = k_u;
+    unsigned int gt_local = 0;
+    unsigned int eq_local = 0;
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_7 = start + tid * 4;
+            if (i_7 < vocab) {
+                float _vec_load_12[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_7);
+                    _vec_load_12[0 + 0] = _v4.x;
+                    _vec_load_12[0 + 1] = _v4.y;
+                    _vec_load_12[0 + 2] = _v4.z;
+                    _vec_load_12[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_12[0];
+                vals_a[1] = _vec_load_12[1];
+                vals_a[2] = _vec_load_12[2];
+                vals_a[3] = _vec_load_12[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_4 = start + 2048 + tid * 4;
+            if (i_0_4 < vocab) {
+                float _vec_load_13[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_4);
+                    _vec_load_13[0 + 0] = _v4.x;
+                    _vec_load_13[0 + 1] = _v4.y;
+                    _vec_load_13[0 + 2] = _v4.z;
+                    _vec_load_13[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_13[0];
+                vals_a[5] = _vec_load_13[1];
+                vals_a[6] = _vec_load_13[2];
+                vals_a[7] = _vec_load_13[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_5 = start + 4096 + tid * 4;
+            if (i_1_5 < vocab) {
+                float _vec_load_14[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_5);
+                    _vec_load_14[0 + 0] = _v4.x;
+                    _vec_load_14[0 + 1] = _v4.y;
+                    _vec_load_14[0 + 2] = _v4.z;
+                    _vec_load_14[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_14[0];
+                vals_a[9] = _vec_load_14[1];
+                vals_a[10] = _vec_load_14[2];
+                vals_a[11] = _vec_load_14[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_5 = start + 6144 + tid * 4;
+            if (i_2_5 < vocab) {
+                float _vec_load_15[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_5);
+                    _vec_load_15[0 + 0] = _v4.x;
+                    _vec_load_15[0 + 1] = _v4.y;
+                    _vec_load_15[0 + 2] = _v4.z;
+                    _vec_load_15[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_15[0];
+                vals_a[13] = _vec_load_15[1];
+                vals_a[14] = _vec_load_15[2];
+                vals_a[15] = _vec_load_15[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_17 = start + tid;
+            if (i2_17 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_17];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_3 = start + 512 + tid;
+            if (i2_0_3 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_3];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_3 = start + 1024 + tid;
+            if (i2_1_3 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_3];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_3 = start + 1536 + tid;
+            if (i2_2_3 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_3];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_3 = start + 2048 + tid;
+            if (i2_3_3 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_3];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_3 = start + 2560 + tid;
+            if (i2_4_3 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_3];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_3 = start + 3072 + tid;
+            if (i2_5_3 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_3];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_3 = start + 3584 + tid;
+            if (i2_6_3 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_3];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_3 = start + 4096 + tid;
+            if (i2_7_3 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_3];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_3 = start + 4608 + tid;
+            if (i2_8_3 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_3];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_3 = start + 5120 + tid;
+            if (i2_9_3 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_3];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_3 = start + 5632 + tid;
+            if (i2_10_3 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_3];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_3 = start + 6144 + tid;
+            if (i2_11_3 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_3];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_3 = start + 6656 + tid;
+            if (i2_12_3 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_3];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_3 = start + 7168 + tid;
+            if (i2_13_3 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_3];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_3 = start + 7680 + tid;
+            if (i2_14_3 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_3];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_2 = 0; c_2 < nch_stream; c_2 += 2) {
+        if (nch_stream > c_2 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_8 = start + (c_2 + 1) * 8192 + tid * 4;
+                if (i_8 < vocab) {
+                    float _vec_load_16[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_8);
+                        _vec_load_16[0 + 0] = _v4.x;
+                        _vec_load_16[0 + 1] = _v4.y;
+                        _vec_load_16[0 + 2] = _v4.z;
+                        _vec_load_16[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_16[0];
+                    vals_b[1] = _vec_load_16[1];
+                    vals_b[2] = _vec_load_16[2];
+                    vals_b[3] = _vec_load_16[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_5 = start + (c_2 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_5 < vocab) {
+                    float _vec_load_17[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_5);
+                        _vec_load_17[0 + 0] = _v4.x;
+                        _vec_load_17[0 + 1] = _v4.y;
+                        _vec_load_17[0 + 2] = _v4.z;
+                        _vec_load_17[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_17[0];
+                    vals_b[5] = _vec_load_17[1];
+                    vals_b[6] = _vec_load_17[2];
+                    vals_b[7] = _vec_load_17[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_6 = start + (c_2 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_6 < vocab) {
+                    float _vec_load_18[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_6);
+                        _vec_load_18[0 + 0] = _v4.x;
+                        _vec_load_18[0 + 1] = _v4.y;
+                        _vec_load_18[0 + 2] = _v4.z;
+                        _vec_load_18[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_18[0];
+                    vals_b[9] = _vec_load_18[1];
+                    vals_b[10] = _vec_load_18[2];
+                    vals_b[11] = _vec_load_18[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_6 = start + (c_2 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_6 < vocab) {
+                    float _vec_load_19[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_6);
+                        _vec_load_19[0 + 0] = _v4.x;
+                        _vec_load_19[0 + 1] = _v4.y;
+                        _vec_load_19[0 + 2] = _v4.z;
+                        _vec_load_19[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_19[0];
+                    vals_b[13] = _vec_load_19[1];
+                    vals_b[14] = _vec_load_19[2];
+                    vals_b[15] = _vec_load_19[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_18 = start + (c_2 + 1) * 8192 + tid;
+                if (i2_18 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_18];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_4 = start + (c_2 + 1) * 8192 + 512 + tid;
+                if (i2_0_4 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_4];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_4 = start + (c_2 + 1) * 8192 + 1024 + tid;
+                if (i2_1_4 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_4];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_4 = start + (c_2 + 1) * 8192 + 1536 + tid;
+                if (i2_2_4 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_4];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_4 = start + (c_2 + 1) * 8192 + 2048 + tid;
+                if (i2_3_4 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_4];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_4 = start + (c_2 + 1) * 8192 + 2560 + tid;
+                if (i2_4_4 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_4];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_4 = start + (c_2 + 1) * 8192 + 3072 + tid;
+                if (i2_5_4 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_4];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_4 = start + (c_2 + 1) * 8192 + 3584 + tid;
+                if (i2_6_4 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_4];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_4 = start + (c_2 + 1) * 8192 + 4096 + tid;
+                if (i2_7_4 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_4];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_4 = start + (c_2 + 1) * 8192 + 4608 + tid;
+                if (i2_8_4 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_4];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_4 = start + (c_2 + 1) * 8192 + 5120 + tid;
+                if (i2_9_4 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_4];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_4 = start + (c_2 + 1) * 8192 + 5632 + tid;
+                if (i2_10_4 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_4];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_4 = start + (c_2 + 1) * 8192 + 6144 + tid;
+                if (i2_11_4 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_4];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_4 = start + (c_2 + 1) * 8192 + 6656 + tid;
+                if (i2_12_4 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_4];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_4 = start + (c_2 + 1) * 8192 + 7168 + tid;
+                if (i2_13_4 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_4];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_4 = start + (c_2 + 1) * 8192 + 7680 + tid;
+                if (i2_14_4 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_4];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_5 = __as_u32(vals_a[0]);
+        unsigned int key_5 = ((bits_5 <= 2139095040) ? bits_5 : 0);
+        unsigned int bucket_4 = key_5 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_4], 1);
+        unsigned int bits_0 = __as_u32(vals_a[1]);
+        unsigned int key_1_1 = ((bits_0 <= 2139095040) ? bits_0 : 0);
+        unsigned int bucket_2_1 = key_1_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_2_1], 1);
+        unsigned int bits_3_1 = __as_u32(vals_a[2]);
+        unsigned int key_4_1 = ((bits_3_1 <= 2139095040) ? bits_3_1 : 0);
+        unsigned int bucket_5 = key_4_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_5], 1);
+        unsigned int bits_6_1 = __as_u32(vals_a[3]);
+        unsigned int key_7_1 = ((bits_6_1 <= 2139095040) ? bits_6_1 : 0);
+        unsigned int bucket_8 = key_7_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_8], 1);
+        unsigned int bits_9 = __as_u32(vals_a[4]);
+        unsigned int key_10 = ((bits_9 <= 2139095040) ? bits_9 : 0);
+        unsigned int bucket_11 = key_10 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_11], 1);
+        unsigned int bits_12 = __as_u32(vals_a[5]);
+        unsigned int key_13 = ((bits_12 <= 2139095040) ? bits_12 : 0);
+        unsigned int bucket_14 = key_13 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_14], 1);
+        unsigned int bits_15 = __as_u32(vals_a[6]);
+        unsigned int key_16 = ((bits_15 <= 2139095040) ? bits_15 : 0);
+        unsigned int bucket_17 = key_16 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_17], 1);
+        unsigned int bits_18_1 = __as_u32(vals_a[7]);
+        unsigned int key_19_1 = ((bits_18_1 <= 2139095040) ? bits_18_1 : 0);
+        unsigned int bucket_20 = key_19_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_20], 1);
+        unsigned int bits_21 = __as_u32(vals_a[8]);
+        unsigned int key_22 = ((bits_21 <= 2139095040) ? bits_21 : 0);
+        unsigned int bucket_23 = key_22 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_23], 1);
+        unsigned int bits_24_1 = __as_u32(vals_a[9]);
+        unsigned int key_25_1 = ((bits_24_1 <= 2139095040) ? bits_24_1 : 0);
+        unsigned int bucket_26 = key_25_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_26], 1);
+        unsigned int bits_27 = __as_u32(vals_a[10]);
+        unsigned int key_28 = ((bits_27 <= 2139095040) ? bits_27 : 0);
+        unsigned int bucket_29 = key_28 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_29], 1);
+        unsigned int bits_30 = __as_u32(vals_a[11]);
+        unsigned int key_31 = ((bits_30 <= 2139095040) ? bits_30 : 0);
+        unsigned int bucket_32 = key_31 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_32], 1);
+        unsigned int bits_33 = __as_u32(vals_a[12]);
+        unsigned int key_34 = ((bits_33 <= 2139095040) ? bits_33 : 0);
+        unsigned int bucket_35 = key_34 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_35], 1);
+        unsigned int bits_36 = __as_u32(vals_a[13]);
+        unsigned int key_37 = ((bits_36 <= 2139095040) ? bits_36 : 0);
+        unsigned int bucket_38 = key_37 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_38], 1);
+        unsigned int bits_39_1 = __as_u32(vals_a[14]);
+        unsigned int key_40_1 = ((bits_39_1 <= 2139095040) ? bits_39_1 : 0);
+        unsigned int bucket_41 = key_40_1 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_41], 1);
+        unsigned int bits_42 = __as_u32(vals_a[15]);
+        unsigned int key_43 = ((bits_42 <= 2139095040) ? bits_42 : 0);
+        unsigned int bucket_44 = key_43 >> 21 & 2047;
+        atomicAdd(&hist0[bucket_44], 1);
+        if (nch_stream > c_2 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_9 = start + (c_2 + 2) * 8192 + tid * 4;
+                if (i_9 < vocab) {
+                    float _vec_load_20[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_9);
+                        _vec_load_20[0 + 0] = _v4.x;
+                        _vec_load_20[0 + 1] = _v4.y;
+                        _vec_load_20[0 + 2] = _v4.z;
+                        _vec_load_20[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_20[0];
+                    vals_a[1] = _vec_load_20[1];
+                    vals_a[2] = _vec_load_20[2];
+                    vals_a[3] = _vec_load_20[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_6 = start + (c_2 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_6 < vocab) {
+                    float _vec_load_21[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_6);
+                        _vec_load_21[0 + 0] = _v4.x;
+                        _vec_load_21[0 + 1] = _v4.y;
+                        _vec_load_21[0 + 2] = _v4.z;
+                        _vec_load_21[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_21[0];
+                    vals_a[5] = _vec_load_21[1];
+                    vals_a[6] = _vec_load_21[2];
+                    vals_a[7] = _vec_load_21[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_7 = start + (c_2 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_7 < vocab) {
+                    float _vec_load_22[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_7);
+                        _vec_load_22[0 + 0] = _v4.x;
+                        _vec_load_22[0 + 1] = _v4.y;
+                        _vec_load_22[0 + 2] = _v4.z;
+                        _vec_load_22[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_22[0];
+                    vals_a[9] = _vec_load_22[1];
+                    vals_a[10] = _vec_load_22[2];
+                    vals_a[11] = _vec_load_22[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_7 = start + (c_2 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_7 < vocab) {
+                    float _vec_load_23[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_7);
+                        _vec_load_23[0 + 0] = _v4.x;
+                        _vec_load_23[0 + 1] = _v4.y;
+                        _vec_load_23[0 + 2] = _v4.z;
+                        _vec_load_23[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_23[0];
+                    vals_a[13] = _vec_load_23[1];
+                    vals_a[14] = _vec_load_23[2];
+                    vals_a[15] = _vec_load_23[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_19 = start + (c_2 + 2) * 8192 + tid;
+                if (i2_19 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_19];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_5 = start + (c_2 + 2) * 8192 + 512 + tid;
+                if (i2_0_5 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_5];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_5 = start + (c_2 + 2) * 8192 + 1024 + tid;
+                if (i2_1_5 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_5];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_5 = start + (c_2 + 2) * 8192 + 1536 + tid;
+                if (i2_2_5 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_5];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_5 = start + (c_2 + 2) * 8192 + 2048 + tid;
+                if (i2_3_5 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_5];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_5 = start + (c_2 + 2) * 8192 + 2560 + tid;
+                if (i2_4_5 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_5];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_5 = start + (c_2 + 2) * 8192 + 3072 + tid;
+                if (i2_5_5 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_5];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_5 = start + (c_2 + 2) * 8192 + 3584 + tid;
+                if (i2_6_5 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_5];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_5 = start + (c_2 + 2) * 8192 + 4096 + tid;
+                if (i2_7_5 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_5];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_5 = start + (c_2 + 2) * 8192 + 4608 + tid;
+                if (i2_8_5 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_5];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_5 = start + (c_2 + 2) * 8192 + 5120 + tid;
+                if (i2_9_5 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_5];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_5 = start + (c_2 + 2) * 8192 + 5632 + tid;
+                if (i2_10_5 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_5];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_5 = start + (c_2 + 2) * 8192 + 6144 + tid;
+                if (i2_11_5 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_5];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_5 = start + (c_2 + 2) * 8192 + 6656 + tid;
+                if (i2_12_5 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_5];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_5 = start + (c_2 + 2) * 8192 + 7168 + tid;
+                if (i2_13_5 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_5];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_5 = start + (c_2 + 2) * 8192 + 7680 + tid;
+                if (i2_14_5 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_5];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_2 + 1) {
+            unsigned int bits_1_2 = __as_u32(vals_b[0]);
+            unsigned int key_2_2 = ((bits_1_2 <= 2139095040) ? bits_1_2 : 0);
+            unsigned int bucket_3_1 = key_2_2 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_3_1], 1);
+            unsigned int bits_4_1 = __as_u32(vals_b[1]);
+            unsigned int key_5_1 = ((bits_4_1 <= 2139095040) ? bits_4_1 : 0);
+            unsigned int bucket_6 = key_5_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_6], 1);
+            unsigned int bits_7 = __as_u32(vals_b[2]);
+            unsigned int key_8 = ((bits_7 <= 2139095040) ? bits_7 : 0);
+            unsigned int bucket_9 = key_8 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_9], 1);
+            unsigned int bits_10 = __as_u32(vals_b[3]);
+            unsigned int key_11 = ((bits_10 <= 2139095040) ? bits_10 : 0);
+            unsigned int bucket_12 = key_11 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_12], 1);
+            unsigned int bits_13_1 = __as_u32(vals_b[4]);
+            unsigned int key_14_1 = ((bits_13_1 <= 2139095040) ? bits_13_1 : 0);
+            unsigned int bucket_15 = key_14_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_15], 1);
+            unsigned int bits_16 = __as_u32(vals_b[5]);
+            unsigned int key_17 = ((bits_16 <= 2139095040) ? bits_16 : 0);
+            unsigned int bucket_18 = key_17 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_18], 1);
+            unsigned int bits_19 = __as_u32(vals_b[6]);
+            unsigned int key_20 = ((bits_19 <= 2139095040) ? bits_19 : 0);
+            unsigned int bucket_21 = key_20 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_21], 1);
+            unsigned int bits_22 = __as_u32(vals_b[7]);
+            unsigned int key_23 = ((bits_22 <= 2139095040) ? bits_22 : 0);
+            unsigned int bucket_24 = key_23 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_24], 1);
+            unsigned int bits_25 = __as_u32(vals_b[8]);
+            unsigned int key_26 = ((bits_25 <= 2139095040) ? bits_25 : 0);
+            unsigned int bucket_27 = key_26 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_27], 1);
+            unsigned int bits_28 = __as_u32(vals_b[9]);
+            unsigned int key_29 = ((bits_28 <= 2139095040) ? bits_28 : 0);
+            unsigned int bucket_30 = key_29 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_30], 1);
+            unsigned int bits_31 = __as_u32(vals_b[10]);
+            unsigned int key_32 = ((bits_31 <= 2139095040) ? bits_31 : 0);
+            unsigned int bucket_33 = key_32 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_33], 1);
+            unsigned int bits_34_1 = __as_u32(vals_b[11]);
+            unsigned int key_35_1 = ((bits_34_1 <= 2139095040) ? bits_34_1 : 0);
+            unsigned int bucket_36 = key_35_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_36], 1);
+            unsigned int bits_37 = __as_u32(vals_b[12]);
+            unsigned int key_38 = ((bits_37 <= 2139095040) ? bits_37 : 0);
+            unsigned int bucket_39 = key_38 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_39], 1);
+            unsigned int bits_40 = __as_u32(vals_b[13]);
+            unsigned int key_41 = ((bits_40 <= 2139095040) ? bits_40 : 0);
+            unsigned int bucket_42 = key_41 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_42], 1);
+            unsigned int bits_43_1 = __as_u32(vals_b[14]);
+            unsigned int key_44_1 = ((bits_43_1 <= 2139095040) ? bits_43_1 : 0);
+            unsigned int bucket_45 = key_44_1 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_45], 1);
+            unsigned int bits_46 = __as_u32(vals_b[15]);
+            unsigned int key_47 = ((bits_46 <= 2139095040) ? bits_46 : 0);
+            unsigned int bucket_48 = key_47 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_48], 1);
+        }
+    }
+    int niter = (int)(n_eff + 31 >> 5);
+    for (int j = 0; j < niter; j++) {
+        unsigned int e = (unsigned int)(j * 32 + lane);
+        if (e < n_eff) {
+            unsigned int key_6 = lkeys[seg_base + j * 32 + lane];
+            unsigned int bucket_7 = key_6 >> 21 & 2047;
+            atomicAdd(&hist0[bucket_7], 1);
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0_15 = 0;
+    unsigned int c1_16 = 0;
+    unsigned int c2_17 = 0;
+    unsigned int c3_18 = 0;
+    {
+        unsigned int words_3[4];
+        uint32_t _mapa_6;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_6) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 3]))
+            : "r"(_mapa_6));
+        c0_15 = c0_15 + words_3[0];
+        c1_16 = c1_16 + words_3[1];
+        c2_17 = c2_17 + words_3[2];
+        c3_18 = c3_18 + words_3[3];
+        unsigned int words_0_1[4];
+        uint32_t _mapa_7;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_7) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_1[(0) + 3]))
+            : "r"(_mapa_7));
+        c0_15 = c0_15 + words_0_1[0];
+        c1_16 = c1_16 + words_0_1[1];
+        c2_17 = c2_17 + words_0_1[2];
+        c3_18 = c3_18 + words_0_1[3];
+        unsigned int words_1_1[4];
+        uint32_t _mapa_8;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_8) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_1[(0) + 3]))
+            : "r"(_mapa_8));
+        c0_15 = c0_15 + words_1_1[0];
+        c1_16 = c1_16 + words_1_1[1];
+        c2_17 = c2_17 + words_1_1[2];
+        c3_18 = c3_18 + words_1_1[3];
+        unsigned int words_2_1[4];
+        uint32_t _mapa_9;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_9) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_1[(0) + 3]))
+            : "r"(_mapa_9));
+        c0_15 = c0_15 + words_2_1[0];
+        c1_16 = c1_16 + words_2_1[1];
+        c2_17 = c2_17 + words_2_1[2];
+        c3_18 = c3_18 + words_2_1[3];
+    }
+    unsigned int local_19 = c0_15 + c1_16 + c2_17 + c3_18;
+    uint32_t _warp_scan_sum_u32_1 = local_19;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_1) : "r"(16));
+    unsigned int lane_suffix_20 = _warp_scan_sum_u32_1 - local_19;
+    unsigned int _warp_redux_u32_2;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_2) : "r"(local_19));
+    unsigned int warp_total_21 = _warp_redux_u32_2;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_21;
+    }
+    __syncthreads();
+    unsigned int peer_22 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_23 = ((lane > warp) ? peer_22 : 0);
+    unsigned int _warp_redux_u32_3;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_3) : "r"(above_23));
+    unsigned int warps_above_24 = _warp_redux_u32_3;
+    unsigned int suffix_25 = lane_suffix_20 + warps_above_24;
+    if (suffix_25 < remaining && remaining <= suffix_25 + local_19) {
+        unsigned int s3 = suffix_25 + c3_18;
+        unsigned int s2 = s3 + c2_17;
+        unsigned int s1 = s2 + c1_16;
+        if (remaining <= s3) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_25;
+        } else if (remaining <= s2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3;
+        } else {
+            if (remaining <= s1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 11 | bucket_sel;
+    unsigned int b0 = (unsigned int)(tid * 4);
+    unsigned int h0 = hist0[tid * 4];
+    unsigned int h1 = hist0[tid * 4 + 1];
+    unsigned int h2 = hist0[tid * 4 + 2];
+    unsigned int h3 = hist0[tid * 4 + 3];
+    unsigned int above_26 = 0;
+    unsigned int own_1 = 0;
+    if (b0 > bucket_sel) {
+        above_26 = above_26 + h0;
+    }
+    if (bucket_sel < b0 + 1) {
+        above_26 = above_26 + h1;
+    }
+    if (bucket_sel < b0 + 2) {
+        above_26 = above_26 + h2;
+    }
+    if (bucket_sel < b0 + 3) {
+        above_26 = above_26 + h3;
+    }
+    if (b0 == bucket_sel) {
+        own_1 = h0;
+    }
+    if (b0 + 1 == bucket_sel) {
+        own_1 = h1;
+    }
+    if (b0 + 2 == bucket_sel) {
+        own_1 = h2;
+    }
+    if (b0 + 3 == bucket_sel) {
+        own_1 = h3;
+    }
+    uint32_t _warp_scan_sum_u32_2 = above_26;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_2) : "r"(16));
+    unsigned int incl = _warp_scan_sum_u32_2;
+    if (lane == 31) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    unsigned int before_27 = 0;
+    unsigned int total_28 = 0;
+    unsigned int ws = warp_sums[0];
+    total_28 = total_28 + ws;
+    if (warp > 0) {
+        before_27 = before_27 + ws;
+    }
+    unsigned int ws_29 = warp_sums[1];
+    total_28 = total_28 + ws_29;
+    if (warp > 1) {
+        before_27 = before_27 + ws_29;
+    }
+    unsigned int ws_30 = warp_sums[2];
+    total_28 = total_28 + ws_30;
+    if (warp > 2) {
+        before_27 = before_27 + ws_30;
+    }
+    unsigned int ws_31 = warp_sums[3];
+    total_28 = total_28 + ws_31;
+    if (warp > 3) {
+        before_27 = before_27 + ws_31;
+    }
+    unsigned int ws_32 = warp_sums[4];
+    total_28 = total_28 + ws_32;
+    if (warp > 4) {
+        before_27 = before_27 + ws_32;
+    }
+    unsigned int ws_33 = warp_sums[5];
+    total_28 = total_28 + ws_33;
+    if (warp > 5) {
+        before_27 = before_27 + ws_33;
+    }
+    unsigned int ws_34 = warp_sums[6];
+    total_28 = total_28 + ws_34;
+    if (warp > 6) {
+        before_27 = before_27 + ws_34;
+    }
+    unsigned int ws_35 = warp_sums[7];
+    total_28 = total_28 + ws_35;
+    if (warp > 7) {
+        before_27 = before_27 + ws_35;
+    }
+    unsigned int ws_36 = warp_sums[8];
+    total_28 = total_28 + ws_36;
+    if (warp > 8) {
+        before_27 = before_27 + ws_36;
+    }
+    unsigned int ws_37 = warp_sums[9];
+    total_28 = total_28 + ws_37;
+    if (warp > 9) {
+        before_27 = before_27 + ws_37;
+    }
+    unsigned int ws_38 = warp_sums[10];
+    total_28 = total_28 + ws_38;
+    if (warp > 10) {
+        before_27 = before_27 + ws_38;
+    }
+    unsigned int ws_39 = warp_sums[11];
+    total_28 = total_28 + ws_39;
+    if (warp > 11) {
+        before_27 = before_27 + ws_39;
+    }
+    unsigned int ws_40 = warp_sums[12];
+    total_28 = total_28 + ws_40;
+    if (warp > 12) {
+        before_27 = before_27 + ws_40;
+    }
+    unsigned int ws_41 = warp_sums[13];
+    total_28 = total_28 + ws_41;
+    if (warp > 13) {
+        before_27 = before_27 + ws_41;
+    }
+    unsigned int ws_42 = warp_sums[14];
+    total_28 = total_28 + ws_42;
+    if (warp > 14) {
+        before_27 = before_27 + ws_42;
+    }
+    unsigned int ws_43 = warp_sums[15];
+    total_28 = total_28 + ws_43;
+    if (warp > 15) {
+        before_27 = before_27 + ws_43;
+    }
+    unsigned int excl = before_27 + incl - above_26;
+    __syncthreads();
+    gt_local = gt_local + total_28;
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_10 = start + tid * 4;
+            if (i_10 < vocab) {
+                float _vec_load_24[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_10);
+                    _vec_load_24[0 + 0] = _v4.x;
+                    _vec_load_24[0 + 1] = _v4.y;
+                    _vec_load_24[0 + 2] = _v4.z;
+                    _vec_load_24[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_24[0];
+                vals_a[1] = _vec_load_24[1];
+                vals_a[2] = _vec_load_24[2];
+                vals_a[3] = _vec_load_24[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_7 = start + 2048 + tid * 4;
+            if (i_0_7 < vocab) {
+                float _vec_load_25[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_7);
+                    _vec_load_25[0 + 0] = _v4.x;
+                    _vec_load_25[0 + 1] = _v4.y;
+                    _vec_load_25[0 + 2] = _v4.z;
+                    _vec_load_25[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_25[0];
+                vals_a[5] = _vec_load_25[1];
+                vals_a[6] = _vec_load_25[2];
+                vals_a[7] = _vec_load_25[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_8 = start + 4096 + tid * 4;
+            if (i_1_8 < vocab) {
+                float _vec_load_26[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_8);
+                    _vec_load_26[0 + 0] = _v4.x;
+                    _vec_load_26[0 + 1] = _v4.y;
+                    _vec_load_26[0 + 2] = _v4.z;
+                    _vec_load_26[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_26[0];
+                vals_a[9] = _vec_load_26[1];
+                vals_a[10] = _vec_load_26[2];
+                vals_a[11] = _vec_load_26[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_8 = start + 6144 + tid * 4;
+            if (i_2_8 < vocab) {
+                float _vec_load_27[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_8);
+                    _vec_load_27[0 + 0] = _v4.x;
+                    _vec_load_27[0 + 1] = _v4.y;
+                    _vec_load_27[0 + 2] = _v4.z;
+                    _vec_load_27[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_27[0];
+                vals_a[13] = _vec_load_27[1];
+                vals_a[14] = _vec_load_27[2];
+                vals_a[15] = _vec_load_27[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_20 = start + tid;
+            if (i2_20 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_20];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_6 = start + 512 + tid;
+            if (i2_0_6 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_6];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_6 = start + 1024 + tid;
+            if (i2_1_6 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_6];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_6 = start + 1536 + tid;
+            if (i2_2_6 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_6];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_6 = start + 2048 + tid;
+            if (i2_3_6 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_6];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_6 = start + 2560 + tid;
+            if (i2_4_6 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_6];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_6 = start + 3072 + tid;
+            if (i2_5_6 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_6];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_6 = start + 3584 + tid;
+            if (i2_6_6 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_6];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_6 = start + 4096 + tid;
+            if (i2_7_6 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_6];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_6 = start + 4608 + tid;
+            if (i2_8_6 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_6];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_6 = start + 5120 + tid;
+            if (i2_9_6 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_6];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_6 = start + 5632 + tid;
+            if (i2_10_6 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_6];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_6 = start + 6144 + tid;
+            if (i2_11_6 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_6];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_6 = start + 6656 + tid;
+            if (i2_12_6 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_6];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_6 = start + 7168 + tid;
+            if (i2_13_6 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_6];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_6 = start + 7680 + tid;
+            if (i2_14_6 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_6];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_3 = 0; c_3 < nch_stream; c_3 += 2) {
+        if (nch_stream > c_3 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_11 = start + (c_3 + 1) * 8192 + tid * 4;
+                if (i_11 < vocab) {
+                    float _vec_load_28[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_11);
+                        _vec_load_28[0 + 0] = _v4.x;
+                        _vec_load_28[0 + 1] = _v4.y;
+                        _vec_load_28[0 + 2] = _v4.z;
+                        _vec_load_28[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_28[0];
+                    vals_b[1] = _vec_load_28[1];
+                    vals_b[2] = _vec_load_28[2];
+                    vals_b[3] = _vec_load_28[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_8 = start + (c_3 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_8 < vocab) {
+                    float _vec_load_29[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_8);
+                        _vec_load_29[0 + 0] = _v4.x;
+                        _vec_load_29[0 + 1] = _v4.y;
+                        _vec_load_29[0 + 2] = _v4.z;
+                        _vec_load_29[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_29[0];
+                    vals_b[5] = _vec_load_29[1];
+                    vals_b[6] = _vec_load_29[2];
+                    vals_b[7] = _vec_load_29[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_9 = start + (c_3 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_9 < vocab) {
+                    float _vec_load_30[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_9);
+                        _vec_load_30[0 + 0] = _v4.x;
+                        _vec_load_30[0 + 1] = _v4.y;
+                        _vec_load_30[0 + 2] = _v4.z;
+                        _vec_load_30[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_30[0];
+                    vals_b[9] = _vec_load_30[1];
+                    vals_b[10] = _vec_load_30[2];
+                    vals_b[11] = _vec_load_30[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_9 = start + (c_3 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_9 < vocab) {
+                    float _vec_load_31[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_9);
+                        _vec_load_31[0 + 0] = _v4.x;
+                        _vec_load_31[0 + 1] = _v4.y;
+                        _vec_load_31[0 + 2] = _v4.z;
+                        _vec_load_31[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_31[0];
+                    vals_b[13] = _vec_load_31[1];
+                    vals_b[14] = _vec_load_31[2];
+                    vals_b[15] = _vec_load_31[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_21 = start + (c_3 + 1) * 8192 + tid;
+                if (i2_21 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_21];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_7 = start + (c_3 + 1) * 8192 + 512 + tid;
+                if (i2_0_7 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_7];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_7 = start + (c_3 + 1) * 8192 + 1024 + tid;
+                if (i2_1_7 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_7];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_7 = start + (c_3 + 1) * 8192 + 1536 + tid;
+                if (i2_2_7 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_7];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_7 = start + (c_3 + 1) * 8192 + 2048 + tid;
+                if (i2_3_7 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_7];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_7 = start + (c_3 + 1) * 8192 + 2560 + tid;
+                if (i2_4_7 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_7];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_7 = start + (c_3 + 1) * 8192 + 3072 + tid;
+                if (i2_5_7 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_7];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_7 = start + (c_3 + 1) * 8192 + 3584 + tid;
+                if (i2_6_7 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_7];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_7 = start + (c_3 + 1) * 8192 + 4096 + tid;
+                if (i2_7_7 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_7];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_7 = start + (c_3 + 1) * 8192 + 4608 + tid;
+                if (i2_8_7 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_7];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_7 = start + (c_3 + 1) * 8192 + 5120 + tid;
+                if (i2_9_7 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_7];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_7 = start + (c_3 + 1) * 8192 + 5632 + tid;
+                if (i2_10_7 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_7];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_7 = start + (c_3 + 1) * 8192 + 6144 + tid;
+                if (i2_11_7 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_7];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_7 = start + (c_3 + 1) * 8192 + 6656 + tid;
+                if (i2_12_7 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_7];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_7 = start + (c_3 + 1) * 8192 + 7168 + tid;
+                if (i2_13_7 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_7];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_7 = start + (c_3 + 1) * 8192 + 7680 + tid;
+                if (i2_14_7 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_7];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_14 = __as_u32(vals_a[0]);
+        unsigned int key_15 = ((bits_14 <= 2139095040) ? bits_14 : 0);
+        unsigned int bucket_10 = key_15 >> 10 & 2047;
+        if (key_15 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_10], 1);
+        }
+        unsigned int bits_0_1 = __as_u32(vals_a[1]);
+        unsigned int key_1_2 = ((bits_0_1 <= 2139095040) ? bits_0_1 : 0);
+        unsigned int bucket_2_2 = key_1_2 >> 10 & 2047;
+        if (key_1_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_2_2], 1);
+        }
+        unsigned int bits_3_2 = __as_u32(vals_a[2]);
+        unsigned int key_4_2 = ((bits_3_2 <= 2139095040) ? bits_3_2 : 0);
+        unsigned int bucket_5_1 = key_4_2 >> 10 & 2047;
+        if (key_4_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_5_1], 1);
+        }
+        unsigned int bits_6_2 = __as_u32(vals_a[3]);
+        unsigned int key_7_2 = ((bits_6_2 <= 2139095040) ? bits_6_2 : 0);
+        unsigned int bucket_8_1 = key_7_2 >> 10 & 2047;
+        if (key_7_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_8_1], 1);
+        }
+        unsigned int bits_9_1 = __as_u32(vals_a[4]);
+        unsigned int key_10_1 = ((bits_9_1 <= 2139095040) ? bits_9_1 : 0);
+        unsigned int bucket_11_1 = key_10_1 >> 10 & 2047;
+        if (key_10_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_11_1], 1);
+        }
+        unsigned int bits_12_1 = __as_u32(vals_a[5]);
+        unsigned int key_13_1 = ((bits_12_1 <= 2139095040) ? bits_12_1 : 0);
+        unsigned int bucket_14_1 = key_13_1 >> 10 & 2047;
+        if (key_13_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_14_1], 1);
+        }
+        unsigned int bits_15_1 = __as_u32(vals_a[6]);
+        unsigned int key_16_1 = ((bits_15_1 <= 2139095040) ? bits_15_1 : 0);
+        unsigned int bucket_17_1 = key_16_1 >> 10 & 2047;
+        if (key_16_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_17_1], 1);
+        }
+        unsigned int bits_18_2 = __as_u32(vals_a[7]);
+        unsigned int key_19_2 = ((bits_18_2 <= 2139095040) ? bits_18_2 : 0);
+        unsigned int bucket_20_1 = key_19_2 >> 10 & 2047;
+        if (key_19_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_20_1], 1);
+        }
+        unsigned int bits_21_1 = __as_u32(vals_a[8]);
+        unsigned int key_22_1 = ((bits_21_1 <= 2139095040) ? bits_21_1 : 0);
+        unsigned int bucket_23_1 = key_22_1 >> 10 & 2047;
+        if (key_22_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_23_1], 1);
+        }
+        unsigned int bits_24_2 = __as_u32(vals_a[9]);
+        unsigned int key_25_2 = ((bits_24_2 <= 2139095040) ? bits_24_2 : 0);
+        unsigned int bucket_26_1 = key_25_2 >> 10 & 2047;
+        if (key_25_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_26_1], 1);
+        }
+        unsigned int bits_27_1 = __as_u32(vals_a[10]);
+        unsigned int key_28_1 = ((bits_27_1 <= 2139095040) ? bits_27_1 : 0);
+        unsigned int bucket_29_1 = key_28_1 >> 10 & 2047;
+        if (key_28_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_29_1], 1);
+        }
+        unsigned int bits_30_1 = __as_u32(vals_a[11]);
+        unsigned int key_31_1 = ((bits_30_1 <= 2139095040) ? bits_30_1 : 0);
+        unsigned int bucket_32_1 = key_31_1 >> 10 & 2047;
+        if (key_31_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_32_1], 1);
+        }
+        unsigned int bits_33_1 = __as_u32(vals_a[12]);
+        unsigned int key_34_1 = ((bits_33_1 <= 2139095040) ? bits_33_1 : 0);
+        unsigned int bucket_35_1 = key_34_1 >> 10 & 2047;
+        if (key_34_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_35_1], 1);
+        }
+        unsigned int bits_36_1 = __as_u32(vals_a[13]);
+        unsigned int key_37_1 = ((bits_36_1 <= 2139095040) ? bits_36_1 : 0);
+        unsigned int bucket_38_1 = key_37_1 >> 10 & 2047;
+        if (key_37_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_38_1], 1);
+        }
+        unsigned int bits_39_2 = __as_u32(vals_a[14]);
+        unsigned int key_40_2 = ((bits_39_2 <= 2139095040) ? bits_39_2 : 0);
+        unsigned int bucket_41_1 = key_40_2 >> 10 & 2047;
+        if (key_40_2 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_41_1], 1);
+        }
+        unsigned int bits_42_1 = __as_u32(vals_a[15]);
+        unsigned int key_43_1 = ((bits_42_1 <= 2139095040) ? bits_42_1 : 0);
+        unsigned int bucket_44_1 = key_43_1 >> 10 & 2047;
+        if (key_43_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_44_1], 1);
+        }
+        if (nch_stream > c_3 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_12 = start + (c_3 + 2) * 8192 + tid * 4;
+                if (i_12 < vocab) {
+                    float _vec_load_32[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_12);
+                        _vec_load_32[0 + 0] = _v4.x;
+                        _vec_load_32[0 + 1] = _v4.y;
+                        _vec_load_32[0 + 2] = _v4.z;
+                        _vec_load_32[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_32[0];
+                    vals_a[1] = _vec_load_32[1];
+                    vals_a[2] = _vec_load_32[2];
+                    vals_a[3] = _vec_load_32[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_9 = start + (c_3 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_9 < vocab) {
+                    float _vec_load_33[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_9);
+                        _vec_load_33[0 + 0] = _v4.x;
+                        _vec_load_33[0 + 1] = _v4.y;
+                        _vec_load_33[0 + 2] = _v4.z;
+                        _vec_load_33[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_33[0];
+                    vals_a[5] = _vec_load_33[1];
+                    vals_a[6] = _vec_load_33[2];
+                    vals_a[7] = _vec_load_33[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_10 = start + (c_3 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_10 < vocab) {
+                    float _vec_load_34[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_10);
+                        _vec_load_34[0 + 0] = _v4.x;
+                        _vec_load_34[0 + 1] = _v4.y;
+                        _vec_load_34[0 + 2] = _v4.z;
+                        _vec_load_34[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_34[0];
+                    vals_a[9] = _vec_load_34[1];
+                    vals_a[10] = _vec_load_34[2];
+                    vals_a[11] = _vec_load_34[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_10 = start + (c_3 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_10 < vocab) {
+                    float _vec_load_35[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_10);
+                        _vec_load_35[0 + 0] = _v4.x;
+                        _vec_load_35[0 + 1] = _v4.y;
+                        _vec_load_35[0 + 2] = _v4.z;
+                        _vec_load_35[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_35[0];
+                    vals_a[13] = _vec_load_35[1];
+                    vals_a[14] = _vec_load_35[2];
+                    vals_a[15] = _vec_load_35[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_22 = start + (c_3 + 2) * 8192 + tid;
+                if (i2_22 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_22];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_8 = start + (c_3 + 2) * 8192 + 512 + tid;
+                if (i2_0_8 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_8];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_8 = start + (c_3 + 2) * 8192 + 1024 + tid;
+                if (i2_1_8 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_8];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_8 = start + (c_3 + 2) * 8192 + 1536 + tid;
+                if (i2_2_8 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_8];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_8 = start + (c_3 + 2) * 8192 + 2048 + tid;
+                if (i2_3_8 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_8];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_8 = start + (c_3 + 2) * 8192 + 2560 + tid;
+                if (i2_4_8 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_8];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_8 = start + (c_3 + 2) * 8192 + 3072 + tid;
+                if (i2_5_8 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_8];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_8 = start + (c_3 + 2) * 8192 + 3584 + tid;
+                if (i2_6_8 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_8];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_8 = start + (c_3 + 2) * 8192 + 4096 + tid;
+                if (i2_7_8 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_8];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_8 = start + (c_3 + 2) * 8192 + 4608 + tid;
+                if (i2_8_8 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_8];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_8 = start + (c_3 + 2) * 8192 + 5120 + tid;
+                if (i2_9_8 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_8];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_8 = start + (c_3 + 2) * 8192 + 5632 + tid;
+                if (i2_10_8 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_8];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_8 = start + (c_3 + 2) * 8192 + 6144 + tid;
+                if (i2_11_8 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_8];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_8 = start + (c_3 + 2) * 8192 + 6656 + tid;
+                if (i2_12_8 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_8];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_8 = start + (c_3 + 2) * 8192 + 7168 + tid;
+                if (i2_13_8 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_8];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_8 = start + (c_3 + 2) * 8192 + 7680 + tid;
+                if (i2_14_8 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_8];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_3 + 1) {
+            unsigned int bits_1_3 = __as_u32(vals_b[0]);
+            unsigned int key_2_3 = ((bits_1_3 <= 2139095040) ? bits_1_3 : 0);
+            unsigned int bucket_3_2 = key_2_3 >> 10 & 2047;
+            if (key_2_3 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_3_2], 1);
+            }
+            unsigned int bits_4_2 = __as_u32(vals_b[1]);
+            unsigned int key_5_2 = ((bits_4_2 <= 2139095040) ? bits_4_2 : 0);
+            unsigned int bucket_6_1 = key_5_2 >> 10 & 2047;
+            if (key_5_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_6_1], 1);
+            }
+            unsigned int bits_7_1 = __as_u32(vals_b[2]);
+            unsigned int key_8_1 = ((bits_7_1 <= 2139095040) ? bits_7_1 : 0);
+            unsigned int bucket_9_1 = key_8_1 >> 10 & 2047;
+            if (key_8_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_9_1], 1);
+            }
+            unsigned int bits_10_1 = __as_u32(vals_b[3]);
+            unsigned int key_11_1 = ((bits_10_1 <= 2139095040) ? bits_10_1 : 0);
+            unsigned int bucket_12_1 = key_11_1 >> 10 & 2047;
+            if (key_11_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_12_1], 1);
+            }
+            unsigned int bits_13_2 = __as_u32(vals_b[4]);
+            unsigned int key_14_2 = ((bits_13_2 <= 2139095040) ? bits_13_2 : 0);
+            unsigned int bucket_15_1 = key_14_2 >> 10 & 2047;
+            if (key_14_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_15_1], 1);
+            }
+            unsigned int bits_16_1 = __as_u32(vals_b[5]);
+            unsigned int key_17_1 = ((bits_16_1 <= 2139095040) ? bits_16_1 : 0);
+            unsigned int bucket_18_1 = key_17_1 >> 10 & 2047;
+            if (key_17_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_18_1], 1);
+            }
+            unsigned int bits_19_1 = __as_u32(vals_b[6]);
+            unsigned int key_20_1 = ((bits_19_1 <= 2139095040) ? bits_19_1 : 0);
+            unsigned int bucket_21_1 = key_20_1 >> 10 & 2047;
+            if (key_20_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_21_1], 1);
+            }
+            unsigned int bits_22_1 = __as_u32(vals_b[7]);
+            unsigned int key_23_1 = ((bits_22_1 <= 2139095040) ? bits_22_1 : 0);
+            unsigned int bucket_24_1 = key_23_1 >> 10 & 2047;
+            if (key_23_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_24_1], 1);
+            }
+            unsigned int bits_25_1 = __as_u32(vals_b[8]);
+            unsigned int key_26_1 = ((bits_25_1 <= 2139095040) ? bits_25_1 : 0);
+            unsigned int bucket_27_1 = key_26_1 >> 10 & 2047;
+            if (key_26_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_27_1], 1);
+            }
+            unsigned int bits_28_1 = __as_u32(vals_b[9]);
+            unsigned int key_29_1 = ((bits_28_1 <= 2139095040) ? bits_28_1 : 0);
+            unsigned int bucket_30_1 = key_29_1 >> 10 & 2047;
+            if (key_29_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_30_1], 1);
+            }
+            unsigned int bits_31_1 = __as_u32(vals_b[10]);
+            unsigned int key_32_1 = ((bits_31_1 <= 2139095040) ? bits_31_1 : 0);
+            unsigned int bucket_33_1 = key_32_1 >> 10 & 2047;
+            if (key_32_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_33_1], 1);
+            }
+            unsigned int bits_34_2 = __as_u32(vals_b[11]);
+            unsigned int key_35_2 = ((bits_34_2 <= 2139095040) ? bits_34_2 : 0);
+            unsigned int bucket_36_1 = key_35_2 >> 10 & 2047;
+            if (key_35_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_36_1], 1);
+            }
+            unsigned int bits_37_1 = __as_u32(vals_b[12]);
+            unsigned int key_38_1 = ((bits_37_1 <= 2139095040) ? bits_37_1 : 0);
+            unsigned int bucket_39_1 = key_38_1 >> 10 & 2047;
+            if (key_38_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_39_1], 1);
+            }
+            unsigned int bits_40_1 = __as_u32(vals_b[13]);
+            unsigned int key_41_1 = ((bits_40_1 <= 2139095040) ? bits_40_1 : 0);
+            unsigned int bucket_42_1 = key_41_1 >> 10 & 2047;
+            if (key_41_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_42_1], 1);
+            }
+            unsigned int bits_43_2 = __as_u32(vals_b[14]);
+            unsigned int key_44_2 = ((bits_43_2 <= 2139095040) ? bits_43_2 : 0);
+            unsigned int bucket_45_1 = key_44_2 >> 10 & 2047;
+            if (key_44_2 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_45_1], 1);
+            }
+            unsigned int bits_46_1 = __as_u32(vals_b[15]);
+            unsigned int key_47_1 = ((bits_46_1 <= 2139095040) ? bits_46_1 : 0);
+            unsigned int bucket_48_1 = key_47_1 >> 10 & 2047;
+            if (key_47_1 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_48_1], 1);
+            }
+        }
+    }
+    int niter_44 = (int)(n_eff + 31 >> 5);
+    for (int j_1 = 0; j_1 < niter_44; j_1++) {
+        unsigned int e_1 = (unsigned int)(j_1 * 32 + lane);
+        if (e_1 < n_eff) {
+            unsigned int key_18 = lkeys[seg_base + j_1 * 32 + lane];
+            unsigned int bucket_13 = key_18 >> 10 & 2047;
+            if (key_18 >> 21 == prefix) {
+                atomicAdd(&hist1[bucket_13], 1);
+            }
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0_45 = 0;
+    unsigned int c1_46 = 0;
+    unsigned int c2_47 = 0;
+    unsigned int c3_48 = 0;
+    {
+        unsigned int words_4[4];
+        uint32_t _mapa_10;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_10) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 3]))
+            : "r"(_mapa_10));
+        c0_45 = c0_45 + words_4[0];
+        c1_46 = c1_46 + words_4[1];
+        c2_47 = c2_47 + words_4[2];
+        c3_48 = c3_48 + words_4[3];
+        unsigned int words_0_2[4];
+        uint32_t _mapa_11;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_11) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_2[(0) + 3]))
+            : "r"(_mapa_11));
+        c0_45 = c0_45 + words_0_2[0];
+        c1_46 = c1_46 + words_0_2[1];
+        c2_47 = c2_47 + words_0_2[2];
+        c3_48 = c3_48 + words_0_2[3];
+        unsigned int words_1_2[4];
+        uint32_t _mapa_12;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_12) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_2[(0) + 3]))
+            : "r"(_mapa_12));
+        c0_45 = c0_45 + words_1_2[0];
+        c1_46 = c1_46 + words_1_2[1];
+        c2_47 = c2_47 + words_1_2[2];
+        c3_48 = c3_48 + words_1_2[3];
+        unsigned int words_2_2[4];
+        uint32_t _mapa_13;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_13) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_2[(0) + 3]))
+            : "r"(_mapa_13));
+        c0_45 = c0_45 + words_2_2[0];
+        c1_46 = c1_46 + words_2_2[1];
+        c2_47 = c2_47 + words_2_2[2];
+        c3_48 = c3_48 + words_2_2[3];
+    }
+    unsigned int local_49 = c0_45 + c1_46 + c2_47 + c3_48;
+    uint32_t _warp_scan_sum_u32_3 = local_49;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_3) : "r"(16));
+    unsigned int lane_suffix_50 = _warp_scan_sum_u32_3 - local_49;
+    unsigned int _warp_redux_u32_4;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_4) : "r"(local_49));
+    unsigned int warp_total_51 = _warp_redux_u32_4;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_51;
+    }
+    __syncthreads();
+    unsigned int peer_52 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_53 = ((lane > warp) ? peer_52 : 0);
+    unsigned int _warp_redux_u32_5;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_5) : "r"(above_53));
+    unsigned int warps_above_54 = _warp_redux_u32_5;
+    unsigned int suffix_55 = lane_suffix_50 + warps_above_54;
+    if (suffix_55 < remaining && remaining <= suffix_55 + local_49) {
+        unsigned int s3_1 = suffix_55 + c3_48;
+        unsigned int s2_1 = s3_1 + c2_47;
+        unsigned int s1_1 = s2_1 + c1_46;
+        if (remaining <= s3_1) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_55;
+        } else if (remaining <= s2_1) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3_1;
+        } else {
+            if (remaining <= s1_1) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2_1;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1_1;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel_56 = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 11 | bucket_sel_56;
+    unsigned int b0_57 = (unsigned int)(tid * 4);
+    unsigned int h0_58 = hist1[tid * 4];
+    unsigned int h1_59 = hist1[tid * 4 + 1];
+    unsigned int h2_60 = hist1[tid * 4 + 2];
+    unsigned int h3_61 = hist1[tid * 4 + 3];
+    unsigned int above_62 = 0;
+    unsigned int own_63 = 0;
+    if (b0_57 > bucket_sel_56) {
+        above_62 = above_62 + h0_58;
+    }
+    if (bucket_sel_56 < b0_57 + 1) {
+        above_62 = above_62 + h1_59;
+    }
+    if (bucket_sel_56 < b0_57 + 2) {
+        above_62 = above_62 + h2_60;
+    }
+    if (bucket_sel_56 < b0_57 + 3) {
+        above_62 = above_62 + h3_61;
+    }
+    if (b0_57 == bucket_sel_56) {
+        own_63 = h0_58;
+    }
+    if (b0_57 + 1 == bucket_sel_56) {
+        own_63 = h1_59;
+    }
+    if (b0_57 + 2 == bucket_sel_56) {
+        own_63 = h2_60;
+    }
+    if (b0_57 + 3 == bucket_sel_56) {
+        own_63 = h3_61;
+    }
+    uint32_t _warp_scan_sum_u32_4 = above_62;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_4) : "r"(16));
+    unsigned int incl_64 = _warp_scan_sum_u32_4;
+    if (lane == 31) {
+        warp_sums[warp] = incl_64;
+    }
+    __syncthreads();
+    unsigned int before_65 = 0;
+    unsigned int total_66 = 0;
+    unsigned int ws_67 = warp_sums[0];
+    total_66 = total_66 + ws_67;
+    if (warp > 0) {
+        before_65 = before_65 + ws_67;
+    }
+    unsigned int ws_68 = warp_sums[1];
+    total_66 = total_66 + ws_68;
+    if (warp > 1) {
+        before_65 = before_65 + ws_68;
+    }
+    unsigned int ws_69 = warp_sums[2];
+    total_66 = total_66 + ws_69;
+    if (warp > 2) {
+        before_65 = before_65 + ws_69;
+    }
+    unsigned int ws_70 = warp_sums[3];
+    total_66 = total_66 + ws_70;
+    if (warp > 3) {
+        before_65 = before_65 + ws_70;
+    }
+    unsigned int ws_71 = warp_sums[4];
+    total_66 = total_66 + ws_71;
+    if (warp > 4) {
+        before_65 = before_65 + ws_71;
+    }
+    unsigned int ws_72 = warp_sums[5];
+    total_66 = total_66 + ws_72;
+    if (warp > 5) {
+        before_65 = before_65 + ws_72;
+    }
+    unsigned int ws_73 = warp_sums[6];
+    total_66 = total_66 + ws_73;
+    if (warp > 6) {
+        before_65 = before_65 + ws_73;
+    }
+    unsigned int ws_74 = warp_sums[7];
+    total_66 = total_66 + ws_74;
+    if (warp > 7) {
+        before_65 = before_65 + ws_74;
+    }
+    unsigned int ws_75 = warp_sums[8];
+    total_66 = total_66 + ws_75;
+    if (warp > 8) {
+        before_65 = before_65 + ws_75;
+    }
+    unsigned int ws_76 = warp_sums[9];
+    total_66 = total_66 + ws_76;
+    if (warp > 9) {
+        before_65 = before_65 + ws_76;
+    }
+    unsigned int ws_77 = warp_sums[10];
+    total_66 = total_66 + ws_77;
+    if (warp > 10) {
+        before_65 = before_65 + ws_77;
+    }
+    unsigned int ws_78 = warp_sums[11];
+    total_66 = total_66 + ws_78;
+    if (warp > 11) {
+        before_65 = before_65 + ws_78;
+    }
+    unsigned int ws_79 = warp_sums[12];
+    total_66 = total_66 + ws_79;
+    if (warp > 12) {
+        before_65 = before_65 + ws_79;
+    }
+    unsigned int ws_80 = warp_sums[13];
+    total_66 = total_66 + ws_80;
+    if (warp > 13) {
+        before_65 = before_65 + ws_80;
+    }
+    unsigned int ws_81 = warp_sums[14];
+    total_66 = total_66 + ws_81;
+    if (warp > 14) {
+        before_65 = before_65 + ws_81;
+    }
+    unsigned int ws_82 = warp_sums[15];
+    total_66 = total_66 + ws_82;
+    if (warp > 15) {
+        before_65 = before_65 + ws_82;
+    }
+    unsigned int excl_83 = before_65 + incl_64 - above_62;
+    __syncthreads();
+    gt_local = gt_local + total_66;
+    {
+        for (int i_13 = tid; i_13 < 2048; i_13 += 512) {
+            hist0[i_13] = 0;
+        }
+        __syncthreads();
+    }
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_14 = start + tid * 4;
+            if (i_14 < vocab) {
+                float _vec_load_36[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_14);
+                    _vec_load_36[0 + 0] = _v4.x;
+                    _vec_load_36[0 + 1] = _v4.y;
+                    _vec_load_36[0 + 2] = _v4.z;
+                    _vec_load_36[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_36[0];
+                vals_a[1] = _vec_load_36[1];
+                vals_a[2] = _vec_load_36[2];
+                vals_a[3] = _vec_load_36[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_10 = start + 2048 + tid * 4;
+            if (i_0_10 < vocab) {
+                float _vec_load_37[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_10);
+                    _vec_load_37[0 + 0] = _v4.x;
+                    _vec_load_37[0 + 1] = _v4.y;
+                    _vec_load_37[0 + 2] = _v4.z;
+                    _vec_load_37[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_37[0];
+                vals_a[5] = _vec_load_37[1];
+                vals_a[6] = _vec_load_37[2];
+                vals_a[7] = _vec_load_37[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_11 = start + 4096 + tid * 4;
+            if (i_1_11 < vocab) {
+                float _vec_load_38[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_11);
+                    _vec_load_38[0 + 0] = _v4.x;
+                    _vec_load_38[0 + 1] = _v4.y;
+                    _vec_load_38[0 + 2] = _v4.z;
+                    _vec_load_38[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_38[0];
+                vals_a[9] = _vec_load_38[1];
+                vals_a[10] = _vec_load_38[2];
+                vals_a[11] = _vec_load_38[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_11 = start + 6144 + tid * 4;
+            if (i_2_11 < vocab) {
+                float _vec_load_39[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_11);
+                    _vec_load_39[0 + 0] = _v4.x;
+                    _vec_load_39[0 + 1] = _v4.y;
+                    _vec_load_39[0 + 2] = _v4.z;
+                    _vec_load_39[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_39[0];
+                vals_a[13] = _vec_load_39[1];
+                vals_a[14] = _vec_load_39[2];
+                vals_a[15] = _vec_load_39[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_23 = start + tid;
+            if (i2_23 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_23];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_9 = start + 512 + tid;
+            if (i2_0_9 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_9];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_9 = start + 1024 + tid;
+            if (i2_1_9 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_9];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_9 = start + 1536 + tid;
+            if (i2_2_9 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_9];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_9 = start + 2048 + tid;
+            if (i2_3_9 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_9];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_9 = start + 2560 + tid;
+            if (i2_4_9 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_9];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_9 = start + 3072 + tid;
+            if (i2_5_9 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_9];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_9 = start + 3584 + tid;
+            if (i2_6_9 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_9];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_9 = start + 4096 + tid;
+            if (i2_7_9 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_9];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_9 = start + 4608 + tid;
+            if (i2_8_9 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_9];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_9 = start + 5120 + tid;
+            if (i2_9_9 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_9];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_9 = start + 5632 + tid;
+            if (i2_10_9 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_9];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_9 = start + 6144 + tid;
+            if (i2_11_9 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_9];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_9 = start + 6656 + tid;
+            if (i2_12_9 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_9];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_9 = start + 7168 + tid;
+            if (i2_13_9 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_9];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_9 = start + 7680 + tid;
+            if (i2_14_9 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_9];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_4 = 0; c_4 < nch_stream; c_4 += 2) {
+        if (nch_stream > c_4 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_15 = start + (c_4 + 1) * 8192 + tid * 4;
+                if (i_15 < vocab) {
+                    float _vec_load_40[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_15);
+                        _vec_load_40[0 + 0] = _v4.x;
+                        _vec_load_40[0 + 1] = _v4.y;
+                        _vec_load_40[0 + 2] = _v4.z;
+                        _vec_load_40[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_40[0];
+                    vals_b[1] = _vec_load_40[1];
+                    vals_b[2] = _vec_load_40[2];
+                    vals_b[3] = _vec_load_40[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_11 = start + (c_4 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_11 < vocab) {
+                    float _vec_load_41[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_11);
+                        _vec_load_41[0 + 0] = _v4.x;
+                        _vec_load_41[0 + 1] = _v4.y;
+                        _vec_load_41[0 + 2] = _v4.z;
+                        _vec_load_41[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_41[0];
+                    vals_b[5] = _vec_load_41[1];
+                    vals_b[6] = _vec_load_41[2];
+                    vals_b[7] = _vec_load_41[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_12 = start + (c_4 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_12 < vocab) {
+                    float _vec_load_42[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_12);
+                        _vec_load_42[0 + 0] = _v4.x;
+                        _vec_load_42[0 + 1] = _v4.y;
+                        _vec_load_42[0 + 2] = _v4.z;
+                        _vec_load_42[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_42[0];
+                    vals_b[9] = _vec_load_42[1];
+                    vals_b[10] = _vec_load_42[2];
+                    vals_b[11] = _vec_load_42[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_12 = start + (c_4 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_12 < vocab) {
+                    float _vec_load_43[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_12);
+                        _vec_load_43[0 + 0] = _v4.x;
+                        _vec_load_43[0 + 1] = _v4.y;
+                        _vec_load_43[0 + 2] = _v4.z;
+                        _vec_load_43[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_43[0];
+                    vals_b[13] = _vec_load_43[1];
+                    vals_b[14] = _vec_load_43[2];
+                    vals_b[15] = _vec_load_43[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_24 = start + (c_4 + 1) * 8192 + tid;
+                if (i2_24 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_24];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_10 = start + (c_4 + 1) * 8192 + 512 + tid;
+                if (i2_0_10 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_10];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_10 = start + (c_4 + 1) * 8192 + 1024 + tid;
+                if (i2_1_10 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_10];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_10 = start + (c_4 + 1) * 8192 + 1536 + tid;
+                if (i2_2_10 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_10];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_10 = start + (c_4 + 1) * 8192 + 2048 + tid;
+                if (i2_3_10 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_10];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_10 = start + (c_4 + 1) * 8192 + 2560 + tid;
+                if (i2_4_10 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_10];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_10 = start + (c_4 + 1) * 8192 + 3072 + tid;
+                if (i2_5_10 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_10];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_10 = start + (c_4 + 1) * 8192 + 3584 + tid;
+                if (i2_6_10 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_10];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_10 = start + (c_4 + 1) * 8192 + 4096 + tid;
+                if (i2_7_10 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_10];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_10 = start + (c_4 + 1) * 8192 + 4608 + tid;
+                if (i2_8_10 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_10];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_10 = start + (c_4 + 1) * 8192 + 5120 + tid;
+                if (i2_9_10 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_10];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_10 = start + (c_4 + 1) * 8192 + 5632 + tid;
+                if (i2_10_10 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_10];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_10 = start + (c_4 + 1) * 8192 + 6144 + tid;
+                if (i2_11_10 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_10];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_10 = start + (c_4 + 1) * 8192 + 6656 + tid;
+                if (i2_12_10 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_10];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_10 = start + (c_4 + 1) * 8192 + 7168 + tid;
+                if (i2_13_10 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_10];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_10 = start + (c_4 + 1) * 8192 + 7680 + tid;
+                if (i2_14_10 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_10];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int bits_17 = __as_u32(vals_a[0]);
+        unsigned int key_21 = ((bits_17 <= 2139095040) ? bits_17 : 0);
+        unsigned int bucket_16 = key_21 & 1023;
+        if (key_21 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_16], 1);
+        }
+        unsigned int bits_0_2 = __as_u32(vals_a[1]);
+        unsigned int key_1_3 = ((bits_0_2 <= 2139095040) ? bits_0_2 : 0);
+        unsigned int bucket_2_3 = key_1_3 & 1023;
+        if (key_1_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_2_3], 1);
+        }
+        unsigned int bits_3_3 = __as_u32(vals_a[2]);
+        unsigned int key_4_3 = ((bits_3_3 <= 2139095040) ? bits_3_3 : 0);
+        unsigned int bucket_5_2 = key_4_3 & 1023;
+        if (key_4_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_5_2], 1);
+        }
+        unsigned int bits_6_3 = __as_u32(vals_a[3]);
+        unsigned int key_7_3 = ((bits_6_3 <= 2139095040) ? bits_6_3 : 0);
+        unsigned int bucket_8_2 = key_7_3 & 1023;
+        if (key_7_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_8_2], 1);
+        }
+        unsigned int bits_9_2 = __as_u32(vals_a[4]);
+        unsigned int key_10_2 = ((bits_9_2 <= 2139095040) ? bits_9_2 : 0);
+        unsigned int bucket_11_2 = key_10_2 & 1023;
+        if (key_10_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_11_2], 1);
+        }
+        unsigned int bits_12_2 = __as_u32(vals_a[5]);
+        unsigned int key_13_2 = ((bits_12_2 <= 2139095040) ? bits_12_2 : 0);
+        unsigned int bucket_14_2 = key_13_2 & 1023;
+        if (key_13_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_14_2], 1);
+        }
+        unsigned int bits_15_2 = __as_u32(vals_a[6]);
+        unsigned int key_16_2 = ((bits_15_2 <= 2139095040) ? bits_15_2 : 0);
+        unsigned int bucket_17_2 = key_16_2 & 1023;
+        if (key_16_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_17_2], 1);
+        }
+        unsigned int bits_18_3 = __as_u32(vals_a[7]);
+        unsigned int key_19_3 = ((bits_18_3 <= 2139095040) ? bits_18_3 : 0);
+        unsigned int bucket_20_2 = key_19_3 & 1023;
+        if (key_19_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_20_2], 1);
+        }
+        unsigned int bits_21_2 = __as_u32(vals_a[8]);
+        unsigned int key_22_2 = ((bits_21_2 <= 2139095040) ? bits_21_2 : 0);
+        unsigned int bucket_23_2 = key_22_2 & 1023;
+        if (key_22_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_23_2], 1);
+        }
+        unsigned int bits_24_3 = __as_u32(vals_a[9]);
+        unsigned int key_25_3 = ((bits_24_3 <= 2139095040) ? bits_24_3 : 0);
+        unsigned int bucket_26_2 = key_25_3 & 1023;
+        if (key_25_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_26_2], 1);
+        }
+        unsigned int bits_27_2 = __as_u32(vals_a[10]);
+        unsigned int key_28_2 = ((bits_27_2 <= 2139095040) ? bits_27_2 : 0);
+        unsigned int bucket_29_2 = key_28_2 & 1023;
+        if (key_28_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_29_2], 1);
+        }
+        unsigned int bits_30_2 = __as_u32(vals_a[11]);
+        unsigned int key_31_2 = ((bits_30_2 <= 2139095040) ? bits_30_2 : 0);
+        unsigned int bucket_32_2 = key_31_2 & 1023;
+        if (key_31_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_32_2], 1);
+        }
+        unsigned int bits_33_2 = __as_u32(vals_a[12]);
+        unsigned int key_34_2 = ((bits_33_2 <= 2139095040) ? bits_33_2 : 0);
+        unsigned int bucket_35_2 = key_34_2 & 1023;
+        if (key_34_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_35_2], 1);
+        }
+        unsigned int bits_36_2 = __as_u32(vals_a[13]);
+        unsigned int key_37_2 = ((bits_36_2 <= 2139095040) ? bits_36_2 : 0);
+        unsigned int bucket_38_2 = key_37_2 & 1023;
+        if (key_37_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_38_2], 1);
+        }
+        unsigned int bits_39_3 = __as_u32(vals_a[14]);
+        unsigned int key_40_3 = ((bits_39_3 <= 2139095040) ? bits_39_3 : 0);
+        unsigned int bucket_41_2 = key_40_3 & 1023;
+        if (key_40_3 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_41_2], 1);
+        }
+        unsigned int bits_42_2 = __as_u32(vals_a[15]);
+        unsigned int key_43_2 = ((bits_42_2 <= 2139095040) ? bits_42_2 : 0);
+        unsigned int bucket_44_2 = key_43_2 & 1023;
+        if (key_43_2 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_44_2], 1);
+        }
+        if (nch_stream > c_4 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_16 = start + (c_4 + 2) * 8192 + tid * 4;
+                if (i_16 < vocab) {
+                    float _vec_load_44[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_16);
+                        _vec_load_44[0 + 0] = _v4.x;
+                        _vec_load_44[0 + 1] = _v4.y;
+                        _vec_load_44[0 + 2] = _v4.z;
+                        _vec_load_44[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_44[0];
+                    vals_a[1] = _vec_load_44[1];
+                    vals_a[2] = _vec_load_44[2];
+                    vals_a[3] = _vec_load_44[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_0_12 = start + (c_4 + 2) * 8192 + 2048 + tid * 4;
+                if (i_0_12 < vocab) {
+                    float _vec_load_45[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_12);
+                        _vec_load_45[0 + 0] = _v4.x;
+                        _vec_load_45[0 + 1] = _v4.y;
+                        _vec_load_45[0 + 2] = _v4.z;
+                        _vec_load_45[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_45[0];
+                    vals_a[5] = _vec_load_45[1];
+                    vals_a[6] = _vec_load_45[2];
+                    vals_a[7] = _vec_load_45[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_1_13 = start + (c_4 + 2) * 8192 + 4096 + tid * 4;
+                if (i_1_13 < vocab) {
+                    float _vec_load_46[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_13);
+                        _vec_load_46[0 + 0] = _v4.x;
+                        _vec_load_46[0 + 1] = _v4.y;
+                        _vec_load_46[0 + 2] = _v4.z;
+                        _vec_load_46[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_46[0];
+                    vals_a[9] = _vec_load_46[1];
+                    vals_a[10] = _vec_load_46[2];
+                    vals_a[11] = _vec_load_46[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_2_13 = start + (c_4 + 2) * 8192 + 6144 + tid * 4;
+                if (i_2_13 < vocab) {
+                    float _vec_load_47[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_13);
+                        _vec_load_47[0 + 0] = _v4.x;
+                        _vec_load_47[0 + 1] = _v4.y;
+                        _vec_load_47[0 + 2] = _v4.z;
+                        _vec_load_47[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_47[0];
+                    vals_a[13] = _vec_load_47[1];
+                    vals_a[14] = _vec_load_47[2];
+                    vals_a[15] = _vec_load_47[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_25 = start + (c_4 + 2) * 8192 + tid;
+                if (i2_25 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_25];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_11 = start + (c_4 + 2) * 8192 + 512 + tid;
+                if (i2_0_11 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_11];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_11 = start + (c_4 + 2) * 8192 + 1024 + tid;
+                if (i2_1_11 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_11];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_11 = start + (c_4 + 2) * 8192 + 1536 + tid;
+                if (i2_2_11 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_11];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_11 = start + (c_4 + 2) * 8192 + 2048 + tid;
+                if (i2_3_11 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_11];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_11 = start + (c_4 + 2) * 8192 + 2560 + tid;
+                if (i2_4_11 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_11];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_11 = start + (c_4 + 2) * 8192 + 3072 + tid;
+                if (i2_5_11 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_11];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_11 = start + (c_4 + 2) * 8192 + 3584 + tid;
+                if (i2_6_11 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_11];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_11 = start + (c_4 + 2) * 8192 + 4096 + tid;
+                if (i2_7_11 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_11];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_11 = start + (c_4 + 2) * 8192 + 4608 + tid;
+                if (i2_8_11 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_11];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_11 = start + (c_4 + 2) * 8192 + 5120 + tid;
+                if (i2_9_11 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_11];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_11 = start + (c_4 + 2) * 8192 + 5632 + tid;
+                if (i2_10_11 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_11];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_11 = start + (c_4 + 2) * 8192 + 6144 + tid;
+                if (i2_11_11 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_11];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_11 = start + (c_4 + 2) * 8192 + 6656 + tid;
+                if (i2_12_11 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_11];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_11 = start + (c_4 + 2) * 8192 + 7168 + tid;
+                if (i2_13_11 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_11];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_11 = start + (c_4 + 2) * 8192 + 7680 + tid;
+                if (i2_14_11 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_11];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_4 + 1) {
+            unsigned int bits_1_4 = __as_u32(vals_b[0]);
+            unsigned int key_2_4 = ((bits_1_4 <= 2139095040) ? bits_1_4 : 0);
+            unsigned int bucket_3_3 = key_2_4 & 1023;
+            if (key_2_4 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_3_3], 1);
+            }
+            unsigned int bits_4_3 = __as_u32(vals_b[1]);
+            unsigned int key_5_3 = ((bits_4_3 <= 2139095040) ? bits_4_3 : 0);
+            unsigned int bucket_6_2 = key_5_3 & 1023;
+            if (key_5_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_6_2], 1);
+            }
+            unsigned int bits_7_2 = __as_u32(vals_b[2]);
+            unsigned int key_8_2 = ((bits_7_2 <= 2139095040) ? bits_7_2 : 0);
+            unsigned int bucket_9_2 = key_8_2 & 1023;
+            if (key_8_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_9_2], 1);
+            }
+            unsigned int bits_10_2 = __as_u32(vals_b[3]);
+            unsigned int key_11_2 = ((bits_10_2 <= 2139095040) ? bits_10_2 : 0);
+            unsigned int bucket_12_2 = key_11_2 & 1023;
+            if (key_11_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_12_2], 1);
+            }
+            unsigned int bits_13_3 = __as_u32(vals_b[4]);
+            unsigned int key_14_3 = ((bits_13_3 <= 2139095040) ? bits_13_3 : 0);
+            unsigned int bucket_15_2 = key_14_3 & 1023;
+            if (key_14_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_15_2], 1);
+            }
+            unsigned int bits_16_2 = __as_u32(vals_b[5]);
+            unsigned int key_17_2 = ((bits_16_2 <= 2139095040) ? bits_16_2 : 0);
+            unsigned int bucket_18_2 = key_17_2 & 1023;
+            if (key_17_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_18_2], 1);
+            }
+            unsigned int bits_19_2 = __as_u32(vals_b[6]);
+            unsigned int key_20_2 = ((bits_19_2 <= 2139095040) ? bits_19_2 : 0);
+            unsigned int bucket_21_2 = key_20_2 & 1023;
+            if (key_20_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_21_2], 1);
+            }
+            unsigned int bits_22_2 = __as_u32(vals_b[7]);
+            unsigned int key_23_2 = ((bits_22_2 <= 2139095040) ? bits_22_2 : 0);
+            unsigned int bucket_24_2 = key_23_2 & 1023;
+            if (key_23_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_24_2], 1);
+            }
+            unsigned int bits_25_2 = __as_u32(vals_b[8]);
+            unsigned int key_26_2 = ((bits_25_2 <= 2139095040) ? bits_25_2 : 0);
+            unsigned int bucket_27_2 = key_26_2 & 1023;
+            if (key_26_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_27_2], 1);
+            }
+            unsigned int bits_28_2 = __as_u32(vals_b[9]);
+            unsigned int key_29_2 = ((bits_28_2 <= 2139095040) ? bits_28_2 : 0);
+            unsigned int bucket_30_2 = key_29_2 & 1023;
+            if (key_29_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_30_2], 1);
+            }
+            unsigned int bits_31_2 = __as_u32(vals_b[10]);
+            unsigned int key_32_2 = ((bits_31_2 <= 2139095040) ? bits_31_2 : 0);
+            unsigned int bucket_33_2 = key_32_2 & 1023;
+            if (key_32_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_33_2], 1);
+            }
+            unsigned int bits_34_3 = __as_u32(vals_b[11]);
+            unsigned int key_35_3 = ((bits_34_3 <= 2139095040) ? bits_34_3 : 0);
+            unsigned int bucket_36_2 = key_35_3 & 1023;
+            if (key_35_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_36_2], 1);
+            }
+            unsigned int bits_37_2 = __as_u32(vals_b[12]);
+            unsigned int key_38_2 = ((bits_37_2 <= 2139095040) ? bits_37_2 : 0);
+            unsigned int bucket_39_2 = key_38_2 & 1023;
+            if (key_38_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_39_2], 1);
+            }
+            unsigned int bits_40_2 = __as_u32(vals_b[13]);
+            unsigned int key_41_2 = ((bits_40_2 <= 2139095040) ? bits_40_2 : 0);
+            unsigned int bucket_42_2 = key_41_2 & 1023;
+            if (key_41_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_42_2], 1);
+            }
+            unsigned int bits_43_3 = __as_u32(vals_b[14]);
+            unsigned int key_44_3 = ((bits_43_3 <= 2139095040) ? bits_43_3 : 0);
+            unsigned int bucket_45_2 = key_44_3 & 1023;
+            if (key_44_3 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_45_2], 1);
+            }
+            unsigned int bits_46_2 = __as_u32(vals_b[15]);
+            unsigned int key_47_2 = ((bits_46_2 <= 2139095040) ? bits_46_2 : 0);
+            unsigned int bucket_48_2 = key_47_2 & 1023;
+            if (key_47_2 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_48_2], 1);
+            }
+        }
+    }
+    int niter_84 = (int)(n_eff + 31 >> 5);
+    for (int j_2 = 0; j_2 < niter_84; j_2++) {
+        unsigned int e_2 = (unsigned int)(j_2 * 32 + lane);
+        if (e_2 < n_eff) {
+            unsigned int key_27 = lkeys[seg_base + j_2 * 32 + lane];
+            unsigned int bucket_19 = key_27 & 1023;
+            if (key_27 >> 10 == prefix) {
+                atomicAdd(&hist0[bucket_19], 1);
+            }
+        }
+    }
+    __syncthreads();
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int c0_85 = 0;
+    unsigned int c1_86 = 0;
+    unsigned int c2_87 = 0;
+    unsigned int c3_88 = 0;
+    {
+        unsigned int words_5[4];
+        uint32_t _mapa_14;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_14) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 3]))
+            : "r"(_mapa_14));
+        c0_85 = c0_85 + words_5[0];
+        c1_86 = c1_86 + words_5[1];
+        c2_87 = c2_87 + words_5[2];
+        c3_88 = c3_88 + words_5[3];
+        unsigned int words_0_3[4];
+        uint32_t _mapa_15;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_15) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0_3[(0) + 3]))
+            : "r"(_mapa_15));
+        c0_85 = c0_85 + words_0_3[0];
+        c1_86 = c1_86 + words_0_3[1];
+        c2_87 = c2_87 + words_0_3[2];
+        c3_88 = c3_88 + words_0_3[3];
+        unsigned int words_1_3[4];
+        uint32_t _mapa_16;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_16) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1_3[(0) + 3]))
+            : "r"(_mapa_16));
+        c0_85 = c0_85 + words_1_3[0];
+        c1_86 = c1_86 + words_1_3[1];
+        c2_87 = c2_87 + words_1_3[2];
+        c3_88 = c3_88 + words_1_3[3];
+        unsigned int words_2_3[4];
+        uint32_t _mapa_17;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_17) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2_3[(0) + 3]))
+            : "r"(_mapa_17));
+        c0_85 = c0_85 + words_2_3[0];
+        c1_86 = c1_86 + words_2_3[1];
+        c2_87 = c2_87 + words_2_3[2];
+        c3_88 = c3_88 + words_2_3[3];
+    }
+    unsigned int local_89 = c0_85 + c1_86 + c2_87 + c3_88;
+    uint32_t _warp_scan_sum_u32_5 = local_89;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_5) : "r"(16));
+    unsigned int lane_suffix_90 = _warp_scan_sum_u32_5 - local_89;
+    unsigned int _warp_redux_u32_6;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_6) : "r"(local_89));
+    unsigned int warp_total_91 = _warp_redux_u32_6;
+    if (lane == 0) {
+        warp_sums[warp] = warp_total_91;
+    }
+    __syncthreads();
+    unsigned int peer_92 = ((lane < 16) ? warp_sums[lane] : 0);
+    unsigned int above_93 = ((lane > warp) ? peer_92 : 0);
+    unsigned int _warp_redux_u32_7;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_7) : "r"(above_93));
+    unsigned int warps_above_94 = _warp_redux_u32_7;
+    unsigned int suffix_95 = lane_suffix_90 + warps_above_94;
+    if (suffix_95 < remaining && remaining <= suffix_95 + local_89) {
+        unsigned int s3_2 = suffix_95 + c3_88;
+        unsigned int s2_2 = s3_2 + c2_87;
+        unsigned int s1_2 = s2_2 + c1_86;
+        if (remaining <= s3_2) {
+            scal[0] = (unsigned int)(tid * 4 + 3);
+            scal[1] = remaining - suffix_95;
+        } else if (remaining <= s2_2) {
+            scal[0] = (unsigned int)(tid * 4 + 2);
+            scal[1] = remaining - s3_2;
+        } else {
+            if (remaining <= s1_2) {
+                scal[0] = (unsigned int)(tid * 4 + 1);
+                scal[1] = remaining - s2_2;
+            } else {
+                scal[0] = (unsigned int)(tid * 4);
+                scal[1] = remaining - s1_2;
+            }
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel_96 = scal[0];
+    remaining = scal[1];
+    prefix = prefix << 10 | bucket_sel_96;
+    unsigned int b0_97 = (unsigned int)(tid * 4);
+    unsigned int h0_98 = hist0[tid * 4];
+    unsigned int h1_99 = hist0[tid * 4 + 1];
+    unsigned int h2_100 = hist0[tid * 4 + 2];
+    unsigned int h3_101 = hist0[tid * 4 + 3];
+    unsigned int above_102 = 0;
+    unsigned int own_103 = 0;
+    if (b0_97 > bucket_sel_96) {
+        above_102 = above_102 + h0_98;
+    }
+    if (bucket_sel_96 < b0_97 + 1) {
+        above_102 = above_102 + h1_99;
+    }
+    if (bucket_sel_96 < b0_97 + 2) {
+        above_102 = above_102 + h2_100;
+    }
+    if (bucket_sel_96 < b0_97 + 3) {
+        above_102 = above_102 + h3_101;
+    }
+    if (b0_97 == bucket_sel_96) {
+        own_103 = h0_98;
+    }
+    if (b0_97 + 1 == bucket_sel_96) {
+        own_103 = h1_99;
+    }
+    if (b0_97 + 2 == bucket_sel_96) {
+        own_103 = h2_100;
+    }
+    if (b0_97 + 3 == bucket_sel_96) {
+        own_103 = h3_101;
+    }
+    uint32_t _warp_scan_sum_u32_6 = above_102;
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(1));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(2));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(4));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(8));
+    asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_6) : "r"(16));
+    unsigned int incl_104 = _warp_scan_sum_u32_6;
+    if (lane == 31) {
+        warp_sums[warp] = incl_104;
+    }
+    __syncthreads();
+    unsigned int before_105 = 0;
+    unsigned int total_106 = 0;
+    unsigned int ws_107 = warp_sums[0];
+    total_106 = total_106 + ws_107;
+    if (warp > 0) {
+        before_105 = before_105 + ws_107;
+    }
+    unsigned int ws_108 = warp_sums[1];
+    total_106 = total_106 + ws_108;
+    if (warp > 1) {
+        before_105 = before_105 + ws_108;
+    }
+    unsigned int ws_109 = warp_sums[2];
+    total_106 = total_106 + ws_109;
+    if (warp > 2) {
+        before_105 = before_105 + ws_109;
+    }
+    unsigned int ws_110 = warp_sums[3];
+    total_106 = total_106 + ws_110;
+    if (warp > 3) {
+        before_105 = before_105 + ws_110;
+    }
+    unsigned int ws_111 = warp_sums[4];
+    total_106 = total_106 + ws_111;
+    if (warp > 4) {
+        before_105 = before_105 + ws_111;
+    }
+    unsigned int ws_112 = warp_sums[5];
+    total_106 = total_106 + ws_112;
+    if (warp > 5) {
+        before_105 = before_105 + ws_112;
+    }
+    unsigned int ws_113 = warp_sums[6];
+    total_106 = total_106 + ws_113;
+    if (warp > 6) {
+        before_105 = before_105 + ws_113;
+    }
+    unsigned int ws_114 = warp_sums[7];
+    total_106 = total_106 + ws_114;
+    if (warp > 7) {
+        before_105 = before_105 + ws_114;
+    }
+    unsigned int ws_115 = warp_sums[8];
+    total_106 = total_106 + ws_115;
+    if (warp > 8) {
+        before_105 = before_105 + ws_115;
+    }
+    unsigned int ws_116 = warp_sums[9];
+    total_106 = total_106 + ws_116;
+    if (warp > 9) {
+        before_105 = before_105 + ws_116;
+    }
+    unsigned int ws_117 = warp_sums[10];
+    total_106 = total_106 + ws_117;
+    if (warp > 10) {
+        before_105 = before_105 + ws_117;
+    }
+    unsigned int ws_118 = warp_sums[11];
+    total_106 = total_106 + ws_118;
+    if (warp > 11) {
+        before_105 = before_105 + ws_118;
+    }
+    unsigned int ws_119 = warp_sums[12];
+    total_106 = total_106 + ws_119;
+    if (warp > 12) {
+        before_105 = before_105 + ws_119;
+    }
+    unsigned int ws_120 = warp_sums[13];
+    total_106 = total_106 + ws_120;
+    if (warp > 13) {
+        before_105 = before_105 + ws_120;
+    }
+    unsigned int ws_121 = warp_sums[14];
+    total_106 = total_106 + ws_121;
+    if (warp > 14) {
+        before_105 = before_105 + ws_121;
+    }
+    unsigned int ws_122 = warp_sums[15];
+    total_106 = total_106 + ws_122;
+    if (warp > 15) {
+        before_105 = before_105 + ws_122;
+    }
+    unsigned int excl_123 = before_105 + incl_104 - above_102;
+    __syncthreads();
+    gt_local = gt_local + total_106;
+    {
+        if (own_103 > 0) {
+            scal[4] = own_103;
+        }
+        __syncthreads();
+        eq_local = scal[4];
+    }
+    unsigned int threshold = prefix;
+    if (threshold == 0) {
+        if (nch_stream > 0) {
+            eq_local = eq_local - pad;
+        }
+    }
+    unsigned int gt = 0;
+    unsigned int ties = 0;
+    int niter_124 = (int)(n_eff + 31 >> 5);
+    for (int j_3 = 0; j_3 < niter_124; j_3++) {
+        unsigned int e_3 = (unsigned int)(j_3 * 32 + lane);
+        bool valid = e_3 < n_eff;
+        unsigned int key_33 = ((valid) ? lkeys[seg_base + j_3 * 32 + lane] : 0);
+        unsigned int _vote_33 = __ballot_sync(0xFFFFFFFF, valid && key_33 > threshold);
+        unsigned int mg = _vote_33;
+        unsigned int _vote_34 = __ballot_sync(0xFFFFFFFF, valid && key_33 == threshold);
+        unsigned int mt = _vote_34;
+        int _popc_64 = __popc(mg);
+        gt = gt + (unsigned int)_popc_64;
+        int _popc_65 = __popc(mt);
+        ties = ties + (unsigned int)_popc_65;
+    }
+    if (lane == 0) {
+        scal[32 + warp] = gt;
+        scal[48 + warp] = ties;
+    }
+    __syncthreads();
+    unsigned int before_125 = 0;
+    unsigned int total_126 = 0;
+    unsigned int v_127 = scal[32];
+    total_126 = total_126 + v_127;
+    if (warp > 0) {
+        before_125 = before_125 + v_127;
+    }
+    unsigned int v_128 = scal[33];
+    total_126 = total_126 + v_128;
+    if (warp > 1) {
+        before_125 = before_125 + v_128;
+    }
+    unsigned int v_129 = scal[34];
+    total_126 = total_126 + v_129;
+    if (warp > 2) {
+        before_125 = before_125 + v_129;
+    }
+    unsigned int v_130 = scal[35];
+    total_126 = total_126 + v_130;
+    if (warp > 3) {
+        before_125 = before_125 + v_130;
+    }
+    unsigned int v_131 = scal[36];
+    total_126 = total_126 + v_131;
+    if (warp > 4) {
+        before_125 = before_125 + v_131;
+    }
+    unsigned int v_132 = scal[37];
+    total_126 = total_126 + v_132;
+    if (warp > 5) {
+        before_125 = before_125 + v_132;
+    }
+    unsigned int v_133 = scal[38];
+    total_126 = total_126 + v_133;
+    if (warp > 6) {
+        before_125 = before_125 + v_133;
+    }
+    unsigned int v_134 = scal[39];
+    total_126 = total_126 + v_134;
+    if (warp > 7) {
+        before_125 = before_125 + v_134;
+    }
+    unsigned int v_135 = scal[40];
+    total_126 = total_126 + v_135;
+    if (warp > 8) {
+        before_125 = before_125 + v_135;
+    }
+    unsigned int v_136 = scal[41];
+    total_126 = total_126 + v_136;
+    if (warp > 9) {
+        before_125 = before_125 + v_136;
+    }
+    unsigned int v_137 = scal[42];
+    total_126 = total_126 + v_137;
+    if (warp > 10) {
+        before_125 = before_125 + v_137;
+    }
+    unsigned int v_138 = scal[43];
+    total_126 = total_126 + v_138;
+    if (warp > 11) {
+        before_125 = before_125 + v_138;
+    }
+    unsigned int v_139 = scal[44];
+    total_126 = total_126 + v_139;
+    if (warp > 12) {
+        before_125 = before_125 + v_139;
+    }
+    unsigned int v_140 = scal[45];
+    total_126 = total_126 + v_140;
+    if (warp > 13) {
+        before_125 = before_125 + v_140;
+    }
+    unsigned int v_141 = scal[46];
+    total_126 = total_126 + v_141;
+    if (warp > 14) {
+        before_125 = before_125 + v_141;
+    }
+    unsigned int v_142 = scal[47];
+    total_126 = total_126 + v_142;
+    if (warp > 15) {
+        before_125 = before_125 + v_142;
+    }
+    unsigned int before_143 = 0;
+    unsigned int total_144 = 0;
+    unsigned int v_145 = scal[48];
+    total_144 = total_144 + v_145;
+    if (warp > 0) {
+        before_143 = before_143 + v_145;
+    }
+    unsigned int v_146 = scal[49];
+    total_144 = total_144 + v_146;
+    if (warp > 1) {
+        before_143 = before_143 + v_146;
+    }
+    unsigned int v_147 = scal[50];
+    total_144 = total_144 + v_147;
+    if (warp > 2) {
+        before_143 = before_143 + v_147;
+    }
+    unsigned int v_148 = scal[51];
+    total_144 = total_144 + v_148;
+    if (warp > 3) {
+        before_143 = before_143 + v_148;
+    }
+    unsigned int v_149 = scal[52];
+    total_144 = total_144 + v_149;
+    if (warp > 4) {
+        before_143 = before_143 + v_149;
+    }
+    unsigned int v_150 = scal[53];
+    total_144 = total_144 + v_150;
+    if (warp > 5) {
+        before_143 = before_143 + v_150;
+    }
+    unsigned int v_151 = scal[54];
+    total_144 = total_144 + v_151;
+    if (warp > 6) {
+        before_143 = before_143 + v_151;
+    }
+    unsigned int v_152 = scal[55];
+    total_144 = total_144 + v_152;
+    if (warp > 7) {
+        before_143 = before_143 + v_152;
+    }
+    unsigned int v_153 = scal[56];
+    total_144 = total_144 + v_153;
+    if (warp > 8) {
+        before_143 = before_143 + v_153;
+    }
+    unsigned int v_154 = scal[57];
+    total_144 = total_144 + v_154;
+    if (warp > 9) {
+        before_143 = before_143 + v_154;
+    }
+    unsigned int v_155 = scal[58];
+    total_144 = total_144 + v_155;
+    if (warp > 10) {
+        before_143 = before_143 + v_155;
+    }
+    unsigned int v_156 = scal[59];
+    total_144 = total_144 + v_156;
+    if (warp > 11) {
+        before_143 = before_143 + v_156;
+    }
+    unsigned int v_157 = scal[60];
+    total_144 = total_144 + v_157;
+    if (warp > 12) {
+        before_143 = before_143 + v_157;
+    }
+    unsigned int v_158 = scal[61];
+    total_144 = total_144 + v_158;
+    if (warp > 13) {
+        before_143 = before_143 + v_158;
+    }
+    unsigned int v_159 = scal[62];
+    total_144 = total_144 + v_159;
+    if (warp > 14) {
+        before_143 = before_143 + v_159;
+    }
+    unsigned int v_160 = scal[63];
+    total_144 = total_144 + v_160;
+    if (warp > 15) {
+        before_143 = before_143 + v_160;
+    }
+    unsigned int gt_n = ((use_list) ? total_126 : gt_local);
+    unsigned int eq_n = ((use_list) ? total_144 : eq_local);
+    if (tid == 0) {
+        scal[2] = gt_n;
+        scal[3] = eq_n;
+    }
+    __syncthreads();
+    unsigned int gt_prefix = 0;
+    unsigned int eq_prefix = 0;
+    {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        for (int r_1 = 0; r_1 < 4; r_1++) {
+            if (rank > r_1) {
+                uint32_t _mapa_18;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_18) : "r"(scal_addr + 8), "r"(r_1));
+                unsigned int _cluster_ld_2;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_2) : "r"(_mapa_18) : "memory");
+                unsigned int gt_peer = _cluster_ld_2;
+                uint32_t _mapa_19;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_19) : "r"(scal_addr + 12), "r"(r_1));
+                unsigned int _cluster_ld_3;
+                asm volatile(
+                    "ld.shared::cluster.u32 %0, [%1];"
+                    : "=r"(_cluster_ld_3) : "r"(_mapa_19) : "memory");
+                unsigned int eq_peer = _cluster_ld_3;
+                gt_prefix = gt_prefix + gt_peer;
+                eq_prefix = eq_prefix + eq_peer;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    unsigned int gt_total = k_u - remaining;
+    unsigned int _min_2 = ((eq_n) < (remaining - eq_prefix) ? (eq_n) : (remaining - eq_prefix));
+    unsigned int take_rem = ((eq_prefix < remaining) ? _min_2 : 0);
+    unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
+    unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
+    if (nch_stream > 0) {
+        if ((vocab & 3) == 0) {
+            int i_17 = start + tid * 4;
+            if (i_17 < vocab) {
+                float _vec_load_48[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_17);
+                    _vec_load_48[0 + 0] = _v4.x;
+                    _vec_load_48[0 + 1] = _v4.y;
+                    _vec_load_48[0 + 2] = _v4.z;
+                    _vec_load_48[0 + 3] = _v4.w;
+                }
+                vals_a[0] = _vec_load_48[0];
+                vals_a[1] = _vec_load_48[1];
+                vals_a[2] = _vec_load_48[2];
+                vals_a[3] = _vec_load_48[3];
+            } else {
+                vals_a[0] = 0.0f;
+                vals_a[1] = 0.0f;
+                vals_a[2] = 0.0f;
+                vals_a[3] = 0.0f;
+            }
+            int i_0_13 = start + 2048 + tid * 4;
+            if (i_0_13 < vocab) {
+                float _vec_load_49[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_13);
+                    _vec_load_49[0 + 0] = _v4.x;
+                    _vec_load_49[0 + 1] = _v4.y;
+                    _vec_load_49[0 + 2] = _v4.z;
+                    _vec_load_49[0 + 3] = _v4.w;
+                }
+                vals_a[4] = _vec_load_49[0];
+                vals_a[5] = _vec_load_49[1];
+                vals_a[6] = _vec_load_49[2];
+                vals_a[7] = _vec_load_49[3];
+            } else {
+                vals_a[4] = 0.0f;
+                vals_a[5] = 0.0f;
+                vals_a[6] = 0.0f;
+                vals_a[7] = 0.0f;
+            }
+            int i_1_14 = start + 4096 + tid * 4;
+            if (i_1_14 < vocab) {
+                float _vec_load_50[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_14);
+                    _vec_load_50[0 + 0] = _v4.x;
+                    _vec_load_50[0 + 1] = _v4.y;
+                    _vec_load_50[0 + 2] = _v4.z;
+                    _vec_load_50[0 + 3] = _v4.w;
+                }
+                vals_a[8] = _vec_load_50[0];
+                vals_a[9] = _vec_load_50[1];
+                vals_a[10] = _vec_load_50[2];
+                vals_a[11] = _vec_load_50[3];
+            } else {
+                vals_a[8] = 0.0f;
+                vals_a[9] = 0.0f;
+                vals_a[10] = 0.0f;
+                vals_a[11] = 0.0f;
+            }
+            int i_2_14 = start + 6144 + tid * 4;
+            if (i_2_14 < vocab) {
+                float _vec_load_51[4];
+                {
+                    float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_14);
+                    _vec_load_51[0 + 0] = _v4.x;
+                    _vec_load_51[0 + 1] = _v4.y;
+                    _vec_load_51[0 + 2] = _v4.z;
+                    _vec_load_51[0 + 3] = _v4.w;
+                }
+                vals_a[12] = _vec_load_51[0];
+                vals_a[13] = _vec_load_51[1];
+                vals_a[14] = _vec_load_51[2];
+                vals_a[15] = _vec_load_51[3];
+            } else {
+                vals_a[12] = 0.0f;
+                vals_a[13] = 0.0f;
+                vals_a[14] = 0.0f;
+                vals_a[15] = 0.0f;
+            }
+        } else {
+            int i2_26 = start + tid;
+            if (i2_26 < vocab) {
+                vals_a[0] = probs[row_base + (unsigned long long)i2_26];
+            } else {
+                vals_a[0] = 0.0f;
+            }
+            int i2_0_12 = start + 512 + tid;
+            if (i2_0_12 < vocab) {
+                vals_a[1] = probs[row_base + (unsigned long long)i2_0_12];
+            } else {
+                vals_a[1] = 0.0f;
+            }
+            int i2_1_12 = start + 1024 + tid;
+            if (i2_1_12 < vocab) {
+                vals_a[2] = probs[row_base + (unsigned long long)i2_1_12];
+            } else {
+                vals_a[2] = 0.0f;
+            }
+            int i2_2_12 = start + 1536 + tid;
+            if (i2_2_12 < vocab) {
+                vals_a[3] = probs[row_base + (unsigned long long)i2_2_12];
+            } else {
+                vals_a[3] = 0.0f;
+            }
+            int i2_3_12 = start + 2048 + tid;
+            if (i2_3_12 < vocab) {
+                vals_a[4] = probs[row_base + (unsigned long long)i2_3_12];
+            } else {
+                vals_a[4] = 0.0f;
+            }
+            int i2_4_12 = start + 2560 + tid;
+            if (i2_4_12 < vocab) {
+                vals_a[5] = probs[row_base + (unsigned long long)i2_4_12];
+            } else {
+                vals_a[5] = 0.0f;
+            }
+            int i2_5_12 = start + 3072 + tid;
+            if (i2_5_12 < vocab) {
+                vals_a[6] = probs[row_base + (unsigned long long)i2_5_12];
+            } else {
+                vals_a[6] = 0.0f;
+            }
+            int i2_6_12 = start + 3584 + tid;
+            if (i2_6_12 < vocab) {
+                vals_a[7] = probs[row_base + (unsigned long long)i2_6_12];
+            } else {
+                vals_a[7] = 0.0f;
+            }
+            int i2_7_12 = start + 4096 + tid;
+            if (i2_7_12 < vocab) {
+                vals_a[8] = probs[row_base + (unsigned long long)i2_7_12];
+            } else {
+                vals_a[8] = 0.0f;
+            }
+            int i2_8_12 = start + 4608 + tid;
+            if (i2_8_12 < vocab) {
+                vals_a[9] = probs[row_base + (unsigned long long)i2_8_12];
+            } else {
+                vals_a[9] = 0.0f;
+            }
+            int i2_9_12 = start + 5120 + tid;
+            if (i2_9_12 < vocab) {
+                vals_a[10] = probs[row_base + (unsigned long long)i2_9_12];
+            } else {
+                vals_a[10] = 0.0f;
+            }
+            int i2_10_12 = start + 5632 + tid;
+            if (i2_10_12 < vocab) {
+                vals_a[11] = probs[row_base + (unsigned long long)i2_10_12];
+            } else {
+                vals_a[11] = 0.0f;
+            }
+            int i2_11_12 = start + 6144 + tid;
+            if (i2_11_12 < vocab) {
+                vals_a[12] = probs[row_base + (unsigned long long)i2_11_12];
+            } else {
+                vals_a[12] = 0.0f;
+            }
+            int i2_12_12 = start + 6656 + tid;
+            if (i2_12_12 < vocab) {
+                vals_a[13] = probs[row_base + (unsigned long long)i2_12_12];
+            } else {
+                vals_a[13] = 0.0f;
+            }
+            int i2_13_12 = start + 7168 + tid;
+            if (i2_13_12 < vocab) {
+                vals_a[14] = probs[row_base + (unsigned long long)i2_13_12];
+            } else {
+                vals_a[14] = 0.0f;
+            }
+            int i2_14_12 = start + 7680 + tid;
+            if (i2_14_12 < vocab) {
+                vals_a[15] = probs[row_base + (unsigned long long)i2_14_12];
+            } else {
+                vals_a[15] = 0.0f;
+            }
+        }
+    }
+    for (int c_5 = 0; c_5 < nch_stream; c_5 += 2) {
+        if (nch_stream > c_5 + 1) {
+            if ((vocab & 3) == 0) {
+                int i_18 = start + (c_5 + 1) * 8192 + tid * 4;
+                if (i_18 < vocab) {
+                    float _vec_load_52[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_18);
+                        _vec_load_52[0 + 0] = _v4.x;
+                        _vec_load_52[0 + 1] = _v4.y;
+                        _vec_load_52[0 + 2] = _v4.z;
+                        _vec_load_52[0 + 3] = _v4.w;
+                    }
+                    vals_b[0] = _vec_load_52[0];
+                    vals_b[1] = _vec_load_52[1];
+                    vals_b[2] = _vec_load_52[2];
+                    vals_b[3] = _vec_load_52[3];
+                } else {
+                    vals_b[0] = 0.0f;
+                    vals_b[1] = 0.0f;
+                    vals_b[2] = 0.0f;
+                    vals_b[3] = 0.0f;
+                }
+                int i_0_14 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+                if (i_0_14 < vocab) {
+                    float _vec_load_53[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_14);
+                        _vec_load_53[0 + 0] = _v4.x;
+                        _vec_load_53[0 + 1] = _v4.y;
+                        _vec_load_53[0 + 2] = _v4.z;
+                        _vec_load_53[0 + 3] = _v4.w;
+                    }
+                    vals_b[4] = _vec_load_53[0];
+                    vals_b[5] = _vec_load_53[1];
+                    vals_b[6] = _vec_load_53[2];
+                    vals_b[7] = _vec_load_53[3];
+                } else {
+                    vals_b[4] = 0.0f;
+                    vals_b[5] = 0.0f;
+                    vals_b[6] = 0.0f;
+                    vals_b[7] = 0.0f;
+                }
+                int i_1_15 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+                if (i_1_15 < vocab) {
+                    float _vec_load_54[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1_15);
+                        _vec_load_54[0 + 0] = _v4.x;
+                        _vec_load_54[0 + 1] = _v4.y;
+                        _vec_load_54[0 + 2] = _v4.z;
+                        _vec_load_54[0 + 3] = _v4.w;
+                    }
+                    vals_b[8] = _vec_load_54[0];
+                    vals_b[9] = _vec_load_54[1];
+                    vals_b[10] = _vec_load_54[2];
+                    vals_b[11] = _vec_load_54[3];
+                } else {
+                    vals_b[8] = 0.0f;
+                    vals_b[9] = 0.0f;
+                    vals_b[10] = 0.0f;
+                    vals_b[11] = 0.0f;
+                }
+                int i_2_15 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+                if (i_2_15 < vocab) {
+                    float _vec_load_55[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_15);
+                        _vec_load_55[0 + 0] = _v4.x;
+                        _vec_load_55[0 + 1] = _v4.y;
+                        _vec_load_55[0 + 2] = _v4.z;
+                        _vec_load_55[0 + 3] = _v4.w;
+                    }
+                    vals_b[12] = _vec_load_55[0];
+                    vals_b[13] = _vec_load_55[1];
+                    vals_b[14] = _vec_load_55[2];
+                    vals_b[15] = _vec_load_55[3];
+                } else {
+                    vals_b[12] = 0.0f;
+                    vals_b[13] = 0.0f;
+                    vals_b[14] = 0.0f;
+                    vals_b[15] = 0.0f;
+                }
+            } else {
+                int i2_27 = start + (c_5 + 1) * 8192 + tid;
+                if (i2_27 < vocab) {
+                    vals_b[0] = probs[row_base + (unsigned long long)i2_27];
+                } else {
+                    vals_b[0] = 0.0f;
+                }
+                int i2_0_13 = start + (c_5 + 1) * 8192 + 512 + tid;
+                if (i2_0_13 < vocab) {
+                    vals_b[1] = probs[row_base + (unsigned long long)i2_0_13];
+                } else {
+                    vals_b[1] = 0.0f;
+                }
+                int i2_1_13 = start + (c_5 + 1) * 8192 + 1024 + tid;
+                if (i2_1_13 < vocab) {
+                    vals_b[2] = probs[row_base + (unsigned long long)i2_1_13];
+                } else {
+                    vals_b[2] = 0.0f;
+                }
+                int i2_2_13 = start + (c_5 + 1) * 8192 + 1536 + tid;
+                if (i2_2_13 < vocab) {
+                    vals_b[3] = probs[row_base + (unsigned long long)i2_2_13];
+                } else {
+                    vals_b[3] = 0.0f;
+                }
+                int i2_3_13 = start + (c_5 + 1) * 8192 + 2048 + tid;
+                if (i2_3_13 < vocab) {
+                    vals_b[4] = probs[row_base + (unsigned long long)i2_3_13];
+                } else {
+                    vals_b[4] = 0.0f;
+                }
+                int i2_4_13 = start + (c_5 + 1) * 8192 + 2560 + tid;
+                if (i2_4_13 < vocab) {
+                    vals_b[5] = probs[row_base + (unsigned long long)i2_4_13];
+                } else {
+                    vals_b[5] = 0.0f;
+                }
+                int i2_5_13 = start + (c_5 + 1) * 8192 + 3072 + tid;
+                if (i2_5_13 < vocab) {
+                    vals_b[6] = probs[row_base + (unsigned long long)i2_5_13];
+                } else {
+                    vals_b[6] = 0.0f;
+                }
+                int i2_6_13 = start + (c_5 + 1) * 8192 + 3584 + tid;
+                if (i2_6_13 < vocab) {
+                    vals_b[7] = probs[row_base + (unsigned long long)i2_6_13];
+                } else {
+                    vals_b[7] = 0.0f;
+                }
+                int i2_7_13 = start + (c_5 + 1) * 8192 + 4096 + tid;
+                if (i2_7_13 < vocab) {
+                    vals_b[8] = probs[row_base + (unsigned long long)i2_7_13];
+                } else {
+                    vals_b[8] = 0.0f;
+                }
+                int i2_8_13 = start + (c_5 + 1) * 8192 + 4608 + tid;
+                if (i2_8_13 < vocab) {
+                    vals_b[9] = probs[row_base + (unsigned long long)i2_8_13];
+                } else {
+                    vals_b[9] = 0.0f;
+                }
+                int i2_9_13 = start + (c_5 + 1) * 8192 + 5120 + tid;
+                if (i2_9_13 < vocab) {
+                    vals_b[10] = probs[row_base + (unsigned long long)i2_9_13];
+                } else {
+                    vals_b[10] = 0.0f;
+                }
+                int i2_10_13 = start + (c_5 + 1) * 8192 + 5632 + tid;
+                if (i2_10_13 < vocab) {
+                    vals_b[11] = probs[row_base + (unsigned long long)i2_10_13];
+                } else {
+                    vals_b[11] = 0.0f;
+                }
+                int i2_11_13 = start + (c_5 + 1) * 8192 + 6144 + tid;
+                if (i2_11_13 < vocab) {
+                    vals_b[12] = probs[row_base + (unsigned long long)i2_11_13];
+                } else {
+                    vals_b[12] = 0.0f;
+                }
+                int i2_12_13 = start + (c_5 + 1) * 8192 + 6656 + tid;
+                if (i2_12_13 < vocab) {
+                    vals_b[13] = probs[row_base + (unsigned long long)i2_12_13];
+                } else {
+                    vals_b[13] = 0.0f;
+                }
+                int i2_13_13 = start + (c_5 + 1) * 8192 + 7168 + tid;
+                if (i2_13_13 < vocab) {
+                    vals_b[14] = probs[row_base + (unsigned long long)i2_13_13];
+                } else {
+                    vals_b[14] = 0.0f;
+                }
+                int i2_14_13 = start + (c_5 + 1) * 8192 + 7680 + tid;
+                if (i2_14_13 < vocab) {
+                    vals_b[15] = probs[row_base + (unsigned long long)i2_14_13];
+                } else {
+                    vals_b[15] = 0.0f;
+                }
+            }
+        }
+        unsigned int gt_0 = 0;
+        unsigned int bits_20 = __as_u32(vals_a[0]);
+        unsigned int key_36 = ((bits_20 <= 2139095040) ? bits_20 : 0);
+        int i_vec_1 = start + c_5 * 8192 + tid * 4;
+        int i_str_1 = start + c_5 * 8192 + tid;
+        int i_19 = ((aligned) ? i_vec_1 : i_str_1);
+        int i_1_16 = i_19;
+        bool tie = key_36 == threshold && i_1_16 < vocab;
+        unsigned int _vote_35 = __ballot_sync(0xFFFFFFFF, tie);
+        unsigned int m_1 = _vote_35;
+        if (lane == 0) {
+            int _popc_66 = __popc(m_1);
+            cnt[warp] = (unsigned int)_popc_66;
+        }
+        if (key_36 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_2_1 = __as_u32(vals_a[1]);
+        unsigned int key_3_1 = ((bits_2_1 <= 2139095040) ? bits_2_1 : 0);
+        int i_vec_4 = start + c_5 * 8192 + tid * 4 + 1;
+        int i_str_5 = start + c_5 * 8192 + 512 + tid;
+        int i_6_1 = ((aligned) ? i_vec_4 : i_str_5);
+        int i_7_1 = i_6_1;
+        bool tie_8 = key_3_1 == threshold && i_7_1 < vocab;
+        unsigned int _vote_36 = __ballot_sync(0xFFFFFFFF, tie_8);
+        unsigned int m_9 = _vote_36;
+        if (lane == 0) {
+            int _popc_67 = __popc(m_9);
+            cnt[16 + warp] = (unsigned int)_popc_67;
+        }
+        if (key_3_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_10_3 = __as_u32(vals_a[2]);
+        unsigned int key_11_3 = ((bits_10_3 <= 2139095040) ? bits_10_3 : 0);
+        int i_vec_12 = start + c_5 * 8192 + tid * 4 + 2;
+        int i_str_13 = start + c_5 * 8192 + 1024 + tid;
+        int i_14_1 = ((aligned) ? i_vec_12 : i_str_13);
+        int i_15_1 = i_14_1;
+        bool tie_16 = key_11_3 == threshold && i_15_1 < vocab;
+        unsigned int _vote_37 = __ballot_sync(0xFFFFFFFF, tie_16);
+        unsigned int m_17_1 = _vote_37;
+        if (lane == 0) {
+            int _popc_68 = __popc(m_17_1);
+            cnt[32 + warp] = (unsigned int)_popc_68;
+        }
+        if (key_11_3 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_18_4 = __as_u32(vals_a[3]);
+        unsigned int key_19_4 = ((bits_18_4 <= 2139095040) ? bits_18_4 : 0);
+        int i_vec_20_1 = start + c_5 * 8192 + tid * 4 + 3;
+        int i_str_21_1 = start + c_5 * 8192 + 1536 + tid;
+        int i_22 = ((aligned) ? i_vec_20_1 : i_str_21_1);
+        int i_23 = i_22;
+        bool tie_24 = key_19_4 == threshold && i_23 < vocab;
+        unsigned int _vote_38 = __ballot_sync(0xFFFFFFFF, tie_24);
+        unsigned int m_25 = _vote_38;
+        if (lane == 0) {
+            int _popc_69 = __popc(m_25);
+            cnt[48 + warp] = (unsigned int)_popc_69;
+        }
+        if (key_19_4 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_26 = __as_u32(vals_a[4]);
+        unsigned int key_27_1 = ((bits_26 <= 2139095040) ? bits_26 : 0);
+        int i_vec_28 = start + c_5 * 8192 + 2048 + tid * 4;
+        int i_str_29 = start + c_5 * 8192 + 2048 + tid;
+        int i_30 = ((aligned) ? i_vec_28 : i_str_29);
+        int i_31 = i_30;
+        bool tie_32 = key_27_1 == threshold && i_31 < vocab;
+        unsigned int _vote_39 = __ballot_sync(0xFFFFFFFF, tie_32);
+        unsigned int m_33_1 = _vote_39;
+        if (lane == 0) {
+            int _popc_70 = __popc(m_33_1);
+            cnt[64 + warp] = (unsigned int)_popc_70;
+        }
+        if (key_27_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_34_4 = __as_u32(vals_a[5]);
+        unsigned int key_35_4 = ((bits_34_4 <= 2139095040) ? bits_34_4 : 0);
+        int i_vec_36_1 = start + c_5 * 8192 + 2048 + tid * 4 + 1;
+        int i_str_37_1 = start + c_5 * 8192 + 2560 + tid;
+        int i_38 = ((aligned) ? i_vec_36_1 : i_str_37_1);
+        int i_39 = i_38;
+        bool tie_40 = key_35_4 == threshold && i_39 < vocab;
+        unsigned int _vote_40 = __ballot_sync(0xFFFFFFFF, tie_40);
+        unsigned int m_41 = _vote_40;
+        if (lane == 0) {
+            int _popc_71 = __popc(m_41);
+            cnt[80 + warp] = (unsigned int)_popc_71;
+        }
+        if (key_35_4 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_42_3 = __as_u32(vals_a[6]);
+        unsigned int key_43_3 = ((bits_42_3 <= 2139095040) ? bits_42_3 : 0);
+        int i_vec_44 = start + c_5 * 8192 + 2048 + tid * 4 + 2;
+        int i_str_45 = start + c_5 * 8192 + 3072 + tid;
+        int i_46 = ((aligned) ? i_vec_44 : i_str_45);
+        int i_47 = i_46;
+        bool tie_48 = key_43_3 == threshold && i_47 < vocab;
+        unsigned int _vote_41 = __ballot_sync(0xFFFFFFFF, tie_48);
+        unsigned int m_49 = _vote_41;
+        if (lane == 0) {
+            int _popc_72 = __popc(m_49);
+            cnt[96 + warp] = (unsigned int)_popc_72;
+        }
+        if (key_43_3 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_50 = __as_u32(vals_a[7]);
+        unsigned int key_51 = ((bits_50 <= 2139095040) ? bits_50 : 0);
+        int i_vec_52 = start + c_5 * 8192 + 2048 + tid * 4 + 3;
+        int i_str_53 = start + c_5 * 8192 + 3584 + tid;
+        int i_54 = ((aligned) ? i_vec_52 : i_str_53);
+        int i_55 = i_54;
+        bool tie_56 = key_51 == threshold && i_55 < vocab;
+        unsigned int _vote_42 = __ballot_sync(0xFFFFFFFF, tie_56);
+        unsigned int m_57_1 = _vote_42;
+        if (lane == 0) {
+            int _popc_73 = __popc(m_57_1);
+            cnt[112 + warp] = (unsigned int)_popc_73;
+        }
+        if (key_51 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_58 = __as_u32(vals_a[8]);
+        unsigned int key_59 = ((bits_58 <= 2139095040) ? bits_58 : 0);
+        int i_vec_60 = start + c_5 * 8192 + 4096 + tid * 4;
+        int i_str_61 = start + c_5 * 8192 + 4096 + tid;
+        int i_62 = ((aligned) ? i_vec_60 : i_str_61);
+        int i_63 = i_62;
+        bool tie_64 = key_59 == threshold && i_63 < vocab;
+        unsigned int _vote_43 = __ballot_sync(0xFFFFFFFF, tie_64);
+        unsigned int m_65 = _vote_43;
+        if (lane == 0) {
+            int _popc_74 = __popc(m_65);
+            cnt[128 + warp] = (unsigned int)_popc_74;
+        }
+        if (key_59 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_66 = __as_u32(vals_a[9]);
+        unsigned int key_67 = ((bits_66 <= 2139095040) ? bits_66 : 0);
+        int i_vec_68 = start + c_5 * 8192 + 4096 + tid * 4 + 1;
+        int i_str_69 = start + c_5 * 8192 + 4608 + tid;
+        int i_70 = ((aligned) ? i_vec_68 : i_str_69);
+        int i_71 = i_70;
+        bool tie_72 = key_67 == threshold && i_71 < vocab;
+        unsigned int _vote_44 = __ballot_sync(0xFFFFFFFF, tie_72);
+        unsigned int m_73_1 = _vote_44;
+        if (lane == 0) {
+            int _popc_75 = __popc(m_73_1);
+            cnt[144 + warp] = (unsigned int)_popc_75;
+        }
+        if (key_67 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_74 = __as_u32(vals_a[10]);
+        unsigned int key_75 = ((bits_74 <= 2139095040) ? bits_74 : 0);
+        int i_vec_76 = start + c_5 * 8192 + 4096 + tid * 4 + 2;
+        int i_str_77 = start + c_5 * 8192 + 5120 + tid;
+        int i_78 = ((aligned) ? i_vec_76 : i_str_77);
+        int i_79 = i_78;
+        bool tie_80 = key_75 == threshold && i_79 < vocab;
+        unsigned int _vote_45 = __ballot_sync(0xFFFFFFFF, tie_80);
+        unsigned int m_81 = _vote_45;
+        if (lane == 0) {
+            int _popc_76 = __popc(m_81);
+            cnt[160 + warp] = (unsigned int)_popc_76;
+        }
+        if (key_75 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_82 = __as_u32(vals_a[11]);
+        unsigned int key_83 = ((bits_82 <= 2139095040) ? bits_82 : 0);
+        int i_vec_84 = start + c_5 * 8192 + 4096 + tid * 4 + 3;
+        int i_str_85 = start + c_5 * 8192 + 5632 + tid;
+        int i_86 = ((aligned) ? i_vec_84 : i_str_85);
+        int i_87 = i_86;
+        bool tie_88 = key_83 == threshold && i_87 < vocab;
+        unsigned int _vote_46 = __ballot_sync(0xFFFFFFFF, tie_88);
+        unsigned int m_89 = _vote_46;
+        if (lane == 0) {
+            int _popc_77 = __popc(m_89);
+            cnt[176 + warp] = (unsigned int)_popc_77;
+        }
+        if (key_83 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_90 = __as_u32(vals_a[12]);
+        unsigned int key_91 = ((bits_90 <= 2139095040) ? bits_90 : 0);
+        int i_vec_92 = start + c_5 * 8192 + 6144 + tid * 4;
+        int i_str_93 = start + c_5 * 8192 + 6144 + tid;
+        int i_94 = ((aligned) ? i_vec_92 : i_str_93);
+        int i_95 = i_94;
+        bool tie_96 = key_91 == threshold && i_95 < vocab;
+        unsigned int _vote_47 = __ballot_sync(0xFFFFFFFF, tie_96);
+        unsigned int m_97 = _vote_47;
+        if (lane == 0) {
+            int _popc_78 = __popc(m_97);
+            cnt[192 + warp] = (unsigned int)_popc_78;
+        }
+        if (key_91 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_98_1 = __as_u32(vals_a[13]);
+        unsigned int key_99_1 = ((bits_98_1 <= 2139095040) ? bits_98_1 : 0);
+        int i_vec_100_1 = start + c_5 * 8192 + 6144 + tid * 4 + 1;
+        int i_str_101_1 = start + c_5 * 8192 + 6656 + tid;
+        int i_102 = ((aligned) ? i_vec_100_1 : i_str_101_1);
+        int i_103 = i_102;
+        bool tie_104 = key_99_1 == threshold && i_103 < vocab;
+        unsigned int _vote_48 = __ballot_sync(0xFFFFFFFF, tie_104);
+        unsigned int m_105 = _vote_48;
+        if (lane == 0) {
+            int _popc_79 = __popc(m_105);
+            cnt[208 + warp] = (unsigned int)_popc_79;
+        }
+        if (key_99_1 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_106 = __as_u32(vals_a[14]);
+        unsigned int key_107 = ((bits_106 <= 2139095040) ? bits_106 : 0);
+        int i_vec_108 = start + c_5 * 8192 + 6144 + tid * 4 + 2;
+        int i_str_109 = start + c_5 * 8192 + 7168 + tid;
+        int i_110 = ((aligned) ? i_vec_108 : i_str_109);
+        int i_111 = i_110;
+        bool tie_112 = key_107 == threshold && i_111 < vocab;
+        unsigned int _vote_49 = __ballot_sync(0xFFFFFFFF, tie_112);
+        unsigned int m_113 = _vote_49;
+        if (lane == 0) {
+            int _popc_80 = __popc(m_113);
+            cnt[224 + warp] = (unsigned int)_popc_80;
+        }
+        if (key_107 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int bits_114 = __as_u32(vals_a[15]);
+        unsigned int key_115 = ((bits_114 <= 2139095040) ? bits_114 : 0);
+        int i_vec_116 = start + c_5 * 8192 + 6144 + tid * 4 + 3;
+        int i_str_117 = start + c_5 * 8192 + 7680 + tid;
+        int i_118 = ((aligned) ? i_vec_116 : i_str_117);
+        int i_119 = i_118;
+        bool tie_120 = key_115 == threshold && i_119 < vocab;
+        unsigned int _vote_50 = __ballot_sync(0xFFFFFFFF, tie_120);
+        unsigned int m_121 = _vote_50;
+        if (lane == 0) {
+            int _popc_81 = __popc(m_121);
+            cnt[240 + warp] = (unsigned int)_popc_81;
+        }
+        if (key_115 > threshold) {
+            gt_0 = gt_0 + 1;
+        }
+        unsigned int gt_cnt = gt_0;
+        __syncthreads();
+        unsigned int local_122 = 0;
+        int f = tid;
+        if (f < 256) {
+            local_122 = local_122 + cnt[f];
+        }
+        unsigned int packed = gt_cnt | local_122 << 12;
+        uint32_t _warp_scan_sum_u32_7 = packed;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_7) : "r"(16));
+        unsigned int incl_123 = _warp_scan_sum_u32_7;
+        if (lane == 31) {
+            warp_sums[warp] = incl_123;
+        }
+        __syncthreads();
+        unsigned int before_124 = 0;
+        unsigned int total_125 = 0;
+        unsigned int ws_126 = warp_sums[0];
+        total_125 = total_125 + ws_126;
+        if (warp > 0) {
+            before_124 = before_124 + ws_126;
+        }
+        unsigned int ws_127 = warp_sums[1];
+        total_125 = total_125 + ws_127;
+        if (warp > 1) {
+            before_124 = before_124 + ws_127;
+        }
+        unsigned int ws_128 = warp_sums[2];
+        total_125 = total_125 + ws_128;
+        if (warp > 2) {
+            before_124 = before_124 + ws_128;
+        }
+        unsigned int ws_129 = warp_sums[3];
+        total_125 = total_125 + ws_129;
+        if (warp > 3) {
+            before_124 = before_124 + ws_129;
+        }
+        unsigned int ws_130 = warp_sums[4];
+        total_125 = total_125 + ws_130;
+        if (warp > 4) {
+            before_124 = before_124 + ws_130;
+        }
+        unsigned int ws_131 = warp_sums[5];
+        total_125 = total_125 + ws_131;
+        if (warp > 5) {
+            before_124 = before_124 + ws_131;
+        }
+        unsigned int ws_132 = warp_sums[6];
+        total_125 = total_125 + ws_132;
+        if (warp > 6) {
+            before_124 = before_124 + ws_132;
+        }
+        unsigned int ws_133 = warp_sums[7];
+        total_125 = total_125 + ws_133;
+        if (warp > 7) {
+            before_124 = before_124 + ws_133;
+        }
+        unsigned int ws_134 = warp_sums[8];
+        total_125 = total_125 + ws_134;
+        if (warp > 8) {
+            before_124 = before_124 + ws_134;
+        }
+        unsigned int ws_135 = warp_sums[9];
+        total_125 = total_125 + ws_135;
+        if (warp > 9) {
+            before_124 = before_124 + ws_135;
+        }
+        unsigned int ws_136 = warp_sums[10];
+        total_125 = total_125 + ws_136;
+        if (warp > 10) {
+            before_124 = before_124 + ws_136;
+        }
+        unsigned int ws_137 = warp_sums[11];
+        total_125 = total_125 + ws_137;
+        if (warp > 11) {
+            before_124 = before_124 + ws_137;
+        }
+        unsigned int ws_138 = warp_sums[12];
+        total_125 = total_125 + ws_138;
+        if (warp > 12) {
+            before_124 = before_124 + ws_138;
+        }
+        unsigned int ws_139 = warp_sums[13];
+        total_125 = total_125 + ws_139;
+        if (warp > 13) {
+            before_124 = before_124 + ws_139;
+        }
+        unsigned int ws_140 = warp_sums[14];
+        total_125 = total_125 + ws_140;
+        if (warp > 14) {
+            before_124 = before_124 + ws_140;
+        }
+        unsigned int ws_141 = warp_sums[15];
+        total_125 = total_125 + ws_141;
+        if (warp > 15) {
+            before_124 = before_124 + ws_141;
+        }
+        unsigned int excl_142 = before_124 + incl_123 - packed;
+        __syncthreads();
+        unsigned int running = excl_142 >> 12;
+        int f2 = tid;
+        if (f2 < 256) {
+            unsigned int c_0 = cnt[f2];
+            cnt[f2] = running;
+            running = running + c_0;
+        }
+        __syncthreads();
+        unsigned int gt_slot = excl_142 & 4095;
+        unsigned int gt_total_143 = total_125 & 4095;
+        unsigned int eq_total = total_125 >> 12;
+        unsigned int _min_3 = ((eq_total) < (take_rem) ? (eq_total) : (take_rem));
+        unsigned int take_c = _min_3;
+        unsigned int lt_mask_1 = (1 << (unsigned int)lane) - 1;
+        unsigned int g = gt_slot;
+        unsigned int keys_1[4];
+        int idxs_1[4];
+        bool ties_144[4];
+        unsigned int strided[4];
+        unsigned int grp_warp = 0;
+        unsigned int grp_lane = 0;
+        unsigned int bits_145 = __as_u32(vals_a[0]);
+        unsigned int key_146 = ((bits_145 <= 2139095040) ? bits_145 : 0);
+        keys_1[0] = key_146;
+        int i_vec_147 = start + c_5 * 8192 + tid * 4;
+        int i_str_148 = start + c_5 * 8192 + tid;
+        int i_149 = ((aligned) ? i_vec_147 : i_str_148);
+        idxs_1[0] = i_149;
+        ties_144[0] = keys_1[0] == threshold && idxs_1[0] < vocab;
+        unsigned int _vote_51 = __ballot_sync(0xFFFFFFFF, ties_144[0]);
+        unsigned int m_150 = _vote_51;
+        int _popc_82 = __popc(m_150 & lt_mask_1);
+        unsigned int lane_before = (unsigned int)_popc_82;
+        unsigned int warp_off = cnt[warp];
+        strided[0] = warp_off + lane_before;
+        grp_warp = grp_warp + (warp_off - cnt[0]);
+        grp_lane = grp_lane + lane_before;
+        unsigned int bits_151 = __as_u32(vals_a[1]);
+        unsigned int key_152 = ((bits_151 <= 2139095040) ? bits_151 : 0);
+        keys_1[1] = key_152;
+        int i_vec_153 = start + c_5 * 8192 + tid * 4 + 1;
+        int i_str_154 = start + c_5 * 8192 + 512 + tid;
+        int i_155 = ((aligned) ? i_vec_153 : i_str_154);
+        idxs_1[1] = i_155;
+        ties_144[1] = keys_1[1] == threshold && idxs_1[1] < vocab;
+        unsigned int _vote_52 = __ballot_sync(0xFFFFFFFF, ties_144[1]);
+        unsigned int m_156 = _vote_52;
+        int _popc_83 = __popc(m_156 & lt_mask_1);
+        unsigned int lane_before_157 = (unsigned int)_popc_83;
+        unsigned int warp_off_158 = cnt[16 + warp];
+        strided[1] = warp_off_158 + lane_before_157;
+        grp_warp = grp_warp + (warp_off_158 - cnt[16]);
+        grp_lane = grp_lane + lane_before_157;
+        unsigned int bits_159 = __as_u32(vals_a[2]);
+        unsigned int key_160 = ((bits_159 <= 2139095040) ? bits_159 : 0);
+        keys_1[2] = key_160;
+        int i_vec_161 = start + c_5 * 8192 + tid * 4 + 2;
+        int i_str_162 = start + c_5 * 8192 + 1024 + tid;
+        int i_163 = ((aligned) ? i_vec_161 : i_str_162);
+        idxs_1[2] = i_163;
+        ties_144[2] = keys_1[2] == threshold && idxs_1[2] < vocab;
+        unsigned int _vote_53 = __ballot_sync(0xFFFFFFFF, ties_144[2]);
+        unsigned int m_164 = _vote_53;
+        int _popc_84 = __popc(m_164 & lt_mask_1);
+        unsigned int lane_before_165 = (unsigned int)_popc_84;
+        unsigned int warp_off_166 = cnt[32 + warp];
+        strided[2] = warp_off_166 + lane_before_165;
+        grp_warp = grp_warp + (warp_off_166 - cnt[32]);
+        grp_lane = grp_lane + lane_before_165;
+        unsigned int bits_167 = __as_u32(vals_a[3]);
+        unsigned int key_168 = ((bits_167 <= 2139095040) ? bits_167 : 0);
+        keys_1[3] = key_168;
+        int i_vec_169 = start + c_5 * 8192 + tid * 4 + 3;
+        int i_str_170 = start + c_5 * 8192 + 1536 + tid;
+        int i_171 = ((aligned) ? i_vec_169 : i_str_170);
+        idxs_1[3] = i_171;
+        ties_144[3] = keys_1[3] == threshold && idxs_1[3] < vocab;
+        unsigned int _vote_54 = __ballot_sync(0xFFFFFFFF, ties_144[3]);
+        unsigned int m_172 = _vote_54;
+        int _popc_85 = __popc(m_172 & lt_mask_1);
+        unsigned int lane_before_173 = (unsigned int)_popc_85;
+        unsigned int warp_off_174 = cnt[48 + warp];
+        strided[3] = warp_off_174 + lane_before_173;
+        grp_warp = grp_warp + (warp_off_174 - cnt[48]);
+        grp_lane = grp_lane + lane_before_173;
+        unsigned int grp_base = cnt[0];
+        unsigned int own_175 = 0;
+        unsigned int vec_rank = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_176 = ((aligned) ? vec_rank : strided[0]);
+        if (keys_1[0] > threshold) {
+            unsigned long long dst = gt_run + (unsigned long long)g;
+            out_vals[dst] = __uint_as_float(keys_1[0]);
+            out_idx[dst] = idxs_1[0];
+            g = g + 1;
+        } else if (ties_144[0] && rank_176 < take_c) {
+            unsigned long long dst2 = eq_run + (unsigned long long)rank_176;
+            out_vals[dst2] = __uint_as_float(keys_1[0]);
+            out_idx[dst2] = idxs_1[0];
+        }
+        if (ties_144[0]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_177 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_178 = ((aligned) ? vec_rank_177 : strided[1]);
+        if (keys_1[1] > threshold) {
+            unsigned long long dst_1 = gt_run + (unsigned long long)g;
+            out_vals[dst_1] = __uint_as_float(keys_1[1]);
+            out_idx[dst_1] = idxs_1[1];
+            g = g + 1;
+        } else if (ties_144[1] && rank_178 < take_c) {
+            unsigned long long dst2_1 = eq_run + (unsigned long long)rank_178;
+            out_vals[dst2_1] = __uint_as_float(keys_1[1]);
+            out_idx[dst2_1] = idxs_1[1];
+        }
+        if (ties_144[1]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_179 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_180 = ((aligned) ? vec_rank_179 : strided[2]);
+        if (keys_1[2] > threshold) {
+            unsigned long long dst_2 = gt_run + (unsigned long long)g;
+            out_vals[dst_2] = __uint_as_float(keys_1[2]);
+            out_idx[dst_2] = idxs_1[2];
+            g = g + 1;
+        } else if (ties_144[2] && rank_180 < take_c) {
+            unsigned long long dst2_2 = eq_run + (unsigned long long)rank_180;
+            out_vals[dst2_2] = __uint_as_float(keys_1[2]);
+            out_idx[dst2_2] = idxs_1[2];
+        }
+        if (ties_144[2]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int vec_rank_181 = grp_base + grp_warp + grp_lane + own_175;
+        unsigned int rank_182 = ((aligned) ? vec_rank_181 : strided[3]);
+        if (keys_1[3] > threshold) {
+            unsigned long long dst_3 = gt_run + (unsigned long long)g;
+            out_vals[dst_3] = __uint_as_float(keys_1[3]);
+            out_idx[dst_3] = idxs_1[3];
+            g = g + 1;
+        } else if (ties_144[3] && rank_182 < take_c) {
+            unsigned long long dst2_3 = eq_run + (unsigned long long)rank_182;
+            out_vals[dst2_3] = __uint_as_float(keys_1[3]);
+            out_idx[dst2_3] = idxs_1[3];
+        }
+        if (ties_144[3]) {
+            own_175 = own_175 + 1;
+        }
+        unsigned int keys_183[4];
+        int idxs_184[4];
+        bool ties_185[4];
+        unsigned int strided_186[4];
+        unsigned int grp_warp_187 = 0;
+        unsigned int grp_lane_188 = 0;
+        unsigned int bits_189 = __as_u32(vals_a[4]);
+        unsigned int key_190 = ((bits_189 <= 2139095040) ? bits_189 : 0);
+        keys_183[0] = key_190;
+        int i_vec_191 = start + c_5 * 8192 + 2048 + tid * 4;
+        int i_str_192 = start + c_5 * 8192 + 2048 + tid;
+        int i_193 = ((aligned) ? i_vec_191 : i_str_192);
+        idxs_184[0] = i_193;
+        ties_185[0] = keys_183[0] == threshold && idxs_184[0] < vocab;
+        unsigned int _vote_55 = __ballot_sync(0xFFFFFFFF, ties_185[0]);
+        unsigned int m_194 = _vote_55;
+        int _popc_86 = __popc(m_194 & lt_mask_1);
+        unsigned int lane_before_195 = (unsigned int)_popc_86;
+        unsigned int warp_off_196 = cnt[64 + warp];
+        strided_186[0] = warp_off_196 + lane_before_195;
+        grp_warp_187 = grp_warp_187 + (warp_off_196 - cnt[64]);
+        grp_lane_188 = grp_lane_188 + lane_before_195;
+        unsigned int bits_197 = __as_u32(vals_a[5]);
+        unsigned int key_198 = ((bits_197 <= 2139095040) ? bits_197 : 0);
+        keys_183[1] = key_198;
+        int i_vec_199 = start + c_5 * 8192 + 2048 + tid * 4 + 1;
+        int i_str_200 = start + c_5 * 8192 + 2560 + tid;
+        int i_201 = ((aligned) ? i_vec_199 : i_str_200);
+        idxs_184[1] = i_201;
+        ties_185[1] = keys_183[1] == threshold && idxs_184[1] < vocab;
+        unsigned int _vote_56 = __ballot_sync(0xFFFFFFFF, ties_185[1]);
+        unsigned int m_202 = _vote_56;
+        int _popc_87 = __popc(m_202 & lt_mask_1);
+        unsigned int lane_before_203 = (unsigned int)_popc_87;
+        unsigned int warp_off_204 = cnt[80 + warp];
+        strided_186[1] = warp_off_204 + lane_before_203;
+        grp_warp_187 = grp_warp_187 + (warp_off_204 - cnt[80]);
+        grp_lane_188 = grp_lane_188 + lane_before_203;
+        unsigned int bits_205 = __as_u32(vals_a[6]);
+        unsigned int key_206 = ((bits_205 <= 2139095040) ? bits_205 : 0);
+        keys_183[2] = key_206;
+        int i_vec_207 = start + c_5 * 8192 + 2048 + tid * 4 + 2;
+        int i_str_208 = start + c_5 * 8192 + 3072 + tid;
+        int i_209 = ((aligned) ? i_vec_207 : i_str_208);
+        idxs_184[2] = i_209;
+        ties_185[2] = keys_183[2] == threshold && idxs_184[2] < vocab;
+        unsigned int _vote_57 = __ballot_sync(0xFFFFFFFF, ties_185[2]);
+        unsigned int m_210 = _vote_57;
+        int _popc_88 = __popc(m_210 & lt_mask_1);
+        unsigned int lane_before_211 = (unsigned int)_popc_88;
+        unsigned int warp_off_212 = cnt[96 + warp];
+        strided_186[2] = warp_off_212 + lane_before_211;
+        grp_warp_187 = grp_warp_187 + (warp_off_212 - cnt[96]);
+        grp_lane_188 = grp_lane_188 + lane_before_211;
+        unsigned int bits_213 = __as_u32(vals_a[7]);
+        unsigned int key_214 = ((bits_213 <= 2139095040) ? bits_213 : 0);
+        keys_183[3] = key_214;
+        int i_vec_215 = start + c_5 * 8192 + 2048 + tid * 4 + 3;
+        int i_str_216 = start + c_5 * 8192 + 3584 + tid;
+        int i_217 = ((aligned) ? i_vec_215 : i_str_216);
+        idxs_184[3] = i_217;
+        ties_185[3] = keys_183[3] == threshold && idxs_184[3] < vocab;
+        unsigned int _vote_58 = __ballot_sync(0xFFFFFFFF, ties_185[3]);
+        unsigned int m_218 = _vote_58;
+        int _popc_89 = __popc(m_218 & lt_mask_1);
+        unsigned int lane_before_219 = (unsigned int)_popc_89;
+        unsigned int warp_off_220 = cnt[112 + warp];
+        strided_186[3] = warp_off_220 + lane_before_219;
+        grp_warp_187 = grp_warp_187 + (warp_off_220 - cnt[112]);
+        grp_lane_188 = grp_lane_188 + lane_before_219;
+        unsigned int grp_base_221 = cnt[64];
+        unsigned int own_222 = 0;
+        unsigned int vec_rank_223 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_224 = ((aligned) ? vec_rank_223 : strided_186[0]);
+        if (keys_183[0] > threshold) {
+            unsigned long long dst_4 = gt_run + (unsigned long long)g;
+            out_vals[dst_4] = __uint_as_float(keys_183[0]);
+            out_idx[dst_4] = idxs_184[0];
+            g = g + 1;
+        } else if (ties_185[0] && rank_224 < take_c) {
+            unsigned long long dst2_4 = eq_run + (unsigned long long)rank_224;
+            out_vals[dst2_4] = __uint_as_float(keys_183[0]);
+            out_idx[dst2_4] = idxs_184[0];
+        }
+        if (ties_185[0]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_225 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_226 = ((aligned) ? vec_rank_225 : strided_186[1]);
+        if (keys_183[1] > threshold) {
+            unsigned long long dst_5 = gt_run + (unsigned long long)g;
+            out_vals[dst_5] = __uint_as_float(keys_183[1]);
+            out_idx[dst_5] = idxs_184[1];
+            g = g + 1;
+        } else if (ties_185[1] && rank_226 < take_c) {
+            unsigned long long dst2_5 = eq_run + (unsigned long long)rank_226;
+            out_vals[dst2_5] = __uint_as_float(keys_183[1]);
+            out_idx[dst2_5] = idxs_184[1];
+        }
+        if (ties_185[1]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_227 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_228 = ((aligned) ? vec_rank_227 : strided_186[2]);
+        if (keys_183[2] > threshold) {
+            unsigned long long dst_6 = gt_run + (unsigned long long)g;
+            out_vals[dst_6] = __uint_as_float(keys_183[2]);
+            out_idx[dst_6] = idxs_184[2];
+            g = g + 1;
+        } else if (ties_185[2] && rank_228 < take_c) {
+            unsigned long long dst2_6 = eq_run + (unsigned long long)rank_228;
+            out_vals[dst2_6] = __uint_as_float(keys_183[2]);
+            out_idx[dst2_6] = idxs_184[2];
+        }
+        if (ties_185[2]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int vec_rank_229 = grp_base_221 + grp_warp_187 + grp_lane_188 + own_222;
+        unsigned int rank_230 = ((aligned) ? vec_rank_229 : strided_186[3]);
+        if (keys_183[3] > threshold) {
+            unsigned long long dst_7 = gt_run + (unsigned long long)g;
+            out_vals[dst_7] = __uint_as_float(keys_183[3]);
+            out_idx[dst_7] = idxs_184[3];
+            g = g + 1;
+        } else if (ties_185[3] && rank_230 < take_c) {
+            unsigned long long dst2_7 = eq_run + (unsigned long long)rank_230;
+            out_vals[dst2_7] = __uint_as_float(keys_183[3]);
+            out_idx[dst2_7] = idxs_184[3];
+        }
+        if (ties_185[3]) {
+            own_222 = own_222 + 1;
+        }
+        unsigned int keys_231[4];
+        int idxs_232[4];
+        bool ties_233[4];
+        unsigned int strided_234[4];
+        unsigned int grp_warp_235 = 0;
+        unsigned int grp_lane_236 = 0;
+        unsigned int bits_237 = __as_u32(vals_a[8]);
+        unsigned int key_238 = ((bits_237 <= 2139095040) ? bits_237 : 0);
+        keys_231[0] = key_238;
+        int i_vec_239 = start + c_5 * 8192 + 4096 + tid * 4;
+        int i_str_240 = start + c_5 * 8192 + 4096 + tid;
+        int i_241 = ((aligned) ? i_vec_239 : i_str_240);
+        idxs_232[0] = i_241;
+        ties_233[0] = keys_231[0] == threshold && idxs_232[0] < vocab;
+        unsigned int _vote_59 = __ballot_sync(0xFFFFFFFF, ties_233[0]);
+        unsigned int m_242 = _vote_59;
+        int _popc_90 = __popc(m_242 & lt_mask_1);
+        unsigned int lane_before_243 = (unsigned int)_popc_90;
+        unsigned int warp_off_244 = cnt[128 + warp];
+        strided_234[0] = warp_off_244 + lane_before_243;
+        grp_warp_235 = grp_warp_235 + (warp_off_244 - cnt[128]);
+        grp_lane_236 = grp_lane_236 + lane_before_243;
+        unsigned int bits_245 = __as_u32(vals_a[9]);
+        unsigned int key_246 = ((bits_245 <= 2139095040) ? bits_245 : 0);
+        keys_231[1] = key_246;
+        int i_vec_247 = start + c_5 * 8192 + 4096 + tid * 4 + 1;
+        int i_str_248 = start + c_5 * 8192 + 4608 + tid;
+        int i_249 = ((aligned) ? i_vec_247 : i_str_248);
+        idxs_232[1] = i_249;
+        ties_233[1] = keys_231[1] == threshold && idxs_232[1] < vocab;
+        unsigned int _vote_60 = __ballot_sync(0xFFFFFFFF, ties_233[1]);
+        unsigned int m_250 = _vote_60;
+        int _popc_91 = __popc(m_250 & lt_mask_1);
+        unsigned int lane_before_251 = (unsigned int)_popc_91;
+        unsigned int warp_off_252 = cnt[144 + warp];
+        strided_234[1] = warp_off_252 + lane_before_251;
+        grp_warp_235 = grp_warp_235 + (warp_off_252 - cnt[144]);
+        grp_lane_236 = grp_lane_236 + lane_before_251;
+        unsigned int bits_253 = __as_u32(vals_a[10]);
+        unsigned int key_254 = ((bits_253 <= 2139095040) ? bits_253 : 0);
+        keys_231[2] = key_254;
+        int i_vec_255 = start + c_5 * 8192 + 4096 + tid * 4 + 2;
+        int i_str_256 = start + c_5 * 8192 + 5120 + tid;
+        int i_257 = ((aligned) ? i_vec_255 : i_str_256);
+        idxs_232[2] = i_257;
+        ties_233[2] = keys_231[2] == threshold && idxs_232[2] < vocab;
+        unsigned int _vote_61 = __ballot_sync(0xFFFFFFFF, ties_233[2]);
+        unsigned int m_258 = _vote_61;
+        int _popc_92 = __popc(m_258 & lt_mask_1);
+        unsigned int lane_before_259 = (unsigned int)_popc_92;
+        unsigned int warp_off_260 = cnt[160 + warp];
+        strided_234[2] = warp_off_260 + lane_before_259;
+        grp_warp_235 = grp_warp_235 + (warp_off_260 - cnt[160]);
+        grp_lane_236 = grp_lane_236 + lane_before_259;
+        unsigned int bits_261 = __as_u32(vals_a[11]);
+        unsigned int key_262 = ((bits_261 <= 2139095040) ? bits_261 : 0);
+        keys_231[3] = key_262;
+        int i_vec_263 = start + c_5 * 8192 + 4096 + tid * 4 + 3;
+        int i_str_264 = start + c_5 * 8192 + 5632 + tid;
+        int i_265 = ((aligned) ? i_vec_263 : i_str_264);
+        idxs_232[3] = i_265;
+        ties_233[3] = keys_231[3] == threshold && idxs_232[3] < vocab;
+        unsigned int _vote_62 = __ballot_sync(0xFFFFFFFF, ties_233[3]);
+        unsigned int m_266 = _vote_62;
+        int _popc_93 = __popc(m_266 & lt_mask_1);
+        unsigned int lane_before_267 = (unsigned int)_popc_93;
+        unsigned int warp_off_268 = cnt[176 + warp];
+        strided_234[3] = warp_off_268 + lane_before_267;
+        grp_warp_235 = grp_warp_235 + (warp_off_268 - cnt[176]);
+        grp_lane_236 = grp_lane_236 + lane_before_267;
+        unsigned int grp_base_269 = cnt[128];
+        unsigned int own_270 = 0;
+        unsigned int vec_rank_271 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_272 = ((aligned) ? vec_rank_271 : strided_234[0]);
+        if (keys_231[0] > threshold) {
+            unsigned long long dst_8 = gt_run + (unsigned long long)g;
+            out_vals[dst_8] = __uint_as_float(keys_231[0]);
+            out_idx[dst_8] = idxs_232[0];
+            g = g + 1;
+        } else if (ties_233[0] && rank_272 < take_c) {
+            unsigned long long dst2_8 = eq_run + (unsigned long long)rank_272;
+            out_vals[dst2_8] = __uint_as_float(keys_231[0]);
+            out_idx[dst2_8] = idxs_232[0];
+        }
+        if (ties_233[0]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_273 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_274 = ((aligned) ? vec_rank_273 : strided_234[1]);
+        if (keys_231[1] > threshold) {
+            unsigned long long dst_9 = gt_run + (unsigned long long)g;
+            out_vals[dst_9] = __uint_as_float(keys_231[1]);
+            out_idx[dst_9] = idxs_232[1];
+            g = g + 1;
+        } else if (ties_233[1] && rank_274 < take_c) {
+            unsigned long long dst2_9 = eq_run + (unsigned long long)rank_274;
+            out_vals[dst2_9] = __uint_as_float(keys_231[1]);
+            out_idx[dst2_9] = idxs_232[1];
+        }
+        if (ties_233[1]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_275 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_276 = ((aligned) ? vec_rank_275 : strided_234[2]);
+        if (keys_231[2] > threshold) {
+            unsigned long long dst_10 = gt_run + (unsigned long long)g;
+            out_vals[dst_10] = __uint_as_float(keys_231[2]);
+            out_idx[dst_10] = idxs_232[2];
+            g = g + 1;
+        } else if (ties_233[2] && rank_276 < take_c) {
+            unsigned long long dst2_10 = eq_run + (unsigned long long)rank_276;
+            out_vals[dst2_10] = __uint_as_float(keys_231[2]);
+            out_idx[dst2_10] = idxs_232[2];
+        }
+        if (ties_233[2]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int vec_rank_277 = grp_base_269 + grp_warp_235 + grp_lane_236 + own_270;
+        unsigned int rank_278 = ((aligned) ? vec_rank_277 : strided_234[3]);
+        if (keys_231[3] > threshold) {
+            unsigned long long dst_11 = gt_run + (unsigned long long)g;
+            out_vals[dst_11] = __uint_as_float(keys_231[3]);
+            out_idx[dst_11] = idxs_232[3];
+            g = g + 1;
+        } else if (ties_233[3] && rank_278 < take_c) {
+            unsigned long long dst2_11 = eq_run + (unsigned long long)rank_278;
+            out_vals[dst2_11] = __uint_as_float(keys_231[3]);
+            out_idx[dst2_11] = idxs_232[3];
+        }
+        if (ties_233[3]) {
+            own_270 = own_270 + 1;
+        }
+        unsigned int keys_279[4];
+        int idxs_280[4];
+        bool ties_281[4];
+        unsigned int strided_282[4];
+        unsigned int grp_warp_283 = 0;
+        unsigned int grp_lane_284 = 0;
+        unsigned int bits_285 = __as_u32(vals_a[12]);
+        unsigned int key_286 = ((bits_285 <= 2139095040) ? bits_285 : 0);
+        keys_279[0] = key_286;
+        int i_vec_287 = start + c_5 * 8192 + 6144 + tid * 4;
+        int i_str_288 = start + c_5 * 8192 + 6144 + tid;
+        int i_289 = ((aligned) ? i_vec_287 : i_str_288);
+        idxs_280[0] = i_289;
+        ties_281[0] = keys_279[0] == threshold && idxs_280[0] < vocab;
+        unsigned int _vote_63 = __ballot_sync(0xFFFFFFFF, ties_281[0]);
+        unsigned int m_290 = _vote_63;
+        int _popc_94 = __popc(m_290 & lt_mask_1);
+        unsigned int lane_before_291 = (unsigned int)_popc_94;
+        unsigned int warp_off_292 = cnt[192 + warp];
+        strided_282[0] = warp_off_292 + lane_before_291;
+        grp_warp_283 = grp_warp_283 + (warp_off_292 - cnt[192]);
+        grp_lane_284 = grp_lane_284 + lane_before_291;
+        unsigned int bits_293 = __as_u32(vals_a[13]);
+        unsigned int key_294 = ((bits_293 <= 2139095040) ? bits_293 : 0);
+        keys_279[1] = key_294;
+        int i_vec_295 = start + c_5 * 8192 + 6144 + tid * 4 + 1;
+        int i_str_296 = start + c_5 * 8192 + 6656 + tid;
+        int i_297 = ((aligned) ? i_vec_295 : i_str_296);
+        idxs_280[1] = i_297;
+        ties_281[1] = keys_279[1] == threshold && idxs_280[1] < vocab;
+        unsigned int _vote_64 = __ballot_sync(0xFFFFFFFF, ties_281[1]);
+        unsigned int m_298 = _vote_64;
+        int _popc_95 = __popc(m_298 & lt_mask_1);
+        unsigned int lane_before_299 = (unsigned int)_popc_95;
+        unsigned int warp_off_300 = cnt[208 + warp];
+        strided_282[1] = warp_off_300 + lane_before_299;
+        grp_warp_283 = grp_warp_283 + (warp_off_300 - cnt[208]);
+        grp_lane_284 = grp_lane_284 + lane_before_299;
+        unsigned int bits_301 = __as_u32(vals_a[14]);
+        unsigned int key_302 = ((bits_301 <= 2139095040) ? bits_301 : 0);
+        keys_279[2] = key_302;
+        int i_vec_303 = start + c_5 * 8192 + 6144 + tid * 4 + 2;
+        int i_str_304 = start + c_5 * 8192 + 7168 + tid;
+        int i_305 = ((aligned) ? i_vec_303 : i_str_304);
+        idxs_280[2] = i_305;
+        ties_281[2] = keys_279[2] == threshold && idxs_280[2] < vocab;
+        unsigned int _vote_65 = __ballot_sync(0xFFFFFFFF, ties_281[2]);
+        unsigned int m_306 = _vote_65;
+        int _popc_96 = __popc(m_306 & lt_mask_1);
+        unsigned int lane_before_307 = (unsigned int)_popc_96;
+        unsigned int warp_off_308 = cnt[224 + warp];
+        strided_282[2] = warp_off_308 + lane_before_307;
+        grp_warp_283 = grp_warp_283 + (warp_off_308 - cnt[224]);
+        grp_lane_284 = grp_lane_284 + lane_before_307;
+        unsigned int bits_309 = __as_u32(vals_a[15]);
+        unsigned int key_310 = ((bits_309 <= 2139095040) ? bits_309 : 0);
+        keys_279[3] = key_310;
+        int i_vec_311 = start + c_5 * 8192 + 6144 + tid * 4 + 3;
+        int i_str_312 = start + c_5 * 8192 + 7680 + tid;
+        int i_313 = ((aligned) ? i_vec_311 : i_str_312);
+        idxs_280[3] = i_313;
+        ties_281[3] = keys_279[3] == threshold && idxs_280[3] < vocab;
+        unsigned int _vote_66 = __ballot_sync(0xFFFFFFFF, ties_281[3]);
+        unsigned int m_314 = _vote_66;
+        int _popc_97 = __popc(m_314 & lt_mask_1);
+        unsigned int lane_before_315 = (unsigned int)_popc_97;
+        unsigned int warp_off_316 = cnt[240 + warp];
+        strided_282[3] = warp_off_316 + lane_before_315;
+        grp_warp_283 = grp_warp_283 + (warp_off_316 - cnt[240]);
+        grp_lane_284 = grp_lane_284 + lane_before_315;
+        unsigned int grp_base_317 = cnt[192];
+        unsigned int own_318 = 0;
+        unsigned int vec_rank_319 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_320 = ((aligned) ? vec_rank_319 : strided_282[0]);
+        if (keys_279[0] > threshold) {
+            unsigned long long dst_12 = gt_run + (unsigned long long)g;
+            out_vals[dst_12] = __uint_as_float(keys_279[0]);
+            out_idx[dst_12] = idxs_280[0];
+            g = g + 1;
+        } else if (ties_281[0] && rank_320 < take_c) {
+            unsigned long long dst2_12 = eq_run + (unsigned long long)rank_320;
+            out_vals[dst2_12] = __uint_as_float(keys_279[0]);
+            out_idx[dst2_12] = idxs_280[0];
+        }
+        if (ties_281[0]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_321 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_322 = ((aligned) ? vec_rank_321 : strided_282[1]);
+        if (keys_279[1] > threshold) {
+            unsigned long long dst_13 = gt_run + (unsigned long long)g;
+            out_vals[dst_13] = __uint_as_float(keys_279[1]);
+            out_idx[dst_13] = idxs_280[1];
+            g = g + 1;
+        } else if (ties_281[1] && rank_322 < take_c) {
+            unsigned long long dst2_13 = eq_run + (unsigned long long)rank_322;
+            out_vals[dst2_13] = __uint_as_float(keys_279[1]);
+            out_idx[dst2_13] = idxs_280[1];
+        }
+        if (ties_281[1]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_323 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_324 = ((aligned) ? vec_rank_323 : strided_282[2]);
+        if (keys_279[2] > threshold) {
+            unsigned long long dst_14 = gt_run + (unsigned long long)g;
+            out_vals[dst_14] = __uint_as_float(keys_279[2]);
+            out_idx[dst_14] = idxs_280[2];
+            g = g + 1;
+        } else if (ties_281[2] && rank_324 < take_c) {
+            unsigned long long dst2_14 = eq_run + (unsigned long long)rank_324;
+            out_vals[dst2_14] = __uint_as_float(keys_279[2]);
+            out_idx[dst2_14] = idxs_280[2];
+        }
+        if (ties_281[2]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned int vec_rank_325 = grp_base_317 + grp_warp_283 + grp_lane_284 + own_318;
+        unsigned int rank_326 = ((aligned) ? vec_rank_325 : strided_282[3]);
+        if (keys_279[3] > threshold) {
+            unsigned long long dst_15 = gt_run + (unsigned long long)g;
+            out_vals[dst_15] = __uint_as_float(keys_279[3]);
+            out_idx[dst_15] = idxs_280[3];
+            g = g + 1;
+        } else if (ties_281[3] && rank_326 < take_c) {
+            unsigned long long dst2_15 = eq_run + (unsigned long long)rank_326;
+            out_vals[dst2_15] = __uint_as_float(keys_279[3]);
+            out_idx[dst2_15] = idxs_280[3];
+        }
+        if (ties_281[3]) {
+            own_318 = own_318 + 1;
+        }
+        unsigned long long gt_next = gt_run + (unsigned long long)gt_total_143;
+        unsigned long long eq_next = eq_run + (unsigned long long)take_c;
+        unsigned int rem_next = take_rem - take_c;
+        __syncthreads();
+        gt_run = gt_next;
+        eq_run = eq_next;
+        take_rem = rem_next;
+        if (nch_stream > c_5 + 2) {
+            if ((vocab & 3) == 0) {
+                int i_0_15 = start + (c_5 + 2) * 8192 + tid * 4;
+                if (i_0_15 < vocab) {
+                    float _vec_load_56[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0_15);
+                        _vec_load_56[0 + 0] = _v4.x;
+                        _vec_load_56[0 + 1] = _v4.y;
+                        _vec_load_56[0 + 2] = _v4.z;
+                        _vec_load_56[0 + 3] = _v4.w;
+                    }
+                    vals_a[0] = _vec_load_56[0];
+                    vals_a[1] = _vec_load_56[1];
+                    vals_a[2] = _vec_load_56[2];
+                    vals_a[3] = _vec_load_56[3];
+                } else {
+                    vals_a[0] = 0.0f;
+                    vals_a[1] = 0.0f;
+                    vals_a[2] = 0.0f;
+                    vals_a[3] = 0.0f;
+                }
+                int i_2_16 = start + (c_5 + 2) * 8192 + 2048 + tid * 4;
+                if (i_2_16 < vocab) {
+                    float _vec_load_57[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2_16);
+                        _vec_load_57[0 + 0] = _v4.x;
+                        _vec_load_57[0 + 1] = _v4.y;
+                        _vec_load_57[0 + 2] = _v4.z;
+                        _vec_load_57[0 + 3] = _v4.w;
+                    }
+                    vals_a[4] = _vec_load_57[0];
+                    vals_a[5] = _vec_load_57[1];
+                    vals_a[6] = _vec_load_57[2];
+                    vals_a[7] = _vec_load_57[3];
+                } else {
+                    vals_a[4] = 0.0f;
+                    vals_a[5] = 0.0f;
+                    vals_a[6] = 0.0f;
+                    vals_a[7] = 0.0f;
+                }
+                int i_3_1 = start + (c_5 + 2) * 8192 + 4096 + tid * 4;
+                if (i_3_1 < vocab) {
+                    float _vec_load_58[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3_1);
+                        _vec_load_58[0 + 0] = _v4.x;
+                        _vec_load_58[0 + 1] = _v4.y;
+                        _vec_load_58[0 + 2] = _v4.z;
+                        _vec_load_58[0 + 3] = _v4.w;
+                    }
+                    vals_a[8] = _vec_load_58[0];
+                    vals_a[9] = _vec_load_58[1];
+                    vals_a[10] = _vec_load_58[2];
+                    vals_a[11] = _vec_load_58[3];
+                } else {
+                    vals_a[8] = 0.0f;
+                    vals_a[9] = 0.0f;
+                    vals_a[10] = 0.0f;
+                    vals_a[11] = 0.0f;
+                }
+                int i_4_1 = start + (c_5 + 2) * 8192 + 6144 + tid * 4;
+                if (i_4_1 < vocab) {
+                    float _vec_load_59[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4_1);
+                        _vec_load_59[0 + 0] = _v4.x;
+                        _vec_load_59[0 + 1] = _v4.y;
+                        _vec_load_59[0 + 2] = _v4.z;
+                        _vec_load_59[0 + 3] = _v4.w;
+                    }
+                    vals_a[12] = _vec_load_59[0];
+                    vals_a[13] = _vec_load_59[1];
+                    vals_a[14] = _vec_load_59[2];
+                    vals_a[15] = _vec_load_59[3];
+                } else {
+                    vals_a[12] = 0.0f;
+                    vals_a[13] = 0.0f;
+                    vals_a[14] = 0.0f;
+                    vals_a[15] = 0.0f;
+                }
+            } else {
+                int i2_28 = start + (c_5 + 2) * 8192 + tid;
+                if (i2_28 < vocab) {
+                    vals_a[0] = probs[row_base + (unsigned long long)i2_28];
+                } else {
+                    vals_a[0] = 0.0f;
+                }
+                int i2_0_14 = start + (c_5 + 2) * 8192 + 512 + tid;
+                if (i2_0_14 < vocab) {
+                    vals_a[1] = probs[row_base + (unsigned long long)i2_0_14];
+                } else {
+                    vals_a[1] = 0.0f;
+                }
+                int i2_1_14 = start + (c_5 + 2) * 8192 + 1024 + tid;
+                if (i2_1_14 < vocab) {
+                    vals_a[2] = probs[row_base + (unsigned long long)i2_1_14];
+                } else {
+                    vals_a[2] = 0.0f;
+                }
+                int i2_2_14 = start + (c_5 + 2) * 8192 + 1536 + tid;
+                if (i2_2_14 < vocab) {
+                    vals_a[3] = probs[row_base + (unsigned long long)i2_2_14];
+                } else {
+                    vals_a[3] = 0.0f;
+                }
+                int i2_3_14 = start + (c_5 + 2) * 8192 + 2048 + tid;
+                if (i2_3_14 < vocab) {
+                    vals_a[4] = probs[row_base + (unsigned long long)i2_3_14];
+                } else {
+                    vals_a[4] = 0.0f;
+                }
+                int i2_4_14 = start + (c_5 + 2) * 8192 + 2560 + tid;
+                if (i2_4_14 < vocab) {
+                    vals_a[5] = probs[row_base + (unsigned long long)i2_4_14];
+                } else {
+                    vals_a[5] = 0.0f;
+                }
+                int i2_5_14 = start + (c_5 + 2) * 8192 + 3072 + tid;
+                if (i2_5_14 < vocab) {
+                    vals_a[6] = probs[row_base + (unsigned long long)i2_5_14];
+                } else {
+                    vals_a[6] = 0.0f;
+                }
+                int i2_6_14 = start + (c_5 + 2) * 8192 + 3584 + tid;
+                if (i2_6_14 < vocab) {
+                    vals_a[7] = probs[row_base + (unsigned long long)i2_6_14];
+                } else {
+                    vals_a[7] = 0.0f;
+                }
+                int i2_7_14 = start + (c_5 + 2) * 8192 + 4096 + tid;
+                if (i2_7_14 < vocab) {
+                    vals_a[8] = probs[row_base + (unsigned long long)i2_7_14];
+                } else {
+                    vals_a[8] = 0.0f;
+                }
+                int i2_8_14 = start + (c_5 + 2) * 8192 + 4608 + tid;
+                if (i2_8_14 < vocab) {
+                    vals_a[9] = probs[row_base + (unsigned long long)i2_8_14];
+                } else {
+                    vals_a[9] = 0.0f;
+                }
+                int i2_9_14 = start + (c_5 + 2) * 8192 + 5120 + tid;
+                if (i2_9_14 < vocab) {
+                    vals_a[10] = probs[row_base + (unsigned long long)i2_9_14];
+                } else {
+                    vals_a[10] = 0.0f;
+                }
+                int i2_10_14 = start + (c_5 + 2) * 8192 + 5632 + tid;
+                if (i2_10_14 < vocab) {
+                    vals_a[11] = probs[row_base + (unsigned long long)i2_10_14];
+                } else {
+                    vals_a[11] = 0.0f;
+                }
+                int i2_11_14 = start + (c_5 + 2) * 8192 + 6144 + tid;
+                if (i2_11_14 < vocab) {
+                    vals_a[12] = probs[row_base + (unsigned long long)i2_11_14];
+                } else {
+                    vals_a[12] = 0.0f;
+                }
+                int i2_12_14 = start + (c_5 + 2) * 8192 + 6656 + tid;
+                if (i2_12_14 < vocab) {
+                    vals_a[13] = probs[row_base + (unsigned long long)i2_12_14];
+                } else {
+                    vals_a[13] = 0.0f;
+                }
+                int i2_13_14 = start + (c_5 + 2) * 8192 + 7168 + tid;
+                if (i2_13_14 < vocab) {
+                    vals_a[14] = probs[row_base + (unsigned long long)i2_13_14];
+                } else {
+                    vals_a[14] = 0.0f;
+                }
+                int i2_14_14 = start + (c_5 + 2) * 8192 + 7680 + tid;
+                if (i2_14_14 < vocab) {
+                    vals_a[15] = probs[row_base + (unsigned long long)i2_14_14];
+                } else {
+                    vals_a[15] = 0.0f;
+                }
+            }
+        }
+        if (nch_stream > c_5 + 1) {
+            unsigned int gt_1 = 0;
+            unsigned int bits_3_4 = __as_u32(vals_b[0]);
+            unsigned int key_4_4 = ((bits_3_4 <= 2139095040) ? bits_3_4 : 0);
+            int i_vec_5 = start + (c_5 + 1) * 8192 + tid * 4;
+            int i_str_6 = start + (c_5 + 1) * 8192 + tid;
+            int i_8_1 = ((aligned) ? i_vec_5 : i_str_6);
+            int i_9_1 = i_8_1;
+            bool tie_10 = key_4_4 == threshold && i_9_1 < vocab;
+            unsigned int _vote_67 = __ballot_sync(0xFFFFFFFF, tie_10);
+            unsigned int m_11 = _vote_67;
+            if (lane == 0) {
+                int _popc_98 = __popc(m_11);
+                cnt[warp] = (unsigned int)_popc_98;
+            }
+            if (key_4_4 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_12_3 = __as_u32(vals_b[1]);
+            unsigned int key_13_3 = ((bits_12_3 <= 2139095040) ? bits_12_3 : 0);
+            int i_vec_14 = start + (c_5 + 1) * 8192 + tid * 4 + 1;
+            int i_str_15 = start + (c_5 + 1) * 8192 + 512 + tid;
+            int i_16_1 = ((aligned) ? i_vec_14 : i_str_15);
+            int i_17_1 = i_16_1;
+            bool tie_18 = key_13_3 == threshold && i_17_1 < vocab;
+            unsigned int _vote_68 = __ballot_sync(0xFFFFFFFF, tie_18);
+            unsigned int m_19 = _vote_68;
+            if (lane == 0) {
+                int _popc_99 = __popc(m_19);
+                cnt[16 + warp] = (unsigned int)_popc_99;
+            }
+            if (key_13_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_20_1 = __as_u32(vals_b[2]);
+            unsigned int key_21_1 = ((bits_20_1 <= 2139095040) ? bits_20_1 : 0);
+            int i_vec_22 = start + (c_5 + 1) * 8192 + tid * 4 + 2;
+            int i_str_23 = start + (c_5 + 1) * 8192 + 1024 + tid;
+            int i_24 = ((aligned) ? i_vec_22 : i_str_23);
+            int i_25 = i_24;
+            bool tie_26 = key_21_1 == threshold && i_25 < vocab;
+            unsigned int _vote_69 = __ballot_sync(0xFFFFFFFF, tie_26);
+            unsigned int m_27_1 = _vote_69;
+            if (lane == 0) {
+                int _popc_100 = __popc(m_27_1);
+                cnt[32 + warp] = (unsigned int)_popc_100;
+            }
+            if (key_21_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_28_3 = __as_u32(vals_b[3]);
+            unsigned int key_29_3 = ((bits_28_3 <= 2139095040) ? bits_28_3 : 0);
+            int i_vec_30 = start + (c_5 + 1) * 8192 + tid * 4 + 3;
+            int i_str_31 = start + (c_5 + 1) * 8192 + 1536 + tid;
+            int i_32 = ((aligned) ? i_vec_30 : i_str_31);
+            int i_33 = i_32;
+            bool tie_34 = key_29_3 == threshold && i_33 < vocab;
+            unsigned int _vote_70 = __ballot_sync(0xFFFFFFFF, tie_34);
+            unsigned int m_35 = _vote_70;
+            if (lane == 0) {
+                int _popc_101 = __popc(m_35);
+                cnt[48 + warp] = (unsigned int)_popc_101;
+            }
+            if (key_29_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_36_3 = __as_u32(vals_b[4]);
+            unsigned int key_37_3 = ((bits_36_3 <= 2139095040) ? bits_36_3 : 0);
+            int i_vec_38 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+            int i_str_39 = start + (c_5 + 1) * 8192 + 2048 + tid;
+            int i_40 = ((aligned) ? i_vec_38 : i_str_39);
+            int i_41 = i_40;
+            bool tie_42 = key_37_3 == threshold && i_41 < vocab;
+            unsigned int _vote_71 = __ballot_sync(0xFFFFFFFF, tie_42);
+            unsigned int m_43_1 = _vote_71;
+            if (lane == 0) {
+                int _popc_102 = __popc(m_43_1);
+                cnt[64 + warp] = (unsigned int)_popc_102;
+            }
+            if (key_37_3 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_44 = __as_u32(vals_b[5]);
+            unsigned int key_45 = ((bits_44 <= 2139095040) ? bits_44 : 0);
+            int i_vec_46 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 1;
+            int i_str_47 = start + (c_5 + 1) * 8192 + 2560 + tid;
+            int i_48 = ((aligned) ? i_vec_46 : i_str_47);
+            int i_49 = i_48;
+            bool tie_50 = key_45 == threshold && i_49 < vocab;
+            unsigned int _vote_72 = __ballot_sync(0xFFFFFFFF, tie_50);
+            unsigned int m_51 = _vote_72;
+            if (lane == 0) {
+                int _popc_103 = __popc(m_51);
+                cnt[80 + warp] = (unsigned int)_popc_103;
+            }
+            if (key_45 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_52 = __as_u32(vals_b[6]);
+            unsigned int key_53 = ((bits_52 <= 2139095040) ? bits_52 : 0);
+            int i_vec_54 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 2;
+            int i_str_55 = start + (c_5 + 1) * 8192 + 3072 + tid;
+            int i_56 = ((aligned) ? i_vec_54 : i_str_55);
+            int i_57 = i_56;
+            bool tie_58 = key_53 == threshold && i_57 < vocab;
+            unsigned int _vote_73 = __ballot_sync(0xFFFFFFFF, tie_58);
+            unsigned int m_59 = _vote_73;
+            if (lane == 0) {
+                int _popc_104 = __popc(m_59);
+                cnt[96 + warp] = (unsigned int)_popc_104;
+            }
+            if (key_53 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_60 = __as_u32(vals_b[7]);
+            unsigned int key_61 = ((bits_60 <= 2139095040) ? bits_60 : 0);
+            int i_vec_62 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 3;
+            int i_str_63 = start + (c_5 + 1) * 8192 + 3584 + tid;
+            int i_64 = ((aligned) ? i_vec_62 : i_str_63);
+            int i_65 = i_64;
+            bool tie_66 = key_61 == threshold && i_65 < vocab;
+            unsigned int _vote_74 = __ballot_sync(0xFFFFFFFF, tie_66);
+            unsigned int m_67 = _vote_74;
+            if (lane == 0) {
+                int _popc_105 = __popc(m_67);
+                cnt[112 + warp] = (unsigned int)_popc_105;
+            }
+            if (key_61 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_68_1 = __as_u32(vals_b[8]);
+            unsigned int key_69_1 = ((bits_68_1 <= 2139095040) ? bits_68_1 : 0);
+            int i_vec_70_1 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+            int i_str_71_1 = start + (c_5 + 1) * 8192 + 4096 + tid;
+            int i_72 = ((aligned) ? i_vec_70_1 : i_str_71_1);
+            int i_73 = i_72;
+            bool tie_74 = key_69_1 == threshold && i_73 < vocab;
+            unsigned int _vote_75 = __ballot_sync(0xFFFFFFFF, tie_74);
+            unsigned int m_75 = _vote_75;
+            if (lane == 0) {
+                int _popc_106 = __popc(m_75);
+                cnt[128 + warp] = (unsigned int)_popc_106;
+            }
+            if (key_69_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_76 = __as_u32(vals_b[9]);
+            unsigned int key_77 = ((bits_76 <= 2139095040) ? bits_76 : 0);
+            int i_vec_78 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 1;
+            int i_str_79 = start + (c_5 + 1) * 8192 + 4608 + tid;
+            int i_80 = ((aligned) ? i_vec_78 : i_str_79);
+            int i_81 = i_80;
+            bool tie_82 = key_77 == threshold && i_81 < vocab;
+            unsigned int _vote_76 = __ballot_sync(0xFFFFFFFF, tie_82);
+            unsigned int m_83 = _vote_76;
+            if (lane == 0) {
+                int _popc_107 = __popc(m_83);
+                cnt[144 + warp] = (unsigned int)_popc_107;
+            }
+            if (key_77 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_84_1 = __as_u32(vals_b[10]);
+            unsigned int key_85_1 = ((bits_84_1 <= 2139095040) ? bits_84_1 : 0);
+            int i_vec_86_1 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 2;
+            int i_str_87_1 = start + (c_5 + 1) * 8192 + 5120 + tid;
+            int i_88 = ((aligned) ? i_vec_86_1 : i_str_87_1);
+            int i_89 = i_88;
+            bool tie_90 = key_85_1 == threshold && i_89 < vocab;
+            unsigned int _vote_77 = __ballot_sync(0xFFFFFFFF, tie_90);
+            unsigned int m_91 = _vote_77;
+            if (lane == 0) {
+                int _popc_108 = __popc(m_91);
+                cnt[160 + warp] = (unsigned int)_popc_108;
+            }
+            if (key_85_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_92 = __as_u32(vals_b[11]);
+            unsigned int key_93 = ((bits_92 <= 2139095040) ? bits_92 : 0);
+            int i_vec_94 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 3;
+            int i_str_95 = start + (c_5 + 1) * 8192 + 5632 + tid;
+            int i_96 = ((aligned) ? i_vec_94 : i_str_95);
+            int i_97 = i_96;
+            bool tie_98 = key_93 == threshold && i_97 < vocab;
+            unsigned int _vote_78 = __ballot_sync(0xFFFFFFFF, tie_98);
+            unsigned int m_99 = _vote_78;
+            if (lane == 0) {
+                int _popc_109 = __popc(m_99);
+                cnt[176 + warp] = (unsigned int)_popc_109;
+            }
+            if (key_93 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_100 = __as_u32(vals_b[12]);
+            unsigned int key_101 = ((bits_100 <= 2139095040) ? bits_100 : 0);
+            int i_vec_102 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+            int i_str_103 = start + (c_5 + 1) * 8192 + 6144 + tid;
+            int i_104 = ((aligned) ? i_vec_102 : i_str_103);
+            int i_105 = i_104;
+            bool tie_106 = key_101 == threshold && i_105 < vocab;
+            unsigned int _vote_79 = __ballot_sync(0xFFFFFFFF, tie_106);
+            unsigned int m_107_1 = _vote_79;
+            if (lane == 0) {
+                int _popc_110 = __popc(m_107_1);
+                cnt[192 + warp] = (unsigned int)_popc_110;
+            }
+            if (key_101 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_108_1 = __as_u32(vals_b[13]);
+            unsigned int key_109_1 = ((bits_108_1 <= 2139095040) ? bits_108_1 : 0);
+            int i_vec_110_1 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 1;
+            int i_str_111_1 = start + (c_5 + 1) * 8192 + 6656 + tid;
+            int i_112 = ((aligned) ? i_vec_110_1 : i_str_111_1);
+            int i_113 = i_112;
+            bool tie_114 = key_109_1 == threshold && i_113 < vocab;
+            unsigned int _vote_80 = __ballot_sync(0xFFFFFFFF, tie_114);
+            unsigned int m_115 = _vote_80;
+            if (lane == 0) {
+                int _popc_111 = __popc(m_115);
+                cnt[208 + warp] = (unsigned int)_popc_111;
+            }
+            if (key_109_1 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_116 = __as_u32(vals_b[14]);
+            unsigned int key_117 = ((bits_116 <= 2139095040) ? bits_116 : 0);
+            int i_vec_118 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 2;
+            int i_str_119 = start + (c_5 + 1) * 8192 + 7168 + tid;
+            int i_120 = ((aligned) ? i_vec_118 : i_str_119);
+            int i_121 = i_120;
+            bool tie_122 = key_117 == threshold && i_121 < vocab;
+            unsigned int _vote_81 = __ballot_sync(0xFFFFFFFF, tie_122);
+            unsigned int m_123 = _vote_81;
+            if (lane == 0) {
+                int _popc_112 = __popc(m_123);
+                cnt[224 + warp] = (unsigned int)_popc_112;
+            }
+            if (key_117 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int bits_124 = __as_u32(vals_b[15]);
+            unsigned int key_125 = ((bits_124 <= 2139095040) ? bits_124 : 0);
+            int i_vec_126 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 3;
+            int i_str_127 = start + (c_5 + 1) * 8192 + 7680 + tid;
+            int i_128 = ((aligned) ? i_vec_126 : i_str_127);
+            int i_129 = i_128;
+            bool tie_130 = key_125 == threshold && i_129 < vocab;
+            unsigned int _vote_82 = __ballot_sync(0xFFFFFFFF, tie_130);
+            unsigned int m_131 = _vote_82;
+            if (lane == 0) {
+                int _popc_113 = __popc(m_131);
+                cnt[240 + warp] = (unsigned int)_popc_113;
+            }
+            if (key_125 > threshold) {
+                gt_1 = gt_1 + 1;
+            }
+            unsigned int gt_cnt_132 = gt_1;
+            __syncthreads();
+            unsigned int local_133 = 0;
+            int f_134 = tid;
+            if (f_134 < 256) {
+                local_133 = local_133 + cnt[f_134];
+            }
+            unsigned int packed_135 = gt_cnt_132 | local_133 << 12;
+            uint32_t _warp_scan_sum_u32_8 = packed_135;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_8) : "r"(16));
+            unsigned int incl_136 = _warp_scan_sum_u32_8;
+            if (lane == 31) {
+                warp_sums[warp] = incl_136;
+            }
+            __syncthreads();
+            unsigned int before_137 = 0;
+            unsigned int total_138 = 0;
+            unsigned int ws_142 = warp_sums[0];
+            total_138 = total_138 + ws_142;
+            if (warp > 0) {
+                before_137 = before_137 + ws_142;
+            }
+            unsigned int ws_143 = warp_sums[1];
+            total_138 = total_138 + ws_143;
+            if (warp > 1) {
+                before_137 = before_137 + ws_143;
+            }
+            unsigned int ws_144 = warp_sums[2];
+            total_138 = total_138 + ws_144;
+            if (warp > 2) {
+                before_137 = before_137 + ws_144;
+            }
+            unsigned int ws_145 = warp_sums[3];
+            total_138 = total_138 + ws_145;
+            if (warp > 3) {
+                before_137 = before_137 + ws_145;
+            }
+            unsigned int ws_146 = warp_sums[4];
+            total_138 = total_138 + ws_146;
+            if (warp > 4) {
+                before_137 = before_137 + ws_146;
+            }
+            unsigned int ws_147 = warp_sums[5];
+            total_138 = total_138 + ws_147;
+            if (warp > 5) {
+                before_137 = before_137 + ws_147;
+            }
+            unsigned int ws_148 = warp_sums[6];
+            total_138 = total_138 + ws_148;
+            if (warp > 6) {
+                before_137 = before_137 + ws_148;
+            }
+            unsigned int ws_149 = warp_sums[7];
+            total_138 = total_138 + ws_149;
+            if (warp > 7) {
+                before_137 = before_137 + ws_149;
+            }
+            unsigned int ws_150 = warp_sums[8];
+            total_138 = total_138 + ws_150;
+            if (warp > 8) {
+                before_137 = before_137 + ws_150;
+            }
+            unsigned int ws_151 = warp_sums[9];
+            total_138 = total_138 + ws_151;
+            if (warp > 9) {
+                before_137 = before_137 + ws_151;
+            }
+            unsigned int ws_152 = warp_sums[10];
+            total_138 = total_138 + ws_152;
+            if (warp > 10) {
+                before_137 = before_137 + ws_152;
+            }
+            unsigned int ws_153 = warp_sums[11];
+            total_138 = total_138 + ws_153;
+            if (warp > 11) {
+                before_137 = before_137 + ws_153;
+            }
+            unsigned int ws_154 = warp_sums[12];
+            total_138 = total_138 + ws_154;
+            if (warp > 12) {
+                before_137 = before_137 + ws_154;
+            }
+            unsigned int ws_155 = warp_sums[13];
+            total_138 = total_138 + ws_155;
+            if (warp > 13) {
+                before_137 = before_137 + ws_155;
+            }
+            unsigned int ws_156 = warp_sums[14];
+            total_138 = total_138 + ws_156;
+            if (warp > 14) {
+                before_137 = before_137 + ws_156;
+            }
+            unsigned int ws_157 = warp_sums[15];
+            total_138 = total_138 + ws_157;
+            if (warp > 15) {
+                before_137 = before_137 + ws_157;
+            }
+            unsigned int excl_158 = before_137 + incl_136 - packed_135;
+            __syncthreads();
+            unsigned int running_159 = excl_158 >> 12;
+            int f2_160 = tid;
+            if (f2_160 < 256) {
+                unsigned int c_0_1 = cnt[f2_160];
+                cnt[f2_160] = running_159;
+                running_159 = running_159 + c_0_1;
+            }
+            __syncthreads();
+            unsigned int gt_slot_161 = excl_158 & 4095;
+            unsigned int gt_total_162 = total_138 & 4095;
+            unsigned int eq_total_163 = total_138 >> 12;
+            unsigned int _min_4 = ((eq_total_163) < (take_rem) ? (eq_total_163) : (take_rem));
+            unsigned int take_c_164 = _min_4;
+            unsigned int lt_mask_165 = (1 << (unsigned int)lane) - 1;
+            unsigned int g_166 = gt_slot_161;
+            unsigned int keys_167[4];
+            int idxs_168[4];
+            bool ties_169[4];
+            unsigned int strided_170[4];
+            unsigned int grp_warp_171 = 0;
+            unsigned int grp_lane_172 = 0;
+            unsigned int bits_173 = __as_u32(vals_b[0]);
+            unsigned int key_174 = ((bits_173 <= 2139095040) ? bits_173 : 0);
+            keys_167[0] = key_174;
+            int i_vec_175 = start + (c_5 + 1) * 8192 + tid * 4;
+            int i_str_176 = start + (c_5 + 1) * 8192 + tid;
+            int i_177 = ((aligned) ? i_vec_175 : i_str_176);
+            idxs_168[0] = i_177;
+            ties_169[0] = keys_167[0] == threshold && idxs_168[0] < vocab;
+            unsigned int _vote_83 = __ballot_sync(0xFFFFFFFF, ties_169[0]);
+            unsigned int m_178 = _vote_83;
+            int _popc_114 = __popc(m_178 & lt_mask_165);
+            unsigned int lane_before_179 = (unsigned int)_popc_114;
+            unsigned int warp_off_180 = cnt[warp];
+            strided_170[0] = warp_off_180 + lane_before_179;
+            grp_warp_171 = grp_warp_171 + (warp_off_180 - cnt[0]);
+            grp_lane_172 = grp_lane_172 + lane_before_179;
+            unsigned int bits_181 = __as_u32(vals_b[1]);
+            unsigned int key_182 = ((bits_181 <= 2139095040) ? bits_181 : 0);
+            keys_167[1] = key_182;
+            int i_vec_183 = start + (c_5 + 1) * 8192 + tid * 4 + 1;
+            int i_str_184 = start + (c_5 + 1) * 8192 + 512 + tid;
+            int i_185 = ((aligned) ? i_vec_183 : i_str_184);
+            idxs_168[1] = i_185;
+            ties_169[1] = keys_167[1] == threshold && idxs_168[1] < vocab;
+            unsigned int _vote_84 = __ballot_sync(0xFFFFFFFF, ties_169[1]);
+            unsigned int m_186 = _vote_84;
+            int _popc_115 = __popc(m_186 & lt_mask_165);
+            unsigned int lane_before_187 = (unsigned int)_popc_115;
+            unsigned int warp_off_188 = cnt[16 + warp];
+            strided_170[1] = warp_off_188 + lane_before_187;
+            grp_warp_171 = grp_warp_171 + (warp_off_188 - cnt[16]);
+            grp_lane_172 = grp_lane_172 + lane_before_187;
+            unsigned int bits_190 = __as_u32(vals_b[2]);
+            unsigned int key_191 = ((bits_190 <= 2139095040) ? bits_190 : 0);
+            keys_167[2] = key_191;
+            int i_vec_192 = start + (c_5 + 1) * 8192 + tid * 4 + 2;
+            int i_str_193 = start + (c_5 + 1) * 8192 + 1024 + tid;
+            int i_194 = ((aligned) ? i_vec_192 : i_str_193);
+            idxs_168[2] = i_194;
+            ties_169[2] = keys_167[2] == threshold && idxs_168[2] < vocab;
+            unsigned int _vote_85 = __ballot_sync(0xFFFFFFFF, ties_169[2]);
+            unsigned int m_195 = _vote_85;
+            int _popc_116 = __popc(m_195 & lt_mask_165);
+            unsigned int lane_before_196 = (unsigned int)_popc_116;
+            unsigned int warp_off_197 = cnt[32 + warp];
+            strided_170[2] = warp_off_197 + lane_before_196;
+            grp_warp_171 = grp_warp_171 + (warp_off_197 - cnt[32]);
+            grp_lane_172 = grp_lane_172 + lane_before_196;
+            unsigned int bits_198 = __as_u32(vals_b[3]);
+            unsigned int key_199 = ((bits_198 <= 2139095040) ? bits_198 : 0);
+            keys_167[3] = key_199;
+            int i_vec_200 = start + (c_5 + 1) * 8192 + tid * 4 + 3;
+            int i_str_201 = start + (c_5 + 1) * 8192 + 1536 + tid;
+            int i_202 = ((aligned) ? i_vec_200 : i_str_201);
+            idxs_168[3] = i_202;
+            ties_169[3] = keys_167[3] == threshold && idxs_168[3] < vocab;
+            unsigned int _vote_86 = __ballot_sync(0xFFFFFFFF, ties_169[3]);
+            unsigned int m_203 = _vote_86;
+            int _popc_117 = __popc(m_203 & lt_mask_165);
+            unsigned int lane_before_204 = (unsigned int)_popc_117;
+            unsigned int warp_off_205 = cnt[48 + warp];
+            strided_170[3] = warp_off_205 + lane_before_204;
+            grp_warp_171 = grp_warp_171 + (warp_off_205 - cnt[48]);
+            grp_lane_172 = grp_lane_172 + lane_before_204;
+            unsigned int grp_base_206 = cnt[0];
+            unsigned int own_207 = 0;
+            unsigned int vec_rank_208 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_209 = ((aligned) ? vec_rank_208 : strided_170[0]);
+            if (keys_167[0] > threshold) {
+                unsigned long long dst_16 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_16] = __uint_as_float(keys_167[0]);
+                out_idx[dst_16] = idxs_168[0];
+                g_166 = g_166 + 1;
+            } else if (ties_169[0] && rank_209 < take_c_164) {
+                unsigned long long dst2_16 = eq_run + (unsigned long long)rank_209;
+                out_vals[dst2_16] = __uint_as_float(keys_167[0]);
+                out_idx[dst2_16] = idxs_168[0];
+            }
+            if (ties_169[0]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_210 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_211 = ((aligned) ? vec_rank_210 : strided_170[1]);
+            if (keys_167[1] > threshold) {
+                unsigned long long dst_17 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_17] = __uint_as_float(keys_167[1]);
+                out_idx[dst_17] = idxs_168[1];
+                g_166 = g_166 + 1;
+            } else if (ties_169[1] && rank_211 < take_c_164) {
+                unsigned long long dst2_17 = eq_run + (unsigned long long)rank_211;
+                out_vals[dst2_17] = __uint_as_float(keys_167[1]);
+                out_idx[dst2_17] = idxs_168[1];
+            }
+            if (ties_169[1]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_212 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_213 = ((aligned) ? vec_rank_212 : strided_170[2]);
+            if (keys_167[2] > threshold) {
+                unsigned long long dst_18 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_18] = __uint_as_float(keys_167[2]);
+                out_idx[dst_18] = idxs_168[2];
+                g_166 = g_166 + 1;
+            } else if (ties_169[2] && rank_213 < take_c_164) {
+                unsigned long long dst2_18 = eq_run + (unsigned long long)rank_213;
+                out_vals[dst2_18] = __uint_as_float(keys_167[2]);
+                out_idx[dst2_18] = idxs_168[2];
+            }
+            if (ties_169[2]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int vec_rank_214 = grp_base_206 + grp_warp_171 + grp_lane_172 + own_207;
+            unsigned int rank_215 = ((aligned) ? vec_rank_214 : strided_170[3]);
+            if (keys_167[3] > threshold) {
+                unsigned long long dst_19 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_19] = __uint_as_float(keys_167[3]);
+                out_idx[dst_19] = idxs_168[3];
+                g_166 = g_166 + 1;
+            } else if (ties_169[3] && rank_215 < take_c_164) {
+                unsigned long long dst2_19 = eq_run + (unsigned long long)rank_215;
+                out_vals[dst2_19] = __uint_as_float(keys_167[3]);
+                out_idx[dst2_19] = idxs_168[3];
+            }
+            if (ties_169[3]) {
+                own_207 = own_207 + 1;
+            }
+            unsigned int keys_216[4];
+            int idxs_217[4];
+            bool ties_218[4];
+            unsigned int strided_219[4];
+            unsigned int grp_warp_220 = 0;
+            unsigned int grp_lane_221 = 0;
+            unsigned int bits_222 = __as_u32(vals_b[4]);
+            unsigned int key_223 = ((bits_222 <= 2139095040) ? bits_222 : 0);
+            keys_216[0] = key_223;
+            int i_vec_224 = start + (c_5 + 1) * 8192 + 2048 + tid * 4;
+            int i_str_225 = start + (c_5 + 1) * 8192 + 2048 + tid;
+            int i_226 = ((aligned) ? i_vec_224 : i_str_225);
+            idxs_217[0] = i_226;
+            ties_218[0] = keys_216[0] == threshold && idxs_217[0] < vocab;
+            unsigned int _vote_87 = __ballot_sync(0xFFFFFFFF, ties_218[0]);
+            unsigned int m_227 = _vote_87;
+            int _popc_118 = __popc(m_227 & lt_mask_165);
+            unsigned int lane_before_228 = (unsigned int)_popc_118;
+            unsigned int warp_off_229 = cnt[64 + warp];
+            strided_219[0] = warp_off_229 + lane_before_228;
+            grp_warp_220 = grp_warp_220 + (warp_off_229 - cnt[64]);
+            grp_lane_221 = grp_lane_221 + lane_before_228;
+            unsigned int bits_230 = __as_u32(vals_b[5]);
+            unsigned int key_231 = ((bits_230 <= 2139095040) ? bits_230 : 0);
+            keys_216[1] = key_231;
+            int i_vec_232 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 1;
+            int i_str_233 = start + (c_5 + 1) * 8192 + 2560 + tid;
+            int i_234 = ((aligned) ? i_vec_232 : i_str_233);
+            idxs_217[1] = i_234;
+            ties_218[1] = keys_216[1] == threshold && idxs_217[1] < vocab;
+            unsigned int _vote_88 = __ballot_sync(0xFFFFFFFF, ties_218[1]);
+            unsigned int m_235 = _vote_88;
+            int _popc_119 = __popc(m_235 & lt_mask_165);
+            unsigned int lane_before_236 = (unsigned int)_popc_119;
+            unsigned int warp_off_237 = cnt[80 + warp];
+            strided_219[1] = warp_off_237 + lane_before_236;
+            grp_warp_220 = grp_warp_220 + (warp_off_237 - cnt[80]);
+            grp_lane_221 = grp_lane_221 + lane_before_236;
+            unsigned int bits_238 = __as_u32(vals_b[6]);
+            unsigned int key_239 = ((bits_238 <= 2139095040) ? bits_238 : 0);
+            keys_216[2] = key_239;
+            int i_vec_240 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 2;
+            int i_str_241 = start + (c_5 + 1) * 8192 + 3072 + tid;
+            int i_242 = ((aligned) ? i_vec_240 : i_str_241);
+            idxs_217[2] = i_242;
+            ties_218[2] = keys_216[2] == threshold && idxs_217[2] < vocab;
+            unsigned int _vote_89 = __ballot_sync(0xFFFFFFFF, ties_218[2]);
+            unsigned int m_243 = _vote_89;
+            int _popc_120 = __popc(m_243 & lt_mask_165);
+            unsigned int lane_before_244 = (unsigned int)_popc_120;
+            unsigned int warp_off_245 = cnt[96 + warp];
+            strided_219[2] = warp_off_245 + lane_before_244;
+            grp_warp_220 = grp_warp_220 + (warp_off_245 - cnt[96]);
+            grp_lane_221 = grp_lane_221 + lane_before_244;
+            unsigned int bits_246 = __as_u32(vals_b[7]);
+            unsigned int key_247 = ((bits_246 <= 2139095040) ? bits_246 : 0);
+            keys_216[3] = key_247;
+            int i_vec_248 = start + (c_5 + 1) * 8192 + 2048 + tid * 4 + 3;
+            int i_str_249 = start + (c_5 + 1) * 8192 + 3584 + tid;
+            int i_250 = ((aligned) ? i_vec_248 : i_str_249);
+            idxs_217[3] = i_250;
+            ties_218[3] = keys_216[3] == threshold && idxs_217[3] < vocab;
+            unsigned int _vote_90 = __ballot_sync(0xFFFFFFFF, ties_218[3]);
+            unsigned int m_251 = _vote_90;
+            int _popc_121 = __popc(m_251 & lt_mask_165);
+            unsigned int lane_before_252 = (unsigned int)_popc_121;
+            unsigned int warp_off_253 = cnt[112 + warp];
+            strided_219[3] = warp_off_253 + lane_before_252;
+            grp_warp_220 = grp_warp_220 + (warp_off_253 - cnt[112]);
+            grp_lane_221 = grp_lane_221 + lane_before_252;
+            unsigned int grp_base_254 = cnt[64];
+            unsigned int own_255 = 0;
+            unsigned int vec_rank_256 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_257 = ((aligned) ? vec_rank_256 : strided_219[0]);
+            if (keys_216[0] > threshold) {
+                unsigned long long dst_20 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_20] = __uint_as_float(keys_216[0]);
+                out_idx[dst_20] = idxs_217[0];
+                g_166 = g_166 + 1;
+            } else if (ties_218[0] && rank_257 < take_c_164) {
+                unsigned long long dst2_20 = eq_run + (unsigned long long)rank_257;
+                out_vals[dst2_20] = __uint_as_float(keys_216[0]);
+                out_idx[dst2_20] = idxs_217[0];
+            }
+            if (ties_218[0]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_258 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_259 = ((aligned) ? vec_rank_258 : strided_219[1]);
+            if (keys_216[1] > threshold) {
+                unsigned long long dst_21 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_21] = __uint_as_float(keys_216[1]);
+                out_idx[dst_21] = idxs_217[1];
+                g_166 = g_166 + 1;
+            } else if (ties_218[1] && rank_259 < take_c_164) {
+                unsigned long long dst2_21 = eq_run + (unsigned long long)rank_259;
+                out_vals[dst2_21] = __uint_as_float(keys_216[1]);
+                out_idx[dst2_21] = idxs_217[1];
+            }
+            if (ties_218[1]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_260 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_261 = ((aligned) ? vec_rank_260 : strided_219[2]);
+            if (keys_216[2] > threshold) {
+                unsigned long long dst_22 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_22] = __uint_as_float(keys_216[2]);
+                out_idx[dst_22] = idxs_217[2];
+                g_166 = g_166 + 1;
+            } else if (ties_218[2] && rank_261 < take_c_164) {
+                unsigned long long dst2_22 = eq_run + (unsigned long long)rank_261;
+                out_vals[dst2_22] = __uint_as_float(keys_216[2]);
+                out_idx[dst2_22] = idxs_217[2];
+            }
+            if (ties_218[2]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int vec_rank_262 = grp_base_254 + grp_warp_220 + grp_lane_221 + own_255;
+            unsigned int rank_263 = ((aligned) ? vec_rank_262 : strided_219[3]);
+            if (keys_216[3] > threshold) {
+                unsigned long long dst_23 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_23] = __uint_as_float(keys_216[3]);
+                out_idx[dst_23] = idxs_217[3];
+                g_166 = g_166 + 1;
+            } else if (ties_218[3] && rank_263 < take_c_164) {
+                unsigned long long dst2_23 = eq_run + (unsigned long long)rank_263;
+                out_vals[dst2_23] = __uint_as_float(keys_216[3]);
+                out_idx[dst2_23] = idxs_217[3];
+            }
+            if (ties_218[3]) {
+                own_255 = own_255 + 1;
+            }
+            unsigned int keys_264[4];
+            int idxs_265[4];
+            bool ties_266[4];
+            unsigned int strided_267[4];
+            unsigned int grp_warp_268 = 0;
+            unsigned int grp_lane_269 = 0;
+            unsigned int bits_270 = __as_u32(vals_b[8]);
+            unsigned int key_271 = ((bits_270 <= 2139095040) ? bits_270 : 0);
+            keys_264[0] = key_271;
+            int i_vec_272 = start + (c_5 + 1) * 8192 + 4096 + tid * 4;
+            int i_str_273 = start + (c_5 + 1) * 8192 + 4096 + tid;
+            int i_274 = ((aligned) ? i_vec_272 : i_str_273);
+            idxs_265[0] = i_274;
+            ties_266[0] = keys_264[0] == threshold && idxs_265[0] < vocab;
+            unsigned int _vote_91 = __ballot_sync(0xFFFFFFFF, ties_266[0]);
+            unsigned int m_275 = _vote_91;
+            int _popc_122 = __popc(m_275 & lt_mask_165);
+            unsigned int lane_before_276 = (unsigned int)_popc_122;
+            unsigned int warp_off_277 = cnt[128 + warp];
+            strided_267[0] = warp_off_277 + lane_before_276;
+            grp_warp_268 = grp_warp_268 + (warp_off_277 - cnt[128]);
+            grp_lane_269 = grp_lane_269 + lane_before_276;
+            unsigned int bits_278 = __as_u32(vals_b[9]);
+            unsigned int key_279 = ((bits_278 <= 2139095040) ? bits_278 : 0);
+            keys_264[1] = key_279;
+            int i_vec_280 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 1;
+            int i_str_281 = start + (c_5 + 1) * 8192 + 4608 + tid;
+            int i_282 = ((aligned) ? i_vec_280 : i_str_281);
+            idxs_265[1] = i_282;
+            ties_266[1] = keys_264[1] == threshold && idxs_265[1] < vocab;
+            unsigned int _vote_92 = __ballot_sync(0xFFFFFFFF, ties_266[1]);
+            unsigned int m_283 = _vote_92;
+            int _popc_123 = __popc(m_283 & lt_mask_165);
+            unsigned int lane_before_284 = (unsigned int)_popc_123;
+            unsigned int warp_off_285 = cnt[144 + warp];
+            strided_267[1] = warp_off_285 + lane_before_284;
+            grp_warp_268 = grp_warp_268 + (warp_off_285 - cnt[144]);
+            grp_lane_269 = grp_lane_269 + lane_before_284;
+            unsigned int bits_286 = __as_u32(vals_b[10]);
+            unsigned int key_287 = ((bits_286 <= 2139095040) ? bits_286 : 0);
+            keys_264[2] = key_287;
+            int i_vec_288 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 2;
+            int i_str_289 = start + (c_5 + 1) * 8192 + 5120 + tid;
+            int i_290 = ((aligned) ? i_vec_288 : i_str_289);
+            idxs_265[2] = i_290;
+            ties_266[2] = keys_264[2] == threshold && idxs_265[2] < vocab;
+            unsigned int _vote_93 = __ballot_sync(0xFFFFFFFF, ties_266[2]);
+            unsigned int m_291 = _vote_93;
+            int _popc_124 = __popc(m_291 & lt_mask_165);
+            unsigned int lane_before_292 = (unsigned int)_popc_124;
+            unsigned int warp_off_293 = cnt[160 + warp];
+            strided_267[2] = warp_off_293 + lane_before_292;
+            grp_warp_268 = grp_warp_268 + (warp_off_293 - cnt[160]);
+            grp_lane_269 = grp_lane_269 + lane_before_292;
+            unsigned int bits_294 = __as_u32(vals_b[11]);
+            unsigned int key_295 = ((bits_294 <= 2139095040) ? bits_294 : 0);
+            keys_264[3] = key_295;
+            int i_vec_296 = start + (c_5 + 1) * 8192 + 4096 + tid * 4 + 3;
+            int i_str_297 = start + (c_5 + 1) * 8192 + 5632 + tid;
+            int i_298 = ((aligned) ? i_vec_296 : i_str_297);
+            idxs_265[3] = i_298;
+            ties_266[3] = keys_264[3] == threshold && idxs_265[3] < vocab;
+            unsigned int _vote_94 = __ballot_sync(0xFFFFFFFF, ties_266[3]);
+            unsigned int m_299 = _vote_94;
+            int _popc_125 = __popc(m_299 & lt_mask_165);
+            unsigned int lane_before_300 = (unsigned int)_popc_125;
+            unsigned int warp_off_301 = cnt[176 + warp];
+            strided_267[3] = warp_off_301 + lane_before_300;
+            grp_warp_268 = grp_warp_268 + (warp_off_301 - cnt[176]);
+            grp_lane_269 = grp_lane_269 + lane_before_300;
+            unsigned int grp_base_302 = cnt[128];
+            unsigned int own_303 = 0;
+            unsigned int vec_rank_304 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_305 = ((aligned) ? vec_rank_304 : strided_267[0]);
+            if (keys_264[0] > threshold) {
+                unsigned long long dst_24 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_24] = __uint_as_float(keys_264[0]);
+                out_idx[dst_24] = idxs_265[0];
+                g_166 = g_166 + 1;
+            } else if (ties_266[0] && rank_305 < take_c_164) {
+                unsigned long long dst2_24 = eq_run + (unsigned long long)rank_305;
+                out_vals[dst2_24] = __uint_as_float(keys_264[0]);
+                out_idx[dst2_24] = idxs_265[0];
+            }
+            if (ties_266[0]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_306 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_307 = ((aligned) ? vec_rank_306 : strided_267[1]);
+            if (keys_264[1] > threshold) {
+                unsigned long long dst_25 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_25] = __uint_as_float(keys_264[1]);
+                out_idx[dst_25] = idxs_265[1];
+                g_166 = g_166 + 1;
+            } else if (ties_266[1] && rank_307 < take_c_164) {
+                unsigned long long dst2_25 = eq_run + (unsigned long long)rank_307;
+                out_vals[dst2_25] = __uint_as_float(keys_264[1]);
+                out_idx[dst2_25] = idxs_265[1];
+            }
+            if (ties_266[1]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_308 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_309 = ((aligned) ? vec_rank_308 : strided_267[2]);
+            if (keys_264[2] > threshold) {
+                unsigned long long dst_26 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_26] = __uint_as_float(keys_264[2]);
+                out_idx[dst_26] = idxs_265[2];
+                g_166 = g_166 + 1;
+            } else if (ties_266[2] && rank_309 < take_c_164) {
+                unsigned long long dst2_26 = eq_run + (unsigned long long)rank_309;
+                out_vals[dst2_26] = __uint_as_float(keys_264[2]);
+                out_idx[dst2_26] = idxs_265[2];
+            }
+            if (ties_266[2]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int vec_rank_310 = grp_base_302 + grp_warp_268 + grp_lane_269 + own_303;
+            unsigned int rank_311 = ((aligned) ? vec_rank_310 : strided_267[3]);
+            if (keys_264[3] > threshold) {
+                unsigned long long dst_27 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_27] = __uint_as_float(keys_264[3]);
+                out_idx[dst_27] = idxs_265[3];
+                g_166 = g_166 + 1;
+            } else if (ties_266[3] && rank_311 < take_c_164) {
+                unsigned long long dst2_27 = eq_run + (unsigned long long)rank_311;
+                out_vals[dst2_27] = __uint_as_float(keys_264[3]);
+                out_idx[dst2_27] = idxs_265[3];
+            }
+            if (ties_266[3]) {
+                own_303 = own_303 + 1;
+            }
+            unsigned int keys_312[4];
+            int idxs_313[4];
+            bool ties_314[4];
+            unsigned int strided_315[4];
+            unsigned int grp_warp_316 = 0;
+            unsigned int grp_lane_317 = 0;
+            unsigned int bits_318 = __as_u32(vals_b[12]);
+            unsigned int key_319 = ((bits_318 <= 2139095040) ? bits_318 : 0);
+            keys_312[0] = key_319;
+            int i_vec_320 = start + (c_5 + 1) * 8192 + 6144 + tid * 4;
+            int i_str_321 = start + (c_5 + 1) * 8192 + 6144 + tid;
+            int i_322 = ((aligned) ? i_vec_320 : i_str_321);
+            idxs_313[0] = i_322;
+            ties_314[0] = keys_312[0] == threshold && idxs_313[0] < vocab;
+            unsigned int _vote_95 = __ballot_sync(0xFFFFFFFF, ties_314[0]);
+            unsigned int m_323 = _vote_95;
+            int _popc_126 = __popc(m_323 & lt_mask_165);
+            unsigned int lane_before_324 = (unsigned int)_popc_126;
+            unsigned int warp_off_325 = cnt[192 + warp];
+            strided_315[0] = warp_off_325 + lane_before_324;
+            grp_warp_316 = grp_warp_316 + (warp_off_325 - cnt[192]);
+            grp_lane_317 = grp_lane_317 + lane_before_324;
+            unsigned int bits_326 = __as_u32(vals_b[13]);
+            unsigned int key_327 = ((bits_326 <= 2139095040) ? bits_326 : 0);
+            keys_312[1] = key_327;
+            int i_vec_328 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 1;
+            int i_str_329 = start + (c_5 + 1) * 8192 + 6656 + tid;
+            int i_330 = ((aligned) ? i_vec_328 : i_str_329);
+            idxs_313[1] = i_330;
+            ties_314[1] = keys_312[1] == threshold && idxs_313[1] < vocab;
+            unsigned int _vote_96 = __ballot_sync(0xFFFFFFFF, ties_314[1]);
+            unsigned int m_331 = _vote_96;
+            int _popc_127 = __popc(m_331 & lt_mask_165);
+            unsigned int lane_before_332 = (unsigned int)_popc_127;
+            unsigned int warp_off_333 = cnt[208 + warp];
+            strided_315[1] = warp_off_333 + lane_before_332;
+            grp_warp_316 = grp_warp_316 + (warp_off_333 - cnt[208]);
+            grp_lane_317 = grp_lane_317 + lane_before_332;
+            unsigned int bits_334 = __as_u32(vals_b[14]);
+            unsigned int key_335 = ((bits_334 <= 2139095040) ? bits_334 : 0);
+            keys_312[2] = key_335;
+            int i_vec_336 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 2;
+            int i_str_337 = start + (c_5 + 1) * 8192 + 7168 + tid;
+            int i_338 = ((aligned) ? i_vec_336 : i_str_337);
+            idxs_313[2] = i_338;
+            ties_314[2] = keys_312[2] == threshold && idxs_313[2] < vocab;
+            unsigned int _vote_97 = __ballot_sync(0xFFFFFFFF, ties_314[2]);
+            unsigned int m_339 = _vote_97;
+            int _popc_128 = __popc(m_339 & lt_mask_165);
+            unsigned int lane_before_340 = (unsigned int)_popc_128;
+            unsigned int warp_off_341 = cnt[224 + warp];
+            strided_315[2] = warp_off_341 + lane_before_340;
+            grp_warp_316 = grp_warp_316 + (warp_off_341 - cnt[224]);
+            grp_lane_317 = grp_lane_317 + lane_before_340;
+            unsigned int bits_342 = __as_u32(vals_b[15]);
+            unsigned int key_343 = ((bits_342 <= 2139095040) ? bits_342 : 0);
+            keys_312[3] = key_343;
+            int i_vec_344 = start + (c_5 + 1) * 8192 + 6144 + tid * 4 + 3;
+            int i_str_345 = start + (c_5 + 1) * 8192 + 7680 + tid;
+            int i_346 = ((aligned) ? i_vec_344 : i_str_345);
+            idxs_313[3] = i_346;
+            ties_314[3] = keys_312[3] == threshold && idxs_313[3] < vocab;
+            unsigned int _vote_98 = __ballot_sync(0xFFFFFFFF, ties_314[3]);
+            unsigned int m_347 = _vote_98;
+            int _popc_129 = __popc(m_347 & lt_mask_165);
+            unsigned int lane_before_348 = (unsigned int)_popc_129;
+            unsigned int warp_off_349 = cnt[240 + warp];
+            strided_315[3] = warp_off_349 + lane_before_348;
+            grp_warp_316 = grp_warp_316 + (warp_off_349 - cnt[240]);
+            grp_lane_317 = grp_lane_317 + lane_before_348;
+            unsigned int grp_base_350 = cnt[192];
+            unsigned int own_351 = 0;
+            unsigned int vec_rank_352 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_353 = ((aligned) ? vec_rank_352 : strided_315[0]);
+            if (keys_312[0] > threshold) {
+                unsigned long long dst_28 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_28] = __uint_as_float(keys_312[0]);
+                out_idx[dst_28] = idxs_313[0];
+                g_166 = g_166 + 1;
+            } else if (ties_314[0] && rank_353 < take_c_164) {
+                unsigned long long dst2_28 = eq_run + (unsigned long long)rank_353;
+                out_vals[dst2_28] = __uint_as_float(keys_312[0]);
+                out_idx[dst2_28] = idxs_313[0];
+            }
+            if (ties_314[0]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_354 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_355 = ((aligned) ? vec_rank_354 : strided_315[1]);
+            if (keys_312[1] > threshold) {
+                unsigned long long dst_29 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_29] = __uint_as_float(keys_312[1]);
+                out_idx[dst_29] = idxs_313[1];
+                g_166 = g_166 + 1;
+            } else if (ties_314[1] && rank_355 < take_c_164) {
+                unsigned long long dst2_29 = eq_run + (unsigned long long)rank_355;
+                out_vals[dst2_29] = __uint_as_float(keys_312[1]);
+                out_idx[dst2_29] = idxs_313[1];
+            }
+            if (ties_314[1]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_356 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_357 = ((aligned) ? vec_rank_356 : strided_315[2]);
+            if (keys_312[2] > threshold) {
+                unsigned long long dst_30 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_30] = __uint_as_float(keys_312[2]);
+                out_idx[dst_30] = idxs_313[2];
+                g_166 = g_166 + 1;
+            } else if (ties_314[2] && rank_357 < take_c_164) {
+                unsigned long long dst2_30 = eq_run + (unsigned long long)rank_357;
+                out_vals[dst2_30] = __uint_as_float(keys_312[2]);
+                out_idx[dst2_30] = idxs_313[2];
+            }
+            if (ties_314[2]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned int vec_rank_358 = grp_base_350 + grp_warp_316 + grp_lane_317 + own_351;
+            unsigned int rank_359 = ((aligned) ? vec_rank_358 : strided_315[3]);
+            if (keys_312[3] > threshold) {
+                unsigned long long dst_31 = gt_run + (unsigned long long)g_166;
+                out_vals[dst_31] = __uint_as_float(keys_312[3]);
+                out_idx[dst_31] = idxs_313[3];
+                g_166 = g_166 + 1;
+            } else if (ties_314[3] && rank_359 < take_c_164) {
+                unsigned long long dst2_31 = eq_run + (unsigned long long)rank_359;
+                out_vals[dst2_31] = __uint_as_float(keys_312[3]);
+                out_idx[dst2_31] = idxs_313[3];
+            }
+            if (ties_314[3]) {
+                own_351 = own_351 + 1;
+            }
+            unsigned long long gt_next_360 = gt_run + (unsigned long long)gt_total_162;
+            unsigned long long eq_next_361 = eq_run + (unsigned long long)take_c_164;
+            unsigned int rem_next_362 = take_rem - take_c_164;
+            __syncthreads();
+            gt_run = gt_next_360;
+            eq_run = eq_next_361;
+            take_rem = rem_next_362;
+        }
+    }
+    unsigned long long gt_base_w = gt_run + (unsigned long long)before_125;
+    unsigned long long eq_base_w = eq_run + (unsigned long long)before_143;
+    unsigned int eq_take_w = ((before_143 < take_rem) ? take_rem - before_143 : 0);
+    unsigned int lt_mask_2 = (1 << (unsigned int)lane) - 1;
+    unsigned int g_1 = 0;
+    unsigned int t = 0;
+    int niter_161 = (int)(n_eff + 31 >> 5);
+    for (int j_4 = 0; j_4 < niter_161; j_4++) {
+        unsigned int e_4 = (unsigned int)(j_4 * 32 + lane);
+        bool valid_1 = e_4 < n_eff;
+        unsigned int key_42 = ((valid_1) ? lkeys[seg_base + j_4 * 32 + lane] : 0);
+        int idx = ((valid_1) ? lidx[seg_base + j_4 * 32 + lane] : 0);
+        bool is_gt = valid_1 && key_42 > threshold;
+        bool is_tie = valid_1 && key_42 == threshold;
+        unsigned int _vote_99 = __ballot_sync(0xFFFFFFFF, is_gt);
+        unsigned int mg_1 = _vote_99;
+        unsigned int _vote_100 = __ballot_sync(0xFFFFFFFF, is_tie);
+        unsigned int mt_1 = _vote_100;
+        if (valid_1 && key_42 > threshold) {
+            int _popc_130 = __popc(mg_1 & lt_mask_2);
+            unsigned long long dst_32 = gt_base_w + (unsigned long long)(g_1 + (unsigned int)_popc_130);
+            out_vals[dst_32] = __uint_as_float(key_42);
+            out_idx[dst_32] = idx;
+        }
+        if (valid_1 && key_42 == threshold) {
+            int _popc_131 = __popc(mt_1 & lt_mask_2);
+            unsigned int rank_0 = t + (unsigned int)_popc_131;
+            if (rank_0 < eq_take_w) {
+                unsigned long long dst2_32 = eq_base_w + (unsigned long long)rank_0;
+                out_vals[dst2_32] = __uint_as_float(key_42);
+                out_idx[dst2_32] = idx;
+            }
+        }
+        int _popc_132 = __popc(mg_1);
+        g_1 = g_1 + (unsigned int)_popc_132;
+        int _popc_133 = __popc(mt_1);
+        t = t + (unsigned int)_popc_133;
+    }
+    if (rank == 0 && tid == 0) {
+        out_count[row] = k;
+    }
+}
+
+} // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_CNT_OFF
+#undef SMEM_CNT_STAGE_BYTES
+#undef SMEM_CNT_STRIDE
+#undef SMEM_HIST0_OFF
+#undef SMEM_HIST0_STAGE_BYTES
+#undef SMEM_HIST0_STRIDE
+#undef SMEM_HIST1_OFF
+#undef SMEM_HIST1_STAGE_BYTES
+#undef SMEM_HIST1_STRIDE
+#undef SMEM_LIDX_OFF
+#undef SMEM_LIDX_STAGE_BYTES
+#undef SMEM_LIDX_STRIDE
+#undef SMEM_LKEYS_OFF
+#undef SMEM_LKEYS_STAGE_BYTES
+#undef SMEM_LKEYS_STRIDE
+#undef SMEM_SCAL_OFF
+#undef SMEM_SCAL_STAGE_BYTES
+#undef SMEM_SCAL_STRIDE
+#undef SMEM_TOTAL
+#undef SMEM_WARP_SUMS_OFF
+#undef SMEM_WARP_SUMS_STAGE_BYTES
+#undef SMEM_WARP_SUMS_STRIDE
+#undef THREADS
+#undef cnt_addr
+#undef hist0_addr
+#undef hist1_addr
+#undef lidx_addr
+#undef lkeys_addr
+#undef scal_addr
+#undef warp_sums_addr
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
 #define SMEM_SCRATCH_OFF 0
 #define SMEM_SCRATCH_STAGE_BYTES 18528
 #define SMEM_SCRATCH_STRIDE 18528
