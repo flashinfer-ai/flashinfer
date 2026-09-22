@@ -16,11 +16,8 @@ The two trees are **separate backends**:
 - drops are updated independently; never "sync" shared files across the trees.
 
 Current drop: kernel repo commit `c3e2c2a` ("Add token-based launch
-heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
-("Add Green Context execution", reverted by decision — no
-`green_context.py`, no `execution_phase` kwarg, no `split_*` workspace
-regions / token_comm bodies).  Re-exclude that commit's content when
-syncing future drops.
+heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**.
+Preserve this exclusion when syncing future drops.
 
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
@@ -131,7 +128,7 @@ See `TUNING.md` for the supported domains and current commands.
 
 ```
 kernel_src/sm90/pull_style_cutedsl_megakernel/
-├── src/                    ← CuTeDSL kernel implementation
+├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
 │   ├── common/             ← shared constants/host utils (SM90-drop revision)
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
 │   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,
