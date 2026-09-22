@@ -36,6 +36,31 @@ def _exec_in_fresh_namespace(source: str) -> dict:
     return namespace
 
 
+@pytest.mark.parametrize(
+    "name", ["merge_state", "merge_state_in_place", "merge_states"]
+)
+def test_cascade_json_empty_states_standalone(name):
+    doc = json.loads((FI_TRACE_OUT / f"{name}_h32_d128.json").read_text())
+    namespace = _exec_in_fresh_namespace(doc["reference"])
+    reference = namespace[f"_{name}_reference"]
+    v = torch.zeros(2, 32, 128, dtype=torch.bfloat16)
+    s = torch.full((2, 32), -torch.inf)
+    other_v, other_s = v.clone(), s.clone()
+    other_v[1] = 2
+    other_s[1] = -3
+    if name == "merge_states":
+        output, lse = reference(
+            torch.stack((v, other_v), dim=1), torch.stack((s, other_s), dim=1)
+        )
+        empty_v, empty_s = reference(v[:, None][:, :0], s[:, None][:, :0])
+        assert torch.equal(empty_v, v)
+        assert torch.equal(empty_s, s)
+    else:
+        output, lse = reference(v, s, other_v, other_s)
+    torch.testing.assert_close(output.to(other_v), other_v)
+    torch.testing.assert_close(lse, other_s)
+
+
 def test_block_sparse_json_init_and_reference_standalone():
     """The committed block-sparse JSON must exec and run without flashinfer."""
     doc = json.loads(BLOCK_SPARSE_JSON.read_text())
