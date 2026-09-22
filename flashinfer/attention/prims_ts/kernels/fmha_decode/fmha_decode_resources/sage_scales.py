@@ -424,8 +424,8 @@ class SmemSageKScales:
         stage_info: StageInfo,
         scale_arr: cutlass.Array,
         factor: Float32 | None,
-    ) -> tuple[cutlass.Array, Int32, Float32 | None]:
-        """Return the pass's view: the ring, the lane's half base and the factor."""
+    ) -> tuple[cutlass.Pointer, Float32 | None]:
+        """Return the pass's half pointer and factor, resolving the ring base once."""
         _ = scale_arr
         warp_grp_thread_idx = Int32(
             _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
@@ -433,7 +433,8 @@ class SmemSageKScales:
         half_base = self.tile_base(stage_info) + _keeps_spatial_half(
             self.cfg, warp_grp_thread_idx
         ) * Int32(sage_scale_arr_size(self.cfg, self.groups))
-        return self.words(stage_info.context), half_base, factor
+        half_ptr = self.words(stage_info.context).data_ptr() + half_base
+        return half_ptr, factor
 
     @cute.jit
     def fragment(self, view: tuple, fragment_idx: Int32) -> cutlass.Array:
@@ -443,10 +444,10 @@ class SmemSageKScales:
         Callers issue it ahead of the fragment's score wait so the SMEM
         latency hides behind it.
         """
-        buffer, half_base, factor = view
+        half_ptr, factor = view
         groups = self.groups
         assert groups % 4 == 0
-        words_ptr = buffer.data_ptr() + half_base + fragment_idx * Int32(groups)
+        words_ptr = half_ptr + fragment_idx * Int32(groups)
         values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
         for chunk in cutlass.range_constexpr(0, groups, 4):
             loaded = (words_ptr + Int32(chunk)).load(count=4, alignment=16)
