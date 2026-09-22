@@ -894,15 +894,34 @@ OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
   --hidden 7168 --intermediate 3072 --num-experts 384 --top-k 6 \
   --tokens 8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768 \
   --gate-up-clamp 10 --routing-mode block_permutation --no-sparse-data \
-  --warmup 10 --iters 50 --cooldown-s 5
+  --warmup 10 --iters 50 --cooldown-s 5 --output-csv mxfp4-benchmark.csv
 ```
 
 Check the `runtime_tactic` JSON column: it contains the effective configuration;
-a cache miss uses the heuristic. To replay one selected MXFP4 point, use the
-same geometry, token count, routing and timing flags, replace
-`--mxfp4-tactic-source cache_or_heuristic` with `--mxfp4-knobs-json`, and pass
-that complete JSON object as its argument. FP8 uses `--fp8-knobs-json`.
-Manual tactic flags cannot be combined with JSON replay.
+a cache miss uses the heuristic. For example, extract the T2048 configuration
+and replay it with the same workload and timing flags:
+
+```bash
+mxfp4_tactic=$(python - <<'PYCODE'
+import csv
+with open("mxfp4-benchmark.csv", newline="") as stream:
+    row = next(row for row in csv.DictReader(stream)
+               if row["tokens_per_rank"] == "2048" and row["status"] == "pass")
+print(row["runtime_tactic"])
+PYCODE
+)
+OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
+  benchmarks/bench_moe_ep_sm90_mega.py \
+  --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --scale-mode mxfp4_hybrid \
+  --mxfp4-knobs-json "$mxfp4_tactic" \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --top-k 6 --tokens 2048 \
+  --gate-up-clamp 10 --routing-mode block_permutation --no-sparse-data \
+  --warmup 10 --iters 50 --cooldown-s 5 --output-csv mxfp4-replay.csv
+```
+
+FP8 uses `--fp8-knobs-json` with its own complete `runtime_tactic` object.
+Manual tactic flags cannot be combined with JSON replay. Use a CSV reader
+when extracting records: the JSON field contains quoted commas.
 
 The benchmark preserves the original FP8 CSV prefix and its statistics.
 `compute_max_rank_median_us` reports the maximum rank median separately;
