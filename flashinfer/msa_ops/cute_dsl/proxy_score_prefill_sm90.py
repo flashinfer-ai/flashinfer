@@ -692,3 +692,98 @@ def select_split_k(total_q, hq, batch_size, nkt):
     return best_nk
 
 
+
+
+# --- CUDA-graph stream plumbing (see proxy_score_decode_sm90 for rationale) ---
+import torch
+import cuda.bindings.driver as _kf_cuda
+
+_KF_STREAMS = {}
+
+
+def _kf_stream():
+    h = torch.cuda.current_stream().cuda_stream
+    s = _KF_STREAMS.get(h)
+    if s is None:
+        s = _kf_cuda.CUstream(h)
+        _KF_STREAMS[h] = s
+    return s
+
+
+_CACHE = {}
+
+
+def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):
+    total_q, hq, _ = q.shape
+    batch_size = seqused_k.shape[0]
+    nkt = page_table.shape[1]
+    nkchunk = select_split_k(total_q, hq, batch_size, nkt)
+    n_mtiles = (total_q // batch_size + 127) // 128
+    # Derived inside the kernel object while shapes were static; with dynamic
+    # shapes these are the only compile-time selections left, so the driver
+    # computes them and they alone key the cache.
+    use_tma_q = (total_q // batch_size) % 128 == 0
+    fold = 1 if n_mtiles * 16 >= nkt else 0
+
+    key = (hq, k.shape[2], k.shape[3], use_tma_q, fold)
+    op = _CACHE.get(key)
+    if op is None:
+        kern = MsaProxyScore(
+            nsub=1,
+            nstage=4,
+            page=k.shape[2],
+            head_dim=k.shape[3],
+            hq=hq,
+            use_tma_q=use_tma_q,
+            fold=fold,
+        )
+        args = (
+            from_dlpack(q, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
+                leading_dim=2
+            ),
+            from_dlpack(k, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
+                leading_dim=3
+            ),
+            from_dlpack(
+                max_score, assumed_align=16, enable_tvm_ffi=True
+            ).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(
+                cu_seqlens_q, assumed_align=4, enable_tvm_ffi=True
+            ).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(
+                page_table, assumed_align=4, enable_tvm_ffi=True
+            ).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(
+                seqused_k, assumed_align=4, enable_tvm_ffi=True
+            ).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(
+                prefix_lens, assumed_align=4, enable_tvm_ffi=True
+            ).mark_layout_dynamic(leading_dim=0),
+        )
+        op = cute.compile(
+            kern,
+            _kf_stream(),
+            *args,
+            cutlass.Int32(total_q),
+            cutlass.Int32(nkt),
+            cutlass.Int32(batch_size),
+            cutlass.Int32(nkchunk),
+            cutlass.Int32(n_mtiles),
+            options="--enable-tvm-ffi",
+        )
+        _CACHE[key] = op
+    op(
+        _kf_stream(),
+        q,
+        k,
+        max_score,
+        cu_seqlens_q,
+        page_table,
+        seqused_k,
+        prefix_lens,
+        total_q,
+        nkt,
+        batch_size,
+        nkchunk,
+        n_mtiles,
+    )
