@@ -11,6 +11,14 @@ import torch
 
 _BLK_KV = 128
 
+# The SM90 sparse-prefill union schedule is correct only while a sequence's
+# page list stays small: measured exact at max_pages_per_seq 64/320/560 and
+# WRONG at 1408/2344/3520 (~8% of elements outside tolerance -- it does not
+# fail, it silently mis-attends). The campaign dispatcher keyed on TOTAL
+# pages, which is why it routed these shapes into the bad path. 800 keeps
+# margin below the measured cliff.
+_MPG_MAX = 800
+
 
 def _prefix_lens(cu_seqlens_q: torch.Tensor, seqused_k: torch.Tensor) -> torch.Tensor:
     """Tokens already resident before this chunk, per sequence.
@@ -154,7 +162,16 @@ def _as_packed_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             "(v must be the second half of k's last dim); separate allocations "
             "would need a full-cache copy per call"
         )
-    base = k.as_strided(k.shape[:-1] + (2 * d,), k.stride()[:-1] + (1,), 0)
+    # Preserve k's storage offset: a per-layer KV cache is a view into a pool, so
+    # hardcoding 0 would silently read the wrong memory rather than fail.
+    base = k.as_strided(
+        k.shape[:-1] + (2 * d,), k.stride()[:-1] + (1,), k.storage_offset()
+    )
+    if base.data_ptr() != k.data_ptr():
+        raise NotImplementedError(
+            "SM90 sparse attention could not rebuild the packed KV view "
+            "(reconstructed base does not start at k)"
+        )
     return base
 
 
@@ -203,6 +220,12 @@ def sparse_prefill_sm90(
     v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """MSA sparse prefill attention on Hopper. Writes ``out``."""
+    mpg = int(page_table.shape[1])
+    if mpg > _MPG_MAX:
+        raise NotImplementedError(
+            f"SM90 sparse prefill is correct only for max_pages_per_seq <= {_MPG_MAX}, "
+            f"got {mpg}; the union schedule silently mis-attends above that"
+        )
     from .cute_dsl.sparse_prefill_sm90 import run as _prefill
 
     kv = _as_packed_kv(k, v)
