@@ -37,9 +37,7 @@ from .ptx_helpers import (
     read_clock64,
     red_add_relaxed_sys_u64_raw,
     red_add_release_gpu_s32,
-    atom_cas_acquire_gpu_u64_raw,
     red_add_release_gpu_u64_raw,
-    st_release_gpu_u64_raw,
     red_add_release_sys_s32_raw,
     red_add_release_sys_u64_raw,
     stg_b32_raw,
@@ -422,9 +420,6 @@ class TokenInPullTokenBackPush:
         grouped_token_back: bool = False,
         active_dispatch_warps: int = 4,
         compact_pull_buffer: bool = False,
-        # Receiver-side dispatch rank cache (see the ctor body); rank-local,
-        # no wire change, mutually exclusive with dedup_dispatch.
-        dispatch_rank_cache: bool = False,
         # Tail-split pair tasks: an expert with an odd CTA token-tile count publishes
         # fc2_done this many times for its last cluster tile (0 = off);
         # cta_tile_tokens (cluster_tile_tokens / 2) detects the odd count.
@@ -470,30 +465,6 @@ class TokenInPullTokenBackPush:
                     f"max_tokens_per_rank*num_topk={max_tokens_per_rank * num_topk} "
                     "must stay below 2**30."
                 )
-        # Dispatch rank cache: the receiver-side-only variant of the dedup
-        # above.  A (src_rank, src_token) row that several top-k routes bring
-        # to this rank is pulled over NVLink once by whichever route claims
-        # the table entry first (CAS 0 -> claim); routes that find the entry
-        # published copy the local pool row, routes that find the claim still
-        # in flight fall back to the peer pull WITHOUT waiting.  No sender
-        # election, no route-word flags (rank-local, not collective) and no
-        # wait edges; the price is that in-flight duplicates are not saved.
-        # Bit-exact with the plain pull (same bytes reach every pool row).
-        self.dispatch_rank_cache = dispatch_rank_cache
-        if dispatch_rank_cache:
-            if dedup_dispatch:
-                raise ValueError(
-                    "dispatch_rank_cache and dedup_dispatch both drive the "
-                    "carrier table; enable only one."
-                )
-            if max_tokens_per_rank <= 0:
-                raise ValueError(
-                    "dispatch_rank_cache requires max_tokens_per_rank > 0 "
-                    "(cache-table extent)."
-                )
-        # Either mode copies published pool rows locally through the same
-        # pull pipeline; this gates that shared code.
-        self.pool_row_reuse = dedup_dispatch or dispatch_rank_cache
 
         # Grouped token-back (combine dedup): all pool rows of one
         # (src_rank, src_token) group are pre-reduced in fp32 by the LAST row
@@ -1119,7 +1090,6 @@ class TokenInPullTokenBackPush:
         lane_idx,
         *,
         num_sms,
-        local_rank,
     ):
         # MemRange does not support dynamic indexing here; use raw pointers.
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
@@ -1331,42 +1301,6 @@ class TokenInPullTokenBackPush:
                         if carrier_entry >= Int64(0):
                             _nanosleep(200)
 
-                if cutlass.const_expr(self.dispatch_rank_cache):
-                    # Claim or look up the (src_rank, src_token) cache entry:
-                    # 0 = free, 1 = claimed and in flight, bit63 set (negative)
-                    # = published pool rows (same packing as the dedup entry).
-                    # Lane 0 runs the CAS and the result is broadcast in two
-                    # 32-bit halves.  Self-rank routes read local HBM anyway
-                    # and stay out of the table (sentinel = in flight, i.e.
-                    # plain pull, no publish).
-                    tbl_ptr = carrier_row_table.iterator + (
-                        current_rank_in_expert_idx
-                        * Int32(self.max_tokens_per_rank)
-                        + src_token
-                    )
-                    tbl_addr_i64 = tbl_ptr.toint()
-                    cache_lo = Int32(1)
-                    cache_hi = Int32(0)
-                    if current_rank_in_expert_idx != Int32(local_rank):
-                        if lane_idx == Int32(0):
-                            cache_old = atom_cas_acquire_gpu_u64_raw(
-                                tbl_addr_i64, Int64(0), Int64(1)
-                            )
-                            cache_lo = Int32(cache_old & Int64(0xFFFFFFFF))
-                            cache_hi = Int32(cache_old >> Int64(32))
-                        cache_lo = cute.arch.shuffle_sync(cache_lo, Int32(0))
-                        cache_hi = cute.arch.shuffle_sync(cache_hi, Int32(0))
-                    cache_entry = (Int64(cache_hi) << Int64(32)) | (
-                        Int64(cache_lo) & Int64(0xFFFFFFFF)
-                    )
-                    if cache_entry == Int64(0):
-                        # First route for this row on this rank: pull and publish.
-                        publish_carrier = Int32(1)
-                    elif cache_entry < Int64(0):
-                        # Published: copy the local pool row instead.
-                        is_dup_route = Int32(1)
-                        carrier_entry = cache_entry
-
                 cur_peer_offset = peer_rank_ptr_mapper.map(
                     Int64(0), current_rank_in_expert_idx, Int64(0)
                 )
@@ -1374,12 +1308,12 @@ class TokenInPullTokenBackPush:
                 inp_sf_local_base = input_sf_buffer.iterator.toint()
                 inp_w_local_base = input_topk_weights_buffer.iterator.toint()
                 pool_sf_local_base = Int64(0)
-                if cutlass.const_expr(self.pool_row_reuse):
+                if cutlass.const_expr(self.dedup_dispatch):
                     pool_sf_local_base = fc1_input_sf_buffer.iterator.toint()
 
                 data_src_addr = Int64(0)
                 dedup_sf_axis = Int32(0)
-                if cutlass.const_expr(self.pool_row_reuse):
+                if cutlass.const_expr(self.dedup_dispatch):
                     # Duplicate route: bulk-copy the carrier's local pool row
                     # instead of re-pulling over NVLink.  Branchless select
                     # keeps every value at loop-body scope (region-nested
@@ -1405,7 +1339,7 @@ class TokenInPullTokenBackPush:
                     pull_buffer_warp_ptr = pull_buffer_ptr + (
                         warp_idx * Int32(self.hidden_bytes)
                     )
-                    if cutlass.const_expr(self.pool_row_reuse):
+                    if cutlass.const_expr(self.dedup_dispatch):
                         tma_load_1d_raw(
                             pull_buffer_warp_ptr,
                             data_src_addr,
@@ -1456,7 +1390,7 @@ class TokenInPullTokenBackPush:
                                 * Int32(4)
                             )
                         )
-                        if cutlass.const_expr(self.pool_row_reuse):
+                        if cutlass.const_expr(self.dedup_dispatch):
                             # Duplicate route: the carrier already staged this
                             # token's SF words into the local pool (identical
                             # per-token layout for both rows); branchless
@@ -1580,7 +1514,7 @@ class TokenInPullTokenBackPush:
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0)
 
-                if cutlass.const_expr(self.pool_row_reuse):
+                if cutlass.const_expr(self.dedup_dispatch):
                     # Publish this row for the waiting duplicate routes.  The
                     # row's payload TMA store is drained (wait_group above,
                     # by the elected lane -- the sync_warp orders that drain
@@ -1597,11 +1531,7 @@ class TokenInPullTokenBackPush:
                         | Int64(pool_token_idx)
                     )
                     if (publish_carrier == Int32(1)) and (lane_idx == Int32(0)):
-                        if cutlass.const_expr(self.dispatch_rank_cache):
-                            # The slot holds the claim marker (1): overwrite.
-                            st_release_gpu_u64_raw(tbl_addr_i64, packed_entry)
-                        else:
-                            red_add_release_gpu_u64_raw(tbl_addr_i64, packed_entry)
+                        red_add_release_gpu_u64_raw(tbl_addr_i64, packed_entry)
 
                 if _iket_pull_emit:
                     _iket.range_pop()  # Pull.TMA_Store
@@ -2415,7 +2345,6 @@ class TokenInPullTokenBackPush:
             local_warp_idx,
             lane_idx,
             num_sms=token_comm_args.sm_count,
-            local_rank=token_comm_args.local_rank,
         )
 
         if iket_active:

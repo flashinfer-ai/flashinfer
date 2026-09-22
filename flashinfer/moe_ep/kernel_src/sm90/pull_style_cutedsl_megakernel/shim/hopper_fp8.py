@@ -153,14 +153,6 @@ class MegaMoEHopperFp8Config:
     # are re-materialized locally from the carrier row.  Bit-exact with the
     # non-dedup path (same payload bytes end up in every pool row).
     dedup_dispatch: bool = False
-    # Receiver-side dispatch rank cache: the first top-k route that brings a
-    # (src_rank, src_token) row to this rank claims a rank-local table entry,
-    # pulls over NVLink and publishes its pool row; later routes for the same
-    # row copy the local pool row, or fall back to the peer pull without
-    # waiting when the first pull is still in flight.  Bit-exact, rank-local
-    # (no wire change, NOT collective), no wait edges; exclusive with
-    # dedup_dispatch, which saves every duplicate but waits for the carrier.
-    dispatch_rank_cache: bool = False
     # Combine dedup: all fc2 rows of one (src_rank, src_token) group are
     # pre-reduced in fp32 on the expert rank and ONE row per contributing
     # rank crosses the wire (inbox keyed by rank instead of topk slot).
@@ -293,11 +285,6 @@ class MegaMoEHopperFp8Config:
             raise ValueError(
                 f"active_dispatch_warps must be 1, 2, or 4; got "
                 f"{self.active_dispatch_warps!r}."
-            )
-        if self.dispatch_rank_cache and self.dedup_dispatch:
-            raise ValueError(
-                "dispatch_rank_cache and dedup_dispatch are mutually exclusive "
-                "(both drive the carrier table); enable only one."
             )
         if self.combine_format not in ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"):
             raise ValueError(
@@ -680,8 +667,6 @@ class MegaMoEHopperFp8Frontend:
             c.in_kernel_fc2_reduce,
             c.resolved_token_back_mode,
             c.tail_split_pairs,
-            c.dedup_dispatch,
-            c.dispatch_rank_cache,
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
@@ -792,7 +777,6 @@ class MegaMoEHopperFp8Frontend:
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
             dedup_dispatch=c.dedup_dispatch,
-            dispatch_rank_cache=c.dispatch_rank_cache,
             grouped_token_back=c.grouped_token_back,
             combine_format=c.combine_format,
             active_dispatch_warps=c.active_dispatch_warps,
@@ -1370,7 +1354,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
     ] = None,
     dedup_dispatch: bool = False,
-    dispatch_rank_cache: bool = False,
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
@@ -1541,7 +1524,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         token_back_by_dispatch=token_back_by_dispatch,
         token_back_mode=token_back_mode,
         dedup_dispatch=dedup_dispatch,
-        dispatch_rank_cache=dispatch_rank_cache,
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,

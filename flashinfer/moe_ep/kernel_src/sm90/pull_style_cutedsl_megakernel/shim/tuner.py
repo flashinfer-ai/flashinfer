@@ -59,10 +59,6 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     # COLLECTIVE: changes the route-word wire format -- all EP ranks must
     # agree (a mixed on/off pair mis-decodes the flag bits).
     "dedup_dispatch": (False, True),
-    # Receiver-side rank cache for duplicate (src_rank, src_token) rows:
-    # bit-exact, rank-local (no wire coupling), never waits.  Exclusive with
-    # dedup_dispatch.
-    "dispatch_rank_cache": (False, True),
     # How many of the 4 dispatch warps do token-comm work (the rest idle);
     # output-invariant partitioning (rank-local, no wire-format coupling).
     "active_dispatch_warps": (1, 2, 4),
@@ -172,8 +168,6 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
     if in_kernel and not apply_topk_in_fc1:
         return False
     if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
-        return False
-    if knobs.get("dedup_dispatch", False) and knobs.get("dispatch_rank_cache", False):
         return False
     grouped = bool(knobs.get("grouped_token_back", False))
     combine_format = knobs.get("combine_format", "bf16")

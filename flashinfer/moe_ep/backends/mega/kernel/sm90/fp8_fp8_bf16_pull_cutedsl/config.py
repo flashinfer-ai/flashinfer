@@ -84,11 +84,6 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # COLLECTIVE: changes the route-word wire format, so it MUST match on
     # every EP rank (like the geometry knobs).
     dedup_dispatch: bool = False
-    # Receiver-side dispatch rank cache: duplicate (src_rank, src_token) rows
-    # on this rank copy the first route's pool row once it is published, and
-    # fall back to the peer pull (no waiting) while it is in flight.
-    # Bit-exact, rank-local (NOT collective).  Exclusive with dedup_dispatch.
-    dispatch_rank_cache: bool = False
     # Combine dedup: fc2 rows of one (src_rank, src_token) group are
     # pre-reduced in fp32 on the expert rank; one row per contributing rank
     # crosses the wire.  Requires token_back_mode="reuse_dispatch_warps";
