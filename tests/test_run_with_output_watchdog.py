@@ -9,6 +9,24 @@ from pathlib import Path
 WATCHDOG = Path(__file__).parents[1] / "scripts" / "run_with_output_watchdog.py"
 
 
+def assert_process_stopped(pid: int, message: str) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        stat_path = Path("/proc") / str(pid) / "stat"
+        if (
+            stat_path.is_file()
+            and stat_path.read_text().rpartition(")")[2].split()[0] == "Z"
+        ):
+            return
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    raise AssertionError(message)
+
+
 def run_watchdog(
     *command: str, timeout_seconds: str = "5"
 ) -> subprocess.CompletedProcess:
@@ -101,22 +119,7 @@ time.sleep(30)
     )
 
     descendant_pid = int(descendant_pid_file.read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(descendant_pid, 0)
-        except ProcessLookupError:
-            break
-        stat_path = Path("/proc") / str(descendant_pid) / "stat"
-        if (
-            stat_path.is_file()
-            and stat_path.read_text().rpartition(")")[2].split()[0] == "Z"
-        ):
-            break
-        time.sleep(0.05)
-    else:
-        os.kill(descendant_pid, signal.SIGKILL)
-        raise AssertionError("watchdog left a live descendant behind")
+    assert_process_stopped(descendant_pid, "watchdog left a live descendant behind")
 
     assert result.returncode == 124
 
@@ -126,6 +129,16 @@ def test_watchdog_terminates_command_when_diagnostics_write_fails(
 ) -> None:
     invalid_parent = tmp_path / "not-a-directory"
     invalid_parent.write_text("file")
+    child_pid_file = tmp_path / "child.pid"
+    command = """
+import os
+import pathlib
+import sys
+import time
+
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(30)
+"""
     result = subprocess.run(
         [
             sys.executable,
@@ -139,7 +152,8 @@ def test_watchdog_terminates_command_when_diagnostics_write_fails(
             "--",
             sys.executable,
             "-c",
-            "import time; time.sleep(30)",
+            command,
+            str(child_pid_file),
         ],
         check=False,
         capture_output=True,
@@ -150,3 +164,5 @@ def test_watchdog_terminates_command_when_diagnostics_write_fails(
 
     assert result.returncode == 124
     assert "watchdog could not write" in result.stderr
+    child_pid = int(child_pid_file.read_text())
+    assert_process_stopped(child_pid, "watchdog left the child running")
