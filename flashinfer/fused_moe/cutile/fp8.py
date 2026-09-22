@@ -151,9 +151,12 @@ def _amax_partials_rows_impl(
         ct.load(X, (ct.bid(0),), (4096,), padding_mode=ct.PaddingMode.ZERO),
         ct.float32,
     )
-    offsets = ct.bid(0) * 4096 + ct.arange(4096, dtype=ct.int32)
+    block = ct.bid(0)
+    lanes = ct.arange(4096, dtype=ct.int32)
     if I64:
-        offsets = ct.astype(offsets, ct.int64)
+        block = ct.astype(block, ct.int64)
+        lanes = ct.astype(lanes, ct.int64)
+    offsets = block * 4096 + lanes
     valid_elements = (
         ct.astype(ct.load(POST_PAD, (0,), (1,)).item(), offsets.dtype) * ROW_SIZE
     )

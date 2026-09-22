@@ -2116,6 +2116,43 @@ def test_cutile_fp8_tail_graph_and_int64(monkeypatch):
     torch.testing.assert_close(captured, wide * 0.5, atol=0, rtol=0)
 
 
+def test_cutile_fp8_gated_tail_uses_unfused_path():
+    mode = _CUTILE_FP8_MODES[4]
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(
+        mode, SwiGLU(), tokens=4, hidden=160, inter=160
+    )
+    tactic = (1, *runner._fallback_tactic(inputs))
+
+    actual = runner.forward(inputs, tactic)
+
+    torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.04)
+
+
+def test_cutile_fp8_gated_tail_rejects_fused_gemm1_quant(monkeypatch):
+    mode = _CUTILE_FP8_MODES[4]
+    runner, inputs, _, _, _ = _make_cutile_fp8_case(
+        mode, SwiGLU(), tokens=128, hidden=160, inter=160
+    )
+    fallback = runner._fallback_tactic(inputs)
+    ranked = (1, *fallback)
+    monkeypatch.setattr(
+        runner, "_factorized_sorted_tactics", lambda inputs, mode: [ranked]
+    )
+
+    assert all(tactic[0] != 5 for tactic in runner.get_valid_tactics(inputs, None))
+
+    tactic = [5, *fallback]
+    tactic[2:5] = (128, 128, 2)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "gated fused GEMM1 quantization requires intermediate_size=160 "
+            "to be divisible by tile_n=128"
+        ),
+    ):
+        runner.forward(inputs, tuple(tactic))
+
+
 @pytest.mark.parametrize("mode", (_CUTILE_FP8_MODES[1], _CUTILE_FP8_MODES[3]))
 def test_cutile_fp8_gated_activation_int64_matches_int32(monkeypatch, mode):
     runner, inputs, _, _, _ = _make_cutile_fp8_case(mode, SwiGLU())

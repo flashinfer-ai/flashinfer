@@ -3713,6 +3713,25 @@ class _CuTileFp8Runner(CuTileBf16Runner):
         )
         return modes
 
+    def _fused_gemm1_quant_rejection_reason(
+        self, gemm1_config: tuple[int, int, int]
+    ) -> str | None:
+        if not (self._activation_fp8 and self._block_scaled):
+            return "fused GEMM1 quantization requires MXFP8 activations"
+        if self.config.activation.is_gated != self._weight_fp4:
+            return (
+                "fused GEMM1 quantization supports gated MXFP4 weights or "
+                "ungated FP8/MXFP8 weights"
+            )
+        tile_n = gemm1_config[0]
+        intermediate_size = self.config.experts.intermediate_size
+        if self.config.activation.is_gated and intermediate_size % tile_n:
+            return (
+                f"gated fused GEMM1 quantization requires intermediate_size="
+                f"{intermediate_size} to be divisible by tile_n={tile_n}"
+            )
+        return None
+
     def _persistent_factors(self) -> tuple[int, int]:
         # Cold-L2 model-shape sweeps favor different resident grids by MMA path.
         if self._device_arch == 90:
@@ -3940,25 +3959,21 @@ class _CuTileFp8Runner(CuTileBf16Runner):
         rows_per_expert = (
             inputs[2].numel() + self.config.routing.num_experts - 1
         ) // self.config.routing.num_experts
-        if (
-            self._activation_fp8
-            and self._block_scaled
-            and (
-                (self.config.activation.is_gated and self._weight_fp4)
-                or (not self.config.activation.is_gated and not self._weight_fp4)
-            )
-            and rows_per_expert >= 64
-        ):
+        if self._activation_fp8 and self._block_scaled and rows_per_expert >= 64:
             # Gated fusion uses the measured register-safe GEMM1 tile; ungated
             # fusion reuses the independently ranked GEMM1 winner. Pair either
             # with two ranked GEMM2 winners for the end-to-end decision.
-            fused_gemm1 = (
-                (128, 128, 2) if self.config.activation.is_gated else ranked[0][2:5]
+            fused_gemm1: tuple[int, int, int] = (
+                (128, 128, 2)
+                if self.config.activation.is_gated
+                else (ranked[0][2], ranked[0][3], ranked[0][4])
             )
-            gemm2 = list(dict.fromkeys(tactic[5:8] for tactic in ranked))[:2]
-            sorted_tactics.extend(
-                (5, ranked[0][1], *fused_gemm1, *gemm2_config) for gemm2_config in gemm2
-            )
+            if self._fused_gemm1_quant_rejection_reason(fused_gemm1) is None:
+                gemm2 = list(dict.fromkeys(tactic[5:8] for tactic in ranked))[:2]
+                sorted_tactics.extend(
+                    (5, ranked[0][1], *fused_gemm1, *gemm2_config)
+                    for gemm2_config in gemm2
+                )
         return list(dict.fromkeys((*gather, *sorted_tactics)))
 
     def pack_inputs(
@@ -4043,12 +4058,12 @@ class _CuTileFp8Runner(CuTileBf16Runner):
             values = tuple(rest)
         if mode not in range(6):
             raise ValueError(f"unsupported cuTile FP8 execution mode {mode}.")
-        if mode == 5 and not (self._activation_fp8 and self._block_scaled):
-            raise ValueError(
-                "cuTile fused GEMM1 quantization requires MXFP8 activations."
-            )
         block, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = values
         configs = ((g1_n, g1_k, g1_occ), (g2_n, g2_k, g2_occ))
+        if mode == 5:
+            reason = self._fused_gemm1_quant_rejection_reason(configs[0])
+            if reason is not None:
+                raise ValueError(f"cuTile {reason}.")
         if block not in self._block_sizes:
             raise ValueError(f"unsupported cuTile FP8 block size {block}.")
         for stage, tile in enumerate(configs, start=1):
