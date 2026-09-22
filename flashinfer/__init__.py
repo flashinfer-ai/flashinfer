@@ -216,6 +216,7 @@ from .kda_prefill import (
 )
 from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
+from .kda_chunk_train import chunk_kda_backward as chunk_kda_backward
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
 from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
