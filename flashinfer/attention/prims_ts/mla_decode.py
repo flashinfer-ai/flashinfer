@@ -2345,14 +2345,16 @@ def _resolve_sparse_mla_plan(
         packed_query=False,
         device_scales=True,
     )
+    # Only a second source can require an independent attention pass.
+    source_slots = 2 if max_extra_topk else 1
     sections = {}
     byte_end = 0
     for name, shape, dtype in (
         ("core", (core_bytes,), torch.int8),
-        ("partial", (2, max_rows, 1, num_heads, 512), torch.bfloat16),
+        ("partial", (source_slots, max_rows, 1, num_heads, 512), torch.bfloat16),
         # Both source views must satisfy the core's 16-byte base alignment,
         # including H6/H12 and odd maximum query counts.
-        ("lse", (2, (max_rows + 3) // 4 * 4, 1, num_heads), torch.float32),
+        ("lse", (source_slots, (max_rows + 3) // 4 * 4, 1, num_heads), torch.float32),
         ("public_lse", (max_rows, num_heads), torch.float32),
     ):
         sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
@@ -2919,11 +2921,14 @@ class BatchSparseMLADecodePagedTSWrapper:
                     ),
                 )
             if not fused:
+                other_slot = 1 if independent else 0
                 state["finish"][int(independent)](
                     buffers["partial"][0, :rows].view(rows, state["heads"], 512),
-                    buffers["partial"][1, :rows].view(rows, state["heads"], 512),
+                    buffers["partial"][other_slot, :rows].view(
+                        rows, state["heads"], 512
+                    ),
                     buffers["lse"][0, :rows].view(rows, state["heads"]),
-                    buffers["lse"][1, :rows].view(rows, state["heads"]),
+                    buffers["lse"][other_slot, :rows].view(rows, state["heads"]),
                     buffers["counts"][0, :rows],
                     buffers["counts"][1 if independent else 0, :rows],
                     sinks,

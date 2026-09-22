@@ -1262,6 +1262,8 @@ class SmemKVResource(HighThroughputMlaResource):
                             col_stride=cfg.mma_qk_tiler_k,
                         )
                 else:
+                    # PV consumes the delayed current-V window; the tail can
+                    # instead request the compact pending-V coordinates.
                     cached = cached_next_v_pages if use_next_v_pages else cached_v_pages
                     pv_j = subtile_idx // cfg.kv_subtiles_per_stage
                     token_partition = subtile_idx % cfg.kv_subtiles_per_stage
@@ -1306,6 +1308,7 @@ class SmemKVResource(HighThroughputMlaResource):
                                 col_stride=64,
                             )
                 return
+            # Fewer issuers reconstruct quads from compact lane fragments.
             if cutlass.const_expr(not is_v):
                 for part in cutlass.range_constexpr(cfg.kv_subtiles_per_stage):
                     column = Int32(

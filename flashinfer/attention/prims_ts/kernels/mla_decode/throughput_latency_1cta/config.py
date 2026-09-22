@@ -1884,14 +1884,14 @@ def configure_sparse_mla(
         roles = dict(
             threads_per_cta=768 if issuers == 8 else 640,
             load_warp_idx=16,
-            softmax_regs=128
-            if uniform
-            else 96
+            softmax_regs=96
             if balanced
+            else 128
+            if uniform
             else 144
             if cfg.tile_size_q == 32
             else 160,
-            correction_regs=192 if uniform else 96 if balanced else cfg.correction_regs,
+            correction_regs=96 if balanced else 192 if uniform else cfg.correction_regs,
             mma_load_regs=(64 if issuers == 8 else 96)
             if balanced
             else 96
