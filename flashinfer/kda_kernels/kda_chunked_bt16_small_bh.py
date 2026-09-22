@@ -24,6 +24,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.core import _pack_shape
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
+from flashinfer.cute_dsl.utils import get_max_active_clusters
 
 
 RCP_LN2 = 1.4426950408889634
@@ -3111,10 +3112,7 @@ def chunk_kda_fwd(
     max_active_clusters: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if max_active_clusters <= 0:
-        device_id = torch.cuda.current_device()
-        max_active_clusters = cutlass.utils.HardwareInfo(
-            device_id
-        ).get_max_active_clusters(cluster_size=1)
+        max_active_clusters = get_max_active_clusters(1)
     qd, kd, kr, mqk, mkk, gk = chunk_kda_fwd_k1(
         q,
         k,

@@ -545,7 +545,7 @@ def test_auto_backend_falls_through_when_small_bh_cannot_run(
 
 @pytest.mark.parametrize(
     ("lower_bound", "expected_gate_scale", "expected_gate_lower_bound"),
-    ((-5.0, -5.0, True), (None, 1.0, False)),
+    ((-5.0, -5.0, True),),
 )
 def test_small_bh_dense_runner_translates_gate_and_reuses_initial_state(
     monkeypatch,

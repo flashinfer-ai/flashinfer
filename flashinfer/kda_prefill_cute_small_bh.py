@@ -38,7 +38,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 
 def _is_valid_lower_bound(lower_bound: Optional[float]) -> bool:
     if lower_bound is None:
-        return True
+        return False
     try:
         value = float(lower_bound)
     except (TypeError, ValueError, OverflowError):
