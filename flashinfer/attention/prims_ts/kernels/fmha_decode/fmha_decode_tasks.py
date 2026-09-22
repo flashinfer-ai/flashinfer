@@ -2964,7 +2964,9 @@ def _softmax_schedule_body(
             if cutlass.const_expr(cfg.use_sage_attention):
                 # The route's staged ``sfK`` words go where the strategy keeps
                 # them: the lane's array or the instance's SMEM ring.
-                sage_scale_arr = sparse_softmax_metadata.load_route_sage_k_scales()
+                sage_scale_arr = sparse_softmax_metadata.load_route_sage_k_scales(
+                    route_flags=sparse_route_flags
+                )
             sparse_softmax_metadata.release()
         if cutlass.const_expr(cfg.use_sage_attention and not use_sparse):
             # A dense tile's ``sfK`` loads are issued ahead of the score wait

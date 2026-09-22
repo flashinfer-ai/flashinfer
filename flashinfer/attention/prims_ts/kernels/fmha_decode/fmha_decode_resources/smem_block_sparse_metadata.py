@@ -1323,13 +1323,16 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
 
     @consumer_work(returns=softmax_sage_k_scales)
     @cute.jit
-    def load_route_sage_k_scales(self, stage_info: StageInfo) -> cutlass.Array:
+    def load_route_sage_k_scales(
+        self, stage_info: StageInfo, *, route_flags: Int32
+    ) -> cutlass.Array:
         """Take the route's staged ``sfK`` words before the stage is released.
 
         The staged block has the ``sage_k_scale_words`` layout, so the strategy
         copies the words it keeps (the lane's half into its array, or the whole
         block into the instance's SMEM ring) and returns the routed
-        ``sage_scale_arr``. Must run before ``release``, like ``load_route``.
+        ``sage_scale_arr``. ``route_flags`` comes from the preceding
+        ``load_route``; both calls must run before ``release``.
         """
 
         assert self.cfg.use_sage_attention and self.cfg.use_keeps_mma_ab
@@ -1346,17 +1349,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             Float32, self.sage_k_scales.routed_words, space=cutlass.AddressSpace.rmem
         )
         if cutlass.const_expr(self.cfg.sage_mixed_k_geometry):
-            assert self.staging_layout.route_flags_word_offset is not None
-            route_is_proxy = cute.arch.make_warp_uniform(
-                _route_is_proxy(
-                    Int32(
-                        self._smem_words[
-                            stage_base
-                            + Int32(self.staging_layout.route_flags_word_offset)
-                        ]
-                    )
-                )
-            )
+            route_is_proxy = cute.arch.make_warp_uniform(_route_is_proxy(route_flags))
             if route_is_proxy:
                 self._gather_route_summary_scales(stage_info, stage_base, words)
             else:
