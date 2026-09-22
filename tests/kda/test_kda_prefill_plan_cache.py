@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 HEAD_DIM = 128
 
 
-def _inputs(lengths, heads, *, seed, storage_extra=0, state_dtype=torch.float32):
+def _inputs(lengths, heads, *, seed, storage_extra=0):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     tokens = sum(lengths)
@@ -53,7 +53,7 @@ def _inputs(lengths, heads, *, seed, storage_extra=0, state_dtype=torch.float32)
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.full((heads, HEAD_DIM), -2.0, device="cuda"),
         out=torch.empty(1, tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16),
-        pool=randn(pool_slots, heads, HEAD_DIM, HEAD_DIM, dtype=state_dtype) * 0.1,
+        pool=randn(pool_slots, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32) * 0.1,
         state_indices=torch.arange(len(lengths), device="cuda", dtype=torch.int32) + 1,
         cu_seqlens=torch.tensor(offsets, device="cuda", dtype=torch.int64),
         checkpoint_cu_starts=torch.tensor(cp_offsets, device="cuda", dtype=torch.int64),
@@ -64,7 +64,7 @@ def _inputs(lengths, heads, *, seed, storage_extra=0, state_dtype=torch.float32)
     )
 
 
-def _prepare(d, cache=None, *, checkpoints=True):
+def _prepare(d, cache=None, *, checkpoints=True, lower_bound=None):
     return prepare_bf16_kda_prefill(
         d["q"],
         d["k"],
@@ -76,7 +76,7 @@ def _prepare(d, cache=None, *, checkpoints=True):
         out=d["out"],
         initial_state=d["pool"],
         final_state=d["pool"],
-        lower_bound=None,
+        lower_bound=lower_bound,
         cu_seqlens=d["cu_seqlens"],
         sequence_lengths=d["lengths"],
         state_indices=d["state_indices"],
@@ -87,8 +87,8 @@ def _prepare(d, cache=None, *, checkpoints=True):
     )
 
 
-def _run(d, cache=None, *, checkpoints=True):
-    call = _prepare(d, cache, checkpoints=checkpoints)
+def _run(d, cache=None, *, checkpoints=True, lower_bound=None):
+    call = _prepare(d, cache, checkpoints=checkpoints, lower_bound=lower_bound)
     call.launch()
     if cache is None:
         call.close()
@@ -165,18 +165,19 @@ def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
 
 
 def test_split_sequence_affine_route_is_pass_through():
-    # A long unbounded sequence on a BF16 state pool without a checkpoint
-    # request still takes the affine split route, whose multi-launch plan is
-    # not cached.
+    # A long bounded-gate sequence without a checkpoint request still takes
+    # the affine split route, whose multi-launch plan is not cached (the
+    # prepared API only accepts the FP32 state pool, on which unbounded
+    # sequences are routed sequentially).
     cache = KDAPrefillPlanCache(8)
-    d = _inputs([8192], 12, seed=5, state_dtype=torch.bfloat16)
+    d = _inputs([8192], 12, seed=5)
     pool = d["pool"].clone()
-    call = _run(d, cache, checkpoints=False)
+    call = _run(d, cache, checkpoints=False, lower_bound=-5.0)
     assert "affine" in str(call.schedule)
     assert cache.uncacheable == 1 and len(cache) == 0
     got = _snapshot(d)
     d["pool"].copy_(pool)
-    _run(d, checkpoints=False)
+    _run(d, checkpoints=False, lower_bound=-5.0)
     _assert_same(got, _snapshot(d))
 
 
