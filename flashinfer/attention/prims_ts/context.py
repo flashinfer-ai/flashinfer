@@ -273,6 +273,7 @@ def _make_context_kernel(
     causal_single_kv_tile: bool,
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
+    exp2_fma_pairs: int,
     page_size: int | None = None,
     max_kv_len: int | None = None,
 ):
@@ -296,7 +297,7 @@ def _make_context_kernel(
         if use_paged_kv
         else {}
     )
-    return FmhaTs(
+    fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
         in_qk_dtype=input_qk_dtype,
@@ -324,6 +325,8 @@ def _make_context_kernel(
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         **paged_kwargs,
     )
+    fmha.cfg.exp2_fma_pairs = exp2_fma_pairs
+    return fmha
 
 
 def _validate_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -501,6 +504,14 @@ def _dsl_supports_ldtm_stat() -> bool:
         return pkg_version.Version(dsl_version).release >= (4, 7, 0)
     except pkg_version.InvalidVersion:
         return False
+
+
+def _default_exp2_fma_pairs(device_index: int, v_dtype) -> int:
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk: 4 for 16-bit V on SM100,
+    where MUFU bounds the softmax, 0 elsewhere."""
+    if torch.cuda.get_device_capability(device_index) != (10, 0):
+        return 0
+    return 4 if v_dtype.width == 16 else 0
 
 
 def _default_uses_ldtm_stat(device_index: int) -> bool:
@@ -1475,6 +1486,9 @@ def _make_context_scheduler_probe(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler="static_persistent",
         uses_ldtm_stat=_default_uses_ldtm_stat(geometry.device_index),
+        exp2_fma_pairs=_default_exp2_fma_pairs(
+            geometry.device_index, dtype_map[geometry.pv_dtype]
+        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1750,6 +1764,7 @@ def _get_compiled_context(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        exp2_fma_pairs=_default_exp2_fma_pairs(device_index, input_pv_dtype),
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1962,6 +1977,7 @@ def _get_compiled_paged_context(
         causal_single_kv_tile=False,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        exp2_fma_pairs=_default_exp2_fma_pairs(device_index, input_pv_dtype),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )

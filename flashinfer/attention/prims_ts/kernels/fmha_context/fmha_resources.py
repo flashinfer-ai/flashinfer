@@ -187,6 +187,46 @@ def _pack_float4_to_fp8_e4m3(
     )
 
 
+@cute.jit
+def _f32_bits(x: Float32) -> Int32:
+    return cutlass.Vector.from_elements((x,), Float32).bitcast(Int32)[0]
+
+
+@cute.jit
+def _f32_from_bits(x: Int32) -> Float32:
+    return cutlass.Vector.from_elements((x,), Int32).bitcast(Float32)[0]
+
+
+@cute.jit
+def _exp2_fma_packed(x0: Float32, x1: Float32) -> tuple[Float32, Float32]:
+    """exp2 of two fp32 values on the FMA pipe, 2^x = 2^floor(x) * poly(x - floor(x)).
+    Same routine as ex2_emulation_f32x2_value in the SM110 GQA decode kernel."""
+    # Below -127 the result flushes to zero in e4m3 anyway.
+    x0 = cute.math.max(x0, Float32(-127.0), ftz=True)
+    x1 = cute.math.max(x1, Float32(-127.0), ftz=True)
+    # Adding 1.5 * 2^23 with round-down leaves floor(x) in the low mantissa bits.
+    bias = Float32(1.5 * 2.0**23)
+    t = cute.arch.add_packed_f32x2((x0, x1), (bias, bias), rnd="rm", ftz=False)
+    n = cute.arch.add_packed_f32x2(t, (-bias, -bias), rnd="rn", ftz=False)
+    f = cute.arch.fma_packed_f32x2(
+        n, (Float32(-1.0), Float32(-1.0)), (x0, x1), rnd="rn", ftz=False
+    )
+    # Degree-3 fit of 2^f on [0, 1).
+    c1 = Float32(0.695146143436431884765625)
+    c2 = Float32(0.227564394474029541015625)
+    c3 = Float32(0.077119089663028717041015625)
+    p = cute.arch.fma_packed_f32x2(f, (c3, c3), (c2, c2), rnd="rn", ftz=False)
+    p = cute.arch.fma_packed_f32x2(p, f, (c1, c1), rnd="rn", ftz=False)
+    p = cute.arch.fma_packed_f32x2(
+        p, f, (Float32(1.0), Float32(1.0)), rnd="rn", ftz=False
+    )
+    # The bias has zero low bits, so bits(t) << 23 is floor(x) << 23.
+    return (
+        _f32_from_bits(_f32_bits(p[0]) + (_f32_bits(t[0]) << 23)),
+        _f32_from_bits(_f32_bits(p[1]) + (_f32_bits(t[1]) << 23)),
+    )
+
+
 def _placeholder_softmax_chunks(cfg: Any) -> SoftmaxChunks:
     """Build zero P chunks with the same structure as runtime softmax chunks."""
     try:
@@ -327,6 +367,10 @@ class FmhaConfig:
     num_seq_tiles: int | Int32 = 0
     # Skip correction optimization: when True, skip rescale if old_max == new_max
     enable_skip_correction: bool = True
+    # Keep the running row max while a tile raises it by at most this many log2 units.
+    corr_skip_threshold_log2: float = 0.0
+    # exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
+    exp2_fma_pairs: int = 0
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -467,7 +511,8 @@ class FmhaConfig:
             # Softmax halves the QK N tile and PV halves its K slices, so the
             # two extents must match and split evenly.
             and self.qk_mma_tiler[1] == self.pv_mma_tiler[2]
-            and (self.pv_mma_tiler[2] // (16 if self.v_dtype.width == 16 else 32)) % 2 == 0
+            and (self.pv_mma_tiler[2] // (16 if self.v_dtype.width == 16 else 32)) % 2
+            == 0
         )
 
     @property
@@ -3862,8 +3907,14 @@ class TmemSPResource(MemoryResource):
                     rnd="rn",
                     ftz=False,
                 )
-                p0 = cute.math.exp2(fma_pair[0], fastmath=True)
-                p1 = cute.math.exp2(fma_pair[1], fastmath=True)
+                if cutlass.const_expr(
+                    self.cfg.v_dtype.width == 16
+                    and elem_idx // 2 >= tmem_x // 2 - self.cfg.exp2_fma_pairs
+                ):
+                    p0, p1 = _exp2_fma_packed(fma_pair[0], fma_pair[1])
+                else:
+                    p0 = cute.math.exp2(fma_pair[0], fastmath=True)
+                    p1 = cute.math.exp2(fma_pair[1], fastmath=True)
                 pair_idx = chunk_idx * (tmem_x // 2) + elem_idx // 2
                 if cutlass.const_expr(pair_idx % 2 == 0):
                     local_sum_pair_0 = cute.arch.add_packed_f32x2(
@@ -3896,9 +3947,7 @@ class TmemSPResource(MemoryResource):
                 )
             prims.tcgen05_st(
                 tmem_shape,
-                prims.make_tmem_ptr(
-                    tmem_p_addr + half * words_per_half, cutlass.Int8
-                ),
+                prims.make_tmem_ptr(tmem_p_addr + half * words_per_half, cutlass.Int8),
                 cutlass.Vector.from_elements(packed_words, Int32),
             )
         else:
@@ -4158,6 +4207,24 @@ class TmemSPResource(MemoryResource):
         """Auxiliary identity path (no P-chunk reduction)."""
         _ = stage_info
         return row_max
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=row_max)
+    @cute.jit
+    def freeze_row_max(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_row_max: SoftmaxScalar,
+        row_max: SoftmaxScalar,
+        scale_softmax_log2: Float32,
+    ) -> SoftmaxScalar:
+        """Keep the old row max when the tile raises it by at most the threshold."""
+        _ = stage_info
+        threshold = Float32(self.cfg.corr_skip_threshold_log2)
+        frozen = row_max
+        if (row_max - old_row_max) * scale_softmax_log2 <= threshold:
+            frozen = old_row_max
+        return frozen
 
     @cute.jit
     def _row_sum_reduction(

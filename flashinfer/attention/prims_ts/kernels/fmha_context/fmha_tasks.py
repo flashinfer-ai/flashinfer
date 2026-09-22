@@ -826,13 +826,19 @@ def create_mma_task(
         raise ValueError("split K/V staging requires a separate V buffer")
     kv_resources = (smem_k_or_kv, smem_v) if split_kv else (smem_k_or_kv,)
     pv_half_overlap = smem_q.cfg.pv_half_overlap
-    if pv_half_overlap and (tmem_p_prefix_ready_0 is None or tmem_p_prefix_ready_1 is None):
+    if pv_half_overlap and (
+        tmem_p_prefix_ready_0 is None or tmem_p_prefix_ready_1 is None
+    ):
         raise ValueError("pv_half_overlap requires both P-prefix barriers")
     p_prefix_resources = (
         (tmem_p_prefix_ready_0, tmem_p_prefix_ready_1) if pv_half_overlap else ()
     )
     src = _src_resources(
-        *qkv_resources, smem_q, *kv_resources, *p_prefix_resources, work_queue=work_queue
+        *qkv_resources,
+        smem_q,
+        *kv_resources,
+        *p_prefix_resources,
+        work_queue=work_queue,
     )
     num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
     num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
@@ -1272,7 +1278,9 @@ def create_mma_task(
     ) -> None:
         """Interleave paired QK/PV while retaining each K slice for both Qs."""
 
-        def pv(sp: TmemSPResource, pr: TmemPPrefixReadyResource | None, **kw: Any) -> None:
+        def pv(
+            sp: TmemSPResource, pr: TmemPPrefixReadyResource | None, **kw: Any
+        ) -> None:
             """PV for one query group. With overlap, start on the leading half
             of P as soon as softmax has stored it, then wait for the full P."""
             if pv_half_overlap:
@@ -1393,7 +1401,13 @@ def create_mma_task(
                     desc_v_base = sv.v_desc()
                 # PV0: P0 * Vi+1 → O0.
                 to.acquire()
-                pv(sp0, pr0, desc_v_base=desc_v_base, section=FmhaStage.Loop, inst_idx=1)
+                pv(
+                    sp0,
+                    pr0,
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Loop,
+                    inst_idx=1,
+                )
                 to.commit()
 
             sq.release()
@@ -1594,6 +1608,12 @@ def create_softmax_task(
                             )
                         else:
                             old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                        if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
+                            row_max = sp.freeze_row_max(
+                                old_row_max=old_row_max,
+                                row_max=row_max,
+                                scale_softmax_log2=scale_softmax_log2,
+                            )
                         # Stats(i): S(i) -> row max/sum for correction.
                         vec.store_vec(
                             old_row_max=old_row_max,
@@ -2089,6 +2109,12 @@ def create_softmax_task(
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
+                    row_max = sp.freeze_row_max(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,

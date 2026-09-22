@@ -1895,6 +1895,9 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
 _EARLY_TILE_SUM_DENSE_REGISTER_BUDGET = (176, 80, 80)
 _EARLY_TILE_SUM_CAUSAL_REGISTER_BUDGET = (184, 88, 56)
 
+# Lazy-correction margin for BF16 V. cuDNN and FA4 use 8.
+_CORR_SKIP_THRESHOLD_LOG2 = 8.0
+
 
 def _configure_early_tile_sum_policy(
     cfg: FmhaConfig,
@@ -2580,6 +2583,8 @@ class FmhaTs:
         into the TMEM S load on the non-masked path (default: False). The
         context runner enables this by default on SM103 (B300) and SM107
         (Rubin).
+    exp2_fma_pairs : int, optional
+        exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
     use_paged_kv : bool, optional
         Read K/V from a physical page pool through a fixed block table.
     num_tokens_per_page : int, optional
@@ -2612,6 +2617,7 @@ class FmhaTs:
         h_r: int = 1,
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
+        exp2_fma_pairs: int = 0,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
         max_kv_len: int = 1,
@@ -2711,7 +2717,10 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
+        if enable_skip_correction and v_dtype.width == 16:
+            cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
+        cfg.exp2_fma_pairs = exp2_fma_pairs
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
