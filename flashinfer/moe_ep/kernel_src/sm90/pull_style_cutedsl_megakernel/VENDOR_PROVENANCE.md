@@ -18,9 +18,9 @@ dependency.
 - Main's local 16-byte FC2 store is shared by compatible MXFP4 return modes.
   Its tail-pair scheduler is reused with packed-weight and offset adaptation;
   MXFP4 requires cluster `(1, 2, 1)` and whole-tile readiness. The normal
-  MXFP4 tuner includes a bounded set of tail-pair neighbors for
-  H7168/I3072/E384/EP4, preserving the prior strategies and default buckets.
-  This tuning coverage does not restrict explicit legal tactics on other shapes.
+  MXFP4 tuner checks its bounded tail-pair catalog against each model's
+  geometry and protocol requirements. H7168/I3072/E384/EP4 retains its 38
+  candidates and their order; default buckets remain unchanged.
 - Tiny positive activation scales retain a finite quantization multiplier
   independently of the rounded dequant scale. Normal/zero arithmetic is kept.
 - Shared communication capabilities serve both precisions; FP8's new pair/skip
@@ -54,8 +54,8 @@ package tree IDs, and content hashes.
 | Original FlashInfer vendor baseline | `fe6ddc6459e6e81cda160b3278786264513692de` | Source of staging commit `9e9b873013756d8c67f79afcae5dd21b8391e149` (tree `0b268ac6638ae227b5ad550b2860e746859736ee`) |
 | Pinned FlashInfer PR4688 base | `b1b6b399b7a9885cbe7d543459d0d9a6797b61b4` | Fixed PR snapshot whose FP8 changes are merged into this port |
 | Previous MXFP4 fused checkpoint | `1766988168658dbf73f3378467b4224f2fee9875` | Humming fused semantics |
-| Previous unified fused/split checkpoint | `d0c99d67efb3a1600a9993377a849ff5f4ed14d8` | Green Context split semantics |
-| Historical joint vendor source | package tree IDs and aggregate SHA-256 below | Pinned PR4688 FP8 plus MXFP4 fused/split with fixed production codegen policy |
+| Previous MXFP4 staging checkpoint | `d0c99d67efb3a1600a9993377a849ff5f4ed14d8` | Intermediate donor snapshot |
+| Historical joint vendor source | package tree IDs and aggregate SHA-256 below | Pinned PR4688 FP8 plus the MXFP4 overlay with fixed production codegen policy |
 
 The joint vendor source was committed atomically at `d80c92d1` in this branch. No
 durable staging commit or independently fetchable joint-tree reference is

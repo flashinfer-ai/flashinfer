@@ -573,10 +573,9 @@ Two optional MXFP4 strategies expand the tuning domain:
 MXFP4 also supports main's `tail_split_pairs` through the existing complete
 `knobs` mapping. It requires swap-AB with `cluster_shape_mnk=(1, 2, 1)` and
 `fc1_ready_mode="tile"`; packed weights and their auxiliary offsets follow the
-same task mapping. This is scheduling inside one fused kernel, unrelated to
-removed Green Context execution. The bounded normal tuning union above can
-select it through existing `knobs="auto"` or offline tuning; no new public
-flag is required. An untuned heuristic still defaults to `False`. An explicit
+same task mapping inside one fused kernel. The bounded normal tuning union
+above can select it through existing `knobs="auto"` or offline tuning. An untuned
+heuristic still defaults to `False`. An explicit
 two-candidate comparison is a subset experiment, not a full 38-candidate tune,
 and cannot populate the production cache under its complete-union identity.
 

@@ -123,15 +123,15 @@ the current edited tree. Preserve the FP8 extensions above when updating it.
 MXFP4 adds packed weights, safe tiny-value quantization, guarded communication
 optimizations, and dedicated tuning/cache identities. FP8 and MXFP4 share the
 communication capability checks, with FP8's new optimizations disabled by
-default. Green Context split execution is excluded. Ordinary library CUDA
-Graph support remains; the shared benchmark uses direct CUDA-event launches.
+default. Ordinary library CUDA Graph replay is supported; the shared benchmark
+uses direct CUDA-event launches.
 See `TUNING.md` for the supported domains and current commands.
 
 ## Layout
 
 ```
 kernel_src/sm90/pull_style_cutedsl_megakernel/
-├── src/                    ← kernel snapshot plus documented local overlays
+├── src/                    ← CuTeDSL kernel implementation
 │   ├── common/             ← shared constants/host utils (SM90-drop revision)
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
 │   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,
