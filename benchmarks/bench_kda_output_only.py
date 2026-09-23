@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flashinfer.kda_decode import recurrent_kda
+from flashinfer import recurrent_kda
 from flashinfer.kda_kernels.kda_decode_wy_output_only import (
     kda_wy_output_only as kda_output_only_decode,
 )

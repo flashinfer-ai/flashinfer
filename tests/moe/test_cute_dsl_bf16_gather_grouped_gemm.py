@@ -55,6 +55,8 @@ def make_random_topk_ids(num_experts, num_tokens, top_k, device="cuda"):
         (192, 2048, (128, 192)),  # tp=8, 2-WG small-N tile
         (192, 2048, (128, 64)),  # tp=8 (tile N=64)
         (384, 2048, (128, 128)),  # tp=4
+        (1536, 2072, (128, 128)),  # K % 64 != 0: partial last K tile
+        (768, 1032, (64, 64)),  # partial last K tile, 64-row tile
     ],
 )
 @pytest.mark.parametrize("num_tokens", [3, 777])
@@ -207,6 +209,32 @@ def _activation_cases():
 
 
 @cute_dsl_available
+def test_cute_dsl_bf16_gather_grouped_gemm_k_alignment_rule():
+    """K needs 16-byte chunks, not whole 64-element K tiles."""
+    import cutlass
+
+    from flashinfer.fused_moe.cute_dsl.hopper.contiguous_gather_grouped_gemm_act_fusion import (
+        Sm90ContiguousGatherGroupedGemmActFusionKernel,
+    )
+
+    def ok(k):
+        return Sm90ContiguousGatherGroupedGemmActFusionKernel.can_implement(
+            cutlass.BFloat16,
+            cutlass.BFloat16,
+            cutlass.BFloat16,
+            (128, 128),
+            (1, 1),
+            256,
+            512,
+            k,
+            4,
+        )
+
+    assert ok(2048) and ok(2072) and ok(8)
+    assert not ok(2076) and not ok(4)
+
+
+@cute_dsl_available
 @sm90_required
 def test_cute_dsl_bf16_gather_grouped_gemm_out_handling():
     """Without ``out`` the gather GEMM allocates ``[permuted_m, I]`` in the
@@ -331,6 +359,7 @@ def test_situ_f32_constant_and_runtime_beta():
         (768, (128, 128)),
         (192, (128, 192)),  # 2-WG tile at M=128; N == 2I (gated) or I (relu2)
         (768, (64, 256)),
+        (224, (128, 128)),  # partial last N tile: 2I = 448 (gated), I = 224 (relu2)
     ],
 )
 def test_cute_dsl_bf16_gather_grouped_gemm_activations(
@@ -356,8 +385,6 @@ def test_cute_dsl_bf16_gather_grouped_gemm_activations(
     tile_m = tile_shape_mn[0]
     gated = activation.is_gated
     act = _cute_dsl_activation_kwargs(activation)
-    if not gated and tile_shape_mn[1] > inter:
-        pytest.skip("N tile wider than the non-gated projection")
 
     ids = make_random_topk_ids(num_experts, num_tokens, top_k)
     scales = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
