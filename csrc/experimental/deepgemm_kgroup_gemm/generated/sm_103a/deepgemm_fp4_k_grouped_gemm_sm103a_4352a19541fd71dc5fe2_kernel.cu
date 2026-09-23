@@ -455,7 +455,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_deepgemm_fp4_k_grouped_gemm_sm103a_5d34f331c3bd8867cf67(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, int* __restrict__ grouped_layout, int M, int N, int K, int grid_m, int grid_n, int num_groups)
+kernel_deepgemm_fp4_k_grouped_gemm_sm103a_4352a19541fd71dc5fe2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, int* __restrict__ grouped_layout, int M, int N, int K, int grid_m, int grid_n, int num_groups)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -826,7 +826,7 @@ kernel_deepgemm_fp4_k_grouped_gemm_sm103a_5d34f331c3bd8867cf67(const __grid_cons
                                     "cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.tile.bulk_group"
                                     " [%0, {%1, %2, %3}], [%4];"
                                     :: "l"((&C_tma)), "r"(off_n_1 + (unsigned int)(atom * 32)), "r"(off_m_1 + (unsigned int)(s * 16)), "r"(current_group_3), "r"(store_addr) : "memory");
-                                #else
+                                #elif defined(__CUDA_ARCH__)
                                 #error "TmaReduceAdd3d requires SM90 or newer"
                                 #endif
                             }
