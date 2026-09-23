@@ -232,9 +232,12 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
         heads == 128
         and query_length <= 8
         and (capacity >= 512)
-        and (16 <= rows <= sm_count // 4)
+        and ((8 if capacity <= 6 * 128 else 16) <= rows <= sm_count // 4)
     ):
         # Two CTAs cover H128 without repeating KV loads across M64 tiles.
+        # Up to six KV tiles, avoiding the separate split-KV merge wins from
+        # eight query rows. Longer lists keep the measured sixteen-row
+        # crossover; these are GB300 latency crossovers, not kernel limits.
         # Four splits help only the small, long-list grid measured here.
         small_long_grid = capacity >= 2048 and rows <= sm_count // 8
         return SparseMlaProfile(
