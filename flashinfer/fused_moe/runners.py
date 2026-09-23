@@ -3553,6 +3553,14 @@ class CuTileBf16Runner(MoERunner):
 
 
 _CUTILE_FP4_GATED_FUSION_MIN_ASSIGNMENTS = 64
+# Decode-sized routing batches leave most SMs idle (a 1-token Qwen3.6 GEMM1 is
+# 64 CTAs on 188 SMs), so an FP4 GEMM whose grid does not cover the device
+# splits K across a third grid axis, aiming at about two CTAs per SM. On SM120
+# four splits won for 64-90 CTA grids and two for 126-128 CTA grids; a grid
+# that already covers the SMs gained nothing from splitting.
+_CUTILE_FP4_SPLIT_K_MAX = 4
+_CUTILE_FP4_SPLIT_K_TARGET_CTAS_PER_SM = 2
+_CUTILE_FP4_SPLIT_K_MAX_ASSIGNMENTS = 256
 _CUTILE_FP4_GEMM_CONFIGS = (
     (128, 128, 2),
     (256, 64, 2),
@@ -4182,10 +4190,59 @@ class _CuTileFp4Runner(CuTileBf16Runner):
                 activation_fp4=self._activation_fp4,
                 scale_block_size=self._scale_block_size,
                 scale_dtype=self._scale_dtype,
+                max_k_splits=self._fp4_max_k_splits(
+                    capacity * self.config.routing.top_k
+                ),
                 device=self.device,
             )
             self._workspace_cache[key] = workspace
         self._workspace = workspace
+
+    def _fp4_max_k_splits(self, max_num_assignments: int) -> int:
+        if not self._activation_fp4:
+            return 1
+        if max_num_assignments > _CUTILE_FP4_SPLIT_K_MAX_ASSIGNMENTS:
+            return 1
+        return _CUTILE_FP4_SPLIT_K_MAX
+
+    def _fp4_k_splits(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        stage: int,
+        block_size: int,
+        config: tuple[int, int, int],
+    ) -> int:
+        num_assignments = inputs[2].numel()
+        # Eligibility follows the workspace bucket, not the live batch, so the
+        # partial buffer allocated in _ensure_workspace is always present here.
+        capacity = map_to_hybrid_bucket(
+            inputs[1].shape[0], self.config.execution.tune_max_num_tokens
+        )
+        max_splits = self._fp4_max_k_splits(capacity * self.config.routing.top_k)
+        if max_splits == 1:
+            return 1
+        problem = self._fp4_gemm_problem(
+            inputs, stage=stage, block_size=block_size, fuse_gemm1=False
+        )
+        tile_n, tile_k, _ = config
+        num_experts = self.config.routing.num_experts
+        m_blocks = (
+            num_assignments + num_experts * (block_size - 1) + block_size - 1
+        ) // block_size
+        grid = min(m_blocks, num_assignments) * ((problem.n + tile_n - 1) // tile_n)
+        num_k_tiles = (problem.k + tile_k - 1) // tile_k
+        if grid >= self._num_sms:
+            return 1
+        target = _CUTILE_FP4_SPLIT_K_TARGET_CTAS_PER_SM * self._num_sms
+        splits = 1
+        while (
+            splits * 2 <= max_splits
+            and splits * 2 <= num_k_tiles // 2
+            and grid * splits * 2 <= target
+        ):
+            splits *= 2
+        return splits
 
     def _fp4_config_rejection_reason(
         self, problem: _CuTileGemmProblem, config: tuple[int, int, int]
@@ -4683,6 +4740,12 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             scale_block_size=self._scale_block_size,
             fuse_gemm1=bool(fuse_gemm1),
             num_sms=self._num_sms,
+            gemm1_k_splits=self._fp4_k_splits(
+                inputs, stage=1, block_size=block_size, config=(g1_n, g1_k, g1_occ)
+            ),
+            gemm2_k_splits=self._fp4_k_splits(
+                inputs, stage=2, block_size=block_size, config=(g2_n, g2_k, g2_occ)
+            ),
             block_size=block_size,
             gemm1_config=self._kernel_module.GemmConfig(g1_n, g1_k, g1_occ),
             gemm2_config=self._kernel_module.GemmConfig(g2_n, g2_k, g2_occ),

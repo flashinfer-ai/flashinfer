@@ -92,6 +92,8 @@ class Workspace(Bf16Workspace):
     activation_scale: torch.Tensor
     scale_row_major: bool
     scale_block_size: int
+    partial: torch.Tensor | None
+    max_k_splits: int
 
 
 def allocate_workspace(
@@ -106,9 +108,14 @@ def allocate_workspace(
     activation_fp4: bool = True,
     scale_block_size: int = _NVFP4_BLOCK_SIZE,
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
+    max_k_splits: int = 1,
     device: torch.device,
 ) -> Workspace:
-    """Allocate graph-stable routing, GEMM, and quantization buffers."""
+    """Allocate graph-stable routing, GEMM, and quantization buffers.
+
+    ``max_k_splits`` > 1 adds the fp32 partial-sum buffer that split-K grouped
+    GEMMs write; it is sized for every split count up to that maximum.
+    """
     num_assignments = num_tokens * top_k
     if scale_block_size not in (_NVFP4_BLOCK_SIZE, _MXFP4_BLOCK_SIZE):
         raise ValueError(f"unsupported FP4 scale block size {scale_block_size}.")
@@ -192,6 +199,15 @@ def allocate_workspace(
         dtype=scale_dtype,
         device=device,
     )
+    partial = None
+    if max_k_splits > 1:
+        partial_cols = max(hidden_size, intermediate_size * (2 if is_gated else 1))
+        partial = torch.empty(
+            max_k_splits * (num_assignments + 1),
+            partial_cols,
+            dtype=torch.float32,
+            device=device,
+        )
     return Workspace(
         **vars(base),
         input_q=input_q,
@@ -202,6 +218,8 @@ def allocate_workspace(
         activation_scale=activation_scale,
         scale_row_major=scale_row_major,
         scale_block_size=scale_block_size,
+        partial=partial,
+        max_k_splits=max_k_splits,
     )
 
 
@@ -471,6 +489,345 @@ def _activation_quantize_fp4_i64(
         SCALE_BLOCK_SIZE,
         IS_MXFP4,
         SCALE_ROW_MAJOR,
+    )
+
+
+@ct.function
+def _reduce_activation_quantize_fp4_impl(
+    PARTIAL,
+    Q,
+    SCALE,
+    activation_type: ConstInt,
+    activation_param1: ConstFloat,
+    activation_param2: ConstFloat,
+    activation_param3: ConstFloat,
+    IS_GATED: ConstBool,
+    K_SPLITS: ConstInt,
+    TILE_M: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+    SCALE_BLOCK_SIZE: ConstInt,
+    IS_MXFP4: ConstBool,
+    SCALE_ROW_MAJOR: ConstBool,
+):
+    row_block = ct.bid(0)
+    i_block = ct.bid(1)
+    groups_per_tile = TILE_I // SCALE_BLOCK_SIZE
+    # One (K_SPLITS, TILE_M, TILE_I) load per operand instead of K_SPLITS
+    # dependent loads; the split axis is reduced in registers.
+    values = ct.sum(
+        ct.load(
+            PARTIAL,
+            index=(0, row_block, i_block),
+            shape=(K_SPLITS, TILE_M, TILE_I),
+            padding_mode=ct.PaddingMode.ZERO,
+        ),
+        axis=0,
+    )
+    # The unsplit path hands the activation a BF16 GEMM1 output; round the
+    # fp32 sum the same way so both paths share one precision boundary.
+    values = ct.astype(ct.astype(values, ct.bfloat16), ct.float32)
+    if IS_GATED:
+        up = ct.sum(
+            ct.load(
+                PARTIAL,
+                index=(0, row_block, i_block + NUM_TILES),
+                shape=(K_SPLITS, TILE_M, TILE_I),
+                padding_mode=ct.PaddingMode.ZERO,
+            ),
+            axis=0,
+        )
+        up = ct.astype(ct.astype(up, ct.bfloat16), ct.float32)
+        values = _apply_gated_activation(
+            values,
+            up,
+            activation_type,
+            activation_param1,
+            activation_param2,
+            activation_param3,
+        )
+    else:
+        values = _apply_ungated_activation(
+            values,
+            activation_type,
+            activation_param1,
+            activation_param2,
+            activation_param3,
+        )
+    groups = ct.reshape(
+        ct.astype(ct.astype(values, ct.bfloat16), ct.float32),
+        (TILE_M, groups_per_tile, SCALE_BLOCK_SIZE),
+    )
+    packed, scale = _encode_fp4_groups(groups, TILE_M, TILE_I, IS_MXFP4)
+    ct.store(Q, index=(row_block, i_block), tile=packed)
+    if SCALE_ROW_MAJOR:
+        ct.store(SCALE, index=(row_block, i_block), tile=scale)
+    else:
+        ct.store(
+            SCALE,
+            index=(i_block, row_block),
+            tile=ct.permute(scale, (1, 0)),
+        )
+
+
+@ct.kernel
+def _reduce_activation_quantize_fp4(
+    PARTIAL,
+    Q,
+    SCALE,
+    activation_type: ConstInt,
+    activation_param1: ConstFloat,
+    activation_param2: ConstFloat,
+    activation_param3: ConstFloat,
+    IS_GATED: ConstBool,
+    K_SPLITS: ConstInt,
+    TILE_M: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+    SCALE_BLOCK_SIZE: ConstInt,
+    IS_MXFP4: ConstBool,
+    SCALE_ROW_MAJOR: ConstBool,
+):
+    _reduce_activation_quantize_fp4_impl(
+        PARTIAL,
+        Q,
+        SCALE,
+        activation_type,
+        activation_param1,
+        activation_param2,
+        activation_param3,
+        IS_GATED,
+        K_SPLITS,
+        TILE_M,
+        TILE_I,
+        NUM_TILES,
+        SCALE_BLOCK_SIZE,
+        IS_MXFP4,
+        SCALE_ROW_MAJOR,
+    )
+
+
+@ct.kernel
+def _reduce_activation_quantize_fp4_i64(
+    PARTIAL: ct.IndexedWithInt64,
+    Q: ct.IndexedWithInt64,
+    SCALE: ct.IndexedWithInt64,
+    activation_type: ConstInt,
+    activation_param1: ConstFloat,
+    activation_param2: ConstFloat,
+    activation_param3: ConstFloat,
+    IS_GATED: ConstBool,
+    K_SPLITS: ConstInt,
+    TILE_M: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+    SCALE_BLOCK_SIZE: ConstInt,
+    IS_MXFP4: ConstBool,
+    SCALE_ROW_MAJOR: ConstBool,
+):
+    _reduce_activation_quantize_fp4_impl(
+        PARTIAL,
+        Q,
+        SCALE,
+        activation_type,
+        activation_param1,
+        activation_param2,
+        activation_param3,
+        IS_GATED,
+        K_SPLITS,
+        TILE_M,
+        TILE_I,
+        NUM_TILES,
+        SCALE_BLOCK_SIZE,
+        IS_MXFP4,
+        SCALE_ROW_MAJOR,
+    )
+
+
+def _launch_reduce_activation_quantize(
+    partial: torch.Tensor,
+    k_splits: int,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    activation: ActivationConfig,
+    *,
+    num_assignments: int,
+    scale_block_size: int,
+    scale_row_major: bool,
+) -> None:
+    """Sum split-K GEMM1 partials, apply the activation, and quantize to FP4."""
+    activation = _validate_activation(activation)
+    intermediate_size = q.shape[1] * 2
+    gemm1_width = intermediate_size * (2 if activation.is_gated else 1)
+    if partial.shape != (k_splits * (num_assignments + 1), gemm1_width):
+        raise ValueError(
+            "split-K partial buffer must be "
+            f"({k_splits} x ({num_assignments} + 1), {gemm1_width}), got "
+            f"{tuple(partial.shape)}."
+        )
+    tile_i = 64 if intermediate_size % 64 == 0 else 32
+    if intermediate_size % tile_i != 0:
+        raise ValueError(
+            f"cuTile FP4 activation width must be divisible by {tile_i}, got "
+            f"{intermediate_size}."
+        )
+    num_tiles = intermediate_size // tile_i
+    # Decode batches are a handful of rows; one CTA per row block would leave
+    # the reduction on a few SMs, so keep row tiles small until the grid fills.
+    if num_assignments <= 8:
+        tile_m = 2
+    elif num_assignments <= 32:
+        tile_m = 4
+    elif num_assignments <= 128:
+        tile_m = 8
+    else:
+        tile_m = min(128, next_positive_power_of_2(num_assignments + 1))
+    partial_3d = partial.view(k_splits, num_assignments + 1, gemm1_width)
+    base_kernel = (
+        _reduce_activation_quantize_fp4_i64
+        if needs_int64_indexing(partial, q, scale)
+        else _reduce_activation_quantize_fp4
+    )
+    kernel = cached_replace_hints(base_kernel, occupancy=4)
+    ct.launch(
+        torch.cuda.current_stream(q.device),
+        (((num_assignments + tile_m - 1) // tile_m), num_tiles),
+        kernel,
+        (
+            partial_3d,
+            q,
+            scale,
+            *_activation_kernel_args(activation),
+            activation.is_gated,
+            k_splits,
+            tile_m,
+            tile_i,
+            num_tiles,
+            scale_block_size,
+            scale_block_size == _MXFP4_BLOCK_SIZE,
+            scale_row_major,
+        ),
+    )
+
+
+@ct.function
+def _combine_split_k_impl(
+    PARTIAL,
+    ROUTING_WEIGHTS,
+    OUT,
+    top_k,
+    slab_rows,
+    K_SPLITS: ConstInt,
+    H: ConstInt,
+    TILE_H: ConstInt,
+    USE_INT64: ConstBool,
+):
+    token_i32 = ct.bid(0)
+    h_tile = ct.bid(1)
+    h_offsets_i32 = h_tile * TILE_H + ct.arange(TILE_H, dtype=ct.int32)
+    valid = h_offsets_i32 < H
+    token = token_i32
+    h_offsets = h_offsets_i32
+    if USE_INT64:
+        token = ct.astype(ct.full((1,), token_i32, dtype=ct.int32), ct.int64).item()
+        h_offsets = ct.astype(h_offsets_i32, ct.int64)
+    accumulator = ct.zeros((TILE_H,), dtype=ct.float32)
+    columns = ct.minimum(h_offsets, H - 1)
+    for expert_slot in range(top_k):
+        weight = ct.gather(
+            ROUTING_WEIGHTS,
+            (ct.full((1,), token_i32 * top_k + expert_slot, dtype=ct.int32),),
+            padding_value=0.0,
+        ).item()
+        total = ct.zeros((TILE_H,), dtype=ct.float32)
+        for k_split in range(K_SPLITS):
+            row = k_split * slab_rows + token * top_k + expert_slot
+            # PARTIAL is a column slice of the shared partial buffer, so it is
+            # indexed as 2D and never flattened (a flatten would copy it).
+            rows = ct.full((TILE_H,), row, dtype=columns.dtype)
+            total = total + ct.gather(
+                PARTIAL,
+                (rows, columns),
+                padding_value=0.0,
+            )
+        # The unsplit path combines a BF16 GEMM2 output; keep that boundary.
+        total = ct.astype(ct.astype(total, ct.bfloat16), ct.float32)
+        accumulator = accumulator + total * weight
+    ct.scatter(
+        OUT,
+        (token * H + h_offsets,),
+        ct.astype(accumulator, OUT.dtype),
+        mask=valid,
+    )
+
+
+@ct.kernel
+def _combine_split_k(
+    PARTIAL,
+    ROUTING_WEIGHTS,
+    OUT,
+    top_k,
+    slab_rows,
+    K_SPLITS: ConstInt,
+    H: ConstInt,
+    TILE_H: ConstInt,
+):
+    _combine_split_k_impl(
+        PARTIAL, ROUTING_WEIGHTS, OUT, top_k, slab_rows, K_SPLITS, H, TILE_H, False
+    )
+
+
+@ct.kernel
+def _combine_split_k_i64(
+    PARTIAL: ct.IndexedWithInt64,
+    ROUTING_WEIGHTS,
+    OUT: ct.IndexedWithInt64,
+    top_k,
+    slab_rows,
+    K_SPLITS: ConstInt,
+    H: ConstInt,
+    TILE_H: ConstInt,
+):
+    _combine_split_k_impl(
+        PARTIAL, ROUTING_WEIGHTS, OUT, top_k, slab_rows, K_SPLITS, H, TILE_H, True
+    )
+
+
+def _launch_combine_split_k(
+    partial: torch.Tensor,
+    k_splits: int,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    num_assignments: int,
+) -> None:
+    num_tokens, hidden_size = output.shape
+    if partial.shape != (k_splits * (num_assignments + 1), hidden_size):
+        raise ValueError(
+            "split-K GEMM2 partial buffer must be "
+            f"({k_splits} x ({num_assignments} + 1), {hidden_size}), got "
+            f"{tuple(partial.shape)}."
+        )
+    top_k = num_assignments // num_tokens
+    tile_h = _combine_tile_h(num_tokens, hidden_size)
+    ct.launch(
+        torch.cuda.current_stream(output.device),
+        (num_tokens, (hidden_size + tile_h - 1) // tile_h),
+        (
+            _combine_split_k_i64
+            if needs_int64_indexing(partial, output)
+            else _combine_split_k
+        ),
+        (
+            partial,
+            topk_weights.reshape(-1),
+            output.view(-1),
+            top_k,
+            num_assignments + 1,
+            k_splits,
+            hidden_size,
+            tile_h,
+        ),
     )
 
 
@@ -1422,10 +1779,12 @@ def _grouped_gemm_w4a4_impl(
     SHARDED_GLOBAL_SCALE: ConstBool,
     INPUT_SORTED: ConstBool,
     OUTPUT_SORTED: ConstBool,
+    K_SPLITS: ConstInt,
     USE_INT64: ConstBool,
 ):
     initial_m_block = ct.bid(0)
     n_block = ct.bid(1)
+    k_split = ct.bid(2)
     num_post_pad = ct.gather(
         NUM_POST_PAD, ct.zeros((1,), dtype=ct.int32), padding_value=0
     ).item()
@@ -1433,6 +1792,10 @@ def _grouped_gemm_w4a4_impl(
     num_iterations = (num_live_blocks - initial_m_block + grid_m - 1) // grid_m
     n_offsets = n_block * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
     num_k_tiles = (K_IN + TILE_K - 1) // TILE_K
+    # Even partition: split sizes differ by at most one tile, so no split is
+    # left empty when K_SPLITS does not divide the tile count.
+    k_tile_begin = (num_k_tiles * k_split) // K_SPLITS
+    k_tile_end = (num_k_tiles * (k_split + 1)) // K_SPLITS
     for iteration in range(num_iterations):
         m_block = initial_m_block + iteration * grid_m
         if m_block * TILE_M < num_post_pad:
@@ -1467,7 +1830,7 @@ def _grouped_gemm_w4a4_impl(
             if USE_INT64:
                 rows = ct.astype(rows, ct.int64)
             accumulator = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
-            for k_tile in range(num_k_tiles):
+            for k_tile in range(k_tile_begin, k_tile_end):
                 if INPUT_SORTED:
                     activation, activation_scale = (
                         _load_w4a4_contiguous_activation_tile(
@@ -1510,16 +1873,33 @@ def _grouped_gemm_w4a4_impl(
                     weight_scale,
                     accumulator,
                 )
-            output_rows = m_offsets if OUTPUT_SORTED else slots
-            ct.scatter(
-                OUT,
-                (
-                    ct.reshape(output_rows, (TILE_M, 1)),
-                    ct.reshape(n_offsets, (1, TILE_N)),
-                ),
-                ct.astype(accumulator * alpha, OUT.dtype),
-                check_bounds=True,
-            )
+            if K_SPLITS > 1:
+                # Each split owns a (num_assignments + 1)-row slab of OUT. Rows
+                # of padded slots (sentinel == num_assignments) are skipped so
+                # no two CTAs write the same spare row.
+                slab_rows = OUT.shape[0] // K_SPLITS
+                output_rows = k_split * slab_rows + slots
+                ct.scatter(
+                    OUT,
+                    (
+                        ct.reshape(output_rows, (TILE_M, 1)),
+                        ct.reshape(n_offsets, (1, TILE_N)),
+                    ),
+                    ct.astype(accumulator * alpha, OUT.dtype),
+                    mask=ct.reshape(slots < slab_rows - 1, (TILE_M, 1)),
+                    check_bounds=True,
+                )
+            else:
+                output_rows = m_offsets if OUTPUT_SORTED else slots
+                ct.scatter(
+                    OUT,
+                    (
+                        ct.reshape(output_rows, (TILE_M, 1)),
+                        ct.reshape(n_offsets, (1, TILE_N)),
+                    ),
+                    ct.astype(accumulator * alpha, OUT.dtype),
+                    check_bounds=True,
+                )
 
 
 @ct.kernel
@@ -1549,6 +1929,7 @@ def _grouped_gemm_w4a4(
     SHARDED_GLOBAL_SCALE: ConstBool,
     INPUT_SORTED: ConstBool,
     OUTPUT_SORTED: ConstBool,
+    K_SPLITS: ConstInt,
 ):
     _grouped_gemm_w4a4_impl(
         X,
@@ -1576,6 +1957,7 @@ def _grouped_gemm_w4a4(
         SHARDED_GLOBAL_SCALE,
         INPUT_SORTED,
         OUTPUT_SORTED,
+        K_SPLITS,
         False,
     )
 
@@ -1607,6 +1989,7 @@ def _grouped_gemm_w4a4_i64(
     SHARDED_GLOBAL_SCALE: ConstBool,
     INPUT_SORTED: ConstBool,
     OUTPUT_SORTED: ConstBool,
+    K_SPLITS: ConstInt,
 ):
     _grouped_gemm_w4a4_impl(
         X,
@@ -1634,6 +2017,7 @@ def _grouped_gemm_w4a4_i64(
         SHARDED_GLOBAL_SCALE,
         INPUT_SORTED,
         OUTPUT_SORTED,
+        K_SPLITS,
         True,
     )
 
@@ -2018,6 +2402,8 @@ def _grouped_gemm(
     sorted_x: torch.Tensor | None = None,
     sorted_x_scale: torch.Tensor | None = None,
     output_sorted: bool = False,
+    k_splits: int = 1,
+    num_assignments: int | None = None,
 ) -> None:
     tile_k_alignment = 4 * scale_block_size
     if config.tile_n % 128 != 0 or config.tile_k % tile_k_alignment != 0:
@@ -2027,7 +2413,27 @@ def _grouped_gemm(
         )
     n = output.shape[1]
     k = x.shape[1] * 2
-    num_assignment_rows = output.shape[0]
+    num_k_tiles = (k + config.tile_k - 1) // config.tile_k
+    if k_splits > 1:
+        if output_sorted:
+            raise ValueError("split-K W4A4 GEMM cannot write sorted output.")
+        if num_assignments is None:
+            raise ValueError("split-K W4A4 GEMM needs num_assignments.")
+        if k_splits > num_k_tiles:
+            raise ValueError(
+                f"k_splits={k_splits} exceeds the {num_k_tiles} K tiles of K={k}."
+            )
+        if output.dtype is not torch.float32 or output.shape[0] != k_splits * (
+            num_assignments + 1
+        ):
+            raise ValueError(
+                "split-K W4A4 GEMM output must be an fp32 buffer of "
+                f"{k_splits} x ({num_assignments} + 1) rows, got "
+                f"{tuple(output.shape)} {output.dtype}."
+            )
+        num_assignment_rows = num_assignments
+    else:
+        num_assignment_rows = output.shape[0]
     m_blocks = (sorted_slots.shape[0] + block_size - 1) // block_size
     grid_m = max(1, min(m_blocks, num_assignment_rows))
     global_scale_shards = (
@@ -2093,10 +2499,11 @@ def _grouped_gemm(
         weight_global_scale.ndim == 2,
         input_sorted,
         output_sorted,
+        k_splits,
     )
     ct.launch(
         torch.cuda.current_stream(x.device),
-        (grid_m, (n + config.tile_n - 1) // config.tile_n),
+        (grid_m, (n + config.tile_n - 1) // config.tile_n, k_splits),
         kernel,
         launch_args,
     )
@@ -2431,12 +2838,29 @@ def run_moe(
     block_size: int,
     gemm1_config: GemmConfig,
     gemm2_config: GemmConfig,
+    gemm1_k_splits: int = 1,
+    gemm2_k_splits: int = 1,
 ) -> torch.Tensor:
-    """Run a pre-routed FP4-weight MoE pipeline."""
+    """Run a pre-routed FP4-weight MoE pipeline.
+
+    ``gemm1_k_splits`` / ``gemm2_k_splits`` > 1 run the corresponding grouped
+    GEMM as split-K over a third grid axis, writing fp32 partial sums that the
+    activation-quantize and combine stages reduce in a fixed order. Meant for
+    decode-sized routing batches whose GEMM grids leave most SMs idle.
+    """
     activation = _validate_activation(activation)
     num_tokens, hidden_size = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_assignments = num_tokens * top_k
+    if (gemm1_k_splits > 1 or gemm2_k_splits > 1) and (
+        workspace.partial is None
+        or max(gemm1_k_splits, gemm2_k_splits) > workspace.max_k_splits
+        or not activation_fp4
+    ):
+        raise ValueError(
+            "split-K needs an FP4-activation workspace allocated with "
+            f"max_k_splits >= {max(gemm1_k_splits, gemm2_k_splits)}."
+        )
     sorted_slots, block_expert, num_post_pad = _permute(
         topk_ids, w1.shape[0], block_size, workspace
     )
@@ -2507,6 +2931,10 @@ def run_moe(
         or workspace.activation_q.shape[1] * 2 % gemm1_config.tile_n != 0
     ) and can_fuse_gemm1
     use_fused_gemm1 = auto_fuse_gemm1 if fuse_gemm1 is None else fuse_gemm1
+    if gemm1_k_splits > 1:
+        if use_sorted_io:
+            raise ValueError("split-K GEMM1 is not available with sorted I/O.")
+        use_fused_gemm1 = False
     if use_fused_gemm1 and not can_fuse_gemm1:
         raise ValueError(
             "the selected tactic cannot fuse GEMM1 for "
@@ -2538,6 +2966,41 @@ def run_moe(
             sorted_x_scale=sorted_gemm1_input_scale,
             output_sorted=use_sorted_io,
         )
+    elif gemm1_k_splits > 1:
+        gemm1_width = (
+            workspace.activation_q.shape[1] * 2 * (2 if activation.is_gated else 1)
+        )
+        gemm1_partial = workspace.partial[
+            : gemm1_k_splits * (num_assignments + 1), :gemm1_width
+        ]
+        _grouped_gemm(
+            gemm1_input,
+            gemm1_input_scale,
+            w1,
+            w1_scale,
+            w1_global_scale,
+            sorted_slots,
+            block_expert,
+            num_post_pad,
+            gemm1_partial,
+            top_k=top_k,
+            block_size=block_size,
+            config=gemm1_config,
+            scale_block_size=scale_block_size,
+            scale_row_major=workspace.scale_row_major,
+            k_splits=gemm1_k_splits,
+            num_assignments=num_assignments,
+        )
+        _launch_reduce_activation_quantize(
+            gemm1_partial,
+            gemm1_k_splits,
+            workspace.activation_q,
+            workspace.activation_scale,
+            activation,
+            num_assignments=num_assignments,
+            scale_block_size=scale_block_size,
+            scale_row_major=workspace.scale_row_major,
+        )
     else:
         gemm1_rows = sorted_slots.shape[0] if use_sorted_io else num_assignments
         gemm1_out = workspace.gemm1_out[:gemm1_rows]
@@ -2560,7 +3023,6 @@ def run_moe(
             sorted_x_scale=sorted_gemm1_input_scale,
             output_sorted=use_sorted_io,
         )
-    if not use_fused_gemm1:
         _launch_unfused_activation_quantize(
             gemm1_out,
             workspace,
@@ -2570,6 +3032,38 @@ def run_moe(
         )
     gemm2_input = workspace.activation_q
     gemm2_input_scale = workspace.activation_scale
+    if gemm2_k_splits > 1:
+        if use_sorted_io:
+            raise ValueError("split-K GEMM2 is not available with sorted I/O.")
+        gemm2_partial = workspace.partial[
+            : gemm2_k_splits * (num_assignments + 1), :hidden_size
+        ]
+        _grouped_gemm(
+            gemm2_input,
+            gemm2_input_scale,
+            w2,
+            w2_scale,
+            w2_global_scale,
+            sorted_slots,
+            block_expert,
+            num_post_pad,
+            gemm2_partial,
+            top_k=1,
+            block_size=block_size,
+            config=gemm2_config,
+            scale_block_size=scale_block_size,
+            scale_row_major=workspace.scale_row_major,
+            k_splits=gemm2_k_splits,
+            num_assignments=num_assignments,
+        )
+        _launch_combine_split_k(
+            gemm2_partial,
+            gemm2_k_splits,
+            topk_weights,
+            output,
+            num_assignments=num_assignments,
+        )
+        return output
 
     gemm2_out = workspace.gemm2_out[:num_assignments]
     _grouped_gemm(

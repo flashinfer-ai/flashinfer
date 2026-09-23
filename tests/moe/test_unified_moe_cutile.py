@@ -1657,6 +1657,83 @@ def test_cutile_mxfp4_quantization_covers_tail(scale_row_major):
 
 @cutile_nvfp4_required
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("k_splits", (2, 4))
+def test_cutile_nvfp4_split_k_matches_unsplit_and_reference(
+    activation, k_splits, monkeypatch
+):
+    from flashinfer.fused_moe import runners as runners_module
+
+    # hidden_size 512 gives 8 K tiles at tile_k 64, so both GEMMs can split 4.
+    config, activations, weights, expected = _make_nvfp4_case(
+        activation, num_tokens=3, hidden_size=512, intermediate_size=256
+    )
+
+    def run(splits: int) -> torch.Tensor:
+        def forced_splits(self, inputs, *, stage, block_size, config):
+            k = inputs[1].shape[1] if stage == 1 else config_intermediate
+            num_k_tiles = (k + config[1] - 1) // config[1]
+            return max(1, min(splits, num_k_tiles // 2))
+
+        config_intermediate = config.experts.intermediate_size
+        monkeypatch.setattr(
+            runners_module._CuTileFp4Runner,
+            "_fp4_max_k_splits",
+            lambda self, n: max(splits, 1),
+        )
+        monkeypatch.setattr(
+            runners_module._CuTileFp4Runner, "_fp4_k_splits", forced_splits
+        )
+        runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+        runner.check_support()
+        runner.build()
+        inputs = runner.pack_inputs(activations, weights)
+        tactic = runner._fp4_fallback_tactic(inputs)
+        out = runner.forward(inputs, tactic=tactic).clone()
+        assert (runner._workspace.partial is not None) is (splits > 1)
+        return out
+
+    unsplit = run(1)
+    split = run(k_splits)
+    assert torch.isfinite(split).all()
+    # Partial sums change the fp32 accumulation order ahead of the BF16
+    # boundary, so a few FP4 codes may flip; the reference bound below is the
+    # one the unsplit path is held to.
+    torch.testing.assert_close(split, unsplit, rtol=5e-2, atol=2.5e-1)
+    torch.testing.assert_close(split, expected, rtol=0.25, atol=1.0)
+
+
+@cutile_nvfp4_required
+def test_cutile_nvfp4_split_k_follows_the_workspace_bucket():
+    from flashinfer.fused_moe.utils import map_to_hybrid_bucket
+
+    # 33 tokens x top_k 6 = 198 live assignments would qualify for split-K,
+    # but the workspace is sized for the 128-token config's bucket, whose
+    # capacity exceeds the split-K limit and therefore carries no partial
+    # buffer. The split decision has to follow the bucket, not the live batch.
+    config, activations, weights, expected = _make_nvfp4_case(
+        ReLU2(), num_tokens=33, num_experts=8, top_k=6, hidden_size=512
+    )
+    capacity = map_to_hybrid_bucket(33, config.execution.tune_max_num_tokens)
+    assert 33 * 6 <= 256 < capacity * 6
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    tactic = runner._fp4_fallback_tactic(inputs)
+    actual = runner.forward(inputs, tactic=tactic).clone()
+    assert runner._workspace.partial is None
+    for stage, config_slice in ((1, tactic[2:5]), (2, tactic[5:8])):
+        assert (
+            runner._fp4_k_splits(
+                inputs, stage=stage, block_size=tactic[0], config=tuple(config_slice)
+            )
+            == 1
+        )
+    torch.testing.assert_close(actual, expected, rtol=0.25, atol=1.0)
+
+
+@cutile_nvfp4_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_nvfp4_int64_specialization_matches_int32(activation, monkeypatch):
     config, activations, weights, _ = _make_nvfp4_case(activation)
     runner = CuTileNvfp4Runner(config, torch.device("cuda"))
