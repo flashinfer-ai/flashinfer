@@ -65,12 +65,12 @@ def warmup_jit():
     yield
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @parametrize_product(
     {
         "seq_len": [1, 3, 19, 99, 199, 1177, 1999],
         "window_left": [3, 13, 23, 37, 43],
         "num_kv_heads,num_qo_heads": [(1, 4), (1, 8), (4, 4), (4, 8)],
-        "head_dim": [64, 128, 256, 512],
     },
     regular=pairwise_product_cases,
 )
@@ -95,15 +95,15 @@ def test_single_decode_sliding_window(
     torch.testing.assert_close(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
 @parametrize_product(
     {
         "batch_size": [1, 3, 13, 32],
         "kv_len": [1, 3, 99, 199, 1999],
         "window_left": [33, 533],
         "num_kv_heads,num_qo_heads": [(1, 4), (1, 8), (4, 4), (4, 8)],
-        "head_dim": [64, 128, 256, 512],
         "page_size": [1, 16],
-        "backend": ["fa2", "auto"],
     },
     regular=pairwise_product_cases,
 )
@@ -221,12 +221,12 @@ def test_single_decode_prefill_sliding_window_match(
     torch.testing.assert_close(o.cpu()[0], o_decoded.cpu(), rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @parametrize_product(
     {
         "seq_len": [99, 199, 1999],
         "window_left": [43, 233],
         "num_kv_heads,num_qo_heads": [(1, 4), (1, 8), (4, 4), (4, 8)],
-        "head_dim": [64, 128, 256, 512],
     },
     regular=pairwise_product_cases,
 )
@@ -255,18 +255,32 @@ def test_single_prefill_sliding_window(
     torch.testing.assert_close(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
 
 
+_PAGED_PREFILL_PARAMETERS = {
+    "batch_size": [12, 17, 30],
+    "kv_len": [54, 397, 1177],
+    "qo_len": [1, 37, 47],
+    "window_left": [13, 33, 111],
+    "num_kv_heads,num_qo_heads": [(1, 4), (1, 8), (4, 4), (4, 8), (8, 4), (8, 8)],
+    "page_size": [1, 16],
+}
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
 @parametrize_product(
-    {
-        "batch_size": [12, 17, 30],
-        "kv_len": [54, 397, 1177],
-        "qo_len": [1, 37, 47],
-        "window_left": [13, 33, 111],
-        "num_kv_heads,num_qo_heads": [(1, 4), (1, 8), (4, 4), (4, 8), (8, 4), (8, 8)],
-        "head_dim": [64, 128, 256, 512],
-        "page_size": [1, 16],
-        "backend": ["fa2", "auto"],
-    },
-    regular=pairwise_product_cases,
+    _PAGED_PREFILL_PARAMETERS,
+    # Unsupported head pairs must not consume regular coverage of valid pairs.
+    # Keep the original axes, including skipped cases, for --full.
+    regular=pairwise_product_cases(
+        {
+            **_PAGED_PREFILL_PARAMETERS,
+            "num_kv_heads,num_qo_heads": [
+                (kv, qo)
+                for kv, qo in _PAGED_PREFILL_PARAMETERS["num_kv_heads,num_qo_heads"]
+                if qo >= kv
+            ],
+        }.values()
+    ),
 )
 def test_batch_paged_prefill_sliding_window(
     batch_size,
@@ -368,6 +382,8 @@ def test_batch_paged_prefill_sliding_window(
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
 @parametrize_product(
     {
         "batch_size": [12, 17],
@@ -375,8 +391,6 @@ def test_batch_paged_prefill_sliding_window(
         "qo_len": [37, 47],
         "window_left": [13, 33],
         "num_kv_heads,num_qo_heads": [(1, 4), (1, 8), (4, 4), (4, 8)],
-        "head_dim": [64, 128, 256, 512],
-        "backend": ["fa2", "auto"],
     },
     regular=pairwise_product_cases,
 )
