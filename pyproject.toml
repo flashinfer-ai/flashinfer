@@ -88,6 +88,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+"flashinfer.experimental.cake_w4a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.
 "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
