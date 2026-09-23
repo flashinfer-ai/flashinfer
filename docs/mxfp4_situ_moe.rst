@@ -258,8 +258,10 @@ It never inspects device routing on the host or autotunes during execution.
 
 Kernel selection by token count is host-side and layout-aware. Both parallel
 layouts run the swap-AB grouped GEMMs (weights as MMA-M, ``n_tile``-row
-expert groups as MMA-N) up to ``swapab_max_tokens`` (1024 on either layout)
-and the dense grouped GEMMs above. The group width follows the expected rows
+expert groups as MMA-N) up to ``swapab_max_tokens`` (1024 on an
+expert-parallel rank, 2048 on a MoE-TP shard narrower than 1024 columns,
+where T > 1024 takes the hybrid form described below) and the dense grouped
+GEMMs above. The group width follows the expected rows
 per local expert: with the balanced routing of the benchmarks every expert
 receives T/56 rows, and as soon as that exceeds the group width every expert
 needs a second group, which streams its weight tile a second time and costs
@@ -267,17 +269,39 @@ both swap GEMMs 40-50% on B300 (the per-tile cost is set by the tile count,
 not by the bytes). A wider group also caps the weight re-streaming of a hot
 expert (T=128 hot: 16 groups of 8 rows re-read 34 MB of weights each). The
 defaults are 16 rows up to T=128 and 32 above for an expert-parallel rank;
-8 up to T=128, 16 up to T=256 and 32 above for a 384-wide MoE-TP shard,
-whose rank sees eight times the local rows. Both follow
+8 up to T=128, 16 up to T=256, 32 up to T=1024 and 64 above for a 384-wide
+MoE-TP shard, whose rank sees eight times the local rows. Both follow
 ``swapab_tile_policy``/``SWAPAB_TILE_POLICY`` and
 ``swapab_max_tokens``/``SWAPAB_MAX_TOKENS``. On an expert-parallel rank
 (full 3072-wide shard) GEMM2 streams its K in 4-K-block (128-wide) stages up
 to T=256 (a deeper pipeline for the single-group case, 6-10 us) and in one
 384-wide stage above (``SWAP_GEMM2_SHORT_STAGE_MAX_TOKENS``); the 384-wide
-MoE-TP shard always uses one stage. Groups wider than 32 rows were measured
-and rejected: a single-warp 64-row TP8 GEMM2 ran 393 us against 246 us for
-two 32-row groups, and a four-warp gather did not close the gap, so above
-T=1024 the dense path is faster on both layouts.
+MoE-TP shard always uses one stage. On an expert-parallel rank the dense
+path is faster above T=1024.
+
+From T=1025 to T=2048 the MoE-TP shard uses the hybrid form
+(``SWAPAB_HYBRID=0`` disables it): ``moe_sort`` groups the permuted rows in 128-row tiles, a
+single-block dispatch kernel (``csrc/moe_swapab_dispatch.cu``, about 3 us)
+lists the occupied 64-row halves of those tiles, and the swap-AB GEMM1 runs
+only those halves (its cp.async gather warps fetch 64 activation rows per
+weight tile; two 64-row halves of a full tile re-stream the weight tile
+once more, which the row operand's smaller stage keeps cheaper than a
+128-row swap tile on B300) and writes its MXFP8 rows with the tcgen05
+block-scaled scale-factor layout. GEMM2 is then the dense contiguous
+grouped GEMM with the bulk-reduce finalize (``cp.reduce.async.bulk`` of
+each token's 256-byte hidden segment into the zero-filled output), which
+runs at the L2 reduction throughput its 128-row tiles reach (TP8 T=2048
+balanced 314 us) instead of the swap GEMM2's permuted partial rows plus the
+finalize gather (295 + 94 us). On B300 at TP8 T=2048 the hybrid form takes
+0.795 ms (balanced) against 0.841 ms for the all-swap form and 0.844 ms
+for the dense path, and 0.415 ms against 0.506 / 0.291 ms on the ``empty``
+routing (16 active experts); a swap GEMM1 over 128-row tiles was measured
+and rejected (369 us against 225 us for two 64-row halves), as was a
+per-column ``red.global.add`` or bulk-reduce finalize in the 64-row swap
+GEMM2 epilogue (1009 / 808 us against 389 us for the two-stage form). At
+T=4096 the hybrid form loses to the dense path (its 64-row GEMM1 re-streams
+every expert's weights for two to three groups: 0.80-0.83 against
+trtllm-gen), so the shard returns to the dense grouped GEMMs there.
 
 Every weight TMA load (swap-AB and dense) can carry an L2 eviction hint.
 The dense GEMMs mark their B/SFB streams ``EVICT_FIRST`` (CUTLASS SM90 TMA
@@ -315,8 +339,10 @@ with FP32 accumulation and one BF16 rounding, overwriting every output row
 shard the epilogue reductions cost about 380 us at T=1024 (8192 local rows
 of 7168) against a 244 us GEMM2; the two-stage form replaces them with a
 46 us gather. ``get_workspace_size`` includes the region whenever the
-two-stage form applies; the deferred form (``do_finalize=False``) uses the
-caller's row buffer instead.
+two-stage form applies; the hybrid form above T=1024 holds the dispatch
+work lists instead and reduces into the output from the dense GEMM2; the
+deferred form (``do_finalize=False``) uses the caller's row buffer
+instead.
 ``mxfp4_moe_capability`` checks architecture, quantization, activation,
 dimensions, top-k and the explicit parallel metadata before a plan is
 constructed. Its result reports ``supported``, ``reason``, ``cuda_graph``

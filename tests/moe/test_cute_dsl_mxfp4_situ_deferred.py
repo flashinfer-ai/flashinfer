@@ -147,7 +147,20 @@ def test_deferred_workspace_and_row_queries(tokens, mode):
     assert deferred > 0 and deferred % 256 == 0
     if wrapper._use_swapab(tokens):
         finalized = wrapper.get_workspace_size(tokens)
-        if (
+        if wrapper._swap_hybrid(tokens):
+            # Hybrid finalize: 128-row sort groups with the dispatch work
+            # lists and no permuted partial rows (the dense GEMM2 reduces
+            # into the output); the deferred form keeps the swap layout.
+            names = {f.name for f in wrapper._workspace_fields(tokens, True)[0]}
+            assert {
+                "swap_row_groups",
+                "swap_row_group_count",
+                "swap_wide_list",
+                "swap_wide_count",
+            } <= names
+            assert "partial_rows" not in names
+            assert finalized < deferred + rows * 7168 * 2
+        elif (
             tokens > m.SWAP_ATOMIC_FINALIZE_MAX_TOKENS
             and wrapper.intermediate_shard <= m.SWAP_TWO_STAGE_MAX_SHARD
         ):

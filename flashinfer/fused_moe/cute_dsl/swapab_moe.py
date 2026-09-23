@@ -51,12 +51,15 @@ def gemm1_k_blocks_per_stage(n_tile: int) -> int:
 _ENV_KBLOCKS2 = os.environ.get("SWAPAB_KBLOCKS2")
 
 
-def gemm2_k_blocks_per_stage(k: int) -> int:
+def gemm2_k_blocks_per_stage(k: int, n_tile: int = 8) -> int:
     """Stage depth for GEMM2: one 384-wide stage when the intermediate shard
     allows it (a 384-wide MoE-TP shard becomes a single stage per tile),
-    otherwise the generic 128-wide stage."""
+    otherwise the generic 128-wide stage. Grouped weight tiles (``swap_m_group``
+    > 1) keep 128-wide stages: their SF TMEM columns scale with the group."""
     if _ENV_KBLOCKS2:
         return int(_ENV_KBLOCKS2)
+    if swap_m_group(n_tile, gemm2=True) > 1:
+        return 4
     if k % 384 == 0:
         return 12
     return SWAP_K_BLOCKS_PER_STAGE
@@ -145,6 +148,187 @@ def _gmem_ptr(dtype, tensor: Optional[torch.Tensor], align: int = 16):
     )
 
 
+def swap_row_tma(n_tile: int, gather_rows: bool = True) -> bool:
+    """Whether the kernel loads the row operand with TMA at this tile width.
+
+    Default: the contiguous permuted rows of GEMM2 at wide tiles (tile load);
+    GEMM1's gathered rows stay on the cp.async gather warps (``gather4`` is
+    slow for 128-byte rows). ``SWAPAB_ROW_TMA=0|1`` overrides both.
+    """
+    env = os.environ.get("SWAPAB_ROW_TMA")
+    if env:
+        return bool(int(env))
+    return n_tile >= 64 and not gather_rows
+
+
+def swap_m_group(n_tile: int, gemm2: bool = False) -> int:
+    """Weight M-tiles per work item (``SWAPAB_MGROUP`` / ``SWAPAB_MGROUP2`` override).
+
+    B300, 64-token tiles: GEMM1 (K = hidden) is bound by the number of
+    mainloop stages in flight, so grouping (fewer, larger stages) slows it
+    (1 -> 434 us, 2 -> 638, 3 -> 714 at TP8 T=2048); GEMM2 (K = 384, one to
+    three stages per tile) gains from sharing the token stage over two weight
+    tiles (333 -> 296 us).
+    """
+    env = os.environ.get("SWAPAB_MGROUP2" if gemm2 else "SWAPAB_MGROUP")
+    if env:
+        return int(env)
+    if n_tile == 64 and gemm2:
+        return 2
+    return 1
+
+
+def swap_gather_warps(n_tile: int) -> Optional[int]:
+    """cp.async gather warps (``SWAPAB_GATHER_WARPS`` overrides; None = kernel default)."""
+    env = os.environ.get("SWAPAB_GATHER_WARPS")
+    return int(env) if env else None
+
+
+_swapab_dispatch_module = None
+
+
+def _get_swapab_dispatch_module():
+    global _swapab_dispatch_module
+    if _swapab_dispatch_module is None:
+        from flashinfer.jit.moe_swapab_dispatch import gen_swapab_dispatch_module
+
+        _swapab_dispatch_module = gen_swapab_dispatch_module().build_and_load()
+    return _swapab_dispatch_module
+
+
+def swapab_dispatch(
+    *,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    group_rows: int,
+    narrow_tile: int,
+    wide_list: torch.Tensor,
+    wide_count: torch.Tensor,
+    narrow_list: torch.Tensor,
+    narrow_count: torch.Tensor,
+    wide_min_rows: Optional[int] = None,
+    enable_pdl: bool = False,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Split the ``group_rows``-row sort groups into the wide (``n_tile =
+    group_rows``) and narrow (``n_tile = narrow_tile`` sub-tiles) work lists
+    consumed through ``tile_idx_to_row_group``. Groups with more than
+    ``wide_min_rows`` valid rows (default ``group_rows - narrow_tile``) go to
+    the wide list; the others contribute one narrow item per occupied
+    sub-tile. Order-preserving, single CTA, graph-capturable."""
+    if group_rows % narrow_tile != 0:
+        raise ValueError("group_rows must be a multiple of narrow_tile")
+    groups = tile_idx_to_mn_limit.shape[0]
+    if wide_list.shape[0] < groups:
+        raise ValueError(f"wide_list needs {groups} entries")
+    if narrow_list.shape[0] < groups * (group_rows // narrow_tile):
+        raise ValueError(
+            f"narrow_list needs {groups * (group_rows // narrow_tile)} entries"
+        )
+    for t in (
+        tile_idx_to_mn_limit,
+        num_non_exiting_tiles,
+        wide_list,
+        wide_count,
+        narrow_list,
+        narrow_count,
+    ):
+        if t.dtype != torch.int32 or not t.is_contiguous():
+            raise ValueError("dispatch buffers must be contiguous int32")
+    if wide_min_rows is None:
+        wide_min_rows = group_rows - narrow_tile
+    func = _get_swapab_dispatch_module()["flashinfer_moe_swapab_dispatch"]
+    args = (
+        tile_idx_to_mn_limit.data_ptr(),
+        num_non_exiting_tiles.data_ptr(),
+        int(group_rows),
+        int(narrow_tile),
+        int(wide_min_rows),
+        wide_list.data_ptr(),
+        wide_count.data_ptr(),
+        narrow_list.data_ptr(),
+        narrow_count.data_ptr(),
+        bool(enable_pdl),
+    )
+    func(*args, torch.cuda.current_stream().cuda_stream)
+    if _prepared_launches is not None:
+        _prepared_launches["swap_dispatch"] = (func, args)
+
+
+class _PermutedTokenIndex:
+    """``permuted_idx_to_token_idx[r] = expanded[r] // top_k`` with the
+    out-of-range value ``num_tokens`` for padding rows (``expanded < 0``), the
+    gather4 coordinate tensor of the TMA row operand (TMA zero-fills them)."""
+
+    @cute.kernel
+    def kernel(
+        self,
+        src: cute.Tensor,
+        dst: cute.Tensor,
+        num_tokens: cutlass.Int32,
+        top_k: cutlass.Constexpr,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        i = bidx * 256 + tidx
+        if i < cute.size(src):
+            expanded = src[i]
+            valid = (expanded >= 0).to(cutlass.Int32)
+            tok = cutlass.max(expanded, cutlass.Int32(0)) // top_k
+            dst[i] = tok * valid + num_tokens * (cutlass.Int32(1) - valid)
+
+    @cute.jit
+    def __call__(
+        self,
+        src_ptr: cute.Pointer,
+        dst_ptr: cute.Pointer,
+        rows: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        top_k: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        src = cute.make_tensor(src_ptr, cute.make_layout((rows,)))
+        dst = cute.make_tensor(dst_ptr, cute.make_layout((rows,)))
+        self.kernel(src, dst, num_tokens, top_k).launch(
+            grid=(cute.ceil_div(rows, 256), 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+
+_token_index_cache: Dict[int, Any] = {}
+
+
+def fill_permuted_token_index(
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    permuted_idx_to_token_idx: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Fill the gather4 row-coordinate tensor for the TMA row operand."""
+    rows = permuted_idx_to_expanded_idx.shape[0]
+    if permuted_idx_to_token_idx.shape[0] != rows:
+        raise ValueError(
+            "permuted_idx_to_token_idx must have one entry per permuted row"
+        )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = (
+        _gmem_ptr(cutlass.Int32, permuted_idx_to_expanded_idx, 4),
+        _gmem_ptr(cutlass.Int32, permuted_idx_to_token_idx, 4),
+        cutlass.Int32(rows),
+        cutlass.Int32(num_tokens),
+    )
+    if top_k not in _token_index_cache:
+        _token_index_cache[top_k] = cute.compile(
+            _PermutedTokenIndex(), *args, top_k=top_k, stream=stream
+        )
+    compiled = _token_index_cache[top_k]
+    if _prepared_launches is not None:
+        _prepared_launches["swap_token_index"] = (compiled, args)
+    compiled(*args, stream=stream)
+
+
 def _get_compiled_swapab_kernel(
     *,
     epilogue_kind: str,
@@ -161,10 +345,22 @@ def _get_compiled_swapab_kernel(
     tiled_a: bool = False,
     zero_fill: bool = False,
     weight_l2_hint: Optional[int] = None,
+    row_tma: Optional[bool] = None,
+    gather_warps: Optional[int] = None,
+    group_rows: Optional[int] = None,
+    sf_blocked: bool = False,
 ):
     import os
     import sys
 
+    if row_tma is None:
+        row_tma = swap_row_tma(n_tile, epilogue_kind == "situ_mxfp8")
+    if gather_warps is None:
+        gather_warps = swap_gather_warps(n_tile)
+    m_group = swap_m_group(n_tile, gemm2=epilogue_kind != "situ_mxfp8")
+    # ``compile_args[16]`` is the optional per-work-item row-group pointer
+    # (wrapper position: after ``row_index_ptr``).
+    row_group_list = compile_args[16] is not None
     key = (
         epilogue_kind,
         n_tile,
@@ -183,6 +379,12 @@ def _get_compiled_swapab_kernel(
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
         zero_fill,
+        row_tma,
+        gather_warps,
+        m_group,
+        row_group_list,
+        group_rows,
+        sf_blocked,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -200,6 +402,11 @@ def _get_compiled_swapab_kernel(
             meta_in_sched=SWAP_META_IN_SCHED,
             perf_probe=SWAP_PERF_PROBE,
             weight_l2_hint=weight_l2_hint,
+            row_tma=row_tma,
+            gather_warps=gather_warps,
+            m_group=m_group,
+            group_rows=group_rows,
+            sf_blocked=sf_blocked,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -237,7 +444,11 @@ def swapab_gemm1_situ(
     n_tile: int = SWAP_ROW_TILE,
     k_blocks_per_stage: Optional[int] = None,
     enable_pdl: bool = False,
+    permuted_idx_to_token_idx: Optional[torch.Tensor] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
+    tile_idx_to_row_group: Optional[torch.Tensor] = None,
+    group_rows: Optional[int] = None,
+    sf_blocked: bool = False,
 ) -> None:
     """GEMM1 (up/gate) + SiTU + MXFP8 requantization on the swap path.
 
@@ -246,8 +457,15 @@ def swapab_gemm1_situ(
     ``x_sf``; rows are gathered through ``permuted_idx_to_expanded_idx``
     (``[R]``). ``act`` is the ``[R, I]`` E4M3 output and ``act_sf`` its plain
     ``[R, I/32]`` scales. ``zero_output`` (BF16, 16-byte multiple) is
-    zero-filled by the kernel for the following finalize GEMM2.
+    zero-filled by the kernel for the following finalize GEMM2. With the TMA
+    row operand (wide tiles) ``permuted_idx_to_token_idx`` (``[R]`` int32,
+    see :func:`fill_permuted_token_index`) supplies the gather coordinates.
     """
+    row_tma = swap_row_tma(n_tile, True)
+    if row_tma and permuted_idx_to_token_idx is None:
+        raise ValueError(
+            f"n_tile={n_tile} loads rows with TMA and needs permuted_idx_to_token_idx"
+        )
     num_local_experts, rows_w, packed_k = w1.shape
     k = packed_k * 2
     num_tokens = x.shape[0]
@@ -289,6 +507,8 @@ def swapab_gemm1_situ(
         _gmem_ptr(cutlass.Float32, beta, 4),
         _gmem_ptr(cutlass.Float32, linear_beta, 4),
         _gmem_ptr(cutlass.Int64, zero_output, 8),
+        _gmem_ptr(cutlass.Int32, permuted_idx_to_token_idx, 4) if row_tma else None,
+        _gmem_ptr(cutlass.Int32, tile_idx_to_row_group, 4),
         rows_w,
         k,
         num_local_experts,
@@ -298,6 +518,11 @@ def swapab_gemm1_situ(
         intermediate,
         num_tokens,
         tile_idx_to_expert_idx.shape[0],
+        (
+            tile_idx_to_row_group.shape[0]
+            if tile_idx_to_row_group is not None
+            else tile_idx_to_expert_idx.shape[0]
+        ),
         zero_words,
     )
     compiled = _get_compiled_swapab_kernel(
@@ -315,6 +540,9 @@ def swapab_gemm1_situ(
         tiled_a=bool(SWAP_TILED_WEIGHTS & 1),
         zero_fill=zero_output is not None,
         weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
+        row_tma=row_tma,
+        group_rows=group_rows,
+        sf_blocked=sf_blocked,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -341,6 +569,8 @@ def swapab_gemm2(
     enable_pdl: bool = False,
     weight_l2_hint: Optional[int] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
+    tile_idx_to_row_group: Optional[torch.Tensor] = None,
+    group_rows: Optional[int] = None,
 ) -> None:
     """GEMM2 (down) on the swap path.
 
@@ -355,7 +585,7 @@ def swapab_gemm2(
     num_local_experts, rows_w, packed_k = w2.shape
     k = packed_k * 2
     if k_blocks_per_stage is None:
-        k_blocks_per_stage = gemm2_k_blocks_per_stage(k)
+        k_blocks_per_stage = gemm2_k_blocks_per_stage(k, n_tile)
     rows = act.shape[0]
     if act.shape[1] != k or act_sf.shape != (rows, k // 32):
         raise ValueError("act must be [R, I] with act_sf [R, I/32]")
@@ -396,6 +626,8 @@ def swapab_gemm2(
         None,
         None,
         None,
+        None,
+        _gmem_ptr(cutlass.Int32, tile_idx_to_row_group, 4),
         rows_w,
         k,
         num_local_experts,
@@ -405,6 +637,11 @@ def swapab_gemm2(
         rows_w,
         num_tokens,
         tile_idx_to_expert_idx.shape[0],
+        (
+            tile_idx_to_row_group.shape[0]
+            if tile_idx_to_row_group is not None
+            else tile_idx_to_expert_idx.shape[0]
+        ),
         0,
     )
     compiled = _get_compiled_swapab_kernel(
@@ -421,6 +658,7 @@ def swapab_gemm2(
         stream=stream,
         tiled_a=bool(SWAP_TILED_WEIGHTS & 2),
         weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
+        group_rows=group_rows,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)
@@ -462,6 +700,9 @@ class SwapAbBuffers:
             (num_tokens, top_k), dtype=torch.int32, device=device
         )
         self.permuted_idx_to_expanded_idx = torch.empty(
+            (r,), dtype=torch.int32, device=device
+        )
+        self.permuted_idx_to_token_idx = torch.empty(
             (r,), dtype=torch.int32, device=device
         )
         self.total_num_padded_tokens = torch.empty(
@@ -524,11 +765,22 @@ def swapab_moe_forward(
         _prepared_launches=_prepared_launches,
         **buffers.sort_kwargs(),
     )
+    token_idx = None
+    if swap_row_tma(buffers.tile, True):
+        fill_permuted_token_index(
+            buffers.permuted_idx_to_expanded_idx,
+            buffers.permuted_idx_to_token_idx,
+            x.shape[0],
+            top_k,
+            _prepared_launches=_prepared_launches,
+        )
+        token_idx = buffers.permuted_idx_to_token_idx
     swapab_gemm1_situ(
         w1=w1,
         w1_sf=w1_sf,
         x=x,
         x_sf=x_sf,
+        permuted_idx_to_token_idx=token_idx,
         permuted_idx_to_expanded_idx=buffers.permuted_idx_to_expanded_idx,
         act=buffers.act,
         act_sf=buffers.act_sf,
