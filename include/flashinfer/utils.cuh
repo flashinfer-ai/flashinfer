@@ -405,8 +405,40 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
+/*!
+ * \brief Every CTA_TILE_Q FA2DetermineCtaTileQ can return.
+ *
+ * The workspace upper-bound helpers iterate this to cover a tile they cannot
+ * predict, so the two must not drift apart: FA2DetermineCtaTileQ returns
+ * members of this array by construction, and FA2CtaTileQIsCandidate checks it.
+ */
+constexpr uint32_t kFA2CtaTileQCandidates[] = {16, 32, 64, 128};
+
+constexpr bool FA2CtaTileQIsCandidate(uint32_t cta_tile_q) {
+  for (const uint32_t candidate : kFA2CtaTileQCandidates) {
+    if (candidate == cta_tile_q) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline uint32_t FA2DetermineCtaTileQAt(int64_t avg_packed_qo_len, uint32_t head_dim,
+                                       uint32_t head_dim_qk, uint32_t kv_dtype_bytes);
+
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
                                      uint32_t head_dim_qk = 0, uint32_t kv_dtype_bytes = 2) {
+  const uint32_t cta_tile_q =
+      FA2DetermineCtaTileQAt(avg_packed_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);
+  FLASHINFER_CHECK(FA2CtaTileQIsCandidate(cta_tile_q),
+                   "FA2DetermineCtaTileQ returned a CTA_TILE_Q that is not in "
+                   "kFA2CtaTileQCandidates; the workspace upper bound iterates that list "
+                   "and would no longer cover every tile.");
+  return cta_tile_q;
+}
+
+inline uint32_t FA2DetermineCtaTileQAt(int64_t avg_packed_qo_len, uint32_t head_dim,
+                                       uint32_t head_dim_qk, uint32_t kv_dtype_bytes) {
   // head_dim is the VO dim at the batch-prefill call sites; head_dim_qk (when
   // nonzero) lets asymmetric (QK != VO) configurations report the dim that
   // actually drives shared-memory cost. kv_dtype_bytes is sizeof(DTypeKV) when
