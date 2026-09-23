@@ -18,8 +18,8 @@
 //
 // The JIT module (flashinfer/jit/cake_sampling.py) generates a small .cu that defines:
 //   CAKE_SAMPLING_BODY_FILE     "generated/cake_sampling_kernels.cu" (one source for every device)
-//   CAKE_SAMPLING_TARGET_MAJOR / CAKE_SAMPLING_TARGET_MINOR   compute capability this module is
-//                                                            built for (one module per capability)
+//   CAKE_SAMPLING_MIN_MAJOR / CAKE_SAMPLING_MIN_MINOR   oldest compute capability the frozen body
+//                                                      supports (manifest min_compute_capability)
 //   CAKE_SAMPLING_SLAB          slab row stride (entries per row of the top-k slab)
 //   CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads, smem_bytes) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, smem_bytes) ...
@@ -35,6 +35,9 @@
 #endif
 #ifndef CAKE_SAMPLING_SLAB
 #error "CAKE_SAMPLING_SLAB must give the slab row stride"
+#endif
+#if !defined(CAKE_SAMPLING_MIN_MAJOR) || !defined(CAKE_SAMPLING_MIN_MINOR)
+#error "CAKE_SAMPLING_MIN_MAJOR / CAKE_SAMPLING_MIN_MINOR must give the oldest supported capability"
 #endif
 // The frozen body is a self-contained CUDA translation-unit fragment.  Keep its fixed-width
 // types intact: the generated vector-load code refers to them by name.
@@ -61,17 +64,28 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
-inline void CheckTarget(int32_t device_id) {
+// The module is one fatbin holding a cubin per target architecture selected by FlashInfer's
+// CompilationContext (FLASHINFER_CUDA_ARCH_LIST, else the visible devices).  A device below the
+// frozen body's minimum capability, or one whose architecture is not among the compiled targets
+// (no cubin in the fatbin), is rejected here with a message naming the fix instead of failing
+// later inside cudaFuncSetAttribute / cudaLaunchKernelExC.
+inline void CheckTarget(int32_t device_id, const void* probe_kernel) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == CAKE_SAMPLING_TARGET_MAJOR && minor == CAKE_SAMPLING_TARGET_MINOR)
-      << "the frozen radix sampling kernels were compiled for compute capability "
-      << CAKE_SAMPLING_TARGET_MAJOR << "." << CAKE_SAMPLING_TARGET_MINOR << ", got " << major << "."
-      << minor;
+  TVM_FFI_ICHECK(major > CAKE_SAMPLING_MIN_MAJOR ||
+                 (major == CAKE_SAMPLING_MIN_MAJOR && minor >= CAKE_SAMPLING_MIN_MINOR))
+      << "the frozen radix sampling kernels need compute capability " << CAKE_SAMPLING_MIN_MAJOR
+      << "." << CAKE_SAMPLING_MIN_MINOR << " or newer, got " << major << "." << minor;
+  cudaFuncAttributes attributes;
+  const cudaError_t status = cudaFuncGetAttributes(&attributes, probe_kernel);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "the frozen radix sampling module has no kernel image for compute capability " << major
+      << "." << minor << " (" << cudaGetErrorString(status)
+      << "); rebuild with this architecture in FLASHINFER_CUDA_ARCH_LIST";
 }
 
 struct Stage1Variant {
@@ -149,7 +163,6 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   CHECK_CUDA(probs);
   const int32_t device_id = probs.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckTarget(device_id);
   CHECK_INPUT_TYPE(probs, dl_float32);
   TVM_FFI_ICHECK(probs.ndim() == 2) << "probs must have shape [batch, vocab]";
   TVM_FFI_ICHECK(probs.stride(1) == 1 && probs.stride(0) == probs.size(1))
@@ -177,6 +190,7 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
                                       static_cast<int32_t>(stream_variant));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-1 variant for cluster=" << cluster
                                << " ept=" << ept << " stream=" << stream_variant;
+  CheckTarget(device_id, v->kernel);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
@@ -217,7 +231,6 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
   CHECK_CUDA(out_samples);
   const int32_t device_id = out_samples.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckTarget(device_id);
   CHECK_INPUT_TYPE(out_samples, dl_int32);
   TVM_FFI_ICHECK(out_samples.ndim() == 1) << "out_samples must have shape [batch]";
   CHECK_CONTIGUOUS(out_samples);
@@ -248,6 +261,7 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
   const Stage23Variant* v = FindStage23(static_cast<int32_t>(threads), static_cast<int32_t>(items));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-2/3 variant for threads=" << threads
                                << " items=" << items;
+  CheckTarget(device_id, v->kernel);
   if (batch == 0) return;
   EnsureSmemAttribute(v->kernel, v->smem_bytes);
 

@@ -30,15 +30,18 @@ import pytest
 import torch
 
 from flashinfer.cake_sampling import (
+    _stage1_variants,
     cake_sampling_route,
     choose_stage1,
     choose_stage23,
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
+import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
     load_manifest,
+    supported_capabilities,
     supported_capability,
 )
 
@@ -229,8 +232,8 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
         s1, (threads, items) = variant
         cluster, ept = s1[0], s1[1]
         stream_variant = 1 if len(s1) > 2 and s1[2] else 0
-        capability = _require_supported_device()
-        module = load_cake_sampling_module(capability)
+        _require_supported_device()
+        module = load_cake_sampling_module()
         vals, idxs, cnt = ws
         if out is None:
             out = torch.empty(batch, device="cuda", dtype=torch.int32)
@@ -487,15 +490,140 @@ def test_per_request_tensors_and_routes():
     assert (
         cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
     )
-    assert choose_stage1(1, 128256) == (8, 32, False)
-    assert choose_stage1(8, 65536) == (8, 16, False)
-    assert choose_stage1(16, 128256) == (4, 16, True)
-    assert choose_stage1(64, 128256) == (2, 16, True)
-    assert choose_stage1(16, 262144) == (4, 16, True)
-    assert choose_stage1(64, 262144)[2] and choose_stage1(128, 151936)[2]
+    # B200 wave table (148 SMs).
+    assert choose_stage1(1, 128256, sm_count=148) == (8, 32, False)
+    assert choose_stage1(8, 65536, sm_count=148) == (8, 16, False)
+    assert choose_stage1(16, 128256, sm_count=148) == (4, 16, True)
+    assert choose_stage1(32, 128256, sm_count=148) == (4, 16, True)
+    assert choose_stage1(64, 128256, sm_count=148) == (2, 16, True)
+    assert choose_stage1(16, 262144, sm_count=148) == (4, 16, True)
+    assert choose_stage1(64, 262144, sm_count=148)[2]
+    assert choose_stage1(128, 151936, sm_count=148)[2]
+    # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
+    # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
+    # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.
+    for b, v in ((1, 128256), (8, 65536), (16, 128256), (64, 128256), (16, 262144)):
+        assert choose_stage1(b, v, sm_count=132) == choose_stage1(b, v, sm_count=148)
+    assert choose_stage1(32, 128256, sm_count=132) == (2, 16, True)
+    assert choose_stage1(32, 262144, sm_count=132) == (2, 16, True)
+    assert choose_stage1(32, 32768, sm_count=132) == (2, 32, False)
+    assert choose_stage1(32, 32768, sm_count=148) == (4, 16, False)
+    # Other SM counts use the nearest measured table.
+    assert choose_stage1(32, 128256, sm_count=152) == choose_stage1(
+        32, 128256, sm_count=148
+    )
+    assert choose_stage1(32, 128256, sm_count=114) == choose_stage1(
+        32, 128256, sm_count=132
+    )
+    assert choose_stage1(32, 128256) in {(2, 16, True), (4, 16, True)}
     assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)
+
+
+# --------------------------------------------------------------------------- build targets
+
+
+@pytest.fixture
+def arch_list(monkeypatch):
+    """Pin ``FLASHINFER_CUDA_ARCH_LIST`` for one test and drop the cached target set around it."""
+
+    def _set(value: str) -> None:
+        monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", value)
+        cake_sampling_jit.target_capabilities.cache_clear()
+
+    yield _set
+    cake_sampling_jit.target_capabilities.cache_clear()
+
+
+def _gencode(flags):
+    return [f for f in flags if f.startswith("-gencode")]
+
+
+def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list):
+    # AOT builds run on hosts without a GPU and name their targets through
+    # FLASHINFER_CUDA_ARCH_LIST; the module compiles one cubin per listed architecture into a
+    # single fatbin and serves exactly those capabilities.  (Suffixed entries skip the toolkit
+    # version probe of CompilationContext so this test also runs without nvcc.)
+    arch_list("9.0 10.3 12.0f")
+    assert supported_capabilities() == ((9, 0), (10, 3), (12, 0))
+    assert supported_capability((9, 0)) == (9, 0)
+    assert supported_capability((12, 0)) == (12, 0)
+    assert supported_capability((10, 0)) is None  # not a build target
+    assert supported_capability((8, 0)) is None
+    assert _gencode(cake_sampling_jit.nvcc_flags()) == [
+        "-gencode=arch=compute_90a,code=sm_90a",
+        "-gencode=arch=compute_103a,code=sm_103a",
+        "-gencode=arch=compute_120f,code=sm_120f",
+    ]
+    arch_list("10.7 11.0")
+    assert supported_capabilities() == ((10, 7), (11, 0))
+    assert _gencode(cake_sampling_jit.nvcc_flags()) == [
+        "-gencode=arch=compute_107a,code=sm_107a",
+        "-gencode=arch=compute_110a,code=sm_110a",
+    ]
+
+
+def test_build_targets_outside_supported_majors_are_dropped(arch_list):
+    assert cake_sampling_jit.SUPPORTED_MAJOR_VERSIONS == (9, 10, 11, 12)
+    arch_list("8.0 8.9 12.1a")
+    assert supported_capabilities() == ((12, 1),)
+    assert supported_capability((8, 9)) is None
+    assert _gencode(cake_sampling_jit.nvcc_flags()) == [
+        "-gencode=arch=compute_121a,code=sm_121a"
+    ]
+    arch_list("7.5 8.0")
+    assert supported_capabilities() == ()
+    with pytest.raises(RuntimeError, match="No supported CUDA architectures"):
+        cake_sampling_jit.nvcc_flags()
+
+
+def test_device_outside_build_targets_routes_to_top_k_first(arch_list):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs as reference
+
+    batch, vocab = 5, 32768
+    probs = _probs(batch, vocab)
+    expected = reference(
+        probs,
+        50,
+        0.9,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        seed=7,
+        offset=8,
+    )
+    major, minor = torch.cuda.get_device_capability()
+    arch_list("9.0" if (major, minor) != (9, 0) else "10.0")
+    assert supported_capability((major, minor)) is None
+    assert cake_sampling_route(probs, 50) == "fallback:arch"
+    got = top_k_top_p_sampling_from_probs(
+        probs, 50, 0.9, philox_seed=7, philox_offset=8
+    )
+    assert got.dtype == torch.int32 and torch.equal(got.to(expected.dtype), expected)
+    with pytest.raises(ValueError, match="fallback:arch"):
+        top_k_top_p_sampling_from_probs(
+            probs, 50, 0.9, renorm_out=torch.empty(batch, SLAB, device="cuda")
+        )
+
+
+def test_stage1_variants_respect_the_device_smem_limit():
+    variants = _stage1_variants()
+    assert _stage1_variants(None) == variants
+    # 12.x devices opt in to 99 KB of dynamic shared memory: the streaming variants (145 KB) drop
+    # out, the register-resident ones stay, and a vocabulary beyond the resident capacity takes
+    # the existing ``fallback:vocab_too_large`` route instead of a launch failure.
+    small = _stage1_variants(99 * 1024)
+    assert small and all(v in variants for v in small)
+    assert [v for v in variants if v not in small] == [v for v in variants if v[2]]
+    for vocab in (32768, 128256, 196608):
+        pick = choose_stage1(16, vocab, sm_count=148, smem_limit=99 * 1024)
+        assert pick in small and not pick[2]
+    with pytest.raises(ValueError, match="exceeds the frozen stage-1 capacity"):
+        choose_stage1(16, 262144, sm_count=148, smem_limit=99 * 1024)
+    # (explicit 227 KB limit: the default is the current device's opt-in, 64 KB on a T4)
+    assert choose_stage1(16, 262144, sm_count=148, smem_limit=232448)[2]
 
 
 # --------------------------------------------------------------------------- adversarial
