@@ -52,6 +52,7 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.task import Task
 
 from ..stage import FmhaStage
+from ..task_compat import task_context_kwargs
 from .direct_sparse_metadata import DirectSparseMetadataView
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
@@ -752,7 +753,7 @@ class DecodeGenTask(Task):
                     head_entries,
                     work_tile,
                     bookkeeping_domain,
-                    context,
+                    **task_context_kwargs(context),
                 )
         for is_skippable_tail, tail_entries in self._tail_exec_groups:
             if cutlass.const_expr(not is_skippable_tail):
@@ -760,7 +761,7 @@ class DecodeGenTask(Task):
                     tail_entries,
                     work_tile,
                     bookkeeping_domain,
-                    context,
+                    **task_context_kwargs(context),
                 )
 
     @cute.jit
@@ -775,7 +776,7 @@ class DecodeGenTask(Task):
             self,
             work_tile,
             skip_work_tile,
-            context=context,
+            **task_context_kwargs(context),
         )
         if cutlass.const_expr(
             self.cfg is not None
@@ -815,14 +816,14 @@ class DecodeGenTask(Task):
             and self._has_skip_if
         )
         if cutlass.const_expr(not use_packed_early_stop):
-            Task._run_task_body_persistent(self, context)
+            Task._run_task_body_persistent(self, **task_context_kwargs(context))
             return
 
         assert self.work_queue is not None
         work_tile = self.work_queue.initial_work_tile_info()
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
 
-        self._run_pre_work_loop_entries(work_tile, context)
+        self._run_pre_work_loop_entries(work_tile, **task_context_kwargs(context))
         work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
         for resource in self.dst_resources:
             if cutlass.const_expr(
@@ -845,7 +846,9 @@ class DecodeGenTask(Task):
             # The tile is known active here. Running the complete schedule
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
-            Task._run_task_body_impl(self, work_tile, None, context=context)
+            Task._run_task_body_impl(
+                self, work_tile, None, **task_context_kwargs(context)
+            )
             if cutlass.const_expr(self.cfg.use_attention_sinks):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
@@ -856,7 +859,7 @@ class DecodeGenTask(Task):
                 work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
                 self.dummy = cutlass.Boolean(True)
 
-        self._run_post_work_loop_entries(work_tile, context)
+        self._run_post_work_loop_entries(work_tile, **task_context_kwargs(context))
         for resource in self.dst_resources:
             if cutlass.const_expr(
                 resource.pipeline_config is not None
