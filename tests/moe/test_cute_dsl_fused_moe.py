@@ -749,6 +749,47 @@ class TestInputsHelperContract:
 
 
 # =============================================================================
+# Test: routing PDL forwarding (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
+def test_moe_core_forwards_enable_pdl(monkeypatch, enable_pdl):
+    from flashinfer.fused_moe.cute_dsl import fused_moe
+
+    class RoutingReached(Exception):
+        pass
+
+    def check_routing_pdl(**kwargs):
+        assert kwargs["enable_pdl"] is enable_pdl
+        # Stop before routing or GEMM kernels execute; only test flag forwarding.
+        raise RoutingReached
+
+    monkeypatch.setattr(fused_moe, "moe_sort", check_routing_pdl)
+
+    with pytest.raises(RoutingReached):
+        fused_moe._moe_core_impl(
+            x=torch.empty((2, 8), dtype=torch.uint8),
+            x_sf=torch.empty((2, 1), dtype=torch.uint8),
+            token_selected_experts=torch.zeros((2, 1), dtype=torch.int32),
+            token_final_scales=torch.ones((2, 1), dtype=torch.float32),
+            w1_weight=torch.empty((1, 32, 8), dtype=torch.uint8),
+            w1_weight_sf=torch.empty((1, 32, 1), dtype=torch.uint8),
+            w1_alpha=torch.ones(1, dtype=torch.float32),
+            fc2_input_scale=torch.ones(1, dtype=torch.float32),
+            w2_weight=torch.empty((1, 16, 8), dtype=torch.uint8),
+            w2_weight_sf=torch.empty((1, 16, 1), dtype=torch.uint8),
+            w2_alpha=torch.ones(1, dtype=torch.float32),
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            use_async_memset=False,
+            enable_pdl=enable_pdl,
+        )
+
+
+# =============================================================================
 # Test Class: autotune replay stream contract (no GPU required)
 # =============================================================================
 
