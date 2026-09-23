@@ -245,7 +245,7 @@ def test_lookup_negative_memo_and_publish_clears_it(cache_root):
     assert cache.lookup(key) is None
     assert key in cache._missing
     cache.publish(key, "Runner", 7)
-    assert cache.lookup(key) == ("Runner", 7)
+    assert cache.lookup(key) == ("Runner", 7, None)
 
 
 def test_explicit_root_directory(cache_root, monkeypatch, tmp_path):
@@ -955,3 +955,144 @@ def test_profiling_inside_capture_fails_fast(cache_root, monkeypatch):
     tuner = AutoTuner.get()
     with pytest.raises(RuntimeError, match="cannot run inside a CUDA graph capture"):
         tuner._profile_single_kernel(DummyRunner(), [torch.zeros(8, 16)], 0, _CONFIG)
+
+
+@pytest.mark.parametrize("hydrate", ["preload", "lazy", "reload"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_effective_profiling_policy_reuse(cache_root, monkeypatch, hydrate, inherited):
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    config = TuningConfig(
+        use_cuda_graph=inherited,
+        use_cold_l2_cache=inherited,
+        cuda_graph_profile_replays=20,
+    )
+    policy = (
+        None
+        if inherited
+        else MeasurementPolicy(execution_mode="cuda_graph", cold_l2=True)
+    )
+    runner = DummyRunner()
+    inputs = [torch.zeros(8, 16)]
+    calls = _install_fake_profile(monkeypatch, {-1: 5.0, 0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2(measurement_policy=policy):
+        assert AutoTuner.get().choose_one(_OP, [runner], config, inputs)[1] == 1
+    (entry_file,) = _entry_files(cache_root)
+    entry = json.loads(entry_file.read_text())
+    assert entry["profiling_policy"] == [
+        "cuda_graph_profile_replays",
+        20,
+        "l2_cache_policy",
+        "cold",
+    ]
+    if hydrate == "lazy":
+        del entry["key_fields"]
+        entry_file.write_text(json.dumps(entry))
+    tuner = _fresh_process()
+    with autotune_v2(mode="replay", measurement_policy=policy):
+        pass
+    if hydrate == "reload":
+        autotune_v2_reload()
+    calls.clear()
+    with autotune_v2(measurement_policy=policy):
+        assert tuner.choose_one(_OP, [runner], config, inputs)[1] == 1
+        assert tuner._winner_cache()
+        assert list(tuner._profiling_cache_policies.values()) == [
+            tuple(entry["profiling_policy"])
+        ]
+        tuner._managed_decoded.clear()
+        assert tuner.choose_one(_OP, [runner], config, inputs)[1] == 1
+    assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.parametrize("changed", ["cold_l2", "replays"])
+def test_inherited_policy_change_retunes(cache_root, monkeypatch, fresh, changed):
+    original = TuningConfig(
+        use_cuda_graph=True, use_cold_l2_cache=True, cuda_graph_profile_replays=20
+    )
+    updated = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=changed != "cold_l2",
+        cuda_graph_profile_replays=1 if changed == "replays" else 20,
+    )
+    runner = DummyRunner()
+    inputs = [torch.zeros(8, 16)]
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [runner], original, inputs)
+    if fresh:
+        _fresh_process()
+    tuner = AutoTuner.get()
+    calls = _install_fake_profile(monkeypatch, {-1: 5.0, 0: 3.0, 1: 2.0, 2: 1.0})
+    with autotune_v2():
+        assert tuner.choose_one(_OP, [runner], updated, inputs)[1] == 2
+        assert calls
+        calls.clear()
+        tuner._winner_cache().clear()
+        assert tuner.choose_one(_OP, [runner], updated, inputs)[1] == 2
+        assert calls == []
+    assert len(_entry_files(cache_root)) == 1
+    _fresh_process()
+    with autotune_v2():
+        assert AutoTuner.get().choose_one(_OP, [runner], updated, inputs)[1] == 2
+    assert calls == []
+
+
+@pytest.mark.parametrize("policy_metadata", [None, "unknown"])
+def test_unknown_provenance_replays_then_tunes_once(
+    cache_root, monkeypatch, policy_metadata
+):
+    _tune_once(monkeypatch, {0: 3.0, 1: 1.0, 2: 2.0})
+    (entry_file,) = _entry_files(cache_root)
+    entry = json.loads(entry_file.read_text())
+    del entry["profiling_policy"]
+    if policy_metadata is not None:
+        entry["profiling_policy"] = policy_metadata
+    entry_file.write_text(json.dumps(entry))
+    before = entry_file.read_bytes()
+    tuner = _fresh_process()
+    runner = DummyRunner()
+    inputs = [torch.zeros(8, 16)]
+    calls = _install_fake_profile(monkeypatch, {-1: 5.0, 0: 3.0, 1: 2.0, 2: 1.0})
+    with autotune_v2(mode="replay"):
+        assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == 1
+    assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == 1
+    assert calls == [] and entry_file.read_bytes() == before
+    with autotune_v2():
+        assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == 2
+        assert calls
+        calls.clear()
+        tuner._winner_cache().clear()
+        assert tuner.choose_one(_OP, [runner], _CONFIG, inputs)[1] == 2
+    _fresh_process()
+    with autotune_v2():
+        assert AutoTuner.get().choose_one(_OP, [runner], _CONFIG, inputs)[1] == 2
+    assert calls == []
+
+
+def test_memory_policy_is_partitioned_with_winner(cache_root, monkeypatch):
+    tuner = AutoTuner.get()
+    runner = DummyRunner()
+    inputs = [torch.zeros(8, 16)]
+    cold = TuningConfig(
+        use_cuda_graph=True, use_cold_l2_cache=True, cuda_graph_profile_replays=20
+    )
+    hot = TuningConfig(use_cuda_graph=True)
+    root_b = cache_root / "b"
+    for root, config, winner in [(cache_root, cold, 1), (root_b, hot, 2)]:
+        times = {-1: 5.0, 0: 3.0, 1: 2.0, 2: 2.0, winner: 1.0}
+        _install_fake_profile(monkeypatch, times)
+        with autotune_v2(cache_root=root):
+            assert tuner.choose_one(_OP, [runner], config, inputs)[1] == winner
+    calls = _install_fake_profile(monkeypatch, {-1: 5.0, 0: 1.0, 1: 2.0, 2: 3.0})
+    with autotune_v2(cache_root=cache_root):
+        assert tuner.choose_one(_OP, [runner], cold, inputs)[1] == 1
+        assert calls == []
+        assert tuner.choose_one(_OP, [runner], hot, inputs)[1] == 0
+        assert calls
+    calls.clear()
+    with autotune_v2(cache_root=root_b):
+        assert tuner.choose_one(_OP, [runner], hot, inputs)[1] == 2
+    assert calls == []
