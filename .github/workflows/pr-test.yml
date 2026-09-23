@@ -112,10 +112,8 @@ jobs:
       - name: Validate CUDA configuration
         run: python3 ci/validate_cuda_versions.py
 
-      # Tripwire for targeted_lane_scope.py's parse of the shard scripts: empty
-      # coverage exits non-zero, so a change that breaks the parse fails here, on the
-      # PR that made it, rather than silently un-scheduling every later targeted
-      # A10G/T4 run.
+      # A shard script that no longer parses fails here, on the PR that changed it,
+      # instead of silently un-scheduling later targeted A10G/T4 runs.
       - name: Validate bare-run coverage parse
         run: |
           python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
@@ -212,10 +210,9 @@ jobs:
           # already validated in the step above. Empty for an unparameterised run.
           REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
         run: |
-          # A targeted run on a lane never tests more than the bare run tests on that
-          # lane. H100's bare run covers tests/, so it gets the request as-is; A10G and
-          # T4 run fixed shard lists (parts 1-5 / part 3), so their scope is the request
-          # intersected with those scripts, and a lane left with nothing is not scheduled.
+          # A targeted run on a lane never tests more than that lane's bare run: H100
+          # gets the request as-is (its bare run covers tests/); A10G and T4 get it
+          # intersected with their shard lists, and a lane left with nothing is skipped.
           A10G_SCOPE=""; T4_SCOPE=""
           if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
             A10G_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \

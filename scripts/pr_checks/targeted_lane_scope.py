@@ -1,35 +1,28 @@
 """Narrow a targeted CI scope to what a lane's bare run covers.
 
-Rule: a targeted run on a given lane never tests more than the bare run tests on
-that lane. The H100 bare run covers ``tests/`` so its targeted scope is the request
-unchanged; the A10G and T4 bare runs are the fixed shard lists in
-``scripts/task_jit_run_tests_part*.sh``, so their targeted scope is the request
-intersected with those lists. Reading the shard scripts keeps them the single
-source of truth: adding a file to a shard both covers it on every bare run and
-makes it eligible for targeted runs on that lane.
+A targeted run on a lane never tests more than that lane's bare run. The A10G and
+T4 bare runs are the fixed shard lists in ``scripts/task_jit_run_tests_part*.sh``,
+so their targeted scope is the requested paths intersected with the ``pytest``
+targets of those scripts. Reading the scripts keeps them the single source of
+truth: adding a file to a shard covers it on every bare run and makes it eligible
+for targeted runs on that lane. (H100's bare run covers ``tests/``, so it needs no
+narrowing and does not use this tool.)
 
-Coverage is the set of ``pytest ... tests/...`` invocations in the given shard
-scripts. Other commands (e.g. ``bash tests/moe_ep/run_tests.sh unit``) run a
-curated subset with their own flags, so they are not treated as covering their
-directory for ``task_run_unit_tests.sh``; counting them would let a targeted run
-test more than the bare run does.
+Only ``pytest ... tests/...`` lines count. Wrapper commands such as
+``bash tests/moe_ep/run_tests.sh unit`` run a curated subset with their own
+flags, so they do not make their directory eligible.
 
 Usage::
 
-    targeted_lane_scope.py --scripts scripts/task_jit_run_tests_part{1..5}.sh \
+    targeted_lane_scope.py --scripts scripts/task_jit_run_tests_part{1..5}.sh \\
         --targets "tests/attention/ tests/utils/test_topk.py"
 
-Prints the narrowed scope, space-separated, on one line (an empty line when no
-target is covered). Targets are paths under ``tests/``, files or directories, as
-validated by ``experimental_test_scope.py``; ``::`` selectors are not accepted.
-
-An empty *intersection* is normal (the lane is not scheduled). A shard script
-parsing to zero ``pytest`` lines is always parser drift (a script switched to
-``python -m pytest``, a loop over a list variable, ...) and would otherwise
-silently drop that shard's files from the lane's coverage, so it exits non-zero
--- checked per script, not in aggregate, so one drifted shard among five is
-caught. ``pr-test.yml`` also runs ``--coverage-only`` on every setup so drift
-fails the PR that introduces it.
+Prints the narrowed scope on one line; an empty line means nothing requested is
+covered and the lane should not be scheduled. Targets are files or directories
+under ``tests/`` (``::`` selectors are rejected upstream by
+``experimental_test_scope.py``). A shard script with no parseable ``pytest`` line
+is a parser-drift bug, not an empty scope, and exits non-zero; ``pr-test.yml``
+runs ``--coverage-only`` on every setup so such drift fails the PR that causes it.
 """
 
 from __future__ import annotations
@@ -43,61 +36,89 @@ _PYTEST_LINE = re.compile(r"^\s*pytest\b(?:\s+-\S+)*\s+(tests/\S+)")
 
 
 def _norm(path: str) -> str:
-    return PurePosixPath(path.strip().lstrip("./")).as_posix() if path.strip() else ""
+    """``./tests/x/`` -> ``tests/x``."""
+    path = path.strip()
+    return PurePosixPath(path).as_posix() if path else ""
 
 
-def _is_dir(path: str) -> bool:
-    return not path.endswith(".py")
+def _is_test_file(path: str) -> bool:
+    # Targets are not existence-checked, so classify by shape.
+    return PurePosixPath(path).suffix == ".py"
 
 
-def _under(path: str, directory: str) -> bool:
-    return path == directory or path.startswith(directory + "/")
+def _within(path: str, directory: str) -> bool:
+    # Component-wise: tests/att does not contain tests/attention/x.py.
+    return PurePosixPath(path).is_relative_to(PurePosixPath(directory))
 
 
 def coverage(scripts: list[Path]) -> list[str]:
-    """Test files a set of shard scripts run, in stable order.
-
-    Every script must contribute at least one ``pytest`` target. Checking per
-    script rather than in aggregate matters: with five A10G shards, one shard
-    drifting to an unparsed invocation would leave the aggregate non-empty and
-    silently drop that shard's files from targeted A10G coverage.
-    """
-    seen: dict[str, None] = {}
-    drifted: list[str] = []
+    """Test files the shard scripts run, in script order, without duplicates."""
+    files: dict[str, None] = {}  # insertion-ordered set
+    unparsed: list[str] = []
     for script in scripts:
-        found = False
-        for line in script.read_text().splitlines():
-            match = _PYTEST_LINE.match(line)
-            if match:
-                seen.setdefault(_norm(match.group(1)), None)
-                found = True
-        if not found:
-            drifted.append(str(script))
-    if drifted:
+        matches = filter(None, map(_PYTEST_LINE.match, script.read_text().splitlines()))
+        targets = [_norm(m.group(1)) for m in matches]
+        if not targets:
+            unparsed.append(str(script))
+        files.update(dict.fromkeys(targets))
+    # Checked per script: with five A10G shards, one drifting to an unparsed
+    # invocation would leave the total non-empty and silently drop its files.
+    if unparsed:
         raise ValueError(
-            "no pytest targets parsed from " + ", ".join(drifted) + " -- parser drift?"
+            f"no pytest targets parsed from {', '.join(unparsed)} -- parser drift?"
         )
-    return list(seen)
+    return list(files)
 
 
 def intersect(targets: list[str], covered: list[str]) -> list[str]:
-    """Requested targets narrowed to covered files.
+    """Requested files kept if covered; requested directories become their covered files."""
+    selected: dict[str, None] = {}  # insertion-ordered set
+    for target in filter(None, map(_norm, targets)):
+        if _is_test_file(target):
+            if target in covered:
+                selected[target] = None
+        else:
+            selected.update(dict.fromkeys(f for f in covered if _within(f, target)))
+    return list(selected)
 
-    A requested file survives if a shard runs it; a requested directory becomes
-    the covered files under it. Output preserves the request order, then
-    coverage order, without duplicates.
-    """
-    out: dict[str, None] = {}
-    for target in (_norm(t) for t in targets):
-        if not target:
-            continue
-        if _is_dir(target):
-            for file in covered:
-                if _under(file, target):
-                    out.setdefault(file, None)
-        elif target in covered:
-            out.setdefault(target, None)
-    return list(out)
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    ap.add_argument(
+        "--scripts",
+        nargs="+",
+        type=Path,
+        help="shard scripts defining the lane's coverage",
+    )
+    ap.add_argument(
+        "--targets",
+        default="",
+        help="requested scope: space-separated paths under tests/",
+    )
+    ap.add_argument(
+        "--coverage-only",
+        action="store_true",
+        help="print the coverage instead of the intersection",
+    )
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args(argv)
+    if args.selftest:
+        return _selftest()
+    if not args.scripts:
+        ap.error("--scripts is required (or use --selftest)")
+    missing = [str(s) for s in args.scripts if not s.is_file()]
+    if missing:
+        sys.exit(f"targeted_lane_scope: shard script not found: {', '.join(missing)}")
+    try:
+        covered = coverage(args.scripts)
+    except ValueError as exc:
+        sys.exit(f"targeted_lane_scope: {exc}")
+    print(
+        " ".join(
+            covered if args.coverage_only else intersect(args.targets.split(), covered)
+        )
+    )
+    return 0
 
 
 def _selftest() -> int:
@@ -108,6 +129,14 @@ def _selftest() -> int:
     def check(name: str, got: object, want: object) -> None:
         if got != want:
             failures.append(f"{name}: got {got!r}, want {want!r}")
+
+    def raises(name: str, exc_type: type[BaseException], fn) -> BaseException | None:
+        try:
+            fn()
+        except exc_type as exc:
+            return exc
+        failures.append(f"{name}: expected {exc_type.__name__}")
+        return None
 
     with tempfile.TemporaryDirectory() as td:
         part = Path(td) / "part.sh"
@@ -121,128 +150,66 @@ def _selftest() -> int:
             "pytest tests/gemm/test_c.py\n"
         )
         cov = coverage([part])
-        check(
-            "coverage parses pytest lines only",
-            cov,
-            [
-                "tests/attention/test_a.py",
-                "tests/utils/test_b.py",
-                "tests/gemm/test_c.py",
-            ],
+        a, b, c = (
+            "tests/attention/test_a.py",
+            "tests/utils/test_b.py",
+            "tests/gemm/test_c.py",
         )
         check(
-            "file in coverage",
-            intersect(["tests/utils/test_b.py"], cov),
-            ["tests/utils/test_b.py"],
+            "coverage: pytest lines only, comments and wrappers ignored", cov, [a, b, c]
         )
+        check("file in coverage", intersect([b], cov), [b])
         check("file not in coverage", intersect(["tests/kda/test_x.py"], cov), [])
         check(
             "directory expands to covered files",
             intersect(["tests/attention/"], cov),
-            ["tests/attention/test_a.py"],
+            [a],
         )
         check(
-            "directory without trailing slash",
-            intersect(["tests/attention"], cov),
-            ["tests/attention/test_a.py"],
+            "directory without trailing slash", intersect(["tests/attention"], cov), [a]
         )
-        check("tests/ root expands to everything", intersect(["tests/"], cov), cov)
+        check("tests/ expands to everything", intersect(["tests/"], cov), cov)
         check(
-            "uncovered runner dir is not coverage",
+            "wrapper-run directory is not covered",
             intersect(["tests/moe_ep/"], cov),
             [],
         )
         check(
-            "mixed request keeps order, drops uncovered, dedups",
-            intersect(["tests/gemm/", "tests/kda/", "tests/gemm/test_c.py"], cov),
-            ["tests/gemm/test_c.py"],
+            "order kept, uncovered dropped, deduplicated",
+            intersect(["tests/gemm/", "tests/kda/", c], cov),
+            [c],
         )
-        check(
-            "./ prefix normalised",
-            intersect(["./tests/utils/test_b.py"], cov),
-            ["tests/utils/test_b.py"],
-        )
-        check("prefix is not containment", intersect(["tests/att"], cov), [])
+        check("./ prefix normalised", intersect(["./" + b], cov), [b])
+        check("path prefix is not containment", intersect(["tests/att"], cov), [])
 
         drifted = Path(td) / "drifted.sh"
         drifted.write_text("#!/bin/bash\npython -m pytest tests/attention/test_a.py\n")
-        try:
-            coverage([part, drifted])
-            check("mixed valid+drifted shards rejected", "returned", "ValueError")
-        except ValueError as exc:
-            check(
-                "mixed rejection names the drifted script",
-                str(drifted) in str(exc),
-                True,
-            )
-            check(
-                "mixed rejection does not blame the valid script",
-                str(part) in str(exc),
-                False,
-            )
-        argv = sys.argv
-        try:
-            sys.argv = [
-                "x",
-                "--scripts",
-                str(drifted),
-                "--targets",
-                "tests/attention/test_a.py",
-            ]
-            try:
-                main()
-                check("empty coverage exits non-zero", "returned", "SystemExit")
-            except SystemExit as exc:
-                check("empty coverage exit is an error", bool(exc.code), True)
-            sys.argv = ["x", "--scripts", str(part), "--targets", "tests/kda/test_x.py"]
-            check("empty intersection exits zero", main(), 0)
-        finally:
-            sys.argv = argv
+        exc = raises("unparsed shard rejected", ValueError, lambda: coverage([drifted]))
+        exc = raises(
+            "one unparsed shard among parsed ones rejected",
+            ValueError,
+            lambda: coverage([part, drifted]),
+        )
+        if exc:
+            check("error names the unparsed script", str(drifted) in str(exc), True)
+            check("error does not name the parsed script", str(part) in str(exc), False)
+        exc = raises(
+            "main: unparsed shard exits non-zero",
+            SystemExit,
+            lambda: main(["--scripts", str(drifted)]),
+        )
+        if exc:
+            check("main: unparsed shard exit code is an error", bool(exc.code), True)
+        check(
+            "main: empty intersection exits zero",
+            main(["--scripts", str(part), "--targets", "tests/kda/x.py"]),
+            0,
+        )
 
     for failure in failures:
         print(failure)
     print("selftest: FAILED" if failures else "selftest: all cases pass")
     return 1 if failures else 0
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    ap.add_argument(
-        "--scripts",
-        nargs="+",
-        type=Path,
-        help="shard scripts defining the lane's bare-run coverage",
-    )
-    ap.add_argument(
-        "--targets",
-        default="",
-        help="requested scope, space-separated paths under tests/",
-    )
-    ap.add_argument(
-        "--coverage-only",
-        action="store_true",
-        help="print the lane's coverage instead of the intersection",
-    )
-    ap.add_argument("--selftest", action="store_true")
-    args = ap.parse_args()
-    if args.selftest:
-        return _selftest()
-    if not args.scripts:
-        ap.error("--scripts is required (or use --selftest)")
-    missing = [s for s in args.scripts if not s.is_file()]
-    if missing:
-        print(
-            f"error: shard script not found: {', '.join(map(str, missing))}",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        covered = coverage(args.scripts)
-    except ValueError as exc:
-        sys.exit(f"targeted_lane_scope: {exc}")
-    result = covered if args.coverage_only else intersect(args.targets.split(), covered)
-    print(" ".join(result))
-    return 0
 
 
 if __name__ == "__main__":
