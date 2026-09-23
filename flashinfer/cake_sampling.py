@@ -359,7 +359,6 @@ def top_k_top_p_sampling_from_probs(
             return out
         return res.to(torch.int32)
 
-    capability = _capability(probs.device)
     batch, vocab = probs.shape
     if isinstance(top_k, torch.Tensor):
         top_k = _per_row_param(top_k, batch, torch.int32, "top_k")
@@ -469,7 +468,6 @@ def top_k_probs_to_slab(
     route = cake_sampling_route(probs, top_k, top_k_max)
     if route != "pipeline":
         raise ValueError(f"frozen radix top-k cannot serve this request ({route})")
-    capability = _capability(probs.device)
     batch, vocab = probs.shape
     slab = _slab()
     cluster, ept, stream_variant = choose_stage1(batch, vocab)
