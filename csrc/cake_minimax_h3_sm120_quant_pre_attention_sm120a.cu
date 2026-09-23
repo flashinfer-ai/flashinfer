@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// clang-format off
 // MiniMax-H3 quantized fused pre-attention for SM120 (GB202: RTX 5090 / RTX PRO 6000 Blackwell),
 // generated from the Cake kernel schedules.  Two launches per call:
 //   1. norm_adaln_quant_{fp8,nvfp4}: RMSNorm(x) * w, indexed AdaLN (shift + n * (1 + scale)), then
@@ -9205,3 +9206,4 @@ void minimax_h3_sm120_nvfp4_pre_attention(TensorView x, TensorView x_norm_weight
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_sm120_fp8_pre_attention, minimax_h3_sm120_fp8_pre_attention);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_sm120_nvfp4_pre_attention, minimax_h3_sm120_nvfp4_pre_attention);
+// clang-format on

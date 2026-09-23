@@ -660,7 +660,7 @@ def test_minimax_h3_quant_pre_attention_preallocated_outputs_and_workspaces() ->
     torch.testing.assert_close(act_scale, expected_scale, atol=0.0, rtol=2**-7)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@requires_sm120
 def test_minimax_h3_quant_pre_attention_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
     inputs = make_inputs(64, seed=1, device=device)
