@@ -559,8 +559,9 @@ def test_ragged_prefill_rejects_output_scale():
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("scale_type", ["default", "scalar", "tensor"])
 def test_fp8_prefill_scales_capture_replay(paged, scale_type):
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("cuDNN's unified FP8 prefill engine requires Blackwell or newer")
+    # FP8 inputs with BF16 output require SM10x; SM12x is not supported.
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("cuDNN FP8-input/BF16-output prefill requires SM10x")
     if not prefill._cudnn_supports_direct_seqlens(torch.float8_e4m3fn, mixed=paged):
         pytest.skip("requires direct cuDNN FP8 cumulative sequence lengths")
     q, k, v, qo, ip, ix, last = _paged_inputs()
