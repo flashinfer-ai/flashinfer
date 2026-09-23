@@ -226,6 +226,41 @@ def st_bf16_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_bf16_pred_rowaddr(
+    dst_gmem, row_i32, row_bytes_i32, col_bytes_i32, v_f32, pred_i32, loc=None, ip=None
+):
+    """Predicated 2-byte BF16 store at byte ``row * row_bytes + col_bytes`` of
+    ``dst`` where that byte offset may pass 2^31.
+
+    One ``mad.wide.s32`` forms the 64-bit offset (the column term is loop
+    invariant and hoisted by ptxas), so the deferred-row epilogue pays one
+    wide IMAD per store instead of a 64-bit tensor layout. Nothing is issued
+    when ``pred_i32`` is zero.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            row_i32.ir_value(loc=loc, ip=ip),
+            row_bytes_i32.ir_value(loc=loc, ip=ip),
+            col_bytes_i32.ir_value(loc=loc, ip=ip),
+            v_f32.ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\t.reg .b16 h_;\n\t.reg .s64 o_, a_, c_;\n\t"
+        "setp.ne.b32 p_, $5, 0;\n\tcvt.rn.bf16.f32 h_, $4;\n\t"
+        "cvt.s64.s32 c_, $3;\n\tmad.wide.s32 o_, $1, $2, c_;\n\tadd.s64 a_, $0, o_;\n\t"
+        "@p_ st.global.b16 [a_], h_;\n}",
+        "l,r,r,r,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
     llvm.inline_asm(
         None,

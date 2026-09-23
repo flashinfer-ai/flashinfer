@@ -74,6 +74,7 @@ from .utils import (
     UnalignedNamedBarrier,
     red_add_bf16x2_pair_pred,
     st_bf16_pred,
+    st_bf16_pred_rowaddr,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     native_situ_f32,
@@ -110,6 +111,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         m_group: int = 1,
         group_rows: Optional[int] = None,
         sf_blocked: bool = False,
+        wide_out: bool = False,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
@@ -127,6 +129,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.is_situ = epilogue_kind == "situ_mxfp8"
         self.is_finalize = epilogue_kind == "finalize"
         self.is_partial = epilogue_kind == "partial"
+        # ``partial`` outputs whose ``rows * cols`` passes 2^31 elements form the
+        # store offset in 64 bits (one wide IMAD per store); below that the
+        # 32-bit tensor layout math is kept unchanged.
+        self.wide_out = wide_out
         self.enable_pdl = enable_pdl
         self.use_linear_beta = use_linear_beta
         # GEMM1 gathers activation rows through the permuted->expanded map;
@@ -2073,16 +2079,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 for c in cutlass.range_constexpr(n_tile):
                                     if cutlass.const_expr(hold_meta):
                                         v = vals[c] * sScale[(c, meta_stage)]
-                                        dst = cute.domain_offset(
-                                            (sTok[(c, meta_stage)], h, 0), out
-                                        )
+                                        tok = sTok[(c, meta_stage)]
                                     else:
                                         v = vals[c] * cur_scale[c]
-                                        dst = cute.domain_offset(
-                                            (cur_tok[c], h, 0), out
-                                        )
+                                        tok = cur_tok[c]
                                     col_ok = (row_base + c) < mn_limit
                                     if cutlass.const_expr(self.is_finalize):
+                                        dst = cute.domain_offset((tok, h, 0), out)
                                         v_hi = cute.arch.shuffle_sync_bfly(v, 1)
                                         red_add_bf16x2_pair_pred(
                                             dst,
@@ -2090,7 +2093,20 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             v_hi,
                                             cutlass.Int32(col_ok & is_even_lane),
                                         )
+                                    elif cutlass.const_expr(self.wide_out):
+                                        # Deferred rows past 2^31 elements (MoE-TP
+                                        # shard, T >= 16384): 64-bit byte offset
+                                        # ``tok * (2 * cols) + 2 * h`` per store.
+                                        st_bf16_pred_rowaddr(
+                                            out,
+                                            tok,
+                                            out.shape[1] * 2,
+                                            h * 2,
+                                            v,
+                                            cutlass.Int32(col_ok),
+                                        )
                                     else:
+                                        dst = cute.domain_offset((tok, h, 0), out)
                                         st_bf16_pred(dst, v, cutlass.Int32(col_ok))
 
                 tcgen05_fence_before_thread_sync()
@@ -2156,6 +2172,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         num_local_experts: cutlass.Int32,
         rows_b: cutlass.Int32,
         rows_perm: cutlass.Int32,
+        # 32-bit extents: the deferred (``partial``) output holds every
+        # permuted row times the hidden size and passes 2^31 elements for the
+        # largest prefill shapes; that variant (``wide_out``) forms a 64-bit
+        # byte offset per store (``st_bf16_pred_rowaddr``) and the layout math
+        # stays 32-bit.
         out_rows: cutlass.Int32,
         out_cols: cutlass.Int32,
         num_tokens: cutlass.Int32,

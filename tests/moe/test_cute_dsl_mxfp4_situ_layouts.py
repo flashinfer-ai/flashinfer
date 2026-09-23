@@ -337,7 +337,9 @@ def test_tp_workspace_size_follows_intermediate_shard():
     for tokens in (1, 16, 512, 4096):
         assert tp.get_workspace_size(tokens) == single_shard.get_workspace_size(tokens)
         assert tp.get_workspace_size(tokens) < ep.get_workspace_size(tokens)
-    # Default swap-AB caps follow the intermediate shard (B300 crossover points)
+    # Default swap-AB caps follow the intermediate shard (B300 crossover points:
+    # the 384-wide MoE-TP shard continues in the hybrid form up to T=2048, the
+    # 3072-wide expert-parallel rank switches to the dense path after T=1024)
     # and the swap workspace is smaller than the 128-row token-tile layout it
     # replaces; past the cap both wrappers carve the same dense workspace.
     tp_swap = mx.CuteDslMxfp4MoEWrapper(
@@ -346,13 +348,15 @@ def test_tp_workspace_size_follows_intermediate_shard():
     ep_swap = mx.CuteDslMxfp4MoEWrapper(
         896, 16, 7168, 3072, parallel_layout=layout("expert_parallel", 8, 3)
     )
-    assert (tp_swap.swapab_max_tokens, ep_swap.swapab_max_tokens) == (1024, 1024)
+    assert (tp_swap.swapab_max_tokens, ep_swap.swapab_max_tokens) == (2048, 1024)
     for tokens in (1, 16):
         assert ep_swap.get_workspace_size(tokens) < ep.get_workspace_size(tokens)
         assert tp_swap.get_workspace_size(tokens) < tp.get_workspace_size(tokens)
     assert ep_swap.get_workspace_size(17) != ep.get_workspace_size(17)
     assert ep_swap.get_workspace_size(1025) == ep.get_workspace_size(1025)
-    assert tp_swap.get_workspace_size(1025) == tp.get_workspace_size(1025)
+    # The MoE-TP shard's hybrid form still carves its own workspace at T=1025.
+    assert tp_swap.get_workspace_size(1025) != tp.get_workspace_size(1025)
+    assert tp_swap.get_workspace_size(2049) == tp.get_workspace_size(2049)
     # Documented sizes of the 128-row layout; expert parallelism keeps it.
     assert [ep.get_workspace_size(t) for t in (1, 16, 4096)] == [
         6499072,

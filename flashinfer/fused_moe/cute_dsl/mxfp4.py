@@ -103,6 +103,36 @@ SWAP_EP_L2HINT_SKIP = (
 # 256-wide MMA N halves the GEMM2 tile count (TP8 T=2048 GEMM2 444 -> 344 us,
 # T=4096 564 -> 459 us) and matches GEMM1; used when no offline table covers T.
 B300_SITU_DENSE_TACTIC = (128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))
+# Dense-path W4A8 tactics by token-count bucket, measured on B300 (Kimi K3,
+# candidate-only CUPTI graph medians, every tactic of a bucket timed in the
+# same process on the same GPU). The rows per local expert set the M-tile
+# padding. Every bucket keeps the M128 GEMM1 tile: on the narrow MoE-TP
+# shard the 2-CTA M256 tactic measured best at T=8192 (every routing keeps
+# >= 146 rows per expert; GEMM1 905 -> 774 us), but compute-sanitizer
+# synccheck reports "Missing wait" records from that kernel's MMA warp, so
+# the shard runs the cluster-2 N256 GEMM2 with the M128 GEMM1 up to T=8192
+# instead (T=8192 balanced/hot/empty -0.4/-3.7/-0.8% against the base
+# tactic). The expert-parallel rank would gain 17% from M256 on the balanced
+# routing at T=8192 but lose 31% on the remote-dominated one (73 rows per
+# expert, padded 3.5x); a routing-aware tile choice needs both tile lists at
+# run time and is left open. The 192-wide GEMM2 helps where GEMM2 is
+# finalize-bound: cluster 1 wins 1-2% on the wide shard up to T=4096 and
+# cluster 2 wins 3-5% there at T=16384 (not at 32768, where the default is
+# best); on the narrow shard the cluster-2 N192 GEMM2 wins 1-7% on every
+# routing from T=16384 (16384: -3.4..-4.6%, 32768: -1.2..-7.2%).
+_T128_N256_C2 = (128, ((128, 256), (1, 1), False), ((128, 256), (1, 2), False))
+_T128_N192 = (128, ((128, 256), (1, 1), False), ((128, 192), (1, 1), False))
+_T128_N192_C2 = (128, ((128, 256), (1, 1), False), ((128, 192), (1, 2), False))
+B300_SITU_DENSE_TACTIC_TABLE_WIDE = (
+    (8192, _T128_N192),
+    (16384, _T128_N192_C2),
+    (1 << 62, B300_SITU_DENSE_TACTIC),
+)
+B300_SITU_DENSE_TACTIC_TABLE_NARROW = (
+    (2048, B300_SITU_DENSE_TACTIC),
+    (8192, _T128_N256_C2),
+    (1 << 62, _T128_N192_C2),
+)
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
 # applies the route weights (no bulk reduce-add into the output).
 DENSE_TWO_STAGE_FINALIZE = os.environ.get("MXFP4_DENSE_TWO_STAGE", "0") == "1"
@@ -734,6 +764,11 @@ class Mxfp4MoESwapAbPlan:
                 # Dense contiguous grouped GEMM2 over the 128-row sort groups
                 # with the bulk-reduce finalize into the zero-filled output.
                 gemm2_tactic = w._tactic(num_tokens)[2]
+                if gemm2_tactic[0][0] != self.group_rows:
+                    raise ValueError(
+                        "hybrid GEMM2 tactic tile must match the "
+                        f"{self.group_rows}-row sort groups, got {gemm2_tactic!r}"
+                    )
                 blockscaled_contiguous_grouped_gemm_finalize_fusion(
                     a=b["gemm1_out"],
                     b=w2,
@@ -989,7 +1024,14 @@ class CuteDslMxfp4MoEWrapper:
             if num_tokens <= limit:
                 return tactic
         if self.activation_type == ActivationType.Situ:
-            return B300_SITU_DENSE_TACTIC
+            table = (
+                B300_SITU_DENSE_TACTIC_TABLE_NARROW
+                if self.intermediate_shard < 1024
+                else B300_SITU_DENSE_TACTIC_TABLE_WIDE
+            )
+            for limit, tactic in table:
+                if num_tokens <= limit:
+                    return tactic
         return DEFAULT_BLACKWELL_MOE_TACTIC
 
     def _use_swapab(self, num_tokens, do_finalize=True):

@@ -349,6 +349,7 @@ def _get_compiled_swapab_kernel(
     gather_warps: Optional[int] = None,
     group_rows: Optional[int] = None,
     sf_blocked: bool = False,
+    wide_out: bool = False,
 ):
     import os
     import sys
@@ -385,6 +386,7 @@ def _get_compiled_swapab_kernel(
         row_group_list,
         group_rows,
         sf_blocked,
+        wide_out,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -407,6 +409,7 @@ def _get_compiled_swapab_kernel(
             m_group=m_group,
             group_rows=group_rows,
             sf_blocked=sf_blocked,
+            wide_out=wide_out,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -604,6 +607,8 @@ def swapab_gemm2(
                 "permuted order"
             )
         num_tokens = out.shape[0]
+    # Deferred rows past 2^31 elements need the 64-bit store offset variant.
+    wide_out = (not finalize) and out.shape[0] * out.shape[1] >= 1 << 31
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(1)
     args = (
@@ -659,6 +664,7 @@ def swapab_gemm2(
         tiled_a=bool(SWAP_TILED_WEIGHTS & 2),
         weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
         group_rows=group_rows,
+        wide_out=wide_out,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)
