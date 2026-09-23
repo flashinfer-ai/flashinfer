@@ -17,13 +17,15 @@
 // compute capability 10.3).  Generated device code; three operator variants share one
 // translation unit:
 //
-//   a = BF16(BF16(RMSNorm_fp32(x, x_norm_weight, eps)) * BF16(1 + adaln_scale[idx]) + adaln_shift[idx])
+//   a = BF16(BF16(RMSNorm_fp32(x, x_norm_weight, eps)) * BF16(1 + adaln_scale[idx])
+//            + adaln_shift[idx])
 //       rows whose idx lies outside [0, 9) are zero
 //   BF16 : h = BF16(a @ fc1_weight^T)
 //   MXFP8: a_q, a_sf = mxfp8_quantize(a)   (E4M3 + UE8M0 per 32, FlashInfer recipe)
 //          h = BF16(dequant(a_q, a_sf) @ dequant(w_q, w_sf)^T)
 //   NVFP4: a_q, a_sf = nvfp4_quantize(a, a_global_scale)   (E2M1 + UE4M3 per 16, FlashInfer recipe)
-//          h = BF16(alpha * ((a_q * a_sf) @ (w_q * w_sf)^T)),  alpha = 1 / (a_global_scale * w_global_scale)
+//          h = BF16(alpha * ((a_q * a_sf) @ (w_q * w_sf)^T)),
+//          alpha = 1 / (a_global_scale * w_global_scale)
 //   y = BF16(BF16(silu(h[:, :14336])) * h[:, 14336:])      fc1 rows [0, 14336) = gate, [14336, 28672) = up
 //
 // Kernel 1 of each variant (norm + AdaLN [+ quantize]) is a plain 128-thread launch, one warp per
