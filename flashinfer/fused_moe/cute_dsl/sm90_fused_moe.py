@@ -303,11 +303,10 @@ def cute_dsl_fused_moe_bf16(
         * Parallelism: TP by weight shapes; EP via ``num_local_experts`` +
           ``local_expert_offset`` (tokens routed entirely outside the local
           shard contribute zeros).
-        * Shapes: ``hidden % 64 == 0`` (GEMM1's reduction moves whole
-          64-element K tiles), ``I % 32 == 0`` for gated activations (weight
-          interleave; GEMM1's N is ``2I``) and ``I % 64 == 0`` for ``Relu2``
-          (GEMM1's N is ``I``, walked in 64-column tiles); GEMM2's K tail is
-          zero-filled by TMA; ``num_tokens == 0`` is supported.
+        * Shapes: ``hidden % 8 == 0``; ``I % 32 == 0`` for gated activations
+          (32-column up/gate interleave), ``I % 8 == 0`` for ``Relu2``;
+          partial last K and N tiles are handled; ``num_tokens == 0`` is
+          supported.
         * Execution: CUDA-graph capturable; PDL on by default; fused
           finalize (default) is atomic and not bitwise-reproducible —
           ``use_fused_finalize=False`` selects the deterministic path.

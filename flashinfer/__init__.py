@@ -63,6 +63,9 @@ from .cake_fmha import (
     cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
 )
 from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_sampling import (
+    top_k_top_p_sampling_from_probs as cake_top_k_top_p_sampling_from_probs,
+)
 from .cake_fmha import (
     CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
 )
@@ -80,6 +83,9 @@ from .decode import (
 )
 from .decode import (
     launch_sm110_gqa_decode_prepared as launch_sm110_gqa_decode_prepared,
+)
+from .decode import (
+    prepare_balanced_batch_decode_with_kv_cache as prepare_balanced_batch_decode_with_kv_cache,
 )
 from .decode import prepare_sm110_gqa_decode as prepare_sm110_gqa_decode
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
@@ -218,6 +224,7 @@ from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
+from .kda_decode import packed_fused_kda_decode
 from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc

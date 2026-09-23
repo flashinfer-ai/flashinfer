@@ -2834,3 +2834,46 @@ def test_batch_prefill_cuda_graph_padding_without_split_kv(kv_cache):
 
     o = wrapper.run(q, *run_args)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 17])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("seq_lens_dtype", [None, torch.int32, torch.uint32])
+def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
+    """plan() derives the longest query and KV length when the caller omits
+    max_token_per_sequence and max_sequence_kv. seq_lens may be int32 or
+    uint32. A single request is the one-element case of the reduction."""
+    torch.manual_seed(batch_size * 31 + page_size)
+    q_lens = torch.randint(1, 65, (batch_size,), dtype=torch.int32)
+    kv_lens = torch.maximum(
+        torch.randint(1, 513, (batch_size,), dtype=torch.int32), q_lens
+    )
+    num_pages = (kv_lens + page_size - 1) // page_size
+    qo_indptr = torch.nn.functional.pad(
+        torch.cumsum(q_lens, 0, dtype=torch.int32), (1, 0)
+    )
+    kv_indptr = torch.nn.functional.pad(
+        torch.cumsum(num_pages, 0, dtype=torch.int32), (1, 0)
+    )
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
+    )
+    wrapper.plan(
+        qo_indptr.cuda(),
+        kv_indptr.cuda(),
+        torch.arange(int(kv_indptr[-1]), dtype=torch.int32, device="cuda"),
+        (kv_lens - (num_pages - 1) * page_size).cuda(),
+        8,
+        8,
+        128,
+        page_size,
+        causal=True,
+        q_data_type=torch.float16,
+        seq_lens=None if seq_lens_dtype is None else kv_lens.to(seq_lens_dtype).cuda(),
+    )
+
+    assert type(wrapper._max_q_len) is int
+    assert wrapper._max_q_len == int(q_lens.max())
+    assert type(wrapper._max_kv_len) is int
+    assert wrapper._max_kv_len == int(kv_lens.max())

@@ -168,12 +168,14 @@ from .jit.rmsnorm_silu import (
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
+from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
+from .jit.cake_sampling import gen_cake_sampling_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -882,6 +884,13 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        if has_sm100 or has_sm103:
+            jit_specs.append(gen_blackwell_softmax_module())
+        # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
+        if any(
+            (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)
+        ):
+            jit_specs.append(gen_cake_sampling_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:
