@@ -18,39 +18,54 @@ from ...cute_dsl.availability import is_cute_dsl_available
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
     from . import fused_moe as _fused_moe
-    from .fused_moe import (
-        cute_dsl_fused_moe,
-        CuteDslMoEWrapper,
-    )
-    from .fused_moe import (
-        cute_dsl_fused_moe_nvfp4,
-        cute_dsl_fused_moe_mxfp8_mxfp4,
-        CuteDslMxfp8Mxfp4MoEWrapper,
-    )
     from .b12x_moe import (
-        b12x_fused_moe,
         B12xMoEWrapper,
+        b12x_fused_moe,
     )
-    from .blackwell_sm12x import W4A16PackedWeights
+    from .blackwell_sm12x import (
+        W4A16PackedWeights,
+        cute_dsl_sm12x_fc1_act_fp8,
+        cute_dsl_sm12x_fc1_act_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_q1_fp8,
+        cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc2_finalize_fp8,
+        cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
+        cute_dsl_sm12x_moe_gemm_fp8,
+        cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
+    )
+    from .fused_moe import (
+        CuteDslMoEWrapper,
+        CuteDslMxfp8Mxfp4MoEWrapper,
+        cute_dsl_fused_moe,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        cute_dsl_fused_moe_nvfp4,
+    )
     from .sm90_fused_moe import (
-        cute_dsl_fused_moe_bf16,
         CuteDslBf16MoEWrapper,
+        cute_dsl_fused_moe_bf16,
     )
-
 __all__ = [
     "is_cute_dsl_available",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
-        "cute_dsl_fused_moe",
-        "CuteDslMoEWrapper",
-        "cute_dsl_fused_moe_nvfp4",
-        "cute_dsl_fused_moe_mxfp8_mxfp4",
-        "CuteDslMxfp8Mxfp4MoEWrapper",
-        "b12x_fused_moe",
         "B12xMoEWrapper",
-        "W4A16PackedWeights",
-        "cute_dsl_fused_moe_bf16",
         "CuteDslBf16MoEWrapper",
+        "CuteDslMoEWrapper",
+        "CuteDslMxfp8Mxfp4MoEWrapper",
+        "W4A16PackedWeights",
+        "b12x_fused_moe",
+        "cute_dsl_fused_moe",
+        "cute_dsl_fused_moe_bf16",
+        "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_sm12x_fc1_act_fp8",
+        "cute_dsl_sm12x_fc1_act_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_q1_fp8",
+        "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc2_finalize_fp8",
+        "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
+        "cute_dsl_sm12x_moe_gemm_fp8",
+        "cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4",
     ]

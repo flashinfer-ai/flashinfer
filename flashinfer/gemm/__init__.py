@@ -2,7 +2,13 @@ from .gemm_base import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm_base import bmm_bf16 as bmm_bf16
 from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
+from .gemm_base import gemm_alpha_beta as gemm_alpha_beta
+from .gemm_base import masked_bmm as masked_bmm
+from .gemm_base import masked_scaled_bmm as masked_scaled_bmm
 from .gemm_base import mm_bf16 as mm_bf16
+from .gemm_base import ragged_bmm as ragged_bmm
+from .gemm_base import ragged_block_scaled_bmm as ragged_block_scaled_bmm
+from .gemm_base import ragged_scaled_bmm as ragged_scaled_bmm
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
@@ -21,6 +27,9 @@ from .gemm_base import (
 from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
+from .gemm_base import (
+    group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
+)
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
 from .gemm_bf16_fp4 import (
@@ -136,6 +145,7 @@ __all__ = (
         "gemm_fp8_nt_blockscaled",
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
+        "group_gemm_fp8_nt_groupwise_contiguous",
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",

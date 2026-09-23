@@ -80,6 +80,17 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 constexpr int WARP_SIZE = 32;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
+__device__ __forceinline__ float computeSafeFP8QuantScale(float row_amax) {
+  if (!(row_amax > 0.0f)) {
+    return 1.0f;
+  }
+
+  constexpr float FP8_E4M3_MAX = 448.0f;
+  constexpr float MIN_AMAX_FOR_FINITE_SCALE = FP8_E4M3_MAX / FLT_MAX;
+  // A tiny nonzero amax can make FP8_E4M3_MAX / row_amax overflow to infinity.
+  return FP8_E4M3_MAX / fmaxf(row_amax, MIN_AMAX_FOR_FINITE_SCALE);
+}
+
 struct FloatMaxOp {
   __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
 };
@@ -1730,7 +1741,7 @@ __global__ void expandInputRowsKernel(
       float const row_amax =
           BlockReduce(reduce_storage).Reduce(AmaxOp::to_float(thread_amax), FloatMaxOp{});
       if (threadIdx.x == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+        float const quant = computeSafeFP8QuantScale(row_amax);
         float residual = 1.0f;
         if (fp8_expert_residual_scale) {
           int const expert = permuted_token_selected_experts[permuted_row];
@@ -2518,7 +2529,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
       __shared__ float shared_token_quant_scale;
       float const row_amax = BlockReduce(reduce_storage).Reduce(thread_amax, FloatMaxOp{});
       if (tid == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+        float const quant = computeSafeFP8QuantScale(row_amax);
         float residual = 1.0f;
         // The GEMM1 profiler passes no expert map and does not consume the generated FC2 scale.
         if (fp8_expert_residual_scale && permuted_token_selected_experts) {
@@ -4802,6 +4813,8 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   bool is_fp8_act_quant = mDType == nvinfer1::DataType::kFP8;
   bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
   bool const is_native_wfp4afp8_family = isNativeWfp4Afp8Family();
+  // NVFP4 uses the same six quant workspaces as wfp4afp8 (issue #4003).
+  bool const is_native_wfp4afp4_family = isNativeWfp4Afp4Family();
   // This predicate identifies the SM90 FP8 activation x packed-MXFP4 storage
   // family.  Sm90Wfp4Afp8ScaleMode selects Humming/pre-MMA vs future post-MMA
   // semantics; do not infer the semantic path from dtype/layout alone.
@@ -4835,22 +4848,12 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
 
   // FP4 sizes
   bool const use_humming_pre_mma = isHummingPreMmaScaleMode();
-  bool const is_nvfp4_quant =
-      mSM >= 100 && (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   size_t quant_5_size = 0;
   size_t quant_6_size = 0;
-  if (is_nvfp4_quant) {
+  if (is_native_wfp4afp8_family || is_native_wfp4afp4_family) {
     quant_1_size = sizeof(float);
-    quant_2_size = getOffsetWeightSF(num_experts_per_node, inter_size, hidden_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
-    quant_3_size = num_experts_per_node * sizeof(float);
-    quant_4_size = sizeof(float);
-    quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
-    quant_6_size = num_experts_per_node * sizeof(float);
-  } else if (is_native_wfp4afp8_family) {
-    quant_1_size = sizeof(float);
+    // fc1 scale factors span fc1_out_size rows (2x inter_size when gated),
+    // matching the gemm1_n the profiler consumes them with.
     quant_2_size =
         getOffsetWeightSF(num_experts_per_node, fc1_out_size, hidden_size, mScalingType) *
         sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
@@ -5178,8 +5181,7 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
           static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
           static_cast<float const*>(quant_6));
     }
-  } else if ((mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
-             (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64)) {
+  } else if (isNativeWfp4Afp4Family()) {
     // nvllm still uses int64 because torch doesn't have fp4 yet.
     TLLM_CHECK(quant_1 && quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
     mQuantParams = QuantParams::FP4(

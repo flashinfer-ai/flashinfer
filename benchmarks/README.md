@@ -52,7 +52,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16 and NVFP4 W4A4 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
+    - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
+    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
@@ -109,8 +110,14 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 ### Single Test Run
 A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <routine_name> <flags>`.
 
-The unified MoE comparison runs both backends from the same routing, activation,
-and weight inputs. This example uses the Nemotron-3.5-Lightning MoE shape:
+The unified MoE comparison runs the selected backends from the same routing, activation,
+and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
+`nvfp4_w4a16`, `mxfp4`, `mxfp4_w4a16`, `fp8`, `fp8_w8a16`, `mxfp8`,
+`mxfp8_w8a16`, and `mxfp4_w4a8`. `fp8` uses per-tensor E4M3 scaling;
+`mxfp8` uses E8M0 block scales. The W8A16 modes retain BF16 activations;
+`mxfp4_w4a8` uses MXFP4 weights with MXFP8 activations. A8 modes include
+BF16-to-FP8 quantization before both GEMMs in the timed region. This example uses the
+Nemotron-3.5-Lightning MoE shape:
 
 ```bash
 python3 flashinfer_benchmark.py --routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune
@@ -120,6 +127,18 @@ CUDA graph timing is enabled by default and captures one MoE invocation per
 graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
 timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotuned
 results use `cutlass_autotune` and `cutile_autotune`.
+CUTLASS comparisons also support `fp8` (per-tensor W8A8) and `mxfp4_w4a8`
+on supported architectures. These CUTLASS runners take prequantized activations,
+so the benchmark includes their public `prepare_activations` conversion in the
+main BF16-input latency. The additional CSV columns `prequantized_median_time`
+and `prequantized_std_time` (milliseconds) report the runner-only timing without
+that input conversion. Per-tensor CUTLASS uses its fixed GEMM2 activation scale,
+whereas cuTile dynamically scales GEMM2 input; equal precision pairs do not imply
+identical quantization policies. CUTLASS `mxfp4_w4a8` requires hidden and
+intermediate sizes divisible by 128; unsupported shapes are skipped.
+On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
+and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
+`--autotune` does not expand its search space. MXFP4 is not supported by b12x.
 
 Representative Qwen3.6 and Nemotron cases are in `samples/sample_testlist.txt`.
 
@@ -252,6 +271,7 @@ The output CSV will contain detailed metrics including:
 | `--head_dim_kpe`         | Head dimension for KPE (MLA attention).                                                                    |
 | `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
 | `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
+| `--v_dtype`              | Data type for the value tensor. Default: same as kv_dtype. Only the prims-ts backend accepts a V dtype different from kv_dtype, and only as `--kv_dtype bfloat16 --v_dtype fp8_e4m3` (QK-BF16/PV-FP8); other backends then read the FP8-rounded V in kv_dtype. |
 | `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Backend-dependent; PrimTS context accepts bfloat16, float16, or fp8_e4m3, while PrimTS FP8 decode accepts float16 or fp8_e4m3. FP8 ragged comparisons with non-PrimTS backends require bfloat16 or float16. |
 | `--causal`               | Use causal attention masking for context/prefill. Multi-query FMHA and MLA decode use bottom-right causal masking automatically. |
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |
@@ -559,7 +579,8 @@ Legend:
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
-| **unified_moe** |  |  |  | cutlass, cutile (BF16) | cutlass, cutile (BF16) | cutlass | cutlass | cutlass, cutile |
+| **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
+| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass | cutlass | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
@@ -617,7 +638,7 @@ Backend Legend:
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
-- cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
+- cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
 - cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use
   packed NHD storage, while paged K/V uses HND storage. Paged attention accepts
   the standard combined cache or separate K/V pools without copying. The
