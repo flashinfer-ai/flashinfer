@@ -374,6 +374,14 @@ def chunked_attention_ref_torch(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.parametrize(
+    "qkv_dtype,o_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
 @parametrize_product(
     {
         "batch_size": [8],
@@ -381,11 +389,6 @@ def chunked_attention_ref_torch(
         "head_dim_qk": [192],
         "head_dim_v": [128],
         "seq_len": [1024, 4096, 8192],
-        "qkv_dtype,o_dtype": [
-            (torch.bfloat16, torch.bfloat16),
-            (torch.float8_e4m3fn, torch.bfloat16),
-            (torch.float8_e4m3fn, torch.float16),
-        ],
     },
     regular=pairwise_product_cases,
 )
@@ -610,13 +613,10 @@ def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
     torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
 
 
-@parametrize_product(
-    {
-        "causal": [False, True],
-        "head_dim": [64, 128],
-        "batch_size,seq_len,num_heads": [(1, 128, 4), (1, 1024, 32), (2, 129, 4)],
-    },
-    regular=pairwise_product_cases,
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_heads", [(1, 128, 4), (1, 1024, 32), (2, 129, 4)]
 )
 def test_fmha_v2_prefill_sm120_self_attention(
     causal, head_dim, batch_size, seq_len, num_heads
@@ -685,9 +685,9 @@ def test_fmha_v2_prefill_sm120_self_attention(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
+@pytest.mark.parametrize("device_scale", ["bmm1", "bmm2"])
 @parametrize_product(
     {
-        "device_scale": ["bmm1", "bmm2"],
         "causal": [False, True],
         "head_dim": [64, 128],
     },
@@ -1248,30 +1248,36 @@ def run_trtllm_fmha_v2_prefill_case(
         torch.testing.assert_close(lse_kernel, lse_ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "dtype,o_dtype",
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
+@pytest.mark.parametrize(
+    "input_layout,page_size,save_softmax_stats",
+    [
+        ("PACKED_QKV", None, False),
+        ("CONTIGUOUS_Q_KV", None, False),
+        ("CONTIGUOUS_Q_KV", None, True),
+        ("SEPARATE_Q_K_V", None, False),
+        ("Q_PAGED_KV_NHD", 32, False),
+        ("Q_PAGED_KV_NHD", 128, False),
+        ("Q_PAGED_KV_HND", 32, False),
+        ("Q_PAGED_KV_HND", 128, False),
+    ],
+)
 @parametrize_product(
     {
-        "input_layout,page_size,save_softmax_stats": [
-            ("PACKED_QKV", None, False),
-            ("CONTIGUOUS_Q_KV", None, False),
-            ("CONTIGUOUS_Q_KV", None, True),
-            ("SEPARATE_Q_K_V", None, False),
-            ("Q_PAGED_KV_NHD", 32, False),
-            ("Q_PAGED_KV_NHD", 128, False),
-            ("Q_PAGED_KV_HND", 32, False),
-            ("Q_PAGED_KV_HND", 128, False),
-        ],
         "batch_size": [1, 16],
         "max_seq_len": [1024],
         "num_qo_heads": [4, 32],
         "num_kv_heads": [4],
         "head_dim": [128, 256],
-        "dtype,o_dtype": [
-            (torch.float16, torch.float16),
-            (torch.bfloat16, torch.bfloat16),
-            (torch.float8_e4m3fn, torch.float8_e4m3fn),
-            (torch.float8_e4m3fn, torch.bfloat16),
-            (torch.float8_e4m3fn, torch.float16),
-        ],
         "causal,window_left,mask_mode": [
             (True, -1, "CAUSAL"),
             (True, 127, "SLIDING_WINDOW"),
@@ -1433,18 +1439,17 @@ def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
     )
 
 
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize(
+    "input_layout,page_size",
+    [("CONTIGUOUS_Q_KV", None), ("Q_PAGED_KV_NHD", 32), ("Q_PAGED_KV_NHD", 128)],
+)
 @parametrize_product(
     {
-        "input_layout,page_size": [
-            ("CONTIGUOUS_Q_KV", None),
-            ("Q_PAGED_KV_NHD", 32),
-            ("Q_PAGED_KV_NHD", 128),
-        ],
         "batch_size": [1, 4],
         "max_seq_len": [1024],
         "num_qo_heads": [8],
         "num_kv_heads": [2],
-        "head_dim": [256, 512],
         "dtype": [torch.float16, torch.bfloat16],
         "causal,window_left,mask_mode": [
             (True, -1, "CAUSAL"),
@@ -1735,6 +1740,10 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize(
+    "input_layout,page_size",
+    [("CONTIGUOUS_Q_KV", None), ("SEPARATE_Q_K_V", None), ("Q_PAGED_KV_NHD", 32)],
+)
 @parametrize_product(
     {
         "batch_size": [1, 4],
@@ -1743,11 +1752,6 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
         "num_kv_heads": [4],
         "head_dim": [128],
         "dtype": [torch.float16, torch.bfloat16],
-        "input_layout,page_size": [
-            ("CONTIGUOUS_Q_KV", None),
-            ("SEPARATE_Q_K_V", None),
-            ("Q_PAGED_KV_NHD", 32),
-        ],
         "chunked_attention_size": [64, 256],
     },
     regular=pairwise_product_cases,
