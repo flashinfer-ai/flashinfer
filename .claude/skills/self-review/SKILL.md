@@ -40,7 +40,7 @@ focus areas and checklist over the diff. In particular:
   architecture guards are correct. Run the touched test files, not the whole suite:
 
   ```bash
-  pre-commit run --files $(git diff --name-only "$BASE")
+  pre-commit run --files $(git diff --name-only --diff-filter=d "$BASE")  # skip deleted files
   pytest tests/<touched files>
   ```
 
