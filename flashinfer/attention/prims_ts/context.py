@@ -179,7 +179,7 @@ class _ContextPlanGeometry:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     head_dim_vo: int | None = None
-    enable_softmax_stats: bool = False
+    store_softmax_stats: bool = False
     # VC-Attention recipe, or ``None`` for a plain plan.
     vc: Optional[VCAttentionConfig] = None
     # The plan's Sage recipe, part of the compile identity; ``None`` without
@@ -284,7 +284,7 @@ class _ContextCompileSpec:
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
-    enable_softmax_stats: bool = False
+    store_softmax_stats: bool = False
     two_cta_umma: bool = False
     vc: Optional[VCAttentionConfig] = None
     lse_mode: str = "none"
@@ -1374,13 +1374,13 @@ def _resolve_context_plan_geometry(
     window_left: int,
     out_dtype: torch.dtype,
     sage: SageAttentionConfig | None = None,
-    enable_softmax_stats: bool = False,
+    store_softmax_stats: bool = False,
 ) -> _ContextPlanGeometry:
     """Validate explicit static bounds for a reusable contiguous plan."""
 
     _validate_context_dtype_pair(qk_dtype, qk_dtype, pv_dtype, out_dtype)
-    if not isinstance(enable_softmax_stats, bool):
-        raise TypeError("enable_softmax_stats must be a bool")
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     if not isinstance(packed_query, bool):
@@ -1461,7 +1461,7 @@ def _resolve_context_plan_geometry(
         ),
         packed_dense_k_mask=packed_query and mask_type == "dense",
         sage=sage,
-        enable_softmax_stats=enable_softmax_stats,
+        store_softmax_stats=store_softmax_stats,
     )
     if sage is not None:
         _validate_context_sage_config(geometry, sage)
@@ -1938,7 +1938,7 @@ def _context_compile_spec(
         qk_dtype_key=_dtype_key(geometry.qk_dtype),
         pv_dtype_key=_dtype_key(geometry.pv_dtype),
         out_dtype_key=_dtype_key(geometry.out_dtype),
-        enable_softmax_stats=geometry.enable_softmax_stats,
+        store_softmax_stats=geometry.store_softmax_stats,
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
         packed_query=geometry.packed_query,
@@ -2245,7 +2245,7 @@ def _get_compiled_context(
     out_fake = fake_compact(out_dtype, out_shape, 16)
     softmax_stats_fake = (
         fake_compact(cutlass.Float32, (*out_shape[:-1], 2), 4)
-        if compile_spec.enable_softmax_stats
+        if compile_spec.store_softmax_stats
         else None
     )
     lse_fake = (
@@ -3020,7 +3020,7 @@ class BatchPrefillTSWrapper:
         v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         packed_query: bool = False,
-        enable_softmax_stats: bool = False,
+        store_softmax_stats: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
         softmax_scale: Optional[GlobalScale] = None,
@@ -3058,7 +3058,7 @@ class BatchPrefillTSWrapper:
         with one E8M0 scale per 32 channels, E4M3 V by default, fixed dense or causal
         plans only; every run then supplies q_scales and k_scales.
 
-        enable_softmax_stats adds caller-owned FP32 (m, s) merge statistics,
+        store_softmax_stats adds caller-owned FP32 (m, s) merge statistics,
         independent of the optional LSE output. Plain attention only is supported;
         statistics cannot be combined with VC, Sage, or attention sinks.
         """
@@ -3066,7 +3066,7 @@ class BatchPrefillTSWrapper:
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(use_attention_sinks, bool):
             raise TypeError("use_attention_sinks must be a bool")
-        if enable_softmax_stats and (
+        if store_softmax_stats and (
             vc_config is not None or sage is not None or use_attention_sinks
         ):
             raise NotImplementedError(
@@ -3108,7 +3108,7 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             out_dtype=resolved_out_dtype,
             sage=sage,
-            enable_softmax_stats=enable_softmax_stats,
+            store_softmax_stats=store_softmax_stats,
         )
         if sage is not None and sage.v_mean and use_attention_sinks:
             raise NotImplementedError(
@@ -3257,7 +3257,7 @@ class BatchPrefillTSWrapper:
         128-token tile and head as mxfp8_quantize_bshd writes them; other plans
         reject them.
 
-        softmax_stats is required exactly when enable_softmax_stats was planned.
+        softmax_stats is required exactly when store_softmax_stats was planned.
         It is a compact FP32 tensor [*q.shape[:-1], 2], storing the maximum scaled
         logit m in natural-log units and s = sum(exp(logit - m)). Empty rows write
         (-inf, 0) and zero output. Statistics are independent of output_scale;
@@ -3272,10 +3272,10 @@ class BatchPrefillTSWrapper:
         if state is None:
             raise RuntimeError("plan() must be called before run()")
         geometry = state.geometry
-        if geometry.enable_softmax_stats != (softmax_stats is not None):
+        if geometry.store_softmax_stats != (softmax_stats is not None):
             raise ValueError(
                 "softmax_stats must be supplied exactly when "
-                "enable_softmax_stats=True was planned"
+                "store_softmax_stats=True was planned"
             )
         if validate and softmax_stats is not None:
             if softmax_stats.dtype != torch.float32:
