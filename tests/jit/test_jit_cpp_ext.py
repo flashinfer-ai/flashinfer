@@ -28,14 +28,22 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
-def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
+@pytest.mark.parametrize("cuda_at_least_13", [False, True])
+def test_jit_uses_size_optimized_fatbin_compression(monkeypatch, cuda_at_least_13):
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+    monkeypatch.setattr(
+        core, "is_cuda_version_at_least", lambda version_str: cuda_at_least_13
+    )
 
     spec = core.gen_jit_spec(name="test_module", sources=[])
 
     assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
-    assert "--compress-mode=size" in spec.extra_cuda_cflags
+    # `--compress-mode` is only supported by nvcc in CUDA 13.0+, so it must be
+    # omitted on older toolchains to avoid "nvcc fatal: Unknown option
+    # '--compress-mode=size'" failures.
+    # https://github.com/flashinfer-ai/flashinfer/issues/5479
+    assert ("--compress-mode=size" in spec.extra_cuda_cflags) is cuda_at_least_13
 
 
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(

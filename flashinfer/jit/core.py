@@ -24,7 +24,12 @@ from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
+from .cpp_ext import (
+    generate_ninja_build_for_op,
+    get_nvcc_parallelism_flags,
+    is_cuda_version_at_least,
+    run_ninja,
+)
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
@@ -712,7 +717,11 @@ def gen_jit_spec(
     cuda_cflags = [
         *get_nvcc_parallelism_flags(),
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
-        "--compress-mode=size",
+        # `--compress-mode` is only supported by nvcc in CUDA 13.0+. Passing it
+        # to older toolchains makes every JIT build fail with
+        # "nvcc fatal : Unknown option '--compress-mode=size'".
+        # https://github.com/flashinfer-ai/flashinfer/issues/5479
+        *(["--compress-mode=size"] if is_cuda_version_at_least("13.0") else []),
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
