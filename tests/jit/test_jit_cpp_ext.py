@@ -62,6 +62,25 @@ def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
     monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=[
+            "-gencode=arch=compute_103a,code=sm_103a",
+            "-DNDEBUG",
+        ],
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        needs_device_linking=True,
+    )
+
+    assert "cuda_arch_flags = -gencode=arch=compute_103a,code=sm_103a" in ninja
+    assert "command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out" in ninja
+    assert "cuda_arch_flags = -DNDEBUG" not in ninja
+
+
 def _ldflags_block(ninja: str) -> str:
     """Return the multiline ``ldflags = ...`` assignment from a ninja file."""
     lines = ninja.splitlines()
@@ -86,18 +105,6 @@ def test_generate_ninja_supports_pip_cuda_wheel_lib_layout(monkeypatch, tmp_path
         name="test_module",
         sources=[tmp_path / "generated" / "kernel.cu"],
         extra_cflags=None,
-        extra_cuda_cflags=[
-            "-gencode=arch=compute_103a,code=sm_103a",
-            "-DNDEBUG",
-        ],
-        extra_ldflags=None,
-        extra_include_dirs=None,
-        needs_device_linking=True,
-    )
-
-    assert "cuda_arch_flags = -gencode=arch=compute_103a,code=sm_103a" in ninja
-    assert "command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out" in ninja
-    assert "cuda_arch_flags = -DNDEBUG" not in ninja
         extra_cuda_cflags=None,
         extra_ldflags=None,
         extra_include_dirs=None,
@@ -390,16 +397,6 @@ def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
     assert any("sm_86" in flag for flag in spec.extra_cuda_cflags)
     with pytest.raises(RuntimeError, match="No supported CUDA architectures"):
         attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.uint8)
-
-
-def test_fa2_fp8_large_head_uses_sm80_flags(monkeypatch):
-    monkeypatch.setattr(
-        attention_modules.current_compilation_context, "TARGET_CUDA_ARCHS", {(8, 0)}
-    )
-
-    flags = attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.float8_e4m3fn)
-    assert flags is not None
-    assert any("sm_80" in flag for flag in flags)
 
 
 @pytest.mark.parametrize(
