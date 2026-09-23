@@ -316,6 +316,7 @@ def test_blackwell_prefill_workspace_not_in_compile_cache():
         "none",
         None,
         None,
+        1,
     )
     assert set(cache.keys()) <= {"compiled", "num_sm"}, (
         f"compile cache holds mutable execution state: {set(cache.keys())}"

@@ -179,6 +179,7 @@ PREFILL_BASELINE = {
     "cu_checkpoints_dtype_str": "none",
     "initial_state_inner_strides": None,
     "output_state_inner_strides": None,
+    "state_stride_divisibility": 1,
     "num_sm": 148,
 }
 
@@ -398,6 +399,7 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
         ("cu_checkpoints_dtype_str", "torch.int32"),
         ("initial_state_inner_strides", (16384, 128, 1)),
         ("output_state_inner_strides", (16384, 128, 1)),
+        ("state_stride_divisibility", 128),
         ("num_sm", 132),
         ("target_key", (0, "sm90a")),
     ],
