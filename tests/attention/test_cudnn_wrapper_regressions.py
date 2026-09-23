@@ -277,6 +277,20 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
         kv_gpu.cpu(), torch.tensor([0, 33, 50], dtype=torch.int32)
     )
 
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(q, k, v, out=out, lse=lse, return_lse=True)
+    w.plan(qo.clone(), kv.clone(), 8, 2, 128, q_data_type=q.dtype)
+    # Native capture holds raw metadata pointers. Reusing freed indptr storage
+    # must not silently change the work done by subsequent replays.
+    poison = [torch.zeros(3, dtype=torch.int32, device=q.device) for _ in range(128)]
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(lse, stats * math.log2(math.e), atol=0.003, rtol=0.003)
+    assert len(poison) == 128
+
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("layout", ["NHD", "HND"])

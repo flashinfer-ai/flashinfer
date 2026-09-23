@@ -228,10 +228,18 @@ def main():
                 end.record()
                 end.synchronize()
                 ts.append(start.elapsed_time(end) * 1000 / 20)
+            # Replan can release storage still referenced by captured native
+            # pointers. Allocations in the earlier checks may then recycle it:
+            # validate the timed replays too, before accepting their timings.
+            assert torch.isfinite(out).all()
+            assert ((out.float() - expected.float()).abs() <= ulp).all(), (
+                "timed replay differs by more than one output ULP"
+            )
             row.update(
                 graph_gpu_us=statistics.median(ts),
                 status="pass",
                 replay="within_one_ulp",
+                timed_replay="within_one_ulp",
                 math_reference_rows=len(samples),
             )
         except Exception as exc:
