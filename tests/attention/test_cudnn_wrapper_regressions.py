@@ -222,9 +222,12 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
     monkeypatch, force_legacy
 ):
     if force_legacy:
-        monkeypatch.setattr(
-            prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: False
-        )
+        # The wrapper imports its own alias; both dispatch and metadata
+        # resolution must see the missing capability.
+        for module in (flashinfer.prefill, prefill):
+            monkeypatch.setattr(
+                module, "_cudnn_supports_direct_seqlens", lambda *a, **k: False
+            )
     direct = prefill._cudnn_supports_direct_seqlens(torch.bfloat16)
     q = torch.randn(5, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(50, 2, 128, device=q.device, dtype=q.dtype)
@@ -235,11 +238,15 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
     qo_gpu = torch.tensor([0, 3, 5], device=q.device, dtype=torch.int32)
     kv_gpu = torch.tensor([0, 33, 50], device=q.device, dtype=torch.int32)
     w.plan(qo_gpu, kv_gpu, 8, 2, 128, q_data_type=q.dtype)
+    if not direct:
+        assert w._cudnn_plan is None
     w.run(q, k, v)
     for split in (2, 3):
         qo = torch.tensor([0, split, 5], dtype=torch.int32)
         kv = torch.tensor([0, 31, 50], dtype=torch.int32)
         w.plan(qo, kv, 8, 2, 128, q_data_type=q.dtype)
+        if not direct:
+            assert w._cudnn_plan is None
         if split == 2:
             pointer = w._qo_indptr_buf.data_ptr()
             plan = w._cudnn_plan
