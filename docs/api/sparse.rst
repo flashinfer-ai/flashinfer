@@ -126,3 +126,4 @@ dtypes, raise :class:`ValueError`.
     msa_sparse_attention
     msa_sparse_decode_attention
     msa_topk_select
+    prepare_msa_nvfp4_sparse_decode
