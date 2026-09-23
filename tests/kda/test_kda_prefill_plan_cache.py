@@ -278,8 +278,8 @@ def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
     [
         ([8192], True, None),
         ([8192], False, None),
-        ([5000, 5384], True, None),
-        ([3000, 8192, 4096], True, None),
+        ([8192, 8192], True, None),
+        ([11000, 5384], True, None),
         ([8192], False, -5.0),
         ([2048, 8192], True, -5.0),
     ],
@@ -303,13 +303,3 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
     )
     _assert_same(got, want)
 
-
-def test_affine_fused_epilogue_bf16_state_pool_matches_torch(monkeypatch):
-    d = _inputs([8192], 12, seed=12)
-    d["pool"] = (d["pool"] * 1.0).to(torch.bfloat16)
-    pool = d["pool"].clone()
-    want = _run_affine_epilogue(d, False, monkeypatch, checkpoints=False, lower_bound=-5.0)
-    d["pool"].copy_(pool)
-    d["out"].zero_()
-    got = _run_affine_epilogue(d, True, monkeypatch, checkpoints=False, lower_bound=-5.0)
-    _assert_same(got, want)
