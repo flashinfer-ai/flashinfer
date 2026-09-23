@@ -116,29 +116,45 @@ class Session:
             or dist.get_backend(self.group) != "nccl"
         ):
             raise ValueError("the session requires an NCCL group of exactly 16 ranks")
-        if not isinstance(weights, CakeW4A8MegaMoeEp16Weights):
-            raise TypeError("weights must be prepared CakeW4A8MegaMoeEp16Weights")
-        self.device = weights.w13.device
-        prop = torch.cuda.get_device_properties(self.device)
-        if (prop.major, prop.minor, prop.multi_processor_count) != (10, 3, 152):
-            raise ValueError("the schedule requires SM103a with 152 physical SMs")
-        if self.device.index != torch.cuda.current_device():
-            raise ValueError("set the current CUDA device to the weights' device")
-        for name, shape, dtype in (
-            ("w13", (327680, 1536), torch.uint8),
-            ("w2", (98304, 2560), torch.uint8),
-            ("w13_scale", (768, 10240), torch.uint32),
-            ("w2_scale", (1280, 3072), torch.uint32),
-        ):
-            _tensor(getattr(weights, name), name, shape, dtype, self.device)
-        if topk_ids.ndim != 2 or not 0 <= topk_ids.shape[0] <= 384:
-            raise ValueError("topk_ids must have 0 through 384 token rows")
-        self.tokens = int(topk_ids.shape[0])
-        _tensor(topk_ids, "topk_ids", (self.tokens, 8), torch.int64, self.device)
-        info = (self.tokens, bool(((topk_ids >= 0) & (topk_ids < 512)).all().item()))
+        error = None
+        self.tokens = -1
+        valid_ids = False
+        # Every rank must reach this collective, even if a local input is invalid.
+        try:
+            if not isinstance(weights, CakeW4A8MegaMoeEp16Weights):
+                raise TypeError("weights must be prepared CakeW4A8MegaMoeEp16Weights")
+            if not isinstance(weights.w13, torch.Tensor):
+                raise TypeError("w13 must be a tensor")
+            self.device = weights.w13.device
+            for name, shape, dtype in (
+                ("w13", (327680, 1536), torch.uint8),
+                ("w2", (98304, 2560), torch.uint8),
+                ("w13_scale", (768, 10240), torch.uint32),
+                ("w2_scale", (1280, 3072), torch.uint32),
+            ):
+                _tensor(getattr(weights, name), name, shape, dtype, self.device)
+            prop = torch.cuda.get_device_properties(self.device)
+            if (prop.major, prop.minor, prop.multi_processor_count) != (10, 3, 152):
+                raise ValueError("the schedule requires SM103a with 152 physical SMs")
+            if self.device.index != torch.cuda.current_device():
+                raise ValueError("set the current CUDA device to the weights' device")
+            if not isinstance(topk_ids, torch.Tensor):
+                raise TypeError("topk_ids must be a tensor")
+            if topk_ids.ndim != 2 or not 0 <= topk_ids.shape[0] <= 384:
+                raise ValueError("topk_ids must have 0 through 384 token rows")
+            self.tokens = int(topk_ids.shape[0])
+            _tensor(topk_ids, "topk_ids", (self.tokens, 8), torch.int64, self.device)
+            valid_ids = bool(((topk_ids >= 0) & (topk_ids < 512)).all().item())
+        except (TypeError, ValueError) as exc:
+            error = str(exc)
         gathered = [None] * 16
-        dist.all_gather_object(gathered, info, group=self.group)
-        if any(n != self.tokens or not valid for n, valid in gathered):
+        dist.all_gather_object(
+            gathered, (self.tokens, valid_ids, error), group=self.group
+        )
+        errors = [(rank, e) for rank, (_, _, e) in enumerate(gathered) if e is not None]
+        if errors:
+            raise ValueError(f"session setup rejected on ranks {errors}")
+        if any(n != self.tokens or not valid for n, valid, _ in gathered):
             raise ValueError(
                 "all ranks need equal token counts and expert IDs in [0, 512)"
             )

@@ -26,7 +26,9 @@ native DeepGEMM MegaMoE backend.
 - All ranks must construct and invoke sessions in the same order. Use the
   setup CUDA stream, serially, and keep the session and tensor storage alive
   until its work finishes. CUDA graph capture and concurrent forwards on one
-  session are unsupported. Failure on one rank requires aborting the job.
+  session are unsupported. Setup input validation is collective: invalid
+  weights, devices or routing on any rank are reported to every rank before
+  workspace allocation. Runtime failure on one rank requires aborting the job.
 - This is a JIT-only experimental API, with no automatic backend selection.
 
 ## Usage

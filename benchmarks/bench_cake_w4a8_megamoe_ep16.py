@@ -189,6 +189,7 @@ def main():
         rows.append(row)
         if rank == 0:
             print({k: v for k, v in row.items() if k != "groups"}, flush=True)
+        layer.destroy()
         del callbacks, session, layer
     report = dict(
         gpu=torch.cuda.get_device_name(),
