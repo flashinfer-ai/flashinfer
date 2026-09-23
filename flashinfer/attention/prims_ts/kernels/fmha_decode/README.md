@@ -141,8 +141,9 @@ must be on one CUDA device. Metadata uses 4-byte-aligned CUDA `torch.int32`;
 the page table is contiguous within each row but may have padding between
 rows. A caller-provided `out` must not overlap Q, K/V page
 storage, run-time metadata, or caller-owned workspace. This is an unchecked
-caller precondition in both validation modes. The API returns O only; LSE
-and split-KV statistics are internal scratch.
+caller precondition in both validation modes. The API returns O; optional
+caller-owned `softmax_stats` receives final (maximum, denominator) pairs.
+Per-split LSE and reduction state remain internal scratch.
 
 The fixed table controls logical-to-physical lookup only. Native TMA tensor
 maps still span the complete physical page pool and use each cache tensor's
@@ -343,6 +344,33 @@ preallocated compact, 16-byte-aligned `out` tensor. A successful replan changes
 plan-owned length storage and requires graph recapture.
 
 ## Limitations
+
+### Softmax statistics
+
+Set `store_softmax_stats=True` during planning (or in the one-shot call), and
+pass a contiguous caller-owned FP32 `softmax_stats` tensor of shape
+`[*out.shape[:-1], 2]` to each run. Its fields are the scaled token-logit maximum
+in natural-log units and the denominator relative to that maximum. FP8 P's
+internal 448 scale is removed; value/output scales do not affect the statistics.
+The output return value remains unchanged. The flag and buffer must agree even
+with `validate=False`, and all buffers must have disjoint storage.
+
+Direct, fused-GMEM, and cluster-SMEM output owners export their existing final
+max/sum pair. Standalone reducers reserve an additional FP32 raw QK maximum and
+unscaled denominator beside each split's LSE. The final row owner merges these
+max/sum states independently of the existing O/LSE reduction, avoiding precision
+loss from reconstructing denominators with large absolute LSE values. Raw maxima
+are subtracted before scaling so small gaps between large logits are preserved.
+Statistics-disabled workspace and reduction algorithms are unchanged.
+Statistics-enabled Keeps KV256 kernels update the exact maximum instead of using
+the default delayed exponent anchor; default performance policies are unchanged.
+Statistics-enabled P producers also subtract the raw maximum before scaling
+scores, preserving the denominator for large logits without changing the
+statistics-disabled exponent expressions or the internal FP8 probability bias.
+Preallocate statistics along with output for graph capture and retain both
+addresses across replay.
+
+### Input restrictions
 
 - Only HND paged K/V is supported; contiguous K/V and NHD caches are outside
   this API.

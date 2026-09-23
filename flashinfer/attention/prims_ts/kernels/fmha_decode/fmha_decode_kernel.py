@@ -317,6 +317,7 @@ def _build_decode_gen_schedule(
     partial_stats_ptr: cute.Pointer | None = None,
     split_kv_counter_ptr: cute.Pointer | None = None,
     attention_sinks_ptr: cute.Pointer | None = None,
+    softmax_stats_ptr: cute.Pointer | None = None,
     seqlens_kv: cute.Pointer | None = None,
     cu_seqlens_q: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 = 0,
@@ -1274,6 +1275,7 @@ def _build_decode_gen_schedule(
         partial_stats_ptr=partial_stats_ptr,
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
+        softmax_stats_ptr=softmax_stats_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         num_heads_kv=num_heads_kv,
@@ -1297,6 +1299,7 @@ def _build_decode_gen_schedule(
         partial_stats_ptr=partial_stats_ptr,
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
+        softmax_stats_ptr=softmax_stats_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         num_heads_kv=num_heads_kv,
@@ -2284,6 +2287,7 @@ def _run_decode_gen_active(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_softmax_stats: cute.Pointer | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2408,6 +2412,7 @@ def _run_decode_gen_active(
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
         attention_sinks_ptr=g_attention_sinks,
+        softmax_stats_ptr=g_softmax_stats,
         seqlens_kv=runtime_seqlens_kv,
         cu_seqlens_q=g_cu_seqlens_q,
         max_seq_len_kv=runtime_max_seq_len_kv,
@@ -2622,6 +2627,7 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_softmax_stats: cute.Pointer | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2702,6 +2708,7 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_softmax_stats=g_softmax_stats,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -2751,6 +2758,7 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_softmax_stats=g_softmax_stats,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -2794,6 +2802,7 @@ def decode_gen_kernel(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_softmax_stats: cute.Pointer | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
@@ -2876,6 +2885,7 @@ def decode_gen_kernel(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                g_softmax_stats=g_softmax_stats,
             )
         elif cutlass.const_expr(cfg.use_split_kv and cfg.use_pdl):
             # The immediately preceding grid may produce seq_lens. Send every
@@ -2925,6 +2935,7 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_softmax_stats=g_softmax_stats,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -2970,6 +2981,7 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_softmax_stats=g_softmax_stats,
             )
     else:
         # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
@@ -3014,6 +3026,7 @@ def fmha_decode_launch(
     v_token_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
+    softmax_stats_iter: cute.Pointer | None = None,
 ) -> None:
     """Standalone JIT launcher for FMHA decode TS."""
     log2_e = math.log2(math.e)
@@ -3257,6 +3270,7 @@ def fmha_decode_launch(
         null_sparse_route_ptr,
         null_sparse_route_ptr,
         static_full_split_prefix,
+        g_softmax_stats=softmax_stats_iter,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

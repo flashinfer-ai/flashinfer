@@ -102,6 +102,33 @@ must preserve these preconditions when rebinding tensors and replaying graphs.
 Writable-buffer aliasing is unsupported, not an in-place execution mode.
 TensorMap stride/alignment and workspace-capacity checks remain in place.
 
+### Merge-compatible softmax statistics
+
+Contiguous/paged prefill, paged FMHA decode, and paged MLA decode accept
+`plan(store_softmax_stats=True)`. Each `run` then requires a caller-owned,
+contiguous FP32 `softmax_stats` tensor shaped `[*out.shape[:-1], 2]` on the
+same device. The flag is part of the compiled specialization; the buffer is
+per-run state and can be rebound without replanning. One-shot APIs expose the
+same flag and buffer. Decode workspace-size helpers must receive the same
+flag as the plan. With the flag disabled, no statistics output or extra
+statistics scratch is allocated.
+
+For each query/head, the two values are the maximum scaled token logit `m`
+(natural-log units) and `s = sum(exp(logit - m))`, after masking and before
+output scaling. Internal FP8 probability scaling is removed. Decode attention
+sinks, when present, contribute to `s` exactly once and do not change `m`.
+This is a maximum/denominator pair, not an LSE tensor. Independently computed
+partitions can be merged using weights `exp(m_i - max_j(m_j)) * s_i`; a sink
+must belong to only one partition. Empty rows, where supported by the existing
+attention API, produce `(-inf, 0)`.
+
+The statistics buffer must not overlap inputs, output, workspace, or plan-owned
+buffers. The flag/buffer presence contract is enforced even with
+`validate=False`; other unchecked contracts remain the caller's responsibility.
+For CUDA graphs, warm up the exact specialization, supply stable output and
+statistics storage, and capture `run(..., validate=False)`. Replay overwrites
+the statistics for the current request metadata.
+
 The standalone sparse-attention example suggests G for both packed prefill
 and fixed decode using a caller-cached SM count, then fixes G for each plan.
 

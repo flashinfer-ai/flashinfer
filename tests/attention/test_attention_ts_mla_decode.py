@@ -1192,6 +1192,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "kv_data_type",
         "o_data_type",
         "mask_type",
+        "store_softmax_stats",
         "workspace_buffer",
         "validate",
     )
@@ -1228,6 +1229,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "bmm1_scale",
         "bmm2_scale",
         "out",
+        "softmax_stats",
         "validate",
     )
     assert run_parameters["block_tables"].default is inspect.Parameter.empty
@@ -1235,12 +1237,48 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["qo_indptr"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert plan_parameters["store_softmax_stats"].default is False
+    assert run_parameters["softmax_stats"].default is None
+
+
+@pytest.mark.parametrize("split_kv", (1, 4, 64))
+def test_attention_ts_mla_softmax_stats_workspace_is_optional(split_kv):
+    import cutlass
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
+        compute_workspace_size as size_2cta,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        compute_workspace_size as size_1cta,
+    )
+
+    cfg = SimpleNamespace(
+        batch_size=2,
+        seq_len_q=3,
+        num_heads_q=16,
+        head_dim_v=512,
+        num_ctas_per_seq_kv=split_kv,
+        use_cluster_reduction=0,
+    )
+    dtype_args = dict(partial_o_dtype=cutlass.BFloat16, lse_dtype=cutlass.Float32)
+    baseline = size_1cta(cfg=cfg, **dtype_args)
+    enabled = size_1cta(cfg=cfg, store_softmax_stats=True, **dtype_args)
+    assert enabled - baseline == (2 * 3 * 16 * split_kv * 8 if split_kv > 1 else 0)
+    cfg.use_cluster_reduction = 1
+    assert size_1cta(cfg=cfg, store_softmax_stats=True, **dtype_args) == 0
+    shape = dict(
+        tile_size_q=128, num_q_tiles=3, latent_dim=512, batch_size=2, split_kv=split_kv
+    )
+    baseline = size_2cta(**shape, **dtype_args)
+    enabled = size_2cta(**shape, store_softmax_stats=True, **dtype_args)
+    assert enabled - baseline == (2 * 3 * 128 * split_kv * 8 if split_kv > 1 else 0)
 
 
 @pytest.mark.parametrize("validate", (True, False))
+@pytest.mark.parametrize("store_softmax_stats", (True, False))
 def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     monkeypatch,
     validate,
+    store_softmax_stats,
 ):
     """Keep plan publication atomic and compilation after workspace checks."""
 
@@ -1264,6 +1302,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         return torch.device("cpu"), 0
 
     def resolve_spec(*args):
+        assert args[-1] is store_softmax_stats
         events.append("spec")
         return spec
 
@@ -1318,6 +1357,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         o_data_type=torch.bfloat16,
         workspace_buffer=workspace,
         validate=validate,
+        store_softmax_stats=store_softmax_stats,
     )
 
     assert events == [*expected_events, "compile"]
@@ -1325,6 +1365,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     assert tuple(vars(wrapper)) == ("_plan_state",)
     state = wrapper._plan_state
     assert state is not None
+    assert state.store_softmax_stats is store_softmax_stats
     with pytest.raises(FrozenInstanceError):
         state.batch_size = 2
 
@@ -1472,8 +1513,10 @@ def test_attention_ts_mla_run_requires_plan():
         wrapper.run(None, None, None, None)
 
 
+@pytest.mark.parametrize("store_softmax_stats", (False, True))
 def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch,
+    store_softmax_stats,
 ):
     """Leave validation outside compiled and captured MLA run regions."""
 
@@ -1493,6 +1536,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         split_kv=1,
         workspace_views=object(),
         compiled=object(),
+        store_softmax_stats=store_softmax_stats,
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)
@@ -1505,6 +1549,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         return runtime
 
     def launch(*args, **kwargs):
+        assert kwargs["softmax_stats"] is stats
         return sentinel
 
     monkeypatch.setattr(mla_decode_module, "_prepare_mla_runtime", prepare_runtime)
@@ -1514,7 +1559,21 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
 
     tensor = torch.empty(1)
-    assert wrapper.run(tensor, tensor, tensor, tensor, validate=False) is sentinel
+    stats = torch.empty(1, 2) if store_softmax_stats else None
+    assert (
+        wrapper.run(tensor, tensor, tensor, tensor, softmax_stats=stats, validate=False)
+        is sentinel
+    )
+    mismatched_stats = None if store_softmax_stats else torch.empty(1, 2)
+    with pytest.raises(ValueError, match="store_softmax_stats"):
+        wrapper.run(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            softmax_stats=mismatched_stats,
+            validate=False,
+        )
     with pytest.raises(TypeError, match="validate must be a bool"):
         wrapper.run(tensor, tensor, tensor, tensor, validate=0)
 
