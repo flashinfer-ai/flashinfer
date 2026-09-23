@@ -317,8 +317,8 @@ quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
 the per-block V means in E4M3 and shares `v_scale` (built from `V - v_mean`
 when a mean is used).
 
-On B200 both recipes run roughly 15-20% faster than BF16 on the same plan.
-K blocks of 4 and 1 tokens cost roughly 10-20% more than 16-token blocks.
+On B200 both recipes run faster than BF16 on the same plan; the gain depends
+on the shape, and K blocks of 4 and 1 tokens cost more than 16-token blocks.
 
 ### Example
 
@@ -358,12 +358,11 @@ scales = SageAttentionParams(
 out = wrapper.run(q, k, v, sage=scales)  # [B, Sq, Hq, D] bfloat16
 ```
 
-A block-sparse INT8 plan with proxy routes names its E4M3 V, and its runs add
-the routes, the summaries and `k_summary_scale`:
+Continuing the example, a block-sparse INT8 plan with proxy routes names its
+E4M3 V; each Q block attends exactly to the selected KV blocks, and the other
+blocks enter through their per-block summaries:
 
 ```python
-from dataclasses import replace
-
 wrapper.plan(
     B, Sq, Skv, Hq, Hkv, D, 64, 64,
     device=device,
@@ -374,17 +373,39 @@ wrapper.plan(
     v_data_type=fp8,
     sage_config=SageAttentionConfig(),
 )
-# q, k and k_summary are int8; v and v_summary are fp8. The summaries are
-# [B, num_kv_blocks, Hkv, D].
-num_kv_blocks = -(-Skv // 64)
-summary_scale = torch.rand(
-    Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
+
+num_q_blocks, num_kv_blocks = -(-Sq // 64), -(-Skv // 64)
+i8 = dict(low=-127, high=128, dtype=torch.int8, device=device)
+q = torch.randint(size=(B, Sq, Hq, D), **i8)
+k = torch.randint(size=(B, Skv, Hkv, D), **i8)
+v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
+k_summary = torch.randint(size=(B, num_kv_blocks, Hkv, D), **i8)
+v_summary = torch.randn(B, num_kv_blocks, Hkv, D, device=device).to(fp8)
+
+# BSR routes: every Q block of every (batch, KV head) row selects the same
+# KV blocks; block_indptr holds offsets into the flat block_indices.
+selected = torch.tensor([0, 1, num_kv_blocks - 1], dtype=torch.int32, device=device)
+rows = B * Hkv * num_q_blocks
+block_indices = selected.repeat(rows)
+block_indptr = (
+    torch.arange(B * Hkv, dtype=torch.int32, device=device).view(B, Hkv, 1)
+    * num_q_blocks
+    + torch.arange(num_q_blocks + 1, dtype=torch.int32, device=device)
+) * selected.numel()
+
+scales = SageAttentionParams(
+    q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
+    k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
+    v_scale=torch.rand(Hkv, D, device=device),
+    k_summary_scale=torch.rand(
+        Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
+    ),
 )
 out = wrapper.run(
     q, k, v, block_indptr, block_indices,
     k_summary=k_summary,
     v_summary=v_summary,
-    sage=replace(scales, k_summary_scale=summary_scale),
+    sage=scales,
 )
 ```
 
