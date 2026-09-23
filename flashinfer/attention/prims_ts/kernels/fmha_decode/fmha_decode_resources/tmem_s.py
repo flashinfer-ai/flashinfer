@@ -279,10 +279,9 @@ class TmemSResource(DecodeGenResourceBase):
     # instance owns the tile; the other reads it through this reference.
     score_seed_owner: Constexpr["TmemSResource | None"] = None
     _seed_alloc: Constexpr[SmemAllocation | None] = None
-    # The instance's ``sfK`` resources (``SageKScalesResource``), read by the
-    # passes one fragment at a time. Exact routes and dense tiles read
-    # ``sage_k_scales``; proxy routes read ``sage_summary_k_scales``, the same
-    # resource unless the summary scales have their own K block size.
+    # The instance's ``sfK`` resources. Proxy routes read
+    # ``sage_summary_k_scales``, which is ``sage_k_scales`` unless the summary
+    # scales have their own K block size.
     sage_k_scales: SageKScalesResource | None = None
     sage_summary_k_scales: SageKScalesResource | None = None
     old_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -373,11 +372,7 @@ class TmemSResource(DecodeGenResourceBase):
     def create_function_variables(
         self, context: ResourceContext | None = None
     ) -> ResourceVars:
-        """Write the score-seed operand tile before the prologue barrier.
-
-        Eager init runs before the prologue barrier, which is what publishes
-        the tile to the MMA warp's first BMM1.
-        """
+        """Write the score-seed operand tile; the prologue barrier publishes it."""
         if cutlass.const_expr(
             self.cfg.uses_int32_scores
             and context is not None
@@ -388,11 +383,9 @@ class TmemSResource(DecodeGenResourceBase):
 
     @cute.jit
     def fill_score_seed_tiles(self, context: ResourceContext) -> None:
-        """Write the constant operand tile of the score-seeding MMA step once.
+        """Fill the seeding MMA's constant operand tile with the whole CTA.
 
-        The owning instance's whole CTA fills the tile before the prologue
-        barrier; the proxy fence publishes the generic-proxy stores to the
-        tensor core's reads.
+        The fence makes the generic-proxy stores visible to the tensor core.
         """
         assert self.score_seed_owner is None, "only the owning instance fills the tile"
         words = self._seed_mma_tile_words(context)
@@ -639,15 +632,10 @@ class TmemSResource(DecodeGenResourceBase):
 
     @cute.jit
     def _seed_scores(self, stage_info: StageInfo, stage_slot_offset: Int32) -> None:
-        """Seed the acquired S slot as soon as its consumer has released it.
+        """Write ``INT32_SCORE_BIAS`` into the acquired S slot with one BF16 MMA step.
 
-        The elected MMA thread writes ``INT32_SCORE_BIAS`` into the S slot
-        with one BF16 MMA step from the constant operand tile; the INT8 K
-        steps accumulate onto the seed's bit pattern in tcgen05 issue order.
-        The step reads no accumulator: one accumulator write at tensor core
-        bandwidth. The seed depends on no K tile, so it is issued before the
-        MMA warp waits for K and its issue latency overlaps that wait instead
-        of delaying the INT8 K steps behind it.
+        The step reads the constant operand tile and no accumulator; the INT8
+        K steps accumulate onto the seed's bit pattern in issue order.
         """
         cfg = self.cfg
         assert cfg.uses_int32_scores
@@ -818,8 +806,7 @@ class TmemSResource(DecodeGenResourceBase):
 
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             if prims.elect_sync():
-                # INT32 scores accumulate onto the bias that ``_seed_scores``
-                # wrote into this slot ahead of the K wait; FP32 scores
+                # INT32 scores accumulate onto the seeded bias; FP32 scores
                 # overwrite S with the first slice.
                 scale_d = cfg.uses_int32_scores
                 for ki in cutlass.range_constexpr(cfg.headdim // _mma_k_step_qk(cfg)):
@@ -2031,10 +2018,8 @@ class TmemSResource(DecodeGenResourceBase):
                     s_vals[s_base_hi + 2] = _neg_max_f32()
 
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-        # A proxy route carries its token mass in the logit: every summary's
-        # maximum moves by the full block's log2 mass in score units, and the
-        # ragged final summary's score registers are shifted by its shortfall
-        # before the reduction so the P pass exponentiates the right mass.
+        # Proxy mass (``_proxy_score_shifts``): the ragged final summary's
+        # scores shift before the reduction so the P pass sees its true mass.
         proxy_max_shift = Float32(0.0)
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
@@ -2230,11 +2215,7 @@ class TmemSResource(DecodeGenResourceBase):
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_q_scale)
     @cute.jit
     def load_sage_q_scale(self, stage_info: StageInfo) -> Float32:
-        """Load ``sfQ`` of the lane's Q row once per work tile.
-
-        The row is fixed for the tile, so the value serves every KV tile or
-        route of the softmax loop; only ``sfK`` changes per tile.
-        """
+        """Load ``sfQ`` of the lane's Q row, fixed for the whole work tile."""
         cfg = self.cfg
         assert cfg.use_sage_attention
         task_cache = _decode_gen_task_cache(stage_info)
@@ -2408,16 +2389,11 @@ class TmemSResource(DecodeGenResourceBase):
         end, uniform or per-row causal end, sliding-window start) and the Q
         row's validity, and leave the route arguments unset. Masked
         fragments are written back to TMEM so the P pass can reload them
-        without any mask logic. Sage attention reduces the quantized scores
-        per scale group and publishes the dequantized row maximum; the
-        scores stay quantized unless the geometry has one scale per score.
-        INT32 scores of Int8 Q/K arrive as biased FP32 (see
-        ``INT32_SCORE_BIAS``), so both formats
-        share this code; the bias leaves with the group maxima. The
-        ``sage_k_scales`` resource hands each fragment its raw ``sfK`` words
-        (from the routed ``sage_scale_arr`` or the instance's SMEM ring), the
-        group maxima fold with ``sfK`` alone and ``sfQ`` applies once to the
-        tile maximum.
+        without any mask logic. With Sage attention the scores stay quantized
+        unless the geometry has one scale per score: each fragment folds its
+        group maxima with ``sfK`` and ``sfQ`` scales the tile maximum once.
+        Biased INT32 scores (``INT32_SCORE_BIAS``) share this path; the bias
+        leaves with the group maxima.
         """
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
@@ -2546,34 +2522,26 @@ class TmemSResource(DecodeGenResourceBase):
             # The load/store branch must be uniform for each participating warp.
             warp_scores_are_unmasked = cute.arch.vote_all_sync(warp_scores_are_unmasked)
 
-        # A proxy route carries its token mass in the logit: the tile maximum
-        # moves by the full block's log2 mass in score units, and the ragged
-        # final summary's score is shifted by its mass shortfall before the
-        # fold and the TMEM write-back, so the P pass reloads a score whose
-        # exponent already carries the right mass. The route kind is uniform
-        # across the CTA, so the branch below is uniform as well.
+        # Proxy mass (``_proxy_score_shifts``): the ragged final summary's
+        # score shifts before the fold and the TMEM write-back, so the P pass
+        # reloads the shifted score.
         proxy_max_shift = Float32(0.0)
         tail_shift = Float32(0.0)
         tail_fragment_mask = Int32(0)
         tail_lane: Constexpr[int] = 0
         shifts_tail: Constexpr[bool] = False
         route_is_proxy = cutlass.Boolean(False)
-        # A mixed plan quantizes proxy summaries with another K block size
-        # than tokens, so exact and proxy tiles carry different numbers of
-        # ``sfK`` groups per fragment and read different scale resources. The
-        # pass then selects the geometry per tile on the CTA-uniform route
-        # kind; a dense plan or one with equal block sizes has one geometry.
+        # A mixed plan quantizes proxy summaries with their own K block size,
+        # so exact and proxy tiles read different ``sfK`` geometries; the
+        # CTA-uniform route kind selects one per tile.
         mixed_scales: Constexpr[bool] = use_sparse and cfg.sage_mixed_k_geometry
-        # The unmasked pass below carries the exact geometry alone: a mixed
-        # plan's proxy tiles take the rolled masked pass, and on every other
-        # plan the proxy routes share the exact geometry.
+        # The unrolled unmasked pass serves the exact geometry only.
         exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
             proxy=False
         )
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
-            # The route kind and the tail location are the same for every
-            # lane; stating that keeps the fold and the load/store branch
-            # below on the uniform datapath.
+            # A warp-uniform route kind keeps the fold and the load/store
+            # branch below on the uniform datapath.
             route_is_proxy = cute.arch.make_warp_uniform(
                 _route_is_proxy(sparse_route_flags)
             )
@@ -2586,17 +2554,11 @@ class TmemSResource(DecodeGenResourceBase):
                 # ``sfQ`` here and by the tail group's ``sfK`` in the fragment.
                 tail_shift = tail_shift * cute.math.rcp(sage_q_scale, approx=True)
             if cutlass.const_expr(shifts_tail):
-                # One mask bit per streamed fragment marks the fragment holding
-                # the ragged final summary. The summary's half and fragment are
-                # compile-time (``FmhaDecodeConfig.proxy_static_tail_fragment``),
-                # so the masked pass decides from one mask bit whether a
-                # fragment holds it. A thread holds the tail when its route is
-                # a proxy route of the last summary group and it sits in the
-                # tail's spatial half. With one summary group every proxy route
-                # is the last group; with several, the last group is the one
-                # whose first atom origin ``origin0`` is the group base plus
-                # the half's first atom. Both compares are warp-uniform, as is
-                # the mask.
+                # One mask bit per fragment marks the one holding the ragged
+                # final summary, whose half and fragment are compile-time
+                # (``proxy_static_tail_fragment``). A thread holds it on a
+                # proxy route of the last summary group, in the tail's half;
+                # with several groups, ``origin0`` identifies the last one.
                 tail_half, tail_fragment = cfg.proxy_static_tail_fragment
                 holds_tail = cutlass.Boolean(
                     route_is_proxy
@@ -2614,9 +2576,8 @@ class TmemSResource(DecodeGenResourceBase):
                 if holds_tail:
                     tail_fragment_mask = Int32(1 << tail_fragment)
                 tail_fragment_mask = cute.arch.make_warp_uniform(tail_fragment_mask)
-                # The shifted tail score must reach TMEM for the P pass, so
-                # the route takes the store branch; the vote keeps the branch
-                # condition warp-uniform.
+                # The shifted tail score must reach TMEM, so the route takes
+                # the store branch.
                 warp_scores_are_unmasked = cute.arch.vote_all_sync(
                     cutlass.Boolean(
                         warp_scores_are_unmasked and tail_fragment_mask == Int32(0)
@@ -2624,9 +2585,7 @@ class TmemSResource(DecodeGenResourceBase):
                 )
         if cutlass.const_expr(mixed_scales):
             # Proxy tiles take the rolled pass, so the summary geometry's fold
-            # exists once in the rolled body instead of once per unrolled
-            # fragment; the unrolled pass keeps the exact geometry alone. The
-            # route kind is CTA-uniform, so the branch condition stays uniform.
+            # is emitted once rather than per unrolled fragment.
             warp_scores_are_unmasked = cutlass.Boolean(
                 warp_scores_are_unmasked and not route_is_proxy
             )
@@ -2642,8 +2601,6 @@ class TmemSResource(DecodeGenResourceBase):
             max_identity = Float32(float("-inf"))
         for chain_idx in cutlass.range_constexpr(4):
             max_chains[chain_idx] = max_identity
-        # The resource hands each fragment its raw ``sfK`` words; ``sfQ`` is one
-        # per-lane factor and applies once to the tile maximum below.
         scales_view = None
         summary_view = None
         if cutlass.const_expr(cfg.use_sage_attention):
@@ -2732,14 +2689,9 @@ class TmemSResource(DecodeGenResourceBase):
                         visible_end - fragment_token_base,
                         fragment_regs=fragment_regs,
                     )
-            # The masked fragments run as one rolled loop per route kind so
-            # their mask, tail shift, fold and write-back exist once per
-            # softmax instance and kind; the keep words rotate down each
-            # iteration and the scale resource advances with them, so no
-            # runtime selection is needed. A mixed geometry selects the loop
-            # at the tile level: a per-fragment selection between the two
-            # folds is if-converted into one predicated body, so every exact
-            # tile would execute the summary geometry's fold as well.
+            # The masked pass is one rolled loop per route kind. A mixed
+            # geometry selects the loop per tile: a per-fragment selection
+            # would be if-converted and run both folds on every tile.
             if cutlass.const_expr(mixed_scales):
                 if route_is_proxy:
                     self._mask_score_fragments(
@@ -2786,19 +2738,16 @@ class TmemSResource(DecodeGenResourceBase):
             ftz=True,
         )
         if cutlass.const_expr(cfg.use_sage_attention):
-            # The chains hold ``gmax * sfK``; ``sfQ`` is one per-lane factor,
-            # so it applies once here. Masked scores stay -inf under positive
-            # scales. Translate only that reduction identity to the running
-            # state's finite sentinel: a real pre-sfQ maximum can equal
-            # -FLT_MAX and become an ordinary score after sfQ compensates it.
+            # The chains hold ``gmax * sfK``; ``sfQ`` applies once here. Only
+            # the ``-inf`` identity maps to the finite sentinel: a real
+            # pre-``sfQ`` maximum of ``-FLT_MAX`` is an ordinary score.
             if tile_max == Float32(float("-inf")):
                 tile_max = _neg_max_f32()
             else:
                 tile_max = tile_max * sage_q_scale
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The mass enters before the anchor, so the P range is unchanged; a
-            # fully masked route keeps the sentinel, the shift is far below its
-            # FP32 resolution.
+            # fully masked route's sentinel absorbs the shift in FP32.
             tile_max = tile_max + proxy_max_shift
         old_max = new_max_arr[0]
         new_max = self._softmax_anchor(old_max, tile_max)
@@ -2822,27 +2771,17 @@ class TmemSResource(DecodeGenResourceBase):
     ) -> None:
         """Mask, fold and write back every fragment with one route kind's scales.
 
-        ``proxy_kind`` selects the summary resource over the exact one and
-        ``scales_view`` is that resource's opened view; the keep words rotate
-        down one entry per fragment so the body reads ``keep_words[0]``. The
-        resource is taken from ``self`` inside the body: a resource object
-        held in a local would be flattened as a loop-carried value.
+        ``scales_view`` is the opened view of the resource ``proxy_kind``
+        selects; the resource is read from ``self`` because a local would be
+        flattened as a loop-carried value. The keep words rotate down one
+        entry per fragment, so the body reads ``keep_words[0]``.
 
-        Each K32 fragment is masked in place, its maximum folded and the
-        fragment written back. Scores whose keep bit is clear become
-        ``-inf`` with Sage, otherwise the ``-FLT_MAX`` sentinel. A fragment
-        that holds a proxy route's ragged final summary adds the summary's
-        mass shortfall to that score: a
-        score-unit shift that leaves a masked score at the sentinel in FP32.
-        Sage scores are quantized, so the shift (already divided by ``sfQ``
-        by the caller) is divided by the tail group's ``sfK`` (the fragment's
-        raw scales); the approximate reciprocal is within one ulp on a shift
-        far below the score resolution and needs no out-of-line slow path.
-        Biased INT32 scores have unit spacing, so the shift rounds to half a
-        quantized score unit on them. When the route kind's scores come back
-        dequantized (one score per scale group) each score is replaced by its
-        dequantized value before the fold, so the write-back carries
-        dequantized scores.
+        Cleared keep bits become ``-inf`` with Sage, else ``-FLT_MAX``. The
+        fragment holding a proxy route's ragged final summary adds the mass
+        shortfall to that score; Sage divides the shift (already divided by
+        ``sfQ``) by the tail group's ``sfK`` with an approximate reciprocal,
+        ample for a shift far below the score resolution. A route kind whose
+        scores are dequantized writes the dequantized scores back.
         """
         cfg = self.cfg
         num_fragments = cfg.num_softmax_score_fragments
@@ -2939,12 +2878,8 @@ class TmemSResource(DecodeGenResourceBase):
     ) -> None:
         """Replace one fragment's quantized scores by ``(s - bias) * sfK`` in place.
 
-        Each score pair takes the raw ``sfK`` of its scale group (both scores
-        share a group unless the group is one score wide); biased INT32
-        scores fold ``-bias * sfK`` into the same packed FMA, the rounding
-        the P pass already accepts for its group addends. A masked score
-        stays ``-inf`` under any positive finite scale, so it cannot outrank
-        a kept score from another scale group.
+        Biased INT32 scores fold ``-bias * sfK`` into the same packed FMA. A
+        masked ``-inf`` score stays ``-inf`` under any positive scale.
         """
         cfg = self.cfg
         fragment_regs = cfg.softmax_score_fragment_regs
@@ -2998,24 +2933,13 @@ class TmemSResource(DecodeGenResourceBase):
     ) -> None:
         """Fold one fragment's dequantized group maxima into the max chains.
 
-        Each compile-time scale group of the fragment is reduced first and
-        ``(group_max - bias) * sfK_g`` is folded, so the running maximum is
-        the dequantized one up to the row's ``sfQ``, which the caller applies
-        once to the tile maximum, while the scores stay quantized. Groups of
-        four or more scores reduce over four chains seeded from the group's
-        first four scores, so a group of ``n`` scores costs ``n - 1`` maxima.
-        Masked scores already contain ``-inf``, so the same reduction handles
-        partially and fully masked groups. Smaller groups reduce in one chain.
-        Group maxima leave in pairs (a fragment with one group,
-        K blocks of 32 tokens and larger, leaves alone): a packed add removes
-        the INT32 score bias (exact on the biased scores' unit spacing, and
-        the sentinel is unchanged) and a packed multiply applies the
-        fragment's scales. A fully masked group stays ``-inf`` and leaves the
-        tile maximum's reduction identity unchanged. Group ``g`` folds into chain
-        ``(chain_base + g) % 4``: the unrolled unmasked pass spreads the
-        fragments over the four chains, the rolled masked pass passes
-        ``chain_base=0``; the final reduction over all chains is unaffected.
-
+        Each scale group is reduced on the quantized scores, then
+        ``(group_max - bias) * sfK_g`` is folded; the caller applies ``sfQ``
+        to the tile maximum. Groups of four or more scores reduce over four
+        chains; masked ``-inf`` scores need no special case. Group maxima
+        leave in pairs through a packed bias add (exact on the biased scores'
+        unit spacing) and a packed scale multiply. Group ``g`` folds into
+        chain ``(chain_base + g) % 4``.
         """
         cfg = self.cfg
         group_regs = cfg.softmax_score_fragment_regs // groups

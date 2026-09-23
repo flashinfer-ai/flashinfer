@@ -144,10 +144,8 @@ class SmemPResource(DecodeGenResourceBase):
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
-    # The instance's ``sfK`` resources (``SageKScalesResource``, shared with
-    # the S resource): ``sage_k_scales`` for exact routes and dense tiles,
-    # ``sage_summary_k_scales`` for proxy routes (the same resource unless the
-    # summary scales have their own K block size).
+    # The instance's ``sfK`` resources, shared with the S resource; proxy
+    # routes read ``sage_summary_k_scales``, everything else ``sage_k_scales``.
     sage_k_scales: SageKScalesResource | None = None
     sage_summary_k_scales: SageKScalesResource | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
@@ -328,28 +326,19 @@ class SmemPResource(DecodeGenResourceBase):
     def _exponent_addend(
         self, new_max: Float32, route_is_proxy: cutlass.Boolean
     ) -> Float32:
-        """Return the constant term of one row's P exponent ``c * s + addend``.
+        """Return ``addend`` of one row's P exponent ``exp2(c * s + addend)``.
 
-        Every P path exponentiates ``exp2(c * s + addend)`` with the same
-        addend, formed once per row (or per scale group):
-
-        - ``-c * max`` anchors the row; a fully masked row carries the
-          ``-FLT_MAX`` sentinel as its maximum and anchors on zero instead,
-          so its masked scores exponentiate to zero rather than NaN.
-        - Byte-wide P adds ``log2(448)``, the static FP8 quantization scale
-          that the row sums follow and the epilogue divides back out.
-        - A proxy route adds ``log2`` of its block mass, so every summary
-          probability carries the tokens it stands for; the max pass raised
-          the row maximum by the same mass and shifted the ragged final
-          summary's score by its shortfall.
+        - ``-c * max`` anchors the row; a fully masked row (``-FLT_MAX``
+          maximum) anchors on zero so its scores exponentiate to zero, not NaN.
+        - Byte-wide P adds ``log2(448)``, its static FP8 quantization scale.
+        - A proxy route adds ``log2`` of its block mass, as the max pass does,
+          so each summary probability carries the tokens it stands for.
         """
         cfg = self.cfg
         safe_new_max = new_max
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
-        # A multiply and an add: the fused ``cute.math.fma`` form makes ptxas
-        # rematerialize thread indices and spill registers in the callers of
-        # every profile.
+        # Not ``cute.math.fma``: the fused form makes ptxas spill in the callers.
         addend = Float32(-self.scale_softmax_log2 * safe_new_max)
         if cutlass.const_expr(self.cfg.pv_mma_dtype.width == 8):
             addend += Float32(FP8_P_QUANT_LOG2_SCALE)
@@ -454,11 +443,9 @@ class SmemPResource(DecodeGenResourceBase):
         would replicate that body for every fragment and both softmax
         instances and leave the softmax warps instruction-fetch bound. The max
         pass has already written masked (and mass-shifted) scores back to
-        TMEM, so the reload needs no mask or route logic of its own beyond the
-        route-uniform proxy addend. Sage attention only changes the exponent
-        multipliers, ``c * sfQ * sfK_g`` per scale group, which the
-        ``sage_k_scales`` resource hands over one fragment at a time; biased
-        INT32 scores only change the per-group addends.
+        TMEM, so the reload needs no mask or route logic beyond the proxy
+        addend. Sage attention changes only the per-group multipliers
+        ``c * sfQ * sfK_g``, biased INT32 scores only the per-group addends.
         """
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
@@ -473,14 +460,9 @@ class SmemPResource(DecodeGenResourceBase):
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
 
-        # ``c * sfQ`` is one factor per lane and tile. A route kind whose scores
-        # come back dequantized from the max pass takes it as its only
-        # multiplier and carries no bias; the other kinds fold it into their
-        # resource's raw ``sfK`` words. In a mixed geometry whose summary
-        # scores are dequantized and whose exact resource reads the routed
-        # register words, a proxy tile's words are ones and the exact resource
-        # serves every tile unchanged; otherwise the kinds are selected per
-        # fragment on the CTA-uniform route kind.
+        # ``c * sfQ`` is one factor per lane and tile: the only multiplier of a
+        # route kind whose max pass returns dequantized scores (no bias),
+        # otherwise folded into the kind's raw ``sfK`` words.
         exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
             proxy=False
         )
@@ -490,14 +472,15 @@ class SmemPResource(DecodeGenResourceBase):
         exact_scales_in_smem: Constexpr[bool] = cfg.sage_k_scales_in_smem_for(
             cfg.sage_k_groups_per_fragment
         )
+        # A mixed geometry selects the resource per fragment on the CTA-uniform
+        # route kind, unless proxy scores are dequantized and the exact words
+        # sit in registers: the exact resource then serves both kinds, routing
+        # ones on a proxy tile.
         unified_scales: Constexpr[bool] = (
             cfg.sage_mixed_k_geometry
             and summary_dequantized
             and not exact_scales_in_smem
         )
-        # Exact and proxy tiles read different ``sfK`` resources when the
-        # summary K block size differs from the token one, unless the exact
-        # register resource serves both through ``unified_scales``.
         mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry and not unified_scales
         exp_scale = None
         scales_view = None
@@ -527,15 +510,10 @@ class SmemPResource(DecodeGenResourceBase):
                 if route_is_proxy:
                     score_bias = Float32(0.0)
 
-        # The loop scales a whole fragment before its first exponential and
-        # issues the next fragment's TMEM load once the scale FFMAs have
-        # consumed the current scores, so the load reuses the score registers
-        # and its latency hides behind the exponentials; the running sum is a
-        # packed pair folded once after the loop. Scaling ahead on its own
-        # lengthens the exponent chains and the load on its own needs a
-        # second fragment of registers; the combination measured faster on
-        # the byte-wide block-sparse kernels and on the 16-bit dense and Q128
-        # kernels, and within noise on the 16-bit block-sparse kernels.
+        # A fragment is scaled before its first exponential, and the next
+        # fragment's TMEM load issues once the scale FFMAs have consumed the
+        # scores, so it reuses their registers and hides behind the
+        # exponentials. The running sum stays a packed pair until the loop ends.
         num_fragments = cfg.num_softmax_score_fragments
         last_fragment = Int32(num_fragments - 1)
         total_sum_pair = (Float32(0.0), Float32(0.0))
@@ -551,9 +529,8 @@ class SmemPResource(DecodeGenResourceBase):
                 s_arr[score_idx] = pending_scores[score_idx]
 
             if cutlass.const_expr(mixed_scales):
-                # The route kind is CTA-uniform; each kind scales the fragment
-                # in place with its own resource and scale-group geometry, so
-                # nothing but the scores crosses the branch.
+                # Each route kind scales the fragment in place with its own
+                # resource, so only the scores cross the branch.
                 if route_is_proxy:
                     if cutlass.const_expr(summary_dequantized):
                         self._scale_fragment_pairs(
@@ -632,9 +609,8 @@ class SmemPResource(DecodeGenResourceBase):
                     .to(cfg.v_dtype)
                     .bitcast(Int32)
                 )
-            # The packed fragment's TMEM store is made visible to the async
-            # proxy and ordered before the barrier arrive; one lane per warp
-            # arrives so the MMA warp can start the fragment's PV k-slice.
+            # Fence the packed TMEM store before one lane per warp arrives, so
+            # the MMA warp can start this fragment's PV k-slice.
             _keeps_tcgen05_st(
                 cfg,
                 prims.make_tmem_ptr(
@@ -677,10 +653,9 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> None:
         """Issue the TMEM load of one K32 score fragment into ``scores``.
 
-        The caller waits for the load before reading ``scores``. The copy
-        below runs before that wait: with compile-time indices it is only a
-        register rename, so it must stay constant-indexed and free of
-        optimization barriers, or it would read the load's destination early.
+        The caller waits for the load before reading ``scores``. The copy runs
+        before that wait, so it must stay a constant-indexed register rename
+        without optimization barriers, or it would read the destination early.
         """
         cfg = self.cfg
         fragment_regs = cfg.softmax_score_fragment_regs
@@ -703,13 +678,9 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> None:
         """Turn one fragment of scores into log2 exponents in place.
 
-        Each score pair uses the exponent multiplier and addend of its
-        compile-time scale group; without Sage attention there is one group
-        holding the softmax scale. ``groups`` is the route kind's scale
-        groups per fragment. Both scores of a pair share a scale group unless
-        the group is one score wide (the one-token K block), so each takes
-        the multiplier and addend of its own group; a biased INT32 score's
-        bias is already in the group addend.
+        Each score takes the multiplier and addend of its compile-time scale
+        group (``groups`` per fragment); the two scores of a pair differ in
+        group only for the one-token K block.
         """
         fragment_regs = self.cfg.softmax_score_fragment_regs
         group_regs = fragment_regs // groups
@@ -735,12 +706,10 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> tuple[cutlass.Array, cutlass.Array]:
         """Return one fragment's exponent multipliers and addends per scale group.
 
-        Sage attention takes the fragment's ``c * sfQ * sfK_g`` multipliers
-        from the scale resource (``fragment_multipliers``); without Sage the
-        single group holds the softmax scale. Every group starts from the
-        row's addend; biased INT32 scores subtract ``bias * multiplier`` per
-        group, with ``score_bias`` (the row's bias, zero on a tile whose
-        scores come back dequantized) in place of the constant when given.
+        The multipliers are the resource's ``c * sfQ * sfK_g`` under Sage, else
+        the softmax scale. Biased INT32 scores subtract ``bias * multiplier``
+        from the row's addend; ``score_bias`` replaces the constant bias when
+        given (zero on a tile whose scores come back dequantized).
         """
         cfg = self.cfg
         neg_bias = Float32(-INT32_SCORE_BIAS)
@@ -756,14 +725,8 @@ class SmemPResource(DecodeGenResourceBase):
         else:
             group_multipliers[0] = self.scale_softmax_log2
         if cutlass.const_expr(cfg.uses_int32_scores):
-            # Every biased score carries ``INT32_SCORE_BIAS``, so the addend
-            # removes ``bias * multiplier`` for its group: one rounding of the
-            # addend per group instead of one conversion per element. The
-            # rounding is at most half an ulp of ``bias * multiplier``, below
-            # one quantized score unit and far below the INT8 quantization
-            # noise. Groups leave in pairs through one packed FMA, so the
-            # one-token K block (one score per group) spends the same
-            # instruction count as a packed subtract per score pair would.
+            # One rounding per group instead of one conversion per score; the
+            # error stays below one quantized score unit.
             bias_pair = (neg_bias, neg_bias)
             for group_base in cutlass.range_constexpr(0, groups - groups % 2, 2):
                 group_addends[group_base], group_addends[group_base + 1] = (
@@ -795,12 +758,11 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> tuple[Float32, Float32]:
         """Turn one fragment of log2 exponents into probabilities in place.
 
-        ``_scale_fragment_pairs`` has already applied each pair's multiplier
-        and addend. Returns the fragment's probability sum as a packed pair.
-        Eight independent chains keep the denominator update off one long
-        dependency chain; the first four pairs seed the chains, because an add
-        to zero is a real FADD under IEEE semantics. A configurable subset of
-        pairs runs its exponentials on the FMA pipe.
+        Returns the fragment's probability sum as a packed pair. Eight
+        independent chains keep the denominator update off one long dependency
+        chain; the first four pairs seed them, since an add to zero is a real
+        FADD. A configurable subset of pairs runs its exponentials on the FMA
+        pipe.
         """
         pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
         assert pairs_per_fragment >= 4
@@ -1491,10 +1453,9 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> None:
         """Read the route kind from the active Keeps/SWAP metadata view and compute P.
 
-        Keeps carries the kind in its Int32 route flags; SWAP keeps it in the
-        bit-preserving Uint32 flags word of its seven-slot ABI. The max pass
-        has already folded the mass of proxy summaries into the scores and the
-        maximum, so only the route-uniform exponent addend remains here.
+        Keeps carries the kind in its Int32 route flags, SWAP in its
+        bit-preserving Uint32 flags word. The kind selects only the exponent
+        addend; the max pass has already applied the proxy mass to the scores.
         """
 
         assert self.cfg.use_block_sparse_proxy_routes

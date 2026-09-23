@@ -51,11 +51,9 @@ def _validate_contiguous_route_mode(
 def _validate_dense_contiguous_plan_inputs(
     inputs: Iterable[tuple[str, object, object]],
 ) -> None:
-    """Reject block-sparse-only inputs that a dense contiguous plan received.
+    """Reject block-sparse-only inputs given to a dense contiguous plan.
 
-    Each entry names one input, its value and the value that means "unused".
-    A dense plan owns no routes, so the plan arguments that shape them and
-    the run inputs that select them are unsupported alike.
+    Each entry is ``(name, value, unused value)``.
     """
 
     for name, value, unused in inputs:

@@ -91,7 +91,7 @@ class _BlockSparseRunArgs:
     out: torch.Tensor
     block_indptr: torch.Tensor | None
     block_indices: torch.Tensor | None
-    # A dense contiguous run carries no token mask, not even the ABI placeholder.
+    # ``None`` for a dense run.
     kv_valid_bits: torch.Tensor | None
     kv_valid_bits_is_live: bool
     sm_scale: float
@@ -99,8 +99,7 @@ class _BlockSparseRunArgs:
     exact_block_bits: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
-    # The Sage scale slots of the contiguous adapter in ABI order; a plan
-    # without Sage leaves every slot ``None``.
+    # Sage scale tensors in adapter ABI order; ``None`` for unused slots.
     sage_slots: tuple[torch.Tensor | None, ...] = sage_adapter_slots({})
 
 
@@ -334,16 +333,13 @@ def validate_block_sparse_run(
     normalized once into zero-copy HND cache views plus launch metadata. An
     explicit output is returned by identity and may not overlap any live launch
     input or plan-owned buffer. Storage overlap is a caller precondition and
-    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``. A
-    Sage plan takes the scale tensors of this run as ``sage``; a plan without
-    Sage rejects them.
+    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
     """
 
     use_proxy_routes = state.use_proxy_routes
     num_kv_blocks = (state.seq_len_kv + state.kv_block_size - 1) // state.kv_block_size
     if not state.use_block_sparse:
-        # A dense plan owns the rejection of every routing input, summaries
-        # included; the route checks below see block-sparse plans only.
+        # A dense plan takes no routing inputs.
         _validate_dense_contiguous_plan_inputs(
             (name, value, None)
             for name, value in (
@@ -617,8 +613,7 @@ def launch_block_sparse(
 ) -> torch.Tensor:
     """Invoke the adapter ABI chosen by the frozen plan.
 
-    Contiguous plans share one adapter whose optional slots are ``None`` for
-    the inputs the plan does not use; the paged adapter has its own ABI.
+    Contiguous plans share one adapter; unused optional slots are ``None``.
     """
 
     if run_args.paged_kv is not None:

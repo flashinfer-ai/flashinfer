@@ -65,11 +65,7 @@ _B16_MIN_PARALLEL_ROUTE_PAIRS = 4
 
 @dataclass(frozen=True)
 class _BlockSparseCompileKey:
-    """Named, hashable inputs that determine one compiled attention adapter.
-
-    A key describes a contiguous plan, dense or block-sparse, or a paged
-    block-sparse plan.
-    """
+    """Named, hashable inputs that determine one compiled attention adapter."""
 
     device_index: int
     batch_size: int
@@ -82,9 +78,7 @@ class _BlockSparseCompileKey:
     kv_block_size: int
     kv_route_size: int
     dtype_key: str
-    # The output and V dtypes; the plan resolves them (``dtype_key`` unless it
-    # named another one, which the INT8 Sage recipe does for its E4M3 V), so a
-    # key never leaves them implicit.
+    # ``dtype_key`` names Q and K; a Sage plan may resolve other O and V dtypes.
     out_dtype_key: str
     v_dtype_key: str
     mask_type: Literal["dense", "causal"]
@@ -95,10 +89,8 @@ class _BlockSparseCompileKey:
     use_proxy_routes: bool = False
     page_size: int | None = None
     share_pattern_across_kv_heads: bool = False
-    # A dense key keeps the Q-tile and KV-route selection; its configuration
-    # reads none of the routing fields above.
+    # A dense key ignores the routing fields above.
     use_block_sparse: bool = True
-    # The compile-time Sage recipe; ``None`` compiles 16-bit attention.
     sage: SageAttentionConfig | None = None
 
 
@@ -130,13 +122,11 @@ class _BlockSparseStaticProfile:
     kv_block_size: int
     q_tile_size: int
     kv_route_size: int
-    # The compile key's dtype keys: Q/K, the output and V.
     dtype_key: str
     out_dtype_key: str
     v_dtype_key: str
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
-    # The resolved V dtype: the caller's override or, by default, the K dtype.
     v_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: Literal["dense", "causal"]
@@ -145,7 +135,6 @@ class _BlockSparseStaticProfile:
     page_size: int | None = None
     share_pattern_across_kv_heads: bool = False
     sage: SageAttentionConfig | None = None
-    # Whether the plan prepares block-sparse routes or attends densely.
     use_block_sparse: bool = True
 
 
@@ -228,13 +217,10 @@ def _select_block_sparse_scheduler(
 ) -> tuple[int, bool]:
     """Select the Q tile and scheduler without depending on KV storage.
 
-    Both modes share the block-sparse Q tile. A dense plan sizes the launch
-    heuristic by the whole K/V sequence with its default thresholds. A
-    block-sparse plan sizes it by the prepared route capacity of one row once
-    its Q tile qualifies for CLC; proxy routes add one summary route per row
-    on top of the exact routes and see the same per-tile fixed cost the
-    persistent scheduler amortizes, so the selection does not depend on the
-    route kind.
+    A dense plan sizes the launch heuristic by the whole K/V sequence.
+    Proxy routes add one summary route per row on top of the exact routes and
+    see the same per-tile fixed cost the persistent scheduler amortizes, so
+    the selection does not depend on the route kind.
     """
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
@@ -294,11 +280,10 @@ def _select_persistent_launch(
     persistent_min_waves: int = 1,
     persistent_min_tiles_per_cta: int = 1,
 ) -> bool:
-    """Ask the decode kernel's launch heuristic for the CLC work-tile loop.
+    """Return whether the decode launch heuristic selects the CLC scheduler.
 
-    ``seq_len_kv`` is the K/V extent the heuristic sizes each task by. A
-    ``gmem_reduction`` outcome maps to the static grid, because these plans
-    never split K/V across CTAs.
+    ``seq_len_kv`` sizes each task. These plans never split K/V, so any other
+    outcome selects the static grid.
     """
 
     from ..kernels.fmha_decode.fmha_decode_config import (
@@ -376,6 +361,12 @@ def _validate_max_blocks_per_row(
     return max_blocks_per_row
 
 
+def _plan_dtype_key(dtype: torch.dtype) -> str:
+    """Return the compile-key name of a plan dtype; Int8 is a Sage Q/K dtype."""
+
+    return "int8" if dtype == torch.int8 else _dtype_key(dtype)
+
+
 def _resolve_plan_dtypes(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype | None,
@@ -385,11 +376,8 @@ def _resolve_plan_dtypes(
 ) -> tuple[torch.dtype, torch.dtype, torch.dtype, str]:
     """Return ``(kv_dtype, v_dtype, output_dtype, dtype_key)`` of one plan.
 
-    K defaults to Q and V to K. Without Sage, Q, K, V and the output share one
-    16-bit dtype, the output defaulting to Q. With Sage, Q and K share one
-    dtype (the compile key names it) and the output defaults to bfloat16; the
-    decode configuration judges the recipe itself, including the E4M3 V the
-    INT8 recipe names.
+    K defaults to Q and V to K. The output defaults to Q, or to bfloat16 with
+    Sage; the decode configuration validates the Sage dtype recipe.
     """
 
     if kv_dtype is None:
@@ -411,7 +399,7 @@ def _resolve_plan_dtypes(
         raise ValueError("Sage attention requires Q and K in one dtype")
     if output_dtype is None:
         output_dtype = torch.bfloat16
-    return kv_dtype, v_dtype, output_dtype, _dtype_key(q_dtype)
+    return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
 
 
 def _validate_block_sparse_static_profile(
@@ -436,17 +424,7 @@ def _validate_block_sparse_static_profile(
     sage: SageAttentionConfig | None = None,
     use_block_sparse: bool = True,
 ) -> _BlockSparseStaticProfile:
-    """Validate static policy before any device work or BSR inspection.
-
-    ``kv_dtype`` is the K dtype and defaults to Q; ``v_dtype`` defaults to K.
-    ``use_block_sparse`` records whether the plan prepares routes; a dense
-    plan carries no route capacity.
-    With ``sage`` the plan compiles that Sage recipe: Q and K share one 8-bit
-    dtype (INT8 Q/K name their E4M3 V) and the output defaults to bfloat16.
-    The decode configuration owns the remaining Sage rules (8-bit Q/K/V with
-    a 16-bit output, the scale block sizes, the two-instance Keeps profiles)
-    and reports violations when the launch is resolved.
-    """
+    """Validate static policy before any device work or BSR inspection."""
 
     if not isinstance(share_pattern_across_kv_heads, bool):
         raise TypeError("share_pattern_across_kv_heads must be a bool")
@@ -526,8 +504,8 @@ def _validate_block_sparse_static_profile(
         q_tile_size=q_tile_size,
         kv_route_size=kv_route_size,
         dtype_key=dtype_key,
-        out_dtype_key=_dtype_key(output_dtype),
-        v_dtype_key=_dtype_key(v_dtype),
+        out_dtype_key=_plan_dtype_key(output_dtype),
+        v_dtype_key=_plan_dtype_key(v_dtype),
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
         v_dtype=v_dtype,
@@ -651,9 +629,7 @@ def _resolve_block_sparse_launch_spec(
     index values and physical-tail morphology never specialize this cache
     entry. Proxy and exact routes share one scheduler selection. An
     unsupported persistent profile falls back to its valid static
-    counterpart. A dense plan keeps the block-sparse tile selection and sizes
-    its scheduler decision by the whole K/V sequence instead of a route
-    capacity. The dtype keys are the plan's resolved keys.
+    counterpart.
     """
 
     q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
@@ -724,8 +700,8 @@ def _resolve_block_sparse_launch_spec(
         config = _make_block_sparse_config(compile_key)
 
     if compile_key.sage is not None:
-        # Cache the validated geometry: an implicit summary block equals its
-        # explicit value, and a plan without proxies uses the token block.
+        # Key by the resolved summary block so equivalent recipes share one
+        # adapter.
         compile_key = replace(
             compile_key,
             sage=replace(

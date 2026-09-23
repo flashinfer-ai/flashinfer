@@ -23,7 +23,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
-| Block-sparse FMHA | [Sage attention](#sage-attention-8-bit-qkv-with-dequantization-scales) below; kernel notes in [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md#sage-attention) | `BlockSparseTSWrapper`, `block_sparse_attention`; `plan(use_block_sparse=False)` for dense contiguous K/V; `SageAttentionConfig` and `SageAttentionParams` for 8-bit Q/K/V with scales; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
+| Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
@@ -126,7 +126,7 @@ The public lifecycle matches paged block-sparse attention:
 ```python
 wrapper = QTokenKvBlockSparsePagedTSWrapper()
 wrapper.plan(...)  # geometry, capacity, dtypes, workspace; outside capture
-wrapper.run(...)  # live indexer IDs and request metadata; graph hot path
+wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
 ```
 
 `plan` binds the single caller-owned byte workspace and fixes
@@ -249,156 +249,78 @@ are owned by `(batch, pattern head, Q block)`. Both block-sparse APIs default
 to `share_pattern_across_kv_heads=False`; True uses a singleton pattern-head
 axis shared by all KV heads. K/V and proxy summaries retain their physical
 head axis in either mode. A proxy run supplies one K arithmetic mean and one V
-arithmetic mean per semantic KV block; each proxy block then counts as its
-number of structural tokens in the softmax. V summaries must be per-block
-means; the kernel cannot tell a per-block sum apart and would scale the output
-by the block mass. The final partial block averages only its structural tokens.
+arithmetic mean per semantic KV block; the final partial block averages only
+its structural tokens, and each proxy block counts as that many tokens in the
+softmax.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
-proxy summaries or their represented mass. With Sage attention
-the K summaries use the K dtype and are dequantized with
-`SageAttentionParams.k_summary_scale`; the V summaries are E4M3 and share
-`v_scale` (see below).
+proxy summaries or their represented mass.
 
-## Sage attention (8-bit Q/K/V with dequantization scales)
+`BlockSparseTSWrapper.plan(..., use_block_sparse=False)` and
+`block_sparse_attention(..., use_block_sparse=False)` run dense attention over
+the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
+owns no route workspace, and its `run` takes Q/K/V only.
 
-`BlockSparseTSWrapper.plan(..., sage_config=SageAttentionConfig(...))` compiles
-the
-contiguous decode kernel for 8-bit Q, K and V in both modes (dense and
-block-sparse, exact and proxy routes), and every
-`run(..., sage=SageAttentionParams(...))` supplies the scale tensors of that
-call. The math is the one implemented by trtllm-gen and consumed by
-TensorRT-LLM's `sageQuant`-based pipeline:
+## Sage attention
+
+Sage attention runs the contiguous decode kernel on 8-bit Q, K and V with
+dequantization scales, in the dense and block-sparse modes of
+`BlockSparseTSWrapper` and `block_sparse_attention`. The plan fixes the recipe
+with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
+`sage=SageAttentionParams(...)`:
 
 ```text
-S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]      INT8 -> INT32 scores, E4M3 -> FP32 scores
-P       = softmax_row(S)                                        FP32; quantized to E4M3 as 448 * p
-O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (448 * l[r])  (+ v_mean[d] when supplied)
+S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
+P       = softmax_row(S), quantized to E4M3 as 448 * p
+O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (448 * l[r])  (+ v_mean[d])
 ```
 
-The Q/K scales apply to the scores before the row maximum and the
-exponential, never to P; P has one static scale (448, the E4M3 maximum); V
-has one scale per channel. There is no K or V smoothing inside the kernel;
-`v_mean` only adds a caller-provided per-channel mean back after
-normalization, for callers that quantized `V - v_mean`. FlashInfer does not
-quantize: the 8-bit tensors and every scale come from TensorRT-LLM's
-`sageQuant` (or from the test-only torch reference in
-`tests/attention/sage_quant_reference.py`). Every scale must be finite and
-positive; the kernel does not check the values.
+FlashInfer does not quantize: the 8-bit tensors and scales come from the
+caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
+mean back after normalization, for callers that quantized `V - v_mean`. Every
+scale must be finite and positive; the kernel does not check the values.
 
-### Recipes
-
-| Input | Accepted values |
+| Input | Supported values |
 | --- | --- |
-| Q/K dtype (`q_data_type`, `kv_data_type`) | `torch.float8_e4m3fn` or `torch.int8`; Q and K must match |
-| V dtype (`v_data_type`) | `torch.float8_e4m3fn`; defaults to `kv_data_type`, so INT8 K must name it explicitly |
-| Output dtype (`o_data_type`) | `torch.bfloat16` (default with `sage`) or `torch.float16` |
-| `SageAttentionConfig.q_block_size` | Power of two no larger than the Q tile (64 or 128, see below); default 1 |
-| `SageAttentionConfig.k_block_size` | One of `SAGE_K_BLOCK_SIZES == (1, 4, 16, 32, 64, 128, 256)`; default 16 |
-| `SageAttentionConfig.k_summary_block_size` | K block size of a proxy plan's summary scales, one of `SAGE_K_BLOCK_SIZES`; default `None` = `k_block_size`. A plan without proxy routes uses `k_block_size` |
-| `SageAttentionConfig.v_mean` | `True` when every run supplies `v_mean`; default `False` |
-| Head dimension | 128 |
-| K/V storage | Contiguous `[B, S, Hkv, D]` only; the paged wrappers accept neither `sage` nor INT8 |
-| Profiles | Streamed Keeps Q64/KV256 and Q128/KV128 (dense and block-sparse) |
-| Mask | `dense` or `causal` (proxy routes stay `dense`) |
-| Scheduling | Static direct grid or the persistent scheduler, selected as for 16-bit plans in both modes; no split-KV, sliding window or attention sinks |
+| Q/K dtype | Matching `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
+| V dtype (`v_data_type`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
+| Output dtype | `torch.bfloat16` (default) or `torch.float16` |
+| `q_block_size` | Power of two no larger than the Q tile; default 1 |
+| `k_block_size` | 1, 4, 16, 32, 64, 128 or 256; default 16 |
+| `k_summary_block_size` | K block size of proxy summary scales; default `k_block_size` |
+| `v_mean` | Whether every run supplies `v_mean`; default `False` |
+| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) |
 
-`kv_data_type` is the K dtype; the INT8 recipe (`int8` Q/K, `float8_e4m3fn`
-V) names `v_data_type` explicitly, and `(int8, int8)` and
-`(float8_e4m3fn, int8)` are rejected. The defaults
-(`q_block_size=1`, `k_block_size=16`) are TensorRT-LLM's production recipe
-`(1, 16, 1)`; its `(1, 4, 1)` and `(1, 1, 1)` recipes run with eight and 32
-scale groups per K32 score fragment, whose `sfK` words the softmax reads from
-SMEM per fragment instead of holding one multiplier per group in registers.
-
-The profile follows from the same `q_block_size`/`kv_block_size` plan
-arguments as 16-bit decode: `kv_block_size` must be a positive multiple of
-64, and the Q tile is the largest power of two no larger than
-`min(q_block_size * Hq / Hkv, 128)` that fits the block geometry. A Q64 tile
-selects Q64/KV256, a Q128 tile selects Q128/KV128; smaller tiles are Swaps
-profiles and reject `sage`, as does a `kv_block_size` that is not a multiple
-of 64. Every 8-bit Q128/KV128 plan streams its P fragments, as every KV256
-and every block-sparse plan does; the streamed fragment passes are where the
-scales enter.
+The block-size fields belong to `SageAttentionConfig`; the defaults are
+TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
+plans. The paged block-sparse APIs do not support Sage attention.
 
 ### Scale tensors
 
-All scale tensors are contiguous, 16-byte aligned `torch.float32` on the run
-device. Q and K scales use the trtllm-gen flat layout: within one head,
-sequence `b` of a fixed-shape `[B, S, H, D]` tensor starts at slot
-`(b * S) // blk + b` and token `t` uses slot `t // blk` inside it, so one head
-owns `flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1` slots. This is
-`sageQuant`'s `cumSeqLens[b] / blk + b + t / blk` with `cumSeqLens[b] = b * S`;
-the extra `b` keeps the last block of one sequence and the first block of the
-next in distinct slots when `blk` does not divide `S`. `flat_scale_slot`
-(with `log2_block_size`) and `flat_scale_numel` in
-`flashinfer.attention.prims_ts.sage` compute both; the kernel indexes the
-layout with the same `flat_scale_slot`.
+All scales are contiguous, 16-byte-aligned `torch.float32` tensors on the run
+device; a validating `run()` checks them against the plan. Q and K scales use
+the trtllm-gen flat layout: within one head, sequence `b` of `[B, S, H, D]`
+starts at slot `b * S // blk + b` and token `t` uses slot `t // blk` inside
+it, so one head owns `flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1`
+slots.
 
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `q_scale` | `[Hq, flat_scale_numel(B, Sq, q_block_size)]` | One scale per Q head and Q token block |
-| `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` | One scale per KV head and K token block |
-| `v_scale` | `[Hkv, D]` | One scale per KV head and channel, shared across the batch |
-| `v_mean` (optional) | `[Hkv, D]` | Per-channel mean added back after normalization |
-| `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), summary_k_block_size)]` | Required by, and only by, block-sparse proxy plans; `summary_k_block_size` is `k_summary_block_size` or, unset, `k_block_size` |
+| Field | Shape |
+| --- | --- |
+| `q_scale` | `[Hq, flat_scale_numel(B, Sq, q_block_size)]` |
+| `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` |
+| `v_scale` | `[Hkv, D]` |
+| `v_mean` | `[Hkv, D]`; exactly when the recipe sets `v_mean=True` |
+| `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
 
-The recipe (`SageAttentionConfig`) is compile-time and joins the kernel cache
-key; the scale tensors are run inputs, validated for shape, dtype, device and
-contiguity against the plan on every `run()`, and `v_mean` must be present
-exactly when the plan was configured with `v_mean=True`. Sequence tails and
-masked columns beyond the valid length read the last valid slot, so a scale
-array never needs padding beyond `flat_scale_numel`.
+With proxy routes, `k_summary` holds the per-block K means in the K dtype,
+quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
+`k_summary_block_size`; `k_summary_scale` holds its scales. `v_summary` holds
+the per-block V means in E4M3 and shares `v_scale` (built from `V - v_mean`
+when a mean is used).
 
-### Block-sparse contract with Sage
+On B200 both recipes run roughly 15-20% faster than BF16 on the same plan.
+K blocks of 4 and 1 tokens cost roughly 10-20% more than 16-token blocks.
 
-Proxy routes treat the K summaries as one more K sequence of
-`ceil(Skv / kv_block_size)` tokens: `k_summary` holds the per-block K means
-quantized in the K dtype (INT8 or E4M3) with `sageQuant` applied to the
-summary tensor as if it were K with the recipe's summary K block size
-(`k_summary_block_size`, defaulting to `k_block_size`), and
-`k_summary_scale` is the resulting flat-layout array. Summaries are block
-means whose magnitudes spread more than the tokens', so an INT8 recipe can
-take one scale per summary (`k_summary_block_size=1`) while its exact routes
-keep the 16-token block; the kernel then reads the two route kinds' scales
-with their own group geometry and strategy (register array for blocks of 16
-and larger, an SMEM ring for 4 and 1), selected per tile on the route kind.
-A route kind with one scale per score (the one-token K block) has its
-scores written back dequantized by the max pass, so its P pass avoids
-reloading and applying all 32 `sfK` words of each fragment.
-A mixed geometry costs a few percent on proxy plans: the proxy kernel carries
-both geometries' max passes and gathers the summary scales in its softmax
-warps; exact-only plans are unaffected. `v_summary` holds the per-block V means (the final partial
-block averages only its structural tokens) quantized to E4M3 with the shared
-`v_scale`; with `v_mean`, build them from `V - v_mean`. A proxy block stands
-for as many identical tokens as it covers, so its mass enters the proxy
-logit and its probability carries the block's weight. Token masks
-(`kv_valid_bits`) and ragged final blocks are supported exactly as without
-Sage.
-
-### Performance
-
-The Sage kernels keep the warp roles, pipelines and scheduler of the 16-bit
-decode kernels. The 8-bit tensors halve the K/V traffic, and the byte-wide
-tiles free shared memory that the kernels reinvest in a deeper K/V ring and a
-lighter output tail. The softmax warps stay the bottleneck, so the scale
-machinery is kept off their critical path: exact routes' K scales travel with
-the route metadata, dense tiles read theirs ahead of the score wait, one
-multiplier serves each compile-time scale group, INT8 scores accumulate on an
-FP32 bias so they need no conversion, and the one-token K block writes its
-scores back dequantized so its P pass reads no scales.
-
-Rough figures on B200, kernel time relative to the BF16 kernel of the same
-plan under the same launch heuristic: the FP8 and INT8 recipes run the dense
-and block-sparse decode shapes (dense and sparse block patterns, long and
-short sequences) about
-15-20% faster; a small dense shape that a persistent BF16 grid already
-saturates gains nothing; INT8 is within a few percent of FP8; the 4- and
-1-token K blocks cost 10-20% over the 16-token block; the results do not
-depend on the logit distribution.
-
-### Examples
-
-Dense contiguous decode, E4M3 Q/K/V with the production `(1, 16, 1)` recipe:
+### Example
 
 ```python
 import torch
@@ -413,25 +335,18 @@ device = torch.device("cuda")
 B, Sq, Skv, Hq, Hkv, D = 2, 128, 1000, 4, 4, 128
 fp8 = torch.float8_e4m3fn
 
+# q_block_size=64 and kv_block_size=64 select the Q64/KV256 tile.
 wrapper = BlockSparseTSWrapper()
 wrapper.plan(
-    B,
-    Sq,
-    Skv,
-    Hq,
-    Hkv,
-    D,
-    64,  # q_block_size: 64 rows per KV head select the Q64/KV256 profile
-    64,  # kv_block_size: a multiple of 64
+    B, Sq, Skv, Hq, Hkv, D, 64, 64,
     device=device,
     use_block_sparse=False,
     q_data_type=fp8,
     kv_data_type=fp8,
-    o_data_type=torch.bfloat16,
     sage_config=SageAttentionConfig(q_block_size=1, k_block_size=16),
 )
 
-# 8-bit tensors and scales come from the quantizer (TensorRT-LLM sageQuant).
+# The quantizer (for example sageQuant) produces the tensors and scales.
 q = torch.randn(B, Sq, Hq, D, device=device).to(fp8)
 k = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
 v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
@@ -443,87 +358,39 @@ scales = SageAttentionParams(
 out = wrapper.run(q, k, v, sage=scales)  # [B, Sq, Hq, D] bfloat16
 ```
 
-Block-sparse decode with proxy routes, INT8 Q/K and E4M3 V:
+A block-sparse INT8 plan with proxy routes names its E4M3 V, and its runs add
+the routes, the summaries and `k_summary_scale`:
 
 ```python
-import math
+from dataclasses import replace
 
-kv_block_size, max_blocks_per_row = 64, 8
-num_kv_blocks = math.ceil(Skv / kv_block_size)
-
-wrapper = BlockSparseTSWrapper()
 wrapper.plan(
-    B,
-    Sq,
-    Skv,
-    Hq,
-    Hkv,
-    D,
-    64,
-    kv_block_size,
+    B, Sq, Skv, Hq, Hkv, D, 64, 64,
     device=device,
-    max_blocks_per_row=max_blocks_per_row,
-    use_kv_valid_bits=False,
+    max_blocks_per_row=8,
     use_proxy_routes=True,
     q_data_type=torch.int8,
     kv_data_type=torch.int8,
-    v_data_type=fp8,  # INT8 K requires E4M3 V, named explicitly
-    o_data_type=torch.bfloat16,
-    sage_config=SageAttentionConfig(),  # the (1, 16, 1) recipe
+    v_data_type=fp8,
+    sage_config=SageAttentionConfig(),
 )
-
-q = (
-    (torch.randn(B, Sq, Hq, D, device=device) * 40)
-    .round()
-    .clamp(-127, 127)
-    .to(torch.int8)
+# q, k and k_summary are int8; v and v_summary are fp8. The summaries are
+# [B, num_kv_blocks, Hkv, D].
+num_kv_blocks = -(-Skv // 64)
+summary_scale = torch.rand(
+    Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
 )
-k = (
-    (torch.randn(B, Skv, Hkv, D, device=device) * 40)
-    .round()
-    .clamp(-127, 127)
-    .to(torch.int8)
-)
-v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
-scales = SageAttentionParams(
-    q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
-    k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
-    v_scale=torch.rand(Hkv, D, device=device),
-    # The K summaries are quantized as their own sequence of num_kv_blocks tokens.
-    k_summary_scale=torch.rand(
-        Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
-    ),
-)
-# block_indptr [B, Hkv, ceil(Sq / q_block_size) + 1] and block_indices select
-# the exact blocks; k_summary (int8) and v_summary (fp8) are the per-block
-# means of the remaining blocks, [B, num_kv_blocks, Hkv, D].
 out = wrapper.run(
-    q,
-    k,
-    v,
-    block_indptr,
-    block_indices,
+    q, k, v, block_indptr, block_indices,
     k_summary=k_summary,
     v_summary=v_summary,
-    sage=scales,
+    sage=replace(scales, k_summary_scale=summary_scale),
 )
 ```
 
-`block_sparse_attention(..., sage=SageAttentionParams(...))` runs the same
-launch in one shot, in the dense mode and in the block-sparse modes; the recipe
-is `sage_config=SageAttentionConfig(...)`, or the default recipe with a V mean
-exactly when `sage.v_mean` is present. The INT8 recipe is inferred from the
-dtypes of `q`, `k` and `v`. The paged wrappers do not take `sage`.
-
-`BlockSparseTSWrapper.plan(..., use_block_sparse=False)` plans dense attention
-over the whole contiguous K/V sequence with the same Q-tile and KV-route
-selection and the same profile matrix as a block-sparse plan, and
-`block_sparse_attention(..., use_block_sparse=False)` runs it in one shot. A
-dense plan owns no route workspace, launches no route preparation, and its
-`run` takes Q/K/V only; its scheduler follows the decode kernel's launch
-heuristic, which picks the persistent scheduler once the static grid exceeds
-one resident wave because the work-tile loop overlaps a tile's epilogue with
-the next tile's QK head.
+`block_sparse_attention(..., sage=...)` runs the same launches in one shot;
+its recipe is `sage_config` or, when omitted, the default recipe with a V mean
+exactly when `sage.v_mean` is set.
 
 ## Validation
 

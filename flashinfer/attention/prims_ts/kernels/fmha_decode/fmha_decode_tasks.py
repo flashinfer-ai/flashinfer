@@ -338,9 +338,7 @@ def _issue_score_seed(
 ) -> None:
     """Seed the acquired S slot of an INT32-score QK wave before its K wait.
 
-    The seed MMA reads only constant tiles, so it does not need the K tile;
-    issuing it right after the S acquire lets its issue overlap the K wait
-    instead of extending the INT8 K steps that follow.
+    The seed MMA reads only constant tiles, so its issue overlaps the K wait.
     """
     if not cfg.uses_int32_scores:
         return
@@ -2910,11 +2908,9 @@ def _softmax_schedule_body(
 ) -> None:
     """Build one softmax instance's loop, P publication, and final stats handoff.
 
-    Both instances run the same schedule on their own resources; they differ
-    only in the side of the ordered P baton they hold. ``sage_scales_in_smem``
-    marks, per present scale resource, the SMEM form that carries a pipeline;
-    schedule proxies expose work methods only, so the flags come from the
-    task builder.
+    Both instances run this body and differ only in their side of the P
+    baton. ``sage_scales_in_smem`` flags the scale resources in SMEM form,
+    which carry a pipeline; schedule proxies cannot answer it themselves.
     """
     if membership_lifetime is not None:
         membership_lifetime.wait()
@@ -2930,15 +2926,11 @@ def _softmax_schedule_body(
     if cutlass.const_expr(cfg.use_sage_attention):
         # The lane's Q row is fixed for the work tile.
         sage_q_scale = tmem_s.load_sage_q_scale()
-    # The Sage loops take the row's ``sfQ`` and one routed array per scale
-    # resource (the lane's raw ``sfK`` words, or a placeholder when the
-    # tile's words live in the resource's SMEM ring); a single-geometry plan
-    # passes the exact array under both names. The block-sparse loops take
-    # the register-resident route payload and the proxy P pass its route
-    # kind; the work framework routes arguments by token and rejects
-    # ``None``, so each combination is its own work callable.
+    # The work framework rejects ``None`` arguments, so each Sage/sparse
+    # combination is its own work callable. A single-geometry plan passes
+    # its one routed ``sfK`` array under both names.
     sage_scales = [r for r in (sage_k_scales, sage_summary_k_scales) if r is not None]
-    sage_ring_scales = [
+    sage_smem_scales = [
         r
         for r, in_smem in zip(sage_scales, sage_scales_in_smem, strict=True)
         if in_smem
@@ -2975,13 +2967,11 @@ def _softmax_schedule_body(
                 sparse_token_word3,
             ) = sparse_softmax_metadata.load_route()
             if cutlass.const_expr(cfg.use_sage_attention):
-                # The route's ``sfK`` words leave the held metadata stage for
-                # the task's own scale resources: ProdAcquire/ProdWork/
-                # ProdCommit fill and publish an SMEM ring slot, ConsWait
-                # makes it visible to both passes, ConsWork routes the lane's
-                # register words. A mixed-geometry plan fills the resource of
-                # the route's kind; the other one routes ones.
-                for scales in sage_ring_scales:
+                # Take the route's ``sfK`` words before the metadata stage
+                # is released. Each iteration fills and publishes this tile's
+                # words only; the second stage lets the fill overlap the
+                # previous tile's P pass on the instance's other warps.
+                for scales in sage_smem_scales:
                     scales.acquire()
                     scales.publish_route_tile(route_flags=sparse_route_flags)
                     scales.commit()
@@ -2996,10 +2986,9 @@ def _softmax_schedule_body(
                     )
             sparse_softmax_metadata.release()
         if cutlass.const_expr(cfg.use_sage_attention and not use_sparse):
-            # A dense tile's ``sfK`` loads are issued ahead of the score wait
-            # so their latency hides behind the QK MMA; a route's words came
-            # with its metadata above.
-            for scales in sage_ring_scales:
+            # Issue the dense tile's ``sfK`` loads before the score wait so
+            # they hide behind the QK MMA.
+            for scales in sage_smem_scales:
                 scales.acquire()
                 scales.publish_tile()
                 scales.commit()
@@ -3092,9 +3081,8 @@ def _softmax_schedule_body(
             # wave can now overwrite S.
             tmem_s.release()
         if cutlass.const_expr(cfg.use_sage_attention):
-            # ConsRelease: both passes have read the tile's ``sfK`` ring slot,
-            # so the tile after next may fill it.
-            for scales in sage_ring_scales:
+            # ConsRelease: both passes have read this tile's ``sfK`` slot.
+            for scales in sage_smem_scales:
                 scales.release()
         # ProdWork: FP8 path applies the cross-resource sum correction
         # before TmemS.reduce_sums publishes the new running sums.
@@ -3136,8 +3124,8 @@ def _softmax_schedule_body(
         ):
             # Tail stats add one stage beyond the S cadence. Advance the
             # second stats slot so both pipelines start the next work tile
-            # on the same physical TMEM stage. Only the first instance exists
-            # in a one-instance profile, so the advance belongs to it alone.
+            # on the same physical TMEM stage. A one-instance profile has
+            # only the first instance.
             tmem_softmax_local.acquire()
             tmem_softmax_local.commit()
     if membership_lifetime is not None:
@@ -3496,9 +3484,8 @@ def create_correction_task(
         tmem_corr0.init_epilogue_state()
         tmem_corr1.init_epilogue_state()
         if sage_v_scales is not None:
-            # ProdAcquire/ProdWork/ProdCommit: stage the work tile's V channel
-            # scales while no output is pending; the acquire waits for the
-            # previous tile's tail to release the block.
+            # ProdWork: stage the work tile's V channel scales while no
+            # output is pending.
             sage_v_scales.acquire()
             sage_v_scales.stage_tile()
             sage_v_scales.commit()
@@ -3599,8 +3586,7 @@ def create_correction_task(
             inst1_sum_arr=inst1_sum_arr,
         )
         if sage_v_scales is not None:
-            # ConsRelease: the tail has read the block; the next work tile
-            # may restage it.
+            # ConsRelease: the next work tile may restage the block.
             sage_v_scales.release()
         # Inst1 final reduction consumes both O0 and O1, so defer O0 release
         # until after inst1 has finished reading it.
@@ -3801,9 +3787,8 @@ def create_correction_task_one_inst_qkv(
         _, tail_0, tail_1 = tmem_o.init_stage_state()
         tmem_corr.init_epilogue_state()
         if sage_v_scales is not None:
-            # ProdAcquire/ProdWork/ProdCommit: stage the work tile's V channel
-            # scales while no output is pending; the acquire waits for the
-            # previous tile's tail to release the block.
+            # ProdWork: stage the work tile's V channel scales while no
+            # output is pending.
             sage_v_scales.acquire()
             sage_v_scales.stage_tile()
             sage_v_scales.commit()
@@ -3860,8 +3845,7 @@ def create_correction_task_one_inst_qkv(
             inst1_sum_arr=inst_sum_arr,
         )
         if sage_v_scales is not None:
-            # ConsRelease: the tail has read the block; the next work tile
-            # may restage it.
+            # ConsRelease: the next work tile may restage the block.
             sage_v_scales.release()
         # ConsRelease: the final O stage is no longer needed.
         tmem_o.release()

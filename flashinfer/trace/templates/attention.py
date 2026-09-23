@@ -472,11 +472,7 @@ def _make_prims_ts_block_sparse_trace(
     wrapper: bool,
     use_block_sparse: bool = True,
 ) -> TraceTemplate:
-    """Describe one contiguous mode: a route frontend with its source mode, or dense.
-
-    The dense mode keeps the Q/K/V tensors, the block-size tile selectors and
-    the mask type; it carries no route metadata and no token mask.
-    """
+    """Describe one contiguous mode: a route frontend, or dense attention."""
     if use_block_sparse:
         route_axes, route_inputs, route_constraints, suffix = (
             _block_sparse_route_schema(
@@ -566,8 +562,7 @@ def _make_prims_ts_block_sparse_trace(
                 f"BSHD Q/K/V and per-KV-head {route_name} metadata."
             )
     else:
-        # A dense plan attends over the whole K/V sequence: run() takes Q/K/V
-        # only, so the token mask and its axis leave with the route metadata.
+        # A dense run takes Q/K/V only: no route metadata or token mask.
         del axes["num_kv_valid_words"]
         del inputs["kv_valid_bits"]
         constraints.remove(

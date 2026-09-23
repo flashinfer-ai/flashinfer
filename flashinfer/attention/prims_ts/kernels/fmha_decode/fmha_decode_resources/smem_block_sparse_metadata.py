@@ -46,9 +46,7 @@ from ...._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_PROXY_FLAG,
     _BlockSparseRouteLayout,
 )
-from ...placeholder_helpers import (
-    _placeholder_smem_array,
-)
+from ...placeholder_helpers import _placeholder_smem_array
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
@@ -83,8 +81,6 @@ from .sage_scales import (
 # max pass derives its keep words from the token words directly, so the bit is
 # currently staged for the consumer but not read.
 _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
-# Keeps reserves bit 5 for the prepared route kind. The low four structural
-# validity bits and bit 4 keep their existing meaning.
 
 
 # SWAP origins are at least eight-token aligned, so their low two bits are free
@@ -730,12 +726,9 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     the stable task-local ABI. Runtime route flags carry the conservative FULL
     summary and, for proxy-capable builds, the route source kind.
 
-    Sage attention adds the route's ``sfK`` values to the staged payload: the
-    load warp gathers one scale per lane from ``k_scale`` (or
-    ``k_summary_scale`` for a proxy route) while it publishes the route, so
-    the softmax threads read their scale group values from SMEM next to the
-    atom origins instead of issuing scattered global loads before the score
-    wait.
+    Sage attention adds the route's ``sfK`` words to the staged payload, so
+    the softmax threads read them from SMEM instead of issuing scattered
+    global loads before the score wait.
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
@@ -1146,21 +1139,14 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                     + lane_idx
                 ] = Int32(token_word)
         if cutlass.const_expr(self.cfg.use_sage_attention):
-            # The route's ``sfK`` words are staged in the exact geometry,
-            # consecutive words per lane: lane ``l`` owns words
-            # ``l * words_per_lane`` onward. Consecutive words of one lane lie
-            # in one fragment of one spatial half (``words_per_lane`` divides
-            # the group count), so the lane resolves one atom origin from the
-            # lane-distributed record (or the broadcast origin pair of a
-            # two-atom route without one-warp transport) and loads its words
-            # at the group stride in one batch. Invalid atoms carry origin
-            # ``-1``; their scores are masked, so the clamp to token zero only
-            # keeps the load in bounds. Proxy routes of an equal-geometry plan
-            # stage their summary scales the same way; proxy routes of a
-            # mixed-geometry plan stage nothing, since the softmax warps
-            # gather their summary scales (``SageKScalesResource``) where the
-            # loads hide behind the score wait instead of sitting on the load
-            # warp between two routes.
+            # Stage the route's ``sfK`` words in the exact geometry. Lane ``l``
+            # owns words ``l * words_per_lane`` onward, which lie in one
+            # fragment of one spatial half, so it resolves one atom origin and
+            # loads its words at the group stride. Invalid atoms (origin
+            # ``-1``) are masked; the clamp to token zero only keeps the load
+            # in bounds. Proxy routes of a mixed-geometry plan stage nothing:
+            # the softmax warps gather their summary scales behind the score
+            # wait.
             cfg = self.cfg
             assert self.staging_layout.sage_scale_words_word_offset is not None
             route_is_proxy = cutlass.Boolean(False)
@@ -1193,8 +1179,8 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             assert words_per_lane * 32 >= num_words and groups % words_per_lane == 0
             group_tokens: Constexpr[int] = cfg.softmax_score_fragment_regs // groups
             arr_size: Constexpr[int] = sage_scale_arr_size(cfg, groups)
-            # A staged-array view built here keeps its base pointer outside
-            # the dynamic branch below, which the store inside then reuses.
+            # Build the view outside the dynamic branch so the store reuses
+            # its base pointer.
             staged = cutlass.Array(
                 self._smem_scales.data_ptr(),
                 dtype=Float32,

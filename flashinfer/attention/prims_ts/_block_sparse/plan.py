@@ -40,8 +40,7 @@ from .prepared import _BlockSparseRouteLayout
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
-# The tcgen05 MMA kind INT8 that Int8 Q/K score with exists on SM100 alone;
-# SM103 and later drop it, so those GPUs take the Float8E4M3FN Q/K recipe.
+# Only SM100 has the INT8 tcgen05 MMA kind; later GPUs use E4M3 Q/K.
 _INT8_QK_COMPUTE_CAPABILITIES = ((10, 0),)
 
 
@@ -85,12 +84,10 @@ def _serialize_plan(
 class _BlockSparsePlanState:
     """One complete launch state published by a block-sparse wrapper.
 
-    Every contiguous state executes the one contiguous adapter: a block-sparse
-    state runs ``prepare -> prepared-route attention`` in it, including a
-    pattern whose rows select every KV block, and a dense state runs the
-    decode kernel over the whole sequence with the routing slots left empty.
-    Caller BSR and token mask tensors belong to individual runs and are never
-    retained here.
+    Every block-sparse state executes one ``prepare -> prepared-route
+    attention`` adapter, including a pattern whose rows select every KV block;
+    a dense state skips route preparation. Caller BSR and token mask tensors
+    belong to individual runs and are never retained here.
 
     Runtime geometry, dtypes, the compiled launch, and the readiness event are
     published together. ``run()`` therefore sees either the complete old state
@@ -125,20 +122,16 @@ class _BlockSparsePlanState:
     kv_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
-    # The resolved V dtype (the K dtype unless the plan named another one).
     v_dtype: torch.dtype
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
     page_size: int | None
-    # The compile-time Sage recipe; every run supplies the matching scale
-    # tensors. ``None`` runs 16-bit attention without Sage.
     sage: SageAttentionConfig | None
-    # The shape of every scale tensor a Sage run supplies, by field name.
+    # Expected shape of every Sage scale tensor, by field name.
     sage_scale_shapes: dict[str, tuple[int, int]] | None
 
-    # Only an unmasked block-sparse specialization needs a shape-correct ABI
-    # placeholder. A dense contiguous plan runs without a prepare kernel and
-    # owns neither the placeholder nor any route storage.
+    # Only an unmasked specialization needs a shape-correct ABI placeholder;
+    # dense plans own neither it nor route storage.
     dummy_kv_valid_bits: torch.Tensor | None
 
     # Immutable row capacities and mutable per-run route payload.
@@ -218,8 +211,7 @@ def _block_sparse_route_capacity(
 ) -> tuple[int, int]:
     """Return ``(prepared rows, route capacity per row)`` of one plan.
 
-    A dense plan prepares no routes and owns no capacity. A proxy plan adds
-    the routes that carry the summary sequence to every row's exact routes.
+    A dense plan has none; a proxy plan adds its summary routes to every row.
     """
 
     if not static.use_block_sparse:
@@ -256,11 +248,7 @@ def _build_block_sparse_plan_state(
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
 ) -> _BlockSparsePlanState:
-    """Build one format- and route-specialized plan atomically.
-
-    A dense plan owns no route capacity, so it allocates neither the mask
-    placeholder nor any route storage.
-    """
+    """Build one format- and route-specialized plan atomically."""
 
     if static.page_size is not None:
         assert sparse_format == "bsr" and not use_proxy_routes

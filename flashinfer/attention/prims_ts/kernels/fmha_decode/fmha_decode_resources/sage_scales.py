@@ -14,83 +14,36 @@
 
 """Sage attention scale addressing for the decode softmax and epilogue.
 
-Every scale load of the kernel goes through this module. The softmax bodies
-load ``sfQ`` of their Q row once per work tile and the raw ``sfK`` of each
-KV tile's scale groups; the epilogue receives the per-channel V scales for one
-output column range.
+Every scale load of the kernel goes through this module. ``sfQ`` and ``sfK``
+use the trtllm-gen flat layout (``flat_scale_slot`` of
+:mod:`flashinfer.attention.prims_ts.sage`). Tokens past the sequence end and
+Q rows past the valid row count clamp to the last valid slot, so masked
+scores keep a finite scale and exponentiate to zero.
 
-Both providers index the trtllm-gen flat layout through ``flat_scale_slot``
-of :mod:`flashinfer.attention.prims_ts.sage`, the module that owns the layout.
-Tokens beyond the sequence end (masked score columns) and Q rows beyond the
-valid row count are clamped to the last valid slot: their scores are masked or
-discarded, but their scale must stay finite so masked columns exponentiate to
-zero.
+:class:`SageKScalesResource` holds one softmax instance's ``sfK`` words for
+one KV tile. The instance produces and consumes it: it fills the words ahead
+of the tile's score wait, and both softmax passes read them one K32 fragment
+at a time. The scale groups per fragment select the storage form
+(``FmhaDecodeConfig.sage_k_scales_in_smem_for``):
 
-The contiguous provider derives each fragment's first token from the tile
-offset. The block-sparse provider derives it from the route's K64 atom
-origins; a proxy route reads ``k_summary_scale`` instead of ``k_scale`` and
-indexes the summary sequence (one summary per KV block) with the same
-arithmetic, which is why the K source is passed as an address, a head stride
-and a sequence length.
-
-The ``sfK`` words of one softmax instance are a task-scheduling resource,
-:class:`SageKScalesResource`, defined below.
-
-Sage attention scales every score by the K scale of its token block. A
-softmax instance takes one KV tile's ``sfK`` words ahead of the tile's score
-wait so the loads hide behind the QK MMA, and both softmax passes (the max
-pass and the P pass) read them one K32 fragment at a time.
-
-:class:`SageKScalesResource` owns where those words live and how they get
-there. The softmax task produces and consumes it itself: ``publish_tile``
-(producer work) fills the tile's words into the storage the resource owns,
-``take_tile`` (consumer work) hands the passes the routed register array, and
-the passes read fragments through ``open`` / ``fragment`` / ``advance``.
-
-Two storage forms exist, selected at compile time by the scale groups per K32
-fragment (``FmhaDecodeConfig.sage_k_scales_in_smem_for``):
-
-* Register form (K blocks of 16 tokens and larger, at most two groups per
-  fragment): each lane takes the words of its own fragments into a rotating
-  register array. Registers are private to the lane, so the resource carries
-  no pipeline and no producer step; ``take_tile`` gathers the words and
-  routes the array.
+* Register form (K blocks of 16 tokens or more, at most two groups per
+  fragment): each lane gathers its own words into a rotating register array;
+  there is no pipeline.
 * SMEM form (K blocks of 4 and 1 token, eight or 32 groups per fragment):
-  the tile's words live in an SMEM ring of the instance, one slot per
-  pipeline stage, in the layout of ``sage_k_scale_words``. The resource is a
-  two-stage pipeline whose producer and consumer are both the instance's
-  warps: the task acquires a slot, ``publish_tile`` fills it with the
-  instance's threads, the commit publishes it, the wait makes it visible to
-  both passes, which read one fragment's groups with 16-byte broadcast loads,
-  and the release after the P pass frees the slot for the tile after next.
-  The routed array is a one-word placeholder in this form.
+  a two-slot SMEM buffer in the ``sage_k_scale_words`` layout, pipelined
+  between the instance's own warps. The passes read a fragment's groups with
+  16-byte broadcast loads; the routed register array is a placeholder.
 
-The words come from one of three sources, chosen by the plan: a dense tile
-gathers ``k_scale`` over its token range; a block-sparse route takes the
-words the load warp staged with the route metadata; a proxy route of a plan
-whose summary scales use another K block size (``sage_mixed_k_geometry``)
-gathers ``k_summary_scale`` from the route's staged atom origins. A mixed
-plan holds two resources per instance, one per geometry, each routing its own
-array; the route kind, uniform across the CTA, selects which one serves the
-tile, and the other one leaves its array at ones.
+A dense tile gathers ``k_scale`` over its token range, a block-sparse route
+takes the words the load warp staged with its metadata, and a proxy route of
+a mixed-geometry plan (``sage_mixed_k_geometry``) gathers ``k_summary_scale``
+from the route's atom origins. A mixed plan holds one resource per geometry;
+the CTA-uniform route kind selects the one that serves the tile.
 
-The per-channel V scales of one KV head are the second resource of this
-module, :class:`SageVScalesResource`.
-
-Sage attention dequantizes the output tile per V channel: column ``c`` is
-multiplied by ``sfV[c]`` and, when V was quantized around its channel mean,
-``v_mean[c]`` is added back. The correction task copies the work tile's KV
-head's scales and means into SMEM once, at the start of the tile while no
-output is pending, so the tile tail reads SMEM instead of waiting on global
-loads.
-
-:class:`SageVScalesResource` owns that SMEM block and the pipeline that
-orders it. The correction task produces and consumes it itself through a
-one-stage pipeline of the correction warps: the acquire waits until the
-previous tile's tail has released the block, ``stage_tile`` (producer work)
-copies the scales with every correction thread, the commit publishes them,
-the wait before the tail epilogue makes the stores of the other lanes
-visible, and the release after the last read lets the next tile restage.
+:class:`SageVScalesResource` stages the work tile's per-channel V scales
+(and means) in SMEM once per tile, while no output is pending, so the
+epilogue scales column ``c`` by ``sfV[c]`` and adds ``v_mean[c]`` without
+waiting on global loads.
 """
 
 from collections.abc import Callable
@@ -136,16 +89,14 @@ Constexpr = cutlass.Constexpr
 
 @dataclass(eq=False)
 class SageScaleTensors:
-    """The plan's Sage scale tensors as the kernel receives them.
+    """The plan's Sage scale tensors, shared by every resource that reads one.
 
-    A plain mutable dataclass: the DSL swaps frozen dataclasses for proxies
-    while it traces a dynamic branch, which changes the traced structure of
-    the resource that holds one. Every resource that reads a scale takes
-    this one object instead of its own copy of the pointers: ``sfQ`` and ``sfK`` are ``[Hkv, slots]`` FP32
-    arrays in the flat layout with a per-head stride, ``k_summary_scale`` is
-    the same for the summary sequence of a proxy plan (``None`` otherwise),
-    and the per-channel V scales and means are ``[Hkv, D]`` FP32 (``v_mean``
-    is ``None`` unless the recipe restores a channel mean).
+    ``sfQ``, ``sfK`` and ``k_summary_scale`` are ``[heads, slots]`` FP32
+    arrays in the flat layout; the V scales and means are ``[Hkv, D]`` FP32.
+    ``k_summary_scale`` is ``None`` without proxy routes and ``v_mean``
+    without a channel mean. The dataclass is not frozen because the DSL
+    replaces frozen dataclasses with proxies inside traced dynamic branches,
+    which changes the traced structure of the holding resource.
     """
 
     q_scale_ptr: cute.Pointer
@@ -234,13 +185,10 @@ def sage_scale_arr_size(cfg: FmhaDecodeConfig, groups: int) -> int:
 def sage_k_scale_words(cfg: FmhaDecodeConfig, groups: int) -> int:
     """Return the number of ``sfK`` words that cover one KV tile for every spatial half.
 
-    Zero without Sage attention, so the block-sparse staging layout can take
-    the count unconditionally. Word ``half * arr_size + f * groups + g`` holds
-    the scale of group ``g`` of fragment ``f`` of the lanes in that half
-    (``sage_scale_arr_size`` words per half); this is the layout of the words
-    a block-sparse route stages and of the SMEM ring of
-    :class:`SageKScalesResource`, so a softmax thread reads its half's values with
-    contiguous vector loads. ``groups`` selects the route kind's geometry.
+    Zero without Sage attention. Word ``half * arr_size + f * groups + g``
+    holds group ``g`` of fragment ``f`` of that half's lanes. Route staging
+    and the SMEM form of :class:`SageKScalesResource` share this layout, so a
+    softmax thread reads its half with contiguous vector loads.
     """
     if not cfg.use_sage_attention:
         return 0
@@ -266,16 +214,11 @@ def sage_word_position(
 ) -> tuple[Int32, Int32]:
     """Return ``(atom, token offset in the atom)`` of one ``sfK`` word.
 
-    The word is entry ``lane_entry = f * groups + g`` of spatial half
-    ``half``: group ``g`` of fragment ``f`` of the half's lane array. Fragment
-    ``f`` reads the half's atom number ``f // fragments_per_atom``
-    (``_keeps_route_atom``) from token ``(f % fragments_per_atom) *
-    fragment_regs`` onward, and group ``g`` starts ``g * group_tokens`` later.
-    The atom is the Keeps layout atom
-    (``FmhaDecodeConfig.keeps_fragments_per_atom``), which block-sparse routes
-    share as their route atom. A constant ``lane_entry`` folds everything but
-    the half interleave at trace time. ``groups`` is the route kind's scale
-    groups per fragment.
+    ``lane_entry = f * groups + g`` names group ``g`` of fragment ``f`` of
+    spatial half ``half``. Fragment ``f`` reads the half's Keeps layout atom
+    ``f // fragments_per_atom`` (``_keeps_route_atom``), which block-sparse
+    routes share, from token ``(f % fragments_per_atom) * fragment_regs``;
+    group ``g`` starts ``g * group_tokens`` later.
     """
     fragments_per_atom = cfg.keeps_fragments_per_atom
     fragment_regs = cfg.softmax_score_fragment_regs
@@ -295,9 +238,7 @@ def dense_k_scale_token(
 ) -> Int32:
     """Return the first KV token covered by one ``sfK`` word of a dense tile.
 
-    A dense Keeps tile is its layout atoms in order (``_keeps_score_col``), so
-    the word's position (``sage_word_position``) in a route of layout atoms
-    names the token.
+    A dense Keeps tile lays out its atoms in order (``_keeps_score_col``).
     """
     atom_idx, token_offset = sage_word_position(
         cfg, half, lane_entry, cfg.sage_k_groups_per_fragment
@@ -326,13 +267,11 @@ def block_sparse_k_scale_source(
     seq_len_kv: Int32,
     route_is_proxy: cutlass.Boolean,
 ) -> tuple[Int64, Int32, Int32, Int32]:
-    """Return the K scale array of one block-sparse route.
+    """Return ``(address, head stride, sequence length, log2 block size)``.
 
-    Exact routes read ``k_scale`` over the KV tokens with the recipe's K block
-    size; proxy routes read ``k_summary_scale`` over the summary sequence,
-    whose length is the number of KV blocks, with the summary K block size.
-    The result is ``(base address, head stride, sequence length, log2 block
-    size)`` for :func:`load_k_scale`.
+    Exact routes read ``k_scale`` over the KV tokens; proxy routes read
+    ``k_summary_scale`` over the summary sequence, one summary per KV block.
+    The result feeds :func:`load_k_scale`.
     """
     scale_addr = scales.k_scale_ptr.toint()
     head_stride = scales.k_scale_head_stride
@@ -368,13 +307,9 @@ def stage_v_channel_scales(
 ) -> None:
     """Copy one KV head's per-channel V scales and means into SMEM.
 
-    Both tensors are ``[Hkv, D]`` FP32. The ``num_threads`` callers each
-    move ``headdim / num_threads`` channels, so the global loads are issued
-    once per tile while the correction warps are otherwise idle, instead of
-    inside the output store loop where their latency lands on the tile tail.
-    Callers order the writes before the epilogue reads with a barrier, and
-    place a second barrier after the last read of a tile so the next tile's
-    writes cannot overtake it.
+    Each of the ``num_threads`` callers moves ``headdim / num_threads``
+    channels. Callers order these writes before the epilogue reads, and the
+    next tile's writes after the last read.
     """
     assert cfg.headdim % num_threads == 0
     v_scale_addr = scales.v_scale_ptr.toint()
@@ -431,14 +366,12 @@ class SageKScalesResource(DecodeGenResourceBase):
     """One softmax instance's ``sfK`` words for one scale-group geometry.
 
     ``summary`` marks the resource of a mixed-geometry plan that serves proxy
-    routes from ``k_summary_scale`` with the summary K block size; otherwise
-    the resource serves every route with the token K block size. The SMEM
-    form takes the instance's two-stage pipeline as ``pipeline_config``; the
-    register form takes none. ``route_metadata`` is the instance's
-    block-sparse softmax metadata resource, whose held stage holds the staged
-    words and atom origins of the current route; a dense plan resolves the
-    tile's token range from the sequence-length sources it shares with the S
-    resource.
+    routes from ``k_summary_scale``. The SMEM form takes the instance's
+    two-stage pipeline as ``pipeline_config``; the register form takes none.
+    ``route_metadata`` is the instance's block-sparse softmax metadata
+    resource, whose held stage carries the route's staged words and atom
+    origins; a dense plan resolves the tile's tokens from the sequence-length
+    fields instead.
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
@@ -566,10 +499,8 @@ class SageKScalesResource(DecodeGenResourceBase):
     ) -> None:
         """Store the tile's words into the acquired slot (SMEM form).
 
-        Each thread of the instance stores at most two words (one per round
-        of the instance's threads); the pipeline commit that follows publishes
-        the slot. In a mixed-geometry plan only the resource of the route's
-        kind fills; the branch is CTA-uniform.
+        In a mixed-geometry plan only the resource of the route's kind fills;
+        the branch is CTA-uniform.
         """
         assert self.in_smem
         if self._serves(route_is_proxy):
@@ -579,11 +510,7 @@ class SageKScalesResource(DecodeGenResourceBase):
     def _take(
         self, stage_info: StageInfo, route_is_proxy: cutlass.Boolean
     ) -> cutlass.Array:
-        """Return the routed array: the lane's words in the register form, else ones.
-
-        The entries are ones before the gather so a mixed plan's inactive
-        geometry and the SMEM form leave defined padding.
-        """
+        """Return the routed array: the lane's words in the register form, else ones."""
         words = cutlass.Array(
             Float32, self.routed_words, space=cutlass.AddressSpace.rmem
         )
@@ -601,11 +528,7 @@ class SageKScalesResource(DecodeGenResourceBase):
 
     @cute.jit
     def _serves(self, route_is_proxy: cutlass.Boolean) -> cutlass.Boolean:
-        """Whether this resource holds the route's geometry.
-
-        A plan with one geometry is served by its one resource on every route,
-        so the test folds away at compile time there.
-        """
+        """Whether this resource holds the route's geometry; constant for one geometry."""
         if cutlass.const_expr(not self._selects_by_route):
             return True
         if cutlass.const_expr(self.summary):
@@ -618,9 +541,8 @@ class SageKScalesResource(DecodeGenResourceBase):
     def _gather_lane_words(self, stage_info: StageInfo, words: cutlass.Array) -> None:
         """Take the lane's spatial half of the tile's words into ``words``.
 
-        Word ``half * arr_size + entry`` of the ``sage_k_scale_words`` layout
-        is entry ``entry`` of the lane's array, so every entry index is a
-        constant and neither pass indexes registers at run time.
+        Every entry index is a constant, so no pass indexes registers at run
+        time.
         """
         word_value = self._word_source(stage_info)
         arr_size = self.arr_size
@@ -667,9 +589,8 @@ class SageKScalesResource(DecodeGenResourceBase):
     def _word_source(self, stage_info: StageInfo) -> WordSource:
         """Return ``word_value(word_idx, half, lane_entry)`` for the current tile.
 
-        ``word_idx = half * arr_size + lane_entry`` names a word of the
-        ``sage_k_scale_words`` layout; the source reads it from wherever the
-        plan keeps it.
+        ``word_idx = half * arr_size + lane_entry`` in the
+        ``sage_k_scale_words`` layout.
         """
         cfg = self.cfg
         if cutlass.const_expr(self.route_metadata is None):
@@ -732,9 +653,8 @@ class SageKScalesResource(DecodeGenResourceBase):
 
             return staged_word
 
-        # A proxy route of a mixed-geometry plan stages no scale words: the
-        # summary scale of each word is gathered from the route's staged atom
-        # origins, one summary per KV block.
+        # A proxy route of a mixed-geometry plan stages no scale words; gather
+        # each summary scale from the route's staged atom origins.
         groups = self.groups
         num_origins = metadata.staging_layout.num_origin_words
         kv_head_idx, batch_idx = _logical_head_batch(
@@ -775,9 +695,9 @@ class SageKScalesResource(DecodeGenResourceBase):
     ):
         """Return a pass's view of the tile's words with ``factor`` applied.
 
-        Register form: a fresh rotating copy of the routed array, scaled once
-        per tile. SMEM form: the lane's half pointer into the slot the latest
-        wait selected and the factor, applied per fragment on the way out.
+        Register form: a rotating copy of the routed array, scaled once.
+        SMEM form: the lane's half pointer into the waited slot and the
+        factor, applied per fragment.
         """
         if cutlass.const_expr(self.in_smem):
             warp_grp_thread_idx = Int32(
@@ -802,10 +722,9 @@ class SageKScalesResource(DecodeGenResourceBase):
     def fragment(self, view, fragment_idx: Int32) -> cutlass.Array:
         """Return ``factor * sfK`` of one fragment's ``groups`` words.
 
-        The SMEM form reads them from the aligned ring in 16-byte loads;
-        callers issue it ahead of the fragment's score wait so the latency
-        hides behind it. The register form reads the leading entries of the
-        rotating array.
+        The SMEM form uses 16-byte loads, which callers issue ahead of the
+        fragment's score wait; the register form reads the leading entries
+        of the rotating array.
         """
         groups = self.groups
         values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
@@ -837,9 +756,7 @@ class SageKScalesResource(DecodeGenResourceBase):
 class SageVScalesResource(DecodeGenResourceBase):
     """The staged ``sfV`` and ``v_mean`` of the work tile's KV head.
 
-    ``scale_tensors`` carries the plan's ``[Hkv, D]`` FP32 V scales and, when
-    the recipe restores a channel mean, the means. The pipeline is the
-    correction warps' own one-stage pipeline.
+    The pipeline is a one-stage pipeline of the correction warps.
     """
 
     cfg: Constexpr[FmhaDecodeConfig] = None

@@ -151,10 +151,8 @@ def _compute_fp8_p_regs_and_local_sums(
     """Exponentiate two scale groups of four scores into packed FP8 P and sums.
 
     Every probability is ``exp2(c * s + addend)`` with the group's exponent
-    addend (see ``SmemPResource._exponent_addend``), so the helper needs no
-    mask logic: a masked score at ``-FLT_MAX`` exponentiates to zero, and a
-    fully masked group arrives with a zero addend and produces zero P and a
-    zero sum. The packed f32x2 operations keep the two scale groups aligned.
+    addend (``SmemPResource._exponent_addend``), so no mask logic is needed:
+    a masked score at ``-FLT_MAX`` exponentiates to zero.
     """
     addend_pair = (addend_0, addend_1)
     scaled_pair_01 = ffma2(
@@ -413,7 +411,7 @@ def _attention_sink_for_local_head(
         sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2,
         fastmath=True,
     )
-    if cutlass.const_expr(cfg.k_dtype_bytes == 1 and cfg.v_dtype_bytes == 1):
+    if cutlass.const_expr(cfg.pv_mma_dtype.width == 8):
         sink_exp = sink_exp * Float32(FP8_P_QUANT_SCALE)
     return sink_exp
 

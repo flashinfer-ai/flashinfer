@@ -143,17 +143,17 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         sage_kwargs = {}
         if cutlass.const_expr(static_config.use_sage_attention):
             sage_kwargs = {
-                "q_scale_iter": q_scale.iterator,
-                "k_scale_iter": k_scale.iterator,
-                "v_scale_iter": v_scale.iterator,
-                "q_scale_head_stride": Int32(q_scale.shape[1]),
-                "k_scale_head_stride": Int32(k_scale.shape[1]),
+                "sage_q_scale_iter": q_scale.iterator,
+                "sage_k_scale_iter": k_scale.iterator,
+                "sage_v_scale_iter": v_scale.iterator,
+                "sage_q_scale_head_stride": Int32(q_scale.shape[1]),
+                "sage_k_scale_head_stride": Int32(k_scale.shape[1]),
             }
             if cutlass.const_expr(static_config.sage_v_mean):
-                sage_kwargs["v_mean_iter"] = v_mean.iterator
+                sage_kwargs["sage_v_mean_iter"] = v_mean.iterator
             if cutlass.const_expr(static_config.use_block_sparse_proxy_routes):
-                sage_kwargs["k_summary_scale_iter"] = k_summary_scale.iterator
-                sage_kwargs["k_summary_scale_head_stride"] = Int32(
+                sage_kwargs["sage_k_summary_scale_iter"] = k_summary_scale.iterator
+                sage_kwargs["sage_k_summary_scale_head_stride"] = Int32(
                     k_summary_scale.shape[1]
                 )
         if cutlass.const_expr(static_config.use_block_sparse):

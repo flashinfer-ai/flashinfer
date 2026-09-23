@@ -14,16 +14,11 @@
 
 """Sage attention inputs for the PrimTS decode kernels.
 
-Sage attention runs ``QK^T`` on 8-bit Q/K (INT8 with INT32 scores, or E4M3
-with FP32 scores) with one dequantization scale per token block and ``PV`` on
-E4M3 P/V with one scale per V channel. The scale tensors follow the trtllm-gen
-flat layout produced by TensorRT-LLM's ``sageQuant``: per head, sequence ``b``
-starts at ``b * S // blk + b`` and token ``t`` uses slot ``t // blk`` inside
-it, so ``ceil(B * S / blk) + B - 1`` slots cover a fixed ``[B, S, H, D]``
-tensor.
-
-:class:`SageAttentionConfig` is the compile-time recipe a plan is built for;
-:class:`SageAttentionParams` carries the scale tensors of one run.
+Sage attention runs ``QK^T`` on 8-bit Q/K with one dequantization scale per
+token block and ``PV`` on E4M3 P/V with one scale per V channel. Q/K scales use
+the trtllm-gen flat layout of TensorRT-LLM's ``sageQuant``: per head, sequence
+``b`` starts at slot ``b * S // blk + b`` and token ``t`` uses slot
+``t // blk`` inside it.
 """
 
 from __future__ import annotations
@@ -37,7 +32,7 @@ import torch
 from flashinfer.utils import ceil_div
 
 SAGE_K_BLOCK_SIZES = (1, 4, 16, 32, 64, 128, 256)
-# The Sage scale slots of the contiguous attention adapter, in ABI order.
+# Sage scale slots of the contiguous attention adapter, in ABI order.
 SAGE_ADAPTER_SLOTS = ("q_scale", "k_scale", "k_summary_scale", "v_scale", "v_mean")
 
 _T = TypeVar("_T")
@@ -48,18 +43,12 @@ class SageAttentionConfig:
     """Compile-time Sage attention recipe of one plan.
 
     ``q_block_size`` tokens share one Q scale and must be a power of two no
-    larger than the planned Q tile; ``k_block_size`` tokens share one K scale
-    and must be one of ``SAGE_K_BLOCK_SIZES``. ``v_mean`` says whether every
-    run supplies a per-channel V mean that is added back to the normalized
-    output. The defaults are TensorRT-LLM's production recipe ``(1, 16, 1)``.
-
-    ``k_summary_block_size`` is the K block size of a block-sparse proxy
-    plan's summary scales (``k_summary_scale``), also one of
-    ``SAGE_K_BLOCK_SIZES``; ``None`` follows ``k_block_size``. Summaries are
-    block means whose magnitudes spread more than the tokens', so an INT8
-    recipe may want finer summary blocks than token blocks; exact routes keep
-    ``k_block_size`` either way. A plan without proxy routes has no summaries
-    and uses ``k_block_size`` for both geometries.
+    larger than the planned Q tile. ``k_block_size`` tokens share one K scale;
+    ``k_summary_block_size`` is the K block size of a proxy plan's summary
+    scales and defaults to ``k_block_size``. Both must be one of
+    ``SAGE_K_BLOCK_SIZES``. ``v_mean`` says whether every run supplies a
+    per-channel V mean that is added back to the output. The defaults are
+    TensorRT-LLM's production recipe.
     """
 
     q_block_size: int = 1
@@ -70,7 +59,6 @@ class SageAttentionConfig:
     @property
     def summary_k_block_size(self) -> int:
         """Return the K block size of the summary scales."""
-
         if self.k_summary_block_size is None:
             return self.k_block_size
         return self.k_summary_block_size
@@ -80,17 +68,15 @@ class SageAttentionConfig:
 class SageAttentionParams:
     """Per-block Q/K scales and per-channel V scales of one run.
 
-    ``q_scale`` is FP32 ``[Hq, flat_scale_numel(B, Sq, q_block_size)]`` and
-    ``k_scale`` is FP32 ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]`` in
-    the trtllm-gen flat layout, with the block sizes of the plan's
-    :class:`SageAttentionConfig`. ``v_scale`` and ``v_mean`` are FP32
-    ``[Hkv, D]``; ``v_mean`` is present exactly when the plan's
-    :class:`SageAttentionConfig` has ``v_mean=True``. ``k_summary_scale`` is FP32
-    ``[Hkv, flat_scale_numel(B, num_kv_blocks, summary_k_block_size)]``: the
-    flat-layout scales of block-sparse proxy K summaries, quantized as one more
-    K sequence of ``num_kv_blocks`` tokens with the recipe's summary K block
-    size. It is required by proxy plans and rejected otherwise. Every scale must be positive and finite; the kernel does not
-    check the values.
+    All tensors are FP32 with the block sizes of the plan's
+    :class:`SageAttentionConfig`: ``q_scale`` is
+    ``[Hq, flat_scale_numel(B, Sq, q_block_size)]``, ``k_scale`` is
+    ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]``, and ``v_scale`` and
+    ``v_mean`` are ``[Hkv, D]``. ``k_summary_scale`` holds the scales of the
+    K summaries of a proxy plan,
+    ``[Hkv, flat_scale_numel(B, num_kv_blocks, summary_k_block_size)]``.
+    ``v_mean`` and ``k_summary_scale`` are present exactly when the plan uses
+    them. Scales must be positive and finite; the kernel does not check them.
     """
 
     q_scale: torch.Tensor
@@ -102,23 +88,16 @@ class SageAttentionParams:
 
 def flat_scale_numel(batch_size: int, seq_len: int, block_size: int) -> int:
     """Return the per-head slot count of the flat scale layout."""
-
     return ceil_div(batch_size * seq_len, block_size) + batch_size - 1
 
 
 def is_power_of_two(value: int) -> bool:
     """Return whether ``value`` is a positive power of two."""
-
     return value > 0 and value & (value - 1) == 0
 
 
 def log2_block_size(block_size: int) -> int:
-    """Return ``log2`` of a power-of-two scale block size.
-
-    Raises ``ValueError`` for any other value, so it doubles as the
-    power-of-two check of a block size.
-    """
-
+    """Return ``log2`` of a power-of-two scale block size."""
     if not is_power_of_two(block_size):
         raise ValueError(f"block size must be a power of two, got {block_size}")
     return block_size.bit_length() - 1
@@ -127,24 +106,19 @@ def log2_block_size(block_size: int) -> int:
 def sage_adapter_slots(values: Mapping[str, _T | None]) -> tuple[_T | None, ...]:
     """Arrange Sage values named by scale into the adapter slots.
 
-    A slot whose name is absent or ``None`` stays ``None``: only a proxy plan
-    binds ``k_summary_scale`` and only a recipe with a V mean binds
-    ``v_mean``; the adapter binds a null pointer for an empty slot.
+    An absent name leaves its slot ``None``, which the adapter binds as a null
+    pointer.
     """
-
     return tuple(values.get(name) for name in SAGE_ADAPTER_SLOTS)
 
 
 def flat_scale_slot(batch_idx, token_idx, seq_len, log2_block: int):
     """Return the per-head slot of one token in the flat scale layout.
 
-    Sequence ``b`` starts at ``b * S // blk + b``; the extra ``b`` keeps the
-    last block of one sequence and the first block of the next in distinct
-    slots when the block size does not divide the sequence length. Block
-    sizes are powers of two, so the divisions are shifts; the plain
-    arithmetic serves host integers and device ``Int32`` values alike.
+    Sequence ``b`` starts at ``b * S // blk + b``; the extra ``b`` keeps its
+    last block apart from the next sequence's first block when ``blk`` does
+    not divide ``S``. The arithmetic serves host and device ``Int32`` values.
     """
-
     return ((batch_idx * seq_len) >> log2_block) + batch_idx + (token_idx >> log2_block)
 
 
@@ -184,13 +158,9 @@ def sage_scale_shapes(
 ) -> dict[str, tuple[int, int]]:
     """Return the shape of every scale tensor a plan consumes, by field name.
 
-    Q/K scales are ``[heads, flat slots]`` in the flat layout of the recipe's
-    block sizes, V scales and means are ``[kv heads, head dim]``. The K
-    summary scales appear only for a proxy plan, whose ``summary_seq_len`` is
-    its number of KV blocks, in the flat layout of the recipe's summary K
-    block size; ``v_mean`` appears only when the recipe has one.
+    ``summary_seq_len`` is the KV block count of a proxy plan and ``None``
+    otherwise.
     """
-
     shapes = {
         "q_scale": (
             num_qo_heads,
@@ -220,11 +190,9 @@ def validate_sage_params(
 ) -> None:
     """Validate the scale tensors of one run against the plan's expected shapes.
 
-    ``expected_shapes`` is the plan's ``sage_scale_shapes`` result: it names
-    ``k_summary_scale`` only for a proxy plan and ``v_mean`` only for a recipe
-    with a V mean, so a tensor is required exactly when its name is present.
+    ``expected_shapes`` is the plan's ``sage_scale_shapes`` result; an
+    optional tensor is required exactly when its name is present.
     """
-
     if not isinstance(params, SageAttentionParams):
         raise TypeError("sage must be a SageAttentionParams instance")
     for name, consumer in (

@@ -95,8 +95,8 @@ from .tmem_softmax_stats import TmemSoftmaxLocalResource
 _KV_TILE_256_CORRECTION_THREADS = 128
 _KV_TILE_256_LOGICAL_OUTPUT_ROWS = 64
 # One D32 fragment slot, padded by four floats so adjacent slots fall on
-# different bank groups. The row-owner exchange (16-bit K/V) has one slot per
-# logical output row; the column-owner exchange (byte-wide K/V) has one per lane.
+# different bank groups: one per logical output row (row-owner exchange) or
+# per lane (column-owner exchange).
 _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE = 36
 _KV_TILE_256_STATS_PER_THREAD = 4
 
@@ -329,14 +329,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                     alignment=8,
                 )
         if self.cfg.tile_size_kv == 256 and self._kv_tile_256_exchange_alloc is None:
-            # Tail correction exchanges all lane-local stats, then pipelines
-            # D32 fragments one at a time: through 64 logical output rows
-            # (upper lanes publish one spatial half while lower lanes retain
-            # the matching fragment in registers and store every column) or,
-            # with byte-wide K/V, through one slot per lane (each lane
-            # publishes the fragment its peer owns and stores its own 64
-            # columns). The buffer is dedicated, so the shared KV ring keeps
-            # streaming the next tile's routes while the tail runs.
+            # Tail correction exchanges all lane-local stats, then D32
+            # fragments one at a time (see ``_kv_tile_256_tail_epilogue``).
+            # The buffer is dedicated, so the shared KV ring keeps streaming
+            # the next tile's routes while the tail runs.
             self._kv_tile_256_exchange_alloc = SmemAllocation(
                 name=f"{self.name}_kvTile256Exchange",
                 size_bytes=self._kv_tile_256_exchange_entries() * 4,
@@ -599,13 +595,11 @@ class TmemCorrResource(DecodeGenResourceBase):
     def _split_partial_scale(self, denominator: Float32) -> Float32:
         """Return the scale applied to a split-KV partial O before it is stored.
 
-        The separate reduction kernel receives normalized partials, so the
-        scale is the row's public output-domain normalization. Fused GMEM and
-        cluster reductions receive unnormalized partials: 16-bit P as it is,
-        E4M3 P with its static 448 scale removed before the partial is
-        narrowed to 16 bits (the reducer restores it). The 448 scale belongs
-        to P, so it follows ``pv_mma_dtype``: Int8 Q/K with E4M3 V takes it
-        as well.
+        The separate reduction kernel receives normalized partials. Fused GMEM
+        and cluster reductions receive unnormalized partials, with the static
+        448 scale of E4M3 P divided out before the narrowing to 16 bits; the
+        reducer restores it. The 448 scale follows ``pv_mma_dtype``, not the
+        Q/K dtype.
         """
         cfg = self.cfg
         partial_scale = Float32(1.0)
@@ -948,23 +942,15 @@ class TmemCorrResource(DecodeGenResourceBase):
         count: Constexpr[int],
         row_has_mass: cutlass.Boolean,
     ) -> Float32 | None:
-        """Dequantize ``count`` normalized output columns per V channel in place.
+        """Dequantize ``count`` output columns per V channel in place.
 
-        Sage attention multiplies column ``c`` by ``norm_scale * sfV[c]`` and
-        adds ``v_mean[c]`` when V was quantized around its channel mean, so the
-        normalization is consumed here and the caller continues with a unit
-        scale. The scales come from the block the correction task's
-        ``SageVScalesResource`` staged for the work tile and waited on before
-        the tail. Without Sage attention the values and
-        ``norm_scale`` pass through untouched.
-
-        Empty attention rows have no V contribution, so their channel mean
-        must remain zero even when the recipe restores a mean on other rows.
-
-        ``None`` is the unit scale on both sides. The packed multiply is a
-        library call that no compiler folds for a constant one, so the unit
-        scale has to be known here to be skipped; the KV256 tail otherwise
-        pays one ``FMUL2`` per output pair for it.
+        Column ``c`` becomes ``value * norm_scale * sfV[c] + v_mean[c]``, read
+        from the work tile's staged ``SageVScalesResource`` block, so the
+        normalization is consumed here and the caller continues with the unit
+        scale. A row without mass has no V contribution and keeps a zero
+        mean. ``None`` is the unit scale on both sides: the packed multiply
+        does not fold a constant one, so it is skipped explicitly. Without
+        Sage attention the values and ``norm_scale`` pass through.
         """
         cfg = self.cfg
         if cutlass.const_expr(not cfg.use_sage_attention):
@@ -1143,11 +1129,8 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> tuple[Int64, Float32]:
         """Resolve one logical row's output address and normalization once.
 
-        FP8 O accumulators and row sums both carry the 448 P scale. Direct
-        tails normalize the FP32 accumulator, so the two cancel. Split-KV
-        kernels divide their partials by 448 before narrowing them to 16 bits
-        and reach this helper only from the fused reducers, which restore the
-        scale after the FP32 reduction.
+        With E4M3 P the O accumulator and the row sum both carry the 448 P
+        scale, which cancels in a direct tail.
         """
         cfg = self.cfg
         attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
@@ -1169,8 +1152,8 @@ class TmemCorrResource(DecodeGenResourceBase):
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
         if cutlass.const_expr(cfg.pv_mma_dtype.width == 8 and cfg.use_split_kv):
-            # Fused GMEM/cluster partials were divided by 448 before they were
-            # narrowed to 16 bits; restore the P scale after the FP32 reduction.
+            # Fused split partials carry O divided by 448 (see
+            # ``_split_partial_scale``); restore it after the FP32 reduction.
             norm_scale *= Float32(FP8_P_QUANT_SCALE)
         physical_dst_row_idx = _q_physical_output_row_from_logical(
             cfg,
@@ -2618,12 +2601,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> tuple[cutlass.Boolean, Int64, Float32]:
         """Return ``(valid_output_row, row_base, row_scale)`` of a lane's output row.
 
-        ``resolves`` names the lanes that resolve their row (every lane of the
-        column-owner tail, the lower lanes of the row-owner tail); the others
-        return the defaults. A split-KV row gets the byte offset of its
-        partial row and the partial scale, a direct row its destination byte
-        offset and the normalization scale, in which the FP8 P scale of O and
-        of the denominator cancel.
+        Lanes outside ``resolves`` return the defaults. A split-KV row gets its
+        partial row byte offset and the partial scale, a direct row its
+        destination byte offset and the normalization scale.
         """
         cfg = self.cfg
         valid_output_row = cutlass.Boolean(False)
@@ -2830,11 +2810,10 @@ class TmemCorrResource(DecodeGenResourceBase):
         The standard decode schedule still owns the two temporal instances.
         KV256 adds one physical spatial split per instance. Correction exchanges
         their stats, then merges the halves through its dedicated SMEM exchange
-        one D32 fragment at a time and publishes the ordinary logical Q64xD128
-        output: with 16-bit K/V the upper lanes publish and the lower lanes
-        store whole rows (row-owner mode); with byte-wide K/V every lane
-        publishes the fragment its peer owns and stores its own 64 columns
-        (column-owner mode, ``cfg.splits_kv_tile_256_tail_columns``).
+        one D32 fragment at a time into the logical Q64xD128 output. With
+        16-bit K/V the upper lanes publish and the lower lanes store whole
+        rows (row-owner mode); with byte-wide K/V every lane stores its own 64
+        columns (column-owner mode, ``cfg.splits_kv_tile_256_tail_columns``).
         """
         cfg = self.cfg
         assert cfg.headdim == 128
@@ -2900,11 +2879,8 @@ class TmemCorrResource(DecodeGenResourceBase):
                 self.scale_softmax_log2 * (max11 - global_max),
                 fastmath=True,
             )
-        # The denominator is accumulated in one fixed order per row (the
-        # lower spatial half's instances first), so when both lanes of a row
-        # normalize their own columns in the column-owner tail they agree
-        # bitwise with each other and with the fragment exchange. The
-        # row-owner tail uses the lower lane's sum only.
+        # Sum in one fixed order per row (lower spatial half first), so both
+        # column-owner lanes of a row get a bitwise-identical denominator.
         own_terms = ((uses00, sum00, weight00), (uses10, sum10, weight10))
         peer_terms = ((uses01, sum01, weight01), (uses11, sum11, weight11))
         own_first = cutlass.Boolean(True)
@@ -3003,23 +2979,19 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> None:
         """Merge and store the 64 output columns each lane owns, one D32 at a time.
 
-        Lanes below 64 own columns [0, 64) of their logical row and lanes
-        64..127 own [64, 128); the peer lane (index xor 64) holds the other
-        spatial partial of the same row. Each round every lane publishes the
-        temporal combination of the D32 its peer owns into its own slot,
-        combines its own D32 from TMEM, adds the peer's published fragment
-        exactly as the row-owner exchange does, and writes the direct or
-        split-KV output. All four correction warps store instead of two, and
-        one slot per lane needs one publish barrier per round plus one reuse
-        barrier between rounds instead of two barriers per fragment.
+        Lanes below 64 own columns [0, 64) of their logical row, lanes 64..127
+        own [64, 128); the peer lane (index xor 64) holds the other spatial
+        partial of the row. Each round a lane publishes the temporal
+        combination of the D32 its peer owns, combines its own D32 from TMEM,
+        adds the peer's published fragment and stores the direct or split-KV
+        output.
         """
         cfg = self.cfg
         output_exchange_base = Int32(
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
         )
-        # Lane index bit 6 selects the spatial half, and the same bit value is
-        # the first column of the 64-column half that lane owns because the
-        # logical row count equals headdim / 2.
+        # Lane bit 6 selects the spatial half and, since the logical row count
+        # equals headdim / 2, is also the first column of the lane's half.
         half_cols = cfg.headdim // 2
         assert half_cols == _KV_TILE_256_LOGICAL_OUTPUT_ROWS
         exchange_row_idx = exchange_idx & Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS - 1)
@@ -3049,10 +3021,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         # stores are legal exactly when the output base pointer is.
         o_is_32b_aligned = (self.o_ptr.toint() & Int64(31)) == Int64(0)
 
-        # The rounds run as a rolled loop so the tail body exists once in the
-        # instruction stream: all four correction warps execute it beside the
-        # softmax warps' rolled fragment loops, and an unrolled copy per round
-        # measurably starves those warps of instruction fetch.
+        # A rolled loop keeps one copy of the round body in the instruction
+        # stream, so it does not compete with the softmax warps' rolled
+        # fragment loops for instruction fetch.
         for round_idx in cutlass.range(cfg.headdim // 64, unroll=1):
             fragment_offset = Int32(round_idx) * Int32(32)
             published_vals = self._kv_tile_256_temporal_fragment(
@@ -3096,9 +3067,8 @@ class TmemCorrResource(DecodeGenResourceBase):
                     partial_scale=row_scale,
                     valid_output_row=valid_output_row,
                 )
-            # The slot is reused by the next round's publish, and after the
-            # last round by the next work tile's stats exchange and Sage V
-            # scale staging: every lane finishes reading before either.
+            # Every lane finishes reading before the next round's publish or
+            # the next work tile's stats exchange reuses the exchange.
             prims.barrier_cta_sync(
                 self.store_barrier_id,
                 thread_count=cfg.correction_barrier_threads,
@@ -4678,10 +4648,9 @@ class TmemCorrResource(DecodeGenResourceBase):
                             ),
                             offset=keeps_o_ldst_offset,
                         )
-            # The chunks occupy disjoint TMEM columns, so their stores need no
-            # ordering among themselves: one wait retires them all before this
-            # O stage goes to the next PV wave, and keeps the correction task's
-            # TMEM ordering when this warp issued no correction transaction.
+            # The chunks store to disjoint TMEM columns, so one wait retires
+            # them all before the O stage returns to PV; it also keeps the
+            # task's TMEM ordering when this warp issued no correction store.
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             return
 

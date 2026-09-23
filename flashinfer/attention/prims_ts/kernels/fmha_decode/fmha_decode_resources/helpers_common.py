@@ -443,11 +443,8 @@ def _neg_max_f32() -> Float32:
 def _masked_weighted_sum(terms: tuple) -> Float32:
     """Return the sum of ``value * weight`` over four ``(uses, value, weight)`` terms.
 
-    Two packed FMAs fold the terms: the first pair seeds the two lanes, the
-    second pair accumulates onto them, and the lanes are added last. A term
-    whose ``uses`` is false contributes zero, whatever its value holds. Every
-    caller evaluates the same term order, so lanes that share a row agree
-    bitwise.
+    A term whose ``uses`` is false contributes zero, whatever its value. The
+    fixed term order makes lanes that share a row agree bitwise.
     """
     assert len(terms) == 4
     (uses0, value0, weight0), (uses1, value1, weight1) = terms[0], terms[1]
@@ -865,6 +862,8 @@ class DecodeGenResourceBase(MemoryResource):
         return
 
 
+# Keeps softmax staging reserves bit 5 for the prepared route kind; the low
+# four structural validity bits and bit 4 keep their meaning.
 _SOFTMAX_ROUTE_IS_PROXY_FLAG = 1 << 5
 
 
