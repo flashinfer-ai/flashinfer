@@ -1177,6 +1177,10 @@ def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
     )
 
 
+# Cross both head dimensions with every sampled configuration; keep a normal
+# softmax case so mixed-dtype configurations survive the softmax-mode skip.
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 @parametrize_product(
     {
         "backend": ["trtllm-gen"],
@@ -1217,9 +1221,7 @@ def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
         "enable_pdl": [True, False, None],
         "enable_sink": [True, False],
         "max_in_kv_len": [110],
-        "head_dim": [128, 256],
         "non_contiguous_query": [False, True],
-        "skips_softmax": [False, True],
         "uses_shared_paged_kv_idx": [True, False],
     },
     regular=pairwise_product_cases,
@@ -1589,6 +1591,8 @@ def test_trtllm_batch_decode_gpt_oss_counter_reuse():
     )
 
 
+# Keep a normal-softmax case for every sampled mixed-dtype configuration.
+@pytest.mark.parametrize("skips_softmax", [False, True])
 @parametrize_product(
     {
         "kv_layout": ["HND"],
@@ -1616,7 +1620,6 @@ def test_trtllm_batch_decode_gpt_oss_counter_reuse():
         "max_in_kv_len": [110],
         "head_dim": [256],
         "device_scale": [True, False],
-        "skips_softmax": [False, True],
         "uses_shared_paged_kv_idx": [True, False],
     },
     regular=pairwise_product_cases,
@@ -1981,6 +1984,8 @@ def make_query_non_contiguous(
     return q_non_contiguous
 
 
+# Keep a normal-softmax case for every sampled mixed-dtype configuration.
+@pytest.mark.parametrize("skips_softmax", [False, True])
 @parametrize_product(
     {
         "backend": ["trtllm-gen"],
@@ -2022,7 +2027,6 @@ def make_query_non_contiguous(
         "enable_pdl": [True, False, None],
         "enable_sink": [True, False],
         "max_in_kv_len": [110],
-        "skips_softmax": [False, True],
         "uses_shared_paged_kv_idx": [False, True],
     },
     regular=pairwise_product_cases,
