@@ -144,6 +144,16 @@ def ref_attention(
         ),
     ],
 )
+@pytest.mark.parametrize(
+    "fp8_kv_cache,kv_scale,use_fp8_output",
+    [
+        (False, 1.0, False),
+        (True, 1.0, False),
+        (True, 1.0, True),
+        (True, 0.5, False),
+        (True, 0.5, True),
+    ],
+)
 @parametrize_product(
     {
         "enable_pdl": [True, False],
@@ -157,13 +167,6 @@ def ref_attention(
         "head_grp_size": [8, 16],
         "kv_layout": ["NHD", "HND"],
         "q_scale": [1.0, 0.5],
-        "fp8_kv_cache,kv_scale,use_fp8_output": [
-            (False, 1.0, False),
-            (True, 1.0, False),
-            (True, 1.0, True),
-            (True, 0.5, False),
-            (True, 0.5, True),
-        ],
     },
     regular=pairwise_product_cases,
 )
