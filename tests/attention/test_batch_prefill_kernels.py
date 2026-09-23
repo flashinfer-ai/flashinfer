@@ -115,15 +115,18 @@ def warmup_jit():
     yield
 
 
+@pytest.mark.parametrize(
+    "kv_len,qo_len,causal",
+    [
+        (kv_len, qo_len, causal)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+        for causal in [False, True]
+    ],
+)
 @parametrize_product(
     {
         "batch_size": [12, 17, 128],
-        "kv_len,qo_len,causal": [
-            (kv_len, qo_len, causal)
-            for kv_len in [54, 97, 512, 2048]
-            for qo_len in [37, 17, 127, 577]
-            for causal in [False, True]
-        ],
         "page_size": [1, 5, 16],
         "num_kv_heads": [4],
         "num_qo_heads": [4, 32],
@@ -646,15 +649,18 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
+@pytest.mark.parametrize(
+    "kv_len,qo_len,causal",
+    [
+        (kv_len, qo_len, causal)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+        for causal in [False, True]
+    ],
+)
 @parametrize_product(
     {
         "batch_size": [12, 17, 128],
-        "kv_len,qo_len,causal": [
-            (kv_len, qo_len, causal)
-            for kv_len in [54, 97, 512, 2048]
-            for qo_len in [37, 17, 127, 577]
-            for causal in [False, True]
-        ],
         "page_size": [1, 5, 16],
         "num_kv_heads": [4],
         "num_qo_heads": [4, 32],
@@ -899,14 +905,17 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
+@pytest.mark.parametrize(
+    "kv_len,qo_len",
+    [
+        (kv_len, qo_len)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+    ],
+)
 @parametrize_product(
     {
         "batch_size": [12, 17, 128],
-        "kv_len,qo_len": [
-            (kv_len, qo_len)
-            for kv_len in [54, 97, 512, 2048]
-            for qo_len in [37, 17, 127, 577]
-        ],
         "page_size": [1, 16],
         "num_kv_heads": [4],
         "num_qo_heads": [4, 32],
@@ -1024,15 +1033,18 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "kv_len,qo_len,causal",
+    [
+        (kv_len, qo_len, causal)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+        for causal in [False, True]
+    ],
+)
 @parametrize_product(
     {
         "batch_size": [12, 17, 128],
-        "kv_len,qo_len,causal": [
-            (kv_len, qo_len, causal)
-            for kv_len in [54, 97, 512, 2048]
-            for qo_len in [37, 17, 127, 577]
-            for causal in [False, True]
-        ],
         "num_kv_heads": [4],
         "num_qo_heads": [4, 32],
         "head_dim": [64, 128, 256],
@@ -1201,14 +1213,17 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
+@pytest.mark.parametrize(
+    "kv_len,qo_len",
+    [
+        (kv_len, qo_len)
+        for kv_len in [54, 97, 512, 2048]
+        for qo_len in [37, 17, 127, 577]
+    ],
+)
 @parametrize_product(
     {
         "batch_size": [12, 17, 128],
-        "kv_len,qo_len": [
-            (kv_len, qo_len)
-            for kv_len in [54, 97, 512, 2048]
-            for qo_len in [37, 17, 127, 577]
-        ],
         "num_kv_heads": [4],
         "num_qo_heads": [4, 32],
         "head_dim": [128, 256],
