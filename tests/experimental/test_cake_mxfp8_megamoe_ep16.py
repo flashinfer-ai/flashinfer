@@ -146,6 +146,40 @@ def test_invalid_backend_is_rejected_before_session_setup(backend) -> None:
         CakeMxfp8MegaMoeEp16(None, None, backend=backend)
 
 
+@pytest.mark.parametrize("backend", ("cuda", "cute_dsl"))
+@pytest.mark.parametrize(
+    "invalid_backend", (None, True, 0, "auto", "CUDA", "cutedsl", [])
+)
+@pytest.mark.parametrize("rank", (0, 1))
+def test_invalid_backend_is_rejected_collectively(
+    monkeypatch, backend, invalid_backend, rank
+) -> None:
+    process_group = object()
+    choices = [backend] * 16
+    choices[0] = invalid_backend
+    gathered = []
+
+    def all_gather_object(output, selected, *, group):
+        assert group is process_group
+        assert selected == choices[rank]
+        output[:] = choices
+        gathered.append(rank)
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+
+    with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
+        _CakeMxfp8MegaMoeEp16Session(
+            None, None, process_group=process_group, backend=choices[rank]
+        )
+    # Even the rank with the invalid value must join its peers before raising.
+    assert gathered == [rank]
+
+
 def test_public_import_and_default_selection_do_not_import_cute_kernels() -> None:
     code = """
 import sys
@@ -558,6 +592,9 @@ def test_ep16_sm103_sparse_reference_and_repeated_result(backend) -> None:
             ValueError, match="all EP16 ranks must select the same backend"
         ):
             CakeMxfp8MegaMoeEp16(None, None, backend="cuda" if rank % 2 else "cute_dsl")
+        dist.barrier()
+        with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
+            CakeMxfp8MegaMoeEp16(None, None, backend="invalid" if rank == 0 else "cuda")
         dist.barrier()
         w13, w2 = _make_sparse_expert_weights(rank, device)
         weights = preprocess_cake_mxfp8_megamoe_ep16_weights(w13, w2)

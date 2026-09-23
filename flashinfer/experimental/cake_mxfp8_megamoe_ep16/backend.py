@@ -222,8 +222,11 @@ def _validate_collective_backend(
 ) -> None:
     # Different backends use incompatible flag layouts. Agree before any
     # symmetric allocation or backend-specific compilation begins.
+    # Gather before validation so an invalid rank cannot strand its peers.
     choices: list[Any] = [None] * _WORLD_SIZE
     dist.all_gather_object(choices, backend, group=process_group)
+    for choice in choices:
+        _validate_backend(choice)
     if any(choice != backend for choice in choices):
         raise ValueError("all EP16 ranks must select the same backend")
 
@@ -436,8 +439,8 @@ class CakeMxfp8MegaMoeEp16:
         process_group: dist.ProcessGroup | None = None,
         backend: str = "cuda",
     ) -> None:
-        _validate_backend(backend)
         if not dist.is_initialized():
+            _validate_backend(backend)
             raise RuntimeError("torch.distributed must be initialized")
         self._group = dist.group.WORLD if process_group is None else process_group
         self.rank = int(dist.get_rank(self._group))
