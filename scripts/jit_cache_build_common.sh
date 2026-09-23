@@ -367,6 +367,10 @@ setup_sccache() {
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
+  # Server-side mode is intentional. Client-side mode adds compiler probes for
+  # nvcc and reduced provider-build throughput in CI. The build watchdog scans
+  # /proc system-wide, including daemon-owned compilers, and docker --rm is the
+  # final containment boundary if the watchdog cannot signal one of them.
   unset SCCACHE_CLIENT_SIDE
   export FLASHINFER_CXX_LAUNCHER="sccache"
   export FLASHINFER_NVCC_LAUNCHER="sccache"
