@@ -593,6 +593,82 @@
       ],
       "tma_workspace_bytes": 0
     },
+    "deepgemm_native_fp4_gemm_sm103a_ee872bb3e7d3fe877ca0_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "parameter",
+          "alpha"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "b4299faeb6d30e089f7d7c95563ae6ee708e232066dd2bb4c98071c44a9c3d86",
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "name": "deepgemm_native_fp4_gemm_sm103a_ee872bb3e7d3fe877ca0",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_fp4_gemm/generated/sm_103a/deepgemm_native_fp4_gemm_sm103a_ee872bb3e7d3fe877ca0_kernel.cu",
+        "csrc/experimental/deepgemm_fp4_gemm/generated/sm_103a/deepgemm_native_fp4_gemm_sm103a_ee872bb3e7d3fe877ca0_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
     "deepgemm_native_fp4_gemm_sm103a_ef60766231b805be9834_kernel": {
       "arg_plan": [
         [
@@ -782,12 +858,12 @@
           1
         ],
         "grid_m": 32,
-        "grid_n": 40,
+        "grid_n": 23,
         "input_m": 4096,
         "output_m": 4096,
         "required_alpha": null
       },
-      "program": "deepgemm_native_fp4_gemm_sm103a_8b24a9828d541f0c6309_kernel"
+      "program": "deepgemm_native_fp4_gemm_sm103a_ee872bb3e7d3fe877ca0_kernel"
     },
     "512:4608:5120:152:None:128:32": {
       "config": {
