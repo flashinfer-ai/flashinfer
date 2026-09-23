@@ -1308,7 +1308,7 @@ def cutlass_fused_moe(
     ----------
     input : torch.Tensor
         Input tensor of shape [num_tokens, hidden_size].
-        Support float, float16, bfloat16, float8_e4m3fn and nvfp4.
+        Supports float, float16, bfloat16, float8_e4m3fn, and nvfp4.
         For FP8, the input must be quantized.
         For NVFP4, both quantized and non-quantized inputs are supported.
 
@@ -1355,7 +1355,7 @@ def cutlass_fused_moe(
         GEMM1 biases for each expert.
 
     fc2_expert_biases : Optional[torch.Tensor]
-        GEMM1 biases for each expert.
+        GEMM2 biases for each expert.
 
     input_sf : Optional[torch.Tensor]
         Input scaling factor for quantization.

@@ -194,8 +194,8 @@ def concat_mla_k(
         This is broadcast to all heads.
     backend : {"default", "cake"}, optional
         Backend implementation. The source-only ``"cake"`` backend is
-        available on SM100f and exact SM103a for the documented fixed shape
-        and layouts.
+        available on the SM100f family and the exact SM103a target for the
+        documented fixed shape and layouts.
 
     Example
     -------

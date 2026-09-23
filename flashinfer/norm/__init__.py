@@ -159,7 +159,7 @@ def rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
@@ -480,7 +480,7 @@ def gemma_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
@@ -656,9 +656,9 @@ def layernorm_quant(
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor
         Beta tensor, shape (hidden_size,). Need to be float32.
-    scale: torch.Tensor
-        Scale factor for quantization, shape (1,). The normalized output is
-        divided by this scale before the fp8 cast.
+    scale: Union[float, torch.Tensor]
+        Scale factor for quantization; a tensor scale must have shape ``(1,)``.
+        The normalized output is divided by this scale before the fp8 cast.
     eps: float
         Epsilon for numerical stability.
     """

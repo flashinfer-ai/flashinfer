@@ -52,7 +52,7 @@ def merge_state(
         The attention output from the KV segment ``A``, shape:
         ``[seq_len, num_heads, head_dim]``.
     s_a : torch.Tensor
-        The logsumexp value from the KV segment ``A``. expected to be a float32 tensor,
+        The logsumexp value from the KV segment ``A`` is expected to be a float32 tensor,
         shape: ``[seq_len, num_heads]``.
     v_b : torch.Tensor
         The attention output from the KV segment ``B``,
@@ -122,7 +122,7 @@ def merge_state_in_place(
         The partial attention output to be updated in-place, shape:
         ``(seq_len, num_heads, head_dim)``.
     s : torch.Tensor
-        The partial logsumexpr value to be updated in-place, expected to be a float32
+        The partial logsumexp value to be updated in-place, expected to be a float32
         tensor, shape: ``(seq_len, num_heads)``.
     v_other : torch.Tensor
         The other attention output to be merged, shape:
@@ -131,9 +131,9 @@ def merge_state_in_place(
         The other logsumexp value to be merged, expected to be a float32 tensor,
         shape: ``(seq_len, num_heads)``.
     mask : Optional[torch.Tensor]
-        The boolean mask tensor for whether to merge the state for a corresponding sequence
-        or not. Useful for CUDA graphs. If not specified (default), will merge states for
-        all sequences.
+        A boolean mask tensor indicating whether each sequence's state should be merged.
+        Useful for CUDA graphs. If not specified (default), the states of all
+        sequences are merged.
         shape: ``[seq_len]``
 
     Example
@@ -224,8 +224,8 @@ def _fake_merge_states(
 
 
 class MultiLevelCascadeAttentionWrapper:
-    r"""Attention wrapper for memory efficient multi-level cascade inference, this API assumes all
-    levels KV-Cache are stored in a unified paged table.
+    r"""Attention wrapper for memory-efficient multi-level cascade inference. This API assumes
+    the KV caches for all levels are stored in a unified paged table.
 
     Please check :ref:`cascade-inference-data-layout` for data layout in cascade inference.
     Note that it's not always beneficial to increase the number of levels because of the overhead
@@ -316,14 +316,14 @@ class MultiLevelCascadeAttentionWrapper:
         num_levels : int
             The number of levels in the cascade attention.
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         use_cuda_graph : bool
-            Whether to use CUDA graph to capture the kernels, if enabled, the auxiliary data structures
-            will be stored in provided buffers.
+            Whether to use a CUDA graph to capture the kernels. If enabled, the auxiliary data structures
+            will be stored in the provided buffers.
         qo_indptr_buf_arr : Optional[List[torch.Tensor]]
             An array of qo indptr buffers for each level, the array length should be equal to
             the number of levels.
@@ -389,7 +389,7 @@ class MultiLevelCascadeAttentionWrapper:
             be the same as the device of the input tensors.
 
         int_workspace_buffers : List[torch.Tensor]
-            The array of new int workspace buffer, the device of the new int workspace buffer should
+            The array of new int workspace buffers, where the device of each new buffer should
             be the same as the device of the input tensors.
         """
         for wrapper, int_workspace_buffer in zip(
@@ -556,8 +556,8 @@ class MultiLevelCascadeAttentionWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
-              ``paged_kv_cache[:, 1]`` is the value-cache.
+              :attr:`kv_layout` is ``HND``. Here ``paged_kv_cache[:, 0]`` is
+              the key cache and ``paged_kv_cache[:, 1]`` is the value cache.
         """
         out, lse = self._batch_prefill_wrappers[-1].run(
             q,
@@ -574,9 +574,9 @@ class MultiLevelCascadeAttentionWrapper:
 
 
 class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
-    r"""Wrapper class for decode attention with shared-prefix paged kv-cache for batch
-    of requests. The shared-prefix KV-Cache was stored in a standalone tensors, and the
-    unique KV-Cache of each request was stored in a paged KV-Cache data structure.
+    r"""Wrapper class for decode attention with a shared-prefix paged KV cache for a batch
+    of requests. The shared-prefix KV cache is stored in a standalone tensor, and the unique
+    KV cache of each request is stored in a paged KV cache data structure.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -736,8 +736,8 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         Note
         ----
         The :meth:`begin_forward` method should be called before any :meth:`forward` or
-        :meth:`forward_return_lse` calls,
-        auxiliary data structures will be created during this call and cached for
+        :meth:`forward_return_lse` calls. Auxiliary data structures will be
+        created during this call and cached for
         multiple forward calls.
 
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
@@ -787,7 +787,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
             :attr:`kv_layout` is ``HND``.
         unique_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The request-independent suffix paged KV-Cache stored as a tuple of tensors or a single tensor:
+            The request-specific suffix paged KV cache stored as a tuple of tensors or a single tensor:
 
             * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
               ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
@@ -797,8 +797,8 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
-              ``paged_kv_cache[:, 1]`` is the value-cache.
+              :attr:`kv_layout` is ``HND``. Here ``unique_kv_cache[:, 0]`` is
+              the key cache and ``unique_kv_cache[:, 1]`` is the value cache.
 
         Returns
         -------
@@ -827,8 +827,8 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
 
 class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
-    r"""Wrapper class for prefill/append attention with shared-prefix paged kv-cache for
-    batch of requests.
+    r"""Wrapper class for prefill/append attention with a shared-prefix paged KV cache for
+    a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for paged kv-cache layout.
 
@@ -911,7 +911,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's shared-prefix batch prefill/append attention
-    operators creates some auxiliary data structures, these data structures can be
+    operators create auxiliary data structures. These data structures can be
     reused across multiple prefill/append attention calls (e.g. different Transformer
     layers). This wrapper class manages the lifecycle of these data structures.
     """
@@ -920,12 +920,12 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     def __init__(
         self, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
     ) -> None:
-        r"""Constructor of :class:`BatchDecodeWithSharedPrefixPagedKVCacheWrapper`.
+        r"""Constructor of :class:`BatchPrefillWithSharedPrefixPagedKVCacheWrapper`.
 
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         kv_layout : str
@@ -993,7 +993,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         Note
         ----
         The :meth:`begin_forward` method should be called before any :meth:`forward`
-        or :meth:`forward_return_lse` calls, auxiliary data structures will be created
+        or :meth:`forward_return_lse` calls. Auxiliary data structures will be created
         during this call and cached for multiple forward calls.
 
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
@@ -1056,7 +1056,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
             :attr:`kv_layout` is ``HND``.
         unique_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The request-independent suffix paged KV-Cache stored as a tuple of tensors or a single tensor:
+            The request-specific suffix paged KV cache stored as a tuple of tensors or a single tensor:
 
             * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
               ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
@@ -1066,8 +1066,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
-              ``paged_kv_cache[:, 1]`` is the value-cache.
+              :attr:`kv_layout` is ``HND``. Here ``unique_kv_cache[:, 0]`` is
+              the key cache and ``unique_kv_cache[:, 1]`` is the value cache.
 
         causal : bool
             Whether to apply causal mask on the attention matrix.

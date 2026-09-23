@@ -6,7 +6,7 @@ KV-Cache Layout in FlashInfer
 Layout: NHD/HND
 ---------------
 
-FlashInfer provides two layouts for last 3 dimensions in KV-Cache: ``NHD`` and ``HND``:
+FlashInfer provides two layouts for the last three dimensions of the KV-Cache: ``NHD`` and ``HND``:
 
 - ``NHD``: the last 3 dimensions are organized as ``(seq_len, num_heads, head_dim)``.
 - ``HND``: the last 3 dimensions are organized as ``(num_heads, seq_len, head_dim)``.
@@ -15,7 +15,7 @@ The ``NHD`` layout is more natural because it's consistent with the output of
 :math:`xW_k` and :math:`xW_v` without transpose. The ``HND`` layout is more friendly
 for GPU implementation when KV-Cache uses low-precision data type (e.g. fp8).
 In practice we don't observe significant performance difference between these two layouts
-on fp16 kV-Cache and we prioritize ``NHD`` layout for better readability. FlashInfer implements
+on fp16 KV-Cache and we prioritize ``NHD`` layout for better readability. FlashInfer implements
 Attention kernels on both layouts and we provide an option to select between them (``NHD``
 by default).
 
@@ -31,8 +31,8 @@ We use Ragged Tensor to store the variable length Q/K/V tensors in FlashInfer fo
   :align: center
   :alt: Data structure of Ragged KV-Cache.
 
-In Ragged Tensor, all requests's Q/K/V are packed into a single ``data`` tensor without padding,
-we use a ``indptr`` array (``num_requests+1`` elements, the first element is always zero)
+In Ragged Tensor, the Q/K/V tensors for all requests are packed into a single ``data`` tensor without padding.
+We use an ``indptr`` array (``num_requests+1`` elements, the first element is always zero)
 to store the information of variable sequence lengths of each request
 (``indptr[i+1]-indptr[i]`` is the sequence length of request ``i``), the ``data`` tensor has
 shape ``(indptr[-1], num_heads, head_dim)`` when the layout is ``NHD``.
@@ -46,7 +46,7 @@ FlashInfer APIs
 ~~~~~~~~~~~~~~~
 
 FlashInfer provides :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper` to compute
-the prefill attention between queries stored in ragged tensor and keys/values stored in ragged
+the prefill attention between queries stored in a ragged tensor and keys/values stored in ragged
 KV-Cache.
 
 .. _mask-layout:
@@ -62,7 +62,7 @@ the attention mask in FlashInfer is a 2D ragged tensor for batch size greater th
   :align: center
   :alt: Data structure of Mask Layout.
 
-When number of requests is greater than 1, different requests might have different query length and kv length.
+When the number of requests is greater than 1, different requests might have different query lengths and KV lengths.
 To avoid padding, we use a 2D ragged tensor to store attention mask. The input ``qo_indptr`` and
 ``kv_indptr`` arrays (both with length ``num_requests+1``) are used to store the information of
 variable sequence lengths of each request,
@@ -85,7 +85,7 @@ FlashInfer APIs
 ~~~~~~~~~~~~~~~
 
 :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` and :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper`
-allow user to specify ``qo_indptr``, ``kv_indptr`` and custom attention mask ``custom_mask`` in ``begin_forward`` functions,
+allow users to specify ``qo_indptr``, ``kv_indptr`` and custom attention mask ``custom_mask`` in ``begin_forward`` functions,
 the mask data will be added to the attention score before softmax (and after softmax scaling) in the attention kernel.
 
 :meth:`flashinfer.quantization.packbits` and :meth:`flashinfer.quantization.segment_packbits` are the utility functions
@@ -99,8 +99,8 @@ Page Table Layout
 When KV-Cache is dynamic (e.g. in append or decode stage), packing all keys/values is not
 efficient because the sequence length per request changes over time. `vLLM <https://arxiv.org/pdf/2309.06180.pdf>`_
 proposes to organize KV-Cache as a Page Table. In FlashInfer, we treat the page table as
-a block sparse matrix (each used page can be viewed as an non-zero block in block sparse matrix)
-and uses the `CSR format <https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csr_matrix.html>`_
+a block-sparse matrix (each used page can be viewed as a non-zero block in a
+block-sparse matrix) and use the `CSR format <https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csr_matrix.html>`_
 to index the pages in KV-Cache.
 
 .. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/tutorials/page_layout.png
@@ -108,9 +108,9 @@ to index the pages in KV-Cache.
   :align: center
   :alt: Data structure of Paged KV-Cache.
 
-For each request, we keep a record of its ``page_indices``, ``last_page_len`` which
-tracks the pages used by this request and the number of entries in the last page. The KV
-sequence length of request ``i`` is ``page_size * (len(page_indices[i]) - 1) + last_page_length[i]``.
+For each request, we keep records of its ``page_indices`` and ``last_page_len``, which
+track the pages used by this request and the number of entries in the last page. The KV
+sequence length of request ``i`` is ``page_size * (len(page_indices[i]) - 1) + last_page_len[i]``.
 
 .. note::
   The ``last_page_len`` of each request must be greater than zero, and less than or equal to ``page_size``.
@@ -118,17 +118,17 @@ sequence length of request ``i`` is ``page_size * (len(page_indices[i]) - 1) + l
 The overall ``kv_indptr`` array (with length ``num_requests+1``) can be computed as:
 ``[0, len(page_indices[0]), len(page_indices[0])+len(page_indices[1]), ...]``.
 The overall ``kv_page_indices`` array (with length ``kv_indptr[-1]``) is the concatenation of all requests' ``page_indices``.
-The overall ``kv_last_page_lens`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_length``.
+The overall ``kv_last_page_lens`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_len``.
 
-The ``kv_data`` tensor could either be a single 5-D tensor or a tuple of 4-D tensors,
-when stored in a single tensor, ``kv_data`` has shape:
+The ``kv_data`` tensor can be either a single 5-D tensor or a tuple of 4-D tensors.
+When stored in a single tensor, ``kv_data`` has the following shape:
 
 .. code:: python
 
   kv_cache_nhd = torch.empty(max_num_pages, 2, page_size, num_heads, head_dim, dtype=torch.bfloat16) # NHD layout
   kv_cache_hnd = torch.empty(max_num_pages, 2, num_heads, page_size, head_dim, dtype=torch.bfloat16) # HND layout
 
-when stored in a tuple of tensors, ``kv_data = (k_data, v_data)``, and each one of them has shape:
+When stored as a tuple of tensors, ``kv_data = (k_data, v_data)``, each tensor has the following shape:
 
 .. code:: python
 
@@ -151,7 +151,7 @@ Multi-head Latent Attention Page Layout
 
 Multi-head Latent Attention (MLA) is a new attention mechanism proposed in `DeepSeek v2 <https://arxiv.org/abs/2405.04434>`_ and was
 used in later DeepSeek models. MLA unifies key cache and value cache into a single tensor, so there is no need to store them separately.
-Compared to multi-head attention or grouped query attention, the KV-Cache of MLA do not have the ``num_heads`` dimension,
+Compared to multi-head attention or grouped query attention, the MLA KV-Cache does not have the ``num_heads`` dimension,
 so there is no distinction like ``NHD`` and ``HND`` layout.
 
 MLA separates RoPE (Rotary Positional Encoding) dimensions and other head dimensions. We use ``kpe`` (key w/ positional encoding) and ``ckv`` (compressed key/value)
@@ -174,7 +174,7 @@ FlashInfer APIs
 :meth:`flashinfer.page.append_paged_kv_cache` can append a batch of keys/values (stored as ragged tensors) to the paged KV-Cache
 (the pages for these appended keys/values must be allocated prior to calling this API).
 
-:class:`flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper` and :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` implements the decode attention
+:class:`flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper` and :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` implement decode attention
 and prefill/append attention between queries stored in ragged tensors and keys/values stored in paged KV-Cache.
 
 .. _cascade-inference-data-layout:
@@ -186,7 +186,7 @@ When using multi-level `cascade inference <https://flashinfer.ai/2024/02/02/casc
 the query and output are stored in ragged tensors, and KV-Cache of all levels are stored
 in a unified Paged KV-Cache. Each level has a unique ``qo_indptr`` array which is the prefix sum of the
 accumulated number of tokens to append in the subtree, as well as ``kv_page_indptr``, ``kv_page_indices``, and
-``kv_last_page_len`` which has same semantics as in :ref:`page-layout` section. The following figure
+``kv_last_page_len``, which have the same semantics as in the :ref:`page-layout` section. The following figure
 introduces how to construct these data structures for append attention operation for 8 requests where we
 treat their KV-Cache as 3 levels for prefix reuse:
 
@@ -208,7 +208,7 @@ the cascade attention.
 FAQ
 ---
 
-How do FlashInfer manages KV-Cache?
+How does FlashInfer manage KV-Cache?
   FlashInfer itself is not responsible for managing the page-table (pop and allocate new pages, etc.) and we leave the strategy
   to the user: different serving engines might have different strategies to manage the page-table. FlashInfer is only responsible
   for computing the attention between queries and keys/values stored in KV-Cache.

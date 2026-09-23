@@ -188,8 +188,8 @@ class MoELayer:
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
         """Build the layer and the set of backend runners it will autotune over.
 
-        Every backend in ``config.backend`` whose hardware preconditions the
-        target device satisfies gets a runner; the rest are skipped here rather
+        Every backend in ``config.backend`` whose hardware preconditions are
+        satisfied by the target device gets a runner; the rest are skipped here rather
         than at call time, so an unsupported backend costs nothing per call.
 
         Parameters

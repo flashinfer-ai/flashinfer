@@ -310,9 +310,9 @@ These symbols are defined in the backend modules and re-exported from
 Standalone TRT-LLM Gen Routing
 ------------------------------
 
-The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
-exposed on its own so expert selection and the permutation/padding bookkeeping
-can be used (and tested) independently of quantization and GEMM configuration.
+The routing stage that the TRT-LLM Gen fused MoE launchers run before their
+GEMMs is exposed on its own so that expert selection and permutation/padding
+bookkeeping can be used (and tested) independently of quantization and GEMM configuration.
 
 .. autosummary::
     :toctree: ../generated
