@@ -15,13 +15,27 @@ bugs there. See [Kernel review](#kernel-review).
 
 1. **Crash-prone code.** OOB indexing, unchecked pointer/tensor math, int32/int64 overflow in
    offset/stride/size math, unvalidated shapes/dtypes/device assumptions, under-allocated
-   workspace/buffers on large problems, missing synchronization.
+   workspace/buffers on large problems, missing synchronization. How to look:
+   - *OOB:* trace each index expression to the bound that guarantees it, including the last
+     tile and any padding/remainder path.
+   - *Overflow:* any product of sizes (e.g. `M * K`, row stride × row count) computed in 32 bits
+     can exceed 2^31 at supported problem sizes — check the type it is computed in, not just
+     the type it is stored in.
+   - *Workspace:* check the allocation formula at the largest supported problem size and
+     against every branch that writes into it, not only the common path.
 2. **Interface & API design.** Interfaces get replicated — review with "how will this be
    copied?" in mind. Check convention adherence (argument order, plan/run split, wrapper
    patterns, `@flashinfer_api` / `@backend_requirement`), naming, and extensibility. Framework
-   separation: no Torch headers under `include/`.
+   separation: no Torch headers under `include/`. **Any change that is not backwards
+   compatible** — a removed or renamed public API, a changed signature, default, or
+   semantics — must be **flagged loudly**, at the top of the findings: it has to be
+   discussed during review and must not merge quietly.
 3. **Testing surface.** New behavior and edge cases covered by unit tests; numerical refcheck
-   present; correct architecture guards; and the code is actually testable.
+   present; correct architecture guards; and the code is actually testable. Tests must
+   `skip` (or `xfail`) rather than fail on architectures or dependency versions the code does
+   not support — e.g. gate on `is_sm90a_supported()` and friends, and on the availability
+   probe for optional dependencies such as the CuTe DSL version — so CI on a lane that lacks
+   the feature stays green.
 4. **Comments & docs.** Flag low-SNR / verbose comments — want concise, explain *why* not
    *what*. Short rationale for a non-obvious hot-path choice is high-SNR and wanted. Keep
    `CLAUDE.md` / `.claude/skills/` docs in sync when touched.
@@ -37,8 +51,9 @@ bugs there. See [Kernel review](#kernel-review).
    title/message on (squash) merge and are relied on when bisecting — hold them to that
    standard.
 
-**Out of scope:** backwards-compatibility / API-breakage auditing — delegated to a GitHub
-pre-merge check that QA puts in and maintains, not code review.
+**Out of scope:** exhaustive backwards-compatibility auditing — delegated to a GitHub
+pre-merge check that QA puts in and maintains, not code review. This does not relax the rule
+above: a breaking change you notice is flagged loudly, whatever the check reports.
 
 ## Kernel review
 
@@ -73,7 +88,9 @@ criteria (see flashinfer/experimental/README.md). -->
 
 - [ ] Crash/OOB/overflow/allocation defects
 - [ ] API shape, naming, convention consistency; `include/` stays Torch-free
-- [ ] Tests cover new behavior/edge cases; refcheck for numerics
+- [ ] Backwards-incompatible API changes flagged loudly for discussion
+- [ ] Tests cover new behavior/edge cases; refcheck for numerics; unsupported arch/dependency
+      versions skip or xfail rather than fail
 - [ ] Comments concise/high-SNR; docs in sync
 - [ ] Style deviations flagged (esp. durable/high-leverage code)
 - [ ] Default PR template kept (not overwritten); perf-optimization PRs report observed
