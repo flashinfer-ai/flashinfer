@@ -180,9 +180,7 @@ def test_reference_nh1_equals_delta_rule(
     torch.testing.assert_close(prod_state, rule_state, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize(
-    "num_householder", [1, 2, 3, 4], ids=lambda nh: f"num_householder={nh}"
-)
+@pytest.mark.parametrize("num_householder", [1, 2, 3, 4], ids=lambda nh: f"nh{nh}")
 @pytest.mark.parametrize(
     "head_size, head_size_v",
     [(64, 64), (128, 128), (128, 64)],
@@ -254,9 +252,7 @@ def test_reference_equals_expanded_delta_rule(
     torch.testing.assert_close(prod_state, rule_state, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize(
-    "num_householder", [1, 2, 3, 4], ids=lambda nh: f"num_householder={nh}"
-)
+@pytest.mark.parametrize("num_householder", [1, 2, 3, 4], ids=lambda nh: f"nh{nh}")
 @pytest.mark.parametrize(
     "head_size, head_size_v",
     [(64, 64), (128, 128), (128, 64)],
@@ -426,9 +422,7 @@ def test_expanded_prefill_head_size_64(qkv_factory, seed=0):
 @pytest.mark.parametrize(
     "output_final_state", [True, False], ids=["final_state", "no_final_state"]
 )
-@pytest.mark.parametrize(
-    "num_householder", [1, 3], ids=lambda nh: f"num_householder={nh}"
-)
+@pytest.mark.parametrize("num_householder", [1, 3], ids=lambda nh: f"nh{nh}")
 @pytest.mark.parametrize(
     "num_heads",
     [(8, 8, 8), (8, 8, 16)],

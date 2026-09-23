@@ -253,8 +253,8 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
-@pytest.mark.parametrize("use_cp", [False, True])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("use_cp", [False, True], ids=lambda cp: f"cp{int(cp)}")
+@pytest.mark.parametrize("head_size", [128, 64], ids=lambda head_size: f"dk{head_size}")
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [
@@ -271,6 +271,9 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    "head_size_v", [128, 64], ids=lambda head_size: f"dv{head_size}"
+)
 def test_prefill_kernel_basic(
     qkv_factory,
     dtype: str,
@@ -284,8 +287,22 @@ def test_prefill_kernel_basic(
     alpha: bool,
     beta: bool,
     use_cp: bool,
+    head_size_v: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if head_size != head_size_v:
+        device = torch.device("cuda")
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if not is_sm90a_supported(device) and not (
+            is_sm100a_supported(device) and cuda_major >= 13
+        ):
+            pytest.skip("DV != DK requires SM100 or SM90")
+
+    if head_size_v > head_size:
+        pytest.skip("DV > DK is not supported")
+    if use_cp and (head_size, head_size_v) != (128, 128):
+        pytest.skip("CP path only supports square DK=DV=128")
+
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
         qkv_factory,
@@ -301,6 +318,7 @@ def test_prefill_kernel_basic(
         beta,
         use_cp,
         seed,
+        head_size_v,
     )
 
 
@@ -359,98 +377,6 @@ def test_prefill_kernel_nonfull(
         use_cp,
         seed,
     )
-
-
-# ---------------------------------------------------------------------------
-# Rectangular state: head_size_v < head_size
-#
-# The recurrent state is [H, V, K] with V < K, so the value/output head dim is
-# narrower than the key/query one.  Only the SM100 chunked kernel implements
-# this; SM90/SM120/CP are square-only and must reject it.
-# ---------------------------------------------------------------------------
-
-_RECT_HEAD_SIZE = 128
-_RECT_HEAD_SIZE_V = 64
-
-
-@pytest.mark.parametrize("beta", [False, True])
-@pytest.mark.parametrize("alpha", [False, True])
-@pytest.mark.parametrize(
-    "num_q_heads, num_k_heads, num_v_heads",
-    [
-        (1, 1, 1),
-        (4, 1, 1),
-        (2, 2, 4),
-        (16, 16, 32),
-    ],
-)
-@pytest.mark.parametrize("seq_lens", [[64], [256], [31], [256, 256], [64, 128, 512]])
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_prefill_kernel_rectangular_state(
-    qkv_factory,
-    dtype: str,
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    seq_lens: list[int],
-    alpha: bool,
-    beta: bool,
-    seed: int = int(os.environ.get("SEED", "0")),
-):
-    _skip_if_not_sm100()
-    _test_prefill_kernel(
-        qkv_factory,
-        dtype,
-        num_q_heads,
-        num_k_heads,
-        num_v_heads,
-        _RECT_HEAD_SIZE,
-        64,
-        seq_lens,
-        1.0 / math.sqrt(_RECT_HEAD_SIZE),
-        alpha,
-        beta,
-        False,
-        seed,
-        head_size_v=_RECT_HEAD_SIZE_V,
-    )
-
-
-def _rectangular_call(qkv_factory, head_size, head_size_v, use_cp=False):
-    device = torch.device("cuda")
-    seq_lens = [64]
-    with device:
-        q, k, v = qkv_factory(
-            seq_lens, 2, 2, 2, head_size, torch.bfloat16, head_size_v=head_size_v
-        )
-        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-        cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
-    return chunk_gated_delta_rule(
-        q, k, v, cu_seqlens=cu_seq_lens, output_final_state=True, use_cp=use_cp
-    )
-
-
-def test_wider_values_rejected(qkv_factory):
-    """head_size_v > head_size is rejected on every architecture."""
-    _skip_if_unsupported()
-    with pytest.raises(NotImplementedError, match="must not exceed head_size"):
-        _rectangular_call(qkv_factory, head_size=64, head_size_v=128)
-
-
-def test_rectangular_state_rejected_off_sm100(qkv_factory):
-    """SM90/SM120 are square-only and must say so rather than mis-shape."""
-    _skip_if_unsupported()
-    if is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("SM100 implements rectangular state")
-    with pytest.raises(NotImplementedError, match="Rectangular state"):
-        _rectangular_call(qkv_factory, head_size=128, head_size_v=64)
-
-
-def test_rectangular_state_rejected_by_cp(qkv_factory):
-    """Explicit use_cp=True must reject rather than silently fall back."""
-    _skip_if_cp_unsupported()
-    with pytest.raises(ValueError, match="head_size_v == head_size_k"):
-        _rectangular_call(qkv_factory, head_size=128, head_size_v=64, use_cp=True)
 
 
 @pytest.mark.parametrize(

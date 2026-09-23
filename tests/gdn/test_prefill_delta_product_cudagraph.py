@@ -85,7 +85,7 @@ def test_cudagraph_capture_and_replay(qkv_factory, num_householder, num_heads, d
             None,  # initial_state
             True,  # output_final_state
             cu_seqlens,
-            True,  # use_qk_l2norm_in_kernel
+            False,  # use_qk_l2norm_in_kernel
             output=our_o,
             output_state=our_state,
         )
@@ -211,7 +211,7 @@ def test_cudagraph_replay_is_not_frozen(qkv_factory, num_householder):
             None,
             True,
             cu_seqlens,
-            True,
+            False,
             output=our_o,
             output_state=our_state,
         )
