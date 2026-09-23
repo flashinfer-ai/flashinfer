@@ -206,6 +206,7 @@ def test_deepseek_prefill(
     torch.testing.assert_close(o_sm80, o_sm90, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 @parametrize_product(
     {
         "batch_size": [1, 4, 8, 16],
@@ -218,7 +219,6 @@ def test_deepseek_prefill(
             if num_qo_heads % num_kv_heads == 0
         ],
         "causal": [False, True],
-        "head_dim": [64, 128, 256],
         "logits_soft_cap": [0.0, 30.0],
     },
     regular=pairwise_product_cases,
