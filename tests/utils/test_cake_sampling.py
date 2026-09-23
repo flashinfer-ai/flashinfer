@@ -559,8 +559,10 @@ def test_toolkit_guard_rejects_capabilities_nvcc_cannot_target(monkeypatch):
         supported_capability((8, 0)) is None and supported_capability((12, 0)) is None
     )
     assert supported_capabilities() == ((9, 0), (10, 0), (10, 3), (11, 0))
+    # (the JIT spec generator is cached per capability, so probe through the uncached URI helper:
+    # on a real 10.7 device an earlier test may already have generated the spec)
     with pytest.raises(ValueError, match="not compiled for compute capability 10.7"):
-        cake_sampling_jit.gen_cake_sampling_module((10, 7))
+        cake_sampling_jit.get_cake_sampling_uri((10, 7))
 
     hopper_only = frozenset({"compute_80", "compute_90"})
     monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: hopper_only)
