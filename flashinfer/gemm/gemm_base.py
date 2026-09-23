@@ -6323,11 +6323,15 @@ def _get_sm100_block_scaled_tactics(
     return valid_tactics
 
 
-# FP4 backends with a per-row alpha epilogue, by the compute capability major
-# that builds it.
-_PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR = {
-    10: ("cute-dsl",),
-}
+# Compute capabilities on which mm_fp4 serves a per-token alpha. Only the
+# SM100 CuTe-DSL kernel has the per-row alpha epilogue, and SM103 runs that
+# same kernel. The SM103 3xFP4 and SM107 kernels have no such epilogue, and the
+# SM100 kernel has not been validated with it on SM107, so SM107 is not
+# claimed. _cute_dsl_gemm_fp4_requirement is the single place that enforces
+# this; the other FP4 backends never see a per-token alpha because
+# _heuristic_func_mm_fp4 drops them and _check_mm_fp4_problem_size rejects them
+# when requested explicitly.
+_CUTE_DSL_PER_TOKEN_ALPHA_CCS = (100, 103)
 
 
 def _is_per_token_alpha(alpha_tensor) -> bool:
@@ -7267,13 +7271,10 @@ def _check_mm_fp4_problem_size(
                 "alpha must be a scalar, or one scale per row of a for the "
                 f"per-token path. Got {alpha.numel()} for m={a.shape[0]}."
             )
-        per_token_backends = sorted(
-            set().union(*_PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.values())
-        )
-        if backend != "auto" and backend not in per_token_backends:
+        if backend not in ("auto", "cute-dsl"):
             raise ValueError(
-                f"per-token alpha is only supported by the {per_token_backends} "
-                f"backends, got backend={backend!r}."
+                "per-token alpha is only implemented by the 'cute-dsl' backend "
+                f"(SM100/SM103), got backend={backend!r}."
             )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
@@ -7393,7 +7394,7 @@ def _cute_dsl_gemm_fp4_requirement(
     b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
-    alpha: Optional[torch.Tensor] = None,  # unused
+    alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,  # unused
@@ -7412,6 +7413,15 @@ def _cute_dsl_gemm_fp4_requirement(
         if backend != "cute-dsl":
             return False
         raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
+    if _is_per_token_alpha(alpha):
+        major, minor = get_compute_capability(a.device)
+        if major * 10 + minor not in _CUTE_DSL_PER_TOKEN_ALPHA_CCS:
+            if backend != "cute-dsl":
+                return False
+            raise ValueError(
+                "CuTe-DSL FP4 GEMM per-token alpha is implemented on SM100/SM103 "
+                f"only, got SM{major}{minor}."
+            )
     _check_cute_dsl_availability()
     _check_cute_dsl_arch(a.device)
     return True
@@ -8063,6 +8073,12 @@ def _cute_dsl_gemm_fp4_runner(
                                         )
                                     )
 
+            if _is_per_token_alpha(alpha):
+                # Only the SM100 kernel has the per-row alpha epilogue. The
+                # SM103/SM107 tactics would each raise in forward() and cost the
+                # tuner a profiling pass for a tactic that can never win.
+                valid_tactics = [t for t in valid_tactics if t[4] == "sm100"]
+
             # Rank individual tactics so the limit is an actual benchmark
             # budget. Group-counting with ``max_tactics // 2`` only produced
             # the intended number for SM100's two use_prefetch variants; SM103
@@ -8488,7 +8504,13 @@ def _heuristic_func_mm_fp4(
       - On SM103 (B300) - use cutlass (faster based on benchmarks).
       - On SM100 (B200) - use cudnn (faster based on benchmarks).
 
+    A per-token alpha overrides all of the above: only the CuTe-DSL SM100 kernel
+    has a per-row alpha epilogue, and any other backend would apply alpha[0] to
+    every row.
     """
+    if _is_per_token_alpha(alpha):
+        return [c for c in ("cute-dsl",) if c in suitable_backends]
+
     cuda_version = get_cuda_version()
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
@@ -8617,10 +8639,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 
 # Alpha has to follow the M the tuner picks for its profiling shapes, or the
 # kernel reads past the caller's alpha while profiling a larger bucket.
-_MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA = TuningConfig(
-    use_cuda_graph=_MM_FP4_TUNING_CONFIG_128x4.use_cuda_graph,
-    use_cold_l2_cache=_MM_FP4_TUNING_CONFIG_128x4.use_cold_l2_cache,
-    dynamic_tensor_specs=_MM_FP4_TUNING_CONFIG_128x4.dynamic_tensor_specs,
+_MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA = replace(
+    _MM_FP4_TUNING_CONFIG_128x4,
     constraint_specs=(
         *_MM_FP4_TUNING_CONFIG_128x4.constraint_specs,
         ConstraintSpec(
@@ -8717,8 +8737,8 @@ def mm_fp4(
         Global scale tensor, float scalar, or a float32 tensor of ``m``
         elements holding one dequant scale per row of ``a`` (activations
         quantized with a dynamic per-token NVFP4 global scale). The per-token
-        form is served by ``"cute-dsl"`` on SM10X; ``backend="auto"`` narrows
-        to it.
+        form is implemented by the ``"cute-dsl"`` backend on SM100/SM103;
+        ``backend="auto"`` selects it.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
@@ -8803,28 +8823,24 @@ def mm_fp4(
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
-    # A backend without a per-row epilogue would silently consume alpha[0] for
-    # every row, so narrow the candidates instead of letting the tuner pick one.
+    # For a per-token alpha the requirement functions and _heuristic_func_mm_fp4
+    # have already narrowed the candidates to the CuTe-DSL backend. A backend
+    # without the per-row epilogue would silently apply alpha[0] to every row,
+    # so keep a backstop for skip_check=True rather than trust the list.
     per_token_alpha = _is_per_token_alpha(alpha)
-    if per_token_alpha:
-        arch_backends = _PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.get(major, ())
-        supported = [bk for bk in backends if bk in arch_backends]
-        if not supported and backend == "auto":
-            # cute-dsl is never in the auto list, yet on SM10X it is the only
-            # backend with a per-row epilogue.
-            supported = list(arch_backends)
-        if not supported:
-            raise ValueError(
-                f"Per-token alpha is implemented on SM{major}{minor} only by "
-                f"{sorted(arch_backends)}, got backends {backends}."
-            )
-        backends = supported
+    if per_token_alpha and list(backends) != ["cute-dsl"]:
+        raise ValueError(
+            "per-token alpha is only implemented by the 'cute-dsl' backend "
+            f"(SM100/SM103), got backends {list(backends)}."
+        )
 
     tuner = AutoTuner.get()
-    if use_8x4_sf_layout:
-        tuning_config = _MM_FP4_TUNING_CONFIG_8x4
-    elif per_token_alpha:
+    if per_token_alpha:
+        # Rides on the 128x4 config: _cute_dsl_gemm_fp4_requirement rejects 8x4
+        # scales, so an 8x4 + per-token call never reaches this point.
         tuning_config = _MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA
+    elif use_8x4_sf_layout:
+        tuning_config = _MM_FP4_TUNING_CONFIG_8x4
     else:
         tuning_config = _MM_FP4_TUNING_CONFIG_128x4
 

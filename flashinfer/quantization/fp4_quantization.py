@@ -1412,13 +1412,13 @@ def nvfp4_quantize(
         ``a_global_sf`` is the inverse base scale multiplier (typically
         ``1 / (448 * 6)``) and the function also returns per-token FP32
         scales.
+    expanded_idx_to_permuted_idx : torch.Tensor, optional
+        Optional row-remapping buffer for per-token activation
+        quantization.
     out_scale : torch.Tensor, optional
         Scalar the returned per-token scales are multiplied by.  Only for
         ``per_token_activation=True`` with ``backend="cute-dsl"``.  Does not
         change the quantized values.
-    expanded_idx_to_permuted_idx : torch.Tensor, optional
-        Optional row-remapping buffer for per-token activation
-        quantization.
 
     Returns
     -------
