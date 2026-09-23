@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from ..jit.minimax_h3_fc1_swiglu import (
+    MiniMaxH3Fc1SwigluTarget,
     gen_minimax_h3_fc1_swiglu_module,
     minimax_h3_fc1_swiglu_target,
 )
@@ -59,7 +60,7 @@ _E2M1_MAX = 6.0
 
 
 @functools.lru_cache(maxsize=None)
-def _get_module(target: str):
+def _get_module(target: MiniMaxH3Fc1SwigluTarget):
     return gen_minimax_h3_fc1_swiglu_module(target).build_and_load()
 
 

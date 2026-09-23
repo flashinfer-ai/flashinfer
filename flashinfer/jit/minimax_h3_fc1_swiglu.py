@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Dict, Literal, Tuple
 
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
@@ -29,7 +29,10 @@ _TARGETS = {
     "sm100a": ("cake_minimax_h3_fc1_swiglu_sm100a.cu", sm100a_nvcc_flags),
     "sm103a": ("cake_minimax_h3_fc1_swiglu_sm103a.cu", sm103a_nvcc_flags),
 }
-_CAPABILITY_TO_TARGET = {(10, 0): "sm100a", (10, 3): "sm103a"}
+_CAPABILITY_TO_TARGET: Dict[Tuple[int, int], MiniMaxH3Fc1SwigluTarget] = {
+    (10, 0): "sm100a",
+    (10, 3): "sm103a",
+}
 
 
 def _repo_root() -> Path:
@@ -55,7 +58,7 @@ def minimax_h3_fc1_swiglu_target(
     """Map an exact compute capability to the generated source that serves it."""
 
     try:
-        return _CAPABILITY_TO_TARGET[tuple(int(v) for v in capability)]
+        return _CAPABILITY_TO_TARGET[(int(capability[0]), int(capability[1]))]
     except KeyError:
         raise RuntimeError(
             "MiniMax-H3 FC1+SwiGLU requires exact compute capability 10.0 (B200/GB200) or "
