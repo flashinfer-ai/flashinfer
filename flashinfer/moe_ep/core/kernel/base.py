@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -179,12 +179,13 @@ class MegaKernelBackend(ABC):
         heap use and compiled sessions by the layer count.
         """
         self._ensure_ep_bootstrap(bootstrap)
-        key = self._workspace_pool_key(fleet_params)
-        if key is None:
+        request = self._workspace_pool_request(fleet_params)
+        if request is None:
             return self._allocate_workspace(fleet_params)
+        key, factory = request
         from .workspace_pool import acquire_workspace
 
-        return acquire_workspace(key, lambda: self._allocate_workspace(fleet_params))
+        return acquire_workspace(key, factory)
 
     @abstractmethod
     def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
@@ -198,6 +199,22 @@ class MegaKernelBackend(ABC):
         epilogue scalars, and knobs. Default is unpooled.
         """
         return None
+
+    def _workspace_pool_request(
+        self,
+        fleet_params: "FleetParams",
+    ) -> Optional[tuple[Any, Callable[[], Any]]]:
+        """Return one pool key and its matching allocation factory.
+
+        The default preserves the legacy backend contract. Backends whose
+        pool key depends on mutable external state can override this hook to
+        resolve that state once and capture the same frozen value in both the
+        key and factory.
+        """
+        key = self._workspace_pool_key(fleet_params)
+        if key is None:
+            return None
+        return key, lambda: self._allocate_workspace(fleet_params)
 
     def validate_forward(  # noqa: B027 - intentional no-op default
         self,

@@ -13,9 +13,11 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
+from cutlass.cute.nvgpu import cpasync
 import cutlass.utils.hopper_helpers as sm90_utils
 
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int32, Int64, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.ptx_helpers import red_add_relaxed_sys_v2_bf16x2
@@ -48,12 +50,78 @@ SwapABBlockwiseFc1GroupChunkChoices = (1, 2, 4, 8)
 SwapABBlockwiseFc1GroupChunks = int(
     os.environ.get("MEGA_SWAPAB_FC1_GROUP_CHUNKS", "1")
 )
+SwapABMxfp4ReuseFc1AccumScratch = 1
+
+
+@cute.jit
+def _mxfp4_div_rn(a: Float32, b: Float32):
+    return Float32(llvm.inline_asm(
+        Float32.mlir_type, [a.ir_value(), b.ir_value()],
+        "div.rn.f32 $0, $1, $2;", "=f,f,f", has_side_effects=True,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    ))
+
+
+@cute.jit
+def _mxfp4_safe_scale_pair(amax: Float32, dequant_scale: Float32):
+    """Keep the normal path; protect tiny positive values without losing q."""
+    quant_scale = Float32(1.0) / dequant_scale
+    if (amax > Float32(0.0)) & (amax < Float32(448.0e-30)):
+        denominator = fmax(amax, Float32(1.3165537626040637e-36))
+        quant_scale = _mxfp4_div_rn(Float32(448.0), denominator)
+        dequant_scale = _mxfp4_div_rn(Float32(1.0), quant_scale)
+    return dequant_scale, quant_scale
+
+
+@dsl_user_op
+def _red_or_release_gpu_b64(counter_ptr, value, *, loc=None, ip=None):
+    """Publish a unique K64 bit after complete data and scale stores."""
+    llvm.inline_asm(
+        None,
+        [counter_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+         value.ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.or.b64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+
 if SwapABBlockwiseFc1GroupChunks not in SwapABBlockwiseFc1GroupChunkChoices:
     raise ValueError(
         "MEGA_SWAPAB_FC1_GROUP_CHUNKS must be one of "
         f"{SwapABBlockwiseFc1GroupChunkChoices}, got "
         f"{SwapABBlockwiseFc1GroupChunks}."
     )
+def _resolve_swapab_fc1_group_chunks(
+    fp8_scale_mode: str,
+    *,
+    configured_chunks: int = SwapABBlockwiseFc1GroupChunks,
+    token_group_count: Optional[int] = None,
+) -> int:
+    """Select the measured MXFP4 chunk count from the physical token tile."""
+    if fp8_scale_mode == "mxfp4_hybrid":
+        return 1 if token_group_count is not None and token_group_count >= 8 else 2
+    if fp8_scale_mode == "blockwise":
+        return configured_chunks
+    return 1
+
+def _resolve_mxfp4_reuse_fc1_accum_scratch(
+    fp8_scale_mode: str,
+    *,
+    configured: int = SwapABMxfp4ReuseFc1AccumScratch,
+) -> bool:
+    """Keep the experimental scratch alias isolated from every FP8 path."""
+    return fp8_scale_mode == "mxfp4_hybrid" and configured == 1
+
+
+
+
+
 WarpThreadCount = 32
 EpiWarpCount = 4
 
@@ -142,6 +210,7 @@ class SwapABFp8GluEpilogue:
         fc1_store_offload: bool = False,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         pingpong: bool = False,
+        enable_mxfp4_safe_quantization: bool = False,
         generate_c: bool = False,
         c_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ) -> None:
@@ -149,12 +218,18 @@ class SwapABFp8GluEpilogue:
         self.fc1_output_layout = fc1_output_layout
         self.acc_dtype = acc_dtype
         self.sf_dtype = sf_dtype
-        if fp8_scale_mode not in ("per_tensor", "blockwise"):
+        if fp8_scale_mode not in (
+            "per_tensor", "blockwise", "mxfp4_hybrid"
+        ):
             raise ValueError(
-                f"fp8_scale_mode must be 'per_tensor' or 'blockwise', "
+                "fp8_scale_mode must be 'per_tensor', 'blockwise', or "
+                f"'mxfp4_hybrid', "
                 f"got {fp8_scale_mode!r}."
             )
         self.fp8_scale_mode = fp8_scale_mode
+        # Opt in only from Mega fused MXFP4. Standalone epilogues
+        # retain legacy quantization unless their caller explicitly enables it.
+        self._enable_mxfp4_safe_quantization = enable_mxfp4_safe_quantization
         self.fp8_output_rcp_limit = cutlass.Float32(fp8_output_rcp_limit)
         self._sf_vec_size = sf_vec_size
         self._epilog_sync_bar_id = epilog_sync_bar_id
@@ -174,6 +249,7 @@ class SwapABFp8GluEpilogue:
         self._atom_thr_size = 1
         self._raw_cta_tile_m = mma_tiler_mnk[0]
         self._token_tile_n = mma_tiler_mnk[1]
+        self._cluster_token_ctas = cluster_shape_mn[1]
         if len(epilogue_warp_ids) % EpiWarpCount != 0:
             raise ValueError(
                 "Swap-AB epilogue warp count must be a multiple of one "
@@ -198,10 +274,12 @@ class SwapABFp8GluEpilogue:
         self._token_group_count = self._token_tile_n // 8
         self._accum_regs_per_m64 = self._token_tile_n // 2 # n // 8 * 4 = n // 2
         self._folded_values_per_m64_thread = self._token_tile_n // 4
-        self._blockwise_fc1_group_chunks = (
-            SwapABBlockwiseFc1GroupChunks
-            if self.fp8_scale_mode == "blockwise"
-            else 1
+        self._blockwise_fc1_group_chunks = _resolve_swapab_fc1_group_chunks(
+            self.fp8_scale_mode,
+            token_group_count=self._token_group_count,
+        )
+        self._reuse_fc1_accum_temp_scratch = (
+            _resolve_mxfp4_reuse_fc1_accum_scratch(self.fp8_scale_mode)
         )
         if self._token_group_count % self._blockwise_fc1_group_chunks != 0:
             raise ValueError(
@@ -248,6 +326,9 @@ class SwapABFp8GluEpilogue:
         self._iket_fc1_epilogue_bw_range = (
             f"swapab_fc1_epi_m{self._token_tile_n}n64_bw"
         )
+        self._iket_fc1_epilogue_mxfp4_range = (
+            f"swapab_fc1_epi_m{self._token_tile_n}n64_mxfp4"
+        )
         self._iket_fc2_epilogue_range = (
             f"swapab_fc2_epi_m{self._token_tile_n}n128"
         )
@@ -255,6 +336,10 @@ class SwapABFp8GluEpilogue:
         self._fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self._apply_topk_in_fc1 = apply_topk_in_fc1
         self._token_back_by_dispatch = token_back_by_dispatch
+        # Enabled by the shared fused policy after full layout validation.
+        # Unsupported layouts retain the original scalar path.
+        self._paired_bf16_stores = False
+        self._mxfp4_fc1_ready_k256 = False
         # Early fc1_done publication (non-pp only, gated kernel-side):
         # drain this WG's FC1 bulk stores and release the tile flag right
         # after the tile's store issues, ahead of consume_next / the
@@ -285,6 +370,29 @@ class SwapABFp8GluEpilogue:
     def subtile_cnt(self) -> int:
         return self._subtile_cnt
 
+
+
+
+    @property
+    def fc1_store_stage_count(self) -> int:
+        return self._epilogue_warpgroup_count
+
+    @property
+    def fc1_tma_store_tile(self) -> Tuple[int, int]:
+        return self._epi_tile
+
+    @property
+    def fc1_tma_store_smem_layout(
+        self,
+    ) -> Union[cute.Layout, cute.ComposedLayout]:
+        staged = sm90_utils.make_smem_layout_epi(
+            self.fc1_output_dtype,
+            self.fc1_output_layout,
+            self.fc1_tma_store_tile,
+            1,
+        )
+
+        return cute.select(staged, mode=[0, 1])
     def staged_smem_layout(
         self,
         n_stages: int,
@@ -307,7 +415,7 @@ class SwapABFp8GluEpilogue:
 
     @property
     def fc1_amax_smem_layout(self) -> cute.Layout:
-        if self.fp8_scale_mode == "blockwise":
+        if self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid"):
             # Dense scratch is [epilogue WGs, 4 warps/WG, token N].
             return cute.make_layout(
                 (self._epilogue_warpgroup_count, 4, self._token_tile_n),
@@ -326,7 +434,9 @@ class SwapABFp8GluEpilogue:
         self,
         work_tile_info,
         accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
         n_half: cutlass.Constexpr,
+        store_stage_idx,
         smem_fc1_output_buffer: cute.Tensor,
         smem_fc1_amax: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
@@ -344,11 +454,15 @@ class SwapABFp8GluEpilogue:
         gmem_fc1_c,
     ) -> None:
         """Dispatch the FC1 epilogue for one completed WGMMA task tile."""
-        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+        if cutlass.const_expr(
+            self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
+        ):
             self._run_fc1_epilogue_blockwise(
                 work_tile_info=work_tile_info,
                 accumulators=accumulators,
+                accum_temp=accum_temp,
                 n_half=n_half,
+                store_stage_idx=store_stage_idx,
                 smem_fc1_output_buffer=smem_fc1_output_buffer,
                 smem_fc1_amax=smem_fc1_amax,
                 tma_atom_fc1_output=tma_atom_fc1_output,
@@ -359,6 +473,9 @@ class SwapABFp8GluEpilogue:
                 local_warp_idx=local_warp_idx,
                 tidx=tidx,
                 _iket_active=_iket_active,
+                fc1_act_weight_dequant_scale=(
+                    fc1_act_weight_dequant_scale
+                ),
                 storage_group_idx=storage_group_idx,
                 gmem_fc1_c=gmem_fc1_c,
             )
@@ -367,6 +484,7 @@ class SwapABFp8GluEpilogue:
                 work_tile_info=work_tile_info,
                 accumulators=accumulators,
                 n_half=n_half,
+                store_stage_idx=store_stage_idx,
                 smem_fc1_output_buffer=smem_fc1_output_buffer,
                 tma_atom_fc1_output=tma_atom_fc1_output,
                 sched_ext=sched_ext,
@@ -481,6 +599,7 @@ class SwapABFp8GluEpilogue:
         work_tile_info,
         accumulators: cute.Tensor,
         n_half: cutlass.Constexpr,
+        store_stage_idx,
         smem_fc1_output_buffer: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
         sched_ext,
@@ -509,8 +628,7 @@ class SwapABFp8GluEpilogue:
             "topk", gmem_topk_scores, work_tile_info,
         )
         sC_stage = cute.slice_(
-            smem_fc1_output_buffer,
-            (None, None, cutlass.Int32(storage_group_idx)),
+            smem_fc1_output_buffer, (None, None, store_stage_idx)
         )
         output_rcp = Float32(1.0) / fc2_act_dequant_scale
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
@@ -545,6 +663,7 @@ class SwapABFp8GluEpilogue:
         chunk_idx: cutlass.Constexpr,
         accumulators: cute.Tensor,
         r_swiglu: cute.Tensor,
+        fc1_act_weight_dequant_scale,
         tidx,
         c_ctx,
     ) -> None:
@@ -566,10 +685,22 @@ class SwapABFp8GluEpilogue:
                     + token_group * 4
                 )
                 dst = m_sub * 2
-                r_gate[dst + 0] = accumulators[src + 0]
-                r_gate[dst + 1] = accumulators[src + 1]
-                r_up[dst + 0] = accumulators[src + 2]
-                r_up[dst + 1] = accumulators[src + 3]
+                r_gate[dst + 0] = (
+                    accumulators[src + 0]
+                    * fc1_act_weight_dequant_scale
+                )
+                r_gate[dst + 1] = (
+                    accumulators[src + 1]
+                    * fc1_act_weight_dequant_scale
+                )
+                r_up[dst + 0] = (
+                    accumulators[src + 2]
+                    * fc1_act_weight_dequant_scale
+                )
+                r_up[dst + 1] = (
+                    accumulators[src + 3]
+                    * fc1_act_weight_dequant_scale
+                )
             if cutlass.const_expr(self._generate_c):
                 thread_in_warp = tidx % WarpThreadCount
                 token0 = (
@@ -839,6 +970,124 @@ class SwapABFp8GluEpilogue:
                         )
 
     @cute.jit
+    def _publish_fc1_scale_rcp_chunk_swapab_blockwise(
+        self,
+        work_tile_info,
+        chunk_idx: cutlass.Constexpr,
+        n_half: cutlass.Constexpr,
+        local_warp_idx: int,
+        tidx,
+        smem_fc1_amax: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        scale_epsilon: Float32,
+        global_token_base,
+        scale_col_idx,
+    ) -> None:
+        """Publish each output scale and cache its reciprocal in SMEM."""
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        group_start = chunk_idx * groups_per_chunk
+        if local_warp_idx == cutlass.Int32(0):
+            # One four-lane group owns one eight-token group.  The old path
+            # let only lane_group 0 serialize every token group while the
+            # other seven lane groups in warp 0 were idle.  Keep ownership
+            # unique, but process up to eight groups in parallel per wave.
+            publisher_waves = (groups_per_chunk + 7) // 8
+            for publisher_wave in cutlass.range_constexpr(publisher_waves):
+                local_group = (
+                    cutlass.Int32(publisher_wave * 8) + lane_group
+                )
+                if local_group < cutlass.Int32(groups_per_chunk):
+                    token_group = group_start + local_group
+                    token0 = (
+                        cutlass.Int32(token_group * 8)
+                        + lane_mod * cutlass.Int32(2)
+                    )
+                    token1 = token0 + cutlass.Int32(1)
+                    token0_max = fmax(
+                        fmax(
+                            smem_fc1_amax[n_half, 0, token0],
+                            smem_fc1_amax[n_half, 1, token0],
+                        ),
+                        fmax(
+                            smem_fc1_amax[n_half, 2, token0],
+                            smem_fc1_amax[n_half, 3, token0],
+                        ),
+                    )
+                    token1_max = fmax(
+                        fmax(
+                            smem_fc1_amax[n_half, 0, token1],
+                            smem_fc1_amax[n_half, 1, token1],
+                        ),
+                        fmax(
+                            smem_fc1_amax[n_half, 2, token1],
+                            smem_fc1_amax[n_half, 3, token1],
+                        ),
+                    )
+                    scale0 = fmax(
+                        token0_max * self.fp8_output_rcp_limit,
+                        scale_epsilon,
+                    )
+                    scale1 = fmax(
+                        token1_max * self.fp8_output_rcp_limit,
+                        scale_epsilon,
+                    )
+                    quant_scale0 = Float32(1.0) / scale0
+                    quant_scale1 = Float32(1.0) / scale1
+                    if cutlass.const_expr(self._enable_mxfp4_safe_quantization):
+                        scale0, quant_scale0 = _mxfp4_safe_scale_pair(
+                            token0_max, scale0
+                        )
+                        scale1, quant_scale1 = _mxfp4_safe_scale_pair(
+                            token1_max, scale1
+                        )
+                    if token0 < work_tile_info.valid_tokens_in_cta_tile:
+                        stg_fc1_block_scale_row(
+                            gmem_fc1_output_sf,
+                            scale_col_idx,
+                            global_token_base + token0,
+                            scale0,
+                        )
+                    if token1 < work_tile_info.valid_tokens_in_cta_tile:
+                        stg_fc1_block_scale_row(
+                            gmem_fc1_output_sf,
+                            scale_col_idx,
+                            global_token_base + token1,
+                            scale1,
+                        )
+                    smem_fc1_amax[n_half, 0, token0] = quant_scale0
+                    smem_fc1_amax[n_half, 0, token1] = quant_scale1
+
+    @cute.jit
+    def _load_fc1_scale_rcp_chunk_swapab_blockwise(
+        self,
+        chunk_idx: cutlass.Constexpr,
+        n_half: cutlass.Constexpr,
+        tidx,
+        smem_fc1_amax: cute.Tensor,
+        r_scale: cute.Tensor,
+    ) -> None:
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        group_start = chunk_idx * groups_per_chunk
+        lane_mod = (tidx % WarpThreadCount) % 4
+        for local_group in cutlass.range_constexpr(groups_per_chunk):
+            token_group = group_start + local_group
+            pair_base = local_group * 2
+            token0 = (
+                cutlass.Int32(token_group * 8)
+                + lane_mod * cutlass.Int32(2)
+            )
+            token1 = token0 + cutlass.Int32(1)
+            r_scale[pair_base + 0] = smem_fc1_amax[
+                n_half, 0, token0
+            ]
+            r_scale[pair_base + 1] = smem_fc1_amax[
+                n_half, 0, token1
+            ]
+
+    @cute.jit
     def _quantize_store_fc1_chunk_swapab_blockwise(
         self,
         chunk_idx: cutlass.Constexpr,
@@ -862,10 +1111,13 @@ class SwapABFp8GluEpilogue:
                 cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
             )
             token1 = token0 + cutlass.Int32(1)
-            scale0 = r_scale[pair_base + 0]
-            scale1 = r_scale[pair_base + 1]
-            scale0_rcp = Float32(1.0) / scale0
-            scale1_rcp = Float32(1.0) / scale1
+            scale0_rcp = r_scale[pair_base + 0]
+            scale1_rcp = r_scale[pair_base + 1]
+            if cutlass.const_expr(
+                self.fp8_scale_mode != "mxfp4_hybrid"
+            ):
+                scale0_rcp = Float32(1.0) / scale0_rcp
+                scale1_rcp = Float32(1.0) / scale1_rcp
             r_quant = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
             for m_sub in cutlass.range_constexpr(2):
                 reg_base = m_sub * folded_values_per_chunk_m64 + pair_base
@@ -886,7 +1138,9 @@ class SwapABFp8GluEpilogue:
         self,
         work_tile_info,
         accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
         n_half: cutlass.Constexpr,
+        store_stage_idx,
         smem_fc1_output_buffer: cute.Tensor,
         smem_fc1_amax: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
@@ -897,6 +1151,7 @@ class SwapABFp8GluEpilogue:
         local_warp_idx: int,
         tidx,
         _iket_active,
+        fc1_act_weight_dequant_scale,
         storage_group_idx,
         gmem_fc1_c,
     ) -> None:
@@ -907,7 +1162,12 @@ class SwapABFp8GluEpilogue:
         # warpgroup amax reduction, scale publication, blockwise quantization,
         # and RMEM-to-SMEM stores. Final TMA store belongs to the outer task.
         if _iket_active:
-            iket.range_push(self._iket_fc1_epilogue_bw_range)
+            if cutlass.const_expr(
+                self.fp8_scale_mode == "mxfp4_hybrid"
+            ):
+                iket.range_push(self._iket_fc1_epilogue_mxfp4_range)
+            else:
+                iket.range_push(self._iket_fc1_epilogue_bw_range)
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
             "topk", gmem_topk_scores, work_tile_info,
         )
@@ -915,6 +1175,11 @@ class SwapABFp8GluEpilogue:
         folded_values_per_chunk_m64 = 2 * groups_per_chunk
         value_layout = cute.make_layout(2 * folded_values_per_chunk_m64)
         scale_layout = cute.make_layout(folded_values_per_chunk_m64)
+        scratch_regs = cute.size(value_layout) + cute.size(scale_layout)
+        reuse_accum_temp_scratch = (
+            self._reuse_fc1_accum_temp_scratch
+            and scratch_regs <= cute.size(accum_temp)
+        )
         amax_bar = pipeline.NamedBarrier(
             barrier_id=self._fc1_amax_sync_bar_id + storage_group_idx,
             num_threads=EpiWarpCount * WarpThreadCount,
@@ -930,8 +1195,7 @@ class SwapABFp8GluEpilogue:
             + cutlass.Int32(n_half)
         )
         sC_stage = cute.slice_(
-            smem_fc1_output_buffer,
-            (None, None, cutlass.Int32(storage_group_idx)),
+            smem_fc1_output_buffer, (None, None, store_stage_idx)
         )
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
@@ -946,55 +1210,104 @@ class SwapABFp8GluEpilogue:
         for chunk_idx in cutlass.range_constexpr(
             self._blockwise_fc1_group_chunks
         ):
-            r_swiglu = cute.make_rmem_tensor(value_layout.shape, self.acc_dtype)
-            self._fill_fc1_swiglu_chunk_swapab_blockwise(
-                chunk_idx=chunk_idx,
-                accumulators=accumulators,
-                r_swiglu=r_swiglu,
-                tidx=tidx,
-                c_ctx=c_ctx,
-            )
-            self._apply_fc1_topk_chunk_swapab(
-                chunk_idx=chunk_idx,
-                tidx=tidx,
-                r_swiglu=r_swiglu,
-                real_topk_scores=real_topk_scores,
-                token_tile_base=token_tile_base,
-            )
-            self._publish_fc1_amax_chunk_swapab_blockwise(
-                chunk_idx=chunk_idx,
-                n_half=storage_group_idx,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                r_swiglu=r_swiglu,
-                smem_fc1_amax=smem_fc1_amax,
-            )
+            chunk_has_valid_tokens = cutlass.Boolean(True)
+            if cutlass.const_expr(reuse_accum_temp_scratch):
+                # FC1 has promoted accum_temp and waited for WGMMA completion.
+                # Reuse those now-dead registers instead of extending another
+                # SwiGLU tensor's live range. FC2 overwrites them before use.
+                r_swiglu = cute.make_tensor(
+                    accum_temp.iterator, value_layout
+                )
+            else:
+                r_swiglu = cute.make_rmem_tensor(
+                    value_layout.shape, self.acc_dtype
+                )
+            if chunk_has_valid_tokens:
+                self._fill_fc1_swiglu_chunk_swapab_blockwise(
+                    chunk_idx=chunk_idx,
+                    accumulators=accumulators,
+                    r_swiglu=r_swiglu,
+                    tidx=tidx,
+                    c_ctx=c_ctx,
+                    fc1_act_weight_dequant_scale=(
+                        fc1_act_weight_dequant_scale
+                    ),
+                )
+                self._apply_fc1_topk_chunk_swapab(
+                    chunk_idx=chunk_idx,
+                    tidx=tidx,
+                    r_swiglu=r_swiglu,
+                    real_topk_scores=real_topk_scores,
+                    token_tile_base=token_tile_base,
+                )
+                self._publish_fc1_amax_chunk_swapab_blockwise(
+                    chunk_idx=chunk_idx,
+                    n_half=storage_group_idx,
+                    local_warp_idx=local_warp_idx,
+                    tidx=tidx,
+                    r_swiglu=r_swiglu,
+                    smem_fc1_amax=smem_fc1_amax,
+                )
 
-            cute.arch.fence_proxy("async.shared", space="cta")
-            amax_bar.arrive_and_wait()
+                cute.arch.fence_proxy("async.shared", space="cta")
+                amax_bar.arrive_and_wait()
 
-            r_scale = cute.make_rmem_tensor(scale_layout.shape, cutlass.Float32)
-            self._finalize_fc1_scale_chunk_swapab_blockwise(
-                work_tile_info=work_tile_info,
-                chunk_idx=chunk_idx,
-                n_half=storage_group_idx,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                smem_fc1_amax=smem_fc1_amax,
-                gmem_fc1_output_sf=gmem_fc1_output_sf,
-                r_scale=r_scale,
-                scale_epsilon=scale_epsilon,
-                global_token_base=global_token_base,
-                scale_col_idx=scale_col_idx,
-            )
-            self._quantize_store_fc1_chunk_swapab_blockwise(
-                chunk_idx=chunk_idx,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                r_swiglu=r_swiglu,
-                r_scale=r_scale,
-                sC_stage=sC_stage,
-            )
+            if cutlass.const_expr(reuse_accum_temp_scratch):
+                r_scale = cute.make_tensor(
+                    accum_temp.iterator + cute.size(value_layout),
+                    scale_layout,
+                )
+            else:
+                r_scale = cute.make_rmem_tensor(
+                    scale_layout.shape, cutlass.Float32
+                )
+            if cutlass.const_expr(self.fp8_scale_mode == "mxfp4_hybrid"):
+                if chunk_has_valid_tokens:
+                    self._publish_fc1_scale_rcp_chunk_swapab_blockwise(
+                        work_tile_info=work_tile_info,
+                        chunk_idx=chunk_idx,
+                        n_half=storage_group_idx,
+                        local_warp_idx=local_warp_idx,
+                        tidx=tidx,
+                        smem_fc1_amax=smem_fc1_amax,
+                        gmem_fc1_output_sf=gmem_fc1_output_sf,
+                        scale_epsilon=scale_epsilon,
+                        global_token_base=global_token_base,
+                        scale_col_idx=scale_col_idx,
+                    )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    amax_bar.arrive_and_wait()
+                    self._load_fc1_scale_rcp_chunk_swapab_blockwise(
+                        chunk_idx=chunk_idx,
+                        n_half=storage_group_idx,
+                        tidx=tidx,
+                        smem_fc1_amax=smem_fc1_amax,
+                        r_scale=r_scale,
+                    )
+            else:
+                if chunk_has_valid_tokens:
+                    self._finalize_fc1_scale_chunk_swapab_blockwise(
+                        work_tile_info=work_tile_info,
+                        chunk_idx=chunk_idx,
+                        n_half=storage_group_idx,
+                        local_warp_idx=local_warp_idx,
+                        tidx=tidx,
+                        smem_fc1_amax=smem_fc1_amax,
+                        gmem_fc1_output_sf=gmem_fc1_output_sf,
+                        r_scale=r_scale,
+                        scale_epsilon=scale_epsilon,
+                        global_token_base=global_token_base,
+                        scale_col_idx=scale_col_idx,
+                    )
+            if chunk_has_valid_tokens:
+                self._quantize_store_fc1_chunk_swapab_blockwise(
+                    chunk_idx=chunk_idx,
+                    local_warp_idx=local_warp_idx,
+                    tidx=tidx,
+                    r_swiglu=r_swiglu,
+                    r_scale=r_scale,
+                    sC_stage=sC_stage,
+                )
         if _iket_active:
             iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_bw
 
@@ -1008,6 +1321,7 @@ class SwapABFp8GluEpilogue:
         gmem_fc1_output: cute.Tensor,
         local_warp_idx: int,
         n_half: cutlass.Constexpr,
+        store_stage_idx,
         storage_group_idx,
         _iket_active,
         gmem_fc1_done_counter=None,
@@ -1070,7 +1384,7 @@ class SwapABFp8GluEpilogue:
             return
 
         if local_warp_idx == cutlass.Int32(0):
-            stage_idx = cutlass.Int32(storage_group_idx)
+            stage_idx = store_stage_idx
             g_fc1_output_wg_view = cute.local_tile(
                 real_fc1_output,
                 (self._token_tile_n, Fc1EpilogueStoreTileN, 1),
@@ -1192,7 +1506,7 @@ class SwapABFp8GluEpilogue:
                             dest_ptr, packed0, packed1,
                         )
         elif cutlass.const_expr(use_mega_dest):
-            # Scalar stores: the 16-byte variant regressed N16 / N8 token tiles on BF16.
+            # The 16-byte peer-store variant regressed N16 / N8 token tiles on BF16.
             metadata_u32 = cute.recast_tensor(
                 token_comm_args.token_src_metadata, cutlass.Uint32,
             )
@@ -1202,6 +1516,15 @@ class SwapABFp8GluEpilogue:
                 peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
                 reduce_topk_in_kernel=False,
             )
+            # Reuse one destination row across the two M64 fragments.
+            peer_row_addr = cutlass.Int64(0)
+            if cutlass.const_expr(self._paired_bf16_stores):
+                peer_token = token0 + lane_group % cutlass.Int32(2)
+                if peer_token < valid_tokens:
+                    peer_row = fc2_output_dest.resolve_token_row(
+                        pool_token_base + peer_token
+                    )
+                    peer_row_addr = peer_row.iterator.toint()
             pair_layout = cute.make_layout(4)
             for m_sub in cutlass.range_constexpr(2):
                 accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
@@ -1220,22 +1543,55 @@ class SwapABFp8GluEpilogue:
                     + lane_group
                 )
                 hidden1 = hidden0 + cutlass.Int32(8)
-                if token0 < valid_tokens:
-                    dest_row0 = fc2_output_dest.resolve_token_row(
-                        pool_token_base + token0
-                    )
-                    if hidden0 < valid_hidden:
-                        dest_row0[hidden0] = r_bf16[0]
-                    if hidden1 < valid_hidden:
-                        dest_row0[hidden1] = r_bf16[2]
-                if token1 < valid_tokens:
-                    dest_row1 = fc2_output_dest.resolve_token_row(
-                        pool_token_base + token1
-                    )
-                    if hidden0 < valid_hidden:
-                        dest_row1[hidden0] = r_bf16[1]
-                    if hidden1 < valid_hidden:
-                        dest_row1[hidden1] = r_bf16[3]
+                if cutlass.const_expr(self._paired_bf16_stores):
+                    # XOR4 exchanges adjacent hidden coordinates. Each lane
+                    # keeps one token and writes two BF16 values together.
+                    r_u32 = cute.recast_tensor(r_bf16, cutlass.Uint32)
+                    packed = cute.make_rmem_tensor(2, cutlass.Uint32)
+                    odd = lane_group % cutlass.Int32(2)
+                    for hpair in cutlass.range_constexpr(2):
+                        own = r_u32[hpair]
+                        peer = cute.arch.shuffle_sync_bfly(own, offset=4)
+                        bits = (
+                            (own & cutlass.Uint32(0xffff))
+                            | (peer << cutlass.Uint32(16))
+                        )
+                        if odd != cutlass.Int32(0):
+                            bits = (
+                                (peer >> cutlass.Uint32(16))
+                                | (own & cutlass.Uint32(0xffff0000))
+                            )
+                        packed[hpair] = bits
+                    token = token0 + odd
+                    hidden_pair = hidden0 - odd
+                    if token < valid_tokens:
+                        for hpair in cutlass.range_constexpr(2):
+                            hidden = hidden_pair + cutlass.Int32(hpair * 8)
+                            if hidden + cutlass.Int32(1) < valid_hidden:
+                                ptr = cute.make_ptr(
+                                    cutlass.Uint32,
+                                    peer_row_addr + cutlass.Int64(hidden) * cutlass.Int64(2),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=4,
+                                )
+                                cute.make_tensor(ptr, cute.make_layout(1))[0] = packed[hpair]
+                else:
+                    if token0 < valid_tokens:
+                        dest_row0 = fc2_output_dest.resolve_token_row(
+                            pool_token_base + token0
+                        )
+                        if hidden0 < valid_hidden:
+                            dest_row0[hidden0] = r_bf16[0]
+                        if hidden1 < valid_hidden:
+                            dest_row0[hidden1] = r_bf16[2]
+                    if token1 < valid_tokens:
+                        dest_row1 = fc2_output_dest.resolve_token_row(
+                            pool_token_base + token1
+                        )
+                        if hidden0 < valid_hidden:
+                            dest_row1[hidden0] = r_bf16[1]
+                        if hidden1 < valid_hidden:
+                            dest_row1[hidden1] = r_bf16[3]
         else:
             # Local fc2 output: the lane's 8 scaled values (v = 2*m_sub + token_sel
             # at columns lane_group / lane_group + 8) become 8 consecutive hidden
@@ -1337,6 +1693,7 @@ class SwapABFp8GluEpilogue:
         accumulators: cute.Tensor,
         accum_temp: cute.Tensor,
         n_half: cutlass.Constexpr,
+        store_stage_idx,
         ab_pipeline,
         weight_sf_pipeline,
         ab_consumer_state,
@@ -1406,7 +1763,9 @@ class SwapABFp8GluEpilogue:
         self._run_fc1_epilogue(
             work_tile_info=work_tile_info,
             accumulators=accumulators,
+            accum_temp=accum_temp,
             n_half=n_half,
+            store_stage_idx=store_stage_idx,
             smem_fc1_output_buffer=smem_fc1_output_buffer,
             smem_fc1_amax=smem_fc1_amax,
             tma_atom_fc1_output=tma_atom_fc1_output,
@@ -1695,11 +2054,19 @@ class SwapABFp8GluEpilogue:
                 if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
                     if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
                         iket.range_push("swapab_fc1_task_bw")
+                    elif cutlass.const_expr(
+                        self.fp8_scale_mode == "mxfp4_hybrid"
+                    ):
+                        iket.range_push("swapab_fc1_task_mxfp4_hybrid")
                     else:
                         iket.range_push("swapab_fc1_task_pt")
                 else:
                     if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
                         iket.range_push("swapab_fc2_task_bw")
+                    elif cutlass.const_expr(
+                        self.fp8_scale_mode == "mxfp4_hybrid"
+                    ):
+                        iket.range_push("swapab_fc2_task_mxfp4_hybrid")
                     else:
                         iket.range_push("swapab_fc2_task_pt")
 
@@ -1708,6 +2075,18 @@ class SwapABFp8GluEpilogue:
                 fc1_act_weight_dequant_scale = Float32(1.0)
                 fc2_act_dequant_scale = Float32(1.0)
                 fc2_act_weight_dequant_scale = Float32(1.0)
+            elif cutlass.const_expr(
+                self.fp8_scale_mode == "mxfp4_hybrid"
+            ):
+                # Activation scales were applied in the hybrid mainloop.
+                # Only Humming's per-expert residual remains for epilogue.
+                fc1_act_weight_dequant_scale = Float32(
+                    fc1_weight_dequant_scale[expert_idx]
+                )
+                fc2_act_dequant_scale = Float32(1.0)
+                fc2_act_weight_dequant_scale = Float32(
+                    fc2_weight_dequant_scale[expert_idx]
+                )
             else:
                 fc1_act_weight_dequant_scale = (
                     Float32(fc1_activation_dequant_scale[0])
@@ -1744,6 +2123,9 @@ class SwapABFp8GluEpilogue:
                         accumulators=accumulators,
                         accum_temp=accum_temp,
                         n_half=0,
+                        store_stage_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
                         ab_pipeline=ab_pipeline,
                         weight_sf_pipeline=weight_sf_pipeline,
                         ab_consumer_state=ab_consumer_state,
@@ -1781,6 +2163,9 @@ class SwapABFp8GluEpilogue:
                         gmem_fc1_output=gmem_fc1_output,
                         local_warp_idx=local_warp_idx,
                         n_half=0,
+                        store_stage_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
                         storage_group_idx=(
                             warpgroup_idx if self._pingpong else 0
                         ),
@@ -1804,6 +2189,7 @@ class SwapABFp8GluEpilogue:
                         accumulators=accumulators,
                         accum_temp=accum_temp,
                         n_half=0,
+                        store_stage_idx=cutlass.Int32(0),
                         ab_pipeline=ab_pipeline,
                         weight_sf_pipeline=weight_sf_pipeline,
                         ab_consumer_state=ab_consumer_state,
@@ -1841,6 +2227,7 @@ class SwapABFp8GluEpilogue:
                         gmem_fc1_output=gmem_fc1_output,
                         local_warp_idx=local_warp_idx,
                         n_half=0,
+                        store_stage_idx=cutlass.Int32(0),
                         storage_group_idx=(
                             warpgroup_idx if self._pingpong else 0
                         ),
@@ -1864,6 +2251,7 @@ class SwapABFp8GluEpilogue:
                         accumulators=accumulators,
                         accum_temp=accum_temp,
                         n_half=1,
+                        store_stage_idx=cutlass.Int32(1),
                         ab_pipeline=ab_pipeline,
                         weight_sf_pipeline=weight_sf_pipeline,
                         ab_consumer_state=ab_consumer_state,
@@ -1901,6 +2289,7 @@ class SwapABFp8GluEpilogue:
                         gmem_fc1_output=gmem_fc1_output,
                         local_warp_idx=local_warp_idx,
                         n_half=1,
+                        store_stage_idx=cutlass.Int32(1),
                         storage_group_idx=(
                             warpgroup_idx if self._pingpong else 1
                         ),
@@ -2030,21 +2419,39 @@ class SwapABFp8GluEpilogue:
 
             if cutlass.const_expr(self._early_fc1_pub):
                 if cur_was_linear1:
-                    # Drain this WG's FC1 bulk stores and publish the tile
-                    # flag now -- the pre-consume hoist.  The per-WG +1 is
-                    # matched by the kernel's x2 fc2 spin threshold.
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    cute.arch.fence_acq_rel_gpu()
-                    if local_warp_idx == cutlass.Int32(0):
-                        if cute.arch.lane_idx() == cutlass.Int32(0):
-                            _early_ptr = (
-                                gmem_fc1_done_counter.iterator
-                                + cur_fc1_counter_slot
-                            )
-                            red_add_release_gpu_s32(
-                                _early_ptr, cutlass.Int32(1)
-                            )
+                    if cutlass.const_expr(self._mxfp4_fc1_ready_k256):
+                        # Match the store helper's full-warp election. Its
+                        # issuing lane fully drains BOTH data and scales
+                        # before publishing this post-SwiGLU K64 fragment.
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        cute.arch.fence_acq_rel_gpu()
+                        if local_warp_idx == cutlass.Int32(0):
+                            with cute.arch.elect_one():
+                                output_n_tile = (
+                                    work_tile_info.tile_m_idx
+                                    * cutlass.Int32(self._wgmma_fragment_count)
+                                    + n_half
+                                )
+                                _red_or_release_gpu_b64(
+                                    gmem_fc1_done_counter.iterator
+                                    + cur_fc1_counter_slot,
+                                    Int64(1) << output_n_tile,
+                                )
+                    else:
+                        # Preserve ordinary FP8 / whole-tile code exactly.
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        cute.arch.fence_acq_rel_gpu()
+                        if local_warp_idx == cutlass.Int32(0):
+                            if cute.arch.lane_idx() == cutlass.Int32(0):
+                                _early_ptr = (
+                                    gmem_fc1_done_counter.iterator
+                                    + cur_fc1_counter_slot
+                                )
+                                red_add_release_gpu_s32(
+                                    _early_ptr, cutlass.Int32(1)
+                                )
 
             if cutlass.const_expr(self._pingpong_order):
                 # Match CUTLASS ping-pong ordering: retire the current FC1
@@ -2114,6 +2521,7 @@ class SwapABFp8GluEpilogue:
             # epilogue neither drains nor accumulates here.
             if cur_was_linear1 and cutlass.const_expr(
                 not self._pingpong_order and not self._fc1_store_offload
+                and not self._mxfp4_fc1_ready_k256
             ):
                 if _iket_active:
                     iket.range_push("swapab_fc1_store_drain")

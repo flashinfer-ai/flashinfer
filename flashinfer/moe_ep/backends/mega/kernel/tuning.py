@@ -79,6 +79,8 @@ def finish_sweep(
     l2,
     candidates: List[dict],
     tune_fn: Callable,
+    *,
+    tune_kwargs: dict[str, Any] | None = None,
 ) -> dict:
     """Common tail of a tuning sweep: optional skew restage, candidate
     truncation, the timed autotune call, and winner reporting."""
@@ -103,6 +105,7 @@ def finish_sweep(
             flush=True,
         )
 
+    tune_kwargs = {} if tune_kwargs is None else dict(tune_kwargs)
     winner = tune_fn(
         y,
         l1,
@@ -112,10 +115,11 @@ def finish_sweep(
         candidates=candidates,
         warmup_iters=args.warmup_iters,
         timed_iters=args.timed_iters,
+        **tune_kwargs,
     )
     if rank == 0:
         print(
-            f"[moe_ep-tune] recorded winner for max_tokens={max_tokens}: "
+            f"[moe_ep-tune] selected winner for max_tokens={max_tokens}: "
             f"{json.dumps(winner, default=list)}",
             flush=True,
         )

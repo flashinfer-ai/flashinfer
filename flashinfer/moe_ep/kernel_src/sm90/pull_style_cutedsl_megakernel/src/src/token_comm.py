@@ -372,6 +372,10 @@ class TokenCommArgs:
 class TokenInPullTokenBackPush:
     """Current implementation: token-in pull, token-back push."""
 
+    # Compile-time policy for the fused all-CTA completion protocol.
+    # Other communication layouts retain the original path.
+    _skip_zero_expert_counts: bool = False
+
     num_dispatch_warps: int = 4
     warp_threads: int = 32
     num_dispatch_threads: int = num_dispatch_warps * warp_threads
@@ -508,6 +512,7 @@ class TokenInPullTokenBackPush:
                 f"'atomic_counter'; got {token_back_schedule_mode!r}."
             )
         self.token_back_schedule_mode = token_back_schedule_mode
+
         # How many of the (warpgroup-aligned) dispatch warps do token-comm
         # work AT ALL (prep + barrier + pull + reuse token-back).  The
         # physical warp count stays num_dispatch_warps -- the setmaxnreg
@@ -837,14 +842,28 @@ class TokenInPullTokenBackPush:
             if expert_id < Int32(self.num_total_experts):
                 slot_ptr = smem_count_ptr + expert_id
                 local_count = (slot_ptr).load()
-                delta = (Int64(1) << Int64(32)) | (Int64(local_count) & Int64(0xFFFFFFFF))
-                old_packed = cute.arch.atomic_add(
-                    expert_send_count.iterator + expert_id,
-                    delta,
-                    sem="relaxed",
-                    scope="gpu",
-                )
-                base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
+                if cutlass.const_expr(self._skip_zero_expert_counts):
+                    # Zero contributors have no routes that use this base.
+                    # Completion is reconstructed after the existing grid
+                    # barrier, never inferred from a nonzero contribution.
+                    base_slot = Int32(0)
+                    if local_count > Int32(0):
+                        old_packed = cute.arch.atomic_add(
+                            expert_send_count.iterator + expert_id,
+                            Int64(local_count),
+                            sem="relaxed",
+                            scope="gpu",
+                        )
+                        base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
+                else:
+                    delta = (Int64(1) << Int64(32)) | (Int64(local_count) & Int64(0xFFFFFFFF))
+                    old_packed = cute.arch.atomic_add(
+                        expert_send_count.iterator + expert_id,
+                        delta,
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
                 (slot_ptr).store(base_slot)
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
@@ -1032,6 +1051,18 @@ class TokenInPullTokenBackPush:
                         scope="gpu",
                     )
                     token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
+                    if cutlass.const_expr(self._skip_zero_expert_counts):
+                        # Every CTA has completed prep at the grid barrier
+                        # above. Publish the same high32 completion count for
+                        # ALL experts/ranks, including entirely empty ones.
+                        status_u64 = (
+                            (Int64(num_sms) << Int64(32))
+                            | (status_u64 & Int64(0xFFFFFFFF))
+                        )
+                        cute.arch.store(
+                            expert_send_count.iterator + expert_id,
+                            status_u64, sem="relaxed", scope="gpu",
+                        )
                     erc_local_base = expert_recv_count.iterator.toint()
                     erc_elem_off = (
                         Int32(local_rank) * Int32(self.num_experts_per_rank) + dst_local_expert
@@ -2313,6 +2344,7 @@ class TokenInPullTokenBackPush:
             nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
         )
 
+
         nb_dispatch_to_sched = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,
             num_threads=self.dispatch_to_sched_threads,
@@ -2350,7 +2382,7 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_pop()
 
-        if cutlass.const_expr(self.enable_token_back and not self.token_back_standalone):
+        if cutlass.const_expr(self.enable_token_back and (not self.token_back_standalone)):
             if iket_active:
                 _iket.range_push("Token_Back_By_Push")
 
@@ -2383,6 +2415,9 @@ class TokenInPullTokenBackPush:
 
             if iket_active:
                 _iket.range_pop()
+
+
+
 
     @cute.jit
     def token_back_warp_body(

@@ -1,0 +1,316 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+"""Offline tuner for the SM90 Humming MXFP4 x FP8 MegaMoE backend.
+
+Fused execution reuses the production weight preprocessor and
+activation/routing staging code. Its deterministic data recipe matches the
+canonical MXFP4 workload in ``benchmarks/bench_moe_ep_sm90_mega.py``. The
+selected canonical routing profile is forwarded to candidate selection,
+session construction, and the collective tuner; this module only owns CLI
+orchestration and does not introduce a second benchmark/timer.
+
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from ...tuning import finish_sweep, run_tuning as _run_tuning
+from ......sm90_routing import (
+    SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+    generate_sm90_routing_numpy,
+    normalize_sm90_routing_profile,
+    sm90_benchmark_mode_from_routing_profile,
+)
+
+
+_MXFP4_SCALE_MODE: Literal["mxfp4_hybrid"] = "mxfp4_hybrid"
+_MXFP4_WEIGHT_SEED = 0x4D584650
+_ACTIVATION_SEED = 42
+_ROUTING_SEED = 1234
+# Raw E8M0 bytes encode powers of two as 2**(e-127). A compact, finite span
+# gives realistic small weights and stays well inside Humming's range-11
+# contract; the payload itself still samples every legal E2M1 nibble code.
+_MXFP4_E8M0_MIN = 118
+_MXFP4_E8M0_MAX_EXCLUSIVE = 124
+
+
+def _balanced_routing(
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    rank: int,
+    world_size: int,
+    device: Any,
+    *,
+    seed: int,
+    routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+):
+    """Return this rank's IDs from one canonical global routing profile."""
+
+    import torch
+
+    if world_size <= 0 or rank < 0 or rank >= world_size:
+        raise ValueError("rank/world_size are inconsistent")
+    routes = generate_sm90_routing_numpy(
+        routing_profile=normalize_sm90_routing_profile(routing_profile),
+        world_size=world_size,
+        tokens=num_tokens,
+        topk=topk,
+        total_experts=num_experts,
+        seed=seed,
+    )
+    return torch.from_numpy(routes[rank].astype("int64")).to(device)
+
+
+def _raw_mxfp4_shapes(
+    *, local_experts: int, hidden: int, intermediate: int
+) -> dict[str, tuple[int, int, int]]:
+    if local_experts <= 0:
+        raise ValueError("local_experts must be positive")
+    if hidden <= 0 or hidden % 128:
+        raise ValueError("MXFP4 hidden must be a positive multiple of 128")
+    if intermediate <= 0 or intermediate % 128:
+        raise ValueError("MXFP4 intermediate must be a positive multiple of 128")
+    return {
+        "w13": (local_experts, 2 * intermediate, hidden // 2),
+        "w13_scale": (local_experts, 2 * intermediate, hidden // 32),
+        "w2": (local_experts, hidden, intermediate // 2),
+        "w2_scale": (local_experts, hidden, intermediate // 32),
+    }
+
+
+def create_tuning_weights(
+    *,
+    local_experts: int,
+    hidden: int,
+    intermediate: int,
+    rank: int,
+    device: Any,
+    seed: int = 0,
+):
+    """Shared deterministic packed weights for offline tuning and benchmarks."""
+    import torch
+
+    from ......weights import PrequantizedMoEWeights
+
+    shapes = _raw_mxfp4_shapes(
+        local_experts=local_experts,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    weight_gen = torch.Generator(device=device).manual_seed(
+        _MXFP4_WEIGHT_SEED + seed + rank
+    )
+
+    def _payload(name: str) -> torch.Tensor:
+        return torch.randint(
+            0,
+            256,
+            shapes[name],
+            dtype=torch.uint8,
+            device=device,
+            generator=weight_gen,
+        )
+
+    def _exponent(name: str) -> torch.Tensor:
+        return torch.randint(
+            _MXFP4_E8M0_MIN,
+            _MXFP4_E8M0_MAX_EXCLUSIVE,
+            shapes[name],
+            dtype=torch.uint8,
+            device=device,
+            generator=weight_gen,
+        )
+
+    return PrequantizedMoEWeights(
+        w13=_payload("w13"),
+        w2=_payload("w2"),
+        w13_scale=_exponent("w13_scale"),
+        w2_scale=_exponent("w2_scale"),
+    )
+
+
+def _create_canonical_inputs(
+    args,
+    rank: int,
+    world_size: int,
+    max_tokens: int,
+    live_tokens: int,
+    initial_tactic: dict[str, Any],
+):
+    """Build canonical raw weights, preprocess them, and stage live inputs."""
+    import torch
+
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        get_symm_buffer_for_hopper_mxfp4_mega_moe,
+    )
+    from .staging import stage_mega_moe_inputs
+    from .weights import preprocess_mega_weights
+
+    if live_tokens < 0 or live_tokens > max_tokens:
+        raise ValueError(f"live_tokens must be in [0, {max_tokens}], got {live_tokens}")
+    if args.num_experts <= 0 or args.num_experts % world_size:
+        raise ValueError("--num-experts must be positive and divisible by world size")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    local_experts = args.num_experts // world_size
+    raw = create_tuning_weights(
+        local_experts=local_experts,
+        hidden=args.hidden,
+        intermediate=args.intermediate,
+        rank=rank,
+        device=device,
+        seed=args.seed,
+    )
+    transformed_l1, transformed_l2 = preprocess_mega_weights(
+        raw,
+        intermediate_size=args.intermediate,
+        hidden_size=args.hidden,
+    )
+    del raw
+
+    symm_buffer: Any = None
+    try:
+        # An explicit initial tactic keeps stale cache contents out of the
+        # offline sweep.
+        common = (
+            args.num_experts,
+            max_tokens,
+            args.topk,
+            args.hidden,
+            args.intermediate,
+            rank,
+            world_size,
+        )
+        symm_buffer = get_symm_buffer_for_hopper_mxfp4_mega_moe(
+            *common,
+            fp8_scale_mode=_MXFP4_SCALE_MODE,
+            knobs=initial_tactic,
+            gate_up_clamp=args.gate_up_clamp,
+            routing_profile=args.routing_profile,
+        )
+
+        activation_gen = torch.Generator(device=device).manual_seed(
+            _ACTIVATION_SEED + args.seed + rank
+        )
+        hidden_states = torch.randn(
+            live_tokens,
+            args.hidden,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=activation_gen,
+        )
+        topk_idx = _balanced_routing(
+            live_tokens,
+            args.topk,
+            args.num_experts,
+            rank,
+            world_size,
+            device,
+            seed=_ROUTING_SEED + args.seed,
+            routing_profile=args.routing_profile,
+        )
+        topk_weights = torch.softmax(
+            torch.randn(
+                live_tokens,
+                args.topk,
+                dtype=torch.float32,
+                device=device,
+                generator=activation_gen,
+            ),
+            dim=-1,
+        )
+        stage_mega_moe_inputs(
+            hidden_states,
+            topk_weights,
+            topk_idx,
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            quantize_input=True,
+            safe_quantization=True,
+        )
+        y = torch.empty(live_tokens, args.hidden, dtype=torch.bfloat16, device=device)
+        return y, transformed_l1, transformed_l2, symm_buffer
+    except BaseException:
+        if symm_buffer is not None:
+            symm_buffer.destroy()
+        raise
+
+
+def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
+    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+
+    mode = "fused"
+    pkg.require_hopper_mxfp4_fused_tuning_device()
+
+    if args.seed != 0:
+        raise SystemExit("SM90 MXFP4 tuning requires the canonical --seed 0")
+    routing_profile = normalize_sm90_routing_profile(args.routing_profile)
+
+    live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
+    if args.live_tokens is not None and live_tokens != max_tokens:
+        raise SystemExit(
+            "SM90 MXFP4 --live-tokens must equal --max-tokens because live "
+            "tokens are not part of the persistent cache key"
+        )
+
+    candidates = pkg.hopper_mxfp4_candidates(
+        max_tokens,
+        hidden=args.hidden,
+        intermediate=args.intermediate,
+        num_experts=args.num_experts,
+        world_size=world_size,
+        routing_profile=routing_profile,
+    )
+    symm_buffer: Any = None
+    try:
+        y, l1, l2, symm_buffer = _create_canonical_inputs(
+            args,
+            rank,
+            world_size,
+            max_tokens,
+            live_tokens,
+            candidates[0],
+        )
+        if rank == 0:
+            print(
+                f"[moe_ep-tune] sm90_mxfp4 {mode} canonical data: "
+                f"weight_seed=0x{_MXFP4_WEIGHT_SEED + args.seed:x}+rank "
+                f"activation_seed={_ACTIVATION_SEED + args.seed}+rank "
+                f"routing_seed={_ROUTING_SEED + args.seed} "
+                f"routing_profile={routing_profile} "
+                "routing_mode="
+                f"{sm90_benchmark_mode_from_routing_profile(routing_profile)}",
+                flush=True,
+            )
+        tune_fn = pkg.autotune_hopper_mxfp4_mega_moe
+        return finish_sweep(
+            args,
+            rank,
+            max_tokens,
+            live_tokens,
+            symm_buffer,
+            y,
+            l1,
+            l2,
+            candidates,
+            tune_fn,
+            tune_kwargs={
+                "gate_up_clamp": args.gate_up_clamp,
+            },
+        )
+    finally:
+        if symm_buffer is not None:
+            symm_buffer.destroy()
+
+
+def run_tuning(args) -> int:
+    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+
+    return _run_tuning(args, tune_one, pkg=pkg)
+
+
+__all__ = ["run_tuning", "tune_one"]
