@@ -6747,9 +6747,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
     Routing and finalize stay on the TRT-LLM Gen module loaded by
     ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
-    batched path. Weight/activation layouts match the corresponding TRT-LLM
-    prepare helpers so one ``MoEWeightPack`` view can be registered under both
-    ``"prims_ts"`` and ``"trtllm_fp4_routed"`` / ``"trtllm_bf16_routed"``.
+    batched path. Weight and activation layouts match the corresponding
+    TRT-LLM prepare helpers, except DeepSeekFp8 weight payloads, which are
+    shuffled with epilogue tile 64.
     """
 
     backend_key = "prims_ts"
@@ -6760,14 +6760,24 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     )
     supported_quant_variants = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
         (QuantFormat.BF16, QuantFormat.BF16),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
     )
     supports_fused_shared_experts = False
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
         (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (SwiGLU, ReLU2),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
     }
 
     def _check_support(self) -> None:
@@ -6816,6 +6826,19 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} does not support "
                 f"{self.config.routing.method.name} routing for BF16×BF16."
             )
+        if pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if isinstance(activation, SwiGLU) and activation != SwiGLU():
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot represent non-default "
+                    "SwiGLU scalars for FP8PerTensor×FP8PerTensor."
+                )
+            if (
+                self.config.routing.method is RoutingMethodType.Llama4
+                and self.config.routing.top_k != 1
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} requires top_k=1 for Llama4 routing."
+                )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -6858,8 +6881,13 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         # check_support confirmed the DSL, so ``import flashinfer`` stays lazy.
         from flashinfer.prims_ts.moe.runner import (
             PrimsTsBf16MoERunner,
+            PrimsTsFp8BlockScaleMoERunner,
+            PrimsTsFp8PerTensorMoERunner,
+            PrimsTsMxfp4Bf16MoERunner,
+            PrimsTsMxfp4Mxfp8MoERunner,
             PrimsTsNvfp4MoERunner,
         )
+        from flashinfer.tllm_enums import Fp8QuantizationType
 
         moe_op = self._module.moe_op
         common = dict(
@@ -6873,13 +6901,35 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             weight_layout=self._weight_layout(),
             num_experts=self.config.routing.num_experts,
         )
-        if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
+        pair = self._pair
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
             self._inner = PrimsTsBf16MoERunner(**common)
-            return
-        self._inner = PrimsTsNvfp4MoERunner(
-            **common,
-            use_per_token_scaling=self._per_token,
-        )
+        elif pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            self._inner = PrimsTsNvfp4MoERunner(
+                **common,
+                use_per_token_scaling=self._per_token,
+            )
+        elif pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            self._inner = PrimsTsMxfp4Mxfp8MoERunner(**common)
+        elif pair == (QuantFormat.MXFP4, QuantFormat.BF16):
+            self._inner = PrimsTsMxfp4Bf16MoERunner(**common)
+        elif pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            self._inner = PrimsTsFp8PerTensorMoERunner(**common)
+        elif pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
+            self._inner = PrimsTsFp8BlockScaleMoERunner(
+                **common,
+                fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            )
+        elif pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+            self._inner = PrimsTsFp8BlockScaleMoERunner(
+                **common,
+                fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            )
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no inner runner for "
+                f"{pair[0].name}×{pair[1].name}."
+            )
 
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
@@ -6913,9 +6963,19 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         return self._forward_inner(inputs, tactic, do_preparation, launch_state)
 
     def _gemm1_oa_launch_kwargs(self, view: dict) -> dict[str, Any]:
-        # Prims-TS OA (alpha/beta/clamp) is SwiGLU/SiTU only. TRT-LLM FP4
-        # prepare inserts gemm1_alpha=ones for every gated activation,
-        # including GeGLU; forwarding that placeholder fails support.
+        # Prims-TS OA (alpha/beta/clamp) is SwiGLU/SiTU only, and DeepSeek
+        # block-scale rejects OA entirely. TRT-LLM FP4 prepare inserts
+        # gemm1_alpha=ones for every gated activation, including GeGLU;
+        # forwarding that placeholder fails support.
+        if self.config.quant.pair == (
+            QuantFormat.DeepSeekFp8,
+            QuantFormat.DeepSeekFp8,
+        ):
+            return {
+                "gemm1_alpha": None,
+                "gemm1_beta": None,
+                "gemm1_clamp_limit": None,
+            }
         if isinstance(self.config.activation, (SwiGLU, SiTU)):
             return {
                 "gemm1_alpha": view.get("gemm1_alpha"),
@@ -6946,6 +7006,18 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, type(self).__name__
             )
+            if (
+                self._pair
+                in (
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                    (QuantFormat.MXFP4, QuantFormat.BF16),
+                )
+                and act.routing_logits.dtype != torch.bfloat16
+            ):
+                raise TypeError(
+                    f"{self._pair[0].name}×{self._pair[1].name} FromLogits requires "
+                    f"bfloat16 routing_logits, got {act.routing_logits.dtype}."
+                )
             topk_ids = hidden.new_empty((num_tokens, routing.top_k), dtype=torch.int32)
             expert_weights = hidden.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
@@ -6983,6 +7055,10 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._require_built()
         from flashinfer.prims_ts.moe.support import (
             is_prims_ts_bf16_supported,
+            is_prims_ts_fp8_block_scale_supported,
+            is_prims_ts_fp8_per_tensor_supported,
+            is_prims_ts_mxfp4_bf16_supported,
+            is_prims_ts_mxfp4_mxfp8_supported,
             is_prims_ts_nvfp4_supported,
         )
         from .core import MoeRunnerInputs
@@ -6993,20 +7069,52 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         )
         routing = self.config.routing
         num_tokens = act.hidden_states_q.shape[0]
-        is_nvfp4 = self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+        pair = self._pair
+        is_nvfp4 = pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+        is_fp4 = pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+        is_fp8_block = pair in (
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        )
+        is_fp8_per_tensor = pair == (
+            QuantFormat.FP8PerTensor,
+            QuantFormat.FP8PerTensor,
+        )
         hidden_size = (
             act.hidden_states_q.shape[1] * 2
             if is_nvfp4
             else act.hidden_states_q.shape[1]
         )
 
-        if is_nvfp4:
+        per_token_scale = None
+        if is_fp4:
             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
-            if self._per_token and act.per_token_scale is None:
-                raise RuntimeError(
-                    "Per-token NVFP4 scale is configured but no activation scale is given."
+            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
+                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
+                from flashinfer.prims_ts.moe.runner import (
+                    _pad_mxfp8_linear_scale_for_prims,
                 )
-            per_token_scale = act.per_token_scale
+
+                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
+                    hidden_states_scale,
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                ).view(torch.float8_e4m3fn)
+            if is_nvfp4:
+                if self._per_token and act.per_token_scale is None:
+                    raise RuntimeError(
+                        "Per-token NVFP4 scale is configured but no activation "
+                        "scale is given."
+                    )
+                per_token_scale = act.per_token_scale
+        elif is_fp8_block:
+            hidden_states_scale = TrtllmFp8BlockRunner._validate_fp8_tensors(
+                self, act, v, hidden_size
+            )
+        elif is_fp8_per_tensor:
+            TrtllmFp8PerTensorRunner._validate_tensors(self, act, v, hidden_size)
+            hidden_states_scale = None
         else:
             _validate_optional_gemm1_activation_params(
                 v,
@@ -7020,7 +7128,6 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                     f"{act.hidden_states_q.dtype}."
                 )
             hidden_states_scale = None
-            per_token_scale = None
 
         routing_logits, routing_bias, topk_ids, expert_weights = self._pack_routing(act)
 
@@ -7066,7 +7173,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             norm_topk_prob=True,
             routing_replay_out=None,
         )
-        if is_nvfp4:
+        if is_fp4:
             static_kwargs.update(
                 gemm1_weights_scale=v.get("gemm1_weights_scale"),
                 gemm2_weights_scale=v.get("gemm2_weights_scale"),
@@ -7074,11 +7181,36 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
                 output2_scale_scalar=v.get("output2_scale_scalar"),
             )
+        elif is_fp8_block:
+            static_kwargs.update(
+                gemm1_weights_scale=v["gemm1_weights_scale"],
+                gemm2_weights_scale=v["gemm2_weights_scale"],
+            )
+        elif is_fp8_per_tensor:
+            from flashinfer.tllm_enums import RoutingMethodType
+
+            static_kwargs.update(
+                output1_scale_scalar=v["output1_scales_scalar"],
+                output1_scale_gate_scalar=v["output1_scales_gate_scalar"],
+                output2_scale_scalar=v["output2_scales_scalar"],
+                use_routing_scales_on_input=(
+                    routing.method is RoutingMethodType.Llama4
+                ),
+            )
 
         self._ensure_inner(hidden_size)
-        support_fn = (
-            is_prims_ts_nvfp4_supported if is_nvfp4 else is_prims_ts_bf16_supported
-        )
+        if is_nvfp4:
+            support_fn = is_prims_ts_nvfp4_supported
+        elif pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            support_fn = is_prims_ts_mxfp4_mxfp8_supported
+        elif pair == (QuantFormat.MXFP4, QuantFormat.BF16):
+            support_fn = is_prims_ts_mxfp4_bf16_supported
+        elif is_fp8_block:
+            support_fn = is_prims_ts_fp8_block_scale_supported
+        elif is_fp8_per_tensor:
+            support_fn = is_prims_ts_fp8_per_tensor_supported
+        else:
+            support_fn = is_prims_ts_bf16_supported
         ok, reason = support_fn(self._inner, moe_inputs, [-1, -1], **static_kwargs)
         if not ok:
             raise RuntimeError(f"Config not supported by Prims-TS kernel ({reason})")
