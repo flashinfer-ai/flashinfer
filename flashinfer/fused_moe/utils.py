@@ -14,6 +14,39 @@ from ..tllm_enums import ActivationType
 
 logger = logging.getLogger(__name__)
 
+_CUTILE_PERMUTE_TILE_CAP = 16384
+# A single-CTA histogram avoids multi-stage routing overhead at decode sizes.
+_CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS = 24
+
+
+def _cutile_permute_shape(
+    num_assignments: int, num_experts: int
+) -> tuple[int, int, int]:
+    """Return the cuTile routing histogram's expert/chunk dimensions."""
+    epow2 = next_positive_power_of_2(num_experts)
+    max_chunk = max(8, _CUTILE_PERMUTE_TILE_CAP // epow2)
+    target_chunks = max(8, _CUTILE_PERMUTE_TILE_CAP // (4 * epow2))
+    chunk = min(
+        max(8, max_chunk // 2),
+        max(8, next_positive_power_of_2(num_assignments) // target_chunks),
+    )
+    if 32 * max_chunk <= num_assignments < 128 * max_chunk:
+        # Bound the histogram count after the initial parallelism ramp.
+        chunk = max_chunk
+    elif num_assignments >= 128 * max_chunk:
+        # Reintroduce chunks to expose enough CTAs for large routing batches.
+        chunk = min(32, max(8, max_chunk // 2))
+    num_chunks = max(1, (num_assignments + chunk - 1) // chunk)
+    return epow2, chunk, next_positive_power_of_2(num_chunks)
+
+
+def _cutile_max_permuted_rows(
+    num_assignments: int, num_experts: int, block_size: int
+) -> int:
+    """Upper-bound cuTile expert-padded rows without charging empty experts."""
+    return num_assignments + min(num_assignments, num_experts) * (block_size - 1)
+
+
 is_torch_compiling_flag = False
 
 AuxStreamType = Enum(
@@ -330,7 +363,11 @@ def get_piecewise_cuda_graph_flag() -> bool:
 
 
 def make_random_topk_ids(
-    num_experts: int, num_tokens: int, top_k: int, device: torch.device
+    num_experts: int,
+    num_tokens: int,
+    top_k: int,
+    device: torch.device,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
     Pick ``top_k`` distinct experts (no replacement) for each of ``num_tokens`` tokens.
@@ -350,7 +387,9 @@ def make_random_topk_ids(
     weights = torch.ones((), device=device, dtype=torch.float32).expand(
         num_tokens, num_experts
     )
-    return torch.multinomial(weights, top_k, replacement=False).to(torch.int32)
+    return torch.multinomial(weights, top_k, replacement=False, generator=generator).to(
+        torch.int32
+    )
 
 
 def get_b12x_activation_name(activation_type: ActivationType) -> str:

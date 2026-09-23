@@ -463,9 +463,10 @@ class TllmGenFmhaKernel {
                                             params.enable_pdl, params.stream);
 
     if (params.lsePtr != nullptr) {
-      FLASHINFER_CUDA_CHECK(flashinfer::ComputeLSEFromMD(
-          params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ, params.mNumHeadsQ,
-          params.lseStrideTokens, params.lseStrideHeads, params.enable_pdl, params.stream));
+      FLASHINFER_CUDA_CHECK(
+          flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ,
+                                       params.mNumHeadsQ, params.lseStrideTokens, params.lseScale,
+                                       params.lseStrideHeads, params.enable_pdl, params.stream));
     }
   }
 
@@ -782,13 +783,15 @@ class TllmGenFmhaKernel {
     return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
 
-  // Return the smallest shipped MLA head tile that contains a non-power-of-two head group below
-  // 64 heads. Power-of-two groups and groups with at least 128 heads return zero so callers
-  // preserve their existing heuristics; the unsupported 65-127 gap has no Q128 MLA cubin.
+  // Return the smallest shipped MLA head tile that contains a head group below 64 heads which
+  // cannot serve as its own tile: non-power-of-two groups, and any group below the Q8 floor.
+  // Power-of-two groups of at least 8 heads and groups with at least 128 heads return zero so
+  // callers preserve their existing heuristics; the unsupported 65-127 gap has no Q128 MLA cubin.
   static int getPaddedMlaTileSizeQ(int numHeadsQPerKv) {
     FLASHINFER_CHECK(numHeadsQPerKv > 0, "The numHeadsQPerKv must be positive, got %d.",
                      numHeadsQPerKv);
-    if (numHeadsQPerKv >= 128 || (numHeadsQPerKv & (numHeadsQPerKv - 1)) == 0) {
+    if (numHeadsQPerKv >= 128 ||
+        (numHeadsQPerKv >= 8 && (numHeadsQPerKv & (numHeadsQPerKv - 1)) == 0)) {
       return 0;
     }
     FLASHINFER_CHECK(numHeadsQPerKv <= 64,
@@ -870,8 +873,8 @@ class TllmGenFmhaKernel {
         selectKernelParams.mHeadDimPerCtaV = 256;
       }
     }
-    // Preserve the legacy heuristic above for power-of-two groups. A non-power-of-two group must
-    // fit in one padded tile because the final head CTA cannot process a partial tile.
+    // Preserve the legacy heuristic above for power-of-two groups of at least 8 heads. Any other
+    // group must fit in one padded tile because the final head CTA cannot process a partial tile.
     if (int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
         paddedTileSizeQ != 0) {
       tileSizeQ = paddedTileSizeQ;

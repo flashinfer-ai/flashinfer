@@ -67,6 +67,7 @@ def bsa_attn_sm100_blk64_fwd(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
+    backend: str = "cute",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Forward pass for BSA block-sparse attention using the blk64 CuTe-DSL kernel.
 
@@ -97,9 +98,17 @@ def bsa_attn_sm100_blk64_fwd(
         q_scale, k_scale, v_scale: Sage FP8 quantization scales. All three
             must be provided together to enable the FP8 path (q/k/v must then
             be float8_e4m3fn); otherwise all three must be None and q/k/v must
-            be bfloat16. The FP8 path additionally requires batch_size == 1,
-            num_head in (4, 8), q2k_block_nums is None, and block_sizes is
-            None (upstream kernel limits, not specific to this integration).
+            be bfloat16. With ``backend="cute"`` the FP8 path additionally
+            requires batch_size == 1, num_head in (4, 8), q2k_block_nums is
+            None, and block_sizes is None (upstream kernel limits, not specific
+            to this integration).
+        backend: ``"cute"`` (default) runs the CuTe-DSL kernel. ``"cake"``
+            runs the Cake-generated Sage-FP8 kernel
+            (:func:`flashinfer.cute_dsl.sparse.bsa_sage_sm100_cake.bsa_attn_sm100_sage_fwd_cake`)
+            which requires the FP8 path and lifts its limits: any batch size
+            and head count, GQA, unaligned seqlen_q/seqlen_k, q2k_block_nums
+            (empty rows allowed) and block_sizes. ``kv_splits`` and
+            ``use_clc`` are ignored by the Cake backend.
 
     Returns:
         (out, lse) where lse is None if return_lse is False.
@@ -110,6 +119,33 @@ def bsa_attn_sm100_blk64_fwd(
     head_dim_v = v.shape[-1]
 
     is_sage_fp8 = q_scale is not None
+    if backend not in ("cute", "cake"):
+        raise ValueError(
+            f"unsupported sm100_blk64 backend {backend!r}; expected 'cute' or 'cake'"
+        )
+    if backend == "cake":
+        if not is_sage_fp8:
+            raise ValueError(
+                "backend='cake' requires the Sage FP8 path (q_scale/k_scale/v_scale)"
+            )
+        from .bsa_sage_sm100_cake import bsa_attn_sm100_sage_fwd_cake
+
+        return bsa_attn_sm100_sage_fwd_cake(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            block_sparse_num,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            block_sizes=block_sizes,
+            q2k_block_nums=q2k_block_nums,
+            softmax_scale=softmax_scale,
+            return_lse=return_lse,
+            out=out,
+            lse=lse,
+        )
     if is_sage_fp8:
         assert k_scale is not None and v_scale is not None, "FP8 requires Q/K/V scales"
         assert q.dtype == torch.float8_e4m3fn, "FP8 inputs must use float8_e4m3fn"

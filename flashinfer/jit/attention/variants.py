@@ -172,3 +172,55 @@ attention_sink_decl = {
     "fa2": attention_sink_fa2_decl,
     "fa3": attention_sink_fa3_decl,
 }
+
+
+bidirectional_ranges_fa2_decl = r"""
+struct CausalBidirectionalRangesAttention : AttentionVariantBase {
+  static constexpr bool use_softmax = true;
+
+  uint32_t qo_len, kv_len, window_left;
+  int32_t q_base, sw_left, range_window;
+  float sm_scale_log2;
+
+  template <typename Params>
+  __device__ __host__ CausalBidirectionalRangesAttention(const Params& params, uint32_t batch_idx,
+                                        uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    // The FA2 kernel derives its KV traversal start from qo_len + window_left
+    // (tile pruning). This variant owns the window in the mask below, and the
+    // bidirectional term has to reach keys behind that window, so traversal
+    // must never prune.
+    window_left = kv_len;
+    q_base = params.q_indptr[batch_idx];
+    sw_left = int32_t(params.causal_window_left);
+    range_window = int32_t(params.range_window_left);
+    sm_scale_log2 = params.sm_scale * math::log2e;
+  }
+
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    // CTA_TILE_Q padding lanes evaluate the mask for qo_idx >= qo_len and
+    // discard the result; clamp so their range loads stay inside this request.
+    const uint32_t q_local = qo_idx < qo_len ? qo_idx : qo_len - 1;
+    const int32_t q_abs = int32_t(kv_len - qo_len + q_local);
+    const int32_t kv = int32_t(kv_idx);
+    // Same contract as DefaultAttention's window_left: a key is kept when
+    // q_abs - kv <= sw_left, so N keeps N + 1 keys and 0 keeps the diagonal
+    // alone. Only a negative value disables the window.
+    bool causal = (kv <= q_abs) && (sw_left < 0 || (q_abs - kv) <= sw_left);
+    const int32_t row = q_base + int32_t(q_local);
+    const int32_t start = params.bidirectional_ranges[row * 2];
+    const int32_t end = params.bidirectional_ranges[row * 2 + 1];
+    // A (-1, -1) row never passes: kv is non-negative, so kv <= -1 is false.
+    bool in_range = (kv >= start) && (kv <= end);
+    if (range_window > 0) {
+      in_range = in_range && ((q_abs - kv) < range_window);
+    }
+    return causal || in_range;
+  })
+};
+"""
+
+bidirectional_ranges_decl = {
+    "fa2": bidirectional_ranges_fa2_decl,
+}

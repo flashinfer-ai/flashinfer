@@ -18,7 +18,7 @@ limitations under the License.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -43,4 +43,18 @@ def decode(
     )
 
 
-__all__ = ["decode"]
+def prepare_for_launch(
+    inputs: dict[str, Any], num_splits: int | None = None
+) -> dict[str, Any]:
+    from .prepared import prepare_for_launch as prepare
+
+    return prepare(inputs, num_splits=num_splits)
+
+
+def launch_prepared(prepared: dict[str, Any]) -> torch.Tensor:
+    from .prepared import launch_prepared as launch
+
+    return launch(prepared)
+
+
+__all__ = ["decode", "prepare_for_launch", "launch_prepared"]

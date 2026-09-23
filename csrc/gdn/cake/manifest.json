@@ -1,12 +1,12 @@
 {
-  "admitted_architecture_rows": 3504,
-  "architecture_row_count": 3558,
+  "admitted_architecture_rows": 3544,
+  "architecture_row_count": 3598,
   "architectures": [
     "sm_100a",
     "sm_103a"
   ],
   "binary_artifacts": false,
-  "contract_row_count": 1779,
+  "contract_row_count": 1799,
   "contract_rows": [
     {
       "contract": "prefill_focus",
@@ -31975,6 +31975,366 @@
       "domain": "decode",
       "label": "b64_t4_update_cache",
       "line": 4
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b1",
+      "line": 18
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b2",
+      "line": 19
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b3",
+      "line": 20
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b4",
+      "line": 21
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b5",
+      "line": 22
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b6",
+      "line": 23
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b7",
+      "line": 24
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b8",
+      "line": 25
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t8_b1",
+      "line": 26
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp1_verify_t7_b1",
+      "line": 27
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b1_contiguous",
+      "line": 1671
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b2_contiguous",
+      "line": 1672
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b3_contiguous",
+      "line": 1673
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b4_contiguous",
+      "line": 1674
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b5_contiguous",
+      "line": 1675
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b6_contiguous",
+      "line": 1676
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b7_contiguous",
+      "line": 1677
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b8_contiguous",
+      "line": 1678
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t8_b1_contiguous",
+      "line": 1679
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp1_verify_t7_b1_contiguous",
+      "line": 1680
     }
   ],
   "cuda_headers": [
@@ -31982,6 +32342,11 @@
       "path": "../cake_gdn_common.cuh",
       "sha256": "0bd70c6c18e5c9916eb81370a4a9113d9b7e6ff383bee7010815d857b17e8ce7",
       "size_bytes": 25206
+    },
+    {
+      "path": "cuda/gdn_prefill_generated.cuh",
+      "sha256": "3beb2a81f173db4f130a1ffa0d653832f863d813a522dd0d0a0546afeb095d47",
+      "size_bytes": 25064
     }
   ],
   "fail_closed_architecture_rows": 54,
@@ -32016,12 +32381,12 @@
   },
   "schema": "flashinfer-cake-gdn-decode-standalone-export-v1",
   "scope": {
-    "decode": "frozen FP32-state T=1 and promoted MTP plus exact BF16 indexed T1/T2/T3/T4 serving rows",
+    "decode": "frozen FP32-state T=1 and promoted MTP plus exact BF16 indexed T1/T2/T3/T4 serving rows and the Qwen3.5 TP2 T7/T8 verify rows",
     "explicit_backend_policy": "one listed GDN non-CP variant or fail closed; no external fallback",
     "prefill": "frozen general prefill contract"
   },
   "source_only": true,
-  "variant_count": 104,
+  "variant_count": 108,
   "variants": [
     {
       "abi": [
@@ -35973,8 +36338,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_1a1604f98ea0.cu",
-          "sha256": "ab7cb2f5b81cb65a1f56a919e62aafab65fa7b282dab15c67ab75c4823aa8dbb",
-          "size_bytes": 258839
+          "sha256": "582eee087475cce4cae9e620f37d9f0a45cd108f2860a8e25fd04543dd413b9b",
+          "size_bytes": 259115
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill",
@@ -36203,8 +36568,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_68e76b274180.cu",
-          "sha256": "b60d68a260f5c20255ea1f71ada11edb477f53ebd5266f0f779cf828cdbccd50",
-          "size_bytes": 258101
+          "sha256": "35a2092bae8dcb273f985f1a75100f737fb2b53c8845f32e5fa28594965a7dce",
+          "size_bytes": 258377
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill",
@@ -36433,8 +36798,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_5f48c638999f.cu",
-          "sha256": "0285b5cc725d91edf38d887b2f8a6444b08666f52aa529edb814867010bdada2",
-          "size_bytes": 258839
+          "sha256": "6046b0f8780037da2425f31050ebe3ed4833cd9a91d5611a38d89fd60d3d6898",
+          "size_bytes": 259115
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill",
@@ -36663,8 +37028,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_4a14fb54f169.cu",
-          "sha256": "eb3b06d8bd57c1c0e432e0c334ce93bef8340d02c5c7ff28028f5ee7465e7dfd",
-          "size_bytes": 283324
+          "sha256": "f3f461759fe83478a86a01e587f4b54be32344c8c4c7ec60cecba79cdcdbdd2c",
+          "size_bytes": 283704
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -36893,8 +37258,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_998d66b08fd4.cu",
-          "sha256": "a8d14db0ce391645b40dc751c4fdc8cc789b0b0263aeedc9911fbb76e607124c",
-          "size_bytes": 283323
+          "sha256": "284bef7f6a45cb52fcf95c2c0c7ea08182a570a5639f6eb504023b774b8ee7fb",
+          "size_bytes": 283703
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -37123,8 +37488,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_d958b1c14cb5.cu",
-          "sha256": "88e0f78191a89844fb138b70a386842f180dbb3e45b26e232a86d6f25ff93962",
-          "size_bytes": 282514
+          "sha256": "0f116667a9baa375dd9907c26ef8fb1edea82f6e18901a10eed4bcd9a839860f",
+          "size_bytes": 282894
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -37353,8 +37718,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_faf5f1b62cf2.cu",
-          "sha256": "7a2f52740d0b94acb1c15a6451a2518c0489e4680771741c5a419f4dab41e3d6",
-          "size_bytes": 283322
+          "sha256": "7e054a4fc9d08826eeb47e8bf1d835f016bbc0d0ecef6c2b38376fbedbde49f7",
+          "size_bytes": 283702
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -37583,8 +37948,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_daf27da4814d.cu",
-          "sha256": "c7161218307e5e732a2bbd2e8b0cd07d6410b48818c042a77c1272e1222a7798",
-          "size_bytes": 283322
+          "sha256": "21bad2fe34cb3319c96dec086d5ecaa1ec83b6b8851fbafb79dcbabf41da1d8d",
+          "size_bytes": 283702
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -37813,8 +38178,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_55aa88c9bc7e.cu",
-          "sha256": "396b90d8569e17e9083af7ec81a8fa62778c527610bdab0986cf6b3bf19dc640",
-          "size_bytes": 283322
+          "sha256": "d96a99ade53da563847835c4a0a0d863b114bf2e0b08c51f8ccbc2e7740c0af5",
+          "size_bytes": 283702
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -38043,8 +38408,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_bf048bd84dfd.cu",
-          "sha256": "01405aa6a20ab499cf027cb5a331a47c47b7af8888ef4eb2d5c31a770da631a3",
-          "size_bytes": 283322
+          "sha256": "68c636be5edf01135f61bcc9fc70fd89550ef6777fd70b8166d83a29656e870c",
+          "size_bytes": 283702
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -38273,8 +38638,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_aa2b90a7a34e.cu",
-          "sha256": "9979f7ba3ad7c332c2b461f5ed11d10c4537e1e07ef04f8196d1438ed025fd66",
-          "size_bytes": 283322
+          "sha256": "fc15ebfb4f08c33a2f65d04be1568ac732de91164f62b0029f0325f38a3f7536",
+          "size_bytes": 283702
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -38503,8 +38868,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_8d7cfc3f85d6.cu",
-          "sha256": "eb73b4fb41eee6766f6fb7cb9ada8028007e00298faeb4cd9b708953f5b6cd25",
-          "size_bytes": 283322
+          "sha256": "f46c694ffa0c55aee6e76ca1b7b4091552d8db940d978f93e3ee2f0b1283a29c",
+          "size_bytes": 283702
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit",
@@ -38733,8 +39098,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_6cec300144d9.cu",
-          "sha256": "640440d51e179e7f7938503b003b48d4d2c5f98ed8d6e4e6c91d6a3b30006ff7",
-          "size_bytes": 286998
+          "sha256": "a0ef81d70765f427bf979217316f6926bb92f4fb01294912396f25815d9c145c",
+          "size_bytes": 287378
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -38963,8 +39328,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_8a43f866d1b3.cu",
-          "sha256": "0893519d80f2bdac787d2aab19ac207dd1cde89c5af093fae2331b12aea5ce83",
-          "size_bytes": 286997
+          "sha256": "aa07ab1e784e27aee20cb939508800d10e56816dde17188829e504070ada76ca",
+          "size_bytes": 287377
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -39193,8 +39558,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_750b7e4c7c4d.cu",
-          "sha256": "62bfcb4a59d985c4cdd2d019a3be2d22f70c449e6545f4c5cd09eed294afd2f5",
-          "size_bytes": 286188
+          "sha256": "38048814adf795db2f6a615efa22f1fe8a5bd5f7477f584064ecfddaf2cf80cb",
+          "size_bytes": 286568
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -39423,8 +39788,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_c9386f4a65ba.cu",
-          "sha256": "5c9868883e97ec9dd44f32a0f45b35ba70ffc184d4e466cd0d3bb10a5a699440",
-          "size_bytes": 286996
+          "sha256": "f333a2289180eb79c6b8e673a175b348fe4ffcf4e5553c778c76c98920a0c059",
+          "size_bytes": 287376
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -39653,8 +40018,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_d8b86de47147.cu",
-          "sha256": "3920ece84bd330863912713ba80e12f648b801fe5c4b6a4d99fc3f526b31ef36",
-          "size_bytes": 286996
+          "sha256": "48af65e64e55d5637be4966986557791dfecff71ab8e91334632e693f76a84d5",
+          "size_bytes": 287376
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -39883,8 +40248,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_78330e94a6b5.cu",
-          "sha256": "413de28e58ee1eefb6009c38dfdea0f16c97ddb1059e395eebfd4aea94b0a1db",
-          "size_bytes": 286996
+          "sha256": "e9c1d278d6c13eed7c9bcdfa0a4b5894a5f579ca518a2ac51618e92887ebfdb2",
+          "size_bytes": 287376
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -40113,8 +40478,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_2703a93c460f.cu",
-          "sha256": "6df291f4be0ebbb0bcc0bb17cd152d7c16954b138911dc8ba6693f8a1e6e4dc1",
-          "size_bytes": 286996
+          "sha256": "7f7aa52e3eefff8a893e82a2db2b002c1d5134f85f6f72c75f1288848521c251",
+          "size_bytes": 287376
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -40343,8 +40708,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_32208efacd44.cu",
-          "sha256": "3b601fed4af3d95dffdb499078b30778bdde4c6a8fd108edde778277fca8923b",
-          "size_bytes": 286996
+          "sha256": "8fa13b3e9c071b3258232543ad076bc1ef7c8e249ced32d210b4fcf0b8804f35",
+          "size_bytes": 287376
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -40573,8 +40938,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_3720eb85c93f.cu",
-          "sha256": "be8d0c1f4f2ce00b9768f3eda6321ef4c5f41d7789ad6de07ae5ae07f95149b5",
-          "size_bytes": 286996
+          "sha256": "da6aa725fdc646056d4cd4b62f0a7abdf2a93240e4a354abd6543e532b49d2a6",
+          "size_bytes": 287376
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -40803,8 +41168,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_dc042ac28b04.cu",
-          "sha256": "87cd14984193e9e71a92aa2bbb24ce1a51260659478cbcd7c345e72e0bdb5eb4",
-          "size_bytes": 292794
+          "sha256": "bbf1c5c66c6c18a10856f64fa4e0c58bcc5b1c3e62593eedaa7c73916d66dba6",
+          "size_bytes": 293174
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -41033,8 +41398,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_ae782864247c.cu",
-          "sha256": "38d5475953149d0df6029fbaa6d9efd309b04a75a7311b21f06bb8fbc18fc62b",
-          "size_bytes": 292794
+          "sha256": "6dfb6a724d33ba0de639fd129b10098a251403431231077cfa5e3ce89844f2f5",
+          "size_bytes": 293174
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_f16io",
@@ -41263,8 +41628,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_1d0d8a94d534.cu",
-          "sha256": "4a24b11cca27cb4f2213664cb5e3a5f5f3fd0db87bccc8cf2870114a6fb767a4",
-          "size_bytes": 350285
+          "sha256": "e3908610e10973d12e6be1c37e34783340e11f67b2e400cb138fd19995eba94c",
+          "size_bytes": 350665
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial",
@@ -41493,8 +41858,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_373d87a0efe5.cu",
-          "sha256": "04020c2f89c515627f74299e5f85597e5ca7e77e1e74c0f1eb4578334a5ebd37",
-          "size_bytes": 350283
+          "sha256": "e1e74e35781bb6b43d1fa34bb2aa26072716d0b0534b45cc250e9b56ea35b4bc",
+          "size_bytes": 350663
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial",
@@ -41723,8 +42088,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_59521ae9a3c7.cu",
-          "sha256": "e7e0808fb137b24c2b14b1820eb370f8aea5a677407a9d8709be55fa50aa9d06",
-          "size_bytes": 350283
+          "sha256": "73592b3a12ea941c0fafc9abd051bcddd43e430d4f35b7230f72007cd2749044",
+          "size_bytes": 350663
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial",
@@ -41953,8 +42318,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_0895b79b711c.cu",
-          "sha256": "1d2cf33de25c84e08df8b764c6c007d71a94c8db20c52ef454f6375772a1acc0",
-          "size_bytes": 350283
+          "sha256": "263e82a5fb9a0635aa5fea37bf97a66f48294b192e16e9f8e54eff737ff56a3c",
+          "size_bytes": 350663
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial",
@@ -42183,8 +42548,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_642fc591b0ad.cu",
-          "sha256": "4a1b307bbdc63a82c3bfb19c9a337a39590aaf61326f85b09ee4f7889fa2e7c7",
-          "size_bytes": 353229
+          "sha256": "243141bb3156a7fc9e176c09d25bfe4588025135e7b89d2cae58f9ab25ed271a",
+          "size_bytes": 353609
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -42413,8 +42778,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_135bfa59984f.cu",
-          "sha256": "d5b412dd3a4feab10b27b402af3b440a871396340478f2f90a7b79237850ec48",
-          "size_bytes": 353227
+          "sha256": "0462fe66badfb1c060e18c8e078f9341d32c78de350046904b2e1883b88116c8",
+          "size_bytes": 353607
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -42643,8 +43008,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_4ff556120404.cu",
-          "sha256": "9152c41e66805e359810c7e762d335a716f6a3e8b937980720c72378f991835d",
-          "size_bytes": 353227
+          "sha256": "beb921736f150b7c35edcff4fb54b024725b5e09e2a2352bb129045368dd8d84",
+          "size_bytes": 353607
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -42881,8 +43246,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_d5faf444ff97.cu",
-          "sha256": "2cb19ce0c1b396c690097b52e88c506e826ad62a2231f0325ed95ae879f4d6c3",
-          "size_bytes": 365289
+          "sha256": "23e4bc6417819f69a45944d62b8a7428f8e884506f1df8d63786449739d47608",
+          "size_bytes": 365669
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -43119,8 +43484,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_0dda2893e70c.cu",
-          "sha256": "402ef19ea772eeca9a730f5bee27a7411960546e1c16b3ef98d47b80439d93ca",
-          "size_bytes": 365289
+          "sha256": "ea1953f5cefefc9b8b06a44ce4098cb2f05ea3b09512054755d8292606913527",
+          "size_bytes": 365669
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -43357,8 +43722,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_a6d0b5edc69e.cu",
-          "sha256": "cdec04110c679f7b516071fe389f7beff97bacd5f33e5beca8086c2c60636e94",
-          "size_bytes": 365289
+          "sha256": "4abc4966ec1d03fe61818321524f227d6c3eeca7a9f1b3459741ddcc65b57bdc",
+          "size_bytes": 365669
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -43587,8 +43952,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_d8b5b50285af.cu",
-          "sha256": "13aba03e395427ae673017d4cd93bde60e8ecbf9d52376261235a4378dd097d2",
-          "size_bytes": 353227
+          "sha256": "15b12be6c817e46cf6412c922266cfb768ae1bea2269443eeded1d8674b1d676",
+          "size_bytes": 353607
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -43825,8 +44190,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_1c987612a6c1.cu",
-          "sha256": "64d7cddf572d859c909ab172a3c204dd9b330a18fb8b4cfd422f847ce0a52665",
-          "size_bytes": 365289
+          "sha256": "13a699333849ed1c342b48cbe0f85ba2b85aa14269537cc4631192114ed66660",
+          "size_bytes": 365669
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_bf16state",
@@ -44055,8 +44420,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state_bfe2903b97e5.cu",
-          "sha256": "6b992a09fff1ca4639c0192e1a74c53a5b6d5e9be469cbbf2462e8fc4e1553ea",
-          "size_bytes": 354388
+          "sha256": "aa289810d83f3ea5cad7aa2d4fbb85adedaeb1915f1cadf9227fa232bfc62053",
+          "size_bytes": 354768
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state",
@@ -44285,8 +44650,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state_4d2db94adfb6.cu",
-          "sha256": "1bbffe1564313cdbd60e007693d285da45885102b6517e0abf854d54e843cb59",
-          "size_bytes": 354386
+          "sha256": "0c68b52fc6d3a8735de1db191ecf335e5b6ddbc34441b5c7b31d592b04413fae",
+          "size_bytes": 354766
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state",
@@ -44515,8 +44880,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state_fa7efebb6197.cu",
-          "sha256": "cc374dfd276152ff0a19913f4220ed6b0c52af498cf872df5775e900118673da",
-          "size_bytes": 354386
+          "sha256": "89195f7e2f926c370ffe8260048ca945605f78205b85b346e67680b309587258",
+          "size_bytes": 354766
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e4m3state",
@@ -44745,8 +45110,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state_fee52475fff3.cu",
-          "sha256": "2892221fb5149eca8795d922f0f7cbb9337dba63221c91be532b67ade0be8c0d",
-          "size_bytes": 354388
+          "sha256": "3681897bdd9409667eba4a33e00431bd3a891f741e97474d0f2c1a5b44bcf0e8",
+          "size_bytes": 354768
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state",
@@ -44975,8 +45340,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state_dd000093c596.cu",
-          "sha256": "6375fde333f3255d6babbc7a978443218c81b21cb99530ee0938c3d8cf44590b",
-          "size_bytes": 354386
+          "sha256": "221dde3345233a72c6f50fe73c00616a7dd4b156efab95b83d14a2fbc84caf98",
+          "size_bytes": 354766
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state",
@@ -45205,8 +45570,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state_b3cba0e81801.cu",
-          "sha256": "3bf2b18f094375bcb25dee17781fbf043c704b2f5f1ecf08f8c5a470ebcd3c6e",
-          "size_bytes": 354386
+          "sha256": "61030cc414560ea543c68fa20abe3a5996de55def1934b80da325e7c4887b306",
+          "size_bytes": 354766
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_e5m2state",
@@ -45435,8 +45800,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_2897cee67e22.cu",
-          "sha256": "963caa86c988bdb555d920923b39a84666cf64913df6dbca00809830b98cba66",
-          "size_bytes": 358297
+          "sha256": "a5416f60f7006c20d2e73854faeaf23ca5cfdd4b84b59f452744011becf56cd1",
+          "size_bytes": 358677
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -45665,8 +46030,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_ea662e66a1e2.cu",
-          "sha256": "415db3d1867e9895ee631fac458bb9b08dc1aa2483dc23c0b3297a6706183ada",
-          "size_bytes": 358295
+          "sha256": "ae49eac824f9f0b4848c00ac18a2f82d27407aad52eda922db1e5df3a5d10503",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -45895,8 +46260,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_f481beb70ea9.cu",
-          "sha256": "cda1698040be79f04c9fde7c56318a87f23a75f886c1536a418ad8d02a8a9436",
-          "size_bytes": 358295
+          "sha256": "af446f266d9ca26448d33c2ad684666c0fa8fa88702f81481eab1105be84b0e0",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -46125,8 +46490,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_d2efe8eb2aae.cu",
-          "sha256": "3afc80537ec3179f36aaad19f7e24e2be6ccc89d04926f83663bf45368e09d91",
-          "size_bytes": 358295
+          "sha256": "2bac20ccfe19a22787df8a075f26fe02aaf9a4c92811e347705c1f656581ad97",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -46355,8 +46720,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_3aa7d1f5b31b.cu",
-          "sha256": "0c4f343c3fa3da962f332a19b72f4d75ac77a97bcd976d52619c7389502404b4",
-          "size_bytes": 358295
+          "sha256": "beebfc9193209c8de3b1f99d2104d8a1501383b978991c88ca1a23b379e07570",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -46585,8 +46950,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_e721e0dc6863.cu",
-          "sha256": "088a29a668b1e91d35e4ee4e21c4e9cc2c927455afe06f1ff898125f9620f5ca",
-          "size_bytes": 358295
+          "sha256": "5589d5f883da90b8ba6380f071a84bcddb729d4d4c214a7af101cc04ba56a621",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -46815,8 +47180,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_3840a7a6e012.cu",
-          "sha256": "b8ec87abc5b79163103d900a39c7c76c3f54b3a25352dd6b44dfac3fda958df6",
-          "size_bytes": 358295
+          "sha256": "fbafbdd0233b3b4efe3992cb26129253b0aeba0f72f291299fa16295fdecb1a3",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -47045,8 +47410,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_13505860d821.cu",
-          "sha256": "22aaa362bbf4fefc566feddde3b88c9591dcf3a04bac750fda8783bee26ff742",
-          "size_bytes": 358295
+          "sha256": "6ea6c4240b7b40947726254cc001b0b6b314f051c327d106b1234836fbe30e60",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -47275,8 +47640,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_bf1731d1a93d.cu",
-          "sha256": "14ee8d6266b338a2af3cd0ed008660f9477ec9da10f479cf9a194e2667cb866f",
-          "size_bytes": 358295
+          "sha256": "145679d6921cbd14f19630107860805c68cb5ebcbd88edf22c8fbe110e809da2",
+          "size_bytes": 358675
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
@@ -47503,8 +47868,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_62d16849250d.sm_100a.cu",
-          "sha256": "029e53d435e28b396367f9a020632d1738dcf8501f8cde7142d59d3e8bc92d93",
-          "size_bytes": 358350
+          "sha256": "56893461ea63bceac1ae04c44c34fc0252161a41c5becb58444d0958d06e2722",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -47731,8 +48096,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_9a485d1222ca.sm_100a.cu",
-          "sha256": "e08a53fddda0ffba8288af837e5a30052f3e023d8e98144b78459af5d6a08f10",
-          "size_bytes": 358350
+          "sha256": "e5dd4236c653f871f47e6b43769c76f444493b189d910d59b636b365e2865d84",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -47959,8 +48324,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_f26ad2468753.sm_100a.cu",
-          "sha256": "a8f7f318f6fd16cf20e3f76ecbe5129e2587df5923bb85f5959db1cd7027991b",
-          "size_bytes": 358350
+          "sha256": "983a230e6bfe45faea2dbc7cc0a461f94ebab1515a5c37bad9dff2bc0c53edf1",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -48187,8 +48552,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_b3777fef3d8b.sm_100a.cu",
-          "sha256": "534bdce87fcd0bc0e4a4209adae087d70a570f0ca4afccf1ffaf3513839053de",
-          "size_bytes": 358350
+          "sha256": "11be29eee6c3b0cdad2de01f8b8e7d2c4f929be37711611763ebadb1c69a7ec7",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -48415,8 +48780,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_bc94a6ebc83d.sm_100a.cu",
-          "sha256": "412debb50614e605ea371c2c45d5e0534442d54701efa0ec0d6f3edd057d5ed8",
-          "size_bytes": 358350
+          "sha256": "007dbd5e3c57a359aa2829bddbd87e58fb09e519ca0e3481389b76db49908c10",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -48643,8 +49008,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_ff1fc1373ac7.sm_100a.cu",
-          "sha256": "4e2d3c8221ad5d4b0cb7d78b25f5734a347a74578f26485ac08f9a7821821731",
-          "size_bytes": 358350
+          "sha256": "bd3e5609021d4163093a318efc45c113d856851abe6a68b65c1bb9b1235ab486",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -48871,8 +49236,8 @@
             "sm_100a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold_aff8217cc85c.sm_100a.cu",
-          "sha256": "b17c71f3d8aa43ba6a369982b95f1c5022f3a3e09559976272dc7c6a70609790",
-          "size_bytes": 358350
+          "sha256": "5df349e0028e2ba2a7683c3d0c19f8b271b037f5da3b7ab6b71ee1bc37b737fa",
+          "size_bytes": 346357
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_fullgrid_vhold",
@@ -49101,8 +49466,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_ac92807e7ba4.cu",
-          "sha256": "2ce558178113554de32da1dd5345315b173dc477520695104a4619ff3bf523e8",
-          "size_bytes": 358089
+          "sha256": "13aea189921ae39f7f68fb8634cd639e48891a539127978e0fe098a976c6fb2d",
+          "size_bytes": 346136
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -49331,8 +49696,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_90d5603899d9.cu",
-          "sha256": "b844019af86b936d26b4a366def4d037c28644c2e84bfaf70b4647cf637470aa",
-          "size_bytes": 358089
+          "sha256": "cc3ea6aa0e9ff96c7ddb6621a1e7b0c525406dc2935b2f41eeb8ef89242cc14e",
+          "size_bytes": 346136
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -49561,8 +49926,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_ebd3d17eac82.cu",
-          "sha256": "0fda36947cc0e2a26d8b94c128c39fef04525e150508b77633f1631e64e587cf",
-          "size_bytes": 358087
+          "sha256": "39044306c38a372e392f6cb7ff8d4f6fc4426d23b4b9032d46b75f93b7f668dc",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -49791,8 +50156,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_a29e0cc19c9b.cu",
-          "sha256": "212977bdd2d7dc648e392078782bd6e14ab7e18da036a3b390383b3462962816",
-          "size_bytes": 358087
+          "sha256": "8bdebeef55db0a0fc44a7d3d727d186939800b8892b3e6e1c3c9261b0d9be480",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -50021,8 +50386,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_1d2420c9188c.cu",
-          "sha256": "dacd8ef3cdd11956ed7681986771fed95e09fbde727c530c8b9ad629c8ab3328",
-          "size_bytes": 358087
+          "sha256": "ff1f71b842138d35ae09b73ec07cd2fa1eee4ac235d394e1e15fd6b6026c4182",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -50251,8 +50616,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_544749c20e9f.cu",
-          "sha256": "17cb3d31fd17eacfdc399c35021e63d725c9443271a7a6b78e1908a851dc2760",
-          "size_bytes": 358087
+          "sha256": "ab00d8d6022c3d785f03917d93811769d1ab9a778a05f49c92958a39a5750c39",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -50481,8 +50846,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_894d4f98a4c7.cu",
-          "sha256": "13482fc50d62f939edaf5b3d49415154a75cfa81b27f706f839ed4d8ce5a010d",
-          "size_bytes": 358087
+          "sha256": "b005dfe7ecb8ec50a3b0dfd306f57d76a8618a16a664157a25f1e4de27368ab0",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -50711,8 +51076,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_e097d48f3e09.cu",
-          "sha256": "c2b42d9b458b70e20974f093d3a415bc42d72b76b4e6a20237f2812307ee58dc",
-          "size_bytes": 358087
+          "sha256": "b839fea46966c8a1fa5521cf8677f57848e995165edb923a156118bed4f3e09e",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -50941,8 +51306,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4_5aa991a25681.cu",
-          "sha256": "a5a744f3f4d45ad91aa635e87cff19a499d8c49c23307988abad8d584c324971",
-          "size_bytes": 358087
+          "sha256": "e9b4e64430dc2901d6f57a996b06056514758cee71f7487576851e1beb3ae8fd",
+          "size_bytes": 346134
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4",
@@ -51171,8 +51536,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state_b3ab9312c7ec.cu",
-          "sha256": "f4ac22efd7df575bec628a5a7c732c35b3e46f51f01ed97f9d874dfa3566db21",
-          "size_bytes": 349843
+          "sha256": "8f98045f714204c1f52610433b67370fffd77759b4144b945d3f7538edd81107",
+          "size_bytes": 350223
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state",
@@ -51401,8 +51766,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state_7d708a5009e7.cu",
-          "sha256": "b69425bc44951c5a6d6fd220346f744d349c3ea43209d8599044eb410f89600f",
-          "size_bytes": 349841
+          "sha256": "01c055082a5a6cc1a6e94a951eaab60bbd7f5d30e3a6a444187d777a271c7039",
+          "size_bytes": 350221
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state",
@@ -51631,8 +51996,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state_c8c67771cb18.cu",
-          "sha256": "0f780e09e24d4c5d26a0085ef0ac67fd8b7ae3a915799c3aa14fba8f10130aac",
-          "size_bytes": 349841
+          "sha256": "9bb7a80a9eeae625144609fdd9a132bd33005b2521ae96ad1205bedff13ffeaa",
+          "size_bytes": 350221
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16state",
@@ -51861,8 +52226,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_single_chunk_6d7aa504763f.cu",
-          "sha256": "f1142c14df48fc7381ceaf6963ef97a83e78b8da4b84e7cfa03a29e51ed43960",
-          "size_bytes": 238689
+          "sha256": "cb5e2cd4e353d3cbabd3b79c5af72d42854e9c8023c91555f4b4ec64021a9c1f",
+          "size_bytes": 239069
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_single_chunk",
@@ -52091,8 +52456,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_f16io_6c7285a8d69d.cu",
-          "sha256": "d61dd8880927d2e17b484475475404bf9d490d78bcefc06bfe82a6afae2c59fd",
-          "size_bytes": 258105
+          "sha256": "ea58f01dd7e8d04d92c3d11bd1a31f8eb53301d5c3d0093f54e71c5b1ba61a3f",
+          "size_bytes": 258381
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_f16io",
@@ -52321,8 +52686,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_f16io_2cb8220d9440.cu",
-          "sha256": "c6bd9fa5ff96c9f264717ec3aceac96f7b59f3abd3cf586309c32a9e81a149c8",
-          "size_bytes": 257367
+          "sha256": "298d0006ef663c5e53c7709ffe7643b023fa35c0075b6a03a4af123ea7fbf85e",
+          "size_bytes": 257643
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_f16io",
@@ -52551,8 +52916,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_f16io_7b6737dd8c0f.cu",
-          "sha256": "6644f4391eb415a485ea9cc2ceec8f57487c735e26a066d5d7d396a7dd08fce7",
-          "size_bytes": 258105
+          "sha256": "83d977b754297ba1a62da2075a6083fb31d0b5176176f43e486669325fcc8e69",
+          "size_bytes": 258381
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_f16io",
@@ -52781,8 +53146,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f756fe574915.cu",
-          "sha256": "22f4f382d4354ce3260c05ee9cd3de2f4c85af84dad9b28406f94bb5d10ffa1c",
-          "size_bytes": 294454
+          "sha256": "f20368b70b89b7416f9b41584772b6427abade1c048351bbab6dfe60fadc7930",
+          "size_bytes": 294730
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial",
@@ -53011,8 +53376,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_58707c7c1ddd.cu",
-          "sha256": "391ba9095beb403d47c7ca88952c8fb212eda52feb2329395f8df4fd493be645",
-          "size_bytes": 294454
+          "sha256": "fc2f09eecabf0c779fc3089ef4388c647fa3a0d23909681dc36721bcb2ff3a20",
+          "size_bytes": 294730
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial",
@@ -53249,8 +53614,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_bf16state_569ec99dd76e.cu",
-          "sha256": "73b80424e9ac5e122f827cc978b80bf174e403f5dac8974e507f517d113db7d9",
-          "size_bytes": 308460
+          "sha256": "46c4930cb0fced8100671f84cb49fae9887adf7538b4ee281b6cf43ad523c7c5",
+          "size_bytes": 308736
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state",
@@ -53479,8 +53844,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_bf16state_40b5d0844f6b.cu",
-          "sha256": "bbeb721183e07b6819de1bfa63c5ebfa5b41f0bff7dfb0bb991a0df6d7778f40",
-          "size_bytes": 296024
+          "sha256": "aff5a90f2e2cdd2a6f9fd53ee9b12afd4401ba081dfe1c6d21b4f707340314e1",
+          "size_bytes": 296300
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_bf16state",
@@ -53709,8 +54074,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_73c97cad2b18.cu",
-          "sha256": "7ed4d1d2809e1e0fec6158d4afefe73170e4d74cc698ab076d0e4e555bf4c7a3",
-          "size_bytes": 293588
+          "sha256": "e5931e5a6e835ba7769decc5e94921e070a86a03db3a60546500a55ef2d24d5c",
+          "size_bytes": 296126
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -53939,8 +54304,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_4048f368a7a4.cu",
-          "sha256": "6f9647f5b236a1ddf65b37680a75667072e8871ad7f11971d70549f466a90d1b",
-          "size_bytes": 293586
+          "sha256": "a215b0ac8c3dad3320548f07596df4f798d86ce8c791e39ad9fca487ae138992",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -54169,8 +54534,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_abb1b9070748.cu",
-          "sha256": "1b5fcdf3eed4e26c0add4465afbae109a78512d42ac1662b595a6eaa191b020f",
-          "size_bytes": 293586
+          "sha256": "0211e2203d194181921722676de9a42bd49820fcace1cc271f52e7e99076282b",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -54399,8 +54764,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_6c4b00dc9d1a.cu",
-          "sha256": "4f886b98eb1e06d04eabf4f681e17b9e6f45f5aaef316a470abf8740969ec0aa",
-          "size_bytes": 293586
+          "sha256": "ee6fc726757f200e9e623b42b6a38ee2c3957fe03c01753eda9b20846d275202",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -54629,8 +54994,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_65ead80090b5.cu",
-          "sha256": "398c585a9dfa7318c41bfb6e5daad3bab6b32da920c7be7732d6b0f547b63c13",
-          "size_bytes": 293586
+          "sha256": "eec58643fb19c222dc3d8d56bbfdd503676819a8802ff4a9fa8298fb4fd929db",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -54859,8 +55224,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_72bcb63ae70f.cu",
-          "sha256": "442180254af876ab9465555529ffad65e325cce6eb046768975dceb020cceab0",
-          "size_bytes": 293586
+          "sha256": "643be152aebb919431a7710af63181d763e279871f3a320da257a37661b4d62f",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -55089,8 +55454,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_5cac235e5875.cu",
-          "sha256": "9687963c06882956f51081f8093add28f1d48005fb6888eb16bb232652d5a7cb",
-          "size_bytes": 293586
+          "sha256": "2bfcba841c5b153256cecab5f8e7bcdcdea5b03e7cd20be2b5d32487b2254c7d",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -55319,8 +55684,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io_1bbd66851ffe.cu",
-          "sha256": "c5e7a5f5b48a490231cb5b3a3ad18a44e86825041c483e97f3a87bed4cb2654e",
-          "size_bytes": 293586
+          "sha256": "fc3e152bdb82337fd9591455e5373c14c49b0651762785a94d223f64e444e5b9",
+          "size_bytes": 296124
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_initial_f16io",
@@ -55338,6 +55703,936 @@
       },
       "threads": 384,
       "tma_abi": "grid_constant"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16",
+      "domain": "decode",
+      "dynamic_smem_bytes": 8832,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_0751d92fac",
+        "path": "host/cake_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7.cc",
+        "sha256": "cec468ea7607584bf814bee9b4b2150e359ba7ae9a1371cccdbd1ead303e6b6e",
+        "size_bytes": 21374
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7.sm_103a.cu",
+          "sha256": "a7bf18419e97a8b473e9b3dd4b07a4e90a42b37ecee33c4bbfc3789f646de5d5",
+          "size_bytes": 32008
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7.sm_100a.cu",
+          "sha256": "c2a6ac22a2f18f187cca1dbf9fcdf48329e1bc8a3dbfb48d30039612dd690a7b",
+          "size_bytes": 32105
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t4_bf16state_tile16",
+      "source_symbol": "gdn_decode_pretranspose_t4_bf16state_tile16",
+      "specializations": {
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "T_STEPS": 7
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16",
+      "domain": "decode",
+      "dynamic_smem_bytes": 8832,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_706ed7b2e4",
+        "path": "host/cake_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110.cc",
+        "sha256": "fc4d5bd6aadd9b245ed605936081b41a07978ecd3c291565dc8f43f11c8e567f",
+        "size_bytes": 21374
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110.sm_100a.cu",
+          "sha256": "22509d015d4963b7ec7fac9eba92a4759c113ffb452390a1bb26015714acd187",
+          "size_bytes": 32105
+        },
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110.sm_103a.cu",
+          "sha256": "99e672794f03a308af03b2c9dd718702fd9ca19137258b939e6f0fb4ee496f5d",
+          "size_bytes": 32008
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t4_bf16state_tile16",
+      "source_symbol": "gdn_decode_pretranspose_t4_bf16state_tile16",
+      "specializations": {
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "T_STEPS": 8
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "domain": "decode",
+      "dynamic_smem_bytes": 12416,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_2aa5b703bc",
+        "path": "host/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32.cc",
+        "sha256": "dd11827ce426ae68f70b29183e1193963bb5852d8ffa6c5897a39f3304ee1b57",
+        "size_bytes": 21399
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32.sm_103a.cu",
+          "sha256": "0538753f971d3a52393f99cb90cdebbe9e58277f09b0599b16482fcab78726bf",
+          "size_bytes": 47563
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32.sm_100a.cu",
+          "sha256": "6d8cd40b09d2093854bd0a15f76c933b34136fa934260ec73ff7c57a58bc0ad1",
+          "size_bytes": 47660
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "source_symbol": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "domain": "decode",
+      "dynamic_smem_bytes": 12416,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e28325f9bd",
+        "path": "host/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db.cc",
+        "sha256": "cde4e34c7a48953c881dadacf0f87094a378403f9677e0120c3525523b726822",
+        "size_bytes": 21402
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db.sm_103a.cu",
+          "sha256": "01388d1805065f5728d91ad3d6df2877564e7cc2552998bdd6db1fd018bbf836",
+          "size_bytes": 47564
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db.sm_100a.cu",
+          "sha256": "2970688e16f482047d6cd266275ef64fb9afbf413ae1c7ef777ad80a59d7c334",
+          "size_bytes": 47661
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "source_symbol": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 3670016,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
     }
   ]
 }

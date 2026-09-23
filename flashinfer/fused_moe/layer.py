@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
@@ -41,11 +42,21 @@ from .api import (
     CutlassW4A16Config,
     CutlassW4A8Config,
     CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
+    SM12xFp8Config,
+    SM12xMxfp8Mxfp4Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -66,8 +77,18 @@ from .runners import (
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorRunner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    SM12xFp8Runner,
+    SM12xMxfp8Mxfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -92,8 +113,18 @@ _RunnerT = Union[
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorRunner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    SM12xFp8Runner,
+    SM12xMxfp8Mxfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -116,8 +147,18 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassW4A16Config: CutlassW4A16Runner,
     CutlassW4A8Config: CutlassW4A8Runner,
     CuTileBf16Config: CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Config: CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorConfig: CuTileFp8PerTensorRunner,
+    CuTileMxfp4Bf16Config: CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Config: CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Config: CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Config: CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Config: CuTileMxfp8Runner,
+    CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
+    SM12xFp8Config: SM12xFp8Runner,
+    SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
@@ -143,7 +184,29 @@ class MoELayer:
     >>> out = layer(act_pack, weight_pack)
     """
 
+    @flashinfer_api
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
+        """Build the layer and the set of backend runners it will autotune over.
+
+        Every backend in ``config.backend`` whose hardware preconditions the
+        target device satisfies gets a runner; the rest are skipped here rather
+        than at call time, so an unsupported backend costs nothing per call.
+
+        Parameters
+        ----------
+        config : MoEConfig
+            Routing, quantization, expert geometry, activation, backend
+            candidates and execution parameters. Cross-field constraints are
+            validated by ``MoEConfig`` itself.
+        device : torch.device or None
+            Device whose compute capability selects the usable backends.
+            ``None`` → the current CUDA device.
+
+        Raises
+        ------
+        RuntimeError
+            If no configured backend is usable on this device's architecture.
+        """
         self.config = config
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.tuner = AutoTuner.get()
@@ -230,11 +293,41 @@ class MoELayer:
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
+    @flashinfer_api
     def __call__(
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Run the MoE layer, selecting and caching the fastest usable backend.
+
+        Only runners that support this pack's ``routing_input_mode`` compete —
+        not every backend has an in-kernel router — and the winner is cached
+        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+
+        Parameters
+        ----------
+        act_pack : MoEActivationPack
+            Backend-native activations plus routing inputs for this call.
+        weight_pack : MoEWeightPack
+            Expert weights, prepared for the selected backend's native layout.
+
+        Returns
+        -------
+        torch.Tensor or list of torch.Tensor
+            The layer output. With ``config.finalize.do_finalize=False`` the
+            unreduced TRTLLM intermediates are returned instead, as
+            ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``,
+            leaving the combine to the caller.
+
+        Raises
+        ------
+        ValueError
+            If ``act_pack.num_tokens`` exceeds the
+            ``execution.tune_max_num_tokens`` ceiling the layer was built with.
+        NotImplementedError
+            If no usable backend supports this pack's ``routing_input_mode``.
+        """
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(
@@ -289,6 +382,7 @@ class MoELayer:
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
+        best_inputs: Optional[List[torch.Tensor]] = None
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
@@ -320,8 +414,16 @@ class MoELayer:
                 best_time_ms = t_ms
                 best_runner = runner
                 best_tactic = tactic
+                best_inputs = inputs
 
         assert best_runner is not None  # runners is non-empty (checked by caller)
+        assert best_inputs is not None
+        precompile = getattr(best_runner, "_precompile_bucket_variants", None)
+        if precompile is not None:
+            # cuTile has a finite set of JIT dispatch variants inside each
+            # autotune bucket. Compile them as part of selecting that bucket's
+            # winner so ordinary serving calls need no separate warmup API.
+            precompile(best_inputs, best_tactic)
         return best_runner, best_tactic
 
     # ---- Introspection helpers ---------------------------------------------

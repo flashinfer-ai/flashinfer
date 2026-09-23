@@ -20,22 +20,19 @@ import functools
 import math
 import numbers
 import struct
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     attention_ts_decode_trace_dispatch,
     prims_ts_decode_trace_dispatch,
     prims_ts_decode_wrapper_trace_dispatch,
 )
 
-from ._tensor_aliasing import (
-    _validate_out_does_not_overlap_inputs,
-    _validate_tensor_does_not_overlap_inputs,
-)
-
+from . import _q_token_kv_block_sparse_policy as _sparse_policy
+from ._block_sparse.common import _num_sparse_pattern_heads
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
@@ -43,7 +40,7 @@ if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
 
 _SUPPORTED_HEAD_DIMS = (64, 128, 256)
-_SUPPORTED_PAGE_SIZES = (16, 32, 64, 128)
+_SUPPORTED_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
 # Decode K/V masks form an exclusive tile endpoint as
 # ``tile_offset_k + tile_size_kv`` in signed Int32.  Public policies use at
@@ -81,6 +78,7 @@ class _DecodeWorkspaceLayout:
     split_kv_counter: _WorkspaceSection
     cu_seqlens_q: _WorkspaceSection
     attention_sinks: _WorkspaceSection
+    uses_split_kv: bool
     total_bytes: int
 
 
@@ -105,6 +103,16 @@ class _DecodeLaunchSpec:
     scratch_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 
 
+class _DirectQ1CompileSpec(NamedTuple):
+    """Static raw-index geometry; tensor values and strides remain runtime inputs."""
+
+    position_dtype_key: str
+    max_seq_len_kv: int
+    block_topk: int
+    kv_block_size: int
+    page_capacity: int
+
+
 @dataclass(frozen=True)
 class _DecodeCompileSpec:
     """Batch-independent static identity for one compiled decode callable."""
@@ -118,11 +126,14 @@ class _DecodeCompileSpec:
     max_kv_len: int
     seq_len_q: int
     q_dtype_key: str
+    k_dtype_key: str
+    v_dtype_key: str
     output_dtype_key: str
     use_packed_q: bool
     max_active_clusters: int
     kv_prefix_mode: Literal["dynamic", "planned_full"]
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"]
+    direct_q1_spec: Optional[_DirectQ1CompileSpec] = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +146,11 @@ class _DecodeRuntime:
     out: torch.Tensor
     num_physical_pages: int
     k_page_stride: int
+    k_head_stride: int
+    k_token_stride: int
     v_page_stride: int
+    v_head_stride: int
+    v_token_stride: int
     bmm1_scale: float
     bmm2_scale: float
 
@@ -159,7 +174,8 @@ class _DecodePlanState:
     page_size: int
     max_kv_len: int
     q_dtype: torch.dtype
-    kv_dtype: torch.dtype
+    k_dtype: torch.dtype
+    v_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: str
     window_left: int
@@ -174,6 +190,7 @@ class _DecodePlanState:
     planned_seq_lens_host: Optional[tuple[int, ...]]
     planned_seq_lens_device: Optional[torch.Tensor]
     policy: tuple[tuple[str, object], ...]
+    storage_page_size: Optional[int] = None
 
 
 def _decode_policy_from_config(
@@ -346,6 +363,7 @@ def _make_decode_workspace_layout(
     output_dtype: torch.dtype,
     *,
     use_separate_reduction_kernel: bool,
+    use_split_kv: bool = False,
 ) -> _DecodeWorkspaceLayout:
     partial_o_shape, partial_stats_shape, counter_shape = scratch_shapes
     partial_o_dtype = output_dtype
@@ -375,6 +393,7 @@ def _make_decode_workspace_layout(
         split_kv_counter=split_kv_counter,
         cu_seqlens_q=cu_seqlens_q,
         attention_sinks=attention_sinks,
+        uses_split_kv=use_split_kv,
         total_bytes=_align_up(byte_end),
     )
 
@@ -657,30 +676,51 @@ def _dtype_key(dtype: torch.dtype) -> str:
 
 def _validate_dtype_pair(
     q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
     output_dtype: torch.dtype,
+    *,
+    allow_fp8_bf16_output: bool = False,
 ) -> None:
     _dtype_key(q_dtype)
-    _dtype_key(kv_dtype)
+    _dtype_key(k_dtype)
+    _dtype_key(v_dtype)
     _dtype_key(output_dtype)
-    if q_dtype != kv_dtype:
+    if k_dtype != q_dtype:
         raise NotImplementedError(
-            "attention-ts decode requires Q, K, and V to use the same dtype; "
-            f"got Q {q_dtype} and K/V {kv_dtype}"
+            "attention-ts decode requires Q and K to use the same dtype; "
+            f"got Q {q_dtype} and K {k_dtype}"
+        )
+    # V may keep its own dtype only for the supported QK-BF16/PV-FP8 path.
+    if v_dtype != q_dtype and not (
+        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+    ):
+        raise NotImplementedError(
+            "attention-ts decode requires Q, K, and V to use the same dtype "
+            f"except for QK-BF16/PV-FP8; got Q {q_dtype} and V {v_dtype}"
         )
     supported = (
         (q_dtype == torch.float16 and output_dtype == torch.float16)
         or (q_dtype == torch.bfloat16 and output_dtype == torch.bfloat16)
         or (
             q_dtype == torch.float8_e4m3fn
-            and output_dtype in (torch.float16, torch.float8_e4m3fn)
+            and output_dtype
+            in (
+                (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+                if allow_fp8_bf16_output
+                else (torch.float16, torch.float8_e4m3fn)
+            )
         )
     )
     if not supported:
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; got "
-            f"{q_dtype}->{output_dtype}"
+            + (
+                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; got "
+                if allow_fp8_bf16_output
+                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; got "
+            )
+            + f"{q_dtype}->{output_dtype}"
         )
 
 
@@ -895,65 +935,16 @@ def _normalize_paged_kv_cache(
     *,
     expected_device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int, int, int]:
-    """Return zero-copy HND K/V views and their runtime geometry."""
+    """Return compact HND views for block-sparse and legacy paged paths."""
 
-    if isinstance(paged_kv_cache, torch.Tensor):
-        if paged_kv_cache.ndim != 5 or paged_kv_cache.shape[1] != 2:
-            raise ValueError(
-                "combined paged_kv_cache must have shape "
-                "[num_pages, 2, Hkv, page_size, head_dim]"
-            )
-        if paged_kv_cache.device != expected_device:
-            raise ValueError(
-                f"paged_kv_cache must be on {expected_device}, "
-                f"got {paged_kv_cache.device}"
-            )
-        k_cache = paged_kv_cache[:, 0]
-        v_cache = paged_kv_cache[:, 1]
-    elif isinstance(paged_kv_cache, tuple):
-        if len(paged_kv_cache) != 2:
-            raise ValueError("paged_kv_cache tuple must contain exactly (K, V)")
-        k_cache, v_cache = paged_kv_cache
-        if not isinstance(k_cache, torch.Tensor) or not isinstance(
-            v_cache, torch.Tensor
-        ):
-            raise TypeError("paged_kv_cache tuple members must be torch.Tensor")
-        if k_cache.ndim != 4 or v_cache.ndim != 4:
-            raise ValueError(
-                "tuple K/V caches must each have shape "
-                "[num_pages, Hkv, page_size, head_dim]"
-            )
-        if k_cache.device != expected_device or v_cache.device != expected_device:
-            raise ValueError(f"tuple K/V caches must be on {expected_device}")
-    else:
-        raise TypeError(
-            "paged_kv_cache must be a combined torch.Tensor or a (K, V) tuple"
-        )
-
-    if k_cache.ndim != 4 or v_cache.ndim != 4:
-        raise ValueError("K/V cache views must be rank-4 HND tensors")
-    if k_cache.shape != v_cache.shape:
-        raise ValueError("K and V cache views must have identical logical shapes")
-    if k_cache.dtype != v_cache.dtype:
-        raise ValueError("K and V cache views must have identical dtypes")
-    if k_cache.device != v_cache.device:
-        raise ValueError("K and V cache views must be on the same device")
-
-    num_pages, num_kv_heads, page_size, head_dim = map(int, k_cache.shape)
-    if min(num_pages, num_kv_heads, page_size, head_dim) <= 0:
-        raise ValueError("paged_kv_cache dimensions must be positive")
+    views = _normalize_paged_kv_cache_views(
+        paged_kv_cache,
+        expected_device=expected_device,
+    )
+    k_cache, v_cache = views[:2]
     k_page_stride = _validate_hnd_inner_strides(k_cache, "K cache")
     v_page_stride = _validate_hnd_inner_strides(v_cache, "V cache")
-    return (
-        k_cache,
-        v_cache,
-        num_pages,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        k_page_stride,
-        v_page_stride,
-    )
+    return (*views, k_page_stride, v_page_stride)
 
 
 def _validate_block_tables(
@@ -1024,69 +1015,6 @@ def _validate_block_table_metadata(
             f"{batch_size}, got {block_table_batch_size}"
         )
     return seq_lens.device, batch_size, table_capacity
-
-
-def _csr_to_block_tables(
-    paged_kv_indices: torch.Tensor,
-    indptr: tuple[int, ...],
-    seq_lens: tuple[int, ...],
-    *,
-    page_size: int,
-) -> torch.Tensor:
-    """Materialize canonical CSR page IDs as a native fixed page table.
-
-    The caller has already synchronized to materialize and validate CSR row
-    offsets and logical lengths. Equal-width rows are exposed as a zero-copy
-    view only when their actual CSR extents equal the native table capacity.
-    Otherwise a temporary dense table copies each active prefix from its true
-    CSR row start. Its inactive tail is deliberately invalid; the native kernel
-    must bound every access by ``seq_lens``.
-    """
-
-    if paged_kv_indices.ndim != 1:
-        raise ValueError("CSR page IDs must be one-dimensional")
-    if paged_kv_indices.dtype != torch.int32:
-        raise TypeError("CSR page IDs must have dtype torch.int32")
-    if not paged_kv_indices.is_contiguous():
-        raise ValueError("CSR page IDs must be contiguous")
-    page_counts = tuple((seq_len + page_size - 1) // page_size for seq_len in seq_lens)
-    batch_size = len(page_counts)
-    if len(indptr) != batch_size + 1:
-        raise ValueError("CSR indptr must contain one more offset than rows")
-    if indptr[0] != 0:
-        raise ValueError("CSR indptr must start at zero")
-    if any(end < begin for begin, end in zip(indptr[:-1], indptr[1:], strict=True)):
-        raise ValueError("CSR indptr offsets must be nondecreasing")
-    if indptr[-1] != int(paged_kv_indices.numel()):
-        raise ValueError("the final CSR indptr offset must equal the page-ID count")
-    table_capacity = max(page_counts)
-    csr_page_counts = tuple(
-        end - begin for begin, end in zip(indptr[:-1], indptr[1:], strict=True)
-    )
-    if any(
-        active_page_count > csr_page_count
-        for active_page_count, csr_page_count in zip(
-            page_counts, csr_page_counts, strict=True
-        )
-    ):
-        raise ValueError("CSR rows do not contain every active K/V page")
-    if all(csr_page_count == table_capacity for csr_page_count in csr_page_counts):
-        return paged_kv_indices.view(batch_size, table_capacity)
-
-    block_tables = torch.full(
-        (batch_size, table_capacity),
-        -1,
-        dtype=torch.int32,
-        device=paged_kv_indices.device,
-    )
-    for request_idx, (page_begin, page_count) in enumerate(
-        zip(indptr[:-1], page_counts, strict=True)
-    ):
-        page_end = page_begin + page_count
-        block_tables[request_idx, :page_count].copy_(
-            paged_kv_indices[page_begin:page_end]
-        )
-    return block_tables
 
 
 def _decode_output_shape(
@@ -1215,12 +1143,18 @@ def _resolve_decode_launch_spec(
     max_kv_len: int,
     seq_len_q: int,
     q_dtype_key: str,
-    kv_dtype_key: str,
+    k_dtype_key: str,
+    v_dtype_key: str,
     output_dtype_key: str,
     kv_layout: str,
     mask_type: str,
     use_packed_q: bool,
     window_left: int,
+    storage_page_size: Optional[int] = None,
+    use_q_token_kv_block_sparse_route: bool = False,
+    use_pdl: bool = False,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
 
@@ -1233,10 +1167,15 @@ def _resolve_decode_launch_spec(
     )
     max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
     window_left = _validate_window_left(window_left, mask_type)
+    storage_page_size = _validate_storage_page_size(
+        page_size,
+        page_size if storage_page_size is None else storage_page_size,
+    )
 
     import cutlass
 
     from .kernels.fmha_decode.fmha_decode_config import (
+        MIN_LOOP_ITERS_PER_SPLIT,
         get_max_active_clusters_for_cluster_size,
         make_decode_config,
         make_q_tile_geometry,
@@ -1244,17 +1183,24 @@ def _resolve_decode_launch_spec(
 
     if kv_layout != "HND":
         raise ValueError("the cached TS decode compiler accepts HND only")
-    if q_dtype_key != kv_dtype_key:
-        raise ValueError("the cached TS decode compiler requires one QKV dtype")
     dtype_map = {
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
-    qkv_dtype = dtype_map[q_dtype_key]
+    q_dtype = dtype_map[q_dtype_key]
+    k_dtype = dtype_map[k_dtype_key]
+    v_dtype = dtype_map[v_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
 
-    def make_config(args: object | None = None) -> "FmhaDecodeConfig":
+    def make_config(
+        args: object | None = None,
+        *,
+        split_kv_mode: str = "disabled",
+        splits_kv: int = -1,
+        max_splits_kv: int | None = None,
+        min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
+    ) -> "FmhaDecodeConfig":
         return make_decode_config(
             headdim=head_dim,
             args=args,
@@ -1263,15 +1209,22 @@ def _resolve_decode_launch_spec(
             batch_size=batch_size,
             num_heads_q=num_qo_heads,
             num_heads_kv=num_kv_heads,
-            qkv_dtype=qkv_dtype,
+            q_dtype=q_dtype,
+            k_dtype=k_dtype,
+            v_dtype=v_dtype,
             o_dtype=output_dtype,
             qkv_layout="pagedKv",
             num_tokens_per_page=page_size,
-            split_kv_mode="disabled",
+            storage_tokens_per_page=storage_page_size,
+            split_kv_mode=split_kv_mode,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+            min_loop_iters_per_split=min_loop_iters_per_split,
             mask_type=mask_type,
             sliding_window_causal=window_left >= 0,
             attention_window_size=window_left + 1 if window_left >= 0 else 0,
             auto_tuner=True,
+            split_kv=split_kv,
         )
 
     def q_ctas(config: "FmhaDecodeConfig") -> int:
@@ -1297,55 +1250,115 @@ def _resolve_decode_launch_spec(
     # Device capacity participates in automatic selection. Resolve it in the
     # target device context without introducing caller-visible policy knobs.
     with torch.cuda.device(device_index):
-        cfg = make_config({"use_variable_seqlens_q": True} if use_packed_q else None)
         max_active_clusters = get_max_active_clusters_for_cluster_size(1)
-
-        # A grouped fixed-Q launch can leave most of the first service wave
-        # idle. In that regime, evaluate the narrowest supported Swaps head
-        # band. Keep it only when the extra head-band CTAs fit in the same
-        # resident wave without reducing KV fanout or changing the launch and
-        # reduction topology. The grouped cost selector excludes SQ1, so both
-        # configs below remain KV128; this legacy Q8-only adjustment cannot
-        # participate in or override automatic KV256 promotion.
-        if (
-            seq_len_q == 1
-            and not use_packed_q
-            and cfg.groups_tokens_heads_q
-            and not cfg.use_keeps_mma_ab
-        ):
-            grouped_q_ctas = q_ctas(cfg)
-            head_band_geometry = make_q_tile_geometry(
-                rows_per_cta=8,
-                heads_q_per_kv=num_qo_heads // num_kv_heads,
-                groups_tokens_heads_q=False,
+        if use_q_token_kv_block_sparse_route:
+            cfg = _resolve_q_token_kv_block_sparse_decode_config(
+                make_config,
+                batch_size=batch_size,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                max_kv_len=max_kv_len,
+                seq_len_q=seq_len_q,
+                q_dtype_key=q_dtype_key,
+                k_dtype_key=k_dtype_key,
+                v_dtype_key=v_dtype_key,
+                output_dtype_key=output_dtype_key,
+                mask_type=mask_type,
+                use_packed_q=use_packed_q,
+                window_left=window_left,
+                max_active_clusters=max_active_clusters,
+                use_pdl=use_pdl,
+                split_kv=split_kv,
+                share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             )
-            head_band_q_ctas = max(int(head_band_geometry.num_q_ctas(seq_len_q)), 1)
-            head_band_cfg = None
-            if head_band_q_ctas > grouped_q_ctas and fits_one_service_wave(
-                cfg, head_band_q_ctas
+        else:
+            config_overrides = {"use_pdl": use_pdl}
+            if use_packed_q:
+                config_overrides["use_variable_seqlens_q"] = True
+            cfg = make_config(config_overrides)
+
+            # A grouped fixed-Q launch can leave most of the first service wave
+            # idle. In that regime, evaluate the narrowest supported Swaps head
+            # band. Keep it only when the extra head-band CTAs fit in the same
+            # resident wave without reducing KV fanout or changing topology.
+            if (
+                seq_len_q == 1
+                and not use_packed_q
+                and cfg.groups_tokens_heads_q
+                and not cfg.use_keeps_mma_ab
             ):
-                try:
-                    head_band_cfg = make_config(
-                        {"groups_tokens_heads_q": False, "tile_size_q": 8}
-                    )
-                except ValueError:
-                    head_band_cfg = None
-            if head_band_cfg is not None:
-                same_launch_topology = all(
-                    getattr(cfg, field) == getattr(head_band_cfg, field)
-                    for field in (
-                        "use_split_kv",
-                        "splits_kv",
-                        "max_splits_kv",
-                        "use_cluster_smem_reduction",
-                        "use_separate_reduction_kernel",
-                        "use_persistent_scheduler",
-                    )
+                grouped_q_ctas = q_ctas(cfg)
+                head_band_geometry = make_q_tile_geometry(
+                    rows_per_cta=8,
+                    heads_q_per_kv=num_qo_heads // num_kv_heads,
+                    groups_tokens_heads_q=False,
                 )
-                if same_launch_topology and fits_one_service_wave(
-                    head_band_cfg, q_ctas(head_band_cfg)
+                head_band_q_ctas = max(int(head_band_geometry.num_q_ctas(seq_len_q)), 1)
+                head_band_cfg = None
+                if head_band_q_ctas > grouped_q_ctas and fits_one_service_wave(
+                    cfg, head_band_q_ctas
                 ):
-                    cfg = head_band_cfg
+                    try:
+                        head_band_cfg = make_config(
+                            {
+                                "groups_tokens_heads_q": False,
+                                "tile_size_q": 8,
+                                "use_pdl": use_pdl,
+                            }
+                        )
+                    except ValueError:
+                        head_band_cfg = None
+                if head_band_cfg is not None:
+                    same_launch_topology = all(
+                        getattr(cfg, field) == getattr(head_band_cfg, field)
+                        for field in (
+                            "use_split_kv",
+                            "splits_kv",
+                            "max_splits_kv",
+                            "use_cluster_smem_reduction",
+                            "use_separate_reduction_kernel",
+                            "use_persistent_scheduler",
+                        )
+                    )
+                    if same_launch_topology and fits_one_service_wave(
+                        head_band_cfg, q_ctas(head_band_cfg)
+                    ):
+                        cfg = head_band_cfg
+
+            q_token_kv_block_sparse_scattered_fp8 = (
+                page_size == 4
+                and storage_page_size > page_size
+                and q_dtype_key == "float8_e4m3fn"
+            )
+            unsafe_direct_swaps = not cfg.use_split_kv and not cfg.use_keeps_mma_ab
+            unsafe_split_publisher = (
+                cfg.use_split_kv and not cfg.use_separate_reduction_kernel
+            )
+            if q_token_kv_block_sparse_scattered_fp8 and (
+                unsafe_direct_swaps or unsafe_split_publisher
+            ):
+                if not split_kv:
+                    raise NotImplementedError(
+                        "this FP8 encoded-subpage profile requires split-KV; "
+                        "no qualified direct recipe is available with split_kv=False"
+                    )
+                # Direct, fused-GMEM, and cluster-SMEM publication are not
+                # qualified with encoded subpage locators on the FP8 pipeline.
+                safe_splits = int(cfg.splits_kv) if cfg.use_split_kv else 2
+                safe_tile_size_q = max(int(cfg.tile_size_q), 16)
+                cfg = make_config(
+                    {
+                        "groups_tokens_heads_q": cfg.groups_tokens_heads_q,
+                        "tile_size_q": safe_tile_size_q,
+                        "use_variable_seqlens_q": use_packed_q,
+                        "use_pdl": use_pdl,
+                    },
+                    split_kv_mode="gmem_reduction_with_separate_kernel",
+                    splits_kv=safe_splits,
+                    max_splits_kv=safe_splits,
+                )
 
     _validate_decode_policy_kv_tile_size(cfg)
     return _decode_launch_spec_from_config(
@@ -1370,10 +1383,13 @@ def _make_decode_compile_spec(
     max_kv_len: int,
     seq_len_q: int,
     q_dtype_key: str,
+    k_dtype_key: str,
+    v_dtype_key: str,
     output_dtype_key: str,
     use_packed_q: bool,
     kv_prefix_mode: Literal["dynamic", "planned_full"],
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
+    direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
@@ -1387,11 +1403,14 @@ def _make_decode_compile_spec(
         max_kv_len=max_kv_len,
         seq_len_q=seq_len_q,
         q_dtype_key=q_dtype_key,
+        k_dtype_key=k_dtype_key,
+        v_dtype_key=v_dtype_key,
         output_dtype_key=output_dtype_key,
         use_packed_q=use_packed_q,
         max_active_clusters=launch_spec.max_active_clusters,
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
+        direct_q1_spec=direct_q1_spec,
     )
 
 
@@ -1405,10 +1424,11 @@ def _get_compiled_decode(
     num_qo_heads = compile_spec.num_qo_heads
     num_kv_heads = compile_spec.num_kv_heads
     head_dim = compile_spec.head_dim
-    page_size = compile_spec.page_size
     max_kv_len = compile_spec.max_kv_len
     seq_len_q = compile_spec.seq_len_q
     q_dtype_key = compile_spec.q_dtype_key
+    k_dtype_key = compile_spec.k_dtype_key
+    v_dtype_key = compile_spec.v_dtype_key
     output_dtype_key = compile_spec.output_dtype_key
     use_packed_q = compile_spec.use_packed_q
     max_active_clusters = compile_spec.max_active_clusters
@@ -1428,15 +1448,21 @@ def _get_compiled_decode(
 
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
     from .kernels.fmha_decode.fmha_decode_kernel import fmha_decode_launch
+    from .kernels.fmha_decode.direct_sparse_metadata import DirectSparseMetadataView
+
+    direct_q1_spec = compile_spec.direct_q1_spec
 
     dtype_map = {
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
-    qkv_dtype = dtype_map[q_dtype_key]
+    q_dtype = dtype_map[q_dtype_key]
+    k_dtype = dtype_map[k_dtype_key]
+    v_dtype = dtype_map[v_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     cfg = FmhaDecodeConfig(**dict(compile_spec.config_items))
+    storage_page_size = int(cfg.effective_storage_tokens_per_page)
     partial_dtype = output_dtype
     if cfg.use_separate_reduction_kernel and output_dtype in (
         cutlass.BFloat16,
@@ -1458,16 +1484,22 @@ def _get_compiled_decode(
         out: cute.Tensor,
         seq_lens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        block_tables: cute.Tensor,
+        block_table: cute.Tensor,
+        q_token_kv_block_sparse_page_memberships: cute.Tensor,
         partial_o: cute.Tensor,
         partial_stats: cute.Tensor,
         split_kv_counter: cute.Tensor,
         attention_sinks: cute.Tensor,
         num_physical_kv_pages: cutlass.Int64,
         k_page_stride: cutlass.Int64,
+        k_head_stride: cutlass.Int64,
+        k_token_stride: cutlass.Int64,
         v_page_stride: cutlass.Int64,
+        v_head_stride: cutlass.Int64,
+        v_token_stride: cutlass.Int64,
         bmm1_scale: cutlass.Float32,
         bmm2_scale: cutlass.Float32,
+        direct_q1_inputs: tuple,
         stream: cuda_drv.CUstream,
         static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
         static_seq_len_q: cutlass.Constexpr[int],
@@ -1479,9 +1511,12 @@ def _get_compiled_decode(
         static_full_split_prefix: cutlass.Constexpr[bool],
         static_native_uniform_kv: cutlass.Constexpr[bool],
     ) -> None:
-        """Adapt TVM-FFI tensors to the row-strided native launcher."""
+        """Adapt TVM-FFI tensors to the dense block-table pointer launcher."""
 
-        batch_size = Int32(cute.size(seq_lens))
+        pattern_heads = _num_sparse_pattern_heads(
+            static_num_kv_heads, static_cfg.shares_sparse_pattern
+        )
+        batch_size = Int32(cute.size(seq_lens)) // Int32(pattern_heads)
         q_offsets_iter = cu_seqlens_q.iterator
         total_q_tokens = batch_size * Int32(static_seq_len_q)
         if cutlass.const_expr(not static_cfg.use_variable_seqlens_q):
@@ -1491,6 +1526,32 @@ def _get_compiled_decode(
             q_offsets_iter = cute.make_ptr(Int32, 0)
         else:
             total_q_tokens = Int32(q.shape[0])
+
+        lengths_iter = seq_lens.iterator
+        pages_iter = block_table.iterator
+        if cutlass.const_expr(direct_q1_spec is not None):
+            lengths_iter = DirectSparseMetadataView(
+                direct_q1_inputs,
+                cu_seqlens_q,
+                packed=static_cfg.use_variable_seqlens_q,
+                model_len=direct_q1_spec.max_seq_len_kv,
+                page_size=storage_page_size,
+                page_capacity=direct_q1_spec.page_capacity,
+                sparse_block_size=direct_q1_spec.kv_block_size,
+                fragment_size=static_cfg.num_tokens_per_page,
+                lengths=True,
+            )
+            pages_iter = DirectSparseMetadataView(
+                direct_q1_inputs,
+                cu_seqlens_q,
+                packed=static_cfg.use_variable_seqlens_q,
+                model_len=direct_q1_spec.max_seq_len_kv,
+                page_size=storage_page_size,
+                page_capacity=direct_q1_spec.page_capacity,
+                sparse_block_size=direct_q1_spec.kv_block_size,
+                fragment_size=static_cfg.num_tokens_per_page,
+                lengths=False,
+            )
 
         fmha_decode_launch(
             (
@@ -1504,10 +1565,11 @@ def _get_compiled_decode(
             k_cache.iterator,
             v_cache.iterator,
             out.iterator,
-            seq_lens.iterator,
+            lengths_iter,
             q_offsets_iter,
             total_q_tokens,
-            block_tables.iterator,
+            pages_iter,
+            q_token_kv_block_sparse_page_memberships.iterator,
             partial_o.iterator,
             partial_stats.iterator,
             split_kv_counter.iterator,
@@ -1521,12 +1583,16 @@ def _get_compiled_decode(
             static_max_kv_len,
             False,
             True,
-            block_tables.iterator,
-            Int32(block_tables.shape[1]),
-            Int64(block_tables.stride[0]),
+            Int64(block_table.stride[0]),
+            Int32(block_table.shape[1]),
+            Int32(q_token_kv_block_sparse_page_memberships.stride[0]),
             num_physical_kv_pages,
             k_page_stride,
+            k_head_stride,
+            k_token_stride,
             v_page_stride,
+            v_head_stride,
+            v_token_stride,
             static_full_split_prefix,
             static_native_uniform_kv,
         )
@@ -1547,6 +1613,7 @@ def _get_compiled_decode(
             attention_sinks: cute.Tensor,
             bmm1_scale: cutlass.Float32,
             bmm2_scale: cutlass.Float32,
+            direct_q1_inputs: tuple,
             stream: cuda_drv.CUstream,
             static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
             static_num_qo_heads: cutlass.Constexpr[int],
@@ -1557,11 +1624,27 @@ def _get_compiled_decode(
         ) -> None:
             """Adapt TVM-FFI tensors to the raw standalone split reducer."""
 
-            batch_size = Int32(cute.size(seq_lens))
+            pattern_heads = _num_sparse_pattern_heads(
+                static_num_kv_heads, static_cfg.shares_sparse_pattern
+            )
+            batch_size = Int32(cute.size(seq_lens)) // Int32(pattern_heads)
             q_offsets_iter = cu_seqlens_q.iterator
             if cutlass.const_expr(not static_cfg.use_variable_seqlens_q):
                 q_offsets_iter = cute.make_ptr(Int32, 0)
 
+            lengths_iter = seq_lens.iterator
+            if cutlass.const_expr(direct_q1_spec is not None):
+                lengths_iter = DirectSparseMetadataView(
+                    direct_q1_inputs,
+                    cu_seqlens_q,
+                    packed=static_cfg.use_variable_seqlens_q,
+                    model_len=direct_q1_spec.max_seq_len_kv,
+                    page_size=storage_page_size,
+                    page_capacity=direct_q1_spec.page_capacity,
+                    sparse_block_size=direct_q1_spec.kv_block_size,
+                    fragment_size=static_cfg.num_tokens_per_page,
+                    lengths=True,
+                )
             fmha_decode_separate_reduction_launch(
                 (
                     batch_size,
@@ -1571,7 +1654,7 @@ def _get_compiled_decode(
                     Int32(static_head_dim),
                 ),
                 out.iterator,
-                seq_lens.iterator,
+                lengths_iter,
                 q_offsets_iter,
                 partial_o.iterator,
                 partial_stats.iterator,
@@ -1584,10 +1667,15 @@ def _get_compiled_decode(
             )
 
     physical_pages = cute.sym_int()
-    block_table_capacity = cute.sym_int()
+    logical_pages = cute.sym_int()
     block_table_row_stride = cute.sym_int64(divisibility=1)
+    membership_words = cute.sym_int()
     k_outer_stride = cute.sym_int64(divisibility=1)
+    k_head_stride = cute.sym_int64(divisibility=1)
+    k_token_stride = cute.sym_int64(divisibility=1)
     v_outer_stride = cute.sym_int64(divisibility=1)
+    v_head_stride = cute.sym_int64(divisibility=1)
+    v_token_stride = cute.sym_int64(divisibility=1)
     batch_size = cute.sym_int()
     total_q_tokens = cute.sym_int()
     runtime_num_q_offsets = cute.sym_int()
@@ -1601,21 +1689,31 @@ def _get_compiled_decode(
         )
     )
     q_fake = cute.runtime.make_fake_compact_tensor(
-        qkv_dtype,
+        q_dtype,
         q_shape,
         stride_order=tuple(reversed(range(len(q_shape)))),
         assumed_align=16,
     )
     k_fake = cute.runtime.make_fake_tensor(
-        qkv_dtype,
-        (physical_pages, num_kv_heads, page_size, head_dim),
-        stride=(k_outer_stride, page_size * head_dim, head_dim, 1),
+        k_dtype,
+        (physical_pages, num_kv_heads, storage_page_size, head_dim),
+        stride=(
+            k_outer_stride,
+            k_head_stride,
+            k_token_stride,
+            1,
+        ),
         assumed_align=16,
     )
     v_fake = cute.runtime.make_fake_tensor(
-        qkv_dtype,
-        (physical_pages, num_kv_heads, page_size, head_dim),
-        stride=(v_outer_stride, page_size * head_dim, head_dim, 1),
+        v_dtype,
+        (physical_pages, num_kv_heads, storage_page_size, head_dim),
+        stride=(
+            v_outer_stride,
+            v_head_stride,
+            v_token_stride,
+            1,
+        ),
         assumed_align=16,
     )
     out_shape = _decode_output_shape(
@@ -1640,15 +1738,20 @@ def _get_compiled_decode(
             assumed_align=assumed_align,
         )
 
-    seq_lens_fake = fake_compact(Int32, (batch_size,), 4)
+    pattern_heads = _num_sparse_pattern_heads(num_kv_heads, cfg.shares_sparse_pattern)
+    metadata_rows = batch_size * pattern_heads
+    seq_lens_fake = fake_compact(Int32, (metadata_rows,), 4)
     cu_seqlens_q_fake = fake_compact(
         Int32, (runtime_num_q_offsets,) if use_packed_q else (1,), 4
     )
-    block_tables_fake = cute.runtime.make_fake_tensor(
+    block_table_fake = cute.runtime.make_fake_tensor(
         Int32,
-        (batch_size, block_table_capacity),
+        (metadata_rows, logical_pages),
         stride=(block_table_row_stride, 1),
         assumed_align=4,
+    )
+    q_token_kv_block_sparse_page_memberships_fake = fake_compact(
+        Int32, (metadata_rows, membership_words), 4
     )
     partial_o_shape, partial_stats_shape, counter_shape = _decode_scratch_shapes(
         cfg,
@@ -1663,6 +1766,37 @@ def _get_compiled_decode(
     counter_fake = fake_compact(Int32, counter_shape, 4)
     attention_sinks_fake = fake_compact(Float32, (1,), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    direct_q1_fake: tuple = ()
+    if direct_q1_spec is not None:
+        rows = cute.sym_int()
+        direct_q1_fake = (
+            cute.runtime.make_fake_tensor(
+                Int32,
+                (
+                    (rows, direct_q1_spec.block_topk)
+                    if cfg.shares_sparse_pattern
+                    else (rows, num_kv_heads, direct_q1_spec.block_topk)
+                ),
+                stride=(
+                    (cute.sym_int64(), 1)
+                    if cfg.shares_sparse_pattern
+                    else (cute.sym_int64(), cute.sym_int64(), 1)
+                ),
+                assumed_align=4,
+            ),
+            cute.runtime.make_fake_tensor(
+                Int32,
+                (cute.sym_int(), cute.sym_int()),
+                stride=(cute.sym_int64(), 1),
+                assumed_align=4,
+            ),
+            fake_compact(Int32, (rows,), 4),
+            fake_compact(
+                Int64 if direct_q1_spec.position_dtype_key == "int64" else Int32,
+                (rows,),
+                4,
+            ),
+        )
 
     with torch.cuda.device(device_index):
         compiled_main = cute.compile(
@@ -1673,7 +1807,8 @@ def _get_compiled_decode(
             out_fake,
             seq_lens_fake,
             cu_seqlens_q_fake,
-            block_tables_fake,
+            block_table_fake,
+            q_token_kv_block_sparse_page_memberships_fake,
             partial_o_fake,
             partial_stats_fake,
             counter_fake,
@@ -1681,8 +1816,13 @@ def _get_compiled_decode(
             Int64(1),
             Int64(1),
             Int64(1),
+            Int64(1),
+            Int64(1),
+            Int64(1),
+            Int64(1),
             Float32(1.0),
             Float32(1.0),
+            direct_q1_fake,
             stream_fake,
             cfg,
             seq_len_q,
@@ -1708,6 +1848,7 @@ def _get_compiled_decode(
                 attention_sinks_fake,
                 Float32(1.0),
                 Float32(1.0),
+                direct_q1_fake,
                 stream_fake,
                 cfg,
                 num_qo_heads,
@@ -1733,12 +1874,15 @@ def get_prims_ts_batch_decode_workspace_size(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     q_dtype: torch.dtype = torch.float16,
-    kv_dtype: Optional[torch.dtype] = None,
+    k_dtype: Optional[torch.dtype] = None,
+    v_dtype: Optional[torch.dtype] = None,
     out_dtype: Optional[torch.dtype] = None,
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
     kv_layout: Literal["HND"] = "HND",
+    storage_page_size: Optional[int] = None,
     device: Optional[Union[int, str, torch.device]] = None,
+    split_kv: bool = True,
 ) -> int:
     """Return caller-workspace bytes for one automatic FMHA policy.
 
@@ -1753,9 +1897,18 @@ def get_prims_ts_batch_decode_workspace_size(
     static ``max_seq_len_q`` bound used for workspace geometry and JIT policy.
     ``max_seq_len`` must be no larger than ``2,147,483,392`` so the padded
     256-token K/V tile endpoint remains representable as signed Int32.
+    ``storage_page_size`` defaults to the semantic ``page_size``. A larger
+    physical page is supported only for semantic page size four and activates
+    encoded ``(physical page, subpage)`` locators.
     This sizing helper validates that every cumulative-offset delta is positive
     and no larger than the bound. If ``device`` is omitted, it is inferred from
-    ``qo_indptr`` for a packed launch.
+    ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
+    ``v_dtype`` to ``k_dtype``; pass ``v_dtype=torch.float8_e4m3fn`` with
+    BF16 Q/K to size the QK-BF16/PV-FP8 launch.
+
+    ``split_kv`` permits automatic split fanout when True (default), or forces
+    nonsplit execution when False. It is independent of Q layout and must
+    match the value supplied to attention planning/launch.
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -1775,21 +1928,27 @@ def get_prims_ts_batch_decode_workspace_size(
     )
     head_dim = _validate_head_dim(head_dim)
     page_size = _validate_page_size(page_size)
+    storage_page_size = _validate_storage_page_size(
+        page_size,
+        page_size if storage_page_size is None else storage_page_size,
+    )
     max_seq_len = _validate_max_kv_len(max_seq_len, "max_seq_len")
     _validate_layout(kv_layout)
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
-    if kv_dtype is None:
-        kv_dtype = q_dtype
+    if k_dtype is None:
+        k_dtype = q_dtype
+    if v_dtype is None:
+        v_dtype = k_dtype
     if out_dtype is None:
         out_dtype = q_dtype
-    _validate_dtype_pair(q_dtype, kv_dtype, out_dtype)
+    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
     inferred_device = (
         qo_indptr.device
         if device is None and isinstance(qo_indptr, torch.Tensor)
         else device
     )
-    resolved_device, device_index = _resolve_cuda_device(inferred_device)
+    resolved_device, _ = _resolve_cuda_device(inferred_device)
     if qo_indptr is not None:
         _validate_qo_indptr(
             qo_indptr,
@@ -1801,8 +1960,7 @@ def get_prims_ts_batch_decode_workspace_size(
             max_seq_len_q=seq_len_q,
         )
 
-    spec = _resolve_decode_launch_spec(
-        device_index,
+    return _resolve_decode_workspace_layout(
         batch_size,
         num_qo_heads,
         num_kv_heads,
@@ -1810,18 +1968,17 @@ def get_prims_ts_batch_decode_workspace_size(
         page_size,
         max_seq_len,
         seq_len_q,
-        _dtype_key(q_dtype),
-        _dtype_key(kv_dtype),
-        _dtype_key(out_dtype),
+        q_dtype,
+        k_dtype,
+        v_dtype,
+        out_dtype,
         kv_layout,
         mask_type,
         use_packed_q,
         window_left,
-    )
-    return _make_decode_workspace_layout(
-        spec.scratch_shapes,
-        out_dtype,
-        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+        storage_page_size,
+        resolved_device,
+        split_kv=split_kv,
     ).total_bytes
 
 
@@ -1838,13 +1995,16 @@ def _prepare_decode_runtime(
     head_dim: int,
     page_size: int,
     q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
     output_dtype: torch.dtype,
     bmm1_scale: Optional[float],
     bmm2_scale: float,
     out: Optional[torch.Tensor],
 ) -> _DecodeRuntime:
     """Validate runtime tensors and normalize zero-copy K/V views."""
+
+    storage_page_size = page_size
 
     _validate_q(
         q,
@@ -1856,29 +2016,28 @@ def _prepare_decode_runtime(
         head_dim=head_dim,
         q_dtype=q_dtype,
     )
-    (
-        k_cache,
-        v_cache,
-        num_physical_pages,
-        runtime_num_kv_heads,
-        runtime_page_size,
-        runtime_head_dim,
-        k_page_stride,
-        v_page_stride,
-    ) = _normalize_paged_kv_cache(paged_kv_cache, expected_device=device)
+    normalized_cache = _normalize_native_paged_kv_cache(
+        paged_kv_cache,
+        expected_device=device,
+    )
+    k_cache = normalized_cache.k_cache
+    v_cache = normalized_cache.v_cache
     if (
-        runtime_num_kv_heads != num_kv_heads
-        or runtime_page_size != page_size
-        or runtime_head_dim != head_dim
+        normalized_cache.num_kv_heads != num_kv_heads
+        or normalized_cache.storage_page_size != storage_page_size
+        or normalized_cache.head_dim != head_dim
     ):
         raise ValueError(
             "paged_kv_cache geometry does not match the launch: expected "
-            f"Hkv/page/D=({num_kv_heads}, {page_size}, {head_dim}), got "
-            f"({runtime_num_kv_heads}, {runtime_page_size}, {runtime_head_dim})"
+            f"Hkv/storage_page/D=({num_kv_heads}, {storage_page_size}, "
+            f"{head_dim}), got "
+            f"({normalized_cache.num_kv_heads}, "
+            f"{normalized_cache.storage_page_size}, {normalized_cache.head_dim})"
         )
-    if k_cache.dtype != kv_dtype:
+    if k_cache.dtype != k_dtype or v_cache.dtype != v_dtype:
         raise ValueError(
-            f"K/V dtype must match the launch ({kv_dtype}), got {k_cache.dtype}"
+            f"K/V dtype must match the launch (K {k_dtype}, V {v_dtype}), got K "
+            f"{k_cache.dtype} and V {v_cache.dtype}"
         )
     effective_bmm1_scale = _validate_scale(
         1.0 / math.sqrt(head_dim) if bmm1_scale is None else bmm1_scale,
@@ -1908,33 +2067,15 @@ def _prepare_decode_runtime(
         k_cache=k_cache,
         v_cache=v_cache,
         out=out,
-        num_physical_pages=num_physical_pages,
-        k_page_stride=k_page_stride,
-        v_page_stride=v_page_stride,
+        num_physical_pages=normalized_cache.num_physical_pages,
+        k_page_stride=normalized_cache.k_page_stride,
+        k_head_stride=normalized_cache.k_head_stride,
+        k_token_stride=normalized_cache.k_token_stride,
+        v_page_stride=normalized_cache.v_page_stride,
+        v_head_stride=normalized_cache.v_head_stride,
+        v_token_stride=normalized_cache.v_token_stride,
         bmm1_scale=effective_bmm1_scale,
         bmm2_scale=effective_bmm2_scale,
-    )
-
-
-def _validate_decode_output_aliasing(
-    runtime: _DecodeRuntime,
-    *,
-    seq_lens: torch.Tensor,
-    qo_indptr: Optional[torch.Tensor],
-    block_tables: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-) -> None:
-    """Keep output disjoint from every live FMHA decode allocation."""
-
-    _validate_out_does_not_overlap_inputs(
-        runtime.out,
-        ("query", runtime.q),
-        ("k_cache", runtime.k_cache),
-        ("v_cache", runtime.v_cache),
-        ("seq_lens", seq_lens),
-        ("qo_indptr", qo_indptr),
-        ("block_tables", block_tables),
-        ("workspace_buffer", workspace_buffer),
     )
 
 
@@ -1959,15 +2100,21 @@ def _launch_decode(
         seq_lens,
         q_offsets,
         block_tables,
+        block_tables,  # Dense decode constexpr-elides the membership table.
         workspace.partial_o,
         workspace.partial_stats,
         workspace.split_kv_counter,
         workspace.attention_sinks,
         runtime.num_physical_pages,
         runtime.k_page_stride,
+        runtime.k_head_stride,
+        runtime.k_token_stride,
         runtime.v_page_stride,
+        runtime.v_head_stride,
+        runtime.v_token_stride,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
+        (),
     )
     if compiled_reducer is not None:
         compiled_reducer(
@@ -1979,6 +2126,7 @@ def _launch_decode(
             workspace.attention_sinks,
             runtime.bmm1_scale,
             runtime.bmm2_scale,
+            (),
         )
     return runtime.out
 
@@ -2068,7 +2216,11 @@ def _prepare_decode_runtime_unchecked(
         out=out,
         num_physical_pages=int(k_cache.shape[0]),
         k_page_stride=int(k_cache.stride(0)),
+        k_head_stride=int(k_cache.stride(1)),
+        k_token_stride=int(k_cache.stride(2)),
         v_page_stride=int(v_cache.stride(0)),
+        v_head_stride=int(v_cache.stride(1)),
+        v_token_stride=int(v_cache.stride(2)),
         bmm1_scale=(
             1.0 / math.sqrt(state.head_dim) if bmm1_scale is None else float(bmm1_scale)
         ),
@@ -2105,17 +2257,20 @@ def _validate_decode_run_metadata_values(
             )
 
     block_table_rows = block_tables.tolist()
+    locator_capacity = runtime.num_physical_pages * (
+        (state.storage_page_size or state.page_size) // state.page_size
+    )
     for request_idx, (row, seq_len) in enumerate(
         zip(block_table_rows, runtime_seq_lens, strict=True)
     ):
         required_pages = (seq_len + state.page_size - 1) // state.page_size
         if any(
-            int(page_id) < 0 or int(page_id) >= runtime.num_physical_pages
+            int(page_id) < 0 or int(page_id) >= locator_capacity
             for page_id in row[:required_pages]
         ):
             raise ValueError(
                 "block_tables values for active pages must index the physical "
-                f"K/V cache in [0, {runtime.num_physical_pages}); request "
+                f"K/V cache through locators in [0, {locator_capacity}); request "
                 f"{request_idx} contains an invalid page ID"
             )
 
@@ -2148,7 +2303,1229 @@ def _validate_decode_run_metadata_values(
                 )
 
 
-@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
+@dataclass(frozen=True)
+class _NativePagedKVCache:
+    """Zero-copy logical HND views and TensorMap strides for native decode."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    num_physical_pages: int
+    num_kv_heads: int
+    storage_page_size: int
+    head_dim: int
+    k_page_stride: int
+    k_head_stride: int
+    k_token_stride: int
+    v_page_stride: int
+    v_head_stride: int
+    v_token_stride: int
+
+
+@dataclass(frozen=True)
+class PrimsTSBatchDecodePlan:
+    """Validated dense-page-table PrimTS state for framework hot paths.
+
+    The plan retains the K/V cache, dense block-table storage, compiled
+    callables, and typed workspace views validated at construction. Block-table
+    and sequence-length values may change between completed launches, which is
+    the contract needed by QToken-KvBlock-Sparse-Attention metadata builders. Query and output storage may
+    also change, but must preserve the exact shape, dtype, device, and strides
+    proven by the representative tensors passed to
+    :func:`prepare_prims_ts_batch_decode_with_kv_cache`.
+
+    ``run`` deliberately omits repeated cache-stride validation, workspace
+    rebinding, and semantic-policy resolution. Storage overlap is not checked
+    during preparation or execution. The framework must keep retained tensors
+    alive, keep output/workspace disjoint from the inputs and each other, and
+    not mutate metadata concurrently with a launch or replay that reads it.
+    """
+
+    _query_shape: tuple[int, ...]
+    _query_stride: tuple[int, ...]
+    _output_shape: tuple[int, ...]
+    _output_stride: tuple[int, ...]
+    _device: torch.device
+    _q_dtype: torch.dtype
+    _output_dtype: torch.dtype
+    _head_dim: int
+    _cache: _NativePagedKVCache
+    _seq_lens: torch.Tensor
+    _qo_indptr: Optional[torch.Tensor]
+    _block_table: torch.Tensor
+    _q_token_kv_block_sparse_page_memberships: torch.Tensor
+    _workspace: _DecodeWorkspaceViews
+    _compiled_main: Callable[..., object]
+    _compiled_reducer: Optional[Callable[..., object]]
+    _direct_q1_inputs: tuple[torch.Tensor, ...] = ()
+
+    def run(
+        self,
+        query: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        bmm1_scale: Optional[float] = None,
+        bmm2_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """Launch with lightweight checks against the validated plan."""
+
+        if (
+            query.shape != self._query_shape
+            or query.stride() != self._query_stride
+            or query.device != self._device
+            or query.dtype != self._q_dtype
+        ):
+            raise ValueError(
+                "query must preserve the shape, strides, device, and dtype "
+                "validated by the PrimTS plan"
+            )
+        if (
+            out.shape != self._output_shape
+            or out.stride() != self._output_stride
+            or out.device != self._device
+            or out.dtype != self._output_dtype
+        ):
+            raise ValueError(
+                "out must preserve the shape, strides, device, and dtype "
+                "validated by the PrimTS plan"
+            )
+
+        scale_qk = _validate_scale(
+            1.0 / math.sqrt(self._head_dim) if bmm1_scale is None else bmm1_scale,
+            "bmm1_scale",
+        )
+        scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
+        return self._run_unchecked(query, out, scale_qk, scale_v)
+
+    def _run_unchecked(
+        self,
+        query: torch.Tensor,
+        out: torch.Tensor,
+        scale_qk: float,
+        scale_v: float,
+        direct_q1_inputs: Optional[tuple[torch.Tensor, ...]] = None,
+    ) -> torch.Tensor:
+        """Launch state already proven by a framework-owned outer plan."""
+
+        q_offsets = (
+            self._workspace.cu_seqlens_q if self._qo_indptr is None else self._qo_indptr
+        )
+        direct_inputs = (
+            self._direct_q1_inputs if direct_q1_inputs is None else direct_q1_inputs
+        )
+        self._compiled_main(
+            query,
+            self._cache.k_cache,
+            self._cache.v_cache,
+            out,
+            self._seq_lens,
+            q_offsets,
+            self._block_table,
+            self._q_token_kv_block_sparse_page_memberships,
+            self._workspace.partial_o,
+            self._workspace.partial_stats,
+            self._workspace.split_kv_counter,
+            self._workspace.attention_sinks,
+            self._cache.num_physical_pages,
+            self._cache.k_page_stride,
+            self._cache.k_head_stride,
+            self._cache.k_token_stride,
+            self._cache.v_page_stride,
+            self._cache.v_head_stride,
+            self._cache.v_token_stride,
+            scale_qk,
+            scale_v,
+            direct_inputs,
+        )
+        if self._compiled_reducer is not None:
+            self._compiled_reducer(
+                out,
+                self._seq_lens,
+                q_offsets,
+                self._workspace.partial_o,
+                self._workspace.partial_stats,
+                self._workspace.attention_sinks,
+                scale_qk,
+                scale_v,
+                direct_inputs,
+            )
+        return out
+
+
+def _resolve_decode_workspace_layout(
+    batch_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_seq_len: int,
+    seq_len_q: int,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    kv_layout: str,
+    mask_type: str,
+    use_packed_q: bool,
+    window_left: int,
+    storage_page_size: int,
+    device: Optional[Union[int, str, torch.device]],
+    use_q_token_kv_block_sparse_route: bool = False,
+    use_pdl: bool = False,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
+) -> _DecodeWorkspaceLayout:
+    """Resolve the byte layout for one already-validated semantic key."""
+
+    _, device_index = _resolve_cuda_device(device)
+    spec = _resolve_decode_launch_spec(
+        device_index,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        seq_len_q,
+        _dtype_key(q_dtype),
+        _dtype_key(k_dtype),
+        _dtype_key(v_dtype),
+        _dtype_key(out_dtype),
+        kv_layout,
+        mask_type,
+        use_packed_q,
+        window_left,
+        storage_page_size,
+        use_q_token_kv_block_sparse_route,
+        use_pdl,
+        split_kv,
+        share_pattern_across_kv_heads,
+    )
+    return _make_decode_workspace_layout(
+        spec.scratch_shapes,
+        out_dtype,
+        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+        use_split_kv=spec.config.use_split_kv,
+    )
+
+
+def _validate_storage_page_size(page_size: int, storage_page_size: int) -> int:
+    """Require physical cache pages to contain whole logical fragments."""
+    storage_page_size = _validate_positive_int(storage_page_size, "storage_page_size")
+    if storage_page_size % page_size != 0:
+        raise ValueError("storage_page_size must be divisible by page_size")
+    return storage_page_size
+
+
+def _normalize_paged_kv_cache_views(
+    paged_kv_cache: PagedKVCache,
+    *,
+    expected_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int]:
+    """Return structurally validated zero-copy logical HND K/V views."""
+
+    if isinstance(paged_kv_cache, torch.Tensor):
+        if paged_kv_cache.ndim != 5 or paged_kv_cache.shape[1] != 2:
+            raise ValueError(
+                "combined paged_kv_cache must have shape "
+                "[num_pages, 2, Hkv, page_size, head_dim]"
+            )
+        if paged_kv_cache.device != expected_device:
+            raise ValueError(
+                f"paged_kv_cache must be on {expected_device}, "
+                f"got {paged_kv_cache.device}"
+            )
+        k_cache = paged_kv_cache[:, 0]
+        v_cache = paged_kv_cache[:, 1]
+    elif isinstance(paged_kv_cache, tuple):
+        if len(paged_kv_cache) != 2:
+            raise ValueError("paged_kv_cache tuple must contain exactly (K, V)")
+        k_cache, v_cache = paged_kv_cache
+        if not isinstance(k_cache, torch.Tensor) or not isinstance(
+            v_cache, torch.Tensor
+        ):
+            raise TypeError("paged_kv_cache tuple members must be torch.Tensor")
+        if k_cache.ndim != 4 or v_cache.ndim != 4:
+            raise ValueError(
+                "tuple K/V caches must each have shape "
+                "[num_pages, Hkv, page_size, head_dim]"
+            )
+        if k_cache.device != expected_device or v_cache.device != expected_device:
+            raise ValueError(f"tuple K/V caches must be on {expected_device}")
+    else:
+        raise TypeError(
+            "paged_kv_cache must be a combined torch.Tensor or a (K, V) tuple"
+        )
+
+    if k_cache.ndim != 4 or v_cache.ndim != 4:
+        raise ValueError("K/V cache views must be rank-4 HND tensors")
+    if k_cache.shape != v_cache.shape:
+        raise ValueError("K and V cache views must have identical logical shapes")
+    if k_cache.device != v_cache.device:
+        raise ValueError("K and V cache views must be on the same device")
+
+    num_pages, num_kv_heads, page_size, head_dim = map(int, k_cache.shape)
+    if min(num_pages, num_kv_heads, page_size, head_dim) <= 0:
+        raise ValueError("paged_kv_cache dimensions must be positive")
+    return (
+        k_cache,
+        v_cache,
+        num_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )
+
+
+def _validate_native_hnd_tma_strides(
+    tensor: torch.Tensor,
+    name: str,
+) -> tuple[int, int, int]:
+    """Validate a non-overlapping logical HND view for TensorMap addressing."""
+
+    num_pages, num_kv_heads, storage_page_size, head_dim = map(int, tensor.shape)
+    page_stride, head_stride, token_stride, dim_stride = map(int, tensor.stride())
+    if dim_stride != 1:
+        raise ValueError(f"{name} head-dimension stride must be one")
+    named_strides = (
+        ("page", page_stride),
+        ("head", head_stride),
+        ("token", token_stride),
+    )
+    if any(stride <= 0 for _, stride in named_strides):
+        raise ValueError(f"{name} TensorMap strides must be positive")
+    max_int64 = 2**63 - 1
+    if any(stride > max_int64 for _, stride in named_strides):
+        raise ValueError(f"{name} TensorMap stride exceeds signed int64")
+
+    element_size = tensor.element_size()
+    for stride_name, stride in named_strides:
+        if stride * element_size % 16 != 0:
+            raise ValueError(f"{name} {stride_name} stride must be 16-byte aligned")
+    _validate_16byte_alignment(tensor, name)
+
+    # A gapped K or V slice of a packed 2D cache is not dense, so PyTorch's
+    # dense-layout predicates cannot establish safety. Prove non-overlap from
+    # the actual logical dimensions and strides instead.
+    span = 1
+    dimensions = sorted(
+        (
+            (1, head_dim, "head dimension"),
+            (token_stride, storage_page_size, "token"),
+            (head_stride, num_kv_heads, "head"),
+            (page_stride, num_pages, "page"),
+        ),
+        key=lambda item: item[0],
+    )
+    for stride, extent, dimension_name in dimensions:
+        if extent <= 1:
+            continue
+        if stride < span:
+            raise ValueError(
+                f"{name} {dimension_name} dimension overlaps another dimension"
+            )
+        span += (extent - 1) * stride
+        if span - 1 > max_int64:
+            raise ValueError(f"{name} address span exceeds signed int64")
+    return page_stride, head_stride, token_stride
+
+
+def _normalize_native_paged_kv_cache(
+    paged_kv_cache: PagedKVCache,
+    *,
+    expected_device: torch.device,
+) -> _NativePagedKVCache:
+    """Return native decode views supporting HND- or NHD-physical storage."""
+
+    (
+        k_cache,
+        v_cache,
+        num_pages,
+        num_kv_heads,
+        storage_page_size,
+        head_dim,
+    ) = _normalize_paged_kv_cache_views(
+        paged_kv_cache,
+        expected_device=expected_device,
+    )
+    k_page_stride, k_head_stride, k_token_stride = _validate_native_hnd_tma_strides(
+        k_cache, "K cache"
+    )
+    v_page_stride, v_head_stride, v_token_stride = _validate_native_hnd_tma_strides(
+        v_cache, "V cache"
+    )
+    return _NativePagedKVCache(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        num_physical_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        storage_page_size=storage_page_size,
+        head_dim=head_dim,
+        k_page_stride=k_page_stride,
+        k_head_stride=k_head_stride,
+        k_token_stride=k_token_stride,
+        v_page_stride=v_page_stride,
+        v_head_stride=v_head_stride,
+        v_token_stride=v_token_stride,
+    )
+
+
+def _validate_q_token_kv_block_sparse_page_memberships(
+    q_token_kv_block_sparse_page_memberships: torch.Tensor,
+    *,
+    expected_device: torch.device,
+    batch_size: int,
+    max_num_pages: int,
+) -> None:
+    """Validate the private grouped-QToken-KvBlock-Sparse-Attention packed-membership table."""
+
+    if not isinstance(q_token_kv_block_sparse_page_memberships, torch.Tensor):
+        raise TypeError(
+            "q_token_kv_block_sparse_page_memberships must be a torch.Tensor"
+        )
+    if q_token_kv_block_sparse_page_memberships.ndim != 2:
+        raise ValueError(
+            f"q_token_kv_block_sparse_page_memberships must be rank 2, got rank {q_token_kv_block_sparse_page_memberships.ndim}"
+        )
+    if q_token_kv_block_sparse_page_memberships.dtype != torch.int32:
+        raise TypeError(
+            "q_token_kv_block_sparse_page_memberships must have dtype torch.int32"
+        )
+    if q_token_kv_block_sparse_page_memberships.device != expected_device:
+        raise ValueError(
+            f"q_token_kv_block_sparse_page_memberships must be on {expected_device}, got "
+            f"{q_token_kv_block_sparse_page_memberships.device}"
+        )
+    if not q_token_kv_block_sparse_page_memberships.is_contiguous():
+        raise ValueError("q_token_kv_block_sparse_page_memberships must be contiguous")
+    expected_shape = (batch_size, (max_num_pages + 3) // 4)
+    if tuple(q_token_kv_block_sparse_page_memberships.shape) != expected_shape:
+        raise ValueError(
+            "q_token_kv_block_sparse_page_memberships must have shape "
+            f"{expected_shape}, got {tuple(q_token_kv_block_sparse_page_memberships.shape)}"
+        )
+    if q_token_kv_block_sparse_page_memberships.data_ptr() % 4 != 0:
+        raise ValueError(
+            "q_token_kv_block_sparse_page_memberships data pointer must be 4-byte aligned"
+        )
+
+
+def _resolve_q_token_kv_block_sparse_decode_config(
+    make_config: Callable[..., "FmhaDecodeConfig"],
+    *,
+    batch_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_kv_len: int,
+    seq_len_q: int,
+    q_dtype_key: str,
+    k_dtype_key: str,
+    v_dtype_key: str,
+    output_dtype_key: str,
+    mask_type: str,
+    use_packed_q: bool,
+    window_left: int,
+    max_active_clusters: int,
+    use_pdl: bool,
+    split_kv: bool = True,
+    share_pattern_across_kv_heads: bool = True,
+) -> "FmhaDecodeConfig":
+    """Resolve the private encoded-page QToken-KvBlock-Sparse-Attention profile without compiling it."""
+
+    from .kernels.fmha_decode.fmha_decode_config import (
+        MIN_LOOP_ITERS_PER_SPLIT,
+    )
+
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+    _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
+        seq_len_q,
+        num_qo_heads,
+        num_kv_heads,
+    )
+    # This route has no QK-BF16/PV-FP8 kernel, so Q, K, and V must match.
+    q_token_kv_block_sparse_dtype_supported = (
+        q_dtype_key == k_dtype_key == v_dtype_key
+        and (
+            q_dtype_key == output_dtype_key
+            and q_dtype_key in ("float16", "bfloat16")
+            or (
+                q_dtype_key == "float8_e4m3fn"
+                and output_dtype_key in ("float16", "bfloat16")
+            )
+        )
+    )
+    if not (
+        page_size in _SUPPORTED_PAGE_SIZES
+        and head_dim in _SUPPORTED_HEAD_DIMS
+        and q_token_kv_block_sparse_dtype_supported
+        and mask_type == "causal"
+        and window_left < 0
+    ):
+        raise ValueError(
+            "PrimTS QToken-KvBlock-Sparse-Attention requires a supported sparse-fragment size, head_dim in {64,128,256}, "
+            "FP16/BF16 Q/K/V with matching output or FP8 Q/K/V with FP16/BF16 output, "
+            "and a causal non-windowed mask"
+        )
+
+    launch = _sparse_policy.select_sparse_launch(
+        group_size=seq_len_q,
+        heads_q_per_kv=heads_q_per_kv,
+        head_dim=head_dim,
+        q_dtype_key=q_dtype_key,
+        num_routes=batch_size,
+        num_kv_heads=num_kv_heads,
+        route_kv_tokens=max_kv_len,
+        multi_processor_count=max_active_clusters,
+        split_kv=split_kv,
+    )
+
+    q_token_kv_block_sparse_profile = {
+        "use_variable_seqlens_q": use_packed_q,
+        "use_q_token_kv_block_sparse_route": True,
+        "share_pattern_across_kv_heads": share_pattern_across_kv_heads,
+        "use_pdl": use_pdl,
+        "use_keeps_mma_ab": launch.use_keeps_mma_ab,
+        "groups_tokens_heads_q": True,
+        "tile_size_q": launch.tile_size_q,
+        "tile_size_kv": _sparse_policy.TILE_SIZE_KV,
+        "head_dim_per_stage_kv": launch.head_dim_per_stage_kv,
+        "num_insts_kv": launch.num_insts_kv,
+        "use_persistent_scheduler": launch.use_persistent_scheduler,
+        "correction_num_warps": 4,
+        "mma_warp_idx": 12,
+        # CLC uses the control slot beside MMA; page producers occupy the
+        # remaining slots. TMA issuers keep their own complete warp groups.
+        "scheduler_warp_idx": 13,
+        "clc_load_warp_idx": 16,
+        "page_offsets_warp_idx": 14,
+        "page_offsets_num_warps": 2 if seq_len_q == 1 else 1,
+        "load_warp_idx": 16,
+        # FP8's predicated TMA helper constructs coordinates in every load
+        # lane, so Q1 needs only one producer warpgroup. BF16 distributes page
+        # fragments across two producer warpgroups. Grouped routes keep
+        # their qualified two-warpgroup schedule for both dtypes.
+        "load_num_warps": (
+            4 if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn" else 8
+        ),
+    }
+    if launch.use_keeps_mma_ab:
+        q_token_kv_block_sparse_profile["o_stages"] = launch.o_stages
+    return make_config(
+        q_token_kv_block_sparse_profile,
+        split_kv_mode=(
+            "gmem_reduction_with_separate_kernel"
+            if launch.splits_kv > 1
+            else "disabled"
+        ),
+        splits_kv=launch.splits_kv,
+        max_splits_kv=launch.splits_kv,
+        min_loop_iters_per_split=(1 if seq_len_q == 1 else MIN_LOOP_ITERS_PER_SPLIT),
+    )
+
+
+def _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size: int) -> int:
+    """Validate one caller-selected QToken-KvBlock-Sparse-Attention grouping value."""
+
+    group_size = _validate_positive_int(group_size, "group_size")
+    if group_size not in _sparse_policy.SUPPORTED_GROUP_SIZES:
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention group_size must be one of "
+            f"{_sparse_policy.SUPPORTED_GROUP_SIZES}, got {group_size}"
+        )
+    return group_size
+
+
+def _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
+    group_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> int:
+    """Validate that one caller-selected sparse Q group fits TileQ128 and a membership byte."""
+
+    from .kernels.fmha_decode.fmha_decode_constants import (
+        Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
+    )
+
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size)
+    _validate_head_geometry(num_qo_heads, num_kv_heads)
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+    max_group_size = min(
+        Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
+        _sparse_policy.MAX_TILE_SIZE_Q // heads_q_per_kv,
+    )
+    if group_size > max_group_size:
+        raise ValueError(
+            f"QToken-KvBlock-Sparse-Attention group_size={group_size} exceeds the TileQ128/head capacity "
+            f"of {max_group_size}"
+        )
+
+    return group_size
+
+
+@flashinfer_experimental_api
+def suggest_q_token_kv_block_sparse_group_size(
+    batch_size: int,
+    seq_len_q: int,
+    selected_seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    multi_processor_count: int,
+    *,
+    head_dim: int = 256,
+    q_data_type: torch.dtype = torch.bfloat16,
+    split_kv: bool = True,
+    kv_block_size: int = 4,
+) -> int:
+    """Suggest a Q1--Q8 QToken-KvBlock-Sparse-Attention group.
+
+    This pure host-side policy uses the caller-provided SM count; it never
+    queries device properties or reads tensors. It starts with the largest
+    legal group and the smallest fitting dense Q-tile recipe, then adds
+    useful one-wave split-KV parallelism. It considers the largest group for
+    each dense Q tile and further ungrouping at the smallest tile. If the
+    largest group cannot fill a wave, prefer better active SM coverage after
+    instruction-aligned split rounding. Ties prefer less Q padding, then the
+    larger group. Explicit G passed to plan/run is never overridden.
+
+    Query lengths need not be divisible by the result. Packed prefill may end
+    each request with a shorter route. Fixed-shape decode may pad its final
+    ``[B, num_query_groups, G, Hq, D]`` route with consecutive semantic dummy
+    rows and discard their outputs.
+
+    ``selected_seq_len_kv`` is the maximum candidate K/V-token count for one
+    query, including its causal tail. Configured split fanout uses union
+    capacity to accommodate non-shared KV. The recommendation scores useful
+    active splits using a fully-shared per-query proxy, rather than counting
+    every capacity-based split as active. Actual union-overlap and scattered-load
+    costs remain a TODO.
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of requests in the launch.
+    seq_len_q : int
+        Maximum number of live query tokens per request.
+    selected_seq_len_kv : int
+        Maximum selected candidate K/V tokens per query, including the causal
+        tail. This is not the original context length or global cache capacity.
+    num_qo_heads : int
+        Number of query/output heads.
+    num_kv_heads : int
+        Number of key/value heads.
+    multi_processor_count : int
+        Number of SMs available to the launch. Frameworks should query it once
+        and pass the cached value; this function performs no device query.
+    head_dim : int
+        Common Q/K/V head dimension: 64, 128, or 256.
+    q_data_type : torch.dtype
+        Q/K/V dtype used to select the matching dense MMA recipe.
+    split_kv : bool
+        Allow automatic split-KV fanout when True (default); False forces
+        one KV partition. Pass False for prefill and True for decode,
+        independently of packed or fixed Q layout. Match this value in
+        workspace sizing and attention planning. Ragged workloads use maximum
+        Q length as a capacity estimate; no GPU sequence lengths are inspected.
+
+    kv_block_size : int
+        Semantic sparse block size: 4/8/16/32/64/128, default four. Used to
+        bound grouped union work; storage-page size does not affect this bound.
+
+    Returns
+    -------
+    int
+        One of Q1--Q8, subject to the TileQ128 head-capacity bound.
+    """
+
+    from .q_token_kv_block_sparse_metadata import _validate_sparse_block_size
+
+    kv_block_size = _validate_sparse_block_size(kv_block_size)
+    batch_size = _validate_positive_int(batch_size, "batch_size")
+    seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
+    selected_seq_len_kv = _validate_positive_int(
+        selected_seq_len_kv, "selected_seq_len_kv"
+    )
+    multi_processor_count = _validate_positive_int(
+        multi_processor_count, "multi_processor_count"
+    )
+    _validate_head_geometry(num_qo_heads, num_kv_heads)
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+
+    head_dim = _validate_head_dim(head_dim)
+    if q_data_type not in _SUPPORTED_INPUT_DTYPES:
+        raise ValueError("q_data_type must be float16, bfloat16, or float8_e4m3fn")
+    if not isinstance(split_kv, bool):
+        raise TypeError("split_kv must be a bool")
+    return _sparse_policy.suggest_sparse_group(
+        batch_size=batch_size,
+        seq_len_q=seq_len_q,
+        selected_kv_tokens=selected_seq_len_kv,
+        heads_q_per_kv=heads_q_per_kv,
+        num_kv_heads=num_kv_heads,
+        multi_processor_count=multi_processor_count,
+        head_dim=head_dim,
+        q_dtype_key=_dtype_key(q_data_type),
+        split_kv=split_kv,
+        block_size=kv_block_size,
+    )
+
+
+def _validate_prims_ts_q_token_kv_block_sparse_group_layout(
+    group_size: int,
+    query_start_loc_cpu: Optional[torch.Tensor],
+    num_query_tokens: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> int:
+    """Validate one caller-selected QToken-KvBlock-Sparse-Attention group against the live query rows."""
+
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
+        group_size,
+        num_qo_heads,
+        num_kv_heads,
+    )
+    num_query_tokens = _validate_positive_int(num_query_tokens, "num_query_tokens")
+    if group_size == 1:
+        return 1
+    if (
+        query_start_loc_cpu is None
+        or not isinstance(query_start_loc_cpu, torch.Tensor)
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.numel() < 2
+        or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention requires CPU int32/int64 query_start_loc with at "
+            "least two entries"
+        )
+
+    query_starts = [int(value) for value in query_start_loc_cpu.tolist()]
+    num_mapped_tokens = query_starts[-1]
+    if (
+        query_starts[0] != 0
+        or num_mapped_tokens < 0
+        or num_mapped_tokens > num_query_tokens
+    ):
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention query boundaries do not cover valid rows"
+        )
+    query_lengths = [
+        end - begin for begin, end in zip(query_starts, query_starts[1:], strict=False)
+    ]
+    if any(length < 0 for length in query_lengths):
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention query boundaries must be nondecreasing"
+        )
+    query_lengths = [length for length in query_lengths if length > 0]
+    if not query_lengths:
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention requires at least one nonempty request"
+        )
+
+    return group_size
+
+
+@flashinfer_experimental_api
+def validate_q_token_kv_block_sparse_group_size(
+    query_start_loc_cpu: Optional[torch.Tensor],
+    num_query_tokens: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    *,
+    group_size: int,
+) -> int:
+    """Validate a QToken-KvBlock-Sparse-Attention Q1--Q8 group.
+
+    ``query_start_loc_cpu`` contains cumulative flattened-query offsets for
+    real requests. ``num_query_tokens`` includes any inert CUDA-graph padding
+    rows. Validation caps the maximum grouped query by both the kernel
+    membership representation and TileQ128 capacity. Request lengths do not
+    have to be divisible by ``group_size``: frameworks can partition each
+    request into packed routes of at most that size without crossing a request
+    or real/padding boundary.
+
+    This function never chooses a group from workload size or occupancy. The
+    framework owns ``group_size``; attention split-KV fanout is selected
+    separately after the grouped launch grid is known.
+
+    Parameters
+    ----------
+    query_start_loc_cpu : torch.Tensor or None
+        CPU Int32 or Int64 cumulative offsets for the real requests. It is
+        required when ``group_size`` is greater than one; ``None`` is accepted
+        for Q1.
+    num_query_tokens : int
+        Total flattened query-row count, including any inert CUDA-graph
+        padding rows.
+    num_qo_heads : int
+        Number of query/output heads.
+    num_kv_heads : int
+        Number of key/value heads.
+    group_size : int
+        Caller-selected number of query rows per QToken-KvBlock-Sparse-Attention route. Supported values
+        are Q1--Q8, subject to the TileQ128 head-capacity bound.
+
+    Returns
+    -------
+    int
+        The validated ``group_size``.
+    """
+
+    return _validate_prims_ts_q_token_kv_block_sparse_group_layout(
+        group_size,
+        query_start_loc_cpu,
+        num_query_tokens,
+        num_qo_heads,
+        num_kv_heads,
+    )
+
+
+@flashinfer_experimental_api
+def make_q_token_kv_block_sparse_qo_indptr(
+    query_start_loc_cpu: torch.Tensor,
+    num_query_tokens: int,
+    *,
+    group_size: int,
+    device: Optional[Union[int, str, torch.device]] = None,
+) -> torch.Tensor:
+    """Build request-safe QToken-KvBlock-Sparse-Attention route offsets.
+
+    ``query_start_loc_cpu`` contains cumulative offsets for real requests.
+    Every request is chunked independently, so its final route may contain
+    fewer than ``group_size`` rows. Any inert CUDA-graph padding suffix is
+    partitioned separately. The returned Int32 ``qo_indptr`` can be passed to
+    the packed-Q wrapper together with planned ``seq_len_q=group_size``.
+
+    Parameters
+    ----------
+    query_start_loc_cpu : torch.Tensor
+        One-dimensional CPU Int32 or Int64 cumulative offsets for the real
+        requests. The first entry must be zero and the offsets must be
+        nondecreasing.
+    num_query_tokens : int
+        Total flattened query-row count, including any inert CUDA-graph
+        padding suffix.
+    group_size : int
+        Maximum number of rows in each request-safe QToken-KvBlock-Sparse-Attention route.
+    device : int, str, torch.device, or None
+        Destination device for the returned offsets. By default, PyTorch's
+        default tensor device is used.
+
+    Returns
+    -------
+    torch.Tensor
+        Contiguous Int32 cumulative route offsets. Every nonempty route has at
+        most ``group_size`` rows and no route crosses a request boundary.
+    """
+
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size)
+    num_query_tokens = _validate_positive_int(num_query_tokens, "num_query_tokens")
+    if (
+        not isinstance(query_start_loc_cpu, torch.Tensor)
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.numel() < 2
+        or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention requires CPU int32/int64 query_start_loc with at "
+            "least two entries"
+        )
+
+    request_offsets = [int(value) for value in query_start_loc_cpu.tolist()]
+    if (
+        request_offsets[0] != 0
+        or request_offsets[-1] < 0
+        or request_offsets[-1] > num_query_tokens
+        or any(
+            end < begin
+            for begin, end in zip(request_offsets, request_offsets[1:], strict=False)
+        )
+    ):
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention query boundaries do not cover valid rows"
+        )
+
+    route_offsets = [0]
+    for begin, end in zip(request_offsets, request_offsets[1:], strict=False):
+        next_offset = begin
+        while next_offset < end:
+            next_offset = min(next_offset + group_size, end)
+            route_offsets.append(next_offset)
+
+    # Keep graph-padding rows out of the final real request's route even when
+    # that request ends with a partial group.
+    next_offset = request_offsets[-1]
+    while next_offset < num_query_tokens:
+        next_offset = min(next_offset + group_size, num_query_tokens)
+        route_offsets.append(next_offset)
+
+    return torch.tensor(
+        _validate_q_token_kv_block_sparse_route_offsets_cpu(
+            route_offsets,
+            num_query_tokens=num_query_tokens,
+            group_size=group_size,
+        ),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def _validate_q_token_kv_block_sparse_route_offsets_cpu(
+    route_offsets: list[int],
+    *,
+    num_query_tokens: int,
+    group_size: int,
+) -> tuple[int, ...]:
+    """Validate CPU-generated QToken-KvBlock-Sparse-Attention routes before copying them to device storage."""
+
+    offsets = tuple(route_offsets)
+    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != num_query_tokens:
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention route offsets must cover exactly all query tokens"
+        )
+    lengths = tuple(
+        end - begin for begin, end in zip(offsets, offsets[1:], strict=False)
+    )
+    if any(length <= 0 or length > group_size for length in lengths):
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention route offsets must describe nonempty routes no longer than group_size"
+        )
+    return offsets
+
+
+def _prepare_prims_ts_batch_decode_plan(
+    query: torch.Tensor,
+    kv_cache: PagedKVCache,
+    workspace_buffer: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    seq_len_q: int,
+    qo_indptr: Optional[torch.Tensor],
+    max_seq_len_q: Optional[int],
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    mask_type: Literal["dense", "causal"],
+    window_left: int,
+    kv_layout: Literal["HND"],
+    page_size: Optional[int],
+    q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
+    use_q_token_kv_block_sparse_route: bool = False,
+    use_pdl: bool = False,
+    split_kv: bool = True,
+    direct_q1_inputs: tuple[torch.Tensor, ...] = (),
+    direct_q1_max_model_len: Optional[int] = None,
+    direct_q1_sparse_block_size: int = 4,
+    share_pattern_across_kv_heads: bool = True,
+) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
+    """Validate and freeze one dense-block-table PrimTS launch contract."""
+
+    _validate_layout(kv_layout)
+    _validate_mask(mask_type)
+    window_left = _validate_window_left(window_left, mask_type)
+    use_packed_q, resolved_seq_len_q = _resolve_q_mode(
+        seq_len_q=seq_len_q,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        require_packed_max=True,
+    )
+    assert resolved_seq_len_q is not None
+    seq_len_q = resolved_seq_len_q
+    metadata_device, metadata_rows, max_num_pages = _validate_block_table_metadata(
+        block_table,
+        seq_lens,
+    )
+    normalized_cache = _normalize_native_paged_kv_cache(
+        kv_cache, expected_device=query.device
+    )
+    pattern_heads = _num_sparse_pattern_heads(
+        normalized_cache.num_kv_heads, share_pattern_across_kv_heads
+    )
+    if metadata_rows % pattern_heads:
+        raise ValueError("metadata rows must be divisible by the pattern head count")
+    batch_size = metadata_rows // pattern_heads
+    _validate_q(
+        query,
+        seq_len_q=seq_len_q,
+        use_packed_q=use_packed_q,
+        device=metadata_device,
+        batch_size=batch_size,
+    )
+    if qo_indptr is not None:
+        _validate_qo_indptr(
+            qo_indptr,
+            expected_device=query.device,
+            batch_size=batch_size,
+        )
+    k_cache = normalized_cache.k_cache
+    v_cache = normalized_cache.v_cache
+    num_kv_heads = normalized_cache.num_kv_heads
+    storage_page_size = normalized_cache.storage_page_size
+    head_dim = normalized_cache.head_dim
+    num_qo_heads = int(query.shape[-2])
+    _validate_head_geometry(num_qo_heads, num_kv_heads)
+    page_size = _validate_page_size(
+        storage_page_size if page_size is None else page_size
+    )
+    storage_page_size = _validate_storage_page_size(page_size, storage_page_size)
+    max_seq_len = _validate_max_kv_len(max_seq_len, "max_seq_len")
+    required_page_columns = (max_seq_len + page_size - 1) // page_size
+    if max_num_pages < required_page_columns:
+        raise ValueError(
+            "block_table must have at least ceil(max_seq_len / page_size) "
+            f"columns ({required_page_columns}), got {max_num_pages}"
+        )
+    output_dtype = out_dtype
+    if output_dtype is None:
+        if out is not None and not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor")
+        output_dtype = out.dtype if out is not None else query.dtype
+    elif not isinstance(output_dtype, torch.dtype):
+        raise TypeError("out_dtype must be a torch.dtype")
+    _validate_dtype_pair(
+        query.dtype,
+        k_cache.dtype,
+        v_cache.dtype,
+        output_dtype,
+        allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
+    )
+    device_index = _validate_runtime_device(query.device)
+
+    policy_args = (
+        device_index,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        seq_len_q,
+        _dtype_key(query.dtype),
+        _dtype_key(k_cache.dtype),
+        _dtype_key(v_cache.dtype),
+        _dtype_key(output_dtype),
+        kv_layout,
+        mask_type,
+        use_packed_q,
+        window_left,
+        storage_page_size,
+        use_q_token_kv_block_sparse_route,
+        use_pdl,
+        split_kv,
+        share_pattern_across_kv_heads,
+    )
+    spec = _resolve_decode_launch_spec(*policy_args)
+    if spec.config.uses_q_token_kv_block_sparse_page_membership:
+        if q_token_kv_block_sparse_page_memberships is None:
+            raise ValueError(
+                "grouped QToken-KvBlock-Sparse-Attention requires a separate q_token_kv_block_sparse_page_memberships tensor"
+            )
+        _validate_q_token_kv_block_sparse_page_memberships(
+            q_token_kv_block_sparse_page_memberships,
+            expected_device=query.device,
+            batch_size=metadata_rows,
+            max_num_pages=max_num_pages,
+        )
+    else:
+        if q_token_kv_block_sparse_page_memberships is not None:
+            raise ValueError(
+                "q_token_kv_block_sparse_page_memberships is valid only for grouped QToken-KvBlock-Sparse-Attention launches"
+            )
+        # Keep one compiled tensor ABI without requiring Q1 or dense callers to
+        # allocate an unused table. The kernel constexpr-elides all reads.
+        q_token_kv_block_sparse_page_memberships = block_table
+    layout = _make_decode_workspace_layout(
+        spec.scratch_shapes,
+        output_dtype,
+        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+        use_split_kv=spec.config.use_split_kv,
+    )
+    _validate_workspace_buffer(
+        workspace_buffer,
+        device=query.device,
+        required_bytes=layout.total_bytes,
+    )
+    output_shape = _decode_output_shape(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        seq_len_q=seq_len_q,
+        head_dim=head_dim,
+        total_q_tokens=int(query.shape[0]) if use_packed_q else None,
+    )
+    if out is None:
+        out = torch.empty(output_shape, device=query.device, dtype=output_dtype)
+    else:
+        _validate_out(
+            out,
+            q=query,
+            expected_shape=output_shape,
+            seq_len_q=seq_len_q,
+            use_packed_q=use_packed_q,
+            output_dtype=output_dtype,
+        )
+    direct_q1_spec = None
+    if direct_q1_inputs:
+        assert use_q_token_kv_block_sparse_route and seq_len_q == 1
+        assert direct_q1_max_model_len is not None
+        direct_q1_spec = _DirectQ1CompileSpec(
+            position_dtype_key=str(direct_q1_inputs[3].dtype).removeprefix("torch."),
+            max_seq_len_kv=direct_q1_max_model_len,
+            block_topk=int(direct_q1_inputs[0].shape[-1]),
+            kv_block_size=direct_q1_sparse_block_size,
+            page_capacity=max_num_pages,
+        )
+    compile_spec = _make_decode_compile_spec(
+        spec,
+        device_index=device_index,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        max_kv_len=max_seq_len,
+        seq_len_q=seq_len_q,
+        q_dtype_key=_dtype_key(query.dtype),
+        k_dtype_key=_dtype_key(k_cache.dtype),
+        v_dtype_key=_dtype_key(v_cache.dtype),
+        output_dtype_key=_dtype_key(output_dtype),
+        use_packed_q=use_packed_q,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+        direct_q1_spec=direct_q1_spec,
+    )
+    compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
+    workspace = _bind_decode_workspace(workspace_buffer, layout)
+    # A fused split-KV launch uses a wrapping global completion counter.  The
+    # final arriving CTA restores it to zero, so initialization belongs here,
+    # once, rather than on every prepared-plan run.  The standalone reducer
+    # does not read this counter, but the same initialization is harmless and
+    # keeps one replay contract for every split policy.
+    if layout.uses_split_kv:
+        workspace.split_kv_counter.zero_()
+    plan = PrimsTSBatchDecodePlan(
+        _query_shape=tuple(query.shape),
+        _query_stride=tuple(query.stride()),
+        _output_shape=tuple(out.shape),
+        _output_stride=tuple(out.stride()),
+        _device=query.device,
+        _q_dtype=query.dtype,
+        _output_dtype=output_dtype,
+        _head_dim=head_dim,
+        _cache=normalized_cache,
+        _seq_lens=seq_lens,
+        _qo_indptr=qo_indptr,
+        _block_table=block_table,
+        _q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
+        _workspace=workspace,
+        _compiled_main=compiled_main,
+        _compiled_reducer=compiled_reducer,
+        _direct_q1_inputs=direct_q1_inputs,
+    )
+    return plan, out
+
+
+@flashinfer_experimental_api
+def prepare_prims_ts_batch_decode_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: PagedKVCache,
+    workspace_buffer: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    out: torch.Tensor,
+    seq_len_q: int = 1,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_seq_len_q: Optional[int] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    mask_type: Literal["dense", "causal"] = "dense",
+    window_left: int = -1,
+    kv_layout: Literal["HND"] = "HND",
+    page_size: Optional[int] = None,
+    split_kv: bool = True,
+) -> PrimsTSBatchDecodePlan:
+    """Validate and prepare a reusable dense-block-table PrimTS launch.
+
+    This setup API is intended for frameworks that keep K/V, block-table
+    metadata, and workspace storage stable while changing their values between launches.
+    Call :meth:`PrimsTSBatchDecodePlan.run` on the hot path.  The returned plan
+    is CUDA-graph compatible as long as captured tensor storage remains alive.
+
+    Output and workspace must be disjoint from each other and from all inputs.
+    Storage overlap is a caller precondition and is not checked.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Fixed ``[B, Hq, D]`` or ``[B, SQ, Hq, D]`` query, or packed
+        ``[total_q, Hq, D]`` query when ``qo_indptr`` is supplied.
+    kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        Combined or separate HND paged K/V storage.
+    workspace_buffer : torch.Tensor
+        Caller-owned byte workspace, zero-initialized before the first launch
+        for this semantic configuration.
+    block_table : torch.Tensor
+        Contiguous CUDA Int32 dense page table shaped ``[B, max_pages]``.
+    seq_lens : torch.Tensor
+        Positive live K/V sequence lengths, one per request.
+    max_seq_len : int
+        Static maximum K/V length used for policy selection and JIT caching.
+    out : torch.Tensor
+        Caller-owned output tensor whose storage remains stable across replays.
+    seq_len_q : int
+        Fixed query length when ``qo_indptr`` is omitted.
+    qo_indptr : torch.Tensor, optional
+        Cumulative Int32 query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static maximum packed-query route length.
+    out_dtype : torch.dtype, optional
+        Output dtype; defaults to ``out.dtype``.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    kv_layout : {"HND"}
+        Layout of the paged K/V cache.
+    page_size : int, optional
+        Semantic page size; defaults to the physical cache-page extent.
+    split_kv : bool
+        Permit automatic split fanout (True, default), or force S1 (False).
+        Independent of packed/fixed Q. Match workspace sizing's value.
+
+    Returns
+    -------
+    PrimsTSBatchDecodePlan
+        Reusable prepared launch plan. Call :meth:`PrimsTSBatchDecodePlan.run`
+        after updating values in the prepared tensor storage.
+    """
+
+    if not isinstance(out, torch.Tensor):
+        raise TypeError("out must be a caller-owned torch.Tensor")
+    plan, _ = _prepare_prims_ts_batch_decode_plan(
+        query,
+        kv_cache,
+        workspace_buffer,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        seq_len_q=seq_len_q,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        out=out,
+        out_dtype=out_dtype,
+        mask_type=mask_type,
+        window_left=window_left,
+        kv_layout=kv_layout,
+        page_size=page_size,
+        split_kv=split_kv,
+        use_q_token_kv_block_sparse_route=False,
+    )
+    return plan
+
+
+@flashinfer_experimental_api(trace=prims_ts_decode_trace_dispatch)
 def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
@@ -2167,8 +3544,10 @@ def prims_ts_batch_decode_with_kv_cache(
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
     kv_layout: Literal["HND"] = "HND",
+    page_size: Optional[int] = None,
+    split_kv: bool = True,
 ) -> torch.Tensor:
-    """Launch fixed or packed-Q native page-table decode with caller scratch.
+    """Launch fixed or packed-Q dense-table FMHA decode with caller scratch.
 
     For ``seq_len_q=1``, ``query`` and the returned output both have shape
     ``[B, Hq, D]``. For ``seq_len_q>1``, both use compact token-major
@@ -2184,66 +3563,81 @@ def prims_ts_batch_decode_with_kv_cache(
     greater than the corresponding live ``seq_lens`` value.
 
     ``kv_cache`` is either a combined
-    ``[pages, 2, Hkv, page_size, D]`` tensor or a ``(K, V)`` tuple of
-    ``[pages, Hkv, page_size, D]`` tensors. ``block_tables`` is an int32 CUDA
-    tensor with shape ``[B, C]``. Entries are contiguous within each row while
-    the outer row stride may be greater than ``C``. ``seq_lens`` is explicit
-    and ``max_seq_len`` is the exact static maximum used for automatic policy
-    selection and JIT caching.
+    ``[pages, 2, Hkv, storage_page_size, D]`` tensor or a ``(K, V)`` tuple of
+    ``[pages, Hkv, storage_page_size, D]`` tensors. By default ``page_size``
+    is inferred as that physical extent and the metadata uses ordinary physical
+    page IDs. Tuple members are logical HND views; their page, head, and token
+    strides may describe compact HND storage or gapped K/V slices of either
+    HND- or NHD-physical packed storage. Passing ``page_size=4`` with a larger
+    physical extent interprets each live block-table entry as::
+
+        locator = physical_page * (storage_page_size // 4) + subpage
+
+    The TMA producer decodes the locator without a separate offsets tensor.
+    ``seq_lens`` is explicit and ``max_seq_len`` is the exact static maximum
+    used for automatic policy selection and JIT caching.
     It must be no larger than ``2,147,483,392`` so the padded 256-token K/V
     tile endpoint remains representable as signed Int32.
-    The table must contain enough columns for every per-run length::
+    ``block_tables`` is contiguous CUDA Int32 with shape ``[B, max_pages]``.
+    The live prefix of row ``b`` contains::
 
-        (seq_lens[b] + page_size - 1) // page_size <= C
+        (seq_lens[b] + page_size - 1) // page_size
 
-    Every active page ID must index ``kv_cache``. Inactive tail entries at and
-    beyond ``ceil(seq_lens[b] / page_size)`` are ignored.
+    locators; columns after that prefix are ignored. The table width must cover
+    ``ceil(max_seq_len / page_size)`` so graph replays may change live lengths
+    without changing tensor storage.
+
+    A graph-padding request may use the reserved inert-row encoding
+    ``seq_lens[b] == 1`` with its first live locator equal to ``-1``. The TMA
+    out-of-bounds path supplies zero K/V and the row produces exact zero output
+    without a separate output-masking kernel. Negative locators are otherwise
+    invalid in a live table prefix. Except for the reserved inert locator,
+    every live ordinary page ID or encoded locator must resolve inside
+    ``kv_cache``.
 
     ``workspace_buffer`` must be zero-initialized before its first use and
-    re-zeroed whenever any workspace-layout input, including ``batch_size``,
-    changes because the internal section offsets can move even when the
-    compiled callable is reused. It is exclusive to one in-flight launch or
-    captured graph and must not overlap query, K/V
-    cache, metadata, or output storage. Runtime sequence lengths must remain
-    positive and no larger than ``max_seq_len``; this hot path
-    deliberately does not read device metadata back to the host. Per-run table,
+    re-zeroed whenever an argument contributing to the semantic JIT key changes,
+    because the internal section offsets can change with that key. It is exclusive
+    to one in-flight launch or captured graph and must not overlap query, K/V
+    cache, metadata, or output storage. Output must also remain disjoint from
+    all inputs. Storage overlap is not checked. Runtime sequence lengths must
+    remain positive and no larger than ``max_seq_len``; this hot path
+    deliberately does not read device metadata back to the host. Live table,
     length, page-ID, and packed-Q values may change between completed launches
     or graph replays only while all of their contracts remain valid. They must
     not be mutated concurrently with a launch or replay that reads them. Warm
-    the planned topology before CUDA graph capture and provide ``out`` to avoid an
+    the semantic key before CUDA graph capture and provide ``out`` to avoid an
     output allocation. Captured graphs must retain stable metadata storage;
     ``qo_indptr`` values may change only while the packed-offset contract
     remains valid, every delta stays within the compiled bound, and the final
     offset continues to match the captured query/output extent.
     ``window_left=-1`` disables the left window; a
     non-negative value requires causal masking and includes the current token.
-    No backend fallback or scheduling knob is exposed.
+    ``split_kv`` controls whether automatic split fanout is allowed. No backend
+    fallback or explicit tile/split-count tuning knob is exposed.
 
     Parameters
     ----------
     query : torch.Tensor
         Fixed or packed query tensor.
     kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        Combined or separate paged K/V storage.
+        Combined or separate paged K/V storage. K and V dtypes are taken from
+        the tensors; a ``torch.float8_e4m3fn`` V with ``torch.bfloat16`` Q/K
+        requires the separate ``(K, V)`` form.
     workspace_buffer : torch.Tensor
-        Zero-initialized caller-owned byte workspace for this planned layout.
+        Zero-initialized caller-owned byte workspace for this semantic key.
     block_tables : torch.Tensor
-        CUDA int32 physical page IDs with shape ``[B, C]``, unit inner stride,
-        and non-overlapping row stride at least ``C``.
+        Dense ``[B, max_pages]`` physical-page or encoded-locator table.
     seq_lens : torch.Tensor
         Live K/V sequence lengths for each request.
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     seq_len_q : int
-        Fixed query length when ``qo_indptr`` is omitted. In packed-query mode,
-        a non-default value is a backward-compatible alias for
-        ``max_seq_len_q`` and must agree with it when both are provided.
+        Fixed query length when ``qo_indptr`` is omitted.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_seq_len_q : int, optional
-        Per-request packed-query length capacity. When omitted for packed Q,
-        a non-default ``seq_len_q`` must supply the bound. In fixed-query mode,
-        it must equal ``seq_len_q``.
+        Static packed-query length bound.
     bmm1_scale, bmm2_scale : float, optional
         QK and value/output scaling factors.
     out : torch.Tensor, optional
@@ -2256,154 +3650,39 @@ def prims_ts_batch_decode_with_kv_cache(
         Left sliding-window extent, or ``-1`` to disable the window.
     kv_layout : {"HND"}
         Layout of the paged K/V cache.
+    page_size : int, optional
+        Semantic block-table page size. It defaults to the physical cache-page
+        extent. A smaller supported value must divide that extent and uses
+        encoded subpage locators.
+    split_kv : bool
+        Permit automatic split fanout (True, default), or force S1 (False),
+        independently of packed/fixed Q. Match workspace sizing's value.
     """
 
-    _validate_layout(kv_layout)
-    _validate_mask(mask_type)
-    window_left = _validate_window_left(window_left, mask_type)
-    use_packed_q, resolved_seq_len_q = _resolve_q_mode(
+    plan, prepared_out = _prepare_prims_ts_batch_decode_plan(
+        query,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len,
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
-        require_packed_max=True,
-    )
-    assert resolved_seq_len_q is not None
-    seq_len_q = resolved_seq_len_q
-    metadata_device, batch_size, _ = _validate_block_table_metadata(
-        block_tables, seq_lens
-    )
-    _validate_q(
-        query,
-        seq_len_q=seq_len_q,
-        use_packed_q=use_packed_q,
-        device=metadata_device,
-        batch_size=batch_size,
-    )
-    if metadata_device != query.device:
-        raise ValueError(
-            f"paged-KV metadata must be on {query.device}, got {metadata_device}"
-        )
-    if qo_indptr is not None:
-        _validate_qo_indptr(
-            qo_indptr,
-            expected_device=query.device,
-            batch_size=batch_size,
-        )
-    (
-        k_cache,
-        _,
-        _,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        _,
-        _,
-    ) = _normalize_paged_kv_cache(kv_cache, expected_device=query.device)
-    num_qo_heads = int(query.shape[-2])
-    _validate_head_geometry(num_qo_heads, num_kv_heads)
-    _validate_page_size(page_size)
-    max_seq_len = _validate_max_kv_len(max_seq_len, "max_seq_len")
-    output_dtype = out_dtype
-    if output_dtype is None:
-        if out is not None and not isinstance(out, torch.Tensor):
-            raise TypeError("out must be a torch.Tensor")
-        output_dtype = out.dtype if out is not None else query.dtype
-    elif not isinstance(output_dtype, torch.dtype):
-        raise TypeError("out_dtype must be a torch.dtype")
-    _validate_dtype_pair(query.dtype, k_cache.dtype, output_dtype)
-    device_index = _validate_runtime_device(query.device)
-
-    policy_args = (
-        device_index,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        max_seq_len,
-        seq_len_q,
-        _dtype_key(query.dtype),
-        _dtype_key(k_cache.dtype),
-        _dtype_key(output_dtype),
-        kv_layout,
-        mask_type,
-        use_packed_q,
-        window_left,
-    )
-    spec = _resolve_decode_launch_spec(*policy_args)
-    layout = _make_decode_workspace_layout(
-        spec.scratch_shapes,
-        output_dtype,
-        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
-    )
-    _validate_workspace_buffer(
-        workspace_buffer,
-        device=query.device,
-        required_bytes=layout.total_bytes,
-    )
-    caller_provided_out = out is not None
-    runtime = _prepare_decode_runtime(
-        query,
-        kv_cache,
-        device=query.device,
-        batch_size=batch_size,
-        seq_len_q=seq_len_q,
-        use_packed_q=use_packed_q,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
+        out=out,
+        out_dtype=out_dtype,
+        mask_type=mask_type,
+        window_left=window_left,
+        kv_layout=kv_layout,
         page_size=page_size,
-        q_dtype=query.dtype,
-        kv_dtype=k_cache.dtype,
-        output_dtype=output_dtype,
+        split_kv=split_kv,
+        use_q_token_kv_block_sparse_route=False,
+    )
+    return plan.run(
+        query,
+        out=prepared_out,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
-        out=out,
-    )
-    _validate_tensor_does_not_overlap_inputs(
-        workspace_buffer,
-        "workspace_buffer",
-        ("query", runtime.q),
-        ("k_cache", runtime.k_cache),
-        ("v_cache", runtime.v_cache),
-        ("seq_lens", seq_lens),
-        ("qo_indptr", qo_indptr),
-        ("block_tables", block_tables),
-        ("out", runtime.out),
-    )
-    if caller_provided_out:
-        _validate_decode_output_aliasing(
-            runtime,
-            seq_lens=seq_lens,
-            qo_indptr=qo_indptr,
-            block_tables=block_tables,
-            workspace_buffer=workspace_buffer,
-        )
-    compile_spec = _make_decode_compile_spec(
-        spec,
-        device_index=device_index,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        max_kv_len=max_seq_len,
-        seq_len_q=seq_len_q,
-        q_dtype_key=_dtype_key(query.dtype),
-        output_dtype_key=_dtype_key(output_dtype),
-        use_packed_q=use_packed_q,
-        kv_prefix_mode="dynamic",
-        kv_lengths_mode="dynamic",
-    )
-    compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
-    workspace = _bind_decode_workspace(workspace_buffer, layout)
-    return _launch_decode(
-        runtime,
-        seq_lens=seq_lens,
-        qo_indptr=qo_indptr,
-        block_tables=block_tables,
-        workspace=workspace,
-        compiled_main=compiled_main,
-        compiled_reducer=compiled_reducer,
     )
 
 
@@ -2420,7 +3699,7 @@ class BatchDecodePagedTSWrapper:
     graph replays require separate wrappers and workspace buffers.
     """
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
         """Initialize an unplanned wrapper with one static K/V layout.
 
@@ -2446,7 +3725,7 @@ class BatchDecodePagedTSWrapper:
 
         return self._require_plan_state().policy
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         device: Union[int, str, torch.device],
@@ -2460,12 +3739,15 @@ class BatchDecodePagedTSWrapper:
         max_seq_len_q: int = 1,
         packed_query: bool = False,
         q_data_type: torch.dtype = torch.float16,
-        kv_data_type: Optional[torch.dtype] = None,
+        k_data_type: Optional[torch.dtype] = None,
+        v_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
         seq_lens: Optional[Union[Sequence[int], torch.Tensor]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        storage_page_size: Optional[int] = None,
+        split_kv: bool = True,
     ) -> None:
         """Compile one static-capacity plan and optionally own sequence lengths.
 
@@ -2498,7 +3780,10 @@ class BatchDecodePagedTSWrapper:
         head_dim : int
             Query, key, value, and output head dimension.
         page_size : int
-            Number of K/V tokens stored in each page.
+            Number of K/V tokens addressed by each page-table entry.
+        storage_page_size : int, optional
+            Physical cache-page extent, defaulting to ``page_size``. Larger
+            physical pages must be divisible by the logical ``page_size``.
         max_kv_len : int
             Per-request K/V length capacity used for policy selection,
             compilation, and workspace sizing.
@@ -2512,8 +3797,12 @@ class BatchDecodePagedTSWrapper:
         q_data_type : torch.dtype
             Query dtype used to compile the plan. Defaults to
             ``torch.float16``.
-        kv_data_type : torch.dtype, optional
-            K/V dtype used to compile the plan. Defaults to ``q_data_type``.
+        k_data_type : torch.dtype, optional
+            K dtype used to compile the plan. Defaults to ``q_data_type``.
+        v_data_type : torch.dtype, optional
+            V dtype used to compile the plan. Defaults to ``k_data_type``;
+            ``torch.float8_e4m3fn`` with BF16 Q/K selects the QK-BF16/PV-FP8
+            path and requires separate ``(K, V)`` cache tensors.
         o_data_type : torch.dtype, optional
             Output dtype used to compile the plan. Defaults to
             ``q_data_type``.
@@ -2532,6 +3821,11 @@ class BatchDecodePagedTSWrapper:
             must be 32-byte aligned and large enough for the selected plan.
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
+        split_kv : bool
+            Permit automatic useful split fanout (True, default), or force
+            unsplit execution (False), independently of ``packed_query``.
+            Typically False for prefill and True for decode. This choice is
+            frozen for the lifetime of the plan.
         """
 
         if not isinstance(packed_query, bool):
@@ -2539,6 +3833,9 @@ class BatchDecodePagedTSWrapper:
         batch_size = _validate_positive_int(batch_size, "batch_size")
         head_dim = _validate_head_dim(head_dim)
         page_size = _validate_page_size(page_size)
+        storage_page_size = _validate_storage_page_size(
+            page_size, page_size if storage_page_size is None else storage_page_size
+        )
         max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
         seq_len_q = _validate_seq_len_q(max_seq_len_q)
         _validate_head_geometry(num_qo_heads, num_kv_heads)
@@ -2550,11 +3847,18 @@ class BatchDecodePagedTSWrapper:
         _validate_mask(mask_type)
         window_left = _validate_window_left(window_left, mask_type)
 
-        if kv_data_type is None:
-            kv_data_type = q_data_type
+        if k_data_type is None:
+            k_data_type = q_data_type
+        if v_data_type is None:
+            v_data_type = k_data_type
         if o_data_type is None:
             o_data_type = q_data_type
-        _validate_dtype_pair(q_data_type, kv_data_type, o_data_type)
+        _validate_dtype_pair(
+            q_data_type,
+            k_data_type,
+            v_data_type,
+            o_data_type,
+        )
 
         specialization_seq_lens = _normalize_plan_seq_lens(
             seq_lens,
@@ -2586,14 +3890,16 @@ class BatchDecodePagedTSWrapper:
             max_kv_len,
             seq_len_q,
             _dtype_key(q_data_type),
-            _dtype_key(kv_data_type),
+            _dtype_key(k_data_type),
+            _dtype_key(v_data_type),
             _dtype_key(o_data_type),
             self._kv_layout,
             mask_type,
             packed_query,
             window_left,
+            storage_page_size,
         )
-        spec = _resolve_decode_launch_spec(*policy_args)
+        spec = _resolve_decode_launch_spec(*policy_args, split_kv=split_kv)
         if specialization_seq_lens is None:
             kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
             kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
@@ -2636,6 +3942,8 @@ class BatchDecodePagedTSWrapper:
             max_kv_len=max_kv_len,
             seq_len_q=seq_len_q,
             q_dtype_key=_dtype_key(q_data_type),
+            k_dtype_key=_dtype_key(k_data_type),
+            v_dtype_key=_dtype_key(v_data_type),
             output_dtype_key=_dtype_key(o_data_type),
             use_packed_q=packed_query,
             kv_prefix_mode=kv_prefix_mode,
@@ -2645,11 +3953,13 @@ class BatchDecodePagedTSWrapper:
         policy = spec.policy + (
             ("kv_prefix_mode", kv_prefix_mode),
             ("kv_lengths_mode", kv_lengths_mode),
+            ("split_kv_allowed", split_kv),
         )
         workspace_layout = _make_decode_workspace_layout(
             spec.scratch_shapes,
             o_data_type,
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
+            use_split_kv=spec.config.use_split_kv,
         )
         if workspace_buffer is None:
             workspace_buffer = torch.empty(
@@ -2691,7 +4001,8 @@ class BatchDecodePagedTSWrapper:
             page_size=page_size,
             max_kv_len=max_kv_len,
             q_dtype=q_data_type,
-            kv_dtype=kv_data_type,
+            k_dtype=k_data_type,
+            v_dtype=v_data_type,
             output_dtype=o_data_type,
             mask_type=mask_type,
             window_left=window_left,
@@ -2706,12 +4017,13 @@ class BatchDecodePagedTSWrapper:
             planned_seq_lens_host=specialization_seq_lens,
             planned_seq_lens_device=planned_seq_lens_device,
             policy=policy,
+            storage_page_size=storage_page_size,
         )
         # This is the only wrapper mutation. Any failure above leaves the
         # previous complete plan revision usable.
         self._plan_state = candidate
 
-    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
+    @flashinfer_experimental_api(trace=prims_ts_decode_wrapper_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
@@ -2731,9 +4043,8 @@ class BatchDecodePagedTSWrapper:
         ``None`` and the plan's owned CUDA copy is used. Otherwise, ``seq_lens``
         must be supplied on every run. This ownership check is unconditional.
 
-        ``validate=True`` performs structural, value, and alias validation. It
-        reads per-run metadata values back to the host. This is the safe public
-        default.
+        ``validate=True`` performs structural and value validation. It
+        reads per-run metadata values back to the host.
         ``validate=False`` treats every run argument as a trusted binding,
         performs no explicit wrapper validation, and remains free of metadata
         device-to-host synchronization. K/V view selection, scale forwarding,
@@ -2742,6 +4053,9 @@ class BatchDecodePagedTSWrapper:
         Packed plans require ``qo_indptr`` with ``B + 1`` int32 offsets. Fixed
         plans require ``qo_indptr`` to be omitted. Per-run metadata tensors may
         change identity between ordered runs.
+
+        In either validation mode, output and workspace must be disjoint from
+        each other and from all inputs. Storage overlap is not checked.
 
         Parameters
         ----------
@@ -2768,7 +4082,7 @@ class BatchDecodePagedTSWrapper:
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         validate : bool
-            Run explicit structural, value, and alias validation. Disable only
+            Run explicit structural and value validation. Disable only
             when the caller guarantees the complete runtime contract. Sequence
             length ownership is enforced in either mode. Defaults to ``True``.
 
@@ -2797,7 +4111,6 @@ class BatchDecodePagedTSWrapper:
             effective_seq_lens = seq_lens
 
         runtime_qo_indptr = qo_indptr if state.use_packed_q else None
-        caller_provided_out = out is not None
         if validate:
             (
                 metadata_device,
@@ -2841,9 +4154,10 @@ class BatchDecodePagedTSWrapper:
                 num_qo_heads=state.num_qo_heads,
                 num_kv_heads=state.num_kv_heads,
                 head_dim=state.head_dim,
-                page_size=state.page_size,
+                page_size=state.storage_page_size or state.page_size,
                 q_dtype=state.q_dtype,
-                kv_dtype=state.kv_dtype,
+                k_dtype=state.k_dtype,
+                v_dtype=state.v_dtype,
                 output_dtype=state.output_dtype,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
@@ -2856,25 +4170,6 @@ class BatchDecodePagedTSWrapper:
                 block_tables=block_tables,
                 qo_indptr=runtime_qo_indptr,
             )
-            _validate_tensor_does_not_overlap_inputs(
-                state.workspace_buffer,
-                "workspace_buffer",
-                ("query", runtime.q),
-                ("k_cache", runtime.k_cache),
-                ("v_cache", runtime.v_cache),
-                ("seq_lens", effective_seq_lens),
-                ("qo_indptr", runtime_qo_indptr),
-                ("block_tables", block_tables),
-                ("out", runtime.out),
-            )
-            if caller_provided_out:
-                _validate_decode_output_aliasing(
-                    runtime,
-                    seq_lens=effective_seq_lens,
-                    qo_indptr=runtime_qo_indptr,
-                    block_tables=block_tables,
-                    workspace_buffer=state.workspace_buffer,
-                )
         else:
             runtime = _prepare_decode_runtime_unchecked(
                 q,
@@ -2896,7 +4191,7 @@ class BatchDecodePagedTSWrapper:
         )
 
 
-@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
+@flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
 def batch_decode_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
@@ -2913,6 +4208,8 @@ def batch_decode_with_paged_kv_cache(
     bmm2_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    page_size: Optional[int] = None,
+    split_kv: bool = True,
 ) -> torch.Tensor:
     """One-shot fixed or packed-Q paged decode from fixed page tables.
 
@@ -2961,6 +4258,13 @@ def batch_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` or the query dtype.
+    page_size : int, optional
+        Semantic page-table size, defaulting to the physical cache extent.
+        A smaller supported value must divide the physical extent and uses
+        encoded subpage locators.
+    split_kv : bool
+        Allow automatic split fanout (True, default), or force S1 (False),
+        independently of packed/fixed query storage.
 
     Returns
     -------
@@ -3027,15 +4331,16 @@ def batch_decode_with_paged_kv_cache(
     )
     (
         k_cache,
-        _,
+        v_cache,
         _,
         num_kv_heads,
-        page_size,
+        storage_page_size,
         head_dim,
-        _,
-        _,
-    ) = _normalize_paged_kv_cache(paged_kv_cache, expected_device=q.device)
-    _validate_page_size(page_size)
+    ) = _normalize_paged_kv_cache_views(paged_kv_cache, expected_device=q.device)
+    page_size = _validate_page_size(
+        storage_page_size if page_size is None else page_size
+    )
+    storage_page_size = _validate_storage_page_size(page_size, storage_page_size)
     num_qo_heads = int(q.shape[-2])
     _validate_head_geometry(num_qo_heads, num_kv_heads)
     output_dtype = out_dtype
@@ -3063,6 +4368,7 @@ def batch_decode_with_paged_kv_cache(
     _validate_dtype_pair(
         q.dtype,
         k_cache.dtype,
+        v_cache.dtype,
         output_dtype,
     )
 
@@ -3076,6 +4382,7 @@ def batch_decode_with_paged_kv_cache(
     max_kv_len = _validate_max_kv_len(max(seq_lens_host), "max(seq_lens_kv)")
     table_capacity = int(block_tables.shape[1])
     block_table_rows = block_tables.tolist()
+    locator_capacity = int(k_cache.shape[0]) * (storage_page_size // page_size)
     for request_idx, (row, q_len, kv_len) in enumerate(
         zip(
             block_table_rows,
@@ -3092,12 +4399,12 @@ def batch_decode_with_paged_kv_cache(
                 f"{required_pages}, got {table_capacity}"
             )
         if any(
-            int(page_id) < 0 or int(page_id) >= int(k_cache.shape[0])
+            int(page_id) < 0 or int(page_id) >= locator_capacity
             for page_id in row[:required_pages]
         ):
             raise ValueError(
                 "block_tables values for active pages must index the physical "
-                f"K/V cache in [0, {k_cache.shape[0]}); request {request_idx} "
+                f"K/V cache through locators in [0, {locator_capacity}); request {request_idx} "
                 "contains an invalid page ID"
             )
         if mask_type == "causal" and q_len > kv_len:
@@ -3117,9 +4424,12 @@ def batch_decode_with_paged_kv_cache(
         page_size,
         max_kv_len,
         max_seq_len_q=validation_seq_len_q,
+        storage_page_size=storage_page_size,
+        split_kv=split_kv,
         packed_query=use_packed_q,
         q_data_type=q.dtype,
-        kv_data_type=k_cache.dtype,
+        k_data_type=k_cache.dtype,
+        v_data_type=v_cache.dtype,
         o_data_type=output_dtype,
         mask_type=mask_type,
         window_left=window_left,
@@ -3139,7 +4449,12 @@ def batch_decode_with_paged_kv_cache(
 
 __all__ = [
     "BatchDecodePagedTSWrapper",
+    "PrimsTSBatchDecodePlan",
     "batch_decode_with_paged_kv_cache",
     "get_prims_ts_batch_decode_workspace_size",
+    "make_q_token_kv_block_sparse_qo_indptr",
+    "suggest_q_token_kv_block_sparse_group_size",
+    "validate_q_token_kv_block_sparse_group_size",
+    "prepare_prims_ts_batch_decode_with_kv_cache",
     "prims_ts_batch_decode_with_kv_cache",
 ]
