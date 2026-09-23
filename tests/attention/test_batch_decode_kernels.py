@@ -233,6 +233,8 @@ def _run_batch_decode_with_paged_kv_cache_case(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
 @parametrize_product(
     {
         "batch_size": [12, 17, 128],
@@ -240,13 +242,11 @@ def _run_batch_decode_with_paged_kv_cache_case(
         "page_size": [1, 8, 16],
         "num_kv_heads": [4],
         "num_qo_heads": [4, 32],
-        "head_dim": [128, 256, 512],
         "kv_layout": ["NHD"],
         "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
         "logits_soft_cap": [0.0],
         "return_lse": [True],
         "q_dtype": [torch.float16],
-        "kv_dtype": [torch.float16, torch.float8_e4m3fn],
         "contiguous_kv": [True],
     },
     regular=pairwise_product_cases,
