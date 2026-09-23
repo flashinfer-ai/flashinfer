@@ -60,7 +60,6 @@ from ...tensor_map import transform_ragged_coords
 
 from ..helpers.gather import (
     gather4_cached,
-    broadcast_sparse_quad,
     load_sparse_rows,
     invalid_sparse_token,
     gather4_uniform_quad_slices,
@@ -644,6 +643,9 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     page_offsets: Any = None  # GMEM page-offset tensor
     smem_sparse_offsets: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
+    cached_page_stage: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
     cached_k_pages: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -663,6 +665,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         TaskLocalVariable.uninitialized()
     )
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+        ("cached_page_stage", Int32, Int32(0), "Held shared-offset stage."),
         ("cached_mask_low", Int32, Int32(0), "Low half of the prefetched sparse mask."),
         (
             "cached_mask_high",
@@ -730,33 +733,6 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         )
         cute.arch.fence_view_async_shared()
 
-    @cute.jit
-    def _read_sparse_quad(
-        self, stage_info: StageInfo, *, is_v: cutlass.Constexpr[bool]
-    ):
-        lane = cute.arch.thread_idx()[0] % 32
-        warp = cute.arch.thread_idx()[0] // 32 - (
-            self.cfg.load_v_warp_id if is_v else self.cfg.load_k_warp_id
-        )
-        groups = (32 if is_v else 16) // self.cfg.load_num_warps
-        origin = (
-            Int32(0)
-            if is_v
-            else cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            * Int32(64)
-        )
-        raw = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-        for j in cutlass.range_constexpr(4):
-            raw[j] = Int32(0x7FFFFFFF)
-        if lane < Int32(groups):
-            offset = stage_info.stage_idx * 128 + origin + (warp * groups + lane) * 4
-            loaded = self.smem_sparse_offsets.data_ptr(offset).load(
-                count=4, alignment=16
-            )
-            for j in cutlass.range_constexpr(4):
-                raw[j] = loaded[j]
-        return raw
-
     @consumer_work(returns=(cached_mask_low, cached_mask_high))
     @cute.jit
     def read_sparse_mask(self, stage_info: StageInfo):
@@ -781,15 +757,11 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         )
         return low_bits, high_bits
 
-    @consumer_work(returns="cached_k_pages")
+    @consumer_work(returns=cached_page_stage)
     @cute.jit
-    def read_sparse_k(self, stage_info: StageInfo):
-        return self._read_sparse_quad(stage_info, is_v=False)
-
-    @consumer_work(returns="cached_v_pages")
-    @cute.jit
-    def read_sparse_v(self, stage_info: StageInfo):
-        return self._read_sparse_quad(stage_info, is_v=True)
+    def sparse_stage(self, stage_info: StageInfo):
+        """Return the shared-ring slot protected by the current consumer token."""
+        return stage_info.stage_idx
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
@@ -1645,6 +1617,7 @@ class SmemKResource(HighThroughputMlaResource):
     """
 
     smem_k: Any = None
+    smem_sparse_offsets: Any = None
     page_offsets: Any = None
     tma_desc_c_latent: Any = None
     tma_desc_c_rope: Any = None
@@ -1665,8 +1638,8 @@ class SmemKResource(HighThroughputMlaResource):
 
     @producer_work
     @cute.jit
-    def tma_load_cached(self, stage_info: StageInfo, *, cached_k_pages):
-        """Broadcast each cached quad once, then issue its FP8 feature slices."""
+    def tma_load_shared(self, stage_info: StageInfo, *, page_offset_stage):
+        """Read one warp-uniform SMEM quad and reuse it across FP8 feature slices."""
         cfg = self.cfg
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_k_warp_id
         base = (
@@ -1675,8 +1648,16 @@ class SmemKResource(HighThroughputMlaResource):
         for owner in cutlass.range_constexpr(
             cfg.tokens_per_k_cta // TMA_GATHER_ROWS // cfg.load_num_warps
         ):
-            raw = broadcast_sparse_quad(cached_k_pages, owner)
-            quad = warp * Int32(16 // cfg.load_num_warps) + Int32(owner)
+            # All lanes read the same quad: shared-memory broadcast replaces
+            # four register shuffles. Retain the quad across feature slices.
+            quad = warp + Int32(owner * cfg.load_num_warps)
+            offset = (
+                page_offset_stage * Int32(128)
+                + quad * Int32(4)
+                + cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                * Int32(64)
+            )
+            raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
             gather4_uniform_quad_slices(
                 self.smem_k.data_ptr(base + quad * 4 * cfg.mma_qk_tiler_k),
                 self.tma_desc_c_latent,
@@ -1845,6 +1826,7 @@ class SmemVResource(HighThroughputMlaResource):
     """
 
     smem_v: Any = None
+    smem_sparse_offsets: Any = None
     page_offsets: Any = None
     tma_desc_c_transpose: Any = None
     tma_desc_extra_v: Any = None
@@ -1865,8 +1847,8 @@ class SmemVResource(HighThroughputMlaResource):
 
     @producer_work
     @cute.jit
-    def tma_load_cached(self, stage_info: StageInfo, *, cached_v_pages):
-        """Reuse a warp-uniform quad across the FP8 V feature panels."""
+    def tma_load_shared(self, stage_info: StageInfo, *, page_offset_stage):
+        """Read one warp-uniform SMEM quad and reuse it across FP8 V panels."""
         cfg = self.cfg
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_v_warp_id
         cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1876,8 +1858,11 @@ class SmemVResource(HighThroughputMlaResource):
         for owner in cutlass.range_constexpr(
             cfg.tokens_per_v_tile // TMA_GATHER_ROWS // cfg.load_num_warps
         ):
-            raw = broadcast_sparse_quad(cached_v_pages, owner)
-            quad = warp * Int32(32 // cfg.load_num_warps) + Int32(owner)
+            # All lanes read the same quad: shared-memory broadcast replaces
+            # four register shuffles. Retain the quad across feature slices.
+            quad = warp + Int32(owner * cfg.load_num_warps)
+            offset = page_offset_stage * Int32(128) + quad * Int32(4)
+            raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
             call = (quad // Int32(16)) * cfg.iterations_pv_n
             gather4_uniform_quad_slices(
                 self.smem_v.data_ptr(

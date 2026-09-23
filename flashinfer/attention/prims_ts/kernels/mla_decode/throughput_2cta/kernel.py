@@ -396,6 +396,7 @@ def build_mla_decode_task_manager(
 
     if cfg.use_fp8_split_mma_schedule:
         smem_k = SmemKResource(
+            smem_sparse_offsets=sparse_offsets_smem,
             smem_k=smem_kc_arr,
             page_offsets=page_offsets,
             tma_desc_c_latent=tma_desc_c_latent,
@@ -406,6 +407,7 @@ def build_mla_decode_task_manager(
             name="smem_k",
         )
         smem_v = SmemVResource(
+            smem_sparse_offsets=sparse_offsets_smem,
             smem_v=smem_vc_arr,
             page_offsets=page_offsets,
             tma_desc_c_transpose=tma_desc_c_transpose,

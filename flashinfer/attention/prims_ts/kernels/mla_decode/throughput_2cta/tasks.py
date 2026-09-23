@@ -533,11 +533,13 @@ def create_load_k_task(
         with domain_loop(loop_start, loop_end, loop_step):
             if page_offsets is not None:
                 page_offsets.wait()
-                quads = page_offsets.read_sparse_k()
-                page_offsets.release()
+                page_stage = page_offsets.sparse_stage()
                 smem_k.acquire()
-                smem_k.tma_load_cached(cached_k_pages=quads)
+                smem_k.tma_load_shared(page_offset_stage=page_stage)
                 smem_k.commit()
+                # The last quad has been copied into TMA operands. Only now
+                # may the metadata producer overwrite this shared ring slot.
+                page_offsets.release()
             else:
                 smem_k.acquire()
                 smem_k.tma_load_paged()
@@ -595,11 +597,12 @@ def create_load_v_task(
         with domain_loop(loop_start, loop_end, loop_step):
             if page_offsets is not None:
                 page_offsets.wait()
-                quads = page_offsets.read_sparse_v()
-                page_offsets.release()
+                page_stage = page_offsets.sparse_stage()
                 smem_v.acquire()
-                smem_v.tma_load_cached(cached_v_pages=quads)
+                smem_v.tma_load_shared(page_offset_stage=page_stage)
                 smem_v.commit()
+                # Keep the ring slot protected through every shared read.
+                page_offsets.release()
             else:
                 smem_v.acquire()
                 smem_v.tma_load_paged()
