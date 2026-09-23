@@ -30,6 +30,10 @@ class MoEEpTensors:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # ``(num_tokens,)`` fp32 per-token fc1 activation scale (NVFP4 mega path,
+    # requires ``enable_fc1_activation_per_token_scale`` on the kernel config):
+    # multiplied into the dequantized fc1 output before the clamp / activation.
+    fc1_activation_per_token_scale: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
 
