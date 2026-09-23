@@ -647,7 +647,7 @@ def _get_compiled_kernel(state_dtype, lower_bound, norm_eps, packed_t1=False):
         f"_eps{str(float(norm_eps)).replace('.', '_').replace('-', 'm')}"
         f"_packed{int(packed_t1)}"
     )
-    return build_and_load_cute_dsl_kernel(
+    kernel = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         kernel_name,
         lambda: cute.compile(
@@ -662,6 +662,17 @@ def _get_compiled_kernel(state_dtype, lower_bound, norm_eps, packed_t1=False):
         ),
         extra_key_files=_SOURCE_FILES,
     )
+    if packed_t1:
+        return kernel
+
+    # The launch ABI always carries both metadata tensors.  Direct T=1 uses
+    # views of state_indices as rank-compatible, unread placeholders; the
+    # constexpr specialization removes their device access.
+    def direct_kernel(*args):
+        state_indices = args[7]
+        kernel(*args, state_indices, state_indices.reshape(-1, 1))
+
+    return direct_kernel
 
 
 def _check_cuda_tensor(name, tensor, dtype):
@@ -994,12 +1005,7 @@ def run_fused_kda_decode(
     kernel = _get_compiled_kernel(
         state.dtype, lower_bound, float(norm_eps), packed_t1=packed_t1
     )
-    # The launch ABI always carries both metadata tensors.  Direct T=1 uses
-    # views of state_indices as rank-compatible, unread placeholders; the
-    # constexpr specialization removes their device access.
-    direct_qsl = state_indices
-    direct_packed_indices = state_indices.reshape(-1, 1)
-    kernel(
+    args = (
         x,
         weight,
         conv_state,
@@ -1012,7 +1018,9 @@ def run_fused_kda_decode(
         output_gate,
         norm_weight,
         output,
-        query_start_loc if packed_t1 else direct_qsl,
-        packed_state_indices if packed_t1 else direct_packed_indices,
     )
+    if packed_t1:
+        kernel(*args, query_start_loc, packed_state_indices)
+    else:
+        kernel(*args)
     return output
