@@ -800,7 +800,7 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
     import sys
 
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        hopper_mxfp4_optimization_candidates,
+        hopper_mxfp4_candidates,
     )
 
     module = sys.modules[__name__]
@@ -812,7 +812,7 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
     ):
         monkeypatch.setattr(module, field, value)
     _, world_size, _ = _launcher_ranks()
-    candidates = hopper_mxfp4_optimization_candidates(
+    candidates = hopper_mxfp4_candidates(
         tokens,
         hidden=hidden,
         intermediate=intermediate,

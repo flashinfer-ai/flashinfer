@@ -236,7 +236,7 @@ def _argument_error(args: argparse.Namespace) -> Optional[str]:
     if args.sweep != "default" or args.base_knobs is not None:
         return (
             "sm90_mxfp4 accepts only --sweep default with no --base-knobs; "
-            "candidates come from hopper_mxfp4_optimization_candidates()"
+            "candidates come from hopper_mxfp4_candidates()"
         )
     if args.skew is not None:
         return (

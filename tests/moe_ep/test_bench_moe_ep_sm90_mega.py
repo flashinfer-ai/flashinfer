@@ -175,7 +175,7 @@ class BenchmarkContracts(TestCase):
             pull_style_cutedsl_megakernel as sm90,
         )
 
-        candidates = sm90.hopper_mxfp4_optimization_candidates(
+        candidates = sm90.hopper_mxfp4_candidates(
             2048,
             hidden=7168,
             intermediate=3072,

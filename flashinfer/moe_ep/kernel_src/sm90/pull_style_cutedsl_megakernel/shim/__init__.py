@@ -34,7 +34,7 @@ from .autotune import (
     autotune_knobs,
     hopper_fp8_candidates,
 )
-from .mxfp4_optimization import hopper_mxfp4_optimization_candidates
+from .mxfp4_optimization import hopper_mxfp4_candidates
 from .knob_cache import (
     knob_cache_path,
     lookup_knobs,
@@ -117,6 +117,7 @@ __all__ = [
     "MXFP4_TUNING_ROUTING_PROFILES",
     "MXFP4_TUNING_TOKEN_BUCKETS",
     "Mxfp4RoutingProfile",
+    "hopper_mxfp4_candidates",
     "hopper_mxfp4_default_tactic",
     "is_hopper_mxfp4_tactic_shape_compatible",
     "is_valid_hopper_mxfp4_tactic",

@@ -210,7 +210,7 @@ def mxfp4_tail_candidate_provenance() -> dict[str, Any]:
     }
 
 
-def hopper_mxfp4_optimization_candidates(
+def hopper_mxfp4_candidates(
     max_tokens: int,
     *,
     hidden: int,

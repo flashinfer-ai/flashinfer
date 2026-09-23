@@ -557,7 +557,7 @@ def autotune_hopper_mxfp4_mega_moe(
     )
     from .mxfp4_optimization import (
         MXFP4_STRATEGY_FIELDS,
-        hopper_mxfp4_optimization_candidates,
+        hopper_mxfp4_candidates,
         mxfp4_optimization_candidate_sha256,
         normalize_mxfp4_optimization_tactic,
     )
@@ -578,7 +578,7 @@ def autotune_hopper_mxfp4_mega_moe(
 
     cfg = symm_buffer._frontend.config
     require_hopper_mxfp4_fused_tuning_device()
-    full_candidates = hopper_mxfp4_optimization_candidates(
+    full_candidates = hopper_mxfp4_candidates(
         cfg.num_tokens_per_rank,
         hidden=cfg.hidden,
         intermediate=cfg.intermediate,

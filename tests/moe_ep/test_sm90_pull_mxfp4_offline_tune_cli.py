@@ -347,7 +347,7 @@ def test_tune_one_uses_complete_fused_strategy_union(monkeypatch) -> None:
         "winner": "fused"
     }
 
-    expected = pkg.hopper_mxfp4_optimization_candidates(
+    expected = pkg.hopper_mxfp4_candidates(
         8,
         hidden=args.hidden,
         intermediate=args.intermediate,

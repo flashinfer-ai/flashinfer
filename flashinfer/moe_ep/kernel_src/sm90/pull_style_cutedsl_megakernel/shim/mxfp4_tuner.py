@@ -3,7 +3,7 @@
 """Hopper MXFP4 base tactics, default buckets, and persistent cache identity.
 
 The complete shape-filtered online/offline tuning list is exposed by
-``hopper_mxfp4_optimization_candidates`` in ``mxfp4_optimization``.
+``hopper_mxfp4_candidates`` in ``mxfp4_optimization``.
 """
 
 from __future__ import annotations

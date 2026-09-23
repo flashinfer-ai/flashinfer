@@ -257,7 +257,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             "tokens are not part of the persistent cache key"
         )
 
-    candidates = pkg.hopper_mxfp4_optimization_candidates(
+    candidates = pkg.hopper_mxfp4_candidates(
         max_tokens,
         hidden=args.hidden,
         intermediate=args.intermediate,

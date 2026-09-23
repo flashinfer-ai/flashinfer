@@ -35,7 +35,7 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
 )
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
     expand_mxfp4_optimization_candidates,
-    hopper_mxfp4_optimization_candidates,
+    hopper_mxfp4_candidates,
     mxfp4_optimization_candidate_sha256,
     normalize_mxfp4_optimization_tactic,
     resolve_mxfp4_tactic_optimizations,
@@ -303,7 +303,7 @@ def test_defaults_and_complete_candidate_order(profile):
         assert tactic["in_kernel_fc2_reduce"] is False
         assert tactic["grouped_token_back"] is False
         assert tactic["combine_format"] == "bf16"
-        candidates = hopper_mxfp4_optimization_candidates(
+        candidates = hopper_mxfp4_candidates(
             token, routing_profile=profile, **_OPTIMIZATION_SHAPE
         )
         assert candidates[0] == normalize_mxfp4_optimization_tactic(tactic)
@@ -339,7 +339,7 @@ def test_cache_identity_preserves_existing_winners_and_tracks_domain(monkeypatch
 
 
 def test_h20_anchors_are_candidates_but_not_defaults():
-    candidates = hopper_mxfp4_optimization_candidates(
+    candidates = hopper_mxfp4_candidates(
         1, hidden=3072, intermediate=1280, num_experts=384, world_size=8
     )
     anchors = [
@@ -359,7 +359,7 @@ def test_h20_anchors_are_candidates_but_not_defaults():
 
 
 def test_small_shape_uses_legal_candidates_from_both_profiles():
-    candidates = hopper_mxfp4_optimization_candidates(
+    candidates = hopper_mxfp4_candidates(
         512, hidden=128, intermediate=128, num_experts=8, world_size=1
     )
     assert {t["mma_tiler_mnk"][2] for t in candidates} == {128}
@@ -372,7 +372,7 @@ def test_small_shape_uses_legal_candidates_from_both_profiles():
 
 @pytest.mark.parametrize("profile", MXFP4_TUNING_ROUTING_PROFILES)
 def test_candidates_and_defaults_return_fresh_copies(profile):
-    candidates = hopper_mxfp4_optimization_candidates(
+    candidates = hopper_mxfp4_candidates(
         8, routing_profile=profile, **_OPTIMIZATION_SHAPE
     )
     expected = copy.deepcopy(candidates)
@@ -382,9 +382,7 @@ def test_candidates_and_defaults_return_fresh_copies(profile):
     expected_default = dict(default)
     default.clear()
     assert (
-        hopper_mxfp4_optimization_candidates(
-            8, routing_profile=profile, **_OPTIMIZATION_SHAPE
-        )
+        hopper_mxfp4_candidates(8, routing_profile=profile, **_OPTIMIZATION_SHAPE)
         == expected
     )
     assert hopper_mxfp4_default_tactic(8, routing_profile=profile) == expected_default
@@ -407,7 +405,7 @@ def test_profile_aware_apis_reject_noncanonical_profile(bad_profile):
         lambda: normalize_sm90_routing_profile(bad_profile),
         lambda: hopper_mxfp4_cache_provenance_sha256(routing_profile=bad_profile),
         lambda: hopper_mxfp4_default_tactic(8, routing_profile=bad_profile),
-        lambda: hopper_mxfp4_optimization_candidates(
+        lambda: hopper_mxfp4_candidates(
             8, routing_profile=bad_profile, **_OPTIMIZATION_SHAPE
         ),
     )
@@ -651,7 +649,7 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
                 16384,
                 32768,
             ):
-                actual = hopper_mxfp4_optimization_candidates(
+                actual = hopper_mxfp4_candidates(
                     token, routing_profile=profile, **_OPTIMIZATION_SHAPE
                 )
                 original = _ordered_base_candidates(
@@ -674,7 +672,7 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
         self.assertEqual(len(digests), 1)
 
     def test_tail_catalog_covers_measured_neighbors_without_cross_product(self):
-        candidates = hopper_mxfp4_optimization_candidates(2048, **_OPTIMIZATION_SHAPE)
+        candidates = hopper_mxfp4_candidates(2048, **_OPTIMIZATION_SHAPE)
         for token in MXFP4_TUNING_TOKEN_BUCKETS:
             base = normalize_mxfp4_optimization_tactic(
                 hopper_mxfp4_default_tactic(token)
@@ -727,7 +725,7 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
                     2048, hidden=shape["hidden"], intermediate=shape["intermediate"]
                 )
                 previous = expand_mxfp4_optimization_candidates(base, **shape)
-                actual = hopper_mxfp4_optimization_candidates(2048, **shape)
+                actual = hopper_mxfp4_candidates(2048, **shape)
                 self.assertEqual(actual[: len(previous)], previous)
                 tails = [c for c in actual if c["tail_split_pairs"]]
                 self.assertTrue(tails)
@@ -776,7 +774,7 @@ def test_full_union_records_effective_winner_and_cache_identity(
         gate_up_clamp=10.0,
         routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
     )
-    candidates = hopper_mxfp4_optimization_candidates(
+    candidates = hopper_mxfp4_candidates(
         cfg.num_tokens_per_rank,
         hidden=cfg.hidden,
         intermediate=cfg.intermediate,
@@ -930,7 +928,7 @@ def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
     assert captured["candidates"] == [normalize_mxfp4_optimization_tactic(h20_anchor)]
     record.assert_not_called()
 
-    full = hopper_mxfp4_optimization_candidates(
+    full = hopper_mxfp4_candidates(
         cfg.num_tokens_per_rank,
         hidden=cfg.hidden,
         intermediate=cfg.intermediate,

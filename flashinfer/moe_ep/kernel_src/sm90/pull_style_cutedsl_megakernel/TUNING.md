@@ -749,7 +749,7 @@ Other shapes can therefore have fewer than 38 candidates. Token capacity
 changes ordering, not the union; the untuned heuristic buckets are unchanged.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
-`hopper_mxfp4_optimization_candidates` list. The default public scorer takes
+`hopper_mxfp4_candidates` list. The default public scorer takes
 three warmups and ten synchronized `perf_counter` samples, scores each rank
 by its median and takes the maximum across ranks. `knobs=None` consults the
 cache, then the routing/token-bucket heuristic, without timing. An explicit
