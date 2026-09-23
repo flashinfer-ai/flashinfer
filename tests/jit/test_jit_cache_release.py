@@ -108,6 +108,7 @@ set -euo pipefail
 source "{common_script}"
 export PIP_CONSTRAINT=/tmp/original-constraint
 export PIP_BUILD_CONSTRAINT=/tmp/original-build-constraint
+unset PIP_RETRIES PIP_RESUME_RETRIES PIP_DEFAULT_TIMEOUT
 setup_jit_cache_python_build "{fake_python}" 13.0 cu130
 test "${{PIP_RETRIES}}" = 10
 test "${{PIP_RESUME_RETRIES}}" = 10
