@@ -185,17 +185,17 @@ def test_split_sequence_affine_route_caches_and_rebinds():
 
 
 @pytest.mark.parametrize("checkpoints", [True, False])
-def test_long_unbounded_sequence_on_fp32_state_runs_sequentially_and_caches(checkpoints):
+def test_long_unbounded_sequence_on_fp32_state_takes_affine_split_and_caches(checkpoints):
     # The FP32 external state pool is the serving contract: with or without a
-    # checkpoint request an unbounded sequence takes the sequential fused
-    # direct M128 body (FP32 chunk carrier, no affine composition error), and
-    # that single-launch plan is cacheable.
+    # checkpoint request an unbounded long sequence takes the affine split
+    # (FP32 state carrier in every part), and the composite plan is cacheable
+    # and rebinds bitwise onto new addresses.
     cache = KDAPrefillPlanCache(8)
     d = _inputs([8192], 12, seed=5)
     pool = d["pool"].clone()
     call = _run(d, cache, checkpoints=checkpoints)
     schedule = str(call.schedule)
-    assert "fused" in schedule and "affine" not in schedule
+    assert "affine" in schedule
     assert cache.uncacheable == 0 and len(cache) == 1
     got = _snapshot(d)
     d["pool"].copy_(pool)

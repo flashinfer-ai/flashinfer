@@ -4729,24 +4729,13 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or checkpoint_every_n_tokens != 64
     ):
         return False
-    if argument(9, "lower_bound") is None and (
-        checkpoint_request
-        or (initial_state.dtype == torch.float32 and compute_dtype == "bf16")
-    ):
-        # Unbounded (softplus) prefill on the FP32 external state pool is the
-        # serving contract: its final state resumes decode and, when
-        # checkpointed, feeds the radix cache, and both are validated against
-        # Triton.  The split's per-part map and correction passes each add
-        # BF16 error proportional to the whole state, and slow unbounded gates
-        # do not damp it: on real 8K activations the state drifts from 0.002
-        # to 0.03 rel L2 across twelve composed parts (Triton flat at 0.003),
-        # independent of map storage precision.  The split's multi-launch plan
-        # is also rebuilt on every call (about 2.4 ms of host work at 8K),
-        # while the sequential direct M128 recurrence with the FP32 carrier
-        # stays at Triton level and its single-launch plan is cacheable, so it
-        # owns this contract.  BF16-state callers and the TF32 compute family
-        # (TF32 map and correction operands) keep the split.
-        return False
+    # Unbounded (softplus) prefill on the FP32 external state pool is the
+    # serving contract (final state resumes decode; checkpoint rows feed the
+    # radix cache).  Its split parts carry the standalone FP32 state carrier,
+    # which removed the composed per-part drift (real 8K activations: per-chunk
+    # rel L2 flat at 0.002-0.0034 across nine parts, Triton 0.0026-0.0031),
+    # and the composite is covered by the plan cache, so it takes the split at
+    # the same part-count crossover as every other caller.
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
         return False
