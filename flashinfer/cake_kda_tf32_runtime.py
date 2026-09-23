@@ -4252,9 +4252,9 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         if compute_dtype == "tf32":
             self.schedule += "_tf32_compute"
-        self._final_external = torch.empty(
-            state_shape, dtype=final_state.dtype, device=q.device
-        )
+        # Torch-epilogue scratch (final_external / *_selected / checkpoint_merged)
+        # is allocated only when the fused epilogue is unavailable (see below).
+        self._final_external = None
         self._main_initial = torch.zeros(
             (num_parts, heads, HEAD_DIM, HEAD_DIM), dtype=torch.float32, device=q.device
         )
@@ -4275,8 +4275,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._final_compact = torch.empty(
             state_shape, dtype=torch.float32, device=q.device
         )
-        self._final_main_selected = torch.empty_like(self._final_compact)
-        self._final_correction_selected = torch.empty_like(self._final_compact)
+        self._final_main_selected = None
+        self._final_correction_selected = None
         self._zero_v = torch.zeros_like(v[:, first_part_tokens:])
         self._map_out = torch.empty_like(out[:, first_part_tokens:])
         self._correction_out = torch.empty_like(out[:, first_part_tokens:])
@@ -4310,11 +4310,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 dtype=state_checkpoints.dtype,
                 device=q.device,
             )
-            self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
+            self._checkpoint_merged = None
+            self._checkpoint_merged_first = None
+            self._checkpoint_merged_tail = None
+            self._first_cp_count = first_cp_count
             self._checkpoint_main_first = self._checkpoint_main[:first_cp_count]
             self._checkpoint_main_tail = self._checkpoint_main[first_cp_count:]
-            self._checkpoint_merged_first = self._checkpoint_merged[:first_cp_count]
-            self._checkpoint_merged_tail = self._checkpoint_merged[first_cp_count:]
             self._checkpoint_offsets = torch.tensor(
                 [row for count in cp_counts for row in range(count)],
                 dtype=torch.int64,
@@ -4529,6 +4530,19 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._fused_epilogue = _FusedAffineEpilogue.build(self)
             if self._fused_epilogue is not None:
                 self.schedule += "_fused_epilogue"
+        if self._fused_epilogue is None:
+            # Torch epilogue scratch: a merged copy of the checkpoint rows plus
+            # the selected/converted final states (~4x the checkpoint rows of a
+            # 16K pack; retained per plan-cache entry, so only when needed).
+            self._final_external = torch.empty(
+                state_shape, dtype=final_state.dtype, device=q.device
+            )
+            self._final_main_selected = torch.empty_like(self._final_compact)
+            self._final_correction_selected = torch.empty_like(self._final_compact)
+            if self._checkpoint_output is not None:
+                self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
+                self._checkpoint_merged_first = self._checkpoint_merged[: self._first_cp_count]
+                self._checkpoint_merged_tail = self._checkpoint_merged[self._first_cp_count :]
         self._use_cuda_graph = True
         self._cuda_graph_warmed = False
         self._cuda_graph = None

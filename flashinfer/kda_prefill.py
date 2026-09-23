@@ -7431,16 +7431,36 @@ class KDAPrefillPlanCache:
     and no data-dependent host branch, so a hit is CUDA-graph capturable.
     """
 
-    def __init__(self, capacity: int = 64):
+    #: Default budget for workspace retained by cached launches.  An affine
+    #: composite for a 16K-token pack with checkpoint rows retains ~0.7 GiB
+    #: (row windows, part states, tail outputs); serving sees a new pack
+    #: signature on most packed forwards, so an entry-count bound alone let
+    #: the cache grow past the free device memory.
+    DEFAULT_MAX_BYTES = 8 << 30
+
+    def __init__(self, capacity: int = 64, max_bytes: int | None = None):
+        import os
         from collections import OrderedDict
 
         if capacity <= 0:
             raise ValueError("plan cache capacity must be positive")
+        if max_bytes is None:
+            max_bytes = int(
+                os.environ.get(
+                    "FLASHINFER_KDA_PLAN_CACHE_MAX_BYTES", self.DEFAULT_MAX_BYTES
+                )
+            )
+        if max_bytes <= 0:
+            raise ValueError("plan cache byte budget must be positive")
         self.capacity = int(capacity)
+        self.max_bytes = int(max_bytes)
         self._entries = OrderedDict()
+        self._bytes = {}
+        self.bytes = 0
         self.hits = 0
         self.misses = 0
         self.uncacheable = 0
+        self.evictions = 0
 
     def __len__(self):
         return len(self._entries)
@@ -7451,6 +7471,16 @@ class KDAPrefillPlanCache:
             if callable(close):
                 close()
         self._entries.clear()
+        self._bytes.clear()
+        self.bytes = 0
+
+    def _evict_oldest(self):
+        key, (evicted, _) = self._entries.popitem(last=False)
+        self.bytes -= self._bytes.pop(key, 0)
+        self.evictions += 1
+        close = getattr(evicted, "close", None)
+        if callable(close):
+            close()
 
     @staticmethod
     def _key(inputs, **scalars):
@@ -7482,8 +7512,14 @@ class KDAPrefillPlanCache:
         self.hits += 1
         return prepared
 
-    def put(self, prepared, inputs, **scalars):
-        """Record a freshly prepared launch; returns False when not cacheable."""
+    def put(self, prepared, inputs, *, retained_bytes: int = 0, **scalars):
+        """Record a freshly prepared launch; returns False when not cacheable.
+
+        ``retained_bytes`` is the device memory the launch keeps alive (the
+        caller measures the allocator delta across preparation); the cache
+        evicts least-recently-used entries until both the entry count and the
+        byte budget hold, always keeping the newest entry.
+        """
         from .cake_kda_tf32_runtime import capture_rebind_plan
 
         owner = getattr(prepared, "_impl", prepared)
@@ -7492,14 +7528,17 @@ class KDAPrefillPlanCache:
             return False
         plan = capture_rebind_plan(owner, inputs)
         key = self._key(inputs, **scalars)
+        if key in self._entries:
+            self.bytes -= self._bytes.pop(key, 0)
         self._entries[key] = (prepared, plan)
         self._entries.move_to_end(key)
+        self._bytes[key] = int(retained_bytes)
+        self.bytes += int(retained_bytes)
         self.misses += 1
-        while len(self._entries) > self.capacity:
-            _, (evicted, _) = self._entries.popitem(last=False)
-            close = getattr(evicted, "close", None)
-            if callable(close):
-                close()
+        while len(self._entries) > 1 and (
+            len(self._entries) > self.capacity or self.bytes > self.max_bytes
+        ):
+            self._evict_oldest()
         return True
 
 
@@ -7616,6 +7655,7 @@ def _prepare_kda_prefill(
         lower_bound,
     )
     with torch.cuda.device(q.device):
+        allocated_before = torch.cuda.memory_allocated(q.device)
         if beta_is_logit:
             prepared = FlashKDABlackwellLaunch(*args, **kwargs)
         elif compute_dtype == "bf16":
@@ -7628,5 +7668,8 @@ def _prepare_kda_prefill(
             prepared = prepare_active_beta_fwd(*args, **kwargs)
         prepare_descriptors(getattr(prepared, "prepared", prepared))
         if cache_inputs is not None:
-            plan_cache.put(prepared, cache_inputs, **cache_scalars)
+            retained = torch.cuda.memory_allocated(q.device) - allocated_before
+            plan_cache.put(
+                prepared, cache_inputs, retained_bytes=max(0, retained), **cache_scalars
+            )
     return prepared

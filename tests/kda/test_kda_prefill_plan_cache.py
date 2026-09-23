@@ -343,3 +343,28 @@ def test_packed_calls_below_the_break_even_keep_the_sequential_body(lengths):
     d = _inputs(lengths, 16, seed=22)
     call = _run(d)
     assert "affine" not in str(call.schedule)
+
+
+def test_plan_cache_evicts_by_retained_workspace_bytes():
+    # Every cached launch keeps its workspace alive (an affine composite for a
+    # 16K pack with rows holds ~0.7 GiB); serving sees a new pack signature on
+    # most packed forwards, so the cache is bounded in bytes as well as
+    # entries and always keeps the newest launch.
+    small = KDAPrefillPlanCache(8, max_bytes=1)
+    a = _inputs([64] * 4, 12, seed=31)
+    b = _inputs([64] * 8, 12, seed=32)
+    _run(a, small)
+    assert len(small) == 1 and small.bytes > 1
+    _run(b, small)
+    assert len(small) == 1 and small.evictions == 1
+    assert _run(b, small) is not None and small.hits == 1
+
+    roomy = KDAPrefillPlanCache(8)
+    _run(a, roomy)
+    _run(b, roomy)
+    assert len(roomy) == 2 and roomy.evictions == 0
+    assert roomy.bytes == sum(roomy._bytes.values()) > 0
+    long = _inputs([16384], 16, seed=33)
+    _run(long, roomy)
+    # the affine composite with rows retains well under the default budget
+    assert 0 < roomy._bytes[next(reversed(roomy._entries))] < KDAPrefillPlanCache.DEFAULT_MAX_BYTES // 4
