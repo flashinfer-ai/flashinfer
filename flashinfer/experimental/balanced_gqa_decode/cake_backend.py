@@ -34,6 +34,7 @@ distributed merge (``2 * q_len`` merge tickets per split tile).  Other
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
@@ -189,8 +190,18 @@ def _round_up_pages(max_pages: int) -> int:
 
 
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
+    """View ``shape`` elements of ``dtype`` at the start of workspace region ``name``.
+
+    The regions are sized for the larger packed-row MTP slots; the row-tile
+    program uses a prefix of each region.
+    """
     offset, nbytes = layout[name]
-    return flat[offset : offset + nbytes].view(dtype).view(shape)
+    needed = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if needed > nbytes:
+        raise ValueError(
+            f"workspace region {name!r} holds {nbytes} bytes, {needed} needed"
+        )
+    return flat[offset : offset + needed].view(dtype).view(shape)
 
 
 # ---------------------------------------------------------------------------
