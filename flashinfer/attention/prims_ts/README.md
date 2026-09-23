@@ -365,10 +365,9 @@ and larger, an SMEM ring for 4 and 1), selected per tile on the route kind.
 A route kind with one scale per score (the one-token K block) has its
 scores written back dequantized by the max pass, so its P pass avoids
 reloading and applying all 32 `sfK` words of each fragment.
-A mixed geometry costs little: the proxy kernel carries both geometries'
-max passes and gathers the summary scales in its softmax warps, and SOL proxy runs at 1.03x the time of equal block sizes
-with a one-token summary block for both INT8 and FP8 (B200, CUDA Graph
-replay minimum; exact-only plans are unaffected). `v_summary` holds the per-block V means (the final partial
+A mixed geometry costs a few percent on proxy plans: the proxy kernel carries
+both geometries' max passes and gathers the summary scales in its softmax
+warps; exact-only plans are unaffected. `v_summary` holds the per-block V means (the final partial
 block averages only its structural tokens) quantized to E4M3 with the shared
 `v_scale`; with `v_mean`, build them from `V - v_mean`. A proxy block stands
 for as many identical tokens as it covers, so its mass enters the proxy
@@ -378,23 +377,23 @@ Sage.
 
 ### Performance
 
-The kernel is issue-bound in its softmax warps, not tensor-bound, so the
-8-bit tensors alone do not speed it up. The gain comes from keeping the scale
-machinery off the critical path (scales staged with the route metadata and at
-tile start, one multiplier per compile-time score group) and from
-reinvesting the resources the byte-wide tiles free: a four-stage K/V ring,
-the output tile's columns split between the two lane groups of the tail, an
-INT8 accumulator seeded with an FP32 bias so scores need no conversion, and a
-smaller instruction footprint in the masked softmax paths. On B200 with the
-`(fp8, fp8, (1, 16, 1))` recipe, kernel time relative to the BF16 kernel of
-the same plan (both scheduled by the same launch heuristic) is 0.83 on
-dense S=10800 H=40, 1.00 on dense S=4096 H=8 (the small dense case gains
-nothing over the persistent BF16 kernel), 0.91 on block-sparse S=4096 H=8
-(density 0.25), 0.81 on a VSA-shaped block-sparse case (S=15360, H=40,
-density 0.125), 0.82 on the SOL exact case (S=10800, H=40, density 0.175)
-and 0.86 on its proxy variant; the numbers do not depend on the logit
-distribution. The INT8 recipe is within 1-4% of the FP8 recipe.
-`k_block_size=32` is neutral for FP8 and 3-4% faster than 16 for INT8.
+The Sage kernels keep the warp roles, pipelines and scheduler of the 16-bit
+decode kernels. The 8-bit tensors halve the K/V traffic, and the byte-wide
+tiles free shared memory that the kernels reinvest in a deeper K/V ring and a
+lighter output tail. The softmax warps stay the bottleneck, so the scale
+machinery is kept off their critical path: exact routes' K scales travel with
+the route metadata, dense tiles read theirs ahead of the score wait, one
+multiplier serves each compile-time scale group, INT8 scores accumulate on an
+FP32 bias so they need no conversion, and the one-token K block writes its
+scores back dequantized so its P pass reads no scales.
+
+Rough figures on B200, kernel time relative to the BF16 kernel of the same
+plan under the same launch heuristic: the FP8 and INT8 recipes run the dense
+and block-sparse decode shapes (SOL and VSA geometries, long and short) about
+15-20% faster; a small dense shape that a persistent BF16 grid already
+saturates gains nothing; INT8 is within a few percent of FP8; the 4- and
+1-token K blocks cost 10-20% over the 16-token block; the results do not
+depend on the logit distribution.
 
 ### Examples
 
