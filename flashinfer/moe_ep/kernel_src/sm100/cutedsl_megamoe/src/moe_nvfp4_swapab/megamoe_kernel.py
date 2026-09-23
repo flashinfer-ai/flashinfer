@@ -13,12 +13,14 @@ Shared / local workspace split:
             nvlink_barrier_signal
   LOCAL   : expert_send_count, grid_sync_counter, l1_token_buffer,
             l1_sf_buffer, l1_topk_weights_buffer, l1_arrival_count,
+            (optionally) l1_fc1_activation_per_token_scale_buffer,
             token_src_metadata, fc1_output, fc1_output_sf,
             fc1_done_counter, (optionally) load_balance_counter
 
 User tensors are not in the opaque workspaces. ``activation``,
-``activation_sf``, ``topk_weights``, and ``combine_output`` must be reachable
-through the symmetric-heap peer mapper; ``topk_idx`` and weights are local.
+``activation_sf``, ``topk_weights``, ``combine_output``, and (when enabled)
+``fc1_activation_per_token_scale`` must be reachable through the
+symmetric-heap peer mapper; ``topk_idx`` and weights are local.
 
 Dispatch/pool alignment constraints are unified at construction time:
 ``token_padding_block`` (base) and ``block_m`` (dispatch) become the
@@ -197,6 +199,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
+        enable_fc1_activation_per_token_scale: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
     ) -> None:
@@ -287,6 +290,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             gate_up_clamp=gate_up_clamp,
+            enable_fc1_activation_per_token_scale=(
+                enable_fc1_activation_per_token_scale
+            ),
             epi_flag_batch=epi_flag_batch,
         )
 
@@ -679,6 +685,18 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 128,
             ),
         ]
+        if self.enable_fc1_activation_per_token_scale:
+            # Pool-ordered per-token fc1 activation scale: dispatch_pull lane 0
+            # writes one fp32 per pulled token (next to its topk weight), the
+            # fc1 epilogue reads it.  Sized like ``l1_topk_weights_buffer``.
+            specs.append(
+                _RegionSpec(
+                    "l1_fc1_activation_per_token_scale_buffer",
+                    cutlass.Float32,
+                    (pool_token_capacity,),
+                    16,
+                )
+            )
         if self.token_back_by_dispatch:
             # Local fc2 DATA staging (token_back_by_dispatch modes only); the
             # wire-format dtype sizes the plane.
@@ -969,6 +987,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             "standalone_warps": "standalone",
             "reuse_dispatch_warps": "reuse_dispatch",
         }.get(self.token_back_mode, self.token_back_mode)
+        # Empty when off so existing compiled-kernel cache keys stay unchanged.
+        act_scale = (
+            "_fc1actptscale" if self.enable_fc1_activation_per_token_scale else ""
+        )
         return (
             "megamoe_nvfp4"
             f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
@@ -978,6 +1000,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_fc2out{self.fc2_output_dtype.__name__}_combine{self.combine_format}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_swiglua{self.swiglu_alpha}"
             f"_swiglub{self.swiglu_beta}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"{act_scale}"
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
@@ -1106,6 +1129,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             stream=make_fake_stream(),  # explicit stream arg -> caller keeps launch control
         )
 
+        if self.enable_fc1_activation_per_token_scale:
+            # Part of the ABI only when enabled (the default ABI is unchanged).
+            fake["fc1_activation_per_token_scale"] = fake_tensor(
+                float32, (tokens,), (0,), {0}, 4
+            )
+
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake)
         if out_path is None:
             return compiled
@@ -1159,6 +1188,11 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # Codegen / runtime.
         max_active_clusters: cutlass.Constexpr,
         stream,
+        # Optional per-token fc1 activation scale: (T,) Float32 on the
+        # symmetric heap (peer-pulled by dispatch like ``topk_weights``).
+        # Required iff ``enable_fc1_activation_per_token_scale``; ignored
+        # (and absent from the ABI) otherwise.
+        fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch the MegaMoE-complete fused kernel.
 
@@ -1168,6 +1202,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             (typically NVSHMEM symmetric heap).  Single-rank degenerate
             runs (``peer_rank_ptr_mapper.offsets[local_rank] == 0`` by NVSHMEM
             convention) are allowed.
+          * ``fc1_activation_per_token_scale`` (when enabled) is peer-pulled
+            by the dispatch warps exactly like ``topk_weights`` and MUST be
+            reachable via ``peer_rank_ptr_mapper.map(...)`` as well.
           * ``topk_idx`` is read on the local rank only; placement is
             unconstrained (cuda local or sym heap).
           * ``fc1_weight`` / ``fc1_weight_sf`` / ``fc2_weight`` /
@@ -1234,6 +1271,20 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             local_workspace,
             "l1_topk_weights_buffer",
         )
+        if cutlass.const_expr(self.enable_fc1_activation_per_token_scale):
+            if cutlass.const_expr(fc1_activation_per_token_scale is None):
+                raise ValueError(
+                    "enable_fc1_activation_per_token_scale=True but no "
+                    "fc1_activation_per_token_scale tensor was provided."
+                )
+            act_scale_input = fc1_activation_per_token_scale
+            l1_fc1_activation_per_token_scale_buffer = self._view_local(
+                local_workspace,
+                "l1_fc1_activation_per_token_scale_buffer",
+            )
+        else:
+            act_scale_input = None
+            l1_fc1_activation_per_token_scale_buffer = None
         l1_arrival_count = self._view_local(
             local_workspace,
             "l1_arrival_count",
@@ -1454,6 +1505,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             fc1_input_token_buffer=l1_token_buffer_u8,
             fc1_input_sf_buffer=l1_sf_buffer_i32,
             fc1_input_topk_weights_buffer=l1_topk_weights_buffer,
+            input_fc1_activation_per_token_scale_buffer=act_scale_input,
+            dispatched_fc1_activation_per_token_scale_buffer=(
+                l1_fc1_activation_per_token_scale_buffer
+            ),
             fc1_ready_counter=l1_arrival_count,
             token_src_metadata=token_src_metadata,
             combine_output=combine_output_u8,
@@ -1515,6 +1570,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             fc1_alpha=fc1_alpha,
             fc2_alpha=fc2_alpha,
             fc1_norm_const=fc1_norm_const,
+            fc1_activation_per_token_scale=l1_fc1_activation_per_token_scale_buffer,
             offs=None,
             max_active_clusters=max_active_clusters,
             stream=stream,
