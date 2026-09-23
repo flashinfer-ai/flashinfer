@@ -41,10 +41,12 @@ from flashinfer.experimental.nvfp4_mla_decode.cake_backend import (
     V_HALVES,
     build_work_plan,
     check_pairs,
+    kv_pages,
     kv_tiles,
     max_nvfp4_mla_decode_workspace_size,
     nvfp4_mla_decode_workspace_size,
     quantize_nvfp4,
+    token_splits,
     work_table_rows,
     workspace_layout,
 )
@@ -79,7 +81,7 @@ def dequantize_nvfp4(packed, scale):
 
 def _gather_dequant(cache, scale, block_table_row, kv_len):
     """Dequantize the first ``kv_len`` tokens of one request: [kv_len, 512]."""
-    pages = block_table_row[: kv_tiles(kv_len)].long()
+    pages = block_table_row[: kv_pages(kv_len)].long()
     rows = dequantize_nvfp4(cache[pages], scale[pages])  # [pages, page, D]
     return rows.reshape(-1, rows.shape[-1])[:kv_len]
 
@@ -134,7 +136,7 @@ def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
     """Deterministic NVFP4 paged decode inputs with a peaked softmax."""
     gen = torch.Generator(device=device).manual_seed(seed)
     batch = len(kv_lens)
-    pages_per_seq = [kv_tiles(kv) for kv in kv_lens]
+    pages_per_seq = [kv_pages(kv) for kv in kv_lens]
     total_pages = sum(pages_per_seq)
     max_pages = max(pages_per_seq)
     k_full = torch.randn(
@@ -287,8 +289,8 @@ def test_rejects_fewer_than_128_query_rows(kv_lens, num_heads, q_len):
 
 
 # Expected values computed once from the source host plan module for the same
-# shapes (cluster of two CTAs per unit; balanced schedule over num_sms // 2
-# units; uniform schedule pairs consecutive items). Columns: schedule, kv_lens,
+# shapes (128-token pipeline tiles; cluster of two CTAs per unit; balanced
+# schedule over num_sms // 2 units; uniform schedule pairs consecutive items). Columns: schedule, kv_lens,
 # q_len, num_heads, num_sms, tiles_per_split, enable_sink -> (num_items,
 # num_units, grid_x, max_splits, tiles_per_split, item digest).
 PLAN_EXPECTATIONS = [
@@ -300,7 +302,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         True,
-        (16, 3, 6, 2, None, "e1be1df6a1068135"),
+        (12, 1, 2, 1, None, "9e9b3c2f79b9c8c9"),
     ),
     (
         "balanced",
@@ -310,7 +312,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         False,
-        (168, 74, 148, 7, None, "bce7f7a800a4cb91"),
+        (168, 74, 148, 7, None, "4ea8c4a75a2e39ec"),
     ),
     # contract row partial_pages_h8
     (
@@ -321,7 +323,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         True,
-        (56, 27, 54, 16, None, "3592220b611a0c8b"),
+        (28, 14, 28, 8, None, "59301522e221c0dc"),
     ),
     (
         "balanced",
@@ -331,7 +333,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         False,
-        (76, 37, 74, 37, None, "a98e3fabd5f652ba"),
+        (76, 37, 74, 37, None, "a3819a3ff83857a9"),
     ),
     # contract row bs32_q6_kv8k (auto -> balanced at the 8K threshold)
     (
@@ -342,7 +344,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         True,
-        (336, 74, 148, 2, None, "d05e6b3d8872ab59"),
+        (336, 74, 148, 2, None, "572f292c9a1a8d4e"),
     ),
     (
         "uniform",
@@ -350,12 +352,12 @@ PLAN_EXPECTATIONS = [
         6,
         64,
         148,
-        32,
+        16,
         False,
-        (18, 9, 18, 2, 32, "9bcf8e5442f91a15"),
+        (18, 9, 18, 2, 16, "cfc9d381b510474e"),
     ),
-    # contract row smoke, forced to two splits (tiles_per_split = ceil(5 / 2))
-    ("auto", [256, 300], 6, 64, 148, 3, True, (24, 12, 24, 2, 3, "2dd204fdabaf9bf2")),
+    # contract row smoke, forced to two splits (tiles_per_split = ceil(3 / 2))
+    ("auto", [256, 300], 6, 64, 148, 2, True, (18, 9, 18, 2, 2, "0158765222990d70")),
     (
         "uniform",
         [8192] * 32,
@@ -364,18 +366,9 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         False,
-        (192, 96, 192, 1, 128, "2549a4d3ff721985"),
+        (192, 96, 192, 1, 64, "d75ce1d28bf7186c"),
     ),
-    (
-        "uniform",
-        [777, 65],
-        1,
-        64,
-        148,
-        None,
-        True,
-        (4, 2, 4, 1, 13, "7e8e47b4623f60b9"),
-    ),
+    ("uniform", [777, 65], 1, 64, 148, None, True, (4, 2, 4, 1, 7, "8c4b53efc0be2f5d")),
     # contract row no_sink_q1 (auto -> uniform)
     (
         "auto",
@@ -385,7 +378,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         False,
-        (8, 4, 8, 1, 64, "95fe7983a25d234f"),
+        (8, 4, 8, 1, 32, "34d565175b0aecd4"),
     ),
     (
         "uniform",
@@ -395,7 +388,7 @@ PLAN_EXPECTATIONS = [
         148,
         None,
         False,
-        (12, 6, 12, 1, 256, "73cfcd1186a5db80"),
+        (12, 6, 12, 1, 128, "4928f9d56ffee550"),
     ),
 ]
 
@@ -443,7 +436,7 @@ def test_balanced_unit_first_matches_source():
         enable_sink=True,
         schedule="balanced",
     )
-    assert plan.unit_first == (0, 6, 12, 16)
+    assert plan.unit_first == (0, 12)
     plan = build_work_plan(
         [8192] * 32,
         num_heads=64,
@@ -562,7 +555,7 @@ def test_auto_schedule_threshold():
         build_work_plan([5], num_heads=64, num_sms=148, q_len=6)
 
 
-def test_work_table_clears_direct_out_when_any_request_splits():
+def test_work_table_keeps_direct_out_on_single_split_items():
     single = build_work_plan(
         [64, 65, 4096, 777],
         num_heads=64,
@@ -579,12 +572,103 @@ def test_work_table_clears_direct_out_when_any_request_splits():
         num_sms=148,
         q_len=6,
         schedule="uniform",
-        tiles_per_split=32,
+        tiles_per_split=16,
     )
     table = work_table_rows(mixed)
     assert mixed.max_splits == 2 and table.shape == (mixed.num_items, ITEM_FIELDS)
-    assert not bool((table[:, 7] & FLAG_DIRECT_OUT).any())
+    # The single-split request keeps the flag, the split request does not.
+    direct = (table[:, 7] & FLAG_DIRECT_OUT) != 0
+    assert torch.equal(direct, table[:, 6] == 1)
+    assert bool(direct[table[:, 0] == 0].all()) and not bool(
+        direct[table[:, 0] == 1].any()
+    )
     assert torch.equal(table[:, 0].unique(), torch.tensor([0, 1], dtype=torch.int32))
+
+
+def _q_indptr(batch, q_len):
+    return [b * q_len for b in range(batch + 1)]
+
+
+@pytest.mark.parametrize("num_sms", [148, 152, 160])
+def test_token_splits_follow_the_items_of_a_mixed_balanced_plan(num_sms):
+    # bs32 / q_len 6 / 64 heads at 8K: the balanced partition splits per
+    # (request, row tile), so some row tiles run as a single item while the
+    # rest use two splits -- one request's tokens carry different counts.
+    batch, q_len, heads = 32, 6, 64
+    plan = build_work_plan(
+        [8192] * batch,
+        num_heads=heads,
+        num_sms=num_sms,
+        q_len=q_len,
+        schedule="balanced",
+    )
+    ts = token_splits(
+        plan,
+        _q_indptr(batch, q_len),
+        q_len=q_len,
+        num_heads=heads,
+        total_q=batch * q_len,
+    )
+    tokens_per_tile = ROWS_PER_TILE // heads
+    for it in plan.items:
+        assert bool(it[7] & FLAG_DIRECT_OUT) == (it[6] == 1), it
+        for t in range(
+            it[1] * tokens_per_tile, min((it[1] + 1) * tokens_per_tile, q_len)
+        ):
+            assert ts[it[0] * q_len + t] == it[6], (it, t)
+    assert ts.count(1) > 0 and max(ts) == plan.max_splits == 2
+    assert any(
+        len({ts[b * q_len + t] for t in range(q_len)}) > 1 for b in range(batch)
+    ), "expected a request whose tokens carry different split counts"
+    table = work_table_rows(plan)
+    assert torch.equal((table[:, 7] & FLAG_DIRECT_OUT) != 0, table[:, 6] == 1)
+
+
+def test_token_splits_match_uniform_plans():
+    batch, q_len, heads = 32, 6, 64
+    for kv in (4096, 8192, 32768, 131072):
+        plan = build_work_plan(
+            [kv] * batch, num_heads=heads, num_sms=148, q_len=q_len, schedule="uniform"
+        )
+        ts = token_splits(
+            plan,
+            _q_indptr(batch, q_len),
+            q_len=q_len,
+            num_heads=heads,
+            total_q=batch * q_len,
+        )
+        assert ts == [plan.max_splits] * (batch * q_len)
+
+
+def test_token_splits_reject_heads_that_straddle_row_tiles():
+    heads = 48  # 128 % 48 != 0: a token would span two row tiles with possibly different counts
+    plan = build_work_plan(
+        [8192] * 4, num_heads=heads, num_sms=16, q_len=6, schedule="balanced"
+    )
+    with pytest.raises(ValueError, match="divide"):
+        token_splits(plan, _q_indptr(4, 6), q_len=6, num_heads=heads, total_q=24)
+
+
+def test_token_splits_reject_uncovered_tokens_and_inconsistent_flags():
+    batch, q_len, heads = 4, 6, 64
+    plan = build_work_plan(
+        [8192] * batch, num_heads=heads, num_sms=16, q_len=q_len, schedule="balanced"
+    )
+    kw = dict(q_len=q_len, num_heads=heads, total_q=batch * q_len)
+    token_splits(plan, _q_indptr(batch, q_len), **kw)
+    missing = replace(plan, items=tuple(it for it in plan.items if it[0] != 2))
+    with pytest.raises(ValueError, match="no work item"):
+        token_splits(missing, _q_indptr(batch, q_len), **kw)
+    first, *rest = plan.items
+    flipped = replace(plan, items=(first[:7] + (first[7] ^ FLAG_DIRECT_OUT,), *rest))
+    with pytest.raises(ValueError, match="FLAG_DIRECT_OUT"):
+        token_splits(flipped, _q_indptr(batch, q_len), **kw)
+    # Two items of one (request, row tile) disagreeing on the split count.
+    conflicting = replace(
+        plan, items=(first[:6] + (first[6] + 1, first[7] & ~FLAG_DIRECT_OUT), *rest)
+    )
+    with pytest.raises(ValueError, match="split counts"):
+        token_splits(conflicting, _q_indptr(batch, q_len), **kw)
 
 
 def test_workspace_sizing():
@@ -595,7 +679,7 @@ def test_workspace_sizing():
     layout = workspace_layout(plan, batch=32, num_heads=64, q_len=6)
     total_q = 32 * 6
     assert plan.max_splits == 2
-    assert layout["partial_o"][1] == total_q * 64 * plan.max_splits * HEAD_DIM * 4
+    assert layout["partial_o"][1] == total_q * 64 * plan.max_splits * HEAD_DIM * 2
     assert layout["partial_lse"][1] == total_q * 64 * plan.max_splits * 4
     assert layout["work_table"][1] == plan.num_items * ITEM_FIELDS * 4
     assert layout["unit_first"][1] == (plan.num_units + 1) * 4
@@ -623,7 +707,7 @@ def test_workspace_sizing():
     single_layout = workspace_layout(single, batch=4, num_heads=64, q_len=1)
     assert (
         single.max_splits == 1
-        and single_layout["partial_o"][1] == 4
+        and single_layout["partial_o"][1] == 64 * HEAD_DIM * 2
         and single_layout["partial_lse"][1] == 4
     )
     assert max_nvfp4_mla_decode_workspace_size(
@@ -745,7 +829,7 @@ def test_rejects_unsupported_compute_capability():
 @pytest.mark.parametrize(
     "label,kv_lens,q_len,num_heads,enable_sink,tiles_per_split",
     [
-        ("smoke_forced_two_splits", [256, 300], 6, 64, True, 3),
+        ("smoke_forced_two_splits", [256, 300], 6, 64, True, 2),
         ("partial_pages_h8", [1000, 8192, 5000], 6, 8, True, None),
         ("no_sink_q1", [64, 65, 4096, 777], 1, 64, False, None),
         ("bs32_q6_kv8k", [8192] * 32, 6, 64, True, None),
@@ -799,6 +883,18 @@ def test_nvfp4_mla_decode(
     assert decode.main_kwargs["q_len"] == q_len
     if tiles_per_split is not None:
         assert decode.plan.max_splits >= 2 and decode.reduce_kwargs is not None
+    if decode.reduce_kwargs is not None:
+        total_q = len(kv_lens) * q_len
+        expected_splits = token_splits(
+            decode.plan,
+            list(range(0, total_q + 1, q_len)),
+            q_len=q_len,
+            num_heads=num_heads,
+            total_q=total_q,
+        )
+        assert decode.reduce_kwargs["row_splits"].cpu().tolist() == expected_splits
+        table = decode.main_kwargs["work_table"].cpu()
+        assert torch.equal((table[:, 7] & FLAG_DIRECT_OUT) != 0, table[:, 6] == 1)
     result = decode()
     assert result[0] is out and result[1] is lse
     torch.cuda.synchronize()

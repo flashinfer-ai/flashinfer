@@ -28,11 +28,14 @@ with UE4M3 block-16 scales (32 bytes per row); `quantize_nvfp4` in
 
 Preparation validates the inputs, builds the host work plan from the
 sequence lengths (one device-to-host copy unless `seq_lens_cpu` is passed),
-carves the FP32 split partials and plan tables out of `workspace_buffer`, and
+carves the BF16 split partials and plan tables out of `workspace_buffer`, and
 returns an `NVFP4MLADecodeRunner`. The decode kernel launches one cluster of
-two CTAs per work unit (the two output halves of a row tile share a multicast
-page stream). Calling the runner launches the persistent decode kernel and, when the plan has more than one KV split per request, the
-split-KV combine kernel, with no CUDA allocation or host synchronization:
+two CTAs per work unit; the pair forms one tensor-core MMA over the 128 query
+rows of a tile (64 rows x 512 output dims per CTA) and shares a multicast
+page stream. Calling the runner launches the persistent decode kernel and,
+when any request is split across CTAs, the split-KV combine kernel (rows whose
+request was not split are written by the decode kernel and left alone by the
+combine), with no CUDA allocation or host synchronization:
 
 ```python
 import torch

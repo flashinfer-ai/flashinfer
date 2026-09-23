@@ -32,7 +32,9 @@ from .cake_jit import (
 # DeepSeek-V4 main-attention decode geometry served by the generated program:
 # MQA over one 512-wide NVFP4 latent row that is both K and V, 64-token pages.
 HEAD_DIM = 512
-PAGE_SIZE = 64  # tokens per page; one page is one KV tile of the decode kernel
+PAGE_SIZE = 64  # tokens per page
+TILE_KV = 128  # tokens per decode pipeline tile (two pages): unit of tile_start / tile_end in the work table
+PAGES_PER_TILE = TILE_KV // PAGE_SIZE
 SF_VEC = 16  # E2M1 values per UE4M3 block scale
 ROW_BYTES = HEAD_DIM // 2  # 256 packed E2M1 bytes per Q / KV row
 SF_ROW_BYTES = HEAD_DIM // SF_VEC  # 32 UE4M3 bytes per Q / KV row
@@ -44,15 +46,21 @@ CLUSTER_PAIR = (
 )
 ROWS_PER_TILE = 128  # packed query rows (token * H + head) per work item
 V_HALVES = 2  # each work item accumulates 256 of the 512 output dims
+ROWS_PER_CTA = (
+    ROWS_PER_TILE // CLUSTER_PAIR
+)  # query rows per CTA (row split of a tile across the pair)
+REDUCE_HEADS_PER_CTA = (
+    8  # combine kernel: one warp per head, eight heads per 256-thread CTA
+)
 LOG2E = 1.4426950408889634
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 # Host work plan ABI shared with the generated program (part of the ABI freeze).
 ITEM_FIELDS = 8  # b, m_tile, v_half, tile_start, tile_end, split, num_splits, flags
 FLAG_SEED_SINK = 1  # split 0 folds the attention sink into the online softmax
-FLAG_DIRECT_OUT = 2  # single-split request: write O / LSE directly
+FLAG_DIRECT_OUT = 2  # single-split (request, row tile): the CTA writes O / LSE directly
 MAX_SPLITS = 64  # split-KV combine kernel capacity per row
-MIN_PAGES_PER_UNIT = 8  # balanced schedule: minimum pages per CTA
+MIN_TILES_PER_UNIT = 8  # balanced schedule: minimum pipeline tiles per cluster
 BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length on
 WORKSPACE_ALIGNMENT = 256
 
@@ -62,6 +70,8 @@ MAIN_KWARGS = (
     "QS",
     "KV",
     "KVS",
+    "OT",
+    "PO",
     "O",
     "LSE",
     "partial_o",
@@ -72,6 +82,7 @@ MAIN_KWARGS = (
     "seq_lens",
     "q_indptr",
     "sinks",
+    "rows_total",
     "num_heads",
     "q_len",
     "max_pages",
@@ -85,6 +96,7 @@ REDUCE_KWARGS = (
     "partial_o",
     "partial_lse",
     "row_splits",
+    "total_q",
     "num_heads",
     "max_splits",
     "grid",
@@ -143,8 +155,10 @@ class WorkPlan:
     One item is ``(request, m_tile, v_half, tile_start, tile_end, split,
     num_splits, flags)``; cluster ``u`` (``CLUSTER_PAIR`` CTAs) runs items
     ``unit_first[u] .. unit_first[u + 1]``, always whole (v_half 0, v_half 1)
-    pairs of one piece. Requests with more than one split go through the FP32
-    partials and the split-KV combine kernel.
+    pairs of one piece. Plans split per (request, row tile): a piece with more
+    than one split goes through the BF16 partials and the split-KV combine
+    kernel, a single-split piece keeps ``FLAG_DIRECT_OUT`` and its CTAs write
+    ``O`` / ``LSE`` directly, even when other pieces of the batch are split.
     """
 
     schedule: str
@@ -167,8 +181,13 @@ class WorkPlan:
         return (CLUSTER_PAIR * self.num_units, 1, 1)
 
 
-def kv_tiles(kv_len: int) -> int:
+def kv_pages(kv_len: int) -> int:
     return (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
+
+
+def kv_tiles(kv_len: int) -> int:
+    """Decode pipeline tiles (``TILE_KV`` tokens) of one request; the last tile may hold one page."""
+    return (kv_len + TILE_KV - 1) // TILE_KV
 
 
 def _m_tiles(q_len: int, num_heads: int) -> int:
@@ -189,7 +208,7 @@ def choose_tiles_per_split(
 
     Base items (no split) = requests * m_tiles * 2. The split granularity is
     halved until ``items >= target_waves * num_sms``, every split would fall
-    below ``min_tiles_per_split`` tiles, or the FP32 partial traffic of the
+    below ``min_tiles_per_split`` tiles, or the partial traffic of the
     next split count would exceed ``max_partial_fraction`` of the KV bytes
     streamed. For bs32 / q_len 6 / 64 heads this keeps one split at 8K KV and
     two splits from 16K on.
@@ -198,6 +217,8 @@ def choose_tiles_per_split(
     total_tiles = [kv_tiles(kv) for kv in kv_lens]
     max_tiles = max(total_tiles)
     kv_bytes = sum(kv_lens) * (ROW_BYTES + SF_ROW_BYTES)
+    # Policy constant of the source host plan (partials estimated at 4 B per
+    # element); the stored partials are BF16.
     partial_bytes_per_split = len(kv_lens) * q_len * num_heads * HEAD_DIM * 4
     tiles_per_split = max_tiles
     while True:
@@ -272,7 +293,7 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     total = sum(seq[2] for seq in sequences)
     if total == 0 or num_units <= 0:
         raise ValueError("balanced plan needs work and at least one unit")
-    num_units = max(1, min(num_units, total // MIN_PAGES_PER_UNIT))
+    num_units = max(1, min(num_units, total // MIN_TILES_PER_UNIT))
     longest = max(seq[2] for seq in sequences)
     while num_units > 1 and math.ceil(longest / (total / num_units)) + 1 > MAX_SPLITS:
         num_units //= 2
@@ -390,13 +411,53 @@ def build_work_plan(
 def work_table_rows(plan: WorkPlan) -> torch.Tensor:
     """Host int32 ``[num_items, ITEM_FIELDS]`` table for ``plan``.
 
-    When any request has more than one split every row goes through the
-    combine kernel, so ``FLAG_DIRECT_OUT`` is cleared for all items.
+    Items are consumed as planned: every item carries ``FLAG_DIRECT_OUT`` iff
+    it is the only split of its (request, row tile), whatever the other
+    pieces of the batch do; the combine kernel skips the rows of such items
+    (``token_splits``).
     """
-    table = torch.tensor(plan.items, dtype=torch.int32).reshape(-1, ITEM_FIELDS)
-    if plan.max_splits > 1:
-        table[:, 7] &= ~FLAG_DIRECT_OUT
-    return table
+    return torch.tensor(plan.items, dtype=torch.int32).reshape(-1, ITEM_FIELDS)
+
+
+def token_splits(
+    plan: WorkPlan, q_indptr: Sequence[int], *, q_len: int, num_heads: int, total_q: int
+) -> list:
+    """Per query token split count consumed by the combine kernel (``row_splits``).
+
+    Plans split per (request, row tile), so one request's tokens may carry
+    different counts. Token ``t`` of request ``b`` (row ``q_indptr[b] + t``)
+    lies in row tile ``t * num_heads // ROWS_PER_TILE``; ``num_heads`` must
+    divide ``ROWS_PER_TILE`` so no token straddles two row tiles. Every item
+    must carry ``FLAG_DIRECT_OUT`` iff it is the only split of its (request,
+    row tile) -- the decode kernel then writes that row's final ``O`` / ``LSE``
+    itself and the combine kernel leaves the row alone -- and every token
+    must be covered. Any violation raises; nothing is defaulted.
+    """
+    if ROWS_PER_TILE % num_heads != 0:
+        raise ValueError(
+            f"per-token row_splits need num_heads ({num_heads}) to divide "
+            f"ROWS_PER_TILE ({ROWS_PER_TILE}); a token would straddle two row tiles"
+        )
+    tokens_per_tile = ROWS_PER_TILE // num_heads
+    out = [0] * total_q
+    for it in plan.items:
+        if ((it[7] & FLAG_DIRECT_OUT) != 0) != (it[6] == 1):
+            raise ValueError(
+                f"item {it} carries FLAG_DIRECT_OUT inconsistent with its split count"
+            )
+        first = it[1] * tokens_per_tile
+        for t in range(first, min(first + tokens_per_tile, q_len)):
+            row = q_indptr[it[0]] + t
+            if out[row] not in (0, it[6]):
+                raise ValueError(
+                    f"token row {row} receives split counts {out[row]} and {it[6]}"
+                )
+            out[row] = it[6]
+    if 0 in out:
+        raise ValueError(
+            f"query token row {out.index(0)} received no work item (row_splits == 0)"
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -411,10 +472,14 @@ def _align(nbytes: int) -> int:
 
 
 def partial_shapes(plan: WorkPlan, *, total_q: int, num_heads: int) -> tuple:
-    """Shapes of ``partial_o`` / ``partial_lse``; one dummy element each for single-split plans."""
+    """Shapes of BF16 ``partial_o`` (split-major) / FP32 ``partial_lse``.
+
+    Single-split plans keep a ``[ROWS_PER_CTA, 512]`` BF16 dummy: the decode
+    kernel encodes its partial-output tensor map from it and never stores to it.
+    """
     if plan.max_splits == 1:
-        return (1,), (1,)
-    return (total_q, num_heads, plan.max_splits, HEAD_DIM), (
+        return (ROWS_PER_CTA, HEAD_DIM), (1,)
+    return (plan.max_splits, total_q, num_heads, HEAD_DIM), (
         total_q,
         num_heads,
         plan.max_splits,
@@ -424,16 +489,17 @@ def partial_shapes(plan: WorkPlan, *, total_q: int, num_heads: int) -> tuple:
 def workspace_layout(plan: WorkPlan, *, batch: int, num_heads: int, q_len: int) -> dict:
     """Byte offsets and sizes of every workspace region plus ``"total"``.
 
-    Regions: FP32 ``partial_o [total_q, H, max_splits, 512]`` and
-    ``partial_lse [total_q, H, max_splits]`` (one dummy element each when the
-    plan has a single split and the kernel writes ``O`` / ``LSE`` directly),
+    Regions: BF16 ``partial_o [max_splits, total_q, H, 512]`` and FP32
+    ``partial_lse [total_q, H, max_splits]`` (a 64-row tensor-map dummy and one
+    element when the plan has a single split and the kernel writes ``O`` /
+    ``LSE`` directly),
     int32 ``work_table``, ``unit_first``, ``row_splits``, ``q_indptr`` and
     FP32 ``sinks [H]``.
     """
     total_q = batch * q_len
     o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
     sizes = (
-        ("partial_o", math.prod(o_shape) * 4),
+        ("partial_o", math.prod(o_shape) * 2),
         ("partial_lse", math.prod(lse_shape) * 4),
         ("work_table", plan.num_items * ITEM_FIELDS * 4),
         ("unit_first", (plan.num_units + 1) * 4),
@@ -479,12 +545,12 @@ def max_nvfp4_mla_decode_workspace_size(
     """Upper bound of the workspace for any plan with at most ``max_splits`` splits.
 
     Every request contributes at most ``max_splits`` items per (row tile,
-    v_half) pair; the partials dominate (``total_q * H * max_splits * 2 KiB``).
+    v_half) pair; the partials dominate (``total_q * H * max_splits * 1 KiB``).
     """
     total_q = batch * q_len
     max_items = batch * _m_tiles(q_len, num_heads) * V_HALVES * max_splits
     return (
-        _align(total_q * num_heads * max_splits * HEAD_DIM * 4)
+        _align(max(total_q * num_heads * max_splits, ROWS_PER_CTA) * HEAD_DIM * 2)
         + _align(total_q * num_heads * max_splits * 4)
         + _align(max_items * ITEM_FIELDS * 4)
         + _align((max_items + 1) * 4)
@@ -753,8 +819,14 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=device)
 
     max_splits = plan.max_splits
+    rows_total = total_q * num_heads
+    if max_splits > 1 and max_splits * rows_total * HEAD_DIM > 2**31 - 1:
+        raise ValueError(
+            f"partial_o [{max_splits}, {total_q}, {num_heads}, {HEAD_DIM}] exceeds the int32 element-offset "
+            "range of the decode / combine kernels; use fewer splits or a smaller batch"
+        )
     o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
-    partial_o = _carve(flat, layout, "partial_o", torch.float32, o_shape)
+    partial_o = _carve(flat, layout, "partial_o", torch.bfloat16, o_shape)
     partial_lse = _carve(flat, layout, "partial_lse", torch.float32, lse_shape)
     work_table = _carve(
         flat, layout, "work_table", torch.int32, (plan.num_items, ITEM_FIELDS)
@@ -764,13 +836,31 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     q_indptr = _carve(flat, layout, "q_indptr", torch.int32, (batch + 1,))
     sink_buffer = _carve(flat, layout, "sinks", torch.float32, (num_heads,))
     # Unused partial slots keep finite zeros and -inf LSEs so the combine
-    # kernel weights them by zero; every row reads max_splits slots.
+    # kernel weights them by zero. Single-split items keep FLAG_DIRECT_OUT:
+    # their CTAs write final O / LSE directly and the combine kernel skips rows
+    # with row_splits <= 1, so the per-token count is derived from the items
+    # (token_splits resolves it or raises; nothing is defaulted).
     partial_o.zero_()
     partial_lse.fill_(float("-inf"))
     work_table.copy_(work_table_rows(plan))
     unit_first.copy_(torch.tensor(plan.unit_first, dtype=torch.int32))
-    row_splits.fill_(max_splits)
-    q_indptr.copy_(torch.arange(0, total_q + 1, q_len, dtype=torch.int32))
+    q_indptr_host = list(range(0, total_q + 1, q_len))
+    if max_splits > 1:
+        row_splits.copy_(
+            torch.tensor(
+                token_splits(
+                    plan,
+                    q_indptr_host,
+                    q_len=q_len,
+                    num_heads=num_heads,
+                    total_q=total_q,
+                ),
+                dtype=torch.int32,
+            )
+        )
+    else:
+        row_splits.fill_(1)
+    q_indptr.copy_(torch.tensor(q_indptr_host, dtype=torch.int32))
     if sinks is None:
         sink_buffer.zero_()
     else:
@@ -781,6 +871,12 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         QS=query_scale.view(torch.uint8).view(total_q * num_heads, SF_ROW_BYTES),
         KV=kv_cache.view(num_pages * PAGE_SIZE, ROW_BYTES),
         KVS=kv_scale.view(torch.uint8).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
+        # Bulk-tensor-store maps of the epilogue: O and the split-major partials
+        # viewed as [rows, 512] BF16 (the single-split dummy is already 2-D).
+        OT=out.view(rows_total, HEAD_DIM),
+        PO=partial_o.view(max_splits * rows_total, HEAD_DIM)
+        if max_splits > 1
+        else partial_o,
         O=out,
         LSE=lse,
         partial_o=partial_o,
@@ -791,6 +887,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         seq_lens=seq_lens,
         q_indptr=q_indptr,
         sinks=sink_buffer,
+        rows_total=rows_total,
         num_heads=num_heads,
         q_len=q_len,
         max_pages=max_pages,
@@ -806,9 +903,10 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
             partial_o=partial_o,
             partial_lse=partial_lse,
             row_splits=row_splits,
+            total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
-            grid=(num_heads, total_q, 1),
+            grid=(total_q, math.ceil(num_heads / REDUCE_HEADS_PER_CTA), 1),
         )
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS
