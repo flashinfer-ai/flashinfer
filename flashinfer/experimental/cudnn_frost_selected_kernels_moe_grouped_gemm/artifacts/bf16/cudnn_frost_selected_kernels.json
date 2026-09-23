@@ -4989,7 +4989,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -5699,7 +5699,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -6409,7 +6409,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -6764,7 +6764,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -7123,7 +7123,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -7478,7 +7478,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -8192,7 +8192,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -8547,7 +8547,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -8902,7 +8902,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -9257,7 +9257,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -9616,7 +9616,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -9971,7 +9971,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -10326,7 +10326,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -10681,7 +10681,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -11395,7 +11395,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -11750,7 +11750,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -12109,7 +12109,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -12468,7 +12468,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -13541,7 +13541,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -13896,7 +13896,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -16386,7 +16386,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -16740,7 +16740,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -17099,7 +17099,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -17454,7 +17454,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -17813,7 +17813,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 2,
@@ -18168,7 +18168,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -18523,7 +18523,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -18878,7 +18878,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -20661,7 +20661,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 2,
@@ -21016,7 +21016,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -21371,7 +21371,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -21730,7 +21730,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 2,
@@ -22444,7 +22444,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -22803,7 +22803,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -23162,7 +23162,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 2,
@@ -23517,7 +23517,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -23872,7 +23872,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -24227,7 +24227,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -26014,7 +26014,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -26369,7 +26369,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -26728,7 +26728,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 1,
@@ -27087,7 +27087,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_stg.py",
-        "sha256": "c02c27544167ae7a7e9f6b5bac71bcc69f1b5e42cf3cbcd49a1e99b5a1d47bbc"
+        "sha256": "11086ae9984ff28b6e3cab63a5cf16c0c2f72340170c5f1e258e457ff53e5d6d"
       },
       "tactic": {
         "cta_group": 2,
@@ -27442,7 +27442,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 1,
@@ -27797,7 +27797,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm1_swiglu_bf16_swap_ab_tma.py",
-        "sha256": "964dead678aa0d8d3ffac97d25e5441b5694538721ec7a054dd09a38a58e7073"
+        "sha256": "b17e5b86a1bdf58acfb69b9339dd602a055e82cbb378d6d303de108e0bf89a42"
       },
       "tactic": {
         "cta_group": 2,
@@ -29220,7 +29220,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -29574,7 +29574,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -29928,7 +29928,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -30282,7 +30282,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -30636,7 +30636,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -30990,7 +30990,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -31344,7 +31344,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -31698,7 +31698,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -32760,7 +32760,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -33114,7 +33114,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -34176,7 +34176,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -34530,7 +34530,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -34884,7 +34884,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -35592,7 +35592,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -35946,7 +35946,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -36300,7 +36300,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -36654,7 +36654,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 2,
@@ -38424,7 +38424,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -38778,7 +38778,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -39132,7 +39132,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -39486,7 +39486,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -39840,7 +39840,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 1,
@@ -40194,7 +40194,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -40548,7 +40548,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -40902,7 +40902,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -106976,7 +106976,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 1,
@@ -107330,7 +107330,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_stg.py",
-        "sha256": "9cec0203cc96d3c0e4db562cf672f5d8e73dbd49f99a1c376a3ad3294515294d"
+        "sha256": "728775fd952a871c30a4c66541b492cac885699c6c99e981a7967aa2c2fa3d17"
       },
       "tactic": {
         "cta_group": 2,
@@ -107684,7 +107684,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -108038,7 +108038,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,
@@ -108392,7 +108392,7 @@
           "version": 1
         },
         "path": "sources/cudnn_frost_grouped_gemm2_bf16_swap_ab_tma.py",
-        "sha256": "dbff9da484446a390e3381282630eda132b3ed5dec7d03f1b52e78d84cd7992d"
+        "sha256": "269b18d6f527b154fca5335abcc74d70a3411a4356c4e075c28b3e10797e3a00"
       },
       "tactic": {
         "cta_group": 2,

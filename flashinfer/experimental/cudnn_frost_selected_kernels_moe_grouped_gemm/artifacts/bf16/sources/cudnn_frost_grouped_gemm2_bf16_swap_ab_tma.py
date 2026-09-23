@@ -768,13 +768,18 @@ def frost_template_kernel(
             coord_n = cutlass.Int32(0)
             if is_tile_valid != 0:
                 local_linear_idx = linear_idx - start_linear_idx
-                group_nt_n = total_tiles // clusters_along_m
-                cluster_tile_m, coord_n = _moe_swizzle_tile(
-                    local_linear_idx,
-                    clusters_along_m,
-                    group_nt_n,
-                    _moe_auto_swizzle_w(M, group_nt_n * cgrp_tile_mnk[1], k, group_nt_n),
-                )
+                # Direct scheduling admits at most eight rows: one N tile per nonempty group.
+                if cutlass.const_expr(direct_schedule and cgrp_tile_mnk[1] >= 8):
+                    cluster_tile_m = local_linear_idx
+                    coord_n = cutlass.Int32(0)
+                else:
+                    group_nt_n = total_tiles // clusters_along_m
+                    cluster_tile_m, coord_n = _moe_swizzle_tile(
+                        local_linear_idx,
+                        clusters_along_m,
+                        group_nt_n,
+                        _moe_auto_swizzle_w(M, group_nt_n * cgrp_tile_mnk[1], k, group_nt_n),
+                    )
                 coord_expert = group_idx % num_experts
 
             while not nvvm.mbarrier_try_wait_parity(
