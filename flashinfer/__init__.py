@@ -63,6 +63,9 @@ from .cake_fmha import (
     cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
 )
 from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_sampling import (
+    top_k_top_p_sampling_from_probs as cake_top_k_top_p_sampling_from_probs,
+)
 from .cake_fmha import (
     CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
 )
@@ -80,6 +83,9 @@ from .decode import (
 )
 from .decode import (
     launch_sm110_gqa_decode_prepared as launch_sm110_gqa_decode_prepared,
+)
+from .decode import (
+    prepare_balanced_batch_decode_with_kv_cache as prepare_balanced_batch_decode_with_kv_cache,
 )
 from .decode import prepare_sm110_gqa_decode as prepare_sm110_gqa_decode
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
