@@ -41,6 +41,8 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
+        # Required generated CuTe sources; retain lint and formatting checks.
+        exclude: ^flashinfer/experimental/cake_mxfp8_megamoe_ep16/kernels/fused_(?:cta0|all_ctas)\.py$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
