@@ -39,8 +39,8 @@ int CheckArchitecture(int device_id) {
             "reading the CUDA compute-capability major version");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "reading the CUDA compute-capability minor version");
-  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
-      << "fused gated MXFP8 quantization requires SM100 or SM103";
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
+      << "fused gated MXFP8 quantization requires SM100, SM103 or SM107";
   return minor;
 }
 
