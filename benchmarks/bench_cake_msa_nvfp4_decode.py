@@ -142,11 +142,19 @@ def bench_row(name, batch, kv, num_kv_heads, group, seqlen_q, ragged, *, device,
         )
 
     runner()
-    route()
-    torch.cuda.synchronize()
-    max_abs = float((out_cake.float() - out_route.float()).abs().max())
+    try:
+        route()
+        torch.cuda.synchronize()
+        route_declined = None
+    except NotImplementedError as exc:  # geometry outside the route's allowlist
+        route_declined = str(exc).splitlines()[0]
     cake_us = median_us(runner)
-    route_us = median_us(route)
+    if route_declined is None:
+        max_abs = float((out_cake.float() - out_route.float()).abs().max())
+        route_us = median_us(route)
+    else:
+        max_abs = None
+        route_us = None
     items = batch * seqlen_q * num_kv_heads
     return dict(
         row=name,
@@ -161,6 +169,7 @@ def bench_row(name, batch, kv, num_kv_heads, group, seqlen_q, ragged, *, device,
         cake_us=cake_us,
         route_us=route_us,
         max_abs_diff_vs_route=max_abs,
+        route_declined=route_declined,
     )
 
 
@@ -178,10 +187,14 @@ def main():
     )
     for row in rows:
         record = bench_row(*row, device=device, seed=args.seed)
+        if record["route_us"] is None:
+            route_cell, ratio_cell = f"{'declined':>9s}", f"{'-':>10s}"
+        else:
+            route_cell = f"{record['route_us']:9.2f}"
+            ratio_cell = f"{record['route_us'] / record['cake_us']:10.3f}"
         print(
             f"{record['row']:28s} {record['items']:6d} {record['splits']:6d} "
-            f"{record['cake_us']:9.2f} {record['route_us']:9.2f} "
-            f"{record['route_us'] / record['cake_us']:10.3f}"
+            f"{record['cake_us']:9.2f} {route_cell} {ratio_cell}"
         )
         results.append(record)
         torch.cuda.empty_cache()

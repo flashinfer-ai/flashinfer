@@ -48,6 +48,24 @@ from tests.test_helpers.cake_msa_nvfp4_inputs import (
 )
 
 ATOL = RTOL = 1e-2
+# FlashInfer's acceptance for its own NVFP4 route
+# (tests/msa_ops/test_msa_nvfp4_decode_sm100.py ``_assert_peer``): the route
+# accumulates at lower precision than the FP32 oracle on some head geometries,
+# so it is compared on whole-output cosine / relative Frobenius error rather
+# than element-wise tolerance.  The generated program is held to ATOL/RTOL.
+PEER_MIN_COSINE = 0.99
+PEER_MAX_REL_FRO = 0.06
+
+
+def _assert_peer(
+    actual, expected, *, min_cosine=PEER_MIN_COSINE, max_rel_fro=PEER_MAX_REL_FRO
+):
+    a = actual.float().reshape(1, -1)
+    b = expected.float().reshape(1, -1)
+    cosine = torch.nn.functional.cosine_similarity(a, b).item()
+    rel = ((a - b).norm() / b.norm().clamp(min=1e-12)).item()
+    assert cosine >= min_cosine, f"cosine {cosine}"
+    assert rel <= max_rel_fro, f"rel_fro {rel}"
 
 
 def _supported_device() -> bool:
@@ -411,7 +429,11 @@ def test_decode_matches_the_fp32_oracle(seq_lens, num_kv_heads, group_size, seql
     [([8192] * 8, 4), ([300, 65536, 1029], 1)],
 )
 def test_matches_the_existing_nvfp4_route(seq_lens, num_kv_heads):
-    """Both readers of the layout contract agree with the oracle on the same pages."""
+    """Both readers of the layout contract agree with the oracle on the same pages.
+
+    The generated program is checked element-wise in ``_run_and_check``; the
+    existing route is checked at its own peer tolerance.
+    """
     _require_program()
     inputs, runner, _ = _run_and_check(seq_lens, num_kv_heads, seed=41)
     route_out = torch.empty_like(inputs["q"])
@@ -425,8 +447,24 @@ def test_matches_the_existing_nvfp4_route(seq_lens, num_kv_heads):
     )
     torch.cuda.synchronize()
     expected = _oracle(inputs)
-    torch.testing.assert_close(route_out, expected, atol=ATOL, rtol=RTOL)
-    torch.testing.assert_close(runner.out, route_out, atol=2 * ATOL, rtol=2 * RTOL)
+    _assert_peer(route_out, expected)
+    _assert_peer(runner.out, route_out)
+
+
+def test_serves_a_geometry_the_existing_route_declines():
+    """Eight query heads per KV head is outside the route's allowlist; the
+    generated program serves it from the same pages."""
+    _require_program()
+    inputs, _, _ = _run_and_check([4096] * 3, 1, group_size=8, seed=43)
+    with pytest.raises(NotImplementedError):
+        msa_sparse_decode_attention(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["q2k_indices"],
+            out=torch.empty_like(inputs["q"]),
+            **upstream_route_kwargs(inputs),
+        )
 
 
 def test_graph_replay_follows_new_queries_and_selections():
