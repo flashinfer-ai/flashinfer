@@ -735,7 +735,8 @@ def packed_fused_kda_decode(
             function.
         state:
             Paged recurrent state with shape ``[num_slots, H, 128, 128]``.
-            T=1 accepts float32 or bfloat16; T>1 requires float32.
+            float32 or bfloat16. T>1 keeps the recurrence in float32 and
+            rounds only when writing each bfloat16 checkpoint.
         output_gate:
             Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
             ``[1, num_rows, H, 128]`` and dtype bfloat16.
