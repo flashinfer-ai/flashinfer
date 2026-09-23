@@ -33,37 +33,111 @@ indexes the summary sequence (one summary per KV block) with the same
 arithmetic, which is why the K source is passed as an address, a head stride
 and a sequence length.
 
-Where a tile's ``sfK`` words live during the two softmax passes is a
-compile-time strategy chosen by the K block size: :class:`RegisterSageKScales`
-keeps the lane's multipliers in a rotating register array,
-:class:`SmemSageKScales` keeps the tile's words in a two-tile SMEM ring of the
-softmax instance. Both take a tile's words through ``load_tile`` and hand a
-pass one fragment's ``factor * sfK`` at a time through the same interface
-(``open``, ``fragment``, ``advance``); the passes apply ``sfQ`` once per tile
-themselves.
+The ``sfK`` words of one softmax instance are a task-scheduling resource,
+:class:`SageKScalesResource`, defined below.
+
+Sage attention scales every score by the K scale of its token block. A
+softmax instance takes one KV tile's ``sfK`` words ahead of the tile's score
+wait so the loads hide behind the QK MMA, and both softmax passes (the max
+pass and the P pass) read them one K32 fragment at a time.
+
+:class:`SageKScalesResource` owns where those words live and how they get
+there. The softmax task produces and consumes it itself: ``publish_tile``
+(producer work) fills the tile's words into the storage the resource owns,
+``take_tile`` (consumer work) hands the passes the routed register array, and
+the passes read fragments through ``open`` / ``fragment`` / ``advance``.
+
+Two storage forms exist, selected at compile time by the scale groups per K32
+fragment (``FmhaDecodeConfig.sage_k_scales_in_smem_for``):
+
+* Register form (K blocks of 16 tokens and larger, at most two groups per
+  fragment): each lane takes the words of its own fragments into a rotating
+  register array. Registers are private to the lane, so the resource carries
+  no pipeline and no producer step; ``take_tile`` gathers the words and
+  routes the array.
+* SMEM form (K blocks of 4 and 1 token, eight or 32 groups per fragment):
+  the tile's words live in an SMEM ring of the instance, one slot per
+  pipeline stage, in the layout of ``sage_k_scale_words``. The resource is a
+  two-stage pipeline whose producer and consumer are both the instance's
+  warps: the task acquires a slot, ``publish_tile`` fills it with the
+  instance's threads, the commit publishes it, the wait makes it visible to
+  both passes, which read one fragment's groups with 16-byte broadcast loads,
+  and the release after the P pass frees the slot for the tile after next.
+  The routed array is a one-word placeholder in this form.
+
+The words come from one of three sources, chosen by the plan: a dense tile
+gathers ``k_scale`` over its token range; a block-sparse route takes the
+words the load warp staged with the route metadata; a proxy route of a plan
+whose summary scales use another K block size (``sage_mixed_k_geometry``)
+gathers ``k_summary_scale`` from the route's staged atom origins. A mixed
+plan holds two resources per instance, one per geometry, each routing its own
+array; the route kind, uniform across the CTA, selects which one serves the
+tile, and the other one leaves its array at ones.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
-from cutlass.experimental import primitives as prims
-from cutlass.experimental.task_scheduling.memory import SmemAllocation
-from cutlass.experimental.task_scheduling.resources import ResourceContext, StageInfo
+from cutlass.experimental.task_scheduling.enums import WorkAttr
+from cutlass.experimental.task_scheduling.memory import (
+    ResourceContext,
+    SmemAllocation,
+    TmemAllocation,
+)
+from cutlass.experimental.task_scheduling.resources import (
+    StageInfo,
+    TaskLocalVariable,
+    consumer_work,
+    producer_work,
+)
 
 from ....sage import flat_scale_slot, log2_block_size
+from ...placeholder_helpers import _placeholder_local_array
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
+    DecodeGenResourceBase,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _decode_gen_task_cache,
     _keeps_route_atom,
     _keeps_spatial_half,
+    _logical_head_batch,
+    _route_is_proxy,
     fmul2,
 )
+from .helpers_kv_tile_idx import resolve_keeps_tile_context
+
+if TYPE_CHECKING:
+    from .smem_block_sparse_metadata import SmemBlockSparseSoftmaxMetadataResource
 
 Constexpr = cutlass.Constexpr
+
+
+@dataclass(eq=False)
+class SageScaleTensors:
+    """The plan's Sage scale tensors as the kernel receives them.
+
+    A plain mutable dataclass: the DSL swaps frozen dataclasses for proxies
+    while it traces a dynamic branch, which changes the traced structure of
+    the resource that holds one. Every resource that reads a scale takes
+    this one object instead of its own copy of the pointers: ``sfQ`` and ``sfK`` are ``[Hkv, slots]`` FP32
+    arrays in the flat layout with a per-head stride, ``k_summary_scale`` is
+    the same for the summary sequence of a proxy plan (``None`` otherwise),
+    and the per-channel V scales and means are ``[Hkv, D]`` FP32 (``v_mean``
+    is ``None`` unless the recipe restores a channel mean).
+    """
+
+    q_scale_ptr: cute.Pointer
+    q_scale_head_stride: Int32
+    k_scale_ptr: cute.Pointer
+    k_scale_head_stride: Int32
+    k_summary_scale_ptr: cute.Pointer | None
+    k_summary_scale_head_stride: Int32 | None
+    v_scale_ptr: cute.Pointer
+    v_mean_ptr: cute.Pointer | None
 
 
 @cute.jit
@@ -146,8 +220,8 @@ def sage_k_scale_words(cfg: FmhaDecodeConfig, groups: int) -> int:
     the count unconditionally. Word ``half * arr_size + f * groups + g`` holds
     the scale of group ``g`` of fragment ``f`` of the lanes in that half
     (``sage_scale_arr_size`` words per half); this is the layout of the words
-    a block-sparse route stages and of the tile buffer of
-    :class:`SmemSageKScales`, so a softmax thread reads its half's values with
+    a block-sparse route stages and of the SMEM ring of
+    :class:`SageKScalesResource`, so a softmax thread reads its half's values with
     contiguous vector loads. ``groups`` selects the route kind's geometry.
     """
     if not cfg.use_sage_attention:
@@ -226,288 +300,11 @@ def scale_pairs_in_place(
         )
 
 
-@dataclass
-class RegisterSageKScales:
-    """The lane's ``sfK`` multipliers as a rotating register array.
-
-    K blocks of 16 tokens and larger have at most two scale groups per K32
-    fragment, so a lane holds ``sage_scale_arr_size`` words per tile (eight
-    for the 16-token block on KV256). The routed ``sage_scale_arr`` carries
-    the raw ``sfK`` of the lane's fragment groups in fragment order. A pass
-    opens it with its factor, which is applied once per tile, reads the
-    leading ``groups`` entries for the fragment at hand and rotates the
-    array down by one fragment, so neither the unrolled nor the rolled
-    fragment loop indexes registers at run time.
-
-    ``groups`` is the scale groups per fragment of the route kind the
-    strategy serves. ``routed_words`` may exceed the lane's word count when
-    the other route kind's strategy routes more entries; the extra entries
-    are padding.
-    """
-
-    cfg: FmhaDecodeConfig
-    groups: int
-    routed_words: int = 0
-
-    def __post_init__(self) -> None:
-        self.routed_words = max(self.routed_words, self.arr_size)
-
-    @property
-    def arr_size(self) -> int:
-        """Return the number of ``sfK`` words one lane holds per tile."""
-        return sage_scale_arr_size(self.cfg, self.groups)
-
-    def smem_requirements(self, owner_name: str) -> list[SmemAllocation]:
-        """Return the SMEM this strategy needs: none."""
-        _ = owner_name
-        return []
-
-    @cute.jit
-    def load_tile(
-        self,
-        stage_info: StageInfo,
-        word_value: Constexpr[Callable[..., Float32]],
-        words: cutlass.Array,
-    ) -> None:
-        """Fill ``words`` (the routed array) with the lane's ``sfK`` words of the tile.
-
-        ``word_value(word_idx, half, lane_entry)`` returns word ``word_idx =
-        half * arr_size + lane_entry`` of the ``sage_k_scale_words`` layout
-        from whichever coordinates it needs; the lane takes the
-        ``sage_scale_arr_size`` words of its spatial half, so its entries are
-        constants. Padding entries past the lane's words are set to one.
-        """
-        cfg = self.cfg
-        arr_size = self.arr_size
-        warp_grp_thread_idx = Int32(
-            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        )
-        half = _keeps_spatial_half(cfg, warp_grp_thread_idx)
-        half_base = half * Int32(arr_size)
-        for entry in cutlass.range_constexpr(arr_size):
-            words[entry] = word_value(half_base + Int32(entry), half, entry)
-        for entry in cutlass.range_constexpr(arr_size, self.routed_words):
-            words[entry] = Float32(1.0)
-
-    @cute.jit
-    def open(
-        self,
-        stage_info: StageInfo,
-        scale_arr: cutlass.Array,
-        factor: Float32 | None,
-    ) -> cutlass.Array:
-        """Return the tile's ``factor * sfK`` words as a fresh rotating array."""
-        _ = stage_info
-        arr_size = self.arr_size
-        words = cutlass.Array(Float32, arr_size, space=cutlass.AddressSpace.rmem)
-        for entry in cutlass.range_constexpr(arr_size):
-            words[entry] = Float32(scale_arr[entry])
-        if cutlass.const_expr(factor is not None):
-            scale_pairs_in_place(words, factor, arr_size)
-        return words
-
-    @cute.jit
-    def fragment(self, words: cutlass.Array, fragment_idx: Int32) -> cutlass.Array:
-        """Return the leading fragment's ``groups`` words, the factor applied."""
-        _ = fragment_idx
-        groups = self.groups
-        values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
-        for group_idx in cutlass.range_constexpr(groups):
-            values[group_idx] = Float32(words[group_idx])
-        return values
-
-    @cute.jit
-    def advance(self, words: cutlass.Array) -> None:
-        """Rotate the array down by one fragment."""
-        groups = self.groups
-        for entry in cutlass.range_constexpr(self.arr_size - groups):
-            words[entry] = Float32(words[entry + groups])
-
-
-@dataclass
-class SmemSageKScales:
-    """A softmax instance's ``sfK`` words in a two-tile SMEM ring.
-
-    K blocks of 4 and 1 token have eight or 32 scale groups per K32
-    fragment, more multipliers than a lane can hold, so a tile's words live
-    in SMEM in the layout of ``sage_k_scale_words`` and a pass reads one
-    fragment's groups with 16-byte broadcast loads (all lanes of a spatial
-    half read the same words), scaled by the pass's factor on the way. The
-    instance's warps fill a tile's words (``load_tile``, from ``k_scale`` on
-    a dense tile or from the staged route words of a block-sparse route) and
-    one named barrier of the instance publishes them. Consecutive tiles
-    alternate between the two tile slots of the ring, so a fill never
-    overwrites words the previous tile's P pass may still be reading in
-    another warp. The routed ``sage_scale_arr`` holds no words here; its
-    entries are padding for the other route kind's register strategy.
-
-    ``groups`` is the scale groups per fragment of the route kind the
-    strategy serves; ``name`` distinguishes the ring of a proxy-summary
-    strategy from the exact-route one when a plan holds both.
-    """
-
-    cfg: FmhaDecodeConfig
-    inst_id: int
-    sync_barrier_id: int
-    groups: int
-    name: str = "sageKScales"
-    routed_words: int = 1
-    _alloc: SmemAllocation | None = None
-
-    @property
-    def tile_words(self) -> int:
-        """Return the ``sfK`` words of one tile slot."""
-        return sage_k_scale_words(self.cfg, self.groups)
-
-    def smem_requirements(self, owner_name: str) -> list[SmemAllocation]:
-        """Return the ring's allocation, registered by the owning S resource."""
-        if self._alloc is None:
-            self._alloc = SmemAllocation(
-                name=f"{owner_name}_{self.name}",
-                size_bytes=2 * self.tile_words * 4,
-                alignment=16,
-            )
-        return [self._alloc]
-
-    @cute.jit
-    def words(self, context: ResourceContext) -> cutlass.Array:
-        """Return the two-tile ring as an FP32 SMEM array."""
-        return cutlass.Array(
-            context.smem_base.data_ptr() + self._alloc.offset,
-            dtype=Float32,
-            shape=(2 * self.tile_words,),
-            addrspace=3,
-        )
-
-    @cute.jit
-    def tile_base(self, stage_info: StageInfo) -> Int32:
-        """Return the word base of the current tile's slot of the ring."""
-        return (stage_info.loop_offset & Int32(1)) * Int32(self.tile_words)
-
-    @cute.jit
-    def load_tile(
-        self,
-        stage_info: StageInfo,
-        word_value: Constexpr[Callable[..., Float32]],
-        words: cutlass.Array,
-    ) -> None:
-        """Fill the current tile's slot, publish it, and pad the routed array.
-
-        ``word_value(word_idx, half, lane_entry)`` returns word ``word_idx =
-        half * arr_size + lane_entry`` of the ``sage_k_scale_words`` layout
-        from whichever coordinates it needs. Each lane of the instance stores
-        at most two words (one per round of the instance's threads); the named
-        barrier publishes the slot to both passes.
-        """
-        cfg = self.cfg
-        num_words = self.tile_words
-        arr_size = sage_scale_arr_size(cfg, self.groups)
-        threads = 32 * cfg.softmax_num_warps(self.inst_id)
-        warp_grp_thread_idx = Int32(
-            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        )
-        buffer = self.words(stage_info.context)
-        tile_base = self.tile_base(stage_info)
-        for round_idx in cutlass.range_constexpr((num_words + threads - 1) // threads):
-            word_idx = warp_grp_thread_idx + Int32(round_idx * threads)
-            if word_idx < Int32(num_words):
-                buffer[tile_base + word_idx] = word_value(
-                    word_idx, word_idx // Int32(arr_size), word_idx % Int32(arr_size)
-                )
-        prims.barrier_cta_sync(self.sync_barrier_id, thread_count=threads)
-        for entry in cutlass.range_constexpr(self.routed_words):
-            words[entry] = Float32(1.0)
-
-    @cute.jit
-    def open(
-        self,
-        stage_info: StageInfo,
-        scale_arr: cutlass.Array,
-        factor: Float32 | None,
-    ) -> tuple[cutlass.Pointer, Float32 | None]:
-        """Return the pass's half pointer and factor, resolving the ring base once."""
-        _ = scale_arr
-        warp_grp_thread_idx = Int32(
-            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        )
-        half_base = self.tile_base(stage_info) + _keeps_spatial_half(
-            self.cfg, warp_grp_thread_idx
-        ) * Int32(sage_scale_arr_size(self.cfg, self.groups))
-        half_ptr = self.words(stage_info.context).data_ptr() + half_base
-        return half_ptr, factor
-
-    @cute.jit
-    def fragment(self, view: tuple, fragment_idx: Int32) -> cutlass.Array:
-        """Return ``factor * sfK`` of one fragment's groups.
-
-        The words are read from the aligned SMEM ring in 16-byte loads.
-        Callers issue it ahead of the fragment's score wait so the SMEM
-        latency hides behind it.
-        """
-        half_ptr, factor = view
-        groups = self.groups
-        assert groups % 4 == 0
-        words_ptr = half_ptr + fragment_idx * Int32(groups)
-        values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
-        for chunk in cutlass.range_constexpr(0, groups, 4):
-            loaded = (words_ptr + Int32(chunk)).load(count=4, alignment=16)
-            for elem in cutlass.range_constexpr(4):
-                values[chunk + elem] = Float32(loaded[elem])
-        if cutlass.const_expr(factor is not None):
-            scale_pairs_in_place(values, factor, groups)
-        return values
-
-    @cute.jit
-    def advance(self, view: tuple) -> None:
-        """Nothing rotates: every fragment reads its own words."""
-        _ = view
-
-
-SageKScales = RegisterSageKScales | SmemSageKScales
-
-
-def make_sage_k_scales(
-    cfg: FmhaDecodeConfig, *, inst_id: int, sync_barrier_id: int
-) -> tuple[SageKScales | None, SageKScales | None]:
-    """Return one softmax instance's ``sfK`` strategies for exact and proxy routes.
-
-    Both entries are ``None`` without Sage attention and the same object
-    unless the plan's summary scales use another K block size than its token
-    scales (``sage_mixed_k_geometry``); then the proxy strategy is built for
-    the summary geometry, with its own SMEM ring and named barrier
-    (``sync_barrier_id + 2``) if it lives in SMEM, and both route the larger
-    ``sage_scale_arr``.
-    """
-    if not cfg.use_sage_attention:
-        return None, None
-
-    def build(groups: int, barrier_id: int, name: str) -> SageKScales:
-        if cfg.sage_k_scales_in_smem_for(groups):
-            return SmemSageKScales(cfg, inst_id, barrier_id, groups, name=name)
-        return RegisterSageKScales(cfg, groups)
-
-    exact = build(cfg.sage_k_groups_per_fragment, sync_barrier_id, "sageKScales")
-    if not cfg.sage_mixed_k_geometry:
-        return exact, exact
-    proxy = build(
-        cfg.sage_summary_k_groups_per_fragment,
-        sync_barrier_id + 2,
-        "sageSummaryKScales",
-    )
-    routed_words = max(exact.routed_words, proxy.routed_words)
-    exact.routed_words = routed_words
-    proxy.routed_words = routed_words
-    return exact, proxy
-
-
 @cute.jit
 def block_sparse_k_scale_source(
     cfg: Constexpr[FmhaDecodeConfig],
+    scales: SageScaleTensors,
     *,
-    k_scale_ptr: cute.Pointer,
-    k_scale_head_stride: Int32,
-    k_summary_scale_ptr: cute.Pointer | None,
-    k_summary_scale_head_stride: Int32 | None,
     seq_len_kv: Int32,
     route_is_proxy: cutlass.Boolean,
 ) -> tuple[Int64, Int32, Int32, Int32]:
@@ -519,14 +316,14 @@ def block_sparse_k_scale_source(
     The result is ``(base address, head stride, sequence length, log2 block
     size)`` for :func:`load_k_scale`.
     """
-    scale_addr = k_scale_ptr.toint()
-    head_stride = k_scale_head_stride
+    scale_addr = scales.k_scale_ptr.toint()
+    head_stride = scales.k_scale_head_stride
     seq_len = seq_len_kv
     log2_block = Int32(log2_block_size(cfg.sage_k_block_size))
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
         if route_is_proxy:
-            scale_addr = k_summary_scale_ptr.toint()
-            head_stride = k_summary_scale_head_stride
+            scale_addr = scales.k_summary_scale_ptr.toint()
+            head_stride = scales.k_summary_scale_head_stride
             seq_len = Int32(cfg.num_proxy_summaries)
             log2_block = Int32(log2_block_size(cfg.sage_k_summary_block_size))
     return scale_addr, head_stride, seq_len, log2_block
@@ -544,8 +341,7 @@ def staged_v_channel_scale_entries(cfg: FmhaDecodeConfig) -> int:
 @cute.jit
 def stage_v_channel_scales(
     cfg: Constexpr[FmhaDecodeConfig],
-    v_scale_ptr: cute.Pointer,
-    v_mean_ptr: cute.Pointer | None,
+    scales: SageScaleTensors,
     staged: cutlass.Array,
     *,
     kv_head_idx: Int32,
@@ -563,14 +359,14 @@ def stage_v_channel_scales(
     writes cannot overtake it.
     """
     assert cfg.headdim % num_threads == 0
-    v_scale_addr = v_scale_ptr.toint()
+    v_scale_addr = scales.v_scale_ptr.toint()
     head_base = kv_head_idx * Int32(cfg.headdim)
     for base in cutlass.range_constexpr(0, cfg.headdim, num_threads):
         channel = Int32(base) + thread_idx
         staged[channel] = _load_scale(v_scale_addr, head_base + channel)
         if cutlass.const_expr(cfg.sage_v_mean):
             staged[channel + Int32(cfg.headdim)] = _load_scale(
-                v_mean_ptr.toint(), head_base + channel
+                scales.v_mean_ptr.toint(), head_base + channel
             )
 
 
@@ -605,3 +401,415 @@ def load_staged_v_channel_scales(
             for elem in cutlass.range_constexpr(4):
                 means[chunk + elem] = Float32(0.0)
     return scales, means
+
+
+WordSource = Callable[[Int32, Int32, object], Float32]
+
+SAGE_K_SCALES_RING_STAGES = 2
+
+
+@dataclass(kw_only=True)
+class SageKScalesResource(DecodeGenResourceBase):
+    """One softmax instance's ``sfK`` words for one scale-group geometry.
+
+    ``summary`` marks the resource of a mixed-geometry plan that serves proxy
+    routes from ``k_summary_scale`` with the summary K block size; otherwise
+    the resource serves every route with the token K block size. The SMEM
+    form takes the instance's two-stage pipeline as ``pipeline_config``; the
+    register form takes none. ``route_metadata`` is the instance's
+    block-sparse softmax metadata resource, whose held stage holds the staged
+    words and atom origins of the current route; a dense plan resolves the
+    tile's token range from the sequence-length sources it shares with the S
+    resource.
+    """
+
+    _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+        (
+            "sage_scale_arr",
+            cutlass.Array,
+            None,
+            "Raw sfK words of the lane's fragments for the current tile.",
+        ),
+    )
+    cfg: Constexpr[FmhaDecodeConfig] = None
+    inst_id: Constexpr[int] = 0
+    summary: Constexpr[bool] = False
+    route_metadata: "SmemBlockSparseSoftmaxMetadataResource | None" = None
+    seqlens_kv: cute.Pointer | None = None
+    max_seq_len_kv: Int32 = None
+    seq_len_q: Int32 = None
+    q_group_idx: Int32 | None = None
+    h_k_idx: Int32 | None = None
+    b_idx: Int32 | None = None
+    scale_tensors: SageScaleTensors | None = None
+    sage_scale_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    _alloc: Constexpr[SmemAllocation | None] = None
+
+    def __post_init__(self) -> None:
+        assert (self.pipeline_config is not None) == self.in_smem, (
+            "the SMEM form of the Sage K scales carries the instance's pipeline "
+            "and the register form carries none"
+        )
+        super().__post_init__()
+
+    @property
+    def groups(self) -> int:
+        """Return the scale groups per K32 fragment of the served geometry."""
+        if self.summary:
+            return self.cfg.sage_summary_k_groups_per_fragment
+        return self.cfg.sage_k_groups_per_fragment
+
+    @property
+    def in_smem(self) -> bool:
+        """Whether the tile's words live in the SMEM ring rather than registers."""
+        return self.cfg.sage_k_scales_in_smem_for(self.groups)
+
+    @property
+    def arr_size(self) -> int:
+        """Return the ``sfK`` words one lane holds per tile in the register form."""
+        return sage_scale_arr_size(self.cfg, self.groups)
+
+    @property
+    def tile_words(self) -> int:
+        """Return the ``sfK`` words of one tile slot of the SMEM ring."""
+        return sage_k_scale_words(self.cfg, self.groups)
+
+    @property
+    def routed_words(self) -> int:
+        """Return the length of the routed array: the lane's words, or one placeholder."""
+        return 1 if self.in_smem else self.arr_size
+
+    def _init_placeholder_state(self) -> None:
+        """Create the placeholder routed array for task-graph tracing."""
+        self.sage_scale_arr.default = _placeholder_local_array(
+            Float32, self.routed_words
+        )
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Allocate the ring of the SMEM form; the register form needs none."""
+        if not self.in_smem:
+            return []
+        if self._alloc is None:
+            self._alloc = SmemAllocation(
+                name=self.name,
+                size_bytes=SAGE_K_SCALES_RING_STAGES * self.tile_words * 4,
+                alignment=16,
+            )
+        return [self._alloc]
+
+    def get_tmem_requirements(self) -> list[TmemAllocation]:
+        """The words live in SMEM or registers only."""
+        return []
+
+    # -- schedule steps ----------------------------------------------------
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def publish_tile(self, stage_info: StageInfo) -> None:
+        """Fill the acquired ring slot with a dense tile's words (SMEM form)."""
+        self._fill_ring(stage_info, cutlass.Boolean(False))
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def publish_route_tile(self, stage_info: StageInfo, *, route_flags: Int32) -> None:
+        """Fill the acquired ring slot with a block-sparse route's words (SMEM form).
+
+        ``route_flags`` comes from the preceding ``load_route`` of the route
+        metadata resource, whose stage must stay held until this step and
+        ``take_route_tile`` have run.
+        """
+        self._fill_ring(stage_info, self._route_is_proxy(route_flags))
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_scale_arr)
+    @cute.jit
+    def take_tile(self, stage_info: StageInfo) -> cutlass.Array:
+        """Return the routed array of a dense tile."""
+        return self._take(stage_info, cutlass.Boolean(False))
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_scale_arr)
+    @cute.jit
+    def take_route_tile(
+        self, stage_info: StageInfo, *, route_flags: Int32
+    ) -> cutlass.Array:
+        """Return the routed array of a block-sparse route."""
+        return self._take(stage_info, self._route_is_proxy(route_flags))
+
+    @cute.jit
+    def _route_is_proxy(self, route_flags: Int32) -> cutlass.Boolean:
+        """Return the route kind, resolved only where it selects a geometry."""
+        route_is_proxy = cutlass.Boolean(False)
+        if cutlass.const_expr(self._selects_by_route):
+            route_is_proxy = cute.arch.make_warp_uniform(_route_is_proxy(route_flags))
+        return route_is_proxy
+
+    @cute.jit
+    def _fill_ring(
+        self, stage_info: StageInfo, route_is_proxy: cutlass.Boolean
+    ) -> None:
+        """Store the tile's words into the acquired slot (SMEM form).
+
+        Each thread of the instance stores at most two words (one per round
+        of the instance's threads); the pipeline commit that follows publishes
+        the slot. In a mixed-geometry plan only the resource of the route's
+        kind fills; the branch is CTA-uniform.
+        """
+        assert self.in_smem
+        if self._serves(route_is_proxy):
+            self._store_tile_words(stage_info)
+
+    @cute.jit
+    def _take(
+        self, stage_info: StageInfo, route_is_proxy: cutlass.Boolean
+    ) -> cutlass.Array:
+        """Return the routed array: the lane's words in the register form, else ones.
+
+        The entries are ones before the gather so a mixed plan's inactive
+        geometry and the SMEM form leave defined padding.
+        """
+        words = cutlass.Array(
+            Float32, self.routed_words, space=cutlass.AddressSpace.rmem
+        )
+        for entry in cutlass.range_constexpr(self.routed_words):
+            words[entry] = Float32(1.0)
+        if cutlass.const_expr(not self.in_smem):
+            if self._serves(route_is_proxy):
+                self._gather_lane_words(stage_info, words)
+        return words
+
+    @property
+    def _selects_by_route(self) -> bool:
+        """Whether the route kind selects between two geometries of this plan."""
+        return self.cfg.sage_mixed_k_geometry and self.route_metadata is not None
+
+    @cute.jit
+    def _serves(self, route_is_proxy: cutlass.Boolean) -> cutlass.Boolean:
+        """Whether this resource holds the route's geometry.
+
+        A plan with one geometry is served by its one resource on every route,
+        so the test folds away at compile time there.
+        """
+        if cutlass.const_expr(not self._selects_by_route):
+            return True
+        if cutlass.const_expr(self.summary):
+            return route_is_proxy
+        return not route_is_proxy
+
+    # -- storage fills -----------------------------------------------------
+
+    @cute.jit
+    def _gather_lane_words(self, stage_info: StageInfo, words: cutlass.Array) -> None:
+        """Take the lane's spatial half of the tile's words into ``words``.
+
+        Word ``half * arr_size + entry`` of the ``sage_k_scale_words`` layout
+        is entry ``entry`` of the lane's array, so every entry index is a
+        constant and neither pass indexes registers at run time.
+        """
+        word_value = self._word_source(stage_info)
+        arr_size = self.arr_size
+        warp_grp_thread_idx = Int32(
+            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        )
+        half = _keeps_spatial_half(self.cfg, warp_grp_thread_idx)
+        half_base = half * Int32(arr_size)
+        for entry in cutlass.range_constexpr(arr_size):
+            words[entry] = word_value(half_base + Int32(entry), half, entry)
+
+    @cute.jit
+    def _store_tile_words(self, stage_info: StageInfo) -> None:
+        """Store the tile's words into the slot of the acquired producer stage."""
+        word_value = self._word_source(stage_info)
+        num_words = self.tile_words
+        arr_size = self.arr_size
+        threads = 32 * self.cfg.softmax_num_warps(self.inst_id)
+        warp_grp_thread_idx = Int32(
+            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        )
+        buffer = self._ring(stage_info.context)
+        slot_base = Int32(stage_info.stage_idx) * Int32(num_words)
+        for round_idx in cutlass.range_constexpr((num_words + threads - 1) // threads):
+            word_idx = warp_grp_thread_idx + Int32(round_idx * threads)
+            if word_idx < Int32(num_words):
+                buffer[slot_base + word_idx] = word_value(
+                    word_idx, word_idx // Int32(arr_size), word_idx % Int32(arr_size)
+                )
+
+    @cute.jit
+    def _ring(self, context: ResourceContext) -> cutlass.Array:
+        """Return the ring as an FP32 SMEM array."""
+        return cutlass.Array(
+            context.smem_base.data_ptr() + self._alloc.offset,
+            dtype=Float32,
+            shape=(SAGE_K_SCALES_RING_STAGES * self.tile_words,),
+            addrspace=3,
+        )
+
+    # -- word sources ------------------------------------------------------
+
+    @cute.jit
+    def _word_source(self, stage_info: StageInfo) -> WordSource:
+        """Return ``word_value(word_idx, half, lane_entry)`` for the current tile.
+
+        ``word_idx = half * arr_size + lane_entry`` names a word of the
+        ``sage_k_scale_words`` layout; the source reads it from wherever the
+        plan keeps it.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(self.route_metadata is None):
+            # A dense tile gathers ``k_scale`` over its token range; the load
+            # clamps tokens past the sequence end.
+            (
+                seq_len_kv,
+                _q_group_idx,
+                _element_mask_end_idx,
+                tile_offset_k,
+                _window_start_idx,
+                _is_valid_effective_tile,
+                _is_masked_final_wave,
+                _tile_is_unmasked,
+                _rows_are_active,
+            ) = resolve_keeps_tile_context(
+                cfg,
+                stage_info,
+                inst_id=self.inst_id,
+                seqlens_kv=self.seqlens_kv,
+                max_seq_len_kv=self.max_seq_len_kv,
+                seq_len_q=self.seq_len_q,
+                q_group_idx=self.q_group_idx,
+            )
+            kv_head_idx, batch_idx = _logical_head_batch(
+                stage_info, self.h_k_idx, self.b_idx
+            )
+            k_scale_addr = self.scale_tensors.k_scale_ptr.toint()
+
+            def dense_word(word_idx: Int32, half: Int32, lane_entry) -> Float32:
+                _ = word_idx
+                return load_k_scale(
+                    cfg,
+                    k_scale_addr,
+                    self.scale_tensors.k_scale_head_stride,
+                    kv_head_idx=kv_head_idx,
+                    batch_idx=batch_idx,
+                    seq_len_kv=seq_len_kv,
+                    kv_token_idx=dense_k_scale_token(
+                        cfg, half, lane_entry, tile_offset_k
+                    ),
+                )
+
+            return dense_word
+
+        metadata = self.route_metadata
+        stage_base = metadata._consumer_stage_base()
+        if cutlass.const_expr(not self.summary):
+            # The load warp staged the route's words in the
+            # ``sage_k_scale_words`` layout behind the route record.
+            assert metadata.staging_layout.sage_scale_words_word_offset is not None
+            source = stage_base + Int32(
+                metadata.staging_layout.sage_scale_words_word_offset
+            )
+            staged = metadata._smem_scales
+
+            def staged_word(word_idx: Int32, half: Int32, lane_entry) -> Float32:
+                _ = half, lane_entry
+                return Float32(staged[source + word_idx])
+
+            return staged_word
+
+        # A proxy route of a mixed-geometry plan stages no scale words: the
+        # summary scale of each word is gathered from the route's staged atom
+        # origins, one summary per KV block.
+        groups = self.groups
+        num_origins = metadata.staging_layout.num_origin_words
+        kv_head_idx, batch_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        scale_addr = self.scale_tensors.k_summary_scale_ptr.toint()
+        scale_head_stride = self.scale_tensors.k_summary_scale_head_stride
+        summary_seq_len = Int32(cfg.num_proxy_summaries)
+        log2_k_block_size = Int32(log2_block_size(cfg.sage_k_summary_block_size))
+        origins = metadata._smem_words
+
+        def summary_word(word_idx: Int32, half: Int32, lane_entry) -> Float32:
+            _ = word_idx
+            atom_idx, token_offset = sage_word_position(cfg, half, lane_entry, groups)
+            atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
+            origin = Int32(origins[stage_base + atom_idx])
+            return load_k_scale(
+                cfg,
+                scale_addr,
+                scale_head_stride,
+                kv_head_idx=kv_head_idx,
+                batch_idx=batch_idx,
+                seq_len_kv=summary_seq_len,
+                kv_token_idx=cute.math.max(origin, Int32(0)) + token_offset,
+                log2_k_block_size=log2_k_block_size,
+            )
+
+        return summary_word
+
+    # -- pass-side reads ---------------------------------------------------
+
+    @cute.jit
+    def open(
+        self,
+        stage_info: StageInfo,
+        scale_arr: cutlass.Array,
+        factor: Float32 | None,
+    ):
+        """Return a pass's view of the tile's words with ``factor`` applied.
+
+        Register form: a fresh rotating copy of the routed array, scaled once
+        per tile. SMEM form: the lane's half pointer into the slot the latest
+        wait selected and the factor, applied per fragment on the way out.
+        """
+        if cutlass.const_expr(self.in_smem):
+            warp_grp_thread_idx = Int32(
+                _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+            )
+            half_base = Int32(self.consumer_work_stage) * Int32(
+                self.tile_words
+            ) + _keeps_spatial_half(self.cfg, warp_grp_thread_idx) * Int32(
+                self.arr_size
+            )
+            half_ptr = self._ring(stage_info.context).data_ptr() + half_base
+            return half_ptr, factor
+        arr_size = self.arr_size
+        words = cutlass.Array(Float32, arr_size, space=cutlass.AddressSpace.rmem)
+        for entry in cutlass.range_constexpr(arr_size):
+            words[entry] = Float32(scale_arr[entry])
+        if cutlass.const_expr(factor is not None):
+            scale_pairs_in_place(words, factor, arr_size)
+        return words
+
+    @cute.jit
+    def fragment(self, view, fragment_idx: Int32) -> cutlass.Array:
+        """Return ``factor * sfK`` of one fragment's ``groups`` words.
+
+        The SMEM form reads them from the aligned ring in 16-byte loads;
+        callers issue it ahead of the fragment's score wait so the latency
+        hides behind it. The register form reads the leading entries of the
+        rotating array.
+        """
+        groups = self.groups
+        values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
+        if cutlass.const_expr(self.in_smem):
+            half_ptr, factor = view
+            assert groups % 4 == 0
+            words_ptr = half_ptr + fragment_idx * Int32(groups)
+            for chunk in cutlass.range_constexpr(0, groups, 4):
+                loaded = (words_ptr + Int32(chunk)).load(count=4, alignment=16)
+                for elem in cutlass.range_constexpr(4):
+                    values[chunk + elem] = Float32(loaded[elem])
+            if cutlass.const_expr(factor is not None):
+                scale_pairs_in_place(values, factor, groups)
+        else:
+            for group_idx in cutlass.range_constexpr(groups):
+                values[group_idx] = Float32(view[group_idx])
+        return values
+
+    @cute.jit
+    def advance(self, view) -> None:
+        """Rotate the register array down by one fragment; the SMEM form reads in place."""
+        if cutlass.const_expr(not self.in_smem):
+            groups = self.groups
+            for entry in cutlass.range_constexpr(self.arr_size - groups):
+                view[entry] = Float32(view[entry + groups])

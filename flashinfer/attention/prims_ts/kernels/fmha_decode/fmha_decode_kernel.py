@@ -98,7 +98,11 @@ from .fmha_decode_resources.helpers_common import (
     _q_seq_bounds,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
-from .fmha_decode_resources.sage_scales import make_sage_k_scales
+from .fmha_decode_resources.sage_scales import (
+    SAGE_K_SCALES_RING_STAGES,
+    SageKScalesResource,
+    SageScaleTensors,
+)
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
@@ -990,21 +994,25 @@ def _build_decode_gen_schedule(
                 seq_len_q=seq_len_q,
                 name="smemPageOffsetsKvV",
             )
-    # Where each softmax instance's Sage K scales live during the passes. The
-    # S and P resources and the route metadata consumer of one instance share
-    # the strategy object; an SMEM ring is allocated through the S resource and
-    # published through the instance's own softmax named barrier (the same
-    # warps arrive on it in program order, so it needs no barrier of its own).
-    sage_k_scales0, sage_summary_k_scales0 = make_sage_k_scales(
-        cfg, inst_id=0, sync_barrier_id=0
-    )
-    sage_k_scales1, sage_summary_k_scales1 = make_sage_k_scales(
-        cfg, inst_id=1, sync_barrier_id=1
-    )
     sparse_kv_metadata0 = None
     sparse_kv_metadata1 = None
     sparse_softmax_metadata0 = None
     sparse_softmax_metadata1 = None
+    # The plan's scale tensors, shared by every resource that reads a scale:
+    # the S resources (sfQ), the metadata staging and the K scale resources
+    # (sfK, summary sfK) and the epilogue (per-channel V scales and means).
+    sage_scale_tensors = None
+    if cfg.use_sage_attention:
+        sage_scale_tensors = SageScaleTensors(
+            q_scale_ptr=q_scale_ptr,
+            q_scale_head_stride=q_scale_head_stride,
+            k_scale_ptr=k_scale_ptr,
+            k_scale_head_stride=k_scale_head_stride,
+            k_summary_scale_ptr=k_summary_scale_ptr,
+            k_summary_scale_head_stride=k_summary_scale_head_stride,
+            v_scale_ptr=v_scale_ptr,
+            v_mean_ptr=v_mean_ptr,
+        )
     if cfg.use_block_sparse:
         # This selects the prepared-record storage ABI. Causal consumers still
         # intersect these column-validity words with each Q row's causal mask.
@@ -1034,24 +1042,16 @@ def _build_decode_gen_schedule(
             tma_oob_origin=max_seq_len_kv,
             name="smemBlockSparseKvMetadata1",
         )
-        sage_scale_sources = dict(
-            h_k_idx=h_k_idx,
-            b_idx=b_idx,
-            k_scale_ptr=k_scale_ptr,
-            k_summary_scale_ptr=k_summary_scale_ptr,
-            k_scale_head_stride=k_scale_head_stride,
-            k_summary_scale_head_stride=k_summary_scale_head_stride,
-        )
         sparse_softmax_metadata0 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata0_cfg,
             cfg=cfg,
             inst_id=0,
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
-            sage_k_scales=sage_k_scales0,
-            sage_summary_k_scales=sage_summary_k_scales0,
             name="smemBlockSparseSoftmaxMetadata0",
-            **sage_scale_sources,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            scale_tensors=sage_scale_tensors,
         )
         sparse_softmax_metadata1 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata1_cfg,
@@ -1059,10 +1059,10 @@ def _build_decode_gen_schedule(
             inst_id=1,
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
-            sage_k_scales=sage_k_scales1,
-            sage_summary_k_scales=sage_summary_k_scales1,
             name="smemBlockSparseSoftmaxMetadata1",
-            **sage_scale_sources,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            scale_tensors=sage_scale_tensors,
         )
     smem_kv = None
     smem_k0 = None
@@ -1188,18 +1188,93 @@ def _build_decode_gen_schedule(
             name="smemKv",
         )
 
-    # The softmax bodies load ``sfQ`` and the contiguous ``sfK`` from these
-    # sources; the epilogue reads the per-channel V scales and means.
-    sage_qk_scale_sources = dict(
-        q_scale_ptr=q_scale_ptr,
-        k_scale_ptr=k_scale_ptr,
-        q_scale_head_stride=q_scale_head_stride,
-        k_scale_head_stride=k_scale_head_stride,
-    )
-    sage_v_scale_sources = dict(
-        v_scale_ptr=v_scale_ptr,
-        v_mean_ptr=v_mean_ptr,
-    )
+    # Each softmax instance's ``sfK`` words are a resource the softmax task
+    # produces and consumes itself; the S and P resources read it one
+    # fragment at a time. The SMEM form is a two-stage pipeline whose producer
+    # and consumer are both the instance's warps; the register form carries
+    # no pipeline. A mixed-geometry plan holds a second resource for the proxy
+    # summaries; otherwise the exact resource serves every route kind.
+    sage_k_scales0 = None
+    sage_k_scales1 = None
+    sage_summary_k_scales0 = None
+    sage_summary_k_scales1 = None
+    if cfg.use_sage_attention:
+
+        def _sage_k_scales_cfg(groups: int, softmax_grp) -> PipelineConfig | None:
+            if not cfg.sage_k_scales_in_smem_for(groups):
+                return None
+            return PipelineConfig(
+                num_stages=SAGE_K_SCALES_RING_STAGES,
+                num_bytes=0,
+                producer_group=softmax_grp,
+                consumer_group=softmax_grp,
+                pipeline_type=PipelineType.AsyncAsync,
+                cta_layout_vmnk=cta_layout,
+                advance_on_wait=True,
+            )
+
+        token_groups = cfg.sage_k_groups_per_fragment
+        sage_k_scales0 = SageKScalesResource(
+            pipeline_config=_sage_k_scales_cfg(token_groups, softmax0_grp),
+            inst_id=0,
+            route_metadata=sparse_softmax_metadata0,
+            name="sageKScales0",
+            cfg=cfg,
+            seqlens_kv=kv_seqlens,
+            max_seq_len_kv=max_seq_len_kv,
+            q_group_idx=q_group_idx,
+            seq_len_q=seq_len_q,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            scale_tensors=sage_scale_tensors,
+        )
+        sage_k_scales1 = SageKScalesResource(
+            pipeline_config=_sage_k_scales_cfg(token_groups, softmax1_grp),
+            inst_id=1,
+            route_metadata=sparse_softmax_metadata1,
+            name="sageKScales1",
+            cfg=cfg,
+            seqlens_kv=kv_seqlens,
+            max_seq_len_kv=max_seq_len_kv,
+            q_group_idx=q_group_idx,
+            seq_len_q=seq_len_q,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            scale_tensors=sage_scale_tensors,
+        )
+        if cfg.sage_mixed_k_geometry:
+            summary_groups = cfg.sage_summary_k_groups_per_fragment
+            sage_summary_k_scales0 = SageKScalesResource(
+                pipeline_config=_sage_k_scales_cfg(summary_groups, softmax0_grp),
+                inst_id=0,
+                summary=True,
+                route_metadata=sparse_softmax_metadata0,
+                name="sageSummaryKScales0",
+                cfg=cfg,
+                seqlens_kv=kv_seqlens,
+                max_seq_len_kv=max_seq_len_kv,
+                q_group_idx=q_group_idx,
+                seq_len_q=seq_len_q,
+                h_k_idx=h_k_idx,
+                b_idx=b_idx,
+                scale_tensors=sage_scale_tensors,
+            )
+            sage_summary_k_scales1 = SageKScalesResource(
+                pipeline_config=_sage_k_scales_cfg(summary_groups, softmax1_grp),
+                inst_id=1,
+                summary=True,
+                route_metadata=sparse_softmax_metadata1,
+                name="sageSummaryKScales1",
+                cfg=cfg,
+                seqlens_kv=kv_seqlens,
+                max_seq_len_kv=max_seq_len_kv,
+                q_group_idx=q_group_idx,
+                seq_len_q=seq_len_q,
+                h_k_idx=h_k_idx,
+                b_idx=b_idx,
+                scale_tensors=sage_scale_tensors,
+            )
+
     tmem_s0 = TmemSResource(
         inst_id=0,
         pipeline_config=tmem_s0_cfg,
@@ -1214,9 +1289,9 @@ def _build_decode_gen_schedule(
         b_idx=b_idx,
         sync_barrier_id=0,
         sage_k_scales=sage_k_scales0,
-        sage_summary_k_scales=sage_summary_k_scales0,
+        sage_summary_k_scales=sage_summary_k_scales0 or sage_k_scales0,
         name="tmemS0",
-        **sage_qk_scale_sources,
+        scale_tensors=sage_scale_tensors,
     )
     tmem_s1 = TmemSResource(
         inst_id=1,
@@ -1233,9 +1308,9 @@ def _build_decode_gen_schedule(
         sync_barrier_id=1,
         score_seed_owner=tmem_s0,
         sage_k_scales=sage_k_scales1,
-        sage_summary_k_scales=sage_summary_k_scales1,
+        sage_summary_k_scales=sage_summary_k_scales1 or sage_k_scales1,
         name="tmemS1",
-        **sage_qk_scale_sources,
+        scale_tensors=sage_scale_tensors,
     )
     # Packed persistent QK derives the descriptor from Q's just-waited
     # consumer stage, avoiding a routed HEAD-to-LOOP descriptor value across
@@ -1255,7 +1330,7 @@ def _build_decode_gen_schedule(
         scale_softmax_log2=scale_softmax_log2,
         use_variable_seqlens_kv=use_runtime_seqlens_kv,
         sage_k_scales=sage_k_scales0,
-        sage_summary_k_scales=sage_summary_k_scales0,
+        sage_summary_k_scales=sage_summary_k_scales0 or sage_k_scales0,
         name="smemP0",
     )
     smem_p1 = SmemPResource(
@@ -1265,7 +1340,7 @@ def _build_decode_gen_schedule(
         scale_softmax_log2=scale_softmax_log2,
         use_variable_seqlens_kv=use_runtime_seqlens_kv,
         sage_k_scales=sage_k_scales1,
-        sage_summary_k_scales=sage_summary_k_scales1,
+        sage_summary_k_scales=sage_summary_k_scales1 or sage_k_scales1,
         name="smemP1",
     )
 
@@ -1354,7 +1429,7 @@ def _build_decode_gen_schedule(
         active_splits_kv=active_splits_kv,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
-        **sage_v_scale_sources,
+        scale_tensors=sage_scale_tensors,
     )
     tmem_corr1 = TmemCorrResource(
         inst_id=1,
@@ -1378,7 +1453,7 @@ def _build_decode_gen_schedule(
         active_splits_kv=active_splits_kv,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr1",
-        **sage_v_scale_sources,
+        scale_tensors=sage_scale_tensors,
     )
     tmem_corr1.smem_p0_ref = smem_p0
     tmem_corr1.smem_p1_ref = smem_p1
@@ -1426,9 +1501,16 @@ def _build_decode_gen_schedule(
     smem_resources.append(smem_p0)
     if not use_one_inst_qkv:
         smem_resources.append(smem_p1)
+    # Each instance's scale rings follow its S resource in the layout.
     smem_resources.append(tmem_s0)
+    smem_resources.extend(
+        r for r in (sage_k_scales0, sage_summary_k_scales0) if r is not None
+    )
     if not use_one_inst_qkv:
         smem_resources.append(tmem_s1)
+        smem_resources.extend(
+            r for r in (sage_k_scales1, sage_summary_k_scales1) if r is not None
+        )
     smem_resources.append(tmem_o)
     smem_resources.append(tmem_softmax_local0)
     if not use_one_inst_qkv:
@@ -1725,6 +1807,8 @@ def _build_decode_gen_schedule(
         domain=softmax_domain,
         domain_bias=1,
         membership_lifetime=membership_lifetime,
+        sage_k_scales=sage_k_scales0,
+        sage_summary_k_scales=sage_summary_k_scales0,
         **task_runtime_kwargs,
     )
     softmax1_task = None
@@ -1741,6 +1825,8 @@ def _build_decode_gen_schedule(
             domain=softmax_domain,
             domain_bias=1,
             membership_lifetime=membership_lifetime,
+            sage_k_scales=sage_k_scales1,
+            sage_summary_k_scales=sage_summary_k_scales1,
             **task_runtime_kwargs,
         )
     if use_one_inst_qkv:

@@ -414,19 +414,21 @@ correction skip and LSE all operate on the dequantized maximum and are
 unchanged. Both passes use one algebra: the tile's raw `sfK` words per scale
 group, and the row's `sfQ` applied once per tile (to the tile maximum, to the
 `c * sfQ` factor of the exponent multipliers, and to the proxy tail shift).
-Where the `sfK` words live is a compile-time strategy in `sage_scales.py`,
-selected by `sage_k_scales_in_smem` and shared by the S and P resources and
-the route metadata consumer of one softmax instance: `RegisterSageKScales`
-(K blocks of 16 tokens and larger) keeps the lane's words in a rotating
-register array that both passes read fragment by fragment without runtime
-indexing; `SmemSageKScales` (blocks of 4 and 1 token, too many groups for
-registers) keeps the tile's words in a two-tile SMEM ring of the instance
-(filled from `k_scale` by the lanes of a dense tile or copied from the route
-stage, published with one named barrier) that both passes read with 16-byte
-broadcast loads per fragment. The passes see only the strategy's `open`,
-`fragment` and `advance`. The sources are the same for both: the contiguous
+Where the `sfK` words live is a resource of the softmax task itself,
+`SageKScalesResource` in `sage_scales.py`, listed in both the task's source
+and destination resources and read by the S and P resources of one softmax
+instance. Its storage form is selected by `sage_k_scales_in_smem`: K blocks
+of 16 tokens and larger keep the lane's words in a rotating register array
+that both passes read fragment by fragment without runtime indexing; blocks
+of 4 and 1 token (too many groups for registers) keep the tile's words in a
+two-slot SMEM ring the resource allocates, filled by the softmax threads
+(`publish_tile`, a producer work published with one named barrier) and read
+by both passes with 16-byte broadcast loads per fragment. `take_tile`, the
+consumer work, hands the passes the routed register array (a placeholder in
+the SMEM form). The passes see only the resource's `open`, `fragment` and
+`advance`. The sources are the same for both: the contiguous
 provider derives each fragment's first token from the tile offset and loads
-`sfK` from the softmax threads before the score wait (`load_lane_k_scales`);
+`sfK` from the softmax threads before the score wait (`take_tile`);
 the block-sparse provider moves the loads off the softmax warps, the load
 warp resolving and staging the route's `sfK` words (`sage_k_scale_words` per
 route, ordered by consuming half and lane array) next to the route metadata
@@ -434,8 +436,8 @@ from the route's K64 atom origins; a proxy route switches the K source to
 `k_summary_scale` indexed by summary position with the summary K block size
 (`block_sparse_k_scale_source`). When `sage_k_summary_block_size` differs
 from `sage_k_block_size` (`sage_mixed_k_geometry`), each softmax instance
-holds one `sfK` strategy per route kind, the staging area covers the larger
-word count, and the max and P passes select the strategy and its scale-group
+holds one `sfK` resource per route kind, the staging area covers the larger
+word count, and the max and P passes select the resource and its scale-group
 count per tile on the CTA-uniform route kind; equal block sizes keep the
 single geometry.
 Tokens beyond the sequence end and Q rows beyond the valid count clamp to the

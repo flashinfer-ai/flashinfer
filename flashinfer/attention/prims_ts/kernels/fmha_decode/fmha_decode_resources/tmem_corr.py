@@ -89,6 +89,7 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
 )
 from .sage_scales import (
+    SageScaleTensors,
     load_staged_v_channel_scales,
     stage_v_channel_scales,
     staged_v_channel_scale_entries,
@@ -126,8 +127,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     partial_stats_ptr: cute.Pointer = None
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
-    v_scale_ptr: cute.Pointer | None = None
-    v_mean_ptr: cute.Pointer | None = None
+    scale_tensors: SageScaleTensors | None = None
     seqlens_kv: cute.Pointer = None
     max_seq_len_kv: Constexpr[int] = 0
     seq_len_q: Int32 = None
@@ -1393,8 +1393,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_h_k_idx, _ = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
         stage_v_channel_scales(
             cfg,
-            self.v_scale_ptr,
-            self.v_mean_ptr,
+            self.scale_tensors,
             self._sage_v_scales,
             kv_head_idx=logical_h_k_idx,
             thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],

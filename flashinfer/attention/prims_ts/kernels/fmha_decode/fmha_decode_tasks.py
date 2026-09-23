@@ -2904,11 +2904,17 @@ def _softmax_schedule_body(
     tmem_softmax_order: MemoryResource | None,
     sparse_softmax_metadata: MemoryResource | None,
     membership_lifetime: MemoryResource | None,
+    sage_k_scales: MemoryResource | None,
+    sage_summary_k_scales: MemoryResource | None,
+    sage_scales_in_smem: tuple[bool, ...] = (),
 ) -> None:
     """Build one softmax instance's loop, P publication, and final stats handoff.
 
     Both instances run the same schedule on their own resources; they differ
-    only in the side of the ordered P baton they hold.
+    only in the side of the ordered P baton they hold. ``sage_scales_in_smem``
+    marks, per present scale resource, the SMEM form that carries a pipeline;
+    schedule proxies expose work methods only, so the flags come from the
+    task builder.
     """
     if membership_lifetime is not None:
         membership_lifetime.wait()
@@ -2924,12 +2930,19 @@ def _softmax_schedule_body(
     if cutlass.const_expr(cfg.use_sage_attention):
         # The lane's Q row is fixed for the work tile.
         sage_q_scale = tmem_s.load_sage_q_scale()
-    # The Sage loops take the row's ``sfQ`` and the routed ``sage_scale_arr``
-    # (the lane's raw ``sfK`` array, or a placeholder when the tile's words
-    # live in the instance's SMEM ring), the block-sparse loops the
-    # register-resident route payload and the proxy P pass its route kind;
-    # the work framework routes arguments by token and rejects ``None``, so
-    # each combination is its own work callable.
+    # The Sage loops take the row's ``sfQ`` and one routed array per scale
+    # resource (the lane's raw ``sfK`` words, or a placeholder when the
+    # tile's words live in the resource's SMEM ring); a single-geometry plan
+    # passes the exact array under both names. The block-sparse loops take
+    # the register-resident route payload and the proxy P pass its route
+    # kind; the work framework routes arguments by token and rejects
+    # ``None``, so each combination is its own work callable.
+    sage_scales = [r for r in (sage_k_scales, sage_summary_k_scales) if r is not None]
+    sage_ring_scales = [
+        r
+        for r, in_smem in zip(sage_scales, sage_scales_in_smem, strict=True)
+        if in_smem
+    ]
     use_sparse = sparse_softmax_metadata is not None
     use_sage = cfg.use_sage_attention
     compute_softmax_loop = {
@@ -2962,17 +2975,37 @@ def _softmax_schedule_body(
                 sparse_token_word3,
             ) = sparse_softmax_metadata.load_route()
             if cutlass.const_expr(cfg.use_sage_attention):
-                # The route's staged ``sfK`` words go where the strategy keeps
-                # them: the lane's array or the instance's SMEM ring.
-                sage_scale_arr = sparse_softmax_metadata.load_route_sage_k_scales(
+                # The route's ``sfK`` words leave the held metadata stage for
+                # the task's own scale resources: ProdAcquire/ProdWork/
+                # ProdCommit fill and publish an SMEM ring slot, ConsWait
+                # makes it visible to both passes, ConsWork routes the lane's
+                # register words. A mixed-geometry plan fills the resource of
+                # the route's kind; the other one routes ones.
+                for scales in sage_ring_scales:
+                    scales.acquire()
+                    scales.publish_route_tile(route_flags=sparse_route_flags)
+                    scales.commit()
+                    scales.wait()
+                sage_scale_arr = sage_k_scales.take_route_tile(
                     route_flags=sparse_route_flags
                 )
+                sage_summary_scale_arr = sage_scale_arr
+                if sage_summary_k_scales is not None:
+                    sage_summary_scale_arr = sage_summary_k_scales.take_route_tile(
+                        route_flags=sparse_route_flags
+                    )
             sparse_softmax_metadata.release()
         if cutlass.const_expr(cfg.use_sage_attention and not use_sparse):
             # A dense tile's ``sfK`` loads are issued ahead of the score wait
             # so their latency hides behind the QK MMA; a route's words came
             # with its metadata above.
-            sage_scale_arr = tmem_s.load_sage_k_scales()
+            for scales in sage_ring_scales:
+                scales.acquire()
+                scales.publish_tile()
+                scales.commit()
+                scales.wait()
+            sage_scale_arr = sage_k_scales.take_tile()
+            sage_summary_scale_arr = sage_scale_arr
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()
         softmax_loop_kwargs = dict(
@@ -2984,6 +3017,7 @@ def _softmax_schedule_body(
         if cutlass.const_expr(cfg.use_sage_attention):
             softmax_loop_kwargs["sage_q_scale"] = sage_q_scale
             softmax_loop_kwargs["sage_scale_arr"] = sage_scale_arr
+            softmax_loop_kwargs["sage_summary_scale_arr"] = sage_summary_scale_arr
         if use_sparse:
             softmax_loop_kwargs.update(
                 sparse_origin0=sparse_origin0,
@@ -3018,6 +3052,7 @@ def _softmax_schedule_body(
             if cutlass.const_expr(cfg.use_sage_attention):
                 p_fragments_kwargs["sage_q_scale"] = sage_q_scale
                 p_fragments_kwargs["sage_scale_arr"] = sage_scale_arr
+                p_fragments_kwargs["sage_summary_scale_arr"] = sage_summary_scale_arr
             if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                 p_fragments_kwargs["route_flags"] = sparse_route_flags
             compute_p_fragments(**p_fragments_kwargs)
@@ -3056,6 +3091,11 @@ def _softmax_schedule_body(
             # TMEM-P has consumed the aliased S columns, so the next QK
             # wave can now overwrite S.
             tmem_s.release()
+        if cutlass.const_expr(cfg.use_sage_attention):
+            # ConsRelease: both passes have read the tile's ``sfK`` ring slot,
+            # so the tile after next may fill it.
+            for scales in sage_ring_scales:
+                scales.release()
         # ProdWork: FP8 path applies the cross-resource sum correction
         # before TmemS.reduce_sums publishes the new running sums.
         tmem_softmax_global.global_correction(
@@ -3121,10 +3161,15 @@ def create_softmax0_task(
     *,
     domain: int | cutlass.Int32,
     membership_lifetime: MemoryResource | None = None,
+    sage_k_scales: MemoryResource | None = None,
+    sage_summary_k_scales: MemoryResource | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
     """Create the first softmax task, including optional ordered publication."""
+
+    sage_scales = [r for r in (sage_k_scales, sage_summary_k_scales) if r is not None]
+    sage_scales_in_smem = tuple(r.in_smem for r in sage_scales)
 
     @_schedule_with_optional_resources
     def softmax0_schedule(
@@ -3135,6 +3180,8 @@ def create_softmax0_task(
         tmem_softmax_order: MemoryResource | None,
         sparse_softmax_metadata: MemoryResource | None,
         membership_lifetime: MemoryResource | None,
+        sage_k_scales: MemoryResource | None,
+        sage_summary_k_scales: MemoryResource | None,
         work_queue: WorkQueue | None,
     ) -> None:
         """Schedule softmax0 with the supplied order and sparse resources."""
@@ -3152,6 +3199,9 @@ def create_softmax0_task(
                 tmem_softmax_order,
                 sparse_softmax_metadata,
                 membership_lifetime,
+                sage_k_scales,
+                sage_summary_k_scales,
+                sage_scales_in_smem,
             ),
         )
 
@@ -3163,6 +3213,8 @@ def create_softmax0_task(
         tmem_softmax_order,
         sparse_softmax_metadata,
         membership_lifetime,
+        sage_k_scales,
+        sage_summary_k_scales,
         work_queue,
     )
     src = [tmem_s0]
@@ -3170,9 +3222,12 @@ def create_softmax0_task(
         src.append(sparse_softmax_metadata)
     if membership_lifetime is not None:
         src.append(membership_lifetime)
+    # The scale resources are produced and consumed by this task.
+    src.extend(sage_scales)
     if work_queue is not None:
         src.append(work_queue)
     dst = [tmem_softmax_local0, smem_p0, tmem_softmax_global0]
+    dst.extend(r for r in sage_scales if r.in_smem)
     if tmem_softmax_order is not None:
         dst.append(tmem_softmax_order)
     return task_class(
@@ -3204,10 +3259,15 @@ def create_softmax1_task(
     *,
     domain: int | cutlass.Int32,
     membership_lifetime: MemoryResource | None = None,
+    sage_k_scales: MemoryResource | None = None,
+    sage_summary_k_scales: MemoryResource | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
     """Create the second softmax task, including optional ordered publication."""
+
+    sage_scales = [r for r in (sage_k_scales, sage_summary_k_scales) if r is not None]
+    sage_scales_in_smem = tuple(r.in_smem for r in sage_scales)
 
     @_schedule_with_optional_resources
     def softmax1_schedule(
@@ -3218,6 +3278,8 @@ def create_softmax1_task(
         tmem_softmax_order: MemoryResource | None,
         sparse_softmax_metadata: MemoryResource | None,
         membership_lifetime: MemoryResource | None,
+        sage_k_scales: MemoryResource | None,
+        sage_summary_k_scales: MemoryResource | None,
         work_queue: WorkQueue | None,
     ) -> None:
         """Schedule softmax1 with the supplied order and sparse resources."""
@@ -3241,6 +3303,9 @@ def create_softmax1_task(
                 tmem_softmax_order,
                 sparse_softmax_metadata,
                 membership_lifetime,
+                sage_k_scales,
+                sage_summary_k_scales,
+                sage_scales_in_smem,
             ),
         )
 
@@ -3252,6 +3317,8 @@ def create_softmax1_task(
         tmem_softmax_order,
         sparse_softmax_metadata,
         membership_lifetime,
+        sage_k_scales,
+        sage_summary_k_scales,
         work_queue,
     )
     src = [tmem_s1]
@@ -3261,11 +3328,18 @@ def create_softmax1_task(
         src.append(tmem_softmax_order)
     if membership_lifetime is not None:
         src.append(membership_lifetime)
+    # The scale resources are produced and consumed by this task.
+    src.extend(sage_scales)
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_softmax_local1, smem_p1, tmem_softmax_global1],
+        dst_resources=[
+            tmem_softmax_local1,
+            smem_p1,
+            tmem_softmax_global1,
+            *(r for r in sage_scales if r.in_smem),
+        ],
         q_bound_resources=((tmem_s1, False),),
         cfg=cfg,
         warp_idx=cfg.softmax1_warp_idx,

@@ -48,6 +48,7 @@ from ..fmha_decode_constants import (
 )
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
+    _route_is_proxy,
     Constexpr,
     DecodeGenResourceBase,
     ResourceVars,
@@ -82,8 +83,7 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
-from .sage_scales import SageKScales
-from .smem_block_sparse_metadata import _route_is_proxy
+from .sage_scales import SageKScalesResource
 from .tmem_s import TmemSResource
 
 # Tunable: number of score pairs per streamed fragment whose exponentials run
@@ -144,13 +144,12 @@ class SmemPResource(DecodeGenResourceBase):
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
-    # Where the tile's ``sfK`` words live (shared with the S resource and the
-    # route metadata consumer of the same instance): ``sage_k_scales`` for
-    # exact routes and dense tiles, ``sage_summary_k_scales`` for proxy
-    # routes (the same object unless the summary scales have their own K
-    # block size).
-    sage_k_scales: Constexpr[SageKScales | None] = None
-    sage_summary_k_scales: Constexpr[SageKScales | None] = None
+    # The instance's ``sfK`` resources (``SageKScalesResource``, shared with
+    # the S resource): ``sage_k_scales`` for exact routes and dense tiles,
+    # ``sage_summary_k_scales`` for proxy routes (the same resource unless the
+    # summary scales have their own K block size).
+    sage_k_scales: SageKScalesResource | None = None
+    sage_summary_k_scales: SageKScalesResource | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
@@ -383,6 +382,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         sage_q_scale: Float32,
         sage_scale_arr: cutlass.Array,
+        sage_summary_scale_arr: cutlass.Array,
     ) -> None:
         """Stream every K32 fragment with per-group Sage dequantization scales."""
         assert self.cfg.use_sage_attention
@@ -392,6 +392,7 @@ class SmemPResource(DecodeGenResourceBase):
             route_is_proxy=cutlass.Boolean(False),
             sage_q_scale=sage_q_scale,
             sage_scale_arr=sage_scale_arr,
+            sage_summary_scale_arr=sage_summary_scale_arr,
         )
 
     @producer_work
@@ -421,6 +422,7 @@ class SmemPResource(DecodeGenResourceBase):
         route_flags: Int32,
         sage_q_scale: Float32,
         sage_scale_arr: cutlass.Array,
+        sage_summary_scale_arr: cutlass.Array,
     ) -> None:
         """Stream exact or proxy K32 fragments with per-group Sage scales."""
         assert self.cfg.use_block_sparse_proxy_routes and self.cfg.use_sage_attention
@@ -430,6 +432,7 @@ class SmemPResource(DecodeGenResourceBase):
             route_is_proxy=_route_is_proxy(route_flags),
             sage_q_scale=sage_q_scale,
             sage_scale_arr=sage_scale_arr,
+            sage_summary_scale_arr=sage_summary_scale_arr,
         )
 
     @cute.jit
@@ -441,6 +444,7 @@ class SmemPResource(DecodeGenResourceBase):
         route_is_proxy: cutlass.Boolean,
         sage_q_scale: Float32 | None = None,
         sage_scale_arr: cutlass.Array | None = None,
+        sage_summary_scale_arr: cutlass.Array | None = None,
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
@@ -453,7 +457,7 @@ class SmemPResource(DecodeGenResourceBase):
         TMEM, so the reload needs no mask or route logic of its own beyond the
         route-uniform proxy addend. Sage attention only changes the exponent
         multipliers, ``c * sfQ * sfK_g`` per scale group, which the
-        ``sage_k_scales`` strategy hands over one fragment at a time; biased
+        ``sage_k_scales`` resource hands over one fragment at a time; biased
         INT32 scores only change the per-group addends.
         """
         cfg = self.cfg
@@ -472,9 +476,9 @@ class SmemPResource(DecodeGenResourceBase):
         # ``c * sfQ`` is one factor per lane and tile. A route kind whose scores
         # come back dequantized from the max pass takes it as its only
         # multiplier and carries no bias; the other kinds fold it into their
-        # strategy's raw ``sfK`` words. In a mixed geometry whose summary
-        # scores are dequantized and whose exact strategy reads the routed
-        # register words, a proxy tile's words are ones and the exact strategy
+        # resource's raw ``sfK`` words. In a mixed geometry whose summary
+        # scores are dequantized and whose exact resource reads the routed
+        # register words, a proxy tile's words are ones and the exact resource
         # serves every tile unchanged; otherwise the kinds are selected per
         # fragment on the CTA-uniform route kind.
         exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
@@ -513,7 +517,7 @@ class SmemPResource(DecodeGenResourceBase):
                 )
             if cutlass.const_expr(mixed_scales and not summary_dequantized):
                 summary_view = self.sage_summary_k_scales.open(
-                    stage_info, sage_scale_arr, exp_scale
+                    stage_info, sage_summary_scale_arr, exp_scale
                 )
             if cutlass.const_expr(unified_scales and cfg.uses_int32_scores):
                 score_bias = Float32(INT32_SCORE_BIAS)
@@ -545,7 +549,7 @@ class SmemPResource(DecodeGenResourceBase):
 
             if cutlass.const_expr(mixed_scales):
                 # The route kind is CTA-uniform; each kind scales the fragment
-                # in place with its own strategy and scale-group geometry, so
+                # in place with its own resource and scale-group geometry, so
                 # nothing but the scores crosses the branch.
                 if route_is_proxy:
                     if cutlass.const_expr(summary_dequantized):
@@ -647,13 +651,13 @@ class SmemPResource(DecodeGenResourceBase):
     @cute.jit
     def _scale_fragment_with(
         self,
-        scales: Constexpr[SageKScales],
+        scales: Constexpr[SageKScalesResource],
         view,
         fragment: Int32,
         s_arr: cutlass.Array,
         exponent_addend: Float32,
     ) -> None:
-        """Turn one fragment's scores into log2 exponents with one route kind's strategy."""
+        """Turn one fragment's scores into log2 exponents with one route kind's resource."""
         groups = scales.groups
         fragment_multipliers = scales.fragment(view, fragment)
         scales.advance(view)
@@ -729,7 +733,7 @@ class SmemPResource(DecodeGenResourceBase):
         """Return one fragment's exponent multipliers and addends per scale group.
 
         Sage attention takes the fragment's ``c * sfQ * sfK_g`` multipliers
-        from the scale strategy (``fragment_multipliers``); without Sage the
+        from the scale resource (``fragment_multipliers``); without Sage the
         single group holds the softmax scale. Every group starts from the
         row's addend; biased INT32 scores subtract ``bias * multiplier`` per
         group, with ``score_bias`` (the row's bias, zero on a tile whose

@@ -2358,7 +2358,7 @@ class FmhaDecodeConfig:
     def sage_mixed_k_geometry(self) -> bool:
         """Whether exact and proxy routes use different scale-group geometries.
 
-        Then the softmax passes hold one ``sfK`` strategy per route kind and
+        Then the softmax passes hold one ``sfK`` resource per route kind and
         select it per tile on the CTA-uniform route kind; with equal block
         sizes every plan runs the single geometry of its exact routes.
         """
@@ -2393,8 +2393,8 @@ class FmhaDecodeConfig:
         keeps its ``sfK`` words in a small buffer of the softmax instance and
         both softmax passes read one fragment's groups with 16-byte loads;
         the larger blocks keep the rotating register array. The two forms are
-        the strategies ``SmemSageKScales`` and ``RegisterSageKScales`` of the
-        scale module; this predicate selects between them. Forcing every
+        the storage forms of ``SageKScalesResource``; this predicate selects
+        between them. Forcing every
         block size onto the SMEM form measured 2% to 4.5% slower on the
         16-token recipes, so both forms stay.
         """

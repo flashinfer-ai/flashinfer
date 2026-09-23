@@ -90,19 +90,15 @@ from .helpers_common import (
     _q_row_is_valid_for_seq,
     _q_row_token_and_local_head,
     _q_group_token_base,
+    _route_is_proxy,
     _softmax_tile_idx,
 )
 from .smem_block_sparse_metadata import (
-    _route_is_proxy,
     _swaps_forwards_packed_route_full,
 )
-from .sage_scales import (
-    SageKScales,
-    dense_k_scale_token,
-    load_k_scale,
-    load_q_scale,
-)
+from .sage_scales import SageKScalesResource, SageScaleTensors, load_q_scale
 from .helpers_kv_tile_idx import (
+    resolve_keeps_tile_context,
     _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
     _num_skipped_kv_tiles,
@@ -254,12 +250,6 @@ class TmemSResource(DecodeGenResourceBase):
         ),
         ("s_arr", cutlass.Array, None, "Loaded S scores for the current tile."),
         (
-            "sage_scale_arr",
-            cutlass.Array,
-            None,
-            "Sage dequantization multipliers for the current tile's fragments.",
-        ),
-        (
             "sage_q_scale",
             Float32,
             Float32(1.0),
@@ -276,10 +266,7 @@ class TmemSResource(DecodeGenResourceBase):
     h_k_idx: Int32 | None = None
     b_idx: Int32 | None = None
     q_group_idx: Int32 | None = None
-    q_scale_ptr: cute.Pointer | None = None
-    q_scale_head_stride: Int32 | None = None
-    k_scale_ptr: cute.Pointer | None = None
-    k_scale_head_stride: Int32 | None = None
+    scale_tensors: SageScaleTensors | None = None
     q_ref: Constexpr[MemoryResource | None] = None
     page_offsets_ref: Constexpr[MemoryResource | None] = None
     _p_local_sum_arr: cutlass.Array | None = None
@@ -292,19 +279,16 @@ class TmemSResource(DecodeGenResourceBase):
     # instance owns the tile; the other reads it through this reference.
     score_seed_owner: Constexpr["TmemSResource | None"] = None
     _seed_alloc: Constexpr[SmemAllocation | None] = None
-    # Where the tile's ``sfK`` words live during the softmax passes (the lane's
-    # register array or the instance's SMEM ring); shared with the P resource
-    # and the route metadata consumer of the same instance. Exact routes and
-    # dense tiles use ``sage_k_scales``; proxy routes use
-    # ``sage_summary_k_scales``, the same object unless the summary scales
-    # have their own K block size.
-    sage_k_scales: Constexpr[SageKScales | None] = None
-    sage_summary_k_scales: Constexpr[SageKScales | None] = None
+    # The instance's ``sfK`` resources (``SageKScalesResource``), read by the
+    # passes one fragment at a time. Exact routes and dense tiles read
+    # ``sage_k_scales``; proxy routes read ``sage_summary_k_scales``, the same
+    # resource unless the summary scales have their own K block size.
+    sage_k_scales: SageKScalesResource | None = None
+    sage_summary_k_scales: SageKScalesResource | None = None
     old_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sum_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     new_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     s_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    sage_scale_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sage_q_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def _init_placeholder_state(self) -> None:
@@ -315,10 +299,6 @@ class TmemSResource(DecodeGenResourceBase):
         self.sum_arr.default = _placeholder_local_array(Float32, num_scale_groups)
         self.new_max_arr.default = _placeholder_local_array(Float32, num_scale_groups)
         self.s_arr.default = _placeholder_local_array(Float32, num_s_regs)
-        self.sage_scale_arr.default = _placeholder_local_array(
-            Float32,
-            1 if self.sage_k_scales is None else self.sage_k_scales.routed_words,
-        )
         self._p_local_sum_arr = _placeholder_local_array(Float32, num_scale_groups)
         self._global_sum_arr = _placeholder_local_array(Float32, num_scale_groups)
         scratch_entries = (
@@ -360,13 +340,6 @@ class TmemSResource(DecodeGenResourceBase):
                 alignment=16,
             )
         allocations = [self._scratch_alloc]
-        if self.sage_k_scales is not None:
-            allocations.extend(self.sage_k_scales.smem_requirements(self.name))
-        if (
-            self.sage_summary_k_scales is not None
-            and self.sage_summary_k_scales is not self.sage_k_scales
-        ):
-            allocations.extend(self.sage_summary_k_scales.smem_requirements(self.name))
         if self.cfg.uses_int32_scores and self.score_seed_owner is None:
             if self._seed_alloc is None:
                 self._seed_alloc = SmemAllocation(
@@ -943,103 +916,14 @@ class TmemSResource(DecodeGenResourceBase):
     @cute.jit
     def _resolve_keeps_tile_context(self, stage_info: StageInfo):
         """Resolve one score tile's logical position and boundary-mask state."""
-        cfg = self.cfg
-        task_cache = _decode_gen_task_cache(stage_info)
-        if cutlass.const_expr(self.seqlens_kv is None):
-            seq_len_kv = Int32(self.max_seq_len_kv)
-        else:
-            seq_len_kv = _load_runtime_seq_len_kv(
-                self.seqlens_kv,
-                self.max_seq_len_kv,
-                stage_info,
-                Int32(0),
-                Int32(0),
-            )
-
-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
-        q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
-        element_mask_end_idx = seq_len_kv
-        if cutlass.const_expr(cfg.uses_uniform_causal_mask):
-            element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
-
-        use_runtime_kv_domain = (
-            self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
-        )
-        local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
-        if cutlass.const_expr(not use_runtime_kv_domain):
-            effective_tile_idx = _static_split_kv_global_tile_idx(
-                cfg, stage_info, local_tile_idx
-            )
-            effective_total_kv_tiles = Int32(cfg.total_kv_tiles)
-            tile_idx = _clamp_valid_tile_idx(cfg, effective_tile_idx)
-            tile_idx = tile_idx + Int32(cfg.static_num_skipped_kv_tiles)
-            window_start_idx = Int32(cfg.static_window_start_idx)
-        elif cutlass.const_expr(cfg.use_paged_kv and not cfg.use_split_kv):
-            effective_tile_idx = (
-                Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tile_idx
-            )
-            effective_total_kv_tiles = Int32(task_cache[_TASK_CACHE_KV_VALID_TILE_END])
-            tile_idx = effective_tile_idx
-            window_start_idx = Int32(task_cache[_TASK_CACHE_KV_WINDOW_START])
-        else:
-            effective_tile_idx = _runtime_split_kv_global_tile_idx(
-                cfg,
-                stage_info,
-                local_tile_idx,
-                seq_len_kv,
-                self.seq_len_q,
-                q_token_base,
-            )
-            effective_total_kv_tiles = _runtime_total_kv_tiles(
-                cfg, seq_len_kv, self.seq_len_q, q_token_base
-            )
-            tile_idx = _runtime_clamp_valid_tile_idx(
-                cfg,
-                effective_tile_idx,
-                seq_len_kv,
-                self.seq_len_q,
-                q_token_base,
-            )
-            tile_idx = tile_idx + _num_skipped_kv_tiles(
-                cfg, seq_len_kv, self.seq_len_q, q_token_base
-            )
-            window_start_idx = _sliding_window_start_idx(
-                cfg, seq_len_kv, self.seq_len_q, q_token_base
-            )
-
-        tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
-        is_valid_effective_tile = effective_tile_idx < effective_total_kv_tiles
-        is_masked_final_wave = False
-        if cutlass.const_expr(not use_runtime_kv_domain and not cfg.use_split_kv):
-            if cutlass.const_expr(cfg.has_odd_kv_tail and self.inst_id == 1):
-                is_masked_final_wave = _is_last_loop_iteration(stage_info)
-        tile_has_valid_scores = (
-            is_valid_effective_tile
-            and (tile_offset_k < seq_len_kv)
-            and not is_masked_final_wave
-        )
-        tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
-            cfg,
-            tile_offset_k,
-            seq_len_kv,
-            self.seq_len_q,
-            q_token_base,
-            tile_has_valid_scores,
-        )
-        # Flattened SQ=1 QToken-KvBlock-Sparse-Attention routes use their compacted causal length as
-        # seq_len_kv. At or above the 2048-token budget this marks all first
-        # sixteen KV128 tiles unmasked; only the optional 0--3-token tail in a
-        # seventeenth tile reaches the boundary-mask specialization.
-        return (
-            seq_len_kv,
-            logical_q_group_idx,
-            element_mask_end_idx,
-            tile_offset_k,
-            window_start_idx,
-            is_valid_effective_tile,
-            is_masked_final_wave,
-            tile_is_unmasked,
-            tile_has_valid_scores,
+        return resolve_keeps_tile_context(
+            self.cfg,
+            stage_info,
+            inst_id=self.inst_id,
+            seqlens_kv=self.seqlens_kv,
+            max_seq_len_kv=self.max_seq_len_kv,
+            seq_len_q=self.seq_len_q,
+            q_group_idx=self.q_group_idx,
         )
 
     @cute.jit
@@ -2366,59 +2250,13 @@ class TmemSResource(DecodeGenResourceBase):
         )
         return load_q_scale(
             cfg,
-            self.q_scale_ptr.toint(),
-            self.q_scale_head_stride,
+            self.scale_tensors.q_scale_ptr.toint(),
+            self.scale_tensors.q_scale_head_stride,
             kv_head_idx=kv_head_idx,
             local_head_idx=local_head_idx,
             batch_idx=batch_idx,
             q_token_idx=q_token_idx,
         )
-
-    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_scale_arr)
-    @cute.jit
-    def load_sage_k_scales(self, stage_info: StageInfo) -> cutlass.Array:
-        """Take the dense tile's ``sfK`` words from ``k_scale`` ahead of the S wait.
-
-        ``dense_k_scale_token`` names each word's first token and the load
-        clamps tokens past the sequence end; the strategy keeps the words in
-        the lane's array or in the instance's SMEM ring and returns the routed
-        ``sage_scale_arr``.
-        """
-        cfg = self.cfg
-        assert cfg.use_sage_attention and not cfg.use_block_sparse
-        (
-            seq_len_kv,
-            _q_group_idx,
-            _element_mask_end_idx,
-            tile_offset_k,
-            _window_start_idx,
-            _is_valid_effective_tile,
-            _is_masked_final_wave,
-            _tile_is_unmasked,
-            _rows_are_active,
-        ) = self._resolve_keeps_tile_context(stage_info)
-        kv_head_idx, batch_idx = _logical_head_batch(
-            stage_info, self.h_k_idx, self.b_idx
-        )
-        k_scale_addr = self.k_scale_ptr.toint()
-
-        def word_value(word_idx: Int32, half: Int32, lane_entry) -> Float32:
-            _ = word_idx
-            return load_k_scale(
-                cfg,
-                k_scale_addr,
-                self.k_scale_head_stride,
-                kv_head_idx=kv_head_idx,
-                batch_idx=batch_idx,
-                seq_len_kv=seq_len_kv,
-                kv_token_idx=dense_k_scale_token(cfg, half, lane_entry, tile_offset_k),
-            )
-
-        words = cutlass.Array(
-            Float32, self.sage_k_scales.routed_words, space=cutlass.AddressSpace.rmem
-        )
-        self.sage_k_scales.load_tile(stage_info, word_value, words)
-        return words
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit
@@ -2432,6 +2270,7 @@ class TmemSResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
         sage_q_scale: Float32,
         sage_scale_arr: cutlass.Array,
+        sage_summary_scale_arr: cutlass.Array,
     ) -> tuple[object, object, object, object]:
         """Consume S with per-group Sage scales and publish the dequantized max."""
 
@@ -2445,6 +2284,7 @@ class TmemSResource(DecodeGenResourceBase):
             use_sparse=False,
             sage_q_scale=sage_q_scale,
             sage_scale_arr=sage_scale_arr,
+            sage_summary_scale_arr=sage_summary_scale_arr,
         )
 
     @consumer_work(
@@ -2558,6 +2398,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word3: Uint32 | None = None,
         sage_q_scale: Float32 | None = None,
         sage_scale_arr: cutlass.Array | None = None,
+        sage_summary_scale_arr: cutlass.Array | None = None,
     ) -> tuple[object, object, object, object]:
         """Mask streamed K32 score fragments in place and reduce their max.
 
@@ -2573,7 +2414,7 @@ class TmemSResource(DecodeGenResourceBase):
         INT32 scores of Int8 Q/K arrive as biased FP32 (see
         ``INT32_SCORE_BIAS``), so both formats
         share this code; the bias leaves with the group maxima. The
-        ``sage_k_scales`` strategy hands each fragment its raw ``sfK`` words
+        ``sage_k_scales`` resource hands each fragment its raw ``sfK`` words
         (from the routed ``sage_scale_arr`` or the instance's SMEM ring), the
         group maxima fold with ``sfK`` alone and ``sfQ`` applies once to the
         tile maximum.
@@ -2796,7 +2637,7 @@ class TmemSResource(DecodeGenResourceBase):
             max_identity = Float32(float("-inf"))
         for chain_idx in cutlass.range_constexpr(4):
             max_chains[chain_idx] = max_identity
-        # The strategy hands each fragment its raw ``sfK`` words; ``sfQ`` is one
+        # The resource hands each fragment its raw ``sfK`` words; ``sfQ`` is one
         # per-lane factor and applies once to the tile maximum below.
         scales_view = None
         summary_view = None
@@ -2804,7 +2645,7 @@ class TmemSResource(DecodeGenResourceBase):
             scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, None)
             if cutlass.const_expr(mixed_scales):
                 summary_view = self.sage_summary_k_scales.open(
-                    stage_info, sage_scale_arr, None
+                    stage_info, sage_summary_scale_arr, None
                 )
 
         if warp_scores_are_unmasked:
@@ -2889,7 +2730,7 @@ class TmemSResource(DecodeGenResourceBase):
             # The masked fragments run as one rolled loop per route kind so
             # their mask, tail shift, fold and write-back exist once per
             # softmax instance and kind; the keep words rotate down each
-            # iteration and the scale strategy advances with them, so no
+            # iteration and the scale resource advances with them, so no
             # runtime selection is needed. A mixed geometry selects the loop
             # at the tile level: a per-fragment selection between the two
             # folds is if-converted into one predicated body, so every exact
@@ -2976,10 +2817,10 @@ class TmemSResource(DecodeGenResourceBase):
     ) -> None:
         """Mask, fold and write back every fragment with one route kind's scales.
 
-        ``proxy_kind`` selects the summary strategy over the exact one and
-        ``scales_view`` is that strategy's opened view; the keep words rotate
+        ``proxy_kind`` selects the summary resource over the exact one and
+        ``scales_view`` is that resource's opened view; the keep words rotate
         down one entry per fragment so the body reads ``keep_words[0]``. The
-        strategy is taken from ``self`` inside the body: a strategy object
+        resource is taken from ``self`` inside the body: a resource object
         held in a local would be flattened as a loop-carried value.
 
         Each K32 fragment is masked in place, its maximum folded and the
@@ -3246,6 +3087,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word3: Uint32,
         sage_q_scale: Float32,
         sage_scale_arr: cutlass.Array,
+        sage_summary_scale_arr: cutlass.Array,
     ) -> tuple[object, object, object, object]:
         """Consume one routed S payload with per-group Sage scales."""
 
@@ -3266,6 +3108,7 @@ class TmemSResource(DecodeGenResourceBase):
             sparse_token_word3=sparse_token_word3,
             sage_q_scale=sage_q_scale,
             sage_scale_arr=sage_scale_arr,
+            sage_summary_scale_arr=sage_summary_scale_arr,
         )
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
