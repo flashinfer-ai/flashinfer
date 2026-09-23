@@ -17,12 +17,38 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import time
 from pathlib import Path
 
 import torch
 import cudnn
 import flashinfer
+
+
+def _source_revision():
+    """Identify the imported checkout, without mistaking a wheel's parent repo for it."""
+    package = Path(flashinfer.__file__).resolve().parent
+    try:
+
+        def git(*args):
+            return (
+                subprocess.check_output(
+                    ["git", "-C", str(package), *args], stderr=subprocess.DEVNULL
+                )
+                .decode()
+                .strip()
+            )
+
+        root = Path(git("rev-parse", "--show-toplevel"))
+        if root / "flashinfer" == package:
+            return dict(
+                commit=git("rev-parse", "HEAD"),
+                dirty=bool(git("status", "--porcelain", "--", ".")),
+            )
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return None
 
 
 def main():
@@ -102,6 +128,8 @@ def main():
         cudnn=cudnn.backend_version(),
         fe_file=cudnn.__file__,
         fi_file=flashinfer.__file__,
+        fi_version=flashinfer.__version__,
+        fi_source=_source_revision(),
         frost_env=os.getenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES"),
         results=[],
     )
@@ -174,6 +202,7 @@ def main():
                 host.append((time.perf_counter_ns() - t0) / 1e3)
             torch.cuda.synchronize()
             row["host_enqueue_us"] = statistics.median(host)
+            row["host_enqueue_samples_us"] = host
             if a.replan:
                 after_plan, complete = [], []
                 for _ in range(100):
@@ -190,6 +219,8 @@ def main():
                 torch.cuda.synchronize()
                 row["run_after_plan_us"] = statistics.median(after_plan)
                 row["plan_run_host_us"] = statistics.median(complete)
+                row["run_after_plan_samples_us"] = after_plan
+                row["plan_run_host_samples_us"] = complete
                 for (bi, qi), ref in zip(samples, references, strict=True):
                     torch.testing.assert_close(
                         out[bi * sq + qi].float(), ref, atol=0.01, rtol=0.01
@@ -199,7 +230,9 @@ def main():
                 for _ in range(20):
                     run()
             # Replay correctness is separate from eager, including poisoned output.
-            if a.replan:
+            # Other backends need graph-mode buffers to keep plan addresses alive.
+            row["replan_before_replay"] = a.replan and backend == "cudnn"
+            if row["replan_before_replay"]:
                 plan()
             out.fill_(float("nan"))
             g.replay()
@@ -237,6 +270,7 @@ def main():
             )
             row.update(
                 graph_gpu_us=statistics.median(ts),
+                graph_gpu_samples_us=ts,
                 status="pass",
                 replay="within_one_ulp",
                 timed_replay="within_one_ulp",

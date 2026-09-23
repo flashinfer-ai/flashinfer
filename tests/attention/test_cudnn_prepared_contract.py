@@ -118,6 +118,54 @@ def test_decode_public_prepared_share_cold_validation(decode_inputs, buffer, fau
                 )
 
 
+@pytest.mark.parametrize("name", ["batch_offsets_q", "batch_offsets_o"])
+@pytest.mark.parametrize("fault", ["shape", "dtype", "device", "values"])
+def test_decode_public_rejects_unsupported_offsets(decode_inputs, name, fault):
+    q, k, v, kwargs = decode_inputs
+    offsets = torch.tensor([0, 32, 64], dtype=torch.int64)
+    error = ValueError
+    if fault == "shape":
+        offsets = offsets.view(3, 1)
+    elif fault == "dtype":
+        offsets = offsets.float()
+    elif fault == "device":
+        offsets = offsets.to("meta")
+    else:
+        offsets[0] = 1
+        error = RuntimeError  # CPU equivalent of the CUDA asynchronous assertion.
+    with pytest.raises(error, match=name):
+        decode.cudnn_batch_decode_with_kv_cache(
+            q, k, v, 0.5, torch.empty(0), max_sequence_kv=8, **kwargs, **{name: offsets}
+        )
+
+
+def test_decode_cubin_preserves_offsets(monkeypatch, decode_inputs):
+    q, k, v, kwargs = decode_inputs
+    monkeypatch.setattr(decode, "CUDNN_AVAILABLE", False)
+    calls = []
+    monkeypatch.setattr(
+        decode,
+        "get_cudnn_fmha_gen_module",
+        lambda: SimpleNamespace(decode=lambda *args: calls.append(args)),
+    )
+    offsets_q = torch.tensor([32, 64, 96], dtype=torch.int64)
+    offsets_o = torch.tensor([64, 96, 128], dtype=torch.int64)
+    decode.cudnn_batch_decode_with_kv_cache(
+        q,
+        k,
+        v,
+        0.5,
+        torch.empty(0),
+        max_sequence_kv=8,
+        **dict(kwargs, return_lse=False, lse=None, sinks=None),
+        batch_offsets_q=offsets_q,
+        batch_offsets_o=offsets_o,
+    )
+    assert len(calls) == 1
+    assert calls[0][10] is offsets_q
+    assert calls[0][11] is offsets_o
+
+
 def test_decode_binding_is_per_call_and_lse_is_base2(monkeypatch, decode_inputs):
     q, k, v, kwargs = decode_inputs
     packs = []

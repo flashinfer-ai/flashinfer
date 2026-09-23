@@ -333,6 +333,40 @@ def _decode_sinks(q, sinks, *, normalize=True):
     return sinks.contiguous().view(1, q.shape[1], 1, 1) if normalize else sinks
 
 
+def _check_dense_decode_offsets(
+    q, out, batch_size, q_len_per_req, offsets_q, offsets_o
+):
+    """Keep legacy dense offsets without silently accepting ragged addressing.
+
+    This is only used by the public API when explicit offsets are supplied.
+    CUDA value checks stay on device, so capture also checks them on replay.
+    """
+    for name, offsets, tensor in (
+        ("batch_offsets_q", offsets_q, q),
+        ("batch_offsets_o", offsets_o, out),
+    ):
+        if offsets is None:
+            continue
+        if (
+            offsets.device != q.device
+            or offsets.dtype not in (torch.int32, torch.int64)
+            or offsets.dim() != 1
+            or offsets.numel() not in (batch_size, batch_size + 1)
+        ):
+            raise ValueError(
+                f"{name} must be an int32 or int64 tensor of shape "
+                f"({batch_size},) or ({batch_size + 1},) on {q.device}"
+            )
+        expected = torch.arange(
+            offsets.numel(), device=offsets.device, dtype=torch.int64
+        ) * (q_len_per_req * tensor.stride(0))
+        torch._assert_async(
+            (offsets == expected).all(),
+            f"{name}: the cuDNN decode path only supports dense offsets "
+            "matching the tensor's batch stride; omit offsets for dense decode",
+        )
+
+
 def _normalize_decode_inputs(
     q,
     k_cache,
@@ -782,9 +816,14 @@ def cudnn_batch_decode_with_kv_cache(
     is_cuda_graph_compatible : bool
         Whether to plan the operation in a CUDA-graph-capture-safe mode.
     batch_offsets_q : Optional[torch.Tensor]
-        Per-request offsets into the query tensor, shape ``(batch_size,)`` on GPU.
+        Per-request element offsets into the query tensor, int32 or int64, shape
+        ``(batch_size,)`` or ``(batch_size + 1,)`` on GPU (optional end offset).
+        The cuDNN graph path accepts only dense offsets matching the query's
+        batch stride. Prefer ``None`` to avoid redundant device-side checks.
     batch_offsets_o : Optional[torch.Tensor]
-        Per-request offsets into the output tensor, shape ``(batch_size,)`` on GPU.
+        Like ``batch_offsets_q``, but for the contiguous output tensor.
+        On the cuDNN graph path, non-dense Q/O offsets trigger an asynchronous
+        device assertion, including if changed before CUDA graph replay.
     batch_offsets_k : Optional[torch.Tensor]
         Per-request offsets into the key tensor, shape ``(batch_size,)`` on GPU.
     batch_offsets_v : Optional[torch.Tensor]
@@ -856,6 +895,15 @@ def cudnn_batch_decode_with_kv_cache(
         q_len_per_req=q_len_per_req,
         sinks=sinks,
     )
+    if CUDNN_AVAILABLE and (batch_offsets_q is not None or batch_offsets_o is not None):
+        _check_dense_decode_offsets(
+            q,
+            inputs.out,
+            inputs.batch_size,
+            q_len_per_req,
+            batch_offsets_q,
+            batch_offsets_o,
+        )
     q, out, lse, sinks_view, bs = (
         inputs.q,
         inputs.out,
