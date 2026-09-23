@@ -17,7 +17,7 @@ Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 pytest \\
         tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \\
-        -m arch_blackwell --confcutdir=tests/moe_ep
+        -m arch_sm10x --confcutdir=tests/moe_ep
 """
 
 from __future__ import annotations
@@ -273,7 +273,7 @@ def _torch_nvfp4_mega_reference(
     return out.sum(dim=1).to(torch.bfloat16)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
     """``preprocess_mega_weights`` fp4 tensors match an independent plain quant."""
     _require_cuda()
@@ -340,7 +340,7 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
         )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     "hidden,intermediate,num_experts,topk,activation_clamp",
     [

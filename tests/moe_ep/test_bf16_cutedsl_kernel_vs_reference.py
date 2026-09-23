@@ -14,7 +14,7 @@ def _require_cuda():
         pytest.skip("BF16 MegaMoE requires sm_100a or sm_103a")
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_bf16_megamoe_public_reference_is_lazy():
     """Keep the CPU import boundary free of the CuTeDSL reference dependency."""
     import flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe as megamoe
@@ -25,7 +25,7 @@ def test_bf16_megamoe_public_reference_is_lazy():
     assert "compute_megamoe_reference_bf16" in megamoe.__all__
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_bf16_kernel_matches_mega_reference(monkeypatch):
     """The public BF16 shim launch matches the independent MegaMoE reference."""
     _require_cuda()

@@ -3265,8 +3265,8 @@ def test_top_k_uint32_pointer_overflow():
 def _require_sm100_or_sm103():
     major, minor = get_compute_capability(torch.device("cuda"))
     cc = major * 10 + minor
-    if cc not in [100, 103]:
-        pytest.skip("topk_clusters_exact requires SM100 or SM103 (Blackwell)")
+    if cc not in [100, 103, 107]:
+        pytest.skip("topk_clusters_exact requires SM100, SM103 or SM107")
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 64])

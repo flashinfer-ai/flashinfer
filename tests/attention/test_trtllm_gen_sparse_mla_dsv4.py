@@ -1283,7 +1283,7 @@ def _inverse_rope_reference(
 
 
 # Cover the fixed 128-head fused schedule across decode shapes, top-k values, and varlen input.
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     ("batch_size", "q_len", "topk", "is_varlen"),
     (

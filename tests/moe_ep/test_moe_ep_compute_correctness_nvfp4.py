@@ -10,7 +10,7 @@ for this dtype path is the single-GPU
 Launch (4 GPU, SM100+):
     torchrun --nproc_per_node=4 -m pytest \\
         tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v -s \\
-        -m "nvep and gpu_4 and arch_blackwell"
+        -m "nvep and gpu_4 and arch_sm10x"
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ def pytest_generate_tests(metafunc):
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_nvfp4_compute_matches_dense_reference(layout):
     import torch
 

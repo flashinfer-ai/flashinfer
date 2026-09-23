@@ -1,7 +1,7 @@
 """Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_sm10x"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
@@ -479,7 +479,7 @@ def _run_mega_layer(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
     """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with on-the-fly bf16→MXFP8 staging."""
     _require_cuda()
@@ -493,7 +493,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with pre-staged MXFP8 activations."""
     _require_cuda()
@@ -507,7 +507,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     """In-flight top-k combine (``in_kernel_fc2_reduce=True``) for MXFP8.
 
@@ -713,7 +713,7 @@ def _run_mega_layer_zero_token_ikr_regression(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regression():
     """Zero-token / in_kernel_fc2_reduce livelock regression guard (MXFP8).
 
@@ -734,7 +734,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regress
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
     """Large-token (>=2048) dispatch-warp token-back for MXFP8.
 
@@ -963,7 +963,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
 def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     """Real cross-rank EP kernel vs the drop's torch global math (see helper doc)."""
@@ -980,7 +980,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
     _require_cuda()
 

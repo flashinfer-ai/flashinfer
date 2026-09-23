@@ -6688,8 +6688,6 @@ def trtllm_batch_context_with_kv_cache(
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
     if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
-        if get_compute_capability(query.device) == (10, 7):
-            raise ValueError("KV Cache NVFP4 is not supported on SM107")
         if kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     key_block_scales, value_block_scales = (

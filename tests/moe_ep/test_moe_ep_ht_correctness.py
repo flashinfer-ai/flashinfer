@@ -209,7 +209,7 @@ def pytest_generate_tests(metafunc):
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_ht_matches_dense_reference(per_rank):
     import torch.distributed as dist
 

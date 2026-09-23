@@ -11,7 +11,7 @@ Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 pytest \\
         tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py -v \\
-        -m arch_blackwell --confcutdir=tests/moe_ep
+        -m arch_sm10x --confcutdir=tests/moe_ep
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ from .mega_oracle_compare import (  # noqa: E402
 )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mxfp8_preprocess_fp8_weights_match_plain_quant():
     """``preprocess_mega_weights`` fp8 tensors match an independent plain quant."""
     _require_cuda()
@@ -183,7 +183,7 @@ def test_mxfp8_preprocess_fp8_weights_match_plain_quant():
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     _require_cuda()
 
@@ -282,7 +282,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
     """Single-rank kernel output matches ``compute_megamoe_reference_mxfp8``."""
     _require_cuda()

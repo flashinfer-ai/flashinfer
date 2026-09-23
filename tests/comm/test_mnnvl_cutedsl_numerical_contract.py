@@ -45,7 +45,7 @@ PROTOCOL_CONFIGS = {
     "bt": BT_ONLY_CONFIG,
     "ht": HT_ONLY_CONFIG,
 }
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_blackwell]
+pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_sm10x]
 
 
 @pytest.fixture(scope="module")

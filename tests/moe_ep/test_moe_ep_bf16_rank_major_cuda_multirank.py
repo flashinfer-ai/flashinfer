@@ -35,7 +35,7 @@ from flashinfer.moe_ep import (
     Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig,
 )
 
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_blackwell]
+pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_sm10x]
 
 _WORLD = 8
 _CAPACITY = 128

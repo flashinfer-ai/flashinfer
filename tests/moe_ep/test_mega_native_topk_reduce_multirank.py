@@ -4,7 +4,7 @@ Run on four exact-SM100a GPUs from the FlashInfer repository root::
 
     torchrun --nproc_per_node=4 -m pytest \
         tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
-        -m "gpu_4 and arch_blackwell"
+        -m "gpu_4 and arch_sm10x"
 
 The non-deferred CuTeDSL terminal reducer is the full-layer reference.  Both
 paths consume the same transformed NVFP4 weights, so this test isolates the
@@ -26,7 +26,7 @@ from .test_moe_ep_nvfp4_cutedsl_mega_multirank import (
 )
 
 
-pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_blackwell]
+pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_sm10x]
 
 _HIDDEN = 4096
 # Terminal-reducer eligibility is independent of the expert intermediate

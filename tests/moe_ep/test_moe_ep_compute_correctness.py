@@ -275,7 +275,7 @@ def pytest_generate_tests(metafunc):
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_compute_matches_dense_reference(layout):
     import torch.distributed as dist
 
@@ -402,7 +402,7 @@ def _run_w4a8_dispatch(layout_str, *, mxfp8_dispatch):
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_w4a8_packed_dispatch_matches_bf16_dispatch(layout):
     import torch
     import torch.distributed as dist

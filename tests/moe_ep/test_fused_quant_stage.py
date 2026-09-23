@@ -11,7 +11,7 @@ Run on one Blackwell GPU from the FlashInfer repo root::
     cd /path/to/flashinfer
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
     CUDA_VISIBLE_DEVICES=0 pytest tests/moe_ep/test_fused_quant_stage.py -v \\
-        -m arch_blackwell --confcutdir=tests/moe_ep
+        -m arch_sm10x --confcutdir=tests/moe_ep
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
         )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("quant_type", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 @pytest.mark.parametrize("num_tokens", [32, 64])  # partial + full capacity
 def test_fused_stage_bit_matches_torch_stage(monkeypatch, quant_type, num_tokens):
@@ -145,7 +145,7 @@ def test_fused_stage_bit_matches_torch_stage(monkeypatch, quant_type, num_tokens
         assert (got[2][num_tokens:] == -1).all()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_fused_stage_launch_cache_tracks_new_data_and_token_count(monkeypatch):
     """Cache-hit relaunch (new data, same ptrs) and cache-rebuild (new n)."""
     import torch
@@ -167,7 +167,7 @@ def test_fused_stage_launch_cache_tracks_new_data_and_token_count(monkeypatch):
         assert torch.equal(ref[2], buffers[2])
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     """dg staging: fused DataPreprocess(mxfp8_e4m3) == per_token_cast_to_fp8.
 
@@ -210,7 +210,7 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     assert torch.equal(ref[3], got[3]), "topk_weights"
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("quant_type", ["nvfp4", "mxfp8_e4m3"])
 def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
     """A zero-token staging must re-mask rows the previous batch left live.
@@ -274,7 +274,7 @@ def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
     assert staged_tokens(idx_out) == 0
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_fused_stage_tail_memo_shrinking_batches(monkeypatch):
     """Tail re-mask memo: shrink/grow sequences must keep [n:] masked."""
     import torch

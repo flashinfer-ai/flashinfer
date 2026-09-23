@@ -44,7 +44,7 @@ TORCHRUN="${TORCHRUN:-torchrun}"
 NPROC_MULTIRANK="${NPROC_MULTIRANK:-4}"
 NPROC_SMOKE="${NPROC_SMOKE:-4}"
 # NOTE: no --confcutdir. The moe_ep pytest hooks (--backend option, nvep/gpu_*/
-# arch_blackwell markers, env/GPU/arch auto-skips) live in the root
+# arch_sm10x markers, env/GPU/arch auto-skips) live in the root
 # tests/conftest.py. Cutting conftest discovery at tests/moe_ep would drop them
 # and break --backend / marker-based selection below.
 MOE_EP_PYTEST_FLAGS=()
@@ -201,7 +201,7 @@ run_split_path_correctness_bf16() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_compute_correctness.py -v \
-    -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
+    -m "nvep and gpu_4 and arch_sm10x" --backend=nccl_ep
 }
 
 run_split_path_correctness_nvfp4() {
@@ -211,7 +211,7 @@ run_split_path_correctness_nvfp4() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v \
-    -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
+    -m "nvep and gpu_4 and arch_sm10x" --backend=nccl_ep
 }
 
 run_split_path_correctness_ht() {
@@ -221,7 +221,7 @@ run_split_path_correctness_ht() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_ht_correctness.py -v \
-    -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
+    -m "nvep and gpu_4 and arch_sm10x" --backend=nccl_ep
 }
 
 # Single-GPU torch-oracle correctness: every compute path (split trtllm
@@ -236,7 +236,7 @@ run_oracle() {
   "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py -v \
-    -m arch_blackwell || rc=1
+    -m arch_sm10x || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
@@ -244,13 +244,13 @@ run_oracle() {
     tests/moe_ep/test_bf16_mxfp8_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
-    -m arch_blackwell || rc=1
+    -m arch_sm10x || rc=1
 
   # CUDA graph capture/replay for the cutedsl mega layer paths (1 GPU).
   MEGA_NO_DIST=1 "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mega_cuda_graph.py -v \
-    -m arch_blackwell || rc=1
+    -m arch_sm10x || rc=1
 
   # deep_gemm's symm buffer needs an initialized process group (no
   # MEGA_NO_DIST equivalent). The test self-bootstraps a 1-rank group under
@@ -258,7 +258,7 @@ run_oracle() {
   "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \
-    -m arch_blackwell || rc=1
+    -m arch_sm10x || rc=1
 
   return "${rc}"
 }
@@ -288,7 +288,7 @@ run_mega() {
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
     tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
-    -m "gpu_4 and arch_blackwell" || rc=1
+    -m "gpu_4 and arch_sm10x" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
@@ -296,7 +296,7 @@ run_mega() {
     tests/moe_ep/test_bf16_mxfp8_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
-    -m arch_blackwell || rc=1
+    -m arch_sm10x || rc=1
 
   return "${rc}"
 }
@@ -321,7 +321,7 @@ for device in range(8):
   "${TORCHRUN}" --standalone --nproc_per_node=8 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py -v \
-    -m "gpu_8 and arch_blackwell"
+    -m "gpu_8 and arch_sm10x"
 }
 
 # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (layer-vs-direct-shim parity on

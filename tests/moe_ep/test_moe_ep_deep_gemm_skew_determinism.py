@@ -18,7 +18,7 @@ gross skew exonerates arrival order and points the hunt at (b).
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest \\
         tests/moe_ep/test_moe_ep_deep_gemm_skew_determinism.py -v \\
-        -m "gpu_4 and arch_blackwell"
+        -m "gpu_4 and arch_sm10x"
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def _build_layer(rank: int, world_size: int):
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_deep_gemm_mega_repeated_forward_bitexact_under_skew():
     pytest.importorskip("deep_gemm")
     pytest.importorskip("triton")
@@ -126,7 +126,7 @@ def test_deep_gemm_mega_repeated_forward_bitexact_under_skew():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_deep_gemm_mega_bitexact_across_input_addresses():
     """Same input BYTES at different base addresses/alignments must match.
 

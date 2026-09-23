@@ -182,7 +182,7 @@ def _assert_two_layers_share_one_symm_buffer(
         layer2.destroy()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
     """Two same-geometry layers: one buffer, one compile, correct numerics."""
     import torch
@@ -256,7 +256,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
 
 
 @cuda_13_required
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
     """Two same-geometry mixed layers share a workspace through destroy."""
     import torch
