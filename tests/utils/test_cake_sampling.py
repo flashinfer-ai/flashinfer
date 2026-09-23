@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pytest
+import subprocess
 import torch
 
 from flashinfer.cake_sampling import (
@@ -36,9 +37,12 @@ from flashinfer.cake_sampling import (
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
+import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
     load_manifest,
+    parse_gpu_arch_list,
+    supported_capabilities,
     supported_capability,
 )
 
@@ -496,6 +500,118 @@ def test_per_request_tensors_and_routes():
     assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)
+
+
+# --------------------------------------------------------------------------- toolkit guard
+
+_TABLE = ((9, 0), (10, 0), (10, 3), (10, 7), (11, 0))
+# `nvcc --list-gpu-arch` of CUDA 13.3 (public toolkit): no compute_107.
+_CUDA_13_3_ARCH_LIST = (
+    "compute_75\ncompute_80\ncompute_86\ncompute_87\ncompute_88\ncompute_89\ncompute_90\n"
+    "compute_100\ncompute_110\ncompute_103\ncompute_120\ncompute_121\n"
+)
+
+
+def test_toolkit_guard_parses_nvcc_arch_list():
+    archs = parse_gpu_arch_list(_CUDA_13_3_ARCH_LIST)
+    assert {"compute_90", "compute_100", "compute_103", "compute_110"} <= archs
+    assert "compute_107" not in archs
+    # Suffixed spellings collapse onto the base virtual architecture.
+    assert parse_gpu_arch_list("compute_90a compute_100f") == {
+        "compute_90",
+        "compute_100",
+    }
+    assert parse_gpu_arch_list("") == frozenset()
+    assert parse_gpu_arch_list("sm_90a\nnot-an-arch") == frozenset()
+
+
+def test_toolkit_guard_rejects_capabilities_nvcc_cannot_target(monkeypatch):
+    archs = parse_gpu_arch_list(_CUDA_13_3_ARCH_LIST)
+    monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: archs)
+    assert supported_capability((9, 0)) == (9, 0)
+    assert supported_capability((10, 0)) == (10, 0)
+    assert supported_capability((10, 3)) == (10, 3)
+    assert supported_capability((11, 0)) == (11, 0)
+    # compute_107 is only known to the internal Rubin toolchain: a public toolkit must not
+    # attempt the JIT build for an SM107 device.
+    assert supported_capability((10, 7)) is None
+    assert (
+        supported_capability((8, 0)) is None and supported_capability((12, 0)) is None
+    )
+    assert supported_capabilities() == ((9, 0), (10, 0), (10, 3), (11, 0))
+    with pytest.raises(ValueError, match="not compiled for compute capability 10.7"):
+        cake_sampling_jit.gen_cake_sampling_module((10, 7))
+
+    hopper_only = frozenset({"compute_80", "compute_90"})
+    monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: hopper_only)
+    assert supported_capability((9, 0)) == (9, 0)
+    assert all(supported_capability(cap) is None for cap in _TABLE[1:])
+    assert supported_capabilities() == ((9, 0),)
+
+
+def test_toolkit_guard_keeps_table_when_nvcc_cannot_be_queried(monkeypatch):
+    monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: None)
+    assert all(supported_capability(cap) == cap for cap in _TABLE)
+    assert supported_capabilities() == _TABLE
+    assert supported_capability((8, 9)) is None
+
+
+def test_toolkit_guard_queries_nvcc_once(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        assert cmd[-1] == "--list-gpu-arch"
+        return subprocess.CompletedProcess(cmd, 0, _CUDA_13_3_ARCH_LIST, "")
+
+    monkeypatch.setattr(cake_sampling_jit.subprocess, "run", fake_run)
+    monkeypatch.setattr(cake_sampling_jit, "_nvcc_executable", lambda: "nvcc")
+    cake_sampling_jit._nvcc_gpu_archs.cache_clear()
+    try:
+        for _ in range(3):
+            assert supported_capability((10, 7)) is None
+            assert supported_capability((10, 3)) == (10, 3)
+        assert len(calls) == 1
+        monkeypatch.setattr(
+            cake_sampling_jit.subprocess,
+            "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "unknown option"),
+        )
+        cake_sampling_jit._nvcc_gpu_archs.cache_clear()
+        assert cake_sampling_jit._nvcc_gpu_archs() is None
+    finally:
+        cake_sampling_jit._nvcc_gpu_archs.cache_clear()
+
+
+def test_toolkit_guard_routes_untargetable_device_to_top_k_first(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs as reference
+
+    batch, vocab = 5, 32768
+    probs = _probs(batch, vocab)
+    expected = reference(
+        probs,
+        50,
+        0.9,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        seed=7,
+        offset=8,
+    )
+    monkeypatch.setattr(
+        cake_sampling_jit, "_nvcc_gpu_archs", lambda: frozenset({"compute_50"})
+    )
+    assert supported_capability(torch.cuda.get_device_capability()) is None
+    assert cake_sampling_route(probs, 50) == "fallback:arch"
+    got = top_k_top_p_sampling_from_probs(
+        probs, 50, 0.9, philox_seed=7, philox_offset=8
+    )
+    assert got.dtype == torch.int32 and torch.equal(got.to(expected.dtype), expected)
+    with pytest.raises(ValueError, match="fallback:arch"):
+        top_k_top_p_sampling_from_probs(
+            probs, 50, 0.9, renorm_out=torch.empty(batch, SLAB, device="cuda")
+        )
 
 
 # --------------------------------------------------------------------------- adversarial

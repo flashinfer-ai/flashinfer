@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import os
 import re
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,6 +36,7 @@ from .core import (
     sm107a_nvcc_flags,
     sm110a_nvcc_flags,
 )
+from .cpp_ext import get_cuda_path
 from .utils import write_if_different
 
 _GENERATED_DIR = "generated"
@@ -91,14 +94,86 @@ def _get_include_dir() -> Path:
     raise FileNotFoundError("FlashInfer headers were not found")
 
 
+def _nvcc_executable() -> str:
+    override = os.environ.get("FLASHINFER_NVCC", "")
+    if override and "$" not in override:
+        return override
+    return os.path.join(get_cuda_path(), "bin", "nvcc")
+
+
+def parse_gpu_arch_list(text: str) -> frozenset[str]:
+    """Virtual architectures named in ``nvcc --list-gpu-arch`` output, without feature suffixes.
+
+    nvcc lists the base virtual architectures only (``compute_90``, ``compute_100``, ...); the
+    ``a`` / ``f`` variants used by the flag table are available whenever the base is.
+    """
+    return frozenset(
+        f"compute_{m}" for m in re.findall(r"\bcompute_([0-9]+)[a-z]?\b", text)
+    )
+
+
+@functools.cache
+def _nvcc_gpu_archs() -> Optional[frozenset[str]]:
+    """Virtual architectures the installed nvcc can target, or ``None`` when nvcc cannot be asked.
+
+    Queried once per process.  ``None`` (no nvcc, or a query failure) leaves the capability
+    table untouched: a toolkit that cannot be inspected is not evidence that it lacks a target,
+    and prebuilt JIT-cache modules must stay loadable without a compiler.
+    """
+    try:
+        proc = subprocess.run(
+            [_nvcc_executable(), "--list-gpu-arch"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        logger.debug("radix sampling: nvcc --list-gpu-arch unavailable (%s)", error)
+        return None
+    if proc.returncode != 0:
+        logger.debug(
+            "radix sampling: nvcc --list-gpu-arch failed (%d): %s",
+            proc.returncode,
+            proc.stderr.strip(),
+        )
+        return None
+    archs = parse_gpu_arch_list(proc.stdout)
+    return archs if archs else None
+
+
+def _required_virtual_arch(flags: list[str]) -> str:
+    """Base virtual architecture (``compute_<major><minor>``) of a flag table entry."""
+    for flag in flags:
+        match = re.search(r"arch=compute_([0-9]+)[a-z]?(?:,|$)", flag)
+        if match:
+            return f"compute_{match.group(1)}"
+    raise RuntimeError(f"radix sampling flag table entry has no -gencode arch: {flags}")
+
+
+def _toolkit_can_target(key: tuple[int, int]) -> bool:
+    archs = _nvcc_gpu_archs()
+    if archs is None:
+        return True
+    return _required_virtual_arch(_CAPABILITY_FLAGS[key]) in archs
+
+
 def supported_capability(capability: tuple[int, int]) -> Optional[tuple[int, int]]:
-    """Return ``(major, minor)`` when the frozen kernels are compiled for it, else ``None``."""
+    """Return ``(major, minor)`` when the frozen kernels can be built for it, else ``None``.
+
+    A capability is supported when it has an entry in the flag table **and** the installed
+    nvcc lists that entry's virtual architecture in ``nvcc --list-gpu-arch`` (``compute_107``
+    for 10.7, for example); a device the toolkit cannot target therefore takes the
+    ``top_k_first`` fallback instead of failing the JIT build.
+    """
     key = (int(capability[0]), int(capability[1]))
-    return key if key in _CAPABILITY_FLAGS else None
+    if key not in _CAPABILITY_FLAGS or not _toolkit_can_target(key):
+        return None
+    return key
 
 
 def supported_capabilities() -> tuple[tuple[int, int], ...]:
-    return tuple(sorted(_CAPABILITY_FLAGS))
+    """Capabilities in the flag table that the installed nvcc can target."""
+    return tuple(sorted(key for key in _CAPABILITY_FLAGS if _toolkit_can_target(key)))
 
 
 def _reject_duplicate_keys(pairs):
