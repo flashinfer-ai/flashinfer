@@ -73,6 +73,8 @@ output_column_dict = {
         "refcheck_passed",
         "fp4_mode",
         "cold_l2_cache",
+        "prequantized_median_time",
+        "prequantized_std_time",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",

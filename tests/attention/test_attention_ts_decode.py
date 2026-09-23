@@ -88,7 +88,6 @@ from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
     make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_q_token_kv_block_sparse_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
-    prims_ts_batch_decode_with_kv_cache,
     suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size as validate_prims_ts_q_token_kv_block_sparse_group_size,
 )
@@ -1687,6 +1686,7 @@ def _run_standalone(
     block_table: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
     storage_page_size: Optional[int] = None,
+    validate: bool = True,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -1705,6 +1705,7 @@ def _run_standalone(
             max_seq_len_q=max_seq_len_q,
             q_dtype=case.q.dtype,
             k_dtype=case.k_cache.dtype,
+            v_dtype=case.v_cache.dtype,
             out_dtype=case.output_dtype,
             mask_type=case.mask_type,
             window_left=case.window_left,
@@ -1718,13 +1719,13 @@ def _run_standalone(
     output = torch.empty_like(case.q, dtype=case.output_dtype) if out is None else out
     if block_table is None:
         block_table = case.block_tables
-    result = prims_ts_batch_decode_with_kv_cache(
+    result = batch_decode_with_paged_kv_cache(
         case.q,
         case.paged_kv_cache,
-        workspace,
         block_table,
         seq_lens,
-        max_kv_len,
+        workspace_buffer=workspace,
+        max_kv_len=max_kv_len,
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
@@ -1736,6 +1737,7 @@ def _run_standalone(
         window_left=case.window_left,
         kv_layout="HND",
         page_size=page_size,
+        validate=validate,
     )
     assert result is output
     return output
@@ -2484,13 +2486,13 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
     with pytest.raises(
         NotImplementedError, match=r"padded FMHA decode K/V coordinates"
     ):
-        prims_ts_batch_decode_with_kv_cache(
+        batch_decode_with_paged_kv_cache(
             q,
             kv_cache,
-            torch.empty(1, dtype=torch.uint8, device=device),
             block_tables,
             seq_lens,
-            unsafe_max,
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device=device),
+            max_kv_len=unsafe_max,
         )
 
     with pytest.raises(
@@ -2543,7 +2545,6 @@ _DECODE_PUBLIC_SURFACES = (
     BatchDecodePagedTSWrapper.run,
     batch_decode_with_paged_kv_cache,
     get_prims_ts_batch_decode_workspace_size,
-    prims_ts_batch_decode_with_kv_cache,
 )
 
 
@@ -2568,6 +2569,9 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "out_dtype",
         "page_size",
         "split_kv",
+        "workspace_buffer",
+        "max_kv_len",
+        "validate",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -2595,6 +2599,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "storage_page_size",
         "split_kv",
+        "validate",
+        "initialize_workspace",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -3194,13 +3200,13 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
         case.paged_kv_indices,
         min_num_pages=(2051 + 3) // 4,
     )
-    result = prims_ts_batch_decode_with_kv_cache(
+    result = batch_decode_with_paged_kv_cache(
         case.q,
         packed_cache,
-        workspace,
         block_table,
         seq_lens,
-        2051,
+        workspace_buffer=workspace,
+        max_kv_len=2051,
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
         out=output,
@@ -3669,16 +3675,18 @@ def test_attention_ts_decode_page4_inert_block_table_row_is_zero() -> None:
         min_num_pages=(max_seq_len + semantic_page_size - 1) // semantic_page_size,
     )
 
-    prims_ts_batch_decode_with_kv_cache(
+    batch_decode_with_paged_kv_cache(
         q,
         (k_cache, v_cache),
-        workspace,
         block_table,
         seq_lens,
-        max_seq_len,
+        workspace_buffer=workspace,
+        max_kv_len=max_seq_len,
         out=output,
         mask_type="causal",
         page_size=semantic_page_size,
+        # The kernel's inert padding locator is outside the validated page-ID contract.
+        validate=False,
     )
 
     expected_active = v_cache[0, :, 0].repeat_interleave(
@@ -4411,6 +4419,52 @@ def test_attention_ts_decode_mixed_precision(
     )
     _assert_case_correct(one_shot, case)
 
+    # The unified API also serves caller-owned scratch and trusted graph calls.
+    seq_lens = _seq_lens_from_csr(
+        case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
+    )
+    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        seq_len_kv,
+        seq_len_q=seq_len_q,
+        q_dtype=q_dtype,
+        k_dtype=kv_dtype,
+        v_dtype=kv_dtype,
+        out_dtype=output_dtype,
+        device=case.q.device,
+    )
+    workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=case.q.device)
+    explicit_out = torch.empty_like(case.q, dtype=output_dtype)
+
+    def run_with_workspace(validate):
+        return batch_decode_with_paged_kv_cache(
+            case.q,
+            case.paged_kv_cache,
+            case.block_tables,
+            seq_lens,
+            kv_scale_factors=kv_scale_factors,
+            seq_len_q=seq_len_q,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            out=explicit_out,
+            workspace_buffer=workspace,
+            max_kv_len=seq_len_kv,
+            validate=validate,
+        )
+
+    for validate in (True, False):
+        assert run_with_workspace(validate) is explicit_out
+        _assert_case_correct(explicit_out, case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_with_workspace(False)
+    graph.replay()
+    _assert_case_correct(explicit_out, case)
+
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
@@ -4572,6 +4626,86 @@ def test_attention_ts_decode_runtime_kv_ceil_div_covers_int32_domain() -> None:
         )
 
 
+@pytest.mark.parametrize("split_kv", (False, True))
+@pytest.mark.parametrize("workspace_mode", ("owned", "validated", "trusted"))
+@pytest.mark.parametrize(
+    ("k_dtype", "v_dtype"),
+    (
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, _FP8),
+        (_FP8, _FP8),
+        (torch.uint8, torch.uint8),
+    ),
+)
+def test_attention_ts_decode_one_shot_forwards_split_kv(
+    monkeypatch, split_kv, workspace_mode, k_dtype, v_dtype
+):
+    """Workspace sizing and planning must share the split policy and K/V dtypes."""
+
+    from unittest.mock import Mock
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    q = torch.empty((1, 8, 64), dtype=torch.bfloat16)
+    storage_head_dim = 32 if k_dtype == torch.uint8 else 64
+    cache = torch.empty((1, 1, 32, storage_head_dim), dtype=k_dtype)
+    kv_scale_factors = (
+        (torch.empty((1, 1, 32, 4), dtype=_FP8),) * 2
+        if k_dtype == torch.uint8
+        else None
+    )
+    v_cache = torch.empty_like(cache, dtype=v_dtype)
+    seq_lens = torch.tensor([32], dtype=torch.int32)
+    block_tables = torch.zeros((1, 1), dtype=torch.int32)
+    workspace = torch.empty(128, dtype=torch.int8)
+    wrapper = Mock()
+    workspace_size = Mock(return_value=workspace.numel())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        decode_module, "BatchDecodePagedTSWrapper", Mock(return_value=wrapper)
+    )
+    monkeypatch.setattr(
+        decode_module, "get_prims_ts_batch_decode_workspace_size", workspace_size
+    )
+    monkeypatch.setattr(
+        decode_module, "_validate_block_table_metadata", lambda *_: (q.device, 1, 1)
+    )
+    monkeypatch.setattr(decode_module, "_validate_q", lambda *_, **__: None)
+    monkeypatch.setattr(
+        decode_module,
+        "_normalize_paged_kv_cache_views",
+        lambda *_, **__: (cache, v_cache, 1, 1, 32, 64),
+    )
+
+    output = batch_decode_with_paged_kv_cache(
+        q,
+        (cache, v_cache),
+        block_tables,
+        seq_lens,
+        split_kv=split_kv,
+        kv_scale_factors=kv_scale_factors,
+        workspace_buffer=None if workspace_mode == "owned" else workspace,
+        max_kv_len=32,
+        validate=workspace_mode != "trusted",
+    )
+
+    assert output is wrapper.run.return_value
+    wrapper.plan.assert_called_once()
+    assert wrapper.plan.call_args.args[4] == 64
+    assert wrapper.run.call_args.kwargs["kv_scale_factors"] is kv_scale_factors
+    assert wrapper.plan.call_args.kwargs["split_kv"] is split_kv
+    assert wrapper.plan.call_args.kwargs["k_data_type"] is cache.dtype
+    assert wrapper.plan.call_args.kwargs["v_data_type"] is v_dtype
+    if workspace_mode == "owned":
+        workspace_size.assert_called_once()
+        assert workspace_size.call_args.kwargs["split_kv"] is split_kv
+        assert workspace_size.call_args.kwargs["k_dtype"] is cache.dtype
+        assert workspace_size.call_args.kwargs["v_dtype"] is v_dtype
+    else:
+        workspace_size.assert_not_called()
+        assert wrapper.plan.call_args.kwargs["workspace_buffer"] is workspace
+
+
 def test_attention_ts_decode_run_requires_plan():
     wrapper = BatchDecodePagedTSWrapper()
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
@@ -4590,6 +4724,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_TrustedDecodePlanState",
         (),
         {
+            "output_dtype": torch.bfloat16,
             "use_packed_q": False,
             "workspace": object(),
             "compiled_main": object(),
@@ -4688,8 +4823,10 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         wrapper.run(*args, qo_indptr=object())
 
 
+@pytest.mark.parametrize("validate", (True, False))
 def test_attention_ts_decode_failed_replan_preserves_published_state(
     monkeypatch: pytest.MonkeyPatch,
+    validate: bool,
 ) -> None:
     """A failed compile cannot tear down the previous complete revision."""
 
@@ -4707,10 +4844,21 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     )()
     wrapper._plan_state = previous_state
     fake_spec = type("_DecodeLaunchSpec", (), {"config": object()})()
+    device_calls = []
+
+    def resolve_device(device):
+        device_calls.append("resolve")
+        return torch.device("cuda:0"), 0
+
     monkeypatch.setattr(
         decode_module,
         "_resolve_cuda_device",
-        lambda _device: (torch.device("cuda:0"), 0),
+        resolve_device,
+    )
+    monkeypatch.setattr(
+        decode_module,
+        "_validate_runtime_device",
+        lambda _device: device_calls.append("validate"),
     )
     monkeypatch.setattr(
         decode_module,
@@ -4729,7 +4877,8 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     )
 
     with pytest.raises(RuntimeError, match="synthetic compile failure"):
-        wrapper.plan(torch.device("cuda:0"), 1, 8, 1, 64, 16, 128)
+        wrapper.plan(torch.device("cuda:0"), 1, 8, 1, 64, 16, 128, validate=validate)
+    assert device_calls == (["resolve", "validate"] if validate else ["resolve"])
     assert wrapper._plan_state is previous_state
     assert wrapper._plan_state.planned_seq_lens_device is previous_seq_lens
 
@@ -4872,6 +5021,7 @@ def test_attention_ts_decode_planned_full_dynamic_uses_owned_seq_lens(
         "_PlannedFullDynamicDecodePlanState",
         (),
         {
+            "output_dtype": torch.bfloat16,
             "use_packed_q": False,
             "workspace": object(),
             "compiled_main": object(),
@@ -4933,12 +5083,19 @@ def test_attention_ts_decode_plan_owned_validation_uses_host_seq_lens() -> None:
         (),
         {
             "num_physical_pages": 1,
+            "k_cache": torch.empty((1, 1, 16, 64)),
             "q": torch.empty((1, 8, 64)),
         },
     )()
     _validate_decode_run_metadata_values(
-        state,
         runtime,
+        planned_seq_lens_host=state.planned_seq_lens_host,
+        max_kv_len=state.max_kv_len,
+        page_size=state.page_size,
+        use_packed_q=state.use_packed_q,
+        seq_len_q=state.seq_len_q,
+        batch_size=state.batch_size,
+        mask_type=state.mask_type,
         seq_lens=cast(torch.Tensor, _NoDeviceReadback()),
         block_tables=torch.tensor(((0,),), dtype=torch.int32),
         qo_indptr=None,
@@ -5094,7 +5251,11 @@ def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None
 @pytest.mark.parametrize(
     ("seq_lens", "table_values", "message"),
     (
-        ((0, 1), ((0, -101), (1, -102)), "values must be positive"),
+        (
+            (0, 1),
+            ((0, -101), (1, -102)),
+            r"plan seq_lens values must be within \[1, 1\]; request 0 has 0",
+        ),
         ((65, 1), ((0, 1), (2, -102)), "does not have enough columns"),
         ((1, 1), ((0, -101), (8, -102)), "must index the physical K/V cache"),
     ),
@@ -5107,7 +5268,7 @@ def test_attention_ts_decode_one_shot_rejects_malformed_fixed_metadata(
     table_values,
     message,
 ) -> None:
-    """The one-shot surface validates fixed-table values before planning."""
+    """The one-shot surface validates fixed-table values through its wrapper."""
 
     device = torch.device("cuda")
     q = torch.empty((2, 8, 64), dtype=torch.float16, device=device)
@@ -5130,7 +5291,7 @@ def test_attention_ts_decode_one_shot_rejects_graph_capture(
 
     device = torch.device("cuda")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="cannot derive host plan bounds"):
+    with pytest.raises(RuntimeError, match="CUDA graph capture requires"):
         batch_decode_with_paged_kv_cache(
             torch.empty((1, 8, 64), dtype=torch.float16, device=device),
             torch.empty((1, 2, 1, 32, 64), dtype=torch.float16, device=device),
@@ -5198,7 +5359,46 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
         )
 
 
-def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypatch):
+@pytest.mark.parametrize(
+    "device,expected",
+    [
+        (None, "cuda:3"),
+        (2, "cuda:2"),
+        ("cuda", "cuda:3"),
+        ("cuda:1", "cuda:1"),
+        (torch.device("cuda:0"), "cuda:0"),
+        ("cpu", "cpu:0"),
+    ],
+)
+def test_attention_ts_decode_device_resolution_does_not_validate(
+    monkeypatch, device, expected
+):
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    def unexpected_validation(*_args, **_kwargs):
+        pytest.fail("device resolution must not check runtime CUDA support")
+
+    monkeypatch.setattr(
+        decode_module, "_validate_runtime_device", unexpected_validation
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_validation)
+    resolved, device_index = decode_module._resolve_cuda_device(device)
+    assert resolved == torch.device(expected)
+    assert device_index == resolved.index
+
+
+@pytest.mark.parametrize(
+    "device,error,message",
+    [
+        ("cuda:0", NotImplementedError, r"requires an SM100a/B200.*GPU.*\(9, 0\)"),
+        ("cpu", ValueError, "must be CUDA tensors"),
+    ],
+)
+def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(
+    monkeypatch, device, error, message
+):
     """Both public decode workspace APIs enforce the shared architecture guard."""
 
     from contextlib import nullcontext
@@ -5217,7 +5417,7 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypat
             head_dim=128,
             page_size=32,
             max_seq_len=128,
-            device="cuda:0",
+            device=device,
         ),
         lambda: get_prims_ts_batch_mla_decode_workspace_size(
             batch_size=1,
@@ -5226,14 +5426,11 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypat
             qk_rope_head_dim=64,
             page_size=32,
             max_seq_len=128,
-            device="cuda:0",
+            device=device,
         ),
     )
     for query in workspace_queries:
-        with pytest.raises(
-            NotImplementedError,
-            match=r"requires an SM100a/B200.*GPU.*\(9, 0\)",
-        ):
+        with pytest.raises(error, match=message):
             query()
 
 
@@ -6550,7 +6747,7 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     _resolve_decode_launch_spec.cache_clear()
     _get_compiled_decode.cache_clear()
     try:
-        _exercise_auto_case(case)
+        _exercise_auto_case(case, exercise_all_paths=True)
     finally:
         _resolve_decode_launch_spec.cache_clear()
         _get_compiled_decode.cache_clear()
@@ -6982,6 +7179,7 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
             out=graph_out,
             workspace_buffer=workspace,
             block_table=block_table,
+            validate=False,
         )
     assert captured is graph_out
     graph_out.fill_(float("nan"))
