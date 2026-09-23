@@ -1003,8 +1003,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             no RoPE/ALiBi/soft-cap).
             The ``cudnn`` backend runs cuDNN's paged SDPA decode graph
             (:func:`flashinfer.decode.cudnn_batch_decode_with_kv_cache`). It supports
-            fp16/bf16 q/kv/o of one dtype, GQA, ``return_lse`` and CUDA graphs, but not
-            ``q_len_per_req > 1``, RoPE, soft-cap, sliding window, sinks, fp8 or NVFP4 KV.
+            fp16/bf16 q/kv/o of one dtype, GQA, ``return_lse``, CUDA graphs,
+            multi-token decode (``q_len_per_req > 1``, bottom-right causal), a left
+            sliding window (``window_left``) and attention ``sinks``, but not RoPE,
+            soft-cap, fp8 or NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when
+            the cuDNN stack's SDPA engines accept it (cudnn-frontend 1.30+ with the
+            FROST engines enabled); the backend engine raises a not-supported error
+            at the first run.
             Pass a fixed ``block_tables`` to :meth:`plan` when capturing CUDA graphs so
             the captured block-table buffer is stable across re-plans.
 
@@ -1301,7 +1306,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
         if q_len_per_req > 1:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1622,10 +1627,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
-            if not self.use_tensor_cores:
+            if not self.use_tensor_cores and self._backend != "cudnn":
                 raise ValueError(
                     "q_len_per_req > 1 requires tensor-core decode "
-                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl backend)."
+                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl/cudnn backend)."
                 )
             qo_indptr_host = qo_indptr_host * q_len_per_req
         if self.is_cuda_graph_enabled:
@@ -1709,7 +1714,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
         if q_len_per_req > 1 and is_causal:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1821,7 +1826,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"cute-dsl decode backend does not support "
                     f"pos_encoding_mode={pos_encoding_mode!r}"
                 )
-            self._max_kv_len = int(max(kv_lens_arr_host).item())
+            self._max_kv_len = int(kv_lens_arr_host.max().item())
             kv_splits = None
             if fixed_split_size > 0:
                 fixed_split_len = fixed_split_size * page_size
@@ -1859,7 +1864,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
             # Allocated once per plan and reused across run() launches. The
             # trtllm-gen kernel self-resets the counters at the end of each
             # launch, so no per-launch re-zeroing is needed.
@@ -1913,7 +1918,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             self._plan_info = self._cached_module.plan()  # None
         elif self.use_tensor_cores:
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
@@ -2047,16 +2052,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise NotImplementedError(
                 "cudnn decode backend does not apply position encoding "
                 f"(pos_encoding_mode must be 'NONE'); got {pos_encoding_mode!r}."
-            )
-        if window_left >= 0:
-            raise NotImplementedError(
-                "cudnn decode backend does not support sliding window "
-                f"(window_left={window_left})."
-            )
-        if q_len_per_req > 1:
-            raise NotImplementedError(
-                "cudnn decode backend supports q_len_per_req == 1 only "
-                f"(got {q_len_per_req})."
             )
         if q_data_type not in (torch.float16, torch.bfloat16) or not (
             q_data_type == kv_data_type == o_data_type
@@ -2386,14 +2381,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
             q_len_per_req = q.size(0) // actual_batch_size
 
-        if not self.use_tensor_cores and q_len_per_req > 1:
+        if not self.use_tensor_cores and self._backend != "cudnn" and q_len_per_req > 1:
             raise ValueError(
                 f"q implies q_len_per_req={q_len_per_req}, but the "
                 "non-tensor-core decode kernel only supports q_len_per_req=1."
             )
         planned_q_len = getattr(self, "_q_len_per_req", 1) or 1
         if (
-            self.use_tensor_cores
+            (self.use_tensor_cores or self._backend == "cudnn")
             and self._backend not in ("trtllm-gen", "cute-dsl")
             and q_len_per_req != planned_q_len
         ):
@@ -2573,10 +2568,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         if self._backend == "cudnn":
-            if sinks is not None:
-                raise NotImplementedError(
-                    "cudnn decode backend does not support attention sinks."
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support NVFP4 KV cache."
@@ -2584,11 +2575,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if skip_softmax_threshold_scale_factor is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support skip-softmax."
-                )
-            if q.shape[0] != actual_batch_size:
-                raise NotImplementedError(
-                    "cudnn decode backend requires q_len_per_req == 1 "
-                    f"(got q.shape[0]={q.shape[0]}, batch_size={actual_batch_size})."
                 )
             if v_cache.dtype != self._cached_kv_data_type:
                 raise ValueError(
@@ -2616,6 +2602,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
+                # q has batch * q_len_per_req consecutive rows per request; the
+                # graph applies the bottom-right causal diagonal for q_len > 1,
+                # the left window bound and the per-head sink logits.
+                q_len_per_req=q_len_per_req,
+                window_left=window_left,
+                sinks=sinks,
             )
         elif self.use_tensor_cores:
             run_args = [self._float_workspace_buffer]
@@ -3007,6 +2999,7 @@ class TrtllmGenDecodeModule:
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
@@ -4001,11 +3994,17 @@ def trtllm_batch_decode_with_kv_cache(
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
-            lse_stride_tokens,
-            lse_stride_heads,
-            enable_block_sparse_attention,
-            None,  # sparse_mla_top_k_lens
         ]
+        if backend != "cake":
+            run_args.append(1.0)  # lse_scale
+        run_args.extend(
+            [
+                lse_stride_tokens,
+                lse_stride_heads,
+                enable_block_sparse_attention,
+                None,  # sparse_mla_top_k_lens
+            ]
+        )
         if backend != "cake":
             run_args.extend(
                 (

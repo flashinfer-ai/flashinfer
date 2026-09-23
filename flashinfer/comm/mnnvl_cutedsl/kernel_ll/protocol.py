@@ -88,6 +88,32 @@ LL_ALL_REDUCE_GB300_TP16_H8192_M_GE_18 = LLAllReduceTuning(
 LL_ALL_REDUCE_GB300_TP8_H8192 = LL_ALL_REDUCE_GB300_TP8_H8192_M_GE_5
 LL_ALL_REDUCE_GB300_TP16_H8192 = LL_ALL_REDUCE_GB300_TP16_H8192_M_LE_10
 
+# hidden_size=5120, bf16. Tuning presets carry launch
+# knobs only -- hidden_size/top_k reach the kernels through StaticProfile -- so
+# these differ from the H8192 presets purely in knobs picked for a 640-vector
+# token. cluster_size 5 makes fragment_stride (cluster_size * threads / rank
+# lanes) exactly 640, so the Lamport RMSNorm covers one token in a single fully
+# utilised trip; the H8192 cluster_size of 8 leaves 37% of the lanes idle here.
+# prefetch_group is sized to top_k so the staged rmem tensor holds no unused
+# slots (the gather loop is const_expr-predicated on k < top_k, so a larger
+# group is correct but burns registers).
+_LL_COLLECTIVE_H5120 = LLCollectiveTuning(cluster_size=5)
+
+LL_FINALIZE_GB300_TP4_H5120_K6 = LLFinalizeTuning(
+    prefetch_group=6, collective=_LL_COLLECTIVE_H5120
+)
+LL_FINALIZE_GB300_TP4_H5120_K3 = LLFinalizeTuning(
+    prefetch_group=3, collective=_LL_COLLECTIVE_H5120
+)
+LL_FINALIZE_GB300_TP8_H5120_K6 = LLFinalizeTuning(
+    prefetch_group=6, collective=_LL_COLLECTIVE_H5120
+)
+LL_FINALIZE_GB300_TP8_H5120_K3 = LLFinalizeTuning(
+    prefetch_group=3, collective=_LL_COLLECTIVE_H5120
+)
+LL_ALL_REDUCE_GB300_TP4_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
+LL_ALL_REDUCE_GB300_TP8_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
+
 
 @dataclass(slots=True)
 class LLProtocolState:
@@ -283,6 +309,7 @@ class LLProtocol:
         include_shared_expert: bool,
         add_residual: bool,
         write_residual_output: bool,
+        apply_rms_norm: bool = True,
         finalize_tunings: tuple[LLFinalizeTuning, ...],
         all_reduce_tunings: tuple[LLAllReduceTuning, ...],
         group: dist.ProcessGroup,
@@ -298,6 +325,7 @@ class LLProtocol:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.apply_rms_norm = apply_rms_norm
 
         collective_cache = {
             tuning: self._compile_collective(tuning)
@@ -412,6 +440,7 @@ class LLProtocol:
             add_residual=self.add_residual,
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
+            apply_rms_norm=self.apply_rms_norm,
         )
         activation = self.capacity_m * self.hidden_size
         args = (

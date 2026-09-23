@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -166,7 +166,7 @@ def _reference_bf16_mega_moe(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         get_symm_buffer_for_bf16_mega_moe,
     )
@@ -318,7 +318,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         compute_megamoe_reference_bf16,
         get_symm_buffer_for_bf16_mega_moe,
@@ -423,7 +423,9 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
 )
 def test_bf16_multirank_modes_are_constructible(load_balance_mode, token_back_mode):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+        MegaMoEBf16Config,
+    )
 
     config = MegaMoEBf16Config(
         rank=0,

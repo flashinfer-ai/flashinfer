@@ -848,6 +848,52 @@ class TestTypedActivationConfig:
             "situ_linear_beta": None,
         }
 
+    def test_sm12x_mxfp8_mxfp4_activation_mapping(self):
+        from flashinfer.fused_moe.runners import _sm12x_mxfp8_mxfp4_activation_kwargs
+
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU()) == {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": None,
+        }
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU(limit=10.0)) == {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": 10.0,
+        }
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SiTU()) == {
+            "activation": ActivationType.Situ,
+            "situ_beta": DEFAULT_SITU_BETA,
+            "situ_linear_beta": DEFAULT_SITU_LINEAR_BETA,
+        }
+        with pytest.raises(NotImplementedError):
+            _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU(alpha=2.0))
+        with pytest.raises(NotImplementedError):
+            _sm12x_mxfp8_mxfp4_activation_kwargs(SiTU(clamp_limit=1.0))
+
+    def test_sm12x_mxfp8_mxfp4_weight_view_validation(self):
+        from flashinfer.fused_moe.runners import _validate_sm12x_mxfp8_mxfp4_weight_view
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=2, top_k=1),
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            experts=ExpertConfig(intermediate_size=128, local_num_experts=2),
+        )
+        x = torch.empty(3, 128, dtype=torch.bfloat16)
+        view = {
+            "w1_weight": torch.empty(2, 256, 64, dtype=torch.uint8),
+            "w1_weight_sf": torch.empty(2, 1, 1024, dtype=torch.uint8),
+            "w2_weight": torch.empty(2, 128, 64, dtype=torch.uint8),
+            "w2_weight_sf": torch.empty(2, 1, 512, dtype=torch.uint8),
+        }
+        _validate_sm12x_mxfp8_mxfp4_weight_view(view, x, config)
+        with pytest.raises(ValueError, match="w1_weight shape"):
+            _validate_sm12x_mxfp8_mxfp4_weight_view(
+                {**view, "w1_weight": view["w1_weight"][:, :-1]}, x, config
+            )
+        with pytest.raises(TypeError, match="w2_weight must be uint8"):
+            _validate_sm12x_mxfp8_mxfp4_weight_view(
+                {**view, "w2_weight": view["w2_weight"].float()}, x, config
+            )
+
     def test_situ_unclamped_linear_branch_is_expressible(self):
         activation = SiTU(linear_scale=None)
         assert activation.linear_scale is None
@@ -1401,6 +1447,46 @@ class TestMoERunnerSupport:
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
         assert runner.check_support() is None
+
+    @pytest.mark.parametrize(
+        ("runner_cls", "quant"),
+        (
+            (
+                TrtllmFp4RoutedRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP4,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP8,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            (
+                CuteDslRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP4,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+        ),
+    )
+    def test_swizzled_scale_factors_rejected_outside_cutlass_mxfp8(
+        self, runner_cls, quant
+    ):
+        """The flat swizzled input_sf is a CUTLASS MXFP8 opt-in; every other
+        candidate for the pair must refuse it in check_support rather than
+        fail at pack_inputs with a shape error."""
+        runner = runner_cls.__new__(runner_cls)
+        runner.config = self._nvfp4_swiglu(quant=quant)
+        with pytest.raises(NotImplementedError, match="swizzled_scale_factors=True"):
+            runner.check_support()
 
     def test_trtllm_rejects_unclamped_situ_linear_branch(self):
         # The TRT-LLM per-expert gemm1_beta tensor cannot encode "no clamp",
@@ -2538,13 +2624,18 @@ def _make_bf16_packs_and_config(
     seed: int = 42,
     routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
     routing_weights_dtype: torch.dtype = torch.float32,
+    gate_up_scale: tuple[float, float] | None = None,
+    backend_configs: tuple = (TrtllmBf16Config(),),
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for the bf16 path.
 
     Mirrors ``_make_packs_and_config`` but with raw bf16 activations — no
     quantization and no scale tensors (the runner reads ``hidden_states_q``
     directly and ignores ``hidden_states_scale``).  ``tensors_dict`` holds the
-    UNSHUFFLED weights for ``_bf16_dense_reference``.
+    UNSHUFFLED weights for ``_bf16_dense_reference``.  ``gate_up_scale``
+    multiplies the canonical ``[up, gate]`` halves of ``w1`` so a swapped
+    reading is numerically distinguishable.  One native view is prepared per
+    entry of ``backend_configs``.
     """
     local_num_experts = local_num_experts or num_experts
     max_tokens = max_tokens or max(num_tokens, 8192)
@@ -2562,6 +2653,9 @@ def _make_bf16_packs_and_config(
         )
         / hidden_size**0.5
     )
+    if gate_up_scale is not None:
+        up, gate = w1.chunk(2, dim=1)
+        w1 = torch.cat((up * gate_up_scale[0], gate * gate_up_scale[1]), dim=1)
     w2 = (
         torch.randn(
             local_num_experts,
@@ -2596,17 +2690,18 @@ def _make_bf16_packs_and_config(
     )
 
     weight_pack = MoEWeightPack()
-    weight_pack.prepare_for(
-        "trtllm_bf16_routed",
-        TrtllmBf16Config.prepare_weights(
-            w1,
-            w2,
-            num_local_experts=local_num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            device=device,
-        ),
-    )
+    for backend_cfg in backend_configs:
+        weight_pack.prepare_for(
+            _BACKEND_RUNNERS[type(backend_cfg)].backend_key,
+            type(backend_cfg).prepare_weights(
+                w1,
+                w2,
+                num_local_experts=local_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=device,
+            ),
+        )
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
@@ -2617,7 +2712,7 @@ def _make_bf16_packs_and_config(
             local_num_experts=local_num_experts,
         ),
         activation=SwiGLU(),
-        backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
+        backend=BackendOptions(candidates=backend_configs),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
     return act_pack, weight_pack, config, {"x": x, "w1": w1, "w2": w2}
@@ -2810,6 +2905,41 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
 
 def _bf16_check(out, ref, label):
     torch.testing.assert_close(out.float(), ref, rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@sm100_required
+def test_bf16_gate_up_row_order_is_up_then_gate():
+    """TRT-LLM and CUTLASS BF16 read canonical gated ``w1`` rows as ``[up, gate]``.
+
+    Random weights let a backend and a reference that share the same swapped
+    reading agree; scaling the halves apart makes ``[gate, up]`` fail loudly.
+    """
+    arch = get_compute_capability(torch.device("cuda"))
+    arch = arch[0] * 10 + arch[1]
+    configs = tuple(
+        cfg for cfg in (TrtllmBf16Config(), CutlassBf16Config()) if cfg.supported(arch)
+    )
+    act, weights, config, tensors = _make_bf16_packs_and_config(
+        256,
+        max_tokens=256,
+        gate_up_scale=(0.25, 4.0),
+        backend_configs=configs,
+        **SMALL,
+    )
+    ref = _bf16_ref(act, tensors)
+    swapped_w1 = torch.cat(tensors["w1"].chunk(2, dim=1)[::-1], dim=1)
+    swapped_ref = _bf16_ref(act, {**tensors, "w1": swapped_w1})
+    assert not torch.allclose(ref, swapped_ref, rtol=BF16_RTOL, atol=BF16_ATOL), (
+        "fixture cannot distinguish [up, gate] from [gate, up]"
+    )
+
+    layer = MoELayer(config)
+    assert {r.backend_key for r in layer.runners} == {
+        _BACKEND_RUNNERS[type(cfg)].backend_key for cfg in configs
+    }
+    for runner in layer.runners:
+        out = runner.forward(runner.pack_inputs(act, weights), tactic=-1)
+        _bf16_check(out, ref, runner.backend_key)
 
 
 @sm100_required

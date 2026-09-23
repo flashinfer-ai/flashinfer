@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .cudnn.prefill import _cudnn_supports_direct_seqlens
 from .jit import (
@@ -376,6 +376,7 @@ def get_trtllm_gen_prefill_module():
             uses_spcompress,
             is_causal,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
         )
@@ -2476,7 +2477,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
             )
         else:
-            kv_lens_arr_host = seq_lens.cpu().flatten()
+            kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -2787,7 +2788,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
         else:
-            self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
+            self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
 
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
@@ -2799,7 +2800,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
                 )
             else:
-                kv_lens_arr_host = seq_lens.cpu().flatten()
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -2808,7 +2809,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -3174,8 +3175,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         *args,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
@@ -3198,8 +3200,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         *args,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
@@ -6863,7 +6866,7 @@ def trtllm_batch_context_with_kv_cache(
             query.device, cake_route
         ).cake_paged_attention_context
 
-    run_func(
+    run_args = [
         out,
         out_scale_factor,
         query,
@@ -6896,9 +6899,11 @@ def trtllm_batch_context_with_kv_cache(
         uses_spcompress,
         causal,
         lse,
-        lse_stride_tokens,
-        lse_stride_heads,
-    )
+    ]
+    if backend != "cake":
+        run_args.append(1.0)  # lse_scale
+    run_args.extend((lse_stride_tokens, lse_stride_heads))
+    run_func(*run_args)
     result_out = (
         out
         if out_dtype != "nvfp4"
@@ -7573,3 +7578,23 @@ def trtllm_fmha_v2_prefill(
         return out, lse
     else:
         return out
+
+
+@flashinfer_experimental_api
+def prepare_nvfp4_attention(q, k, v, out, *, causal=False, backend="cake"):
+    """Prepare NVFP4 attention from contiguous BF16 [B,H,S,128] tensors.
+
+    The experimental Cake backend requires SM103 and noncausal S divisible
+    by 512. Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
+    NVFP4AttentionRunner. Calling the runner executes QK, softmax and PV
+    attention and writes the caller-owned BF16 output without CUDA allocation.
+    Prepare a new runner after changing input values or bindings. CUDA Graph
+    ownership remains with the caller.
+    """
+    if backend != "cake":
+        raise ValueError("NVFP4 attention currently supports backend='cake'")
+    from .experimental.nvfp4_attention.cake_backend import (
+        prepare_nvfp4_attention as prepare,
+    )
+
+    return prepare(q, k, v, out, causal=causal, backend="cake")

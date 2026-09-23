@@ -47,9 +47,18 @@ flashinfer.msa_ops
 Minimax Sparse Attention (MSA) sparse prefill, sparse decode, and top-k
 selection dispatch on compute capability 10.0/10.3 (SM100/SM103) and
 SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
-only. NVFP4 K/V and views split from a packed paged K/V cache are also
-SM120/SM121-only; the compute capability 10.0/10.3 attention backend requires
-separate contiguous K and V tensors and does not make implicit copies.
+only. On compute capability 10.0/10.3, NVFP4 K/V is served by dedicated
+paged-KV prefill and decode routes that take the four regions of a packed
+NVFP4 page -- K data, K scales, V data, V scales -- as strided views of one
+allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
+128, and 64/4, 32/2 or 16/1 query/KV heads per tensor-parallel rank);
+``msa_prefill_nvfp4_specialized_stats()`` and
+``msa_decode_nvfp4_specialized_stats()`` report the exact accepted set. Other
+NVFP4 forms -- flat or ragged K/V, or separately allocated scale tensors --
+remain SM120/SM121-only, and outside those routes the 10.0/10.3 backend
+requires separate contiguous K and V tensors and does not make implicit
+copies. The decode ``out=`` parameter is implemented by that 10.0/10.3 route
+alone; every other route raises ``NotImplementedError`` when it is passed.
 The compute capability 10.0/10.3 backend uses TopK16 as its generic contract
 and additionally retains four shape-exact routes: paged BF16 decode at
 B64/Q8/KV65536/TopK32, 512-thread paged BF16 decode at
@@ -63,6 +72,21 @@ Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
 kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
 BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
 producer and deterministic reduction once the query reaches 8192 tokens.
+The NVFP4 paged-KV prefill route on compute capability 10.0/10.3 requires
+CUDA 13.0 or newer; on an older toolkit it declines with the reason, which
+``msa_prefill_nvfp4_specialized_stats()`` also reports as
+``toolkit_decline_reason``. The decode route has no such floor. The prefill
+route is bitwise
+reproducible run to run up to a 16,384-token context, and is not guaranteed to
+be above it. The per-tile block union is consumed in ascending hash-slot order;
+at or below 128 blocks per request the slot is a permutation of the selected
+set, so no two selected ids collide, the insert is a commutative ``atomicOr``
+and repeated calls return identical bits. Above that width the insert falls
+back to linear probing under ``atomicCAS``, colliding ids land in whatever
+order the atomics resolve in, and the accumulation order -- and so the last
+bits of the output -- may differ between runs. Every result is correct either
+way. ``msa_prefill_nvfp4_specialized_stats()`` reports the bound as
+``run_to_run_bitwise_reproducible_up_to_context``.
 Call :func:`flashinfer.msa_ops.supports_packed_kv` with the active device when
 integrating a cache manager across these architectures; the legacy aggregate
 ``SUPPORTS_PACKED_KV`` flag describes the SM120/SM121 backend.

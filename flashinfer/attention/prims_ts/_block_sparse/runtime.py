@@ -28,7 +28,7 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
-from .common import _SIGNED_INT32_MAX
+from .common import _SIGNED_INT32_MAX, _num_sparse_pattern_heads
 
 if TYPE_CHECKING:
     from .plan import _BlockSparsePlanState
@@ -339,7 +339,9 @@ def validate_block_sparse_run(
         batch_size=state.batch_size,
         seq_len_q=state.seq_len_q,
         seq_len_kv=state.seq_len_kv,
-        num_kv_heads=state.num_kv_heads,
+        num_kv_heads=_num_sparse_pattern_heads(
+            state.num_kv_heads, state.share_pattern_across_kv_heads
+        ),
         q_block_size=state.q_block_size,
         kv_block_size=state.kv_block_size,
         use_kv_valid_bits=state.use_kv_valid_bits,

@@ -56,6 +56,120 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("input_layout", ["3d", "hnd", "nhd"])
+@pytest.mark.parametrize("kv_layout", [None, "HND", "NHD"])
+def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
+    import json
+
+    from flashinfer.mla import dsv41_fp4_quantize_pack_sparse_mla_cache as pack
+
+    shapes = {"3d": (2, 8, 512), "hnd": (2, 1, 8, 512), "nhd": (2, 8, 1, 512)}
+    latent = torch.empty(shapes[input_layout], dtype=torch.float16)
+    kwargs = {} if kv_layout is None else {"kv_layout": kv_layout}
+    definition = pack.fi_trace(latent_kv=latent, save_dir=tmp_path, **kwargs)
+    axes = {
+        key: value["value"]
+        for key, value in definition["axes"].items()
+        if value["type"] == "const"
+    }
+    axes["num_pages"] = 2
+    assert (
+        tuple(axes[d] for d in definition["inputs"]["latent_kv"]["shape"])
+        == latent.shape
+    )
+    output = definition["outputs"]["cache"]
+    expected = (2, 8, 1, 288) if kv_layout == "NHD" else (2, 1, 8, 288)
+    assert tuple(axes[d] for d in output["shape"]) == expected
+    assert output["dtype"] == "uint8"
+    assert definition["inputs"]["latent_kv"]["dtype"] == "float16"
+    assert definition["inputs"]["kv_layout"]["dtype"] == "string"
+    assert "per-token" in output["description"]
+    assert (
+        json.loads((tmp_path / f"{definition['name']}.json").read_text()) == definition
+    )
+
+
+@pytest.mark.parametrize("latent_shape", [(6, 512), (2, 3, 512), (2, 1, 3, 512)])
+@pytest.mark.parametrize(
+    "cache_shape", [(2, 2304), (2, 8, 288), (2, 1, 8, 288), (2, 8, 1, 288)]
+)
+def test_dsv41_fp4_append_trace(latent_shape, cache_shape):
+    from flashinfer.mla import dsv41_fp4_quantize_append_sparse_mla_cache as append
+
+    latent = torch.empty(latent_shape, dtype=torch.bfloat16)
+    cache = torch.empty((4, *cache_shape[1:]), dtype=torch.uint8)[::2]
+    definition = append.fi_trace(
+        latent_kv=latent, slot_mapping=torch.empty(6, dtype=torch.int64), cache=cache
+    )
+    axes = {
+        key: value["value"]
+        for key, value in definition["axes"].items()
+        if value["type"] == "const"
+    }
+    inputs = definition["inputs"]
+    for name, tensor in (
+        ("latent_kv", latent),
+        ("slot_mapping", torch.empty(6)),
+        ("cache", cache),
+    ):
+        assert len(inputs[name]["shape"]) == tensor.ndim
+        for dim, size in zip(inputs[name]["shape"], tensor.shape, strict=True):
+            if dim in axes:
+                assert axes[dim] == size
+            axes[dim] = size
+    assert all(eval(constraint, {}, axes) for constraint in definition["constraints"])
+    assert inputs["slot_mapping"]["dtype"] == "int64"
+    assert inputs["latent_kv"]["dtype"] == "bfloat16"
+    assert definition["outputs"]["cache"]["shape"] == inputs["cache"]["shape"]
+    assert definition["outputs"]["cache"]["dtype"] == "uint8"
+    assert "None" in definition["description"]
+    assert "lowest-index" in inputs["slot_mapping"]["description"]
+    assert "Page-strided" in inputs["cache"]["description"]
+
+
+def test_dsv41_fp4_cache_autodump(tmp_path, monkeypatch):
+    import json
+
+    from flashinfer.mla import (
+        dsv41_fp4_quantize_append_sparse_mla_cache as append,
+        dsv41_fp4_quantize_pack_sparse_mla_cache as pack,
+    )
+    from flashinfer.trace import template
+    from flashinfer.utils import get_compute_capability
+
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) not in ((12, 0), (12, 1)):
+        pytest.skip("Requires SM120/SM121")
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr(template, "_DUMPED_NAMES", set())
+    latent = torch.randn(2, 8, 512, dtype=torch.bfloat16, device="cuda")
+    for layout in ("HND", "NHD"):
+        cache = pack(latent, kv_layout=layout)
+        full = cache.clone()
+        slots = torch.tensor([0, 0, -1, 16], dtype=torch.int32, device="cuda")
+        assert append(latent.reshape(-1, 512)[:4], slots, cache) is None
+        torch.testing.assert_close(cache, full, rtol=0, atol=0)
+        for api, kwargs in (
+            (pack, {"latent_kv": latent, "kv_layout": layout}),
+            (
+                append,
+                {
+                    "latent_kv": latent.reshape(-1, 512)[:4],
+                    "slot_mapping": slots,
+                    "cache": cache,
+                },
+            ),
+        ):
+            definition = api.fi_trace(**kwargs)
+            assert (
+                json.loads((tmp_path / f"{definition['name']}.json").read_text())
+                == definition
+            )
+    assert len(list(tmp_path.glob("*.json"))) == 4
+
+
 def test_svdquant_trace_activation_scale_tracks_variable_m():
     from flashinfer.trace.templates.gemm import mm_nvfp4_svdquant_trace
 
@@ -525,6 +639,10 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_bitmask",
         "prims_ts_block_sparse_bsr_proxy",
         "prims_ts_block_sparse_bitmask_proxy",
+        "prims_ts_block_sparse_shared",
+        "prims_ts_block_sparse_bitmask_shared",
+        "prims_ts_block_sparse_bsr_proxy_shared",
+        "prims_ts_block_sparse_bitmask_proxy_shared",
     }
     contiguous_wrapper_traces = {
         template.name_prefix: template
@@ -535,6 +653,10 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_wrapper_bitmask",
         "prims_ts_block_sparse_wrapper_bsr_proxy",
         "prims_ts_block_sparse_wrapper_bitmask_proxy",
+        "prims_ts_block_sparse_wrapper_shared",
+        "prims_ts_block_sparse_wrapper_bitmask_shared",
+        "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
+        "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
     }
     route_modes = {
         ("bsr", False): ("", {"block_indptr", "block_indices"}),
@@ -563,6 +685,14 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         suffix,
         expected_inputs,
     ) in route_modes.items():
+        shared_trace = prims_ts_block_sparse_trace_dispatch(
+            sparse_format=sparse_format,
+            use_proxy_routes=use_proxy_routes,
+            share_pattern_across_kv_heads=True,
+        )
+        assert shared_trace.axes["num_pattern_heads"].value == 1
+        pattern_name = "block_indptr" if sparse_format == "bsr" else "exact_block_bits"
+        assert shared_trace.inputs[pattern_name].dim_names[1] == "num_pattern_heads"
         one_shot_template = one_shot_traces[f"prims_ts_block_sparse{suffix}"]
         wrapper_template = contiguous_wrapper_traces[
             f"prims_ts_block_sparse_wrapper{suffix}"
@@ -683,6 +813,8 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     assert set(wrapper_paged_templates) == {
         "prims_ts_paged_block_sparse_wrapper_tuple",
         "prims_ts_paged_block_sparse_wrapper_combined",
+        "prims_ts_paged_block_sparse_wrapper_tuple_shared",
+        "prims_ts_paged_block_sparse_wrapper_combined_shared",
     }
     for template in (
         contiguous_wrapper_trace,
@@ -954,8 +1086,24 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     assert "window_left" not in fmha_definitions[2]["inputs"]
 
 
-def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages():
-    """Encoded locators retain semantic page four over larger cache pages."""
+@pytest.mark.parametrize(
+    "semantic_page_size,storage_page_size,combined",
+    (
+        (4, 32, False),
+        (8, 24, False),
+        (8, 24, True),
+        (16, 64, False),
+        (32, 128, True),
+        (64, 128, False),
+        (128, 256, True),
+        (8, 8, False),
+        (32, 32, True),
+    ),
+)
+def test_attention_ts_trace_semantic_and_storage_pages(
+    semantic_page_size, storage_page_size, combined
+):
+    """Each FMHA surface retains native or encoded page geometry in its trace."""
     from flashinfer.attention.prims_ts.decode import (
         BatchDecodePagedTSWrapper,
         batch_decode_with_paged_kv_cache,
@@ -967,8 +1115,8 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         prims_ts_decode_trace_dispatch,
     )
 
-    batch_size, seq_len_q, max_seq_len = 2, 4, 64
-    semantic_page_size, storage_page_size = 4, 32
+    batch_size, seq_len_q, max_seq_len = 2, 4, 2 * storage_page_size
+    encoded = semantic_page_size != storage_page_size
     num_qo_heads, num_kv_heads, head_dim = 8, 2, 64
     num_physical_pages = batch_size * max_seq_len // storage_page_size
     max_num_semantic_pages = max_seq_len // semantic_page_size
@@ -981,6 +1129,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         dtype=torch.bfloat16,
     )
     v_cache = torch.empty_like(k_cache)
+    cache = torch.stack((k_cache, v_cache), dim=1) if combined else (k_cache, v_cache)
     block_table = torch.arange(
         batch_size * max_num_semantic_pages, dtype=torch.int32
     ).reshape(batch_size, max_num_semantic_pages)
@@ -989,7 +1138,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
 
     one_shot_kwargs = {
         "q": q,
-        "paged_kv_cache": (k_cache, v_cache),
+        "paged_kv_cache": cache,
         "block_tables": block_table,
         "seq_lens_kv": seq_lens,
         "seq_len_q": seq_len_q,
@@ -997,7 +1146,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
     }
     standalone_kwargs = {
         "query": q,
-        "kv_cache": (k_cache, v_cache),
+        "kv_cache": cache,
         "workspace_buffer": workspace,
         "block_tables": block_table,
         "seq_lens": seq_lens,
@@ -1011,36 +1160,38 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         prims_ts_decode_trace_dispatch(**standalone_kwargs),
     )
     for template in direct_templates:
-        assert "_encoded_page4" in template.name_prefix
-        assert template.axes["page_size"].value == semantic_page_size
-        assert template.inputs["semantic_page_size"].param == "page_size"
-        assert template.inputs["semantic_page_size"].optional is False
+        assert ("_encoded_page" in template.name_prefix) == encoded
+        if encoded:
+            assert f"_encoded_page{semantic_page_size}" in template.name_prefix
+            assert template.axes["page_size"].value == semantic_page_size
+            assert template.inputs["semantic_page_size"].param == "page_size"
+            assert template.inputs["semantic_page_size"].optional is False
+        else:
+            assert "storage_page_size" not in template.axes
+            assert "semantic_page_size" not in template.inputs
 
     definitions = (
         batch_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs),
         prims_ts_batch_decode_with_kv_cache.fi_trace(**standalone_kwargs),
     )
     for definition in definitions:
-        assert "_encoded_page4" in definition["name"]
-        assert definition["axes"]["storage_page_size"]["value"] == 32
-        assert definition["axes"]["page_size"]["value"] == 4
-        assert "optional" not in definition["inputs"]["semantic_page_size"]
-        assert "storage_page_size > page_size" in definition["constraints"]
-        assert "storage_page_size % page_size == 0" in definition["constraints"]
-        for cache_name in ("k_cache", "v_cache"):
-            assert definition["inputs"][cache_name]["shape"] == [
-                "num_pages",
-                "num_kv_heads",
-                "storage_page_size",
-                "head_dim",
-            ]
-
-    default_template = attention_ts_decode_trace_dispatch(
-        **{**one_shot_kwargs, "page_size": storage_page_size}
-    )
-    assert "_encoded_page4" not in default_template.name_prefix
-    assert "storage_page_size" not in default_template.axes
-    assert "semantic_page_size" not in default_template.inputs
+        assert ("_encoded_page" in definition["name"]) == encoded
+        assert definition["axes"]["page_size"]["value"] == semantic_page_size
+        if encoded:
+            assert definition["axes"]["storage_page_size"]["value"] == storage_page_size
+            assert "optional" not in definition["inputs"]["semantic_page_size"]
+            assert "storage_page_size > page_size" in definition["constraints"]
+            assert "storage_page_size % page_size == 0" in definition["constraints"]
+        shape = [
+            "num_pages",
+            *(["kv_planes"] if combined else []),
+            "num_kv_heads",
+            "storage_page_size" if encoded else "page_size",
+            "head_dim",
+        ]
+        for name, spec in definition["inputs"].items():
+            if "cache" in name:
+                assert spec["shape"] == shape
 
     wrapper = BatchDecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
@@ -1058,23 +1209,36 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
     )
     wrapper_kwargs = dict(
         q=q,
-        paged_kv_cache=(k_cache, v_cache),
+        paged_kv_cache=cache,
         seq_lens=seq_lens,
         block_tables=block_table,
     )
     wrapper_definition = fi_trace(wrapper.run, **wrapper_kwargs)
-    assert "_encoded_page4" in wrapper_definition["name"]
-    assert wrapper_definition["axes"]["storage_page_size"]["value"] == 32
-    assert wrapper_definition["axes"]["page_size"]["value"] == 4
+    assert ("_encoded_page" in wrapper_definition["name"]) == encoded
+    if encoded:
+        assert (
+            wrapper_definition["axes"]["storage_page_size"]["value"]
+            == storage_page_size
+        )
+    assert wrapper_definition["axes"]["page_size"]["value"] == semantic_page_size
     assert "semantic_page_size" not in wrapper_definition["inputs"]
 
-    wrapper._plan_state.storage_page_size = 16
+    for definition in (*definitions, wrapper_definition):
+        page_constraint = next(
+            c for c in definition["constraints"] if c.startswith("page_size in ")
+        )
+        assert eval(page_constraint, {}, {"page_size": semantic_page_size})
+
+    wrapper._plan_state.storage_page_size += semantic_page_size
     with pytest.raises(ValueError, match="does not match the wrapper plan"):
         fi_trace(wrapper.run, **wrapper_kwargs)
 
 
-@pytest.mark.parametrize("storage_page_size", (2, 6))
-def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
+@pytest.mark.parametrize(
+    "semantic_page_size,storage_page_size", ((4, 2), (4, 6), (8, 4), (8, 20))
+)
+def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
+    semantic_page_size,
     storage_page_size,
 ):
     """Trace selection must reject invalid extents before dumping a definition."""
@@ -1095,7 +1259,7 @@ def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
             paged_kv_cache=(k, v),
             block_tables=block_tables,
             seq_lens_kv=seq_lens,
-            page_size=4,
+            page_size=semantic_page_size,
         )
     with pytest.raises(ValueError, match="larger than and divisible"):
         prims_ts_batch_decode_with_kv_cache.fi_trace(
@@ -1104,8 +1268,8 @@ def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
             workspace_buffer=torch.empty(4096, dtype=torch.uint8),
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=4,
-            page_size=4,
+            max_seq_len=semantic_page_size,
+            page_size=semantic_page_size,
         )
 
 
@@ -1308,6 +1472,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
             None,
         ),
         ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens),
+        ({**fmha_base, "policy": (("split_kv_allowed", False),)}, seq_lens),
     )
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_definitions = []
@@ -1333,6 +1498,8 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     assert "mask:causal" in fmha_definitions[1]["tags"]
     assert "seq-lens-source:run" in fmha_definitions[0]["tags"]
     assert "seq-lens-source:plan" in fmha_definitions[4]["tags"]
+    assert fmha_definitions[0]["axes"]["split_kv_allowed"]["value"] == 1
+    assert fmha_definitions[-1]["axes"]["split_kv_allowed"]["value"] == 0
 
     mla_kwargs = {
         "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),
@@ -1447,6 +1614,50 @@ def test_fi_trace_complete_gqa_paged_decode():
         f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
     )
     assert "unknown" not in str(defn["outputs"])
+
+
+def test_fi_trace_cudnn_batch_decode_multi_token_rows_have_their_own_axis():
+    """q_len_per_req > 1: q / output carry batch_size * q_len_per_req rows
+    while block_tables keeps batch_size rows. One shared axis could not
+    describe both (B=4, q_len 2: q is (8, H, D), the table (4, pages)); the
+    decode template gives the rows ``num_q_rows`` and the extractors read the
+    two counts from their own tensors."""
+    from flashinfer.cudnn.decode import cudnn_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _CUDNN_PAGED_AXES,
+        cudnn_batch_decode_trace,
+    )
+
+    B, QL, H, KV, D, P, NPPS = 4, 2, 8, 4, 128, 16, 4
+    kwargs = dict(
+        q=torch.zeros(B * QL, H, D, dtype=torch.bfloat16),
+        k_cache=torch.zeros(B * NPPS, KV, P, D, dtype=torch.bfloat16),
+        v_cache=torch.zeros(B * NPPS, KV, P, D, dtype=torch.bfloat16),
+        scale=1.0 / D**0.5,
+        workspace_buffer=torch.zeros(1, dtype=torch.uint8),
+        max_sequence_kv=NPPS * P,
+        block_tables=torch.zeros(B, NPPS, dtype=torch.int32),
+        q_len_per_req=QL,
+    )
+    extractors = cudnn_batch_decode_trace._build_axis_extractors()
+    assert extractors["num_q_rows"](kwargs) == B * QL
+    assert extractors["batch_size"](kwargs) == B
+    assert extractors["num_pages_per_seq"](kwargs) == NPPS
+
+    defn = cudnn_batch_decode_with_kv_cache.fi_trace(**kwargs)
+    assert defn["inputs"]["q"]["shape"] == ["num_q_rows", "num_heads_qo", "head_dim"]
+    assert defn["outputs"]["output"]["shape"][0] == "num_q_rows"
+    assert defn["inputs"]["block_tables"]["shape"] == [
+        "batch_size",
+        "num_pages_per_seq",
+    ]
+    assert defn["axes"]["num_q_rows"]["type"] == "var"
+    assert defn["axes"]["batch_size"]["type"] == "var"
+    assert defn["axes"]["num_heads_qo"]["value"] == H
+    assert defn["axes"]["head_dim"]["value"] == D
+    assert defn["axes"]["page_size"]["value"] == P
+    # The prefill template keeps the shared axis map untouched.
+    assert "num_q_rows" not in _CUDNN_PAGED_AXES
 
 
 @pytest.mark.parametrize(

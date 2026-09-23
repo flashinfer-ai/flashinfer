@@ -13,7 +13,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Install for development | `pip install --no-build-isolation -e . -v` |
 | Initialize submodules | `git submodule update --init --recursive` |
 | Install CUPTI for benchmarking | `pip install -U cupti-python` |
-| Run all tests | `pytest tests/` |
+| Run regular tests | `pytest tests/` |
+| Run full parameter matrices | `pytest tests/ --full` |
 | Run specific test | `pytest tests/path/test_file.py::test_function` |
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
@@ -95,10 +96,16 @@ FlashInfer provides optional pre-compiled packages for users who want faster ini
 
 ## Testing
 
-Run all tests:
+Run the regular test suite:
 
 ```bash
 pytest tests/
+```
+
+Run full parameter matrices (used by nightly testing):
+
+```bash
+pytest tests/ --full
 ```
 
 Run specific test file:
@@ -582,6 +589,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
+| `FLASHINFER_JIT_PREBUILD_MAX_JOBS` | unset (uses `MAX_JOBS`) | `flashinfer/jit/core.py` | Maximum parallel Ninja jobs for a bulk `build_jit_specs()` prebuild. This does not control ordinary on-demand module builds. The sharded test runner sets it to the host-wide automatic build budget before reducing each worker's `MAX_JOBS`; an explicit value is preserved. |
 | `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
 | `FLASHINFER_NVCC_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
 | `FLASHINFER_CXX_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |
@@ -591,6 +599,15 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
+
+Release/nightly JIT-cache provider builds run sccache in server-side mode and
+wrap the complete wheel build with a no-output watchdog. After 90 minutes with
+no build output, the watchdog captures system, process, compiler, and sccache
+state; terminates the wrapped build process group (TERM, then KILL after a
+two-minute grace period); and exits with status 124. Compiler discovery scans
+the whole build container, so diagnostics include compiler processes owned by
+the sccache daemon even though they are outside the wrapped process group. The
+CI `docker run --rm` boundary provides final cleanup for those processes.
 
 ##### Cubin / Artifact Loader
 
@@ -645,7 +662,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_PRIMS_TS_CASTA_PATTERN_ACT` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills activations with a quarter-wise pattern `(1,2,4,6)` instead of random data. |
 | `FLASHINFER_PRIMS_TS_CASTA_PATTERN_WEIGHTS` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills cast-A weights with a deterministic pattern (takes precedence over constant fill). |
 | `FLASHINFER_PRIMS_TS_CASTA_CONSTANT_WEIGHTS` | unset | `flashinfer/prims_ts/batched_gemm/batched_gemm_run.py` | `1` fills cast-A weights with constant values when pattern fill is not set. |
-| `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120_cpb.py`, `flashinfer/comm/pcie_ipc_tuning.py` | Override the disk path for tuning cache files (sparse-MLA SM120 cpb calibration constants, and the PCIe IPC all-reduce). Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
+| `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120/_calibration.py`, `flashinfer/comm/pcie_ipc_tuning.py` | Override the disk path for tuning cache files (sparse-MLA SM120 cpb calibration constants, and the PCIe IPC all-reduce). Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
 | `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
 | `FLASHINFER_CUTILE_AUTOTUNE_DISABLED` | `0` | `flashinfer/quantization/kernels/cutile/rope_quantize_fp8_cutile.py` | Non-zero skips exhaustive cuTile RoPE-FP8 tuning and uses the built-in token-count heuristic. |
 | `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |

@@ -4,7 +4,7 @@
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -105,7 +105,7 @@ flowchart TD
     F --> M
 ```
 
-The knobs split into two classes (`kernel_src/cutedsl_megamoe/shim/tuner.py`):
+The knobs split into two classes (`kernel_src/sm100/cutedsl_megamoe/shim/tuner.py`):
 
 - **correctness knobs** change a code path or the output and must be kept at
 the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
@@ -180,7 +180,7 @@ candidates are excluded from the CLI sweep unless
 `--allow-nondeterministic` is passed.
 
 Measured results, methodology, and the full knob reference live in
-[kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+[kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 ## Layout
 
@@ -192,7 +192,7 @@ moe_ep/
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
-  kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
+  kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends
     shim/                      ← thin adapters over src/ (_paths, comm, bf16, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
