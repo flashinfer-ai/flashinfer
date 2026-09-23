@@ -252,9 +252,9 @@ def test_batch_attention_with_noncontiguous_q():
     get_compute_capability(torch.device(device="cuda"))[0] == 12,
     reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
 )
+@pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
 @parametrize_product(
     {
-        "seq_len_pairs": _build_seq_len_configs(),
         "page_block_size": [1, 8, 16],
         "num_kv_heads": [1, 4],
         "gqa_group_size": [1, 4, 7, 8],
