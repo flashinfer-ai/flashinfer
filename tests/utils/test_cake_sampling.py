@@ -232,8 +232,8 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
         s1, (threads, items) = variant
         cluster, ept = s1[0], s1[1]
         stream_variant = 1 if len(s1) > 2 and s1[2] else 0
-        capability = _require_supported_device()
-        module = load_cake_sampling_module(capability)
+        _require_supported_device()
+        module = load_cake_sampling_module()
         vals, idxs, cnt = ws
         if out is None:
             out = torch.empty(batch, device="cuda", dtype=torch.int32)
