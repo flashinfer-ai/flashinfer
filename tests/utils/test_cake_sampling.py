@@ -503,16 +503,8 @@ def test_per_request_tensors_and_routes():
     # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
     # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
     # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.
-    for batch, vocab in (
-        (1, 128256),
-        (8, 65536),
-        (16, 128256),
-        (64, 128256),
-        (16, 262144),
-    ):
-        assert choose_stage1(batch, vocab, sm_count=132) == choose_stage1(
-            batch, vocab, sm_count=148
-        )
+    for b, v in ((1, 128256), (8, 65536), (16, 128256), (64, 128256), (16, 262144)):
+        assert choose_stage1(b, v, sm_count=132) == choose_stage1(b, v, sm_count=148)
     assert choose_stage1(32, 128256, sm_count=132) == (2, 16, True)
     assert choose_stage1(32, 262144, sm_count=132) == (2, 16, True)
     assert choose_stage1(32, 32768, sm_count=132) == (2, 32, False)
