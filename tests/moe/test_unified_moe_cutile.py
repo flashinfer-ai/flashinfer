@@ -60,7 +60,10 @@ from flashinfer.fused_moe.runners import (
     _cutile_fp8_gemm_candidates,
     _validate_cutile_int32_routing,
 )
-from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
+from flashinfer.fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket,
+)
 from flashinfer.tllm_enums import ActivationType
 
 from .utils import compute_reference_activation, compute_reference_moe
@@ -1697,15 +1700,58 @@ def test_cutile_nvfp4_bucket_variant_key_tracks_split_counts():
         g2 = runner._fp4_k_splits_for_shape(
             num_tokens, hidden_size, stage=2, block_size=16, config=(128, 64, 2)
         )
-        assert key == (
-            g1,
-            g2,
-            runner._kernel_module.split_k_reduce_row_tile(num_tokens * 2),
-        )
+        row_tile = runner._kernel_module.split_k_reduce_row_tile(num_tokens * 2)
+        assert key == (g1, g2, row_tile if g1 > 1 else None)
     # Small batches split while a batch whose grid covers the SMs does not, so
     # the key must differ across the counts a bucket precompilation would see.
     assert keys[1][0] > 1
     assert len(set(keys.values())) > 1
+
+
+@cutile_nvfp4_required
+def test_cutile_nvfp4_bucket_precompile_adds_split_variant_inside_bucket():
+    # 16 experts x top_k 2 at block 16: the padded row-block count grows at
+    # 50 assignments (25 tokens), which shares its shape fingerprint with the
+    # 32-token bucket's existing representatives. With 148 SMs the split-K
+    # heuristic drops from 4 to 2 splits exactly there, so a precompilation
+    # keyed on shape alone would never warm the 2-split variant.
+    config, activations, weights, _ = _make_nvfp4_case(
+        ReLU2(),
+        num_tokens=2,
+        num_experts=16,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=512,
+    )
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    runner._num_sms = 148
+    tactic = (16, 0, 128, 64, 2, 128, 64, 2)
+    hidden_size = inputs[1].shape[1]
+    ceiling = config.execution.tune_max_num_tokens
+    assert map_to_hybrid_bucket(24, ceiling) == map_to_hybrid_bucket(25, ceiling) == 32
+
+    def variant_key(num_tokens: int):
+        return runner._bucket_variant_key(num_tokens, hidden_size, tactic)
+
+    assert variant_key(24)[:2] == (4, 4)
+    assert variant_key(25)[:2] == (2, 2)
+    common = dict(
+        tune_max_num_tokens=ceiling,
+        num_experts=16,
+        top_k=2,
+        hidden_size=hidden_size,
+        intermediate_size=config.experts.intermediate_size,
+        block_size=16,
+    )
+    base = _cutile_bucket_compile_token_counts(32, **common)
+    keyed = _cutile_bucket_compile_token_counts(32, variant_key=variant_key, **common)
+    assert 24 in base and 25 not in base
+    assert set(base).issubset(keyed)
+    assert 25 in keyed
+    assert {variant_key(count)[:2] for count in keyed} == {(4, 4), (2, 2)}
 
 
 @cutile_nvfp4_required

@@ -4287,24 +4287,29 @@ class _CuTileFp4Runner(CuTileBf16Runner):
         # K_SPLITS and the reduce row tile are compile-time kernel parameters,
         # so each distinct combination inside a bucket needs its own warm-up.
         block_size, _, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = map(int, tactic)
-        num_assignments = num_tokens * self.config.routing.top_k
-        return (
-            self._fp4_k_splits_for_shape(
-                num_tokens,
-                hidden_size,
-                stage=1,
-                block_size=block_size,
-                config=(g1_n, g1_k, g1_occ),
-            ),
-            self._fp4_k_splits_for_shape(
-                num_tokens,
-                hidden_size,
-                stage=2,
-                block_size=block_size,
-                config=(g2_n, g2_k, g2_occ),
-            ),
-            self._kernel_module.split_k_reduce_row_tile(num_assignments),
+        gemm1_splits = self._fp4_k_splits_for_shape(
+            num_tokens,
+            hidden_size,
+            stage=1,
+            block_size=block_size,
+            config=(g1_n, g1_k, g1_occ),
         )
+        gemm2_splits = self._fp4_k_splits_for_shape(
+            num_tokens,
+            hidden_size,
+            stage=2,
+            block_size=block_size,
+            config=(g2_n, g2_k, g2_occ),
+        )
+        # The reduce kernel only runs behind a split GEMM1.
+        reduce_row_tile = (
+            self._kernel_module.split_k_reduce_row_tile(
+                num_tokens * self.config.routing.top_k
+            )
+            if gemm1_splits > 1
+            else None
+        )
+        return (gemm1_splits, gemm2_splits, reduce_row_tile)
 
     def _fp4_config_rejection_reason(
         self, problem: _CuTileGemmProblem, config: tuple[int, int, int]
