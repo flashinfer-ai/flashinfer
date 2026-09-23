@@ -83,29 +83,14 @@ def load_sparse_quad(routes, request, offset):
 
 
 @cute.jit
-def broadcast_sparse_quad(cached_rows, owner):
-    """Broadcast one lane's four cached rows; all warp lanes must participate."""
-    raw = cutlass.Array(Int32, TMA_GATHER_ROWS, space=cutlass.AddressSpace.rmem)
-    for j in cutlass.range_constexpr(TMA_GATHER_ROWS):
-        raw[j] = cute.arch.make_warp_uniform(
-            prims.shfl_sync(
-                thread_mask=0xFFFFFFFF,
-                val=cached_rows[j],
-                offset=Int32(owner),
-                mask_and_clamp=0x1F,
-                kind=prims.Shfl.IDX,
-            )
-        )
-    return raw
-
-
-@cute.jit
 def decode_sparse_quad(primary, extra, raw):
     """Select a source and map masked row sentinels to TMA zero-fill rows."""
     rows = cutlass.Array(Int32, TMA_GATHER_ROWS, space=cutlass.AddressSpace.rmem)
     for j in cutlass.range_constexpr(TMA_GATHER_ROWS):
-        value = raw[j] & Int32(0x7FFFFFFF)
-        rows[j] = value if value != Int32(0x7FFFFFFF) else Int32(-1)
+        # Native sparse pools have fewer than INT32_MAX storage rows. The
+        # reserved sentinel is already an out-of-bounds TMA coordinate;
+        # retaining it gives zero fill without a compare/select per row.
+        rows[j] = raw[j] & Int32(0x7FFFFFFF)
     return select_gather_map(primary, extra, raw[0] < 0), rows
 
 
