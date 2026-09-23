@@ -2030,6 +2030,36 @@ def _build_decode_gen_schedule(
         if tmem_stats_done1 is not None:
             resource_dependency_graph[tmem_s1].append(tmem_stats_done1)
             resource_dependency_graph[tmem_stats_done1] = [tmem_softmax_local1]
+    # A softmax instance's outputs read its K scale words; an SMEM-form
+    # resource fills them from the route's staged metadata, while a
+    # register-form one hands them straight to the outputs. The correction
+    # epilogue reads the V channel scales.
+    for scales_pair, route_metadata, outputs in (
+        (
+            (sage_k_scales0, sage_summary_k_scales0),
+            sparse_softmax_metadata0,
+            (smem_p0, tmem_softmax_local0, tmem_softmax_global0),
+        ),
+        (
+            (sage_k_scales1, sage_summary_k_scales1),
+            sparse_softmax_metadata1,
+            (smem_p1, tmem_softmax_local1, tmem_softmax_global1),
+        ),
+    ):
+        for scales in scales_pair:
+            if scales is None:
+                continue
+            resource_dependency_graph[scales] = (
+                [route_metadata]
+                if route_metadata is not None and scales.in_smem
+                else []
+            )
+            for resource in outputs:
+                resource_dependency_graph[resource].append(scales)
+    if sage_v_scales is not None:
+        resource_dependency_graph[sage_v_scales] = []
+        for resource in (tmem_corr0, tmem_corr1):
+            resource_dependency_graph[resource].append(sage_v_scales)
     if cutlass.const_expr(use_ordered_softmax_barrier):
         resource_dependency_graph[tmem_softmax_order] = [tmem_s0]
         resource_dependency_graph[smem_p1] = [

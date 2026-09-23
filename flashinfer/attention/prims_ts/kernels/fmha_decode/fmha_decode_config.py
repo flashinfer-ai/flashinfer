@@ -1723,6 +1723,22 @@ class FmhaDecodeConfig:
                 "Sage attention requires a two-instance Keeps profile: "
                 "Q64/KV256 or Q128/KV128"
             )
+        if self.use_paged_kv or self.headdim != 128:
+            raise ValueError("Sage attention requires contiguous K/V with headdim=128")
+        # Only the direct output store applies the V channel scales and means;
+        # split-KV partials and reductions do not.
+        if (
+            self.use_variable_seqlens_q
+            or self.use_sliding_window_causal
+            or self.use_attention_sinks
+            or self.use_split_kv
+            or self.use_cluster_smem_reduction
+            or self.use_separate_reduction_kernel
+        ):
+            raise ValueError(
+                "Sage attention supports the direct-output grid only, without "
+                "split-KV, variable-Q, sliding-window, or attention-sink features"
+            )
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
         """Validate the qualified host profile for block-sparse."""

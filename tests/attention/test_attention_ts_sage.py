@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import warnings
 
 import pytest
 import torch
@@ -690,6 +691,139 @@ def test_sage_plan_rejects_unsupported_recipes(
     )
     with pytest.raises(error, match=match):
         BlockSparseTSWrapper().plan(**{**arguments, **overrides})
+
+
+def _sage_decode_config(
+    tile_size_q: int = 64,
+    qk_dtype_name: str = "Float8E4M3FN",
+    k_block_size: int = 16,
+    args: dict[str, object] | None = None,
+    **overrides: object,
+):
+    """Build a dense contiguous Sage decode configuration at the kernel layer."""
+
+    import cutlass
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        make_decode_config,
+    )
+
+    qk_dtype = getattr(cutlass, qk_dtype_name)
+    heads_q_per_kv = 1 if tile_size_q == 64 else 8
+    return make_decode_config(
+        headdim=_HEAD_DIM,
+        args={
+            "use_keeps_mma_ab": True,
+            "tile_size_q": tile_size_q,
+            "tile_size_kv": 256 if tile_size_q == 64 else 128,
+            "groups_tokens_heads_q": True,
+            "sage_k_block_size": k_block_size,
+            "sage_k_summary_block_size": k_block_size,
+            "sage_q_block_size": 1,
+            **(args or {}),
+        },
+        seq_len_q=64 if tile_size_q == 64 else 16,
+        seq_len_kv=1000,
+        batch_size=2,
+        num_heads_q=8,
+        num_heads_kv=8 // heads_q_per_kv,
+        q_dtype=qk_dtype,
+        k_dtype=qk_dtype,
+        v_dtype=cutlass.Float8E4M3FN,
+        o_dtype=cutlass.BFloat16,
+        mask_type="dense",
+        auto_tuner=False,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        pytest.param(
+            {
+                "args": {"use_split_kv": True, "splits_kv": 2, "max_splits_kv": 2},
+                "split_kv_mode": "gmem_reduction",
+                "splits_kv": 2,
+            },
+            "direct-output grid",
+            id="split-kv",
+        ),
+        pytest.param(
+            {"qkv_layout": "pagedKv", "num_tokens_per_page": 128},
+            "contiguous K/V",
+            id="paged-kv",
+        ),
+    ),
+)
+def test_sage_decode_config_rejects_unsupported_launches(
+    overrides: dict[str, object], match: str
+) -> None:
+    """Only the direct output store of contiguous K/V applies the V scales."""
+
+    with pytest.raises(ValueError, match=match):
+        _sage_decode_config(**overrides)
+
+
+def _mixed_proxy_config():
+    """A block-sparse proxy plan with 16-token K scales and 4-token summary scales."""
+
+    spec = sparse_config._resolve_block_sparse_launch_spec(
+        device_index=0,
+        batch_size=1,
+        seq_len_q=128,
+        seq_len_kv=4096,
+        num_qo_heads=8,
+        num_kv_heads=8,
+        share_pattern_across_kv_heads=False,
+        head_dim=_HEAD_DIM,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_route_size=256,
+        page_size=None,
+        dtype_key="float8_e4m3fn",
+        mask_type="dense",
+        use_kv_valid_bits=False,
+        max_row_route_capacity=16,
+        sparse_format="bsr",
+        use_proxy_routes=True,
+        use_block_sparse=True,
+        out_dtype_key="bfloat16",
+        v_dtype_key="float8_e4m3fn",
+        sage=SageAttentionConfig(k_block_size=16, k_summary_block_size=4),
+    )
+    return sparse_config._make_block_sparse_config(spec.compile_key)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "make_config",
+    (
+        pytest.param(lambda: _sage_decode_config(), id="dense-fp8-k16"),
+        pytest.param(
+            lambda: _sage_decode_config(128, "Int8", k_block_size=4),
+            id="dense-int8-q128-k4",
+        ),
+        pytest.param(lambda: _mixed_proxy_config(), id="block-sparse-mixed-proxy"),
+    ),
+)
+def test_sage_schedule_passes_strict_validation(make_config) -> None:
+    """The scale resources appear in the resource dependency graph."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        build_decode_task_manager,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        build_decode_task_manager(
+            make_config(),
+            seq_len_kv=1024,
+            batch_size=1,
+            num_heads_kv=1,
+            verbose=False,
+            skip_validation=False,
+        )
 
 
 @_REQUIRES_PRIMTS_GPU
