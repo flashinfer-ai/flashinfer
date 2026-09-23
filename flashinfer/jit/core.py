@@ -691,6 +691,15 @@ def gen_jit_spec(
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
     use_fast_math: bool = True,
 ) -> JitSpec:
+    """Describe a module to build.
+
+    ``use_fast_math`` is on by default, which is what every module built before
+    this parameter existed was getting. It replaces the math functions with
+    their approximate intrinsics and turns on flush-to-zero, which is the right
+    trade for an attention kernel and the wrong one for a module whose whole job
+    is to reproduce an elementwise expression: there, a denormal result flushed
+    to zero is not a rounding difference, it is a different answer.
+    """
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")

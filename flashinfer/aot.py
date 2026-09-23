@@ -173,8 +173,12 @@ from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.sparse_scores import gen_sparse_scores_module
 from .jit.topk import gen_topk_module
+from .jit.sparse_route import gen_sparse_route_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
+from .jit.sparse_pre_indexer import gen_sparse_pre_indexer_module
+from .jit.qsa_output_gate import gen_qsa_output_gate_module
 
 
 def gen_fa2(
@@ -535,6 +539,9 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    # The route kernels are plain CUDA and build everywhere; without this an
+    # install with JIT disabled has no artifact to load.
+    jit_specs.append(gen_sparse_route_module())
     has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
@@ -871,6 +878,24 @@ def gen_all_modules(
         jit_specs.append(gen_pcie_ipc_comm_module())
 
     if add_misc:
+        # The QSA modules are one contract: the scorer, the route it expands
+        # and the gate that closes the step. A build that carried some of them
+        # would report a capability it cannot serve. The scorer multiplies with
+        # m16n8k16, which every SM8-or-newer device has, so the gate is the
+        # target list rather than the sm80 flag -- that flag is only set when
+        # an 8.x target is in the build, and an SM90-only or SM120-only build
+        # needs these just as much. The pre-indexer is JIT-only and is not part
+        # of this set.
+        from .jit.core import current_compilation_context
+
+        if any(
+            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        ):
+            jit_specs += [
+                gen_qsa_output_gate_module(),
+                gen_sparse_route_module(),
+                gen_sparse_scores_module(),
+            ]
         jit_specs += [
             gen_api_log_stats_module(),
             gen_cascade_module(),
@@ -880,8 +905,19 @@ def gen_all_modules(
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            gen_sparse_pre_indexer_module(),
             gen_topk_module(),
         ]
+        # The scorer multiplies with m16n8k16, so it is only built where that
+        # exists; without it here an AOT-only install has no artifact to load.
+        # has_sm80 means "an 8.x target is in the build", which is narrower than
+        # what the kernel needs: every 9.x/10.x/12.x target has m16n8k16 too.
+        from .jit.core import current_compilation_context
+
+        if any(
+            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        ):
+            jit_specs.append(gen_sparse_scores_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:
