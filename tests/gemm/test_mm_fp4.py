@@ -332,29 +332,6 @@ def _skip_unless_per_token_alpha_gpu():
         pytest.skip("per-token alpha needs the cute-dsl FP4 GEMM (SM100/SM103).")
 
 
-def _nvfp4_operands(m, n, k):
-    """Quantize random ``a`` (m, k) and ``b`` (n, k) to NVFP4 with the standard
-    global encode scales ``(448 * 6) / absmax``, i.e. the largest value the FP8
-    block scale times the FP4 range can represent.
-
-    Returns the packed operands, their block scales, the bf16 originals and
-    the scalar dequant alpha ``1 / (g_in * g_w)`` that undoes both encode
-    scales in ``a @ b.T``.
-    """
-    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
-    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
-    a_fp4, a_s = nvfp4_quantize(
-        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
-    )
-    b_fp4, b_s = nvfp4_quantize(
-        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
-    )
-    scalar_alpha = (1.0 / (g_in * g_w)).float().reshape(1)
-    return a, b, a_fp4, a_s, b_fp4, b_s, scalar_alpha
-
-
 # m is swept in full because the per-row indexing is what varies with it; n and
 # k only change the tile schedule, so they are kept to the minimum that still
 # exercises both a single- and a multi-tile N.
@@ -369,7 +346,10 @@ def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
     _skip_unless_per_token_alpha_gpu()
 
     torch.manual_seed(0)
-    a, b, a_fp4, a_s, b_fp4, b_s, scalar_alpha = _nvfp4_operands(m, n, k)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    # alpha = 1 / (g_in * g_w) undoes both NVFP4 global encode scales
+    # ((448 * 6) / absmax) in a @ b.T; it is what a scalar-alpha call uses.
+    scalar_alpha = alpha.float().reshape(1)
 
     # In production the per-token alpha is the dynamic per-row scale that
     # nvfp4_quantize(..., per_token_activation=True) returns, times the weight
@@ -434,8 +414,8 @@ def test_mm_fp4_per_token_alpha_rejected_by_other_backends(backend):
         pytest.skip("nvfp4_quantize needs SM100+.")
     m, n, k = 16, 256, 256
     torch.manual_seed(0)
-    _, _, a_fp4, a_s, b_fp4, b_s, scalar_alpha = _nvfp4_operands(m, n, k)
-    per_token_alpha = scalar_alpha.expand(m).contiguous()
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    per_token_alpha = alpha.float().reshape(1).expand(m).contiguous()
     out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
     with pytest.raises(
         (ValueError, BackendSupportedError),
@@ -465,8 +445,8 @@ def test_mm_fp4_per_token_alpha_auto_misaligned_n_raises():
         pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
     m, n, k = 16, 130, 128  # n % 8 == 2
     torch.manual_seed(0)
-    _, _, a_fp4, a_s, b_fp4, b_s, scalar_alpha = _nvfp4_operands(m, n, k)
-    per_token_alpha = scalar_alpha.expand(m).contiguous()
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    per_token_alpha = alpha.float().reshape(1).expand(m).contiguous()
     out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
     with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
         mm_fp4(

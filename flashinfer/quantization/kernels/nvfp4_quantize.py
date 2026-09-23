@@ -2957,6 +2957,10 @@ def nvfp4_quantize_per_token_cute_dsl(
     nvfp4_4over6_config = current_nvfp4_4over6_config()
 
     fold_out_scale = out_scale is not None
+    if fold_out_scale:
+        # Same contract as global_scale_inv: the compiled entry takes a
+        # contiguous float32 (1,) tensor on the input's device.
+        out_scale = out_scale.float().reshape(1).contiguous().to(input.device)
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
         dtype_key,
         k,
