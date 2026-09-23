@@ -822,11 +822,12 @@ def frost_template_kernel(
             for _bj in range(num_b_operands)
         ]
         previous_group_begin = cutlass.Int32(-1)
-        if cutlass.const_expr(moe_aligned_offsets):
+        # Inactive input columns are harmless; per-group output bounds stay intact.
+        if cutlass.const_expr((moe_aligned_offsets or direct_schedule)):
             b_desc_load_list = [tma_b_descs[_bj].get_ptr() for _bj in range(num_b_operands)]
         else:
             b_desc_load_list = b_desc_tma_ptr_list
-        if elect_one and cutlass.const_expr(not moe_aligned_offsets):
+        if elect_one and cutlass.const_expr(not (moe_aligned_offsets or direct_schedule)):
             for _bj in cutlass.range_constexpr(num_b_operands):
                 _copy_tensormap_to_workspace(tma_b_descs[_bj].get_ptr(), tma_b_desc_smem_list[_bj])
         nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -857,13 +858,13 @@ def frost_template_kernel(
             if is_valid != 0:
                 coord_m_desc = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
                 coord_n_group = tile_n * cgrp_tile_mnk[1] + n_rank * (cta_tile_mnk[1] * cta_group)
-                if cutlass.const_expr(moe_aligned_offsets):
+                if cutlass.const_expr((moe_aligned_offsets or direct_schedule)):
                     coord_n_desc = group_begin + coord_n_group
                 else:
                     coord_n_desc = coord_n_group
                 coord_n_per_cta = coord_n_desc + pair_member * cta_tile_mnk[1]
 
-                if group_begin != previous_group_begin and cutlass.const_expr(not moe_aligned_offsets):
+                if group_begin != previous_group_begin and cutlass.const_expr(not (moe_aligned_offsets or direct_schedule)):
                     previous_group_begin = group_begin
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         _fence_tensormap_acquire(b_desc_tma_ptr_list[_bj])
