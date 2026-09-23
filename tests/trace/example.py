@@ -84,12 +84,14 @@ mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+attention_ts_decode_tuple_multi_q_softmax_stats_sq4_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_softmax_stats_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -2749,6 +2751,21 @@ for _pts_semantic_PS in (32, 4):
         _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
         _pts_cache = (_pts_k, _pts_v)
 
+        if _pts_semantic_PS == _pts_PS:
+            _attention_ts_decode.fi_trace(
+                q=_pts_q,
+                paged_kv_cache=_pts_cache,
+                block_tables=_pts_block_tables,
+                seq_lens_kv=_pts_seq_lens,
+                seq_len_q=_pts_SQ,
+                max_q_len=_pts_SQ,
+                max_kv_len=_pts_SK,
+                page_size=_pts_PS,
+                mask_type="causal",
+                store_softmax_stats=True,
+                softmax_stats=torch.empty((*_pts_q.shape[:-1], 2), device=device),
+            )
+
         _attention_ts_decode(
             _pts_q,
             _pts_cache,
@@ -2857,6 +2874,20 @@ with contextlib.suppress(Exception):
         _pmla_num_pages, dtype=torch.int32, device=device
     ).reshape(_pmla_B, _pmla_pages_per_request)
     _pmla_seq_lens = torch.full((_pmla_B,), _pmla_SK, dtype=torch.int32, device=device)
+
+    _attention_ts_mla_decode.fi_trace(
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        max_q_len=_pmla_SQ,
+        max_kv_len=_pmla_SK,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        store_softmax_stats=True,
+        softmax_stats=torch.empty((*_pmla_q.shape[:-1], 2), device=device),
+    )
 
     _attention_ts_mla_decode(
         _pmla_q,

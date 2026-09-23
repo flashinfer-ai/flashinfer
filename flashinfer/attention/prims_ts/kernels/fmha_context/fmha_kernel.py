@@ -1196,6 +1196,9 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
+                keep_empty_kv=softmax_stats is not None
+                and not cfg.use_paged_kv
+                and not cfg.is_causal,
                 **work_queue_kwargs,
             )
         else:
@@ -1216,6 +1219,9 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
+                keep_empty_kv=softmax_stats is not None
+                and not cfg.use_paged_kv
+                and not cfg.is_causal,
                 **work_queue_kwargs,
             )
         else:
@@ -1285,6 +1291,7 @@ def build_context_task_manager(
         vc_repair_tiles=vc_repair_tiles,
         sage_scales=sage_scales,
         num_kv_heads=num_kv_heads,
+        store_softmax_stats=softmax_stats is not None,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1393,6 +1400,7 @@ def build_context_task_manager(
             sage_scales=sage_scales,
             num_kv_heads=num_kv_heads,
             score_seed_owner=tmem_sp0,
+            store_softmax_stats=softmax_stats is not None,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -3950,7 +3958,10 @@ class FmhaTs:
 
         # 7. Execute all tasks via the TS scheduler
         active_request = cutlass.Boolean(True)
-        if cutlass.const_expr(not is_persistent):
+        if cutlass.const_expr(
+            not is_persistent
+            and (softmax_stats is None or cfg.use_paged_kv or cfg.is_causal)
+        ):
             batch_coord = cute.arch.block_idx()[cfg.work_tile_coord_indices[2]]
             if cutlass.const_expr(seq_lens_kv is not None):
                 active_request = Int32(seq_lens_kv[batch_coord]) > Int32(0)

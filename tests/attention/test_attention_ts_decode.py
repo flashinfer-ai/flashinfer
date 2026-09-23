@@ -2688,6 +2688,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "max_kv_len",
         "validate",
+        "store_softmax_stats",
+        "softmax_stats",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -2719,6 +2721,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "split_kv",
         "validate",
         "initialize_workspace",
+        "store_softmax_stats",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -2738,9 +2741,18 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "return_lse",
         "attention_sinks",
         "validate",
+        "softmax_stats",
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert run_parameters["softmax_stats"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["softmax_stats"].default is None
+    assert (
+        inspect.signature(BatchDecodePagedTSWrapper.plan)
+        .parameters["store_softmax_stats"]
+        .default
+        is False
+    )
 
     assert _DecodePlanState.__dataclass_params__.frozen is True
     assert {"batch_size", "max_kv_len", "max_q_len", "seq_lens_kv"}.issubset(
@@ -2748,6 +2760,286 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     )
     request_fields = {"qo_indptr", "block_tables"}
     assert request_fields.isdisjoint(_DecodePlanState.__dataclass_fields__)
+
+
+@pytest.mark.parametrize("validate", (False, True))
+def test_attention_ts_decode_softmax_stats_binding_contract(validate) -> None:
+    from flashinfer.attention.prims_ts.decode import _validate_decode_softmax_stats
+
+    query = torch.empty((2, 3, 8, 128), dtype=torch.bfloat16)
+    stats = torch.empty((2, 3, 8, 2), dtype=torch.float32)
+    _validate_decode_softmax_stats(True, stats, query, validate=validate)
+    _validate_decode_softmax_stats(False, None, query, validate=validate)
+    for enabled, buffer in ((True, None), (False, stats)):
+        with pytest.raises(ValueError, match="exactly when"):
+            _validate_decode_softmax_stats(enabled, buffer, query, validate=validate)
+    if validate:
+        with pytest.raises(TypeError, match="float32"):
+            _validate_decode_softmax_stats(True, stats.half(), query, validate=True)
+        with pytest.raises(ValueError, match="shape"):
+            _validate_decode_softmax_stats(True, stats[..., :1], query, validate=True)
+        with pytest.raises(ValueError, match="contiguous"):
+            _validate_decode_softmax_stats(
+                True, torch.empty((2, 3, 8, 4))[..., ::2], query, validate=True
+            )
+
+
+@pytest.mark.parametrize("separate", (False, True))
+def test_attention_ts_decode_softmax_stats_workspace_contract(separate) -> None:
+    from flashinfer.attention.prims_ts.decode import _decode_scratch_shapes
+
+    config = FmhaDecodeConfig(
+        use_split_kv=True,
+        splits_kv=4,
+        max_splits_kv=4,
+        use_separate_reduction_kernel=separate,
+    )
+    geometry = dict(
+        batch_size=2, num_qo_heads=8, num_kv_heads=1, head_dim=128, seq_len_q=1
+    )
+    disabled = _decode_scratch_shapes(config, **geometry)
+    enabled = _decode_scratch_shapes(
+        replace(config, store_softmax_stats=True), **geometry
+    )
+    assert disabled[0] == enabled[0]
+    assert disabled[2] == enabled[2]
+    assert enabled[1] == (2, 1, 4, 8, 3 if separate else 2)
+    assert disabled[1] == ((2, 1, 4, 8) if separate else (2, 1, 4, 8, 2))
+
+
+def test_attention_ts_decode_softmax_stats_requires_exact_anchor() -> None:
+    config = FmhaDecodeConfig(use_keeps_mma_ab=True, tile_size_kv=256)
+    assert config.defers_softmax_anchor_updates
+    assert not replace(config, store_softmax_stats=True).defers_softmax_anchor_updates
+
+
+def test_attention_ts_decode_softmax_stats_and_lse_are_distinct_cache_fields() -> None:
+    base = FmhaDecodeConfig(runtime_split_kv=True, splits_kv=132, max_splits_kv=132)
+    signatures = {
+        replace(base, store_softmax_stats=stats, lse_mode=lse).compile_signature()
+        for stats in (False, True)
+        for lse in ("none", "base2")
+    }
+    assert len(signatures) == 4
+    for signature in signatures:
+        fields = dict(signature)
+        assert fields["runtime_split_kv"] is True
+        assert fields["splits_kv"] == fields["max_splits_kv"] == 132
+
+
+def test_attention_ts_decode_softmax_stats_rejects_only_new_sage_combination() -> None:
+    config = FmhaDecodeConfig(
+        q_dtype=Float8E4M3FN,
+        k_dtype=Float8E4M3FN,
+        v_dtype=Float8E4M3FN,
+        out_dtype=BFloat16,
+        sage_k_block_size=128,
+    )
+    config.validate_dtypes()
+    with pytest.raises(ValueError, match="store_softmax_stats.*Sage"):
+        replace(config, store_softmax_stats=True).validate_dtypes()
+    # Storage transforms remain separate from the effective compute recipe.
+    replace(config, sage_k_block_size=0, store_softmax_stats=True).validate_dtypes()
+
+
+@pytest.mark.parametrize("query_shape", ((2, 8, 128), (2, 3, 8, 128)))
+@pytest.mark.parametrize("stats_enabled", (False, True))
+def test_attention_ts_decode_softmax_stats_flattened_launch_abi(
+    query_shape, stats_enabled
+) -> None:
+    from flashinfer.attention.prims_ts import decode
+
+    q = torch.empty(query_shape, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    lse = torch.empty(query_shape[:-1], dtype=torch.float32)
+    stats = torch.empty((*query_shape[:-1], 2)) if stats_enabled else None
+    placeholder = torch.empty(1)
+    workspace = SimpleNamespace(
+        attention_sinks=placeholder,
+        cu_seqlens_q=placeholder,
+        partial_o=placeholder,
+        partial_stats=placeholder,
+        split_kv_counter=placeholder,
+    )
+    runtime = SimpleNamespace(
+        q=q,
+        out=out,
+        k_cache=placeholder,
+        v_cache=placeholder,
+        k_sf_cache=placeholder,
+        v_sf_cache=placeholder,
+        num_physical_pages=11,
+        k_page_stride=12,
+        k_head_stride=13,
+        k_token_stride=14,
+        v_page_stride=15,
+        v_head_stride=16,
+        v_token_stride=17,
+        softmax_scale=0.125,
+        output_scale=0.75,
+    )
+    calls = []
+    result = decode._launch_decode(
+        runtime,
+        seq_lens_kv=placeholder,
+        qo_indptr=None,
+        block_tables=placeholder,
+        workspace=workspace,
+        compiled_main=lambda *args: calls.append(args),
+        compiled_reducer=lambda *args: calls.append(args),
+        lse=lse,
+        softmax_stats=stats,
+        requested_splits=5,
+        max_q_len=3,
+        max_kv_len=4097,
+    )
+    assert result is out
+    assert len(calls) == 2
+    rows = math.prod(query_shape[:-2])
+    for args, lse_position in ((calls[0], 6), (calls[1], 1)):
+        assert args[lse_position].shape == (rows, 8)
+        assert args[lse_position].data_ptr() == lse.data_ptr()
+        assert args[-5:-1] == (5, 3, (), 4097)
+        if stats_enabled:
+            assert args[-1].shape == (rows, 8, 2)
+            assert args[-1].data_ptr() == stats.data_ptr()
+        else:
+            assert args[-1] is None
+
+
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+@pytest.mark.parametrize(
+    "reduction",
+    (
+        "disabled",
+        "gmem_reduction",
+        "cluster_smem_reduction",
+        "gmem_reduction_with_separate_kernel",
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_softmax_stats_attention_sink(
+    monkeypatch, dtype, reduction
+):
+    """Exercise the public sink and statistics outputs across reduction topologies."""
+    from flashinfer.attention.prims_ts import decode
+
+    split = reduction != "disabled"
+    kernel_dtype = BFloat16 if dtype == torch.bfloat16 else Float8E4M3FN
+    config = make_decode_config(
+        headdim=128,
+        args={
+            "use_keeps_mma_ab": False,
+            "tile_size_q": 16,
+            "store_softmax_stats": True,
+        },
+        seq_len_q=1,
+        seq_len_kv=1024,
+        batch_size=1,
+        num_heads_q=16,
+        num_heads_kv=1,
+        q_dtype=kernel_dtype,
+        k_dtype=kernel_dtype,
+        v_dtype=kernel_dtype,
+        o_dtype=BFloat16 if dtype == torch.bfloat16 else Float16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=32,
+        split_kv_mode=reduction,
+        splits_kv=2 if split else 1,
+        max_splits_kv=2 if split else 1,
+        use_attention_sinks=True,
+        mask_type="dense",
+        auto_tuner=False,
+    )
+    spec = decode._decode_launch_spec_from_config(
+        config,
+        batch_size=1,
+        num_qo_heads=16,
+        num_kv_heads=1,
+        head_dim=128,
+        seq_len_q=1,
+        max_active_clusters=1,
+    )
+    monkeypatch.setattr(
+        decode, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
+    )
+    torch.manual_seed(21094)
+    query = (torch.randn((1, 16, 128), device="cuda") * 0.4).to(dtype)
+    key = (torch.randn((32, 1, 32, 128), device="cuda") * 0.4).to(dtype)
+    value = (torch.randn((32, 1, 32, 128), device="cuda") * 0.4).to(dtype)
+    block_tables = torch.arange(32, dtype=torch.int32, device="cuda")[None]
+    seq_lens = torch.tensor([1021], dtype=torch.int32, device="cuda")
+    sinks = torch.linspace(-1.0, 5.0, 16, device="cuda", dtype=torch.float32)
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        "cuda",
+        1,
+        16,
+        1,
+        128,
+        32,
+        1024,
+        q_dtype=dtype,
+        out_dtype=torch.bfloat16 if dtype == torch.bfloat16 else torch.float16,
+        store_softmax_stats=True,
+        use_attention_sinks=True,
+        lse_mode="base2",
+    )
+    stats = torch.empty((1, 16, 2), dtype=torch.float32, device="cuda")
+    scale = 0.125
+    output, lse = wrapper.run(
+        query,
+        (key, value),
+        seq_lens,
+        block_tables,
+        softmax_scale=scale,
+        softmax_stats=stats,
+        attention_sinks=sinks,
+        return_lse=True,
+    )
+    keys = key.float().permute(0, 2, 1, 3).flatten(0, 1)[:1021, 0]
+    values = value.float().permute(0, 2, 1, 3).flatten(0, 1)[:1021, 0]
+    logits = query[0].float() @ keys.T * scale
+    maximum = logits.amax(-1)
+    probability = (logits - maximum[:, None]).exp()
+    denominator = probability.sum(-1) + (sinks - maximum).exp()
+    expected = probability @ values / denominator[:, None]
+    torch.testing.assert_close(stats[0, :, 0], maximum, atol=0.004, rtol=0.004)
+    torch.testing.assert_close(stats[0, :, 1], denominator, atol=0.015, rtol=0.004)
+    torch.testing.assert_close(output[0].float(), expected, atol=0.01, rtol=0.03)
+    expected_lse = (maximum + denominator.log()) * math.log2(math.e)
+    torch.testing.assert_close(lse[0], expected_lse, atol=0.015, rtol=0.002)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(
+            query,
+            (key, value),
+            seq_lens,
+            block_tables,
+            softmax_scale=scale,
+            softmax_stats=stats,
+            attention_sinks=sinks,
+            out=output,
+            lse=lse,
+            validate=False,
+        )
+    # Replay changed metadata before any eager wrapper call. Main's inactive
+    # request contract leaves every caller-owned output buffer untouched.
+    seq_lens.zero_()
+    output.fill_(7)
+    stats.fill_(11)
+    lse.fill_(13)
+    graph.replay()
+    torch.testing.assert_close(output, torch.full_like(output, 7), rtol=0, atol=0)
+    torch.testing.assert_close(stats, torch.full_like(stats, 11), rtol=0, atol=0)
+    torch.testing.assert_close(lse, torch.full_like(lse, 13), rtol=0, atol=0)
+    seq_lens.fill_(1021)
+    graph.replay()
+    torch.testing.assert_close(stats[0, :, 0], maximum, atol=0.004, rtol=0.004)
+    torch.testing.assert_close(stats[0, :, 1], denominator, atol=0.015, rtol=0.004)
+    torch.testing.assert_close(output[0].float(), expected, atol=0.01, rtol=0.03)
+    torch.testing.assert_close(lse[0], expected_lse, atol=0.015, rtol=0.002)
 
 
 _FORBIDDEN_DECODE_TUNING_PARAMETERS = frozenset(
@@ -4976,6 +5268,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_TrustedDecodePlanState",
         (),
         {
+            "config": FmhaDecodeConfig(),
             "out_dtype": torch.bfloat16,
             "lse_mode": "none",
             "use_attention_sinks": False,
@@ -5047,6 +5340,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         "_DecodeQModePlanState",
         (),
         {
+            "config": FmhaDecodeConfig(),
             "packed_query": True,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
@@ -5070,6 +5364,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         "_DecodeQModePlanState",
         (),
         {
+            "config": FmhaDecodeConfig(),
             "packed_query": False,
             "device": torch.device("cuda:0"),
             "batch_size": 2,

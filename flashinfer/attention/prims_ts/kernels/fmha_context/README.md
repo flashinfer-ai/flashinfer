@@ -45,7 +45,7 @@ Batch is exact; fixed contiguous Q/KV extents are exact, while packed/paged
 request lengths stay within the provided Q/KV bounds. Every `run()` supplies
 current tensors/metadata and launches the prepared execution.
 
-The contiguous plan fixes `packed` (BSHD or THD); paged plans also fix page size
+The contiguous plan fixes `packed_query` (BSHD or THD); paged plans also fix page size
 and optional `uniform_packed_lengths`, `has_q_offset`, and zero-V-tail promises.
 Plans retain host scalar defaults without device scale tensors. Variable-window
 plans allocate fallback CTA-minimum metadata; paged plans need no scratch.
@@ -70,6 +70,7 @@ Validation can read metadata values on the host. Trusted/captured execution uses
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state; INT8 Q/K accumulate INT32 scores that the softmax reads as FP32 |
 | Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` or `torch.int8` (SM100a only) Q/K, `torch.float8_e4m3fn` V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
+| Softmax statistics | Optional caller-owned FP32 maximum/denominator output for plain attention; not combined with Sage/VC or attention sinks |
 
 See the shared [validation scope](../../README.md#validation-scope) for the
 measured hardware and DSL versions, including SM103/GB300 coverage of the
@@ -100,7 +101,25 @@ below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
 or active wrapper-owned scratch. This is an unchecked caller
 precondition in both validation modes. The default API returns O; an enabled
 LSE plan can also return final FP32 LSE, as described below. Intermediate
-softmax state remains internal.
+softmax state remains internal unless explicitly requested.
+
+Set `plan(store_softmax_stats=True)` and supply `run(..., softmax_stats=stats)`
+to export compact FP32 `[*out.shape[:-1], 2]` statistics. The pair is the
+maximum scaled token logit `m` in natural-log units and
+`s = sum(exp(logit - m))`, with internal FP8 probability scaling removed.
+`output_scale` does not affect it. The buffer must be disjoint from inputs,
+outputs, LSE, metadata, and plan-owned storage. Its presence is checked even
+with `validate=False`; CUDA graphs retain the captured address. One-shot APIs
+accept the same flag and buffer, and the LSE API/return value remain unchanged.
+No additional statistics scratch is required for prefill.
+Statistics-enabled softmax centers raw scores before scaling and retains FP32
+probability sums instead of the optional packed-FP16 exponent/sum path. The
+statistics-disabled exponent policy is unchanged.
+
+Dense contiguous statistics retain valid-query empty-KV chunks and write zero
+output with `(-inf, 0)` statistics. Physical packed K/V storage must contain at
+least one token. Paged context statistics require positive per-request KV lengths.
+Statistics-disabled empty-request skipping is unchanged.
 
 ## Tensor and metadata layouts
 

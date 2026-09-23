@@ -199,6 +199,40 @@ shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime condition
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
 
+### Merge-compatible softmax statistics
+
+Contiguous/paged prefill, paged FMHA decode, and paged MLA decode accept
+`plan(store_softmax_stats=True)`. Each `run` then requires a caller-owned,
+contiguous FP32 `softmax_stats` tensor shaped `[*out.shape[:-1], 2]` on the
+same device. The flag is part of the compiled specialization; the buffer is
+per-run state and can be rebound without replanning. One-shot APIs expose the
+same flag and buffer. Decode workspace-size helpers must receive the same
+flag as the plan. With the flag disabled, no statistics output or extra
+statistics scratch is allocated.
+
+For each query/head, the two values are the maximum scaled token logit `m`
+(natural-log units) and `s = sum(exp(logit - m))`, after masking and before
+output scaling. Internal FP8 probability scaling is removed. Decode attention
+sinks, when present, contribute to `s` exactly once and do not change `m`.
+This is a maximum/denominator pair, not an LSE tensor. Independently computed
+partitions can be merged using weights `exp(m_i - max_j(m_j)) * s_i`; a sink
+must belong to only one partition. Empty rows, where supported by the existing
+attention API, produce `(-inf, 0)`.
+
+The optional base-2 `lse` output and its return-value semantics are unchanged;
+LSE and merge statistics may be enabled together. Context statistics support
+plain attention, not VC/Sage recipes or context attention sinks. Contiguous
+dense statistics support empty request-local K/V chunks when the physical
+packed K/V storage contains at least one token. Paged context statistics require
+positive per-request KV lengths. Statistics-disabled behavior is unchanged.
+
+The statistics buffer must not overlap inputs, output, workspace, or plan-owned
+buffers. The flag/buffer presence contract is enforced even with
+`validate=False`; other unchecked contracts remain the caller's responsibility.
+For CUDA graphs, warm up the exact specialization, supply stable output and
+statistics storage, and capture `run(..., validate=False)`. Replay overwrites
+the statistics for the current request metadata.
+
 ## QToken-KvBlock-Sparse-Attention interface
 
 QToken-KvBlock-Sparse-Attention consumes per-query indexer output directly.
