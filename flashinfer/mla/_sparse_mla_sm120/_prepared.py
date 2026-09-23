@@ -364,6 +364,11 @@ def wrapper_run(
     return_lse=False,
     lse_scale=1.0,
 ):
+    """Prepare or reuse a wrapper call, write output and optionally return LSE.
+
+    Shapes must be warmed up before graph capture; captured calls reuse the
+    prepared descriptor and scratch buffers. Strict BF16-QK rejects T=0.
+    """
     from ._execution import resolve_model_type as _resolve_model_type
 
     is_dsv4_nvfp4 = wrapper._kv_cache_format == "nvfp4"

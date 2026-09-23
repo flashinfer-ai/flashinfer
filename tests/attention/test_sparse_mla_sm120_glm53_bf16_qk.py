@@ -15,6 +15,7 @@ from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
 @pytest.fixture
 def sm12x():
+    """Skip native checks unless a supported SM12x CUDA device is available."""
     from flashinfer.utils import is_sm12x_supported
 
     if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
@@ -22,6 +23,7 @@ def sm12x():
 
 
 def _plan(**overrides):
+    """Build a strict GLM53 policy request with optional geometry overrides."""
     values = dict(
         num_tokens=1,
         num_heads=16,
@@ -40,7 +42,10 @@ def _plan(**overrides):
 @pytest.mark.parametrize("tokens", [1, 7, 65])
 @pytest.mark.parametrize("width", [2112, 2176])
 def test_fixed_sg_policy_does_not_use_fp8_calibration(monkeypatch, tokens, width):
+    """Select SG without loading a module or consulting FP8 timing profiles."""
+
     def unexpected(*args, **kwargs):
+        """Fail if strict planning reaches a forbidden calibration or JIT path."""
         raise AssertionError(
             "strict SG must not consult FP8 calibration or load a module"
         )
@@ -73,6 +78,7 @@ def test_fixed_sg_policy_does_not_use_fp8_calibration(monkeypatch, tokens, width
     ],
 )
 def test_policy_rejects_unsupported_bf16_qk(overrides):
+    """Reject unsupported models, shapes, extra caches and forced prefill choices."""
     with pytest.raises(ValueError, match="bf16_qk"):
         _plan(**overrides)
 
@@ -87,11 +93,13 @@ def test_policy_rejects_unsupported_bf16_qk(overrides):
     ],
 )
 def test_constructor_rejects_other_storage(kwargs):
+    """Reject cache formats and value dimensions incompatible with GLM53 BF16 QK."""
     with pytest.raises(ValueError, match="bf16_qk requires GLM53"):
         SparseMLASm120Wrapper(compute_precision="bf16_qk", **kwargs)
 
 
 def _metadata(tokens=1, width=2112, **overrides):
+    """Build compact-cache SG metadata for native resolver and capability checks."""
     values = dict(
         model=3,
         tokens=tokens,
@@ -117,6 +125,7 @@ def _metadata(tokens=1, width=2112, **overrides):
 
 
 def _resolve(metadata, precision="bf16_qk", max_shared=None):
+    """Resolve with real GPU capabilities and an optional shared-memory limit."""
     props = torch.cuda.get_device_properties("cuda")
     return execution.resolve_attention(
         **metadata._asdict(),
@@ -132,6 +141,7 @@ def _resolve(metadata, precision="bf16_qk", max_shared=None):
 @pytest.mark.parametrize("tokens", [1, 7, 65])
 @pytest.mark.parametrize("width", [2112, 2176])
 def test_descriptor_is_strict_and_accounts_for_bf16_shared_memory(sm12x, tokens, width):
+    """Require hybrid SG, zero split scratch and adequate BF16 shared memory."""
     metadata = _metadata(tokens, width)
     strict = _resolve(metadata)
     ordinary_sg = _resolve(metadata, precision="default")
@@ -167,11 +177,13 @@ def test_descriptor_is_strict_and_accounts_for_bf16_shared_memory(sm12x, tokens,
     ],
 )
 def test_resolver_does_not_fall_back_to_fp8(sm12x, overrides):
+    """Reject unsupported native requests instead of silently selecting FP8 QK."""
     with pytest.raises(RuntimeError, match="bf16_qk requires"):
         _resolve(_metadata(**overrides))
 
 
 def test_empty_strict_query_is_rejected(sm12x):
+    """Reject zero-token strict calls before the wrapper's empty-query fast path."""
     wrapper = SparseMLASm120Wrapper(
         kv_scale_format="arbitrary_fp32", compute_precision="bf16_qk"
     )
@@ -184,6 +196,7 @@ def test_empty_strict_query_is_rejected(sm12x):
 
 @pytest.mark.parametrize("width", [2112, 2176])
 def test_bf16_qk_packed_oracle_tails_masks_and_graphs(sm12x, width):
+    """Pass all 13 packed-cache cases per width, restoring TF32 state afterward."""
     path = (
         Path(__file__).resolve().parents[2]
         / "benchmarks/repro_glm53_sm120_precision.py"

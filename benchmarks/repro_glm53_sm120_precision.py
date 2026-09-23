@@ -39,6 +39,11 @@ SEED = 20260918
 
 
 def reference(q, cache, indices, lengths):
+    """Compute FP32 attention from packed cache bytes and length-masked indices.
+
+    Negative indices are holes; rows with no live slots return zeros. Query
+    values are not requantized, so this remains independent of kernel QK mode.
+    """
     raw = cache.view(torch.uint8).reshape(-1, CACHE_BYTES)
     values = raw[:, :512].contiguous().view(torch.float8_e4m3fn).float()
     scales = raw[:, 512:528].contiguous().view(torch.float32)
@@ -56,6 +61,7 @@ def reference(q, cache, indices, lengths):
 
 
 def error_metrics(output, expected):
+    """Return case/row errors and the worst coordinate, rejecting nonfinite data."""
     if not torch.isfinite(output).all() or not torch.isfinite(expected).all():
         raise AssertionError("Non-finite output or reference; aborting diagnostic")
     difference = output.float() - expected.float()
@@ -82,6 +88,7 @@ def error_metrics(output, expected):
 
 
 def quantized_query(q, *, power_of_two):
+    """Round Q through E4M3 for diagnostics, optionally rounding scales to powers of two."""
     # Diagnostic approximation to FlashInfer's query quantization, not a
     # replacement correctness oracle. Decode/MG round scales up to powers
     # of two; swapAB retains arbitrary FP32 scales for GLM's QK operation.
@@ -112,6 +119,7 @@ def pack_cache(values):
 
 
 def make_cache(device):
+    """Return a randomized compact cache and live slots, with NaN-poisoned slot zero."""
     gains = torch.tensor([0.37, 0.71, 1.13, 1.91], device=device)
     values = torch.randn(4095, 1, 4, 128, device=device)
     values = (values * gains[None, None, :, None]).reshape(-1, 512).to(torch.bfloat16)
@@ -124,6 +132,7 @@ def make_cache(device):
 
 
 def make_inputs(rows, locations, width, *, all_masked=False):
+    """Build BF16 queries and padded indices with poison just beyond each row's length."""
     device = locations.device
     q = torch.randn(rows, HEADS, 512, device=device, dtype=torch.bfloat16) * 0.7
     lengths = torch.tensor(
@@ -143,6 +152,7 @@ def make_inputs(rows, locations, width, *, all_masked=False):
 
 
 def make_runner(cache, route, precision):
+    """Return attention and plan-inspection closures for wrapper or direct FP8 SG."""
     from flashinfer.mla import SparseMLASm120Wrapper
 
     if route == "wrapper":
@@ -152,9 +162,11 @@ def make_runner(cache, route, precision):
         )
 
         def run(q, indices, lengths, output):
+            """Write attention output through the wrapper using per-row lengths."""
             wrapper.run(q, cache, indices, output, SCALE, topk_length=lengths)
 
         def plans():
+            """Report descriptors prepared by the wrapper for exercised shapes."""
             return [
                 dict(call.plan.inspect()) for call in wrapper._prepared_calls.values()
             ]
@@ -170,6 +182,7 @@ def make_runner(cache, route, precision):
     prepared = {}
 
     def run(q, indices, lengths, output):
+        """Resolve and reuse a direct FP8 SG plan, requiring warmup before capture."""
         key = (q.shape[0], indices.shape[1])
         if key not in prepared:
             if torch.cuda.is_current_stream_capturing():
@@ -230,12 +243,14 @@ def make_runner(cache, route, precision):
         )
 
     def plans():
+        """Report descriptors cached by the direct FP8 SG control."""
         return [dict(item[0].inspect()) for item in prepared.values()]
 
     return run, plans
 
 
 def measure(run, q, indices, lengths, output):
+    """Time 30 CUDA-event intervals after 10 warmups, including host launch gaps."""
     for _ in range(10):
         run(q, indices, lengths, output)
     samples = []
@@ -258,6 +273,11 @@ def measure(run, q, indices, lengths, output):
 
 
 def run_suite(width, route="wrapper", precision="default", *, timing=False):
+    """Return 13 seeded screening records for one width, including two graph replays.
+
+    Finite tolerance failures are recorded without stopping later cases;
+    nonfinite values and runtime errors abort. Timing covers eager cases only.
+    """
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
     cache, locations = make_cache(torch.device("cuda"))
@@ -265,6 +285,7 @@ def run_suite(width, route="wrapper", precision="default", *, timing=False):
     records = []
 
     def compare(name, q, indices, lengths, output):
+        """Record and print oracle errors, fixed-limit verdicts and optional timing."""
         expected = reference(q, cache, indices, lengths)
         metrics = error_metrics(output, expected)
         passed = (
@@ -358,6 +379,7 @@ def run_suite(width, route="wrapper", precision="default", *, timing=False):
 
 
 def main():
+    """Run the requested GPU screening suite, returning one for finite failures."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--route", choices=("wrapper", "fp8-sg"), default="wrapper")
     parser.add_argument("--precision", default="default")

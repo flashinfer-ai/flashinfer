@@ -276,6 +276,11 @@ def _lazy_calibrated_profile(request, device) -> Optional[dict]:
 
 
 def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]:
+    """Select from a timing profile, or return None for ordinary policy planning.
+
+    Tuning mode may populate or refine profiles. Strict BF16-QK bypasses this
+    path because its fixed SG route has no phase or CPB choice.
+    """
     if precision == "bf16_qk":
         # This route has one SG specialization and no split-K/CPB choice.
         # Legacy FP8 profiles must not select its arithmetic or execution phase.

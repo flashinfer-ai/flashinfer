@@ -6,6 +6,7 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
+/// Launch the prefill specialization selected by a validated execution plan.
 PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
                                      const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& m = plan.metadata;

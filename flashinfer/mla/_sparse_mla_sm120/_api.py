@@ -891,6 +891,10 @@ class _SparseMLAPagedAttentionRunner:
         compute_precision: str = "default",
         device: Optional[torch.device] = None,
     ) -> None:
+        """Initialize storage and precision policy without loading a JIT module.
+
+        See :class:`_SparseMLAPagedAttentionRunner` for parameter contracts.
+        """
         if (max_num_tokens is None) != (max_num_heads is None):
             raise ValueError(
                 "max_num_tokens and max_num_heads must be provided together"

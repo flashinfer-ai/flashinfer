@@ -62,6 +62,7 @@ void decode_resources(ExecutionPlan& p) {
   }
 }
 
+/// Set launch resources for the plan's model, implementation and numeric route.
 template <ModelType MT>
 void prefill_resources(ExecutionPlan& p) {
   if constexpr (MT == ModelType::GLM53_NOPE) {
@@ -101,6 +102,8 @@ void prefill_resources(ExecutionPlan& p) {
   }
 }
 
+/// Validate metadata and resolve launch/workspace requirements within device limits.
+/// RequireQkBF16PvFP8 rejects unsupported geometry rather than falling back to FP8 QK.
 ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute requested,
                                 int requested_cpb, DeviceCaps caps) {
   TVM_FFI_ICHECK(m.model >= 0 && m.model <= 5 && m.tokens > 0 && m.heads > 0 &&
@@ -249,6 +252,7 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
   return p;
 }
 
+/// Validate FFI capability arguments and return the resolved plan as a descriptor.
 ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t numeric, int64_t cpb,
                                int64_t sm_count, int64_t max_shared) {
   const auto m = unpack_metadata(values, 0);
@@ -259,6 +263,7 @@ ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t numeric, int6
   return pack_plan(resolve_attention(m, static_cast<NumericRoute>(numeric), cpb,
                                      {int(sm_count), size_t(max_shared)}));
 }
+/// Enumerate variants for canonical layout metadata without a device shared-memory cap.
 ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64_t page, bool dual,
                                int64_t extra_page, ffi::String precision) {
   ffi::Array<int64_t> result;
@@ -307,6 +312,7 @@ ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64
   return result;
 }
 
+/// Map legal variants to chunk capacities using actual metadata and device limits.
 ffi::Map<int64_t, int64_t> metadata_candidates(ffi::Array<int64_t> values, int64_t numeric,
                                                int64_t sm_count, int64_t max_shared) {
   TVM_FFI_ICHECK(
