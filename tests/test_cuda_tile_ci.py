@@ -183,7 +183,10 @@ def test_ci_image_validates_cuda_tile_versions_and_compiler(monkeypatch) -> None
     ]
 
 
-def test_ci_image_uses_system_tileiras_for_cuda_13_4(monkeypatch) -> None:
+@pytest.mark.parametrize("cuda_version", ["13.4", "13.5", "14.0"])
+def test_ci_image_uses_system_tileiras_for_cuda_13_4_and_newer(
+    monkeypatch, cuda_version
+) -> None:
     ci_image = load_ci_image_module()
     compiler_path = "/usr/local/cuda/bin/tileiras"
     compile_module = SimpleNamespace(
@@ -212,14 +215,17 @@ def test_ci_image_uses_system_tileiras_for_cuda_13_4(monkeypatch) -> None:
         ),
     )
 
-    assert ci_image._validate_cuda_tile_compiler("13.4") == (
+    assert ci_image._validate_cuda_tile_compiler(cuda_version) == (
         "1.6.0",
         "system",
         compiler_path,
     )
 
 
-def test_ci_image_rejects_tileiras_wheel_for_cuda_13_4(monkeypatch) -> None:
+@pytest.mark.parametrize("cuda_version", ["13.4", "13.5", "14.0"])
+def test_ci_image_rejects_tileiras_wheel_for_cuda_13_4_and_newer(
+    monkeypatch, cuda_version
+) -> None:
     ci_image = load_ci_image_module()
     monkeypatch.setattr(
         ci_image.importlib, "import_module", lambda name: SimpleNamespace()
@@ -230,10 +236,13 @@ def test_ci_image_rejects_tileiras_wheel_for_cuda_13_4(monkeypatch) -> None:
     )
 
     with pytest.raises(SystemExit, match="shadows the system compiler"):
-        ci_image._validate_cuda_tile_compiler("13.4")
+        ci_image._validate_cuda_tile_compiler(cuda_version)
 
 
-def test_ci_image_rejects_system_tileiras_without_sm107(monkeypatch) -> None:
+@pytest.mark.parametrize("cuda_version", ["13.4", "13.5", "14.0"])
+def test_ci_image_rejects_system_tileiras_without_sm107(
+    monkeypatch, cuda_version
+) -> None:
     ci_image = load_ci_image_module()
     compiler_path = "/usr/local/cuda/bin/tileiras"
 
@@ -260,7 +269,7 @@ def test_ci_image_rejects_system_tileiras_without_sm107(monkeypatch) -> None:
     )
 
     with pytest.raises(SystemExit, match="does not advertise SM107"):
-        ci_image._validate_cuda_tile_compiler("13.4")
+        ci_image._validate_cuda_tile_compiler(cuda_version)
 
 
 @pytest.mark.parametrize(
@@ -269,6 +278,7 @@ def test_ci_image_rejects_system_tileiras_without_sm107(monkeypatch) -> None:
         ("12.9", None, []),
         ("13.0", ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras"), ["13.0"]),
         ("13.4", ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras"), ["13.4"]),
+        ("13.5", ("1.4.2", "13.3.0", "/opt/cuda-tile/bin/tileiras"), ["13.5"]),
     ],
 )
 def test_ci_image_requires_cuda_tile_compiler_only_for_cuda13(

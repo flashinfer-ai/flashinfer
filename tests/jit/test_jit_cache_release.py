@@ -124,6 +124,38 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     )
 
 
+@pytest.mark.parametrize(
+    ("cuda_version", "expected_source"),
+    [
+        ("13.0", "github-release"),
+        ("130", "github-release"),
+        ("13.4", "github-source"),
+        ("134", "github-source"),
+        ("13.5", "github-source"),
+        ("135", "github-source"),
+        ("14.0", "github-source"),
+        ("140", "github-source"),
+    ],
+)
+def test_sccache_patch_applies_to_cuda_13_4_and_newer(cuda_version, expected_source):
+    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+install_patched_sccache() {{ :; }}
+install_released_sccache() {{ :; }}
+export CUDA_VERSION={cuda_version}
+install_sccache 0.17.0 x86_64
+printf '%s' "${{FLASHINFER_SCCACHE_INSTALL_SOURCE}}"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], check=True, capture_output=True, text=True
+    )
+
+    assert result.stdout == expected_source
+
+
 def test_pr_aot_matrix_waits_for_published_cuda_image_tag():
     workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text()
 

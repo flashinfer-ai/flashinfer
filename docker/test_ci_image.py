@@ -61,9 +61,21 @@ def _expected_cudnn_backend(version: str) -> int:
     return major * 10000 + minor * 100 + patch
 
 
+def _cuda_version_at_least(version: str, minimum: tuple[int, int]) -> bool:
+    try:
+        major, minor = (int(part) for part in version.split(".", 1))
+    except (TypeError, ValueError):
+        _fail(f"invalid CUDA version: {version}")
+    return (major, minor) >= minimum
+
+
 def _validate_cuda_tile_compiler(
     expected_cuda_version: str | None = None,
 ) -> tuple[str, str, str]:
+    use_system_tileiras = expected_cuda_version is not None and _cuda_version_at_least(
+        expected_cuda_version, (13, 4)
+    )
+
     try:
         importlib.import_module("cuda.tile.tune")
     except ImportError as error:
@@ -77,14 +89,14 @@ def _validate_cuda_tile_compiler(
     try:
         tileiras_version = importlib.metadata.version("nvidia-cuda-tileiras")
     except importlib.metadata.PackageNotFoundError as error:
-        if expected_cuda_version != "13.4":
+        if not use_system_tileiras:
             _fail(f"required cuda-tile package metadata not found: {error}")
         tileiras_version = "system"
 
-    if expected_cuda_version == "13.4" and tileiras_version != "system":
+    if use_system_tileiras and tileiras_version != "system":
         _fail(
             f"nvidia-cuda-tileiras=={tileiras_version} shadows the system compiler; "
-            "CUDA 13.4 images must use the toolkit's TileIRAS"
+            f"CUDA {expected_cuda_version} images must use the toolkit's TileIRAS"
         )
 
     try:
@@ -108,14 +120,18 @@ def _validate_cuda_tile_compiler(
     except OSError as error:
         _fail(f"could not run cuda-tile compiler --help: {error}")
 
-    if expected_cuda_version == "13.4":
+    if use_system_tileiras:
         if compiler_path != "/usr/local/cuda/bin/tileiras":
             _fail(
-                f"cuda-tile selected {compiler_path}; CUDA 13.4 images must use "
+                f"cuda-tile selected {compiler_path}; CUDA {expected_cuda_version} "
+                "images must use "
                 "/usr/local/cuda/bin/tileiras"
             )
         if "sm_107" not in result.stdout + result.stderr:
-            _fail("the CUDA 13.4 system TileIRAS does not advertise SM107 support")
+            _fail(
+                f"the CUDA {expected_cuda_version} system TileIRAS does not "
+                "advertise SM107 support"
+            )
 
     return cuda_tile_version, tileiras_version, compiler_path
 
