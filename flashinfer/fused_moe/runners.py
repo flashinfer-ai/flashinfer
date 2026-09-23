@@ -8290,6 +8290,7 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> Any:
+        self._require_built()
         self._validate_input_count(inputs)
         if tactic == -1 or tactic is None:
             gemm1_tactic, gemm2_tactic = _FALLBACK_STAGE_TACTIC
