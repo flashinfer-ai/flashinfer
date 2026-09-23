@@ -389,7 +389,8 @@ scores back dequantized so its P pass reads no scales.
 
 Rough figures on B200, kernel time relative to the BF16 kernel of the same
 plan under the same launch heuristic: the FP8 and INT8 recipes run the dense
-and block-sparse decode shapes (SOL and VSA geometries, long and short) about
+and block-sparse decode shapes (dense and sparse block patterns, long and
+short sequences) about
 15-20% faster; a small dense shape that a persistent BF16 grid already
 saturates gains nothing; INT8 is within a few percent of FP8; the 4- and
 1-token K blocks cost 10-20% over the 16-token block; the results do not

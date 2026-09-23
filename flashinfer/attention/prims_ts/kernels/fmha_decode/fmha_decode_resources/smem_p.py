@@ -534,8 +534,8 @@ class SmemPResource(DecodeGenResourceBase):
         # packed pair folded once after the loop. Scaling ahead on its own
         # lengthens the exponent chains and the load on its own needs a
         # second fragment of registers; the combination measured faster on
-        # the byte-wide SOL kernels and on the 16-bit dense and Q128 kernels
-        # and within noise on the 16-bit SOL kernels.
+        # the byte-wide block-sparse kernels and on the 16-bit dense and Q128
+        # kernels, and within noise on the 16-bit block-sparse kernels.
         num_fragments = cfg.num_softmax_score_fragments
         last_fragment = Int32(num_fragments - 1)
         total_sum_pair = (Float32(0.0), Float32(0.0))

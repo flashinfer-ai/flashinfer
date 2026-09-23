@@ -2376,7 +2376,8 @@ class FmhaDecodeConfig:
         tiles with the row's single ``c * sfQ`` multiplier, reading neither
         ``sfK`` nor the bias. Coarser geometries keep the scores quantized:
         their fold scales group maxima alone, and a write-back on the unmasked
-        pass would put a TMEM round trip on every tile of the SOL shapes.
+        pass would put a TMEM round trip on every tile of the block-sparse
+        shapes.
         """
         return (
             self.use_sage_attention
@@ -2394,8 +2395,8 @@ class FmhaDecodeConfig:
         the larger blocks keep the rotating register array. The two forms are
         the storage forms of ``SageKScalesResource``; this predicate selects
         between them. Forcing every
-        block size onto the SMEM form measured 2% to 4.5% slower on the
-        16-token recipes, so both forms stay.
+        block size onto the SMEM form measured slower on the 16-token
+        recipes, so both forms stay.
         """
         return self.use_sage_attention and groups >= 4
 

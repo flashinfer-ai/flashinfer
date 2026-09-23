@@ -1485,13 +1485,10 @@ def _recipe_relative_l2_bound(q_magnitude: float, qk_dtype: torch.dtype) -> floa
 
     The INT8 elementwise bound ``(5e-1, 5e-1)`` says nothing about outputs
     below one in magnitude, so this metric holds every head to a fraction of
-    its norm. The bounds leave about 1.2x to 1.7x headroom over the maxima
-    measured on B200 for both profiles and both route kinds: INT8 reaches
-    0.043 with logits spread by one standard deviation and 0.055 unscaled
-    against a bound of 0.075; E4M3 Q/K, whose three mantissa bits quantize
-    each input about ten times as coarsely, reaches 0.082 and 0.133 against
-    bounds of 0.10 and 0.20. A misaddressed scale moves a head by well over
-    half its norm.
+    its norm. The bounds leave headroom over the maxima observed for both
+    profiles and both route kinds; E4M3 Q/K, whose three mantissa bits
+    quantize each input about ten times as coarsely as INT8, get the looser
+    bounds. A misaddressed scale moves a head by well over half its norm.
     """
 
     if qk_dtype == torch.int8:

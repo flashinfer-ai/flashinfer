@@ -40,9 +40,7 @@ BYTES_PER_KIB = 1024
 # previous QK freed instead of waiting for a V slot that its tile's PV still
 # holds. The four-stage build demotes one pair of persistent scheduler words
 # per warp role to local memory; that costs no measurable time, and four
-# stages measure equal or faster than five on every byte-wide case. The
-# measurements are in the K/V ring depth section of
-# flashinfer/attention/prims_ts/kernels/fmha_decode/README.md. Keep both
+# stages measure equal or faster than five on every byte-wide case. Keep both
 # exact-profile depths separate from the conservative, topology-independent
 # MAX_KV_STAGE_SMEM_KIB inference above.
 KV_TILE_256_SHARED_FIFO_STAGES = 3

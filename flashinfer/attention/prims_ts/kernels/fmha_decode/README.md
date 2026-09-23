@@ -360,11 +360,11 @@ this section records what the kernel does with the scales.
 `FmhaDecodeConfig.sage_k_block_size > 0` enables the feature
 (`use_sage_attention`); `sage_q_block_size` and `sage_v_mean` are only legal
 with it. The Sage rules live next to the rules they extend. `validate_dtypes`
-keeps Q == K for every recipe (`kv_dtype` is the K dtype) and, with Sage on,
+keeps Q == K for every recipe and, with Sage on,
 requires Q and K in `Float8E4M3FN` or `Int8`, `Float8E4M3FN` V and a 16-bit
 output; `Int8` K is legal only with Sage scales. `v_dtype` always holds a
-concrete type: `make_decode_config` sets it from `kv_dtype` when a caller
-leaves it out, and code that assigns `kv_dtype` assigns it as well.
+concrete type: `make_decode_config` sets it from `k_dtype` when a caller
+leaves it out.
 `validate_sage_profile` checks the rest of the recipe: `sage_k_block_size` in
 `SAGE_K_BLOCK_SIZES`, `sage_q_block_size` a power of two no larger than
 `tile_size_q`, contiguous K/V with `headdim == 128`, a two-instance Keeps
@@ -388,7 +388,7 @@ dtype: the exponent addend formed once per row, the rolled masked max pass
 with a compile-time tail location, the seeded probability sum chains, the CLC
 response slot in the unified SMEM block and one correction store wait per O
 stage. The byte-wide-only policies (`splits_kv_tile_256_tail_columns`, the
-four-stage KV256 ring) are measured performance choices gated on the
+four-stage KV256 ring) are performance choices gated on the
 one-byte K and V element widths, not dtype requirements; the P pass loads the next score
 fragment behind the scale FFMAs for every dtype.
 
@@ -467,17 +467,13 @@ shallow: the ring alternates K and V tiles, a V slot stays held until its
 tile's PV has run, and with three slots the load of K(t+2) waits for that
 release, so the QK of tile t+2 sees the whole TMA latency. With four slots
 every K load takes the slot the previous QK freed and every V load the slot
-the previous PV freed. On B200 the block-sparse Sage kernels run about 7.5%
-faster with four stages than with three and gain nothing past four. The
-four-stage build demotes one pair of persistent scheduler words per warp role
-to an 8-byte stack (18 STL and 28 LDL per kernel, reloaded once per tile away
-from the softmax critical path); against a five-stage build, which keeps every
-role spill-free, four stages measure equal or faster on every byte-wide case
-(CUDA Graph replay minimum, three paired legs): dense S=10800 H=40 0.982, INT8
-proxy at the SOL shape 0.967, FP8 proxy 0.996, FP8 and INT8 exact within 0.3%,
-Q128 exact 0.995. The 32 KiB the shallower ring leaves free stay available
-for the small-block `sfK` buffers. An explicit `kv_stages` overrides the
-default in both directions.
+the previous PV freed. Four stages measured equal or faster than five on
+every byte-wide shape, dense and block-sparse, although the four-stage
+build demotes one pair of persistent-scheduler words per warp role to
+local memory (reloaded once per tile, away from the softmax critical
+path), and a deeper ring buys nothing. The 32 KiB the shallower ring leaves
+free stay available for the small-block `sfK` buffers. An explicit
+`kv_stages` overrides the default in both directions.
 
 ### INT32 scores
 
