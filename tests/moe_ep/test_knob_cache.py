@@ -162,8 +162,9 @@ def test_permitted_session_falls_back_to_a_deterministic_entry(monkeypatch, tmp_
     )
 
 
+@pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
 def test_resolve_ignores_an_ikr_entry_for_a_deterministic_session(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, dtype
 ):
     """Falling back to the heuristic beats serving a knob set never measured."""
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
@@ -172,18 +173,19 @@ def test_resolve_ignores_an_ikr_entry_for_a_deterministic_session(
         resolve_knobs,
     )
 
+    key = {**_KEY, "dtype": dtype}
     _cache_env(monkeypatch, tmp_path)
     with mock.patch(
         "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache."
         "_current_device_name",
         return_value="testgpu",
     ):
-        record_knobs({**_KNOBS, "in_kernel_fc2_reduce": True}, max_tokens=2048, **_KEY)
-        knobs, source = resolve_knobs(max_tokens=2048, **_KEY)
+        record_knobs({**_KNOBS, "in_kernel_fc2_reduce": True}, max_tokens=2048, **key)
+        knobs, source = resolve_knobs(max_tokens=2048, **key)
         permitted, permitted_source = resolve_knobs(
-            max_tokens=2048, enable_in_kernel_fc2_reduce=True, **_KEY
+            max_tokens=2048, enable_in_kernel_fc2_reduce=True, **key
         )
-    assert (source, knobs) == ("heuristic", default_knobs(2048))
+    assert (source, knobs) == ("heuristic", default_knobs(2048, dtype=dtype))
     assert permitted_source == "cache"
     assert permitted["in_kernel_fc2_reduce"] is True
 
@@ -255,8 +257,14 @@ def test_backend_warns_on_auto_knobs():
 
 
 @pytest.mark.arch_blackwell
-def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
-    """knobs=None buffer creation must pick up the recorded winner."""
+@pytest.mark.parametrize(
+    "mode,mma_m,explicit",
+    [("nvfp4", 256, False), ("bf16_nvfp4", 128, False), ("bf16_nvfp4", 128, True)],
+)
+def test_symm_buffer_resolves_cached_knobs(
+    monkeypatch, tmp_path, mode, mma_m, explicit
+):
+    """Cached and explicit partial tiles derive the same CTA instruction mode."""
     import torch
 
     if not torch.cuda.is_available():
@@ -272,21 +280,30 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
         record_knobs,
     )
 
+    if mode == "bf16_nvfp4":
+        from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+            get_symm_buffer_for_bf16_nvfp4_mega_moe as get_symm_buffer_for_mega_moe,
+        )
+
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     _cache_env(monkeypatch, tmp_path)
     hidden, intermediate2x, num_experts, topk, max_tokens = 2048, 2048, 4, 4, 64
+    token_back_mode = {
+        "nvfp4": "standalone_warps",
+        "bf16_nvfp4": "reuse_dispatch_warps",
+    }[mode]
     cached = {
-        "mma_tiler_mnk": (256, 128, 256),
+        "mma_tiler_mnk": (mma_m, 128, 256),
         "cluster_shape_mnk": (2, 1, 1),
         "group_hint": 128,
         "flag_batch": 16,
         "epi_flag_batch": (1, 2),
-        "token_back_mode": "standalone_warps",
+        "token_back_mode": token_back_mode,
         "load_balance_mode": "atomic_counter",
     }
     record_knobs(
-        cached,
-        dtype="nvfp4",
+        {**cached, "flag_batch": 8} if explicit else cached,
+        dtype=mode,
         world_size=1,
         hidden=hidden,
         intermediate=intermediate2x,
@@ -294,14 +311,44 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
         topk=topk,
         max_tokens=max_tokens,
     )
+    knobs = cached if explicit else None
     buf = get_symm_buffer_for_mega_moe(
-        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1
+        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1, knobs=knobs
     )
     try:
         cfg = buf._frontend.config
+        assert cfg.mma_tiler_mnk == cached["mma_tiler_mnk"]
+        assert cfg.use_2cta_instrs == (mma_m == 256)
         assert cfg.flag_batch == 16
         assert cfg.group_hint == 128
-        assert cfg.token_back_mode == "standalone_warps"
+        assert cfg.token_back_mode == token_back_mode
         assert cfg.epi_flag_batch == (1, 2)
     finally:
         buf.destroy()
+
+
+def test_routing_weight_placement_partitions_cache(monkeypatch, tmp_path):
+    import json
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+
+    path = _cache_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
+    key = dict(max_tokens=2048, **{**_KEY, "dtype": "bf16_nvfp4"})
+    knob_cache.record_knobs(_KNOBS, **key)
+    assert knob_cache.lookup_knobs(**key) == _KNOBS
+    assert knob_cache.lookup_knobs(apply_topk_in_fc1=False, **key) == _KNOBS
+    assert knob_cache.lookup_knobs(apply_topk_in_fc1=True, **key) is None
+
+    fc1_knobs = {**_KNOBS, "flag_batch": 8}
+    knob_cache.record_knobs(fc1_knobs, apply_topk_in_fc1=True, **key)
+    replacement = {**_KNOBS, "flag_batch": 2}
+    knob_cache.record_knobs(replacement, apply_topk_in_fc1=False, **key)
+    assert knob_cache.resolve_knobs(**key) == (replacement, "cache")
+    assert knob_cache.resolve_knobs(apply_topk_in_fc1=True, **key) == (
+        fc1_knobs,
+        "cache",
+    )
+    entries = json.loads(path.read_text())["entries"]
+    assert len(entries) == 2
+    assert {entry["apply_topk_in_fc1"] for entry in entries} == {False, True}
