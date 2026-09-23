@@ -30,7 +30,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Literal, Mapping, Optional
+from typing import Any, Callable, ClassVar, List, Literal, Mapping, Optional
 
 import torch
 
@@ -113,8 +113,13 @@ def _cutile_bucket_compile_token_counts(
     hidden_size: int,
     intermediate_size: int,
     block_size: int,
+    variant_key: Callable[[int], tuple[Any, ...]] | None = None,
 ) -> tuple[int, ...]:
     """Return the cuTile dispatch-shape representatives for one tune bucket.
+
+    ``variant_key`` lets a runner append its own compile-time choices for a
+    token count (split counts, epilogue tiles) to the shape fingerprint, so a
+    bucket keeps one representative per distinct kernel variant.
 
     cuTile specializes array arguments by a small set of alignment and shape
     divisibility facts.  The MoE host code also has a few routing, padding, and
@@ -188,6 +193,7 @@ def _cutile_bucket_compile_token_counts(
             routing_regime,
             block_shape,
             regime_flags,
+            variant_key(num_tokens) if variant_key is not None else (),
         )
         representatives.setdefault(fingerprint, num_tokens)
 
@@ -3180,6 +3186,13 @@ class CuTileBf16Runner(MoERunner):
             raise ValueError(f"invalid cuTile tactic: {tactic!r}.")
         return int(tactic[0])
 
+    def _bucket_variant_key(
+        self, num_tokens: int, hidden_size: int, tactic: Any
+    ) -> tuple[Any, ...]:
+        """Compile-time choices a runner makes per token count beyond shape."""
+        del num_tokens, hidden_size, tactic
+        return ()
+
     def _precompile_bucket_variants(
         self, inputs: List[torch.Tensor], tactic: Any
     ) -> None:
@@ -3201,6 +3214,9 @@ class CuTileBf16Runner(MoERunner):
             hidden_size=hidden_size,
             intermediate_size=self.config.experts.intermediate_size,
             block_size=self._compilation_block_size(tactic),
+            variant_key=lambda count: self._bucket_variant_key(
+                count, hidden_size, tactic
+            ),
         )
 
         # Every cuTile MoE pack keeps output, activation, routing IDs, and
@@ -4213,25 +4229,46 @@ class _CuTileFp4Runner(CuTileBf16Runner):
         block_size: int,
         config: tuple[int, int, int],
     ) -> int:
-        num_assignments = inputs[2].numel()
+        return self._fp4_k_splits_for_shape(
+            inputs[1].shape[0],
+            inputs[1].shape[1],
+            stage=stage,
+            block_size=block_size,
+            config=config,
+        )
+
+    def _fp4_k_splits_for_shape(
+        self,
+        num_tokens: int,
+        hidden_size: int,
+        *,
+        stage: int,
+        block_size: int,
+        config: tuple[int, int, int],
+    ) -> int:
+        top_k = self.config.routing.top_k
         # Eligibility follows the workspace bucket, not the live batch, so the
         # partial buffer allocated in _ensure_workspace is always present here.
         capacity = map_to_hybrid_bucket(
-            inputs[1].shape[0], self.config.execution.tune_max_num_tokens
+            num_tokens, self.config.execution.tune_max_num_tokens
         )
-        max_splits = self._fp4_max_k_splits(capacity * self.config.routing.top_k)
+        max_splits = self._fp4_max_k_splits(capacity * top_k)
         if max_splits == 1:
             return 1
-        problem = self._fp4_gemm_problem(
-            inputs, stage=stage, block_size=block_size, fuse_gemm1=False
-        )
+        num_assignments = num_tokens * top_k
+        intermediate_size = self.config.experts.intermediate_size
+        if stage == 1:
+            n = intermediate_size * (2 if self.config.activation.is_gated else 1)
+            k = hidden_size
+        else:
+            n, k = hidden_size, intermediate_size
         tile_n, tile_k, _ = config
         num_experts = self.config.routing.num_experts
         m_blocks = (
             num_assignments + num_experts * (block_size - 1) + block_size - 1
         ) // block_size
-        grid = min(m_blocks, num_assignments) * ((problem.n + tile_n - 1) // tile_n)
-        num_k_tiles = (problem.k + tile_k - 1) // tile_k
+        grid = min(m_blocks, num_assignments) * ((n + tile_n - 1) // tile_n)
+        num_k_tiles = (k + tile_k - 1) // tile_k
         if grid >= self._num_sms:
             return 1
         target = _CUTILE_FP4_SPLIT_K_TARGET_CTAS_PER_SM * self._num_sms
@@ -4243,6 +4280,31 @@ class _CuTileFp4Runner(CuTileBf16Runner):
         ):
             splits *= 2
         return splits
+
+    def _bucket_variant_key(
+        self, num_tokens: int, hidden_size: int, tactic: Any
+    ) -> tuple[Any, ...]:
+        # K_SPLITS and the reduce row tile are compile-time kernel parameters,
+        # so each distinct combination inside a bucket needs its own warm-up.
+        block_size, _, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = map(int, tactic)
+        num_assignments = num_tokens * self.config.routing.top_k
+        return (
+            self._fp4_k_splits_for_shape(
+                num_tokens,
+                hidden_size,
+                stage=1,
+                block_size=block_size,
+                config=(g1_n, g1_k, g1_occ),
+            ),
+            self._fp4_k_splits_for_shape(
+                num_tokens,
+                hidden_size,
+                stage=2,
+                block_size=block_size,
+                config=(g2_n, g2_k, g2_occ),
+            ),
+            self._kernel_module.split_k_reduce_row_tile(num_assignments),
+        )
 
     def _fp4_config_rejection_reason(
         self, problem: _CuTileGemmProblem, config: tuple[int, int, int]

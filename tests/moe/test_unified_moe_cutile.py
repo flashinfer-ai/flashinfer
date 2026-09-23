@@ -153,6 +153,26 @@ def test_cutile_autotune_uses_bounded_dispatch_representatives():
     assert all(1 <= count <= max_num_tokens for count in counts)
 
 
+def test_cutile_bucket_representatives_split_on_runner_variant_key():
+    common = dict(
+        tune_max_num_tokens=256,
+        num_experts=8,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=512,
+        block_size=16,
+    )
+    base = _cutile_bucket_compile_token_counts(64, **common)
+    # A key that changes inside the bucket must add representatives for every
+    # value it takes, and never drop the shape-only ones.
+    keyed = _cutile_bucket_compile_token_counts(
+        64, variant_key=lambda num_tokens: (num_tokens > 48,), **common
+    )
+    assert set(base).issubset(keyed)
+    assert any(count > 48 for count in keyed) and any(count <= 48 for count in keyed)
+    assert len(keyed) > len(base)
+
+
 @pytest.mark.parametrize("arch", (80, 86, 89, 90, 100, 103, 120, 121))
 @pytest.mark.parametrize("weight_format", (QuantFormat.NVFP4, QuantFormat.MXFP4))
 @pytest.mark.parametrize("activation_fp4", (False, True))
@@ -1656,6 +1676,39 @@ def test_cutile_mxfp4_quantization_covers_tail(scale_row_major):
 
 
 @cutile_nvfp4_required
+def test_cutile_nvfp4_bucket_variant_key_tracks_split_counts():
+    config, activations, weights, _ = _make_nvfp4_case(
+        ReLU2(), num_tokens=2, num_experts=4, top_k=2, hidden_size=512
+    )
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    tactic = (16, 1, 128, 64, 2, 128, 64, 2)
+    hidden_size = inputs[1].shape[1]
+    keys = {
+        num_tokens: runner._bucket_variant_key(num_tokens, hidden_size, tactic)
+        for num_tokens in (1, 2, 8, 16, 64)
+    }
+    for num_tokens, key in keys.items():
+        g1 = runner._fp4_k_splits_for_shape(
+            num_tokens, hidden_size, stage=1, block_size=16, config=(128, 64, 2)
+        )
+        g2 = runner._fp4_k_splits_for_shape(
+            num_tokens, hidden_size, stage=2, block_size=16, config=(128, 64, 2)
+        )
+        assert key == (
+            g1,
+            g2,
+            runner._kernel_module.split_k_reduce_row_tile(num_tokens * 2),
+        )
+    # Small batches split while a batch whose grid covers the SMs does not, so
+    # the key must differ across the counts a bucket precompilation would see.
+    assert keys[1][0] > 1
+    assert len(set(keys.values())) > 1
+
+
+@cutile_nvfp4_required
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 @pytest.mark.parametrize("k_splits", (2, 4))
 def test_cutile_nvfp4_split_k_matches_unsplit_and_reference(
@@ -1663,18 +1716,19 @@ def test_cutile_nvfp4_split_k_matches_unsplit_and_reference(
 ):
     from flashinfer.fused_moe import runners as runners_module
 
-    # hidden_size 512 gives 8 K tiles at tile_k 64, so both GEMMs can split 4.
+    # hidden_size = intermediate_size = 512 gives 8 K tiles at tile_k 64, so
+    # both GEMMs can split 4 with the explicit tactic below.
     config, activations, weights, expected = _make_nvfp4_case(
-        activation, num_tokens=3, hidden_size=512, intermediate_size=256
+        activation, num_tokens=3, hidden_size=512, intermediate_size=512
     )
+    tactic = (16, 0, 128, 64, 2, 128, 64, 2)
+    applied: list[int] = []
 
     def run(splits: int) -> torch.Tensor:
         def forced_splits(self, inputs, *, stage, block_size, config):
-            k = inputs[1].shape[1] if stage == 1 else config_intermediate
-            num_k_tiles = (k + config[1] - 1) // config[1]
-            return max(1, min(splits, num_k_tiles // 2))
+            applied.append(splits)
+            return splits
 
-        config_intermediate = config.experts.intermediate_size
         monkeypatch.setattr(
             runners_module._CuTileFp4Runner,
             "_fp4_max_k_splits",
@@ -1687,8 +1741,9 @@ def test_cutile_nvfp4_split_k_matches_unsplit_and_reference(
         runner.check_support()
         runner.build()
         inputs = runner.pack_inputs(activations, weights)
-        tactic = runner._fp4_fallback_tactic(inputs)
+        applied.clear()
         out = runner.forward(inputs, tactic=tactic).clone()
+        assert applied == [splits, splits]
         assert (runner._workspace.partial is not None) is (splits > 1)
         return out
 

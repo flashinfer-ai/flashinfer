@@ -644,6 +644,21 @@ def _reduce_activation_quantize_fp4_i64(
     )
 
 
+def split_k_reduce_row_tile(num_assignments: int) -> int:
+    """Row tile of the split-K reduce kernel (a compile-time kernel parameter).
+
+    Decode batches are a handful of rows; one CTA per row block would leave the
+    reduction on a few SMs, so row tiles stay small until the grid fills.
+    """
+    if num_assignments <= 8:
+        return 2
+    if num_assignments <= 32:
+        return 4
+    if num_assignments <= 128:
+        return 8
+    return min(128, next_positive_power_of_2(num_assignments + 1))
+
+
 def _launch_reduce_activation_quantize(
     partial: torch.Tensor,
     k_splits: int,
@@ -672,16 +687,7 @@ def _launch_reduce_activation_quantize(
             f"{intermediate_size}."
         )
     num_tiles = intermediate_size // tile_i
-    # Decode batches are a handful of rows; one CTA per row block would leave
-    # the reduction on a few SMs, so keep row tiles small until the grid fills.
-    if num_assignments <= 8:
-        tile_m = 2
-    elif num_assignments <= 32:
-        tile_m = 4
-    elif num_assignments <= 128:
-        tile_m = 8
-    else:
-        tile_m = min(128, next_positive_power_of_2(num_assignments + 1))
+    tile_m = split_k_reduce_row_tile(num_assignments)
     partial_3d = partial.view(k_splits, num_assignments + 1, gemm1_width)
     base_kernel = (
         _reduce_activation_quantize_fp4_i64
