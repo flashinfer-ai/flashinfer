@@ -10,13 +10,13 @@ typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Deepgemm requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct __align__(128) DeepgemmTensorMap { uint64_t opaque[16]; };
+struct __align__(64) DeepgemmTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(DeepgemmTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(DeepgemmTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -25,11 +25,11 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
+static_assert(alignof(DeepgemmTensorMap) >= alignof(CUtensorMap), "DeepgemmTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
+#define DEEPGEMM_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_A_TMEM_OFFSET 0
 #define TMEM_ACCUM_OFFSET 128
@@ -986,7 +986,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(768, 1) void
-kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word)
+kernel_deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1172,16 +1172,16 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                 unsigned int seq = 0;
                 if (elect_sync()) {
                     #pragma unroll 1
-                    for (int task = bid; task < (num_tokens + 63) / 64 * 40; task += 152) {
+                    for (int task = bid; task < (num_tokens + 63) / 64 * 16; task += 152) {
                         #pragma unroll 1
-                        for (int kb = 0; kb < 2 + ((task % 40 < 0) ? 1 : 0); kb++) {
-                            unsigned int extra = ((task % 40 < 0) ? (unsigned int)(task % 40) : (unsigned int)0);
-                            unsigned int hidden = ((unsigned int)(task % 40 * 2) + extra) * 64 + (unsigned int)(kb * 64);
+                        for (int kb = 0; kb < 5 + ((task % 16 < 0) ? 1 : 0); kb++) {
+                            unsigned int extra = ((task % 16 < 0) ? (unsigned int)(task % 16) : (unsigned int)0);
+                            unsigned int hidden = ((unsigned int)(task % 16 * 5) + extra) * 64 + (unsigned int)(kb * 64);
                             if (warp == 0) {
                                 unsigned int stage = seq % 4;
                                 mbarrier_wait(empty_io_addr + (stage) * 8, seq / 4 % 2 ^ 1);
-                                tma_3d_gmem2smem(residual_addr + stage * 32768, (&residual_map), hidden, task / 40 * 64, 0, full_io_addr + (stage) * 8);
-                                tma_2d_gmem2smem(x_addr + stage * 8192, (&x_map), hidden, task / 40 * 64, full_io_addr + (stage) * 8);
+                                tma_3d_gmem2smem(residual_addr + stage * 32768, (&residual_map), hidden, task / 16 * 64, 0, full_io_addr + (stage) * 8);
+                                tma_2d_gmem2smem(x_addr + stage * 8192, (&x_map), hidden, task / 16 * 64, full_io_addr + (stage) * 8);
                                 mbarrier_arrive_expect_tx(full_io_addr + (stage) * 8, 40960);
                             } else {
                                 unsigned int stage_1 = seq % 2;
@@ -1200,12 +1200,12 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                 unsigned int aseq = 0;
                 unsigned int cseq = 0;
                 #pragma unroll 1
-                for (int task_1 = bid; task_1 < (num_tokens + 63) / 64 * 40; task_1 += 152) {
+                for (int task_1 = bid; task_1 < (num_tokens + 63) / 64 * 16; task_1 += 152) {
                     unsigned int cstage = cseq % 2;
                     mbarrier_wait(empty_accum_addr + (cstage) * 8, cseq / 2 % 2 ^ 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     #pragma unroll 1
-                    for (int kb_1 = 0; kb_1 < 2 + ((task_1 % 40 < 0) ? 1 : 0); kb_1++) {
+                    for (int kb_1 = 0; kb_1 < 5 + ((task_1 % 16 < 0) ? 1 : 0); kb_1++) {
                         unsigned int fstage = fseq % 2;
                         mbarrier_wait(full_fn_addr + (fstage) * 8, fseq / 2 % 2);
                         asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1322,37 +1322,37 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
             } else {
                 unsigned int io_seq = 0;
                 unsigned int coeff_seq = 0;
-                if ((unsigned int)bid < (num_tokens + 63) / 64 * 40) {
+                if ((unsigned int)bid < (num_tokens + 63) / 64 * 16) {
                     mbarrier_wait(empty_coeff_addr, 1);
                     if (elect_sync()) {
-                        tma_2d_gmem2smem(post_addr, (&post_map), 0, bid / 40 * 64, full_coeff_addr);
-                        tma_2d_gmem2smem(comb_addr, (&comb_map), 0, bid / 40 * 64, full_coeff_addr);
+                        tma_2d_gmem2smem(post_addr, (&post_map), 0, bid / 16 * 64, full_coeff_addr);
+                        tma_2d_gmem2smem(comb_addr, (&comb_map), 0, bid / 16 * 64, full_coeff_addr);
                         mbarrier_arrive_expect_tx(full_coeff_addr, 5120);
                     }
                     __syncwarp();
                     coeff_seq = 1;
                 }
                 #pragma unroll 1
-                for (int task_2 = bid; task_2 < (num_tokens + 63) / 64 * 40; task_2 += 152) {
-                    unsigned int mb = task_2 / 40;
+                for (int task_2 = bid; task_2 < (num_tokens + 63) / 64 * 16; task_2 += 152) {
+                    unsigned int mb = task_2 / 16;
                     #pragma unroll 1
-                    for (int kb_2 = 0; kb_2 < 2 + ((task_2 % 40 < 0) ? 1 : 0); kb_2++) {
+                    for (int kb_2 = 0; kb_2 < 5 + ((task_2 % 16 < 0) ? 1 : 0); kb_2++) {
                         unsigned int stage_2 = io_seq % 4;
                         mbarrier_wait(store_ready_addr + (stage_2) * 8, io_seq / 4 % 2);
-                        unsigned int prefetch = kb_2 + 1 == 2 + ((task_2 % 40 < 0) ? 1 : 0) && (unsigned int)(task_2 + 152) < (num_tokens + 63) / 64 * 40;
+                        unsigned int prefetch = kb_2 + 1 == 5 + ((task_2 % 16 < 0) ? 1 : 0) && (unsigned int)(task_2 + 152) < (num_tokens + 63) / 64 * 16;
                         if (prefetch != 0) {
                             mbarrier_wait(empty_coeff_addr + (coeff_seq % 2) * 8, coeff_seq / 2 % 2 ^ 1);
                         }
                         if (elect_sync()) {
-                            unsigned int extra_1 = ((task_2 % 40 < 0) ? (unsigned int)(task_2 % 40) : (unsigned int)0);
+                            unsigned int extra_1 = ((task_2 % 16 < 0) ? (unsigned int)(task_2 % 16) : (unsigned int)0);
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint"
                                 " [%0, {%1, %2, %3}], [%4], %5;"
-                                :: "l"((&new_residual_map)), "r"(((unsigned int)(task_2 % 40 * 2) + extra_1) * 64 + (unsigned int)(kb_2 * 64)), "r"(mb * 64), "r"(0), "r"(residual_addr + stage_2 * 32768), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "l"((&new_residual_map)), "r"(((unsigned int)(task_2 % 16 * 5) + extra_1) * 64 + (unsigned int)(kb_2 * 64)), "r"(mb * 64), "r"(0), "r"(residual_addr + stage_2 * 32768), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile("cp.async.bulk.commit_group;");
                             if (prefetch != 0) {
-                                tma_2d_gmem2smem(post_addr + coeff_seq % 2 * 1024, (&post_map), 0, (task_2 + 152) / 40 * 64, full_coeff_addr + (coeff_seq % 2) * 8);
-                                tma_2d_gmem2smem(comb_addr + coeff_seq % 2 * 4096, (&comb_map), 0, (task_2 + 152) / 40 * 64, full_coeff_addr + (coeff_seq % 2) * 8);
+                                tma_2d_gmem2smem(post_addr + coeff_seq % 2 * 1024, (&post_map), 0, (task_2 + 152) / 16 * 64, full_coeff_addr + (coeff_seq % 2) * 8);
+                                tma_2d_gmem2smem(comb_addr + coeff_seq % 2 * 4096, (&comb_map), 0, (task_2 + 152) / 16 * 64, full_coeff_addr + (coeff_seq % 2) * 8);
                                 mbarrier_arrive_expect_tx(full_coeff_addr + (coeff_seq % 2) * 8, 5120);
                             }
                             asm volatile("cp.async.bulk.wait_group 0;");
@@ -1392,7 +1392,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
             unsigned int coeff_seq_1 = 0;
             unsigned int first_row = warp % 4 * 16 + lane_in_warp / 4;
             #pragma unroll 1
-            for (int task_3 = bid; task_3 < (num_tokens + 63) / 64 * 40; task_3 += 152) {
+            for (int task_3 = bid; task_3 < (num_tokens + 63) / 64 * 16; task_3 += 152) {
                 unsigned int coeff_stage = coeff_seq_1 % 2;
                 mbarrier_wait(full_coeff_addr + (coeff_stage) * 8, coeff_seq_1 / 2 % 2);
                 float post_coeff[8];
@@ -1424,7 +1424,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                     x1_sq[j] = 0.0f;
                 }
                 #pragma unroll 1
-                for (int kb_3 = 0; kb_3 < 2 + ((task_3 % 40 < 0) ? 1 : 0); kb_3++) {
+                for (int kb_3 = 0; kb_3 < 5 + ((task_3 % 16 < 0) ? 1 : 0); kb_3++) {
                     unsigned int io_stage = io_seq_1 % 4;
                     mbarrier_wait(full_io_addr + (io_stage) * 8, io_seq_1 / 4 % 2);
                     #pragma unroll
@@ -1532,7 +1532,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
             unsigned int coeff_seq_2 = 0;
             unsigned int first_row_1 = warp % 4 * 16 + lane_in_warp / 4;
             #pragma unroll 1
-            for (int task_4 = bid; task_4 < (num_tokens + 63) / 64 * 40; task_4 += 152) {
+            for (int task_4 = bid; task_4 < (num_tokens + 63) / 64 * 16; task_4 += 152) {
                 unsigned int coeff_stage_1 = coeff_seq_2 % 2;
                 mbarrier_wait(full_coeff_addr + (coeff_stage_1) * 8, coeff_seq_2 / 2 % 2);
                 float post_coeff_1[8];
@@ -1564,7 +1564,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                     x1_sq_1[j_1] = 0.0f;
                 }
                 #pragma unroll 1
-                for (int kb_4 = 0; kb_4 < 2 + ((task_4 % 40 < 0) ? 1 : 0); kb_4++) {
+                for (int kb_4 = 0; kb_4 < 5 + ((task_4 % 16 < 0) ? 1 : 0); kb_4++) {
                     unsigned int io_stage_1 = io_seq_2 % 4;
                     mbarrier_wait(full_io_addr + (io_stage_1) * 8, io_seq_2 / 4 % 2);
                     #pragma unroll
@@ -1670,15 +1670,15 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
             unsigned int seq_1 = 0;
             unsigned int first_row_2 = warp % 4 * 16 + lane_in_warp / 4;
             #pragma unroll 1
-            for (int task_5 = bid; task_5 < (num_tokens + 63) / 64 * 40; task_5 += 152) {
-                unsigned int mb_2 = task_5 / 40;
+            for (int task_5 = bid; task_5 < (num_tokens + 63) / 64 * 16; task_5 += 152) {
+                unsigned int mb_2 = task_5 / 16;
                 if (warp % 4 == 0) {
                     unsigned long long base = (launch_epoch[0] + 1) * 128;
                     {
                     unsigned long long _acquire_observed;
                     do {
                     asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_acquire_observed) : "l"(reinterpret_cast<unsigned long long*>(split_barriers + ((16384 + mb_2) * 16))) : "memory");
-                    } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(base)) >= static_cast<unsigned long long>(40));
+                    } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(base)) >= static_cast<unsigned long long>(16));
                     }
                 }
                 unsigned int stage_3 = seq_1 % 2;
@@ -1724,7 +1724,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                 mbarrier_wait(full_stats_addr, seq_1 % 2);
                 if (lane_in_warp < 16) {
                     unsigned int row_9 = warp % 4 * 16 + lane_in_warp;
-                    scratch[(unsigned long long)((num_tokens + 63) / 64 * 40) * 1536 + ((0) ? (unsigned long long)((num_tokens + 63) / 64 * 40) * 64 : (unsigned long long)0) + (unsigned long long)task_5 * 64 + (unsigned long long)row_9] = hc_sums[row_9] + hc_sums[64 + row_9];
+                    scratch[(unsigned long long)((num_tokens + 63) / 64 * 16) * 1536 + ((0) ? (unsigned long long)((num_tokens + 63) / 64 * 16) * 64 : (unsigned long long)0) + (unsigned long long)task_5 * 64 + (unsigned long long)row_9] = hc_sums[row_9] + hc_sums[64 + row_9];
                 }
                 __syncwarp();
                 mbarrier_arrive(empty_stats_addr);
@@ -1784,7 +1784,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                 normal_control[24 + warp / 4] = token;
             }
             if (token < num_tokens) {
-                unsigned long long target = (launch_epoch[0] + 1) * 128 + 40;
+                unsigned long long target = (launch_epoch[0] + 1) * 128 + 16;
                 {
                 unsigned long long _acquire_observed;
                 do {
@@ -1792,11 +1792,11 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                 } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(target)) >= static_cast<unsigned long long>(1));
                 }
                 unsigned int row_10 = token % 64;
-                unsigned int first_task = token / 64 * 40;
+                unsigned int first_task = token / 64 * 16;
                 float norm_sum = 0.0f;
                 #pragma unroll 1
-                for (int split = lane_in_warp; split < 40; split += 32) {
-                    norm_sum += scratch[(unsigned long long)((num_tokens + 63) / 64 * 40) * 1536 + ((0) ? (unsigned long long)((num_tokens + 63) / 64 * 40) * 64 : (unsigned long long)0) + (unsigned long long)first_task * 64 + (unsigned long long)(split * 64) + (unsigned long long)row_10];
+                for (int split = lane_in_warp; split < 16; split += 32) {
+                    norm_sum += scratch[(unsigned long long)((num_tokens + 63) / 64 * 16) * 1536 + ((0) ? (unsigned long long)((num_tokens + 63) / 64 * 16) * 64 : (unsigned long long)0) + (unsigned long long)first_task * 64 + (unsigned long long)(split * 64) + (unsigned long long)row_10];
                 }
                 float _warp_reduce_0 = norm_sum;
                 #pragma unroll
@@ -1806,7 +1806,7 @@ kernel_cake_mega_mhc_sm103a_0e55a440af22c96477a7(const __grid_constant__ CUtenso
                 unsigned int safe_col = ((lane_in_warp < 24) ? (unsigned int)lane_in_warp : (unsigned int)23);
                 float hc_output = 0.0f;
                 #pragma unroll
-                for (int split_1 = 0; split_1 < 40; split_1++) {
+                for (int split_1 = 0; split_1 < 16; split_1++) {
                     hc_output += scratch[((unsigned long long)first_task + (unsigned long long)split_1) * 1536 + (unsigned long long)(row_10 * 24) + (unsigned long long)safe_col];
                 }
                 float _rsqrt_0 = rsqrtf(norm_sum * 4.8828125e-05f + hc_norm_eps);
