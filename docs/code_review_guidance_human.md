@@ -73,10 +73,8 @@ Where defendability matters more:
 ## Non-focus
 
 ### Backwards compatibility (API breakage)
-Exhaustive auditing is delegated to a GitHub pre-merge check that QA puts in and maintains,
-so reviewers do not need to hunt for API breakage themselves. A breaking change that is
-noticed or declared — removed or renamed public API, changed signature, default, or
-semantics — is still raised loudly and discussed in review; it must not merge quietly.
+Delegated to a GitHub pre-merge check that QA puts in and maintains, rather than code
+review, so reviewers do not need to audit for API breakage themselves.
 
 ### Kernel implementation details
 Deprioritized **for human reviewers**, because of limited attention span and a genuinely

@@ -64,8 +64,7 @@ From [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) (Pull Request Guidelines):
 - Documentation referenced by the change (`CLAUDE.md`, `.claude/skills/`, `docs/`) is
   updated in the same PR.
 - **Backwards compatibility.** If the change removes or renames a public API, or changes a
-  signature, default, or semantics, say so explicitly at the top of the PR description. Such
-  changes must be discussed during review and must not merge quietly.
+  signature, default, or semantics, say so explicitly in the PR description.
 - **Defendability.** For each non-obvious choice, the author can explain the rationale when
   asked. If a choice cannot be explained, it is not ready; either understand it or remove it.
 
