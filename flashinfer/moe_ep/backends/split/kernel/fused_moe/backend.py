@@ -107,13 +107,29 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         per-expert, and its rows are not laid out with a fixed per-expert stride, so
         the same tensor means something different there.
 
-        Set FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=0 to force the old behaviour, i,e ignoring padded rows.
+        **Opt-in**: set FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1 to enable.
+
+        Off by default because the win is strongly shape-dependent. Measured over 264
+        A/B pairs on GB200 (4-32 ranks, NVFP4), end-to-end speedup ranges from 5.24x
+        down to 0.84x, and the losing region grows with EP width: 31% of measured
+        configurations regress at 4 ranks, 78% at 32. The cause is not an
+        implementation artifact - profiling shows this path always reduces GPU work,
+        but on small-MoE shapes the expert GEMM is only ~2.6% of the step (the rest
+        being nccl_ep dispatch/combine), so there is not enough of it to pay for the
+        transform.
+
+        Rule of thumb for when to enable, from that data: turn it on when the
+        baseline's per-GPU padded work clears roughly
+
+            num_local_experts * cap * hidden_size * intermediate_size > 3e11
+
+        which had zero regressions across the 240 configurations it selects.
         """
         if ctx.recv_count is None:
             return None
         if ctx.fleet_params.layout is not EpLayout.EXPERT_MAJOR:
             return None
-        if os.environ.get("FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS", "1") == "0":
+        if os.environ.get("FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS", "0") != "1":
             return None
         return ctx.recv_count
 

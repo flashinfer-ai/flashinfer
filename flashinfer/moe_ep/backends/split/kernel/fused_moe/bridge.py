@@ -102,15 +102,31 @@ def _mask_padding_rows_nonlocal(
     m = selected_experts.shape[0]
     remote_id = (local_expert_offset + num_local_experts) % num_experts # First expert past this ranks block
 
-    rows = torch.arange(m, device=device)
-    per_expert = recv_count.to(device=device, dtype=torch.long)
-    is_real = (rows % cap) < per_expert[rows // cap]
-    is_real = is_real.reshape(m, 1)
+    if m != num_local_experts * cap:
+        raise ValueError(
+            f"EXPERT_MAJOR pack must be num_local_experts * cap rows "
+            f"({num_local_experts} * {cap} = {num_local_experts * cap}), got {m}"
+        )
 
-    selected_experts = torch.where(
-        is_real, selected_experts, torch.full_like(selected_experts, remote_id)
-    )
-    final_scales = torch.where(is_real, final_scales, torch.zeros_like(final_scales))
+    # Row r of the pack is position r % cap of expert r // cap, so the mask is just
+    # a broadcast compare against recv_count once the rows are viewed as
+    # [num_local_experts, cap]. Doing it that way instead of with arange(m) plus
+    # remainder / floor_divide / gather matters: this runs on a step whose GPU is
+    # not saturated at small per-expert GEMMs, so each extra kernel launch lands on
+    # the critical path. Profiling the arithmetic version showed the masking added
+    # ~13 launches for ~25us of actual work, which is what made the change a
+    # wall-clock loss on small-MoE shapes even though it cut total GPU work.
+    # Scalar `other` in torch.where avoids materialising full_like / zeros_like.
+    # No-op (returns self, no kernel) when recv_count is already on this device,
+    # which it is on the dispatch path; kept so a host-side caller cannot fault.
+    # Deliberately no dtype cast: comparing in recv_count's own dtype avoids an
+    # int32 -> int64 copy that the previous version paid on every call.
+    recv_count = recv_count.to(device)
+    col = torch.arange(cap, device=device, dtype=recv_count.dtype)
+    is_real = (col.unsqueeze(0) < recv_count.unsqueeze(1)).reshape(m, 1)
+
+    selected_experts = torch.where(is_real, selected_experts, remote_id)
+    final_scales = torch.where(is_real, final_scales, 0.0)
     return selected_experts, final_scales
 
 
