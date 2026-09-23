@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from flashinfer.decode import prepare_balanced_batch_decode_with_kv_cache
-from flashinfer.experimental.balanced_gqa_decode import cake_backend, cake_plan
+from flashinfer.experimental.balanced_gqa_decode import cake_backend, cake_bounds
 from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
     GROUP_RATIO,
     HEAD_DIM,
@@ -30,17 +30,19 @@ from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
     validate_balanced_gqa_decode_inputs,
     workspace_layout,
 )
-from flashinfer.experimental.balanced_gqa_decode.cake_plan import (
+from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
     MAX_BALANCE_FACTOR,
     MAX_REQUESTS,
     NUM_BUCKETS,
     PAIR_TOKENS,
+    max_items_bound,
+    workspace_bounds,
+)
+from tests.test_helpers.cake_balanced_gqa_plan import (
     chunk_pairs_for,
     length_bucket,
-    max_items_bound,
     plan_balanced_work,
     simulate_greedy_makespan,
-    workspace_bounds,
 )
 
 ATOL = RTOL = 1e-2
@@ -89,7 +91,7 @@ def _check_plan_invariants(seq_lens, work_plan):
         lo = work_plan.bucket_ends[item.bucket - 1] if item.bucket else 0
         assert lo <= ticket < work_plan.bucket_ends[item.bucket]
         assert item.block_begin < item.block_end
-        assert item.block_end == _ceil_div(item.seqlen_row, cake_plan.BLOCK_N) or (
+        assert item.block_end == _ceil_div(item.seqlen_row, cake_bounds.BLOCK_N) or (
             item.block_end - item.block_begin == 2 * work_plan.chunk_pairs
         )
         assert (item.slot >= 0) == item.is_split
@@ -104,7 +106,7 @@ def _check_plan_invariants(seq_lens, work_plan):
             for h in range(work_plan.num_kv_heads):
                 spans = sorted(coverage[(b, j, h)])
                 expected_end = _ceil_div(
-                    seq_len - (work_plan.q_len - 1 - j), cake_plan.BLOCK_N
+                    seq_len - (work_plan.q_len - 1 - j), cake_bounds.BLOCK_N
                 )
                 assert spans[0][0] == 0 and spans[-1][1] == expected_end
                 for (_, e0), (s1, _) in zip(spans, spans[1:], strict=False):
@@ -199,7 +201,7 @@ def test_length_bucket_edges():
 
 def test_chunk_pairs_respects_minimum():
     chunk_pairs, k = chunk_pairs_for([1] * 3, q_len=1, num_kv_heads=1, num_ctas=160)
-    assert chunk_pairs >= cake_plan.DEFAULT_PAIRS_MIN
+    assert chunk_pairs >= cake_bounds.DEFAULT_PAIRS_MIN
     assert k >= 0
 
 

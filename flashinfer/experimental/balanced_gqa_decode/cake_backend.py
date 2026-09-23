@@ -39,7 +39,7 @@ from .cake_jit import (
     load_cake_balanced_gqa_decode_module,
     select_module,
 )
-from .cake_plan import (
+from .cake_bounds import (
     BLOCK_N,
     MAX_REQUESTS,
     max_items_bound,

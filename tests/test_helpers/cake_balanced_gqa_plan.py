@@ -18,10 +18,10 @@ Host mirror of the on-device balanced paged-GQA decode work planner.
 The decode kernel plans its own work on the GPU from the device ``seq_lens``
 buffer: one scheduler warp derives the chunk length ``L`` (in KV block pairs of
 256 tokens) and four length buckets, then decodes every ticket online while
-the other warps run the attention pipeline.  The kernel never calls this
-module.  It exists so the host can size the shape-independent partial
-workspace and bound the ticket loop, and so tests can check the device plan
-(published in the workspace counters) against an exact reference.
+the other warps run the attention pipeline.  Neither the kernel nor the host
+layer calls this module; it is a test-only reference so the plan the kernel
+publishes in its workspace counters can be checked exactly, and it documents
+the scheduling rule.
 
 Work unit: one KV block pair (``PAIR_TOKENS`` tokens).  Request ``b`` with KV
 length ``S_b`` is chunked by the pair count of its *shortest* query row,
@@ -44,15 +44,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-BLOCK_N = 128
-PAIR_TOKENS = 2 * BLOCK_N
-NUM_BUCKETS = 4  # full chunks, [L/2, L), [L/4, L/2), shorter
-REQUEST_GROUP = 32  # requests per planning group (one per scheduler lane)
-MAX_REQUEST_GROUPS = 32
-MAX_REQUESTS = MAX_REQUEST_GROUPS * REQUEST_GROUP
-TARGET_CHUNK_PAIRS = 64
-MAX_BALANCE_FACTOR = 8
-DEFAULT_PAIRS_MIN = 2
+from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
+    BLOCK_N,
+    DEFAULT_PAIRS_MIN,
+    MAX_BALANCE_FACTOR,
+    MAX_REQUESTS,
+    NUM_BUCKETS,
+    PAIR_TOKENS,
+    TARGET_CHUNK_PAIRS,
+)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -146,24 +146,6 @@ def chunk_pairs_for(
     if even is not None and balance_factor is None:
         return even, 0
     return chunk_pairs, k
-
-
-def workspace_bounds(num_ctas: int) -> tuple[int, int]:
-    """``(max_split_items, max_split_tiles)`` valid for every shape.
-
-    Split requests have ``P_b > L`` so ``n_b < 2 P_b / L``; summing gives
-    ``split_items < 2 * total_work / L <= 2 * k * num_ctas`` with
-    ``k <= MAX_BALANCE_FACTOR``, and every split tile has at least two items.
-    """
-    if num_ctas <= 0:
-        raise ValueError("num_ctas must be positive")
-    return 2 * MAX_BALANCE_FACTOR * num_ctas, MAX_BALANCE_FACTOR * num_ctas
-
-
-def max_items_bound(batch: int, q_len: int, num_kv_heads: int, num_ctas: int) -> int:
-    """Device ticket-loop bound: whole tiles plus every possible split item."""
-    max_split_items, _ = workspace_bounds(num_ctas)
-    return batch * q_len * num_kv_heads + max_split_items
 
 
 @dataclass(frozen=True)
@@ -344,23 +326,13 @@ def simulate_greedy_makespan(
 
 
 __all__ = [
-    "BLOCK_N",
-    "PAIR_TOKENS",
-    "NUM_BUCKETS",
-    "MAX_REQUEST_GROUPS",
-    "MAX_REQUESTS",
-    "TARGET_CHUNK_PAIRS",
-    "MAX_BALANCE_FACTOR",
-    "DEFAULT_PAIRS_MIN",
     "BalancedWorkItem",
     "BalancedWorkPlan",
     "balance_factor_for",
     "chunk_pairs_for",
     "even_split_chunk_pairs",
-    "split_is_worthwhile",
     "length_bucket",
-    "max_items_bound",
     "plan_balanced_work",
     "simulate_greedy_makespan",
-    "workspace_bounds",
+    "split_is_worthwhile",
 ]

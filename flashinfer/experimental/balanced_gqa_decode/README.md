@@ -75,9 +75,11 @@ copied into a padded table inside the workspace at preparation (the runner
 reports this as `block_tables_padded=True`); pass a width that is a multiple
 of eight to read the caller's table in place at every launch.
 
-`cake_plan.py` is an exact host mirror of the device planner. The kernel never
-calls it; tests use it to check the device-published plan (`runner.device_plan()`)
-and the workspace bounds, and it documents the scheduling rule.
+`cake_bounds.py` holds the planner constants and the shape-independent workspace
+and ticket-loop bounds; nothing on the host reads KV lengths. The exact host mirror
+of the device planner is test-only (`tests/test_helpers/cake_balanced_gqa_plan.py`):
+the tests use it to check the device-published plan (`runner.device_plan()`) and it
+documents the scheduling rule.
 
 Limits of the current route: BF16 Q/K/V/O only, head dimension 128, page
 size 16, exactly eight query heads per KV head, at most 1024 requests per
