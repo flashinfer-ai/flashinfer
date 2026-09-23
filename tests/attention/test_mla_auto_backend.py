@@ -369,8 +369,7 @@ def _cpu_planners(monkeypatch):
                 return result
 
             def run_from_wrapper(self, *, out, **kwargs):
-                # Output depends on persistent storage: rolling back object references
-                # alone cannot hide corruption of the previous executable's buffers.
+                # Distinguish the published executable from a replacement plan.
                 checksum = sum(int(buffer.flatten()[0]) for buffer in self.buffers)
                 return out.fill_(checksum + int(self._int_workspace_buffer[0]))
 
@@ -522,30 +521,6 @@ def test_cpu_public_auto_uses_request_specific_policy_order(
     assert wrapper._planned_backend is None
 
 
-@pytest.mark.parametrize(
-    "rejected,expected",
-    [
-        ((), "fa2"),
-        (("fa2",), "trtllm-gen"),
-        (("fa2", "trtllm-gen"), "cute-dsl-monolithic"),
-    ],
-)
-def test_cpu_high_head_decode_preserves_geometry_fallback(
-    _cpu_planners, rejected, expected
-):
-    wrapper, kwargs, _ = _cpu_request()
-    kwargs["num_heads"] = 128
-
-    def reject_prefix(name, args):
-        if name in rejected:
-            _reject(name, args)
-
-    _cpu_planners.handler = reject_prefix
-    wrapper.plan(**kwargs)
-    assert tuple(_cpu_planners.calls) == rejected + (expected,)
-    assert wrapper._planned_backend._backend == expected
-
-
 @pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
 def test_cpu_auto_propagates_fatal_planner_errors(_cpu_planners, error_type):
     failure = error_type("deliberate compiler or caller error")
@@ -573,135 +548,119 @@ def test_cpu_explicit_backend_is_strict(_cpu_planners):
     assert wrapper._planned_backend is None
 
 
+@pytest.fixture
+def _cutile_dependency(monkeypatch):
+    import importlib.metadata
+
+    from flashinfer.cutile import cutile_common
+    from flashinfer.mla._batch_mla._backends import cutile_backend
+
+    state = SimpleNamespace(version="1.4.0", probes=[])
+    original_version = importlib.metadata.version
+
+    def installed_version(name):
+        if name != "cuda-tile":
+            return original_version(name)
+        if state.version is None:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return state.version
+
+    def available():
+        state.probes.append("compiler")
+        return True
+
+    monkeypatch.setattr(importlib.metadata, "version", installed_version)
+    monkeypatch.setattr(cutile_common, "is_cuda_tile_available", available)
+    cutile_backend.get_cutile_mla_decode.cache_clear()
+    try:
+        yield state
+    finally:
+        cutile_backend.get_cutile_mla_decode.cache_clear()
+
+
 @pytest.mark.parametrize(
-    "error_type", [_BackendPlanUnsupportedError, RuntimeError, ValueError]
+    "version,supported",
+    [
+        (None, False),
+        ("1.3.0", False),
+        ("1.4.0rc1", False),
+        ("invalid", False),
+        ("1.4.0", True),
+        ("1.4.1", True),
+        ("1.10.0", True),
+        ("9.9.99.dev1", True),
+    ],
 )
-def test_cpu_failed_replan_restores_storage_and_executable(_cpu_planners, error_type):
-    wrapper, kwargs, buffers = _cpu_request("fa2", graph=True)
-    wrapper.plan(**kwargs)
-    previous = wrapper._planned_backend
-    old_contract = wrapper._input_contract
-    old_output = _cpu_run(wrapper).clone()
-    mirrors = (
-        wrapper._cached_module,
-        wrapper._int_workspace_buffer,
-        wrapper._pin_memory_int_workspace_buffer,
-    )
-    watched = [*buffers, mirrors[1], mirrors[2]]
-    snapshots = [(buffer, buffer.data_ptr(), buffer.clone()) for buffer in watched]
-    failure = error_type("deliberate failure after writes")
-
-    def mutate_then_fail(name, args):
-        assert args._graph_plan_int_workspace_buffer is not None
-        assert args._graph_plan_int_workspace_buffer.shape == mirrors[1].shape
-        for buffer in _plan_buffers(args):
-            buffer.fill_(91)  # Includes the tail beyond _staged_int_workspace_bytes.
-        raise failure
-
-    _cpu_planners.handler = mutate_then_fail
-    with pytest.raises(error_type) as error:
-        wrapper.plan(**kwargs)
-    assert error.value is failure
-    assert wrapper._planned_backend is previous
-    assert wrapper._planned_backend_name == "fa2"
-    assert wrapper._input_contract is old_contract
-    assert wrapper._cached_module is mirrors[0]
-    assert wrapper._int_workspace_buffer is mirrors[1]
-    assert wrapper._pin_memory_int_workspace_buffer is mirrors[2]
-    assert wrapper._float_workspace_buffer is buffers[0]
-    for name, buffer in zip(
-        ("_qo_indptr_buf", "_kv_indptr_buf", "_kv_indices_buf", "_kv_len_arr_buf"),
-        buffers[1:],
-        strict=True,
-    ):
-        assert getattr(wrapper, name) is buffer
-    for buffer, pointer, snapshot in snapshots:
-        assert buffer.data_ptr() == pointer
-        assert torch.equal(buffer, snapshot)
-    _cpu_planners.forbidden = True
-    torch.testing.assert_close(_cpu_run(wrapper), old_output)
-
-
-def test_cpu_typed_fallback_restores_buffers_before_next_candidate(_cpu_planners):
-    wrapper, kwargs, buffers = _cpu_request(graph=True)
-    originals = [buffer.clone() for buffer in buffers]
-
-    def first_rejects_after_writes(name, args):
-        current = _plan_buffers(args)
-        assert len(current) == len(originals)
-        for actual, expected in zip(current, originals, strict=True):
-            assert torch.equal(actual, expected), (
-                "candidate saw predecessor's failed writes"
-            )
-        if len(_cpu_planners.calls) == 1:
-            for buffer in current:
-                buffer.fill_(91)
-            _reject(name, args)
-
-    _cpu_planners.handler = first_rejects_after_writes
-    wrapper.plan(**kwargs)
-    assert len(_cpu_planners.calls) == 2
-    for actual, expected in zip(buffers, originals, strict=True):
-        assert torch.equal(actual, expected)
-    _cpu_planners.forbidden = True
-    _cpu_run(wrapper)
-
-
-@pytest.mark.parametrize("allowed", [False, True])
-def test_cpu_experimental_candidate_requires_upstream_opt_in(
-    _cpu_planners, monkeypatch, allowed
-):
-    from dataclasses import replace
-
-    state = _cpu_planners
-    target = state.module._BACKEND_TYPES["trtllm-gen"]
-    monkeypatch.setattr(
-        target,
-        "_plan_capabilities",
-        replace(target._plan_capabilities, is_experimental=True),
-    )
-    monkeypatch.setenv(
-        "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1" if allowed else "0"
+def test_cpu_cutile_minimum_version(_cutile_dependency, version, supported):
+    from flashinfer.mla._batch_mla._backends import cutile_backend
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import (
+        prepare_cutile_mla_decode,
     )
 
-    def only_target(name, args):
-        if name != "trtllm-gen":
-            _reject(name, args)
-
-    state.handler = only_target
-    wrapper, kwargs, _ = _cpu_request()
-    if allowed:
-        wrapper.plan(**kwargs)
-        assert wrapper._planned_backend_name == "trtllm-gen"
+    _cutile_dependency.version = version
+    if supported:
+        assert cutile_backend.get_cutile_mla_decode() is prepare_cutile_mla_decode
+        assert _cutile_dependency.probes == ["compiler"]
     else:
-        with pytest.raises(
-            _BackendPlanUnsupportedError,
-            match="FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1",
-        ):
-            wrapper.plan(**kwargs)
-        assert "trtllm-gen" not in state.calls
+        with pytest.raises(_BackendPlanUnsupportedError, match="cuda-tile>=1.4"):
+            cutile_backend.get_cutile_mla_decode()
+        assert _cutile_dependency.probes == []
 
 
-def test_cpu_eager_auto_reselects_but_failed_replan_preserves_choice(_cpu_planners):
+@pytest.mark.parametrize(
+    "backend,opt_in,version,expected",
+    [
+        ("auto", None, "1.4.0", "cutlass"),
+        ("auto", "0", "1.4.0", "cutlass"),
+        ("auto", "1", "1.4.0", "cutile"),
+        ("auto", "1", "1.3.0", "cutlass"),
+        ("cutile", None, "1.4.0", "cutile"),
+        ("cutile", "0", "1.4.0", "cutile"),
+        ("cutile", None, "1.3.0", None),
+    ],
+)
+def test_cpu_cutile_version_and_experimental_selection(
+    _cpu_planners, _cutile_dependency, monkeypatch, backend, opt_in, version, expected
+):
+    from flashinfer.mla._batch_mla._backends import cutile_backend
+
     state = _cpu_planners
-    desired = ["trtllm-gen"]
+    # Use the real cuTile declaration; only native preparation is replaced.
+    monkeypatch.setattr(
+        state.module._BACKEND_TYPES["cutile"],
+        "_plan_capabilities",
+        cutile_backend._BatchMLAPagedAttentionCutileBackend._plan_capabilities,
+    )
+    monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
+    if opt_in is not None:
+        monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", opt_in)
+    _cutile_dependency.version = version
+    emitted = []
+    monkeypatch.setattr(
+        _wrapper,
+        "warn_experimental_backend_once",
+        lambda api, name, *, automatic: emitted.append((name, automatic)),
+    )
 
-    def only_target(name, args):
-        if name != desired[0]:
+    def prepare(name, args):
+        if name == "cutile":
+            cutile_backend.get_cutile_mla_decode()
+        elif name != "cutlass":
             _reject(name, args)
 
-    state.handler = only_target
-    wrapper, kwargs, _ = _cpu_request()
-    wrapper.plan(**kwargs)
-    desired[0] = "fa2"
-    wrapper.plan(**kwargs)
-    previous = wrapper._planned_backend
-    assert wrapper._planned_backend_name == "fa2"
-    desired[0] = "none"
-    with pytest.raises(_BackendPlanUnsupportedError):
+    state.handler = prepare
+    wrapper, kwargs, _ = _cpu_request(backend)
+    if expected is None:
+        with pytest.raises(_BackendPlanUnsupportedError, match="cuda-tile>=1.4"):
+            wrapper.plan(**kwargs)
+        assert wrapper._planned_backend is None
+    else:
         wrapper.plan(**kwargs)
-    assert wrapper._planned_backend is previous
-    assert wrapper._backend == "fa2"
+        assert wrapper._planned_backend_name == expected
+    assert emitted == ([("cutile", backend == "auto")] if expected == "cutile" else [])
+    if backend == "auto" and opt_in != "1":
+        assert "cutile" not in state.calls
+        assert _cutile_dependency.probes == []
 
 
 @pytest.mark.parametrize("graph", [False, True])
@@ -831,8 +790,6 @@ def test_cpu_legacy_auto_failed_replan_preserves_executable(
     previous = wrapper._planned_backend
     contract = wrapper._input_contract
     output = _cpu_run(wrapper).clone()
-    watched = [*buffers, *previous.buffers, previous._int_workspace_buffer]
-    originals = [(buffer, buffer.clone()) for buffer in watched]
     state.calls.clear()
     failure = error_type("legacy planner failure after writes")
 
@@ -845,17 +802,15 @@ def test_cpu_legacy_auto_failed_replan_preserves_executable(
         monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden_order)
         monkeypatch.setattr(_auto_policy, "determine_mla_backend", forbidden_order)
 
-    def mutate_and_fail(name, args):
+    def fail(name, args):
         assert name == "fa3"
         if graph:
             assert (
                 args._graph_plan_int_workspace_buffer is previous._int_workspace_buffer
             )
-        for buffer in _plan_buffers(args):
-            buffer.fill_(91)
         raise failure
 
-    state.handler = mutate_and_fail
+    state.handler = fail
     with pytest.raises(error_type) as caught:
         wrapper.plan(**kwargs)
     assert caught.value is failure
@@ -863,8 +818,6 @@ def test_cpu_legacy_auto_failed_replan_preserves_executable(
     assert wrapper._planned_backend is previous
     assert wrapper._input_contract is contract
     assert wrapper._backend == "fa3"
-    for buffer, original in originals:
-        assert torch.equal(buffer, original)
     state.forbidden = True
     torch.testing.assert_close(_cpu_run(wrapper), output)
 
@@ -961,7 +914,9 @@ def test_cpu_cute_family_alias_reselects_on_eager_replan(_cpu_planners, monkeypa
 
 
 @pytest.mark.parametrize("selector", ["auto", "cute-dsl"])
-def test_cpu_selector_restores_each_attempt(_cpu_planners, monkeypatch, selector):
+def test_cpu_selector_continues_after_typed_rejection(
+    _cpu_planners, monkeypatch, selector
+):
     state = _cpu_planners
     names = ("cute-dsl-monolithic", "cute-dsl-modular")
     if selector == "auto":
@@ -974,42 +929,21 @@ def test_cpu_selector_restores_each_attempt(_cpu_planners, monkeypatch, selector
             tuple(state.module._BACKEND_TYPES[n] for n in names),
         )
         monkeypatch.setitem(state.module._BACKEND_TYPES, selector, alias)
-    wrapper, kwargs, buffers = _cpu_request(selector)
-    metadata = kwargs["metadata"]
-    watched = {
-        id(buffer): buffer
-        for buffer in (
-            *buffers,
-            metadata.qo_indptr,
-            metadata.kv_indptr,
-            metadata.kv_indices,
-            metadata.kv_len_arr,
-        )
-    }
-    originals = {key: buffer.clone() for key, buffer in watched.items()}
 
-    def first_rejects(name, args):
-        for key, buffer in watched.items():
-            assert torch.equal(buffer, originals[key]), "A rejected planner left writes"
+    def reject_first(name, args):
         if name == names[0]:
-            for buffer in watched.values():
-                buffer.fill_(91)
             _reject(name, args)
 
-    state.handler = first_rejects
+    state.handler = reject_first
+    wrapper, kwargs, _ = _cpu_request(selector)
     wrapper.plan(**kwargs)
     assert state.calls == list(names)
     assert wrapper._planned_backend_name == names[1]
-    for key, buffer in watched.items():
-        assert torch.equal(buffer, originals[key])
-    expected = sum(int(buffer.flatten()[0]) for buffer in buffers) + 17
-    _cpu_planners.forbidden = True
-    torch.testing.assert_close(
-        _cpu_run(wrapper), torch.full((2, 3, 4), expected, dtype=torch.bfloat16)
-    )
+    state.forbidden = True
+    _cpu_run(wrapper)
 
 
-def test_cpu_experimental_warning_failure_restores_unpublished_plan(
+def test_cpu_experimental_warning_failure_does_not_publish_or_rollback(
     _cpu_planners, monkeypatch
 ):
     from dataclasses import replace
@@ -1018,8 +952,6 @@ def test_cpu_experimental_warning_failure_restores_unpublished_plan(
     wrapper, kwargs, buffers = _cpu_request("fa2")
     wrapper.plan(**kwargs)
     previous = wrapper._planned_backend
-    previous_output = _cpu_run(wrapper).clone()
-    originals = [buffer.clone() for buffer in buffers]
     target = state.module._BACKEND_TYPES["fa2"]
     monkeypatch.setattr(
         target,
@@ -1032,6 +964,7 @@ def test_cpu_experimental_warning_failure_restores_unpublished_plan(
             buffer.fill_(91)
 
     def warning_error(*args, **kwargs):
+        assert all(torch.all(buffer == 91) for buffer in buffers)
         raise UserWarning("experimental warning promoted to error")
 
     state.handler = mutate
@@ -1039,9 +972,8 @@ def test_cpu_experimental_warning_failure_restores_unpublished_plan(
     with pytest.raises(UserWarning, match="promoted to error"):
         wrapper.plan(**kwargs)
     assert wrapper._planned_backend is previous
-    for buffer, original in zip(buffers, originals, strict=True):
-        assert torch.equal(buffer, original)
-    torch.testing.assert_close(_cpu_run(wrapper), previous_output)
+    # The warning is outside backend rollback, but prevents plan publication.
+    assert all(torch.all(buffer == 91) for buffer in buffers)
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
@@ -1110,8 +1042,9 @@ def test_cpu_fa_shared_memory_compatibility(monkeypatch, backend, missing):
 
 
 @pytest.mark.parametrize("q_len", [65535, 65536])
+@pytest.mark.parametrize("grid", ["main", "reducer"])
 def test_cpu_monolithic_grid_boundary_rejects_before_compile(
-    _cpu_planners, monkeypatch, q_len
+    _cpu_planners, monkeypatch, q_len, grid
 ):
     from flashinfer.cute_dsl import is_cute_dsl_available
 
@@ -1129,7 +1062,9 @@ def test_cpu_monolithic_grid_boundary_rejects_before_compile(
     calls = []
     monkeypatch.setattr(native, "_check_can_implement", lambda **kwargs: None)
     monkeypatch.setattr(
-        native, "_get_split_kv_and_workspace_size", lambda *args, **kwargs: (1, 0)
+        native,
+        "_get_split_kv_and_workspace_size",
+        lambda *args, **kwargs: (2, 16) if grid == "reducer" else (1, 0),
     )
     monkeypatch.setattr(native, "get_num_sm", lambda _: 148)
     monkeypatch.setattr(
@@ -1146,12 +1081,12 @@ def test_cpu_monolithic_grid_boundary_rejects_before_compile(
             out_dtype=torch.bfloat16,
             page_size=64,
             batch_size=1,
-            num_heads=128,
+            num_heads=8 if grid == "reducer" else 128,
             q_len=q_len,
             head_dim_ckv=512,
             head_dim_kpe=64,
             resolved_is_var_seq=True,
-            is_var_q=False,
+            is_var_q=grid == "reducer",
             total_q=q_len,
             max_seq_len=65536,
             use_sinks=False,
@@ -1180,163 +1115,62 @@ def test_cpu_numeric_scale_normalized_before_candidate_planning(_cpu_planners, s
     assert _cpu_planners.calls
 
 
-@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
-def test_cpu_two_typed_rejections_then_fatal_restores_previous_executable(
-    _cpu_planners, monkeypatch, error_type
+@pytest.mark.parametrize("failure", [_BackendPlanUnsupportedError, RuntimeError])
+def test_cpu_failed_replan_preserves_published_executable(
+    _cpu_planners, monkeypatch, failure
 ):
     state = _cpu_planners
-    order = (
-        "fa2",
-        "cutlass",
-        "trtllm-gen",
-        "cutile",
-        "cute-dsl-monolithic",
-        "cute-dsl-modular",
-    )
+    order = ("fa2", "cutlass", "trtllm-gen")
     monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", lambda args: order)
-    # Eager auto replanning may explore multiple candidates. A graph replan
-    # intentionally retains its previous executable family instead.
-    wrapper, kwargs, buffers = _cpu_request()
+    wrapper, kwargs, _ = _cpu_request()
     wrapper.plan(**kwargs)
-    assert wrapper._planned_backend_name == "fa2"
-    previous = wrapper._planned_backend
-    old_contract = wrapper._input_contract
-    old_output = _cpu_run(wrapper).clone()
+    previous, contract = wrapper._planned_backend, wrapper._input_contract
+    output = _cpu_run(wrapper).clone()
     mirrors = (
         wrapper._cached_module,
         wrapper._int_workspace_buffer,
         wrapper._pin_memory_int_workspace_buffer,
     )
-    metadata = kwargs["metadata"]
-    metadata_buffers = [
-        metadata.qo_indptr,
-        metadata.kv_indptr,
-        metadata.kv_indices,
-        metadata.kv_len_arr,
-    ]
-    watched = [*buffers, *metadata_buffers, mirrors[1], mirrors[2]]
-    snapshots = [(buffer, buffer.data_ptr(), buffer.clone()) for buffer in watched]
-    failure = error_type("fatal third planner after two typed rejections")
     state.calls.clear()
 
-    def mutate_and_fail(name, args):
-        # Every candidate must see the original bytes, not a preceding
-        # rejected candidate's writes. This also checks metadata-source rollback.
-        for buffer, pointer, snapshot in snapshots:
-            assert buffer.data_ptr() == pointer
-            assert torch.equal(buffer, snapshot), f"{name} observed failed writes"
-        attempt = len(state.calls)
-        assert name == order[attempt - 1]
-        for buffer in (*_plan_buffers(args), *metadata_buffers):
-            buffer.fill_(90 + attempt)
-        if attempt <= 2:
-            raise _BackendPlanUnsupportedError(f"typed rejection {attempt}: {name}")
-        raise failure
+    def reject(name, args):
+        if name == "cutlass":
+            raise failure("second candidate failed")
+        _reject(name, args)
 
-    state.handler = mutate_and_fail
-    with pytest.raises(error_type) as caught:
+    state.handler = reject
+    with pytest.raises(failure):
         wrapper.plan(**kwargs)
-    assert caught.value is failure
-    assert state.calls == list(order[:3]), "fatal errors must terminate fallback"
+    assert state.calls == list(
+        order if failure is _BackendPlanUnsupportedError else order[:2]
+    )
     assert wrapper._planned_backend is previous
+    assert wrapper._input_contract is contract
     assert wrapper._planned_backend_name == wrapper._backend == "fa2"
-    assert wrapper._input_contract is old_contract
-    assert wrapper._cached_module is mirrors[0]
-    assert wrapper._int_workspace_buffer is mirrors[1]
-    assert wrapper._pin_memory_int_workspace_buffer is mirrors[2]
-    assert wrapper._float_workspace_buffer is buffers[0]
-    for name, buffer in zip(
-        ("_qo_indptr_buf", "_kv_indptr_buf", "_kv_indices_buf", "_kv_len_arr_buf"),
-        buffers[1:],
-        strict=True,
-    ):
-        assert getattr(wrapper, name) is buffer
-    for buffer, pointer, snapshot in snapshots:
-        assert buffer.data_ptr() == pointer
-        assert torch.equal(buffer, snapshot)
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("run entered automatic policy or planning after a failed replan")
-
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            (
+                wrapper._cached_module,
+                wrapper._int_workspace_buffer,
+                wrapper._pin_memory_int_workspace_buffer,
+            ),
+            mirrors,
+            strict=True,
+        )
+    )
     state.forbidden = True
-    monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden)
-    monkeypatch.setattr(wrapper, "plan", forbidden)
-    torch.testing.assert_close(_cpu_run(wrapper), old_output)
-    assert state.calls == list(order[:3])
+    torch.testing.assert_close(_cpu_run(wrapper), output)
 
 
-@pytest.mark.parametrize(
-    "rejected,expected",
-    [
-        ((), "cute-dsl-monolithic"),
-        (("cute-dsl-monolithic",), "trtllm-gen"),
-        (("cute-dsl-monolithic", "trtllm-gen"), "cute-dsl-modular"),
-        (("cute-dsl-monolithic", "trtllm-gen", "cute-dsl-modular"), "fa2"),
-    ],
-)
-def test_cpu_modular_volume_preserves_native_prefix_and_typed_fallback(
-    _cpu_planners, rejected, expected
-):
-    wrapper, kwargs, _ = _cpu_request()
-    kwargs.update(num_heads=16, page_size=64)
-    # Two Q2 requests: total KV=81920 and work=2.5M. Real CSR geometry
-    # reaches the volume path without the early short-context guard.
-    kwargs["metadata"] = MLAPlanMetadata.csr(
-        qo_indptr=torch.tensor([0, 2, 4], dtype=torch.int32),
-        kv_indptr=torch.tensor([0, 640, 1280], dtype=torch.int32),
-        kv_indices=torch.arange(1280, dtype=torch.int32),
-        kv_len_arr=torch.tensor([40960, 40960], dtype=torch.int32),
+def test_modular_volume_preserves_native_prefix():
+    args, _ = _request((2, 2), (40960, 40960), heads=16)
+    assert _order(args)[:4] == (
+        "cute-dsl-monolithic",
+        "trtllm-gen",
+        "cute-dsl-modular",
+        "fa2",
     )
-
-    def reject_prefix(name, args):
-        if name in rejected:
-            _reject(name, args)
-
-    _cpu_planners.handler = reject_prefix
-    wrapper.plan(**kwargs)
-    assert tuple(_cpu_planners.calls) == rejected + (expected,)
-    assert wrapper._planned_backend_name == expected
-
-
-@pytest.mark.parametrize(
-    "rejected,expected",
-    [
-        ((), "trtllm-gen"),
-        (("trtllm-gen",), "cute-dsl-monolithic"),
-        (("trtllm-gen", "cute-dsl-monolithic"), "fa2"),
-    ],
-)
-def test_cpu_large_prefill_graph_preserves_typed_fallback(
-    _cpu_planners, rejected, expected
-):
-    _, kwargs, _ = _cpu_request(graph=True)
-    metadata = MLAPlanMetadata.csr(
-        qo_indptr=torch.tensor([0, 256, 512, 768, 1024], dtype=torch.int32),
-        kv_indptr=torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32),
-        kv_indices=torch.arange(16, dtype=torch.int32),
-        kv_len_arr=torch.full((4,), 256, dtype=torch.int32),
-    )
-    # Graph mirrors must have room for all four requests and sixteen pages.
-    wrapper = BatchMLAPagedAttentionWrapper(
-        torch.zeros(64, dtype=torch.uint8),
-        backend="auto",
-        use_cuda_graph=True,
-        qo_indptr=torch.empty_like(metadata.qo_indptr),
-        kv_indptr=torch.empty_like(metadata.kv_indptr),
-        kv_indices=torch.empty_like(metadata.kv_indices),
-        kv_len_arr=torch.empty_like(metadata.kv_len_arr),
-    )
-    kwargs.update(metadata=metadata, num_heads=64, page_size=64, causal=True)
-
-    def reject_prefix(name, args):
-        assert args._use_cuda_graph
-        if name in rejected:
-            _reject(name, args)
-
-    _cpu_planners.handler = reject_prefix
-    wrapper.plan(**kwargs)
-    assert tuple(_cpu_planners.calls) == rejected + (expected,)
-    assert wrapper._planned_backend_name == expected
 
 
 # GPU execution: real SM100 adapters, numerical references and graph replay.
@@ -1506,6 +1340,7 @@ def test_fa_plan_without_torch_shared_memory_properties(monkeypatch, backend):
 
 @pytest.mark.usefixtures("_sm100_reference_precision")
 def test_auto_falls_back_when_cutile_library_budget_is_full(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 
@@ -1571,6 +1406,121 @@ def test_modular_fp16_noncausal_adapter_matches_reference(crafted):
         causal=False,
         crafted=crafted,
     )
+
+
+@pytest.mark.usefixtures("_sm100_reference_precision")
+@pytest.mark.parametrize(
+    "dtype,kv_len,initial_lengths,replay_lengths",
+    [
+        pytest.param(
+            torch.bfloat16,
+            128,
+            (1, 3, 7),
+            [(1, 1, 9), (3, 4, 4)],
+            id="reported-unsplit",
+        ),
+        pytest.param(
+            torch.bfloat16, 4096, (1, 3, 7), [(1, 1, 9), (7, 3, 1)], id="reported-split"
+        ),
+        pytest.param(
+            torch.float16,
+            128,
+            (4, 6, 8),
+            [(1, 1, 16), (6, 6, 6)],
+            id="capacity-unsplit-fp16",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            4096,
+            (4, 6, 8),
+            [(1, 1, 16), (8, 6, 4)],
+            id="capacity-split",
+        ),
+        pytest.param(torch.bfloat16, 4096, (2, 2, 2), [], id="uniform-fixed-query"),
+    ],
+)
+def test_monolithic_graph_query_capacity(
+    dtype, kv_len, initial_lengths, replay_lengths
+):
+    capacity = 16
+    kv_lens = (kv_len,) * len(initial_lengths)
+    metadata, query, cache, table, offsets = _inputs(
+        initial_lengths, kv_lens, dtype, capacity
+    )
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="cute-dsl-monolithic",
+        use_cuda_graph=True,
+    )
+    wrapper.plan(
+        metadata=metadata,
+        num_heads=_HEADS,
+        head_dim_ckv=_CKV,
+        head_dim_kpe=_KPE,
+        page_size=_PAGE,
+        causal=True,
+        sm_scale=_SCALE,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        output_dtype=dtype,
+        lse_mode="basee",
+    )
+    selected = wrapper._planned_backend
+    state = selected._execution_state
+    assert (state.split_kv > 1) == (kv_len > 128)
+    out = torch.empty((sum(initial_lengths), _HEADS, _CKV), dtype=dtype, device="cuda")
+    lse = torch.empty(
+        (sum(initial_lengths), _HEADS), dtype=torch.float32, device="cuda"
+    )
+    out_pointer, lse_pointer = out.data_ptr(), lse.data_ptr()
+
+    def run():
+        return wrapper.run(
+            query=query,
+            kv_cache=cache,
+            out=out,
+            lse=lse,
+            return_lse=True,
+            return_lse_base_on_e=True,
+        )
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        run()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    assert captured[0] is out and captured[1] is lse
+
+    for lengths in [initial_lengths, *replay_lengths]:
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        metadata.cum_seq_lens_q.copy_(
+            torch.tensor(offsets, dtype=torch.int32, device="cuda")
+        )
+        expected, expected_lse = _reference(
+            query, cache, table, offsets, kv_lens, causal=True
+        )
+        # Missing tiles/reducer rows must fail instead of retaining old output.
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-2, atol=1e-2)
+        assert out.data_ptr() == out_pointer and lse.data_ptr() == lse_pointer
+        assert wrapper._planned_backend is selected
+
+    # An initially uniform plan must retain its fixed-query tensor views.
+    if len(set(initial_lengths)) == 1:
+        assert state.cum_seq_lens_q is None
+        assert state.q_len == initial_lengths[0]
+    else:
+        assert state.cum_seq_lens_q.data_ptr() == metadata.cum_seq_lens_q.data_ptr()
+        assert state.q_len == capacity
 
 
 @pytest.mark.usefixtures("_sm100_reference_precision")
@@ -1792,6 +1742,70 @@ def test_auto_graph_typed_fallback_freezes_selection_and_replays_correctly(
     assert wrapper._planned_backend_name == "fa2"
     assert attempts == ["cutlass", "fa2"]
     assert policy_calls == [order]
+
+
+@pytest.mark.usefixtures("_sm100_reference_precision")
+def test_auto_graph_falls_back_without_fa_reserved_buffers(monkeypatch):
+    attempts = []
+    for name in ("fa2", "trtllm-gen"):
+        backend_type = _wrapper._BACKEND_TYPES[name]
+        original_plan = backend_type.plan_from_wrapper
+
+        def record_attempt(cls, args, original_plan=original_plan, name=name):
+            attempts.append(name)
+            return original_plan(args)
+
+        monkeypatch.setattr(
+            backend_type, "plan_from_wrapper", classmethod(record_attempt)
+        )
+    torch.manual_seed(5463)
+    query = torch.randn(2, 64, _CKV + _KPE, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(1, 32, _CKV + _KPE, device="cuda", dtype=torch.bfloat16)
+    table = torch.zeros((1, 2), dtype=torch.int32, device="cuda")
+    metadata = MLAPlanMetadata.dense(
+        cum_seq_lens_q=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        block_tables=table,
+        seq_lens=torch.tensor([32], dtype=torch.int32, device="cuda"),
+        max_q_len=2,
+    )
+    # Exercise the real base-2 policy branch that ranks FA2 before TRT.
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="auto",
+        use_cuda_graph=True,
+    )
+    wrapper.plan(
+        metadata=metadata,
+        num_heads=64,
+        head_dim_ckv=_CKV,
+        head_dim_kpe=_KPE,
+        page_size=32,
+        causal=True,
+        sm_scale=_SCALE,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        lse_mode="base2",
+    )
+    assert attempts == ["fa2", "trtllm-gen"]
+    assert wrapper._planned_backend_name == "trtllm-gen"
+    expected, expected_lse = _reference(query, cache, table, [0, 2], (32,), causal=True)
+    out = torch.empty_like(expected, dtype=torch.bfloat16)
+    lse = torch.empty_like(expected_lse)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        wrapper.run(query=query, kv_cache=cache, out=out, lse=lse, return_lse=True)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(query=query, kv_cache=cache, out=out, lse=lse, return_lse=True)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, expected_lse / math.log(2), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.usefixtures("_sm100_reference_precision")

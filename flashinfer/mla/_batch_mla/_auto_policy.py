@@ -11,11 +11,14 @@ Ranking only orders preferences from request metadata. Concrete backend
 preflight owns eligibility; candidate preparation may compile a native plan.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
-from ...api_logging import _warn_from_external_caller
+from ...api_logging import (
+    _warn_from_external_caller,
+    experimental_auto_backends_allowed,
+)
 from ...utils import (
     determine_mla_backend,
     get_compute_capability as _get_compute_capability,
@@ -25,7 +28,7 @@ from ._backends.cutile_backend import _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES
 from ._planning import _MLAPlanArguments
 
 if TYPE_CHECKING:
-    from ._wrapper import _PlannedBackend
+    from ._wrapper import _ConcreteWrapperBackendType, _PlannedBackend
 
 
 class _BatchMLAPagedAttentionAutoBackend:
@@ -65,7 +68,7 @@ class _BatchMLAPagedAttentionAutoBackend:
     def plan_from_wrapper(cls, plan_args: _MLAPlanArguments) -> "_PlannedBackend":
         # The wrapper registers this class during import; resolve its shared
         # machinery only when planning starts, after initialization is complete.
-        from ._wrapper import _BACKEND_TYPES, _prepare_backend
+        from ._wrapper import _BACKEND_TYPES
 
         plan_args.csr()  # Malformed metadata is never a candidate support refusal.
         device = plan_args._float_workspace_buffer.device
@@ -79,15 +82,20 @@ class _BatchMLAPagedAttentionAutoBackend:
             cls._maybe_warn_blackwell_auto_fallback(device, backend)
             candidates = (backend,)
         rejections: list[str] = []
-        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
         for candidate in candidates:
             try:
-                return _prepare_backend(
-                    _BACKEND_TYPES[candidate],
-                    plan_args,
-                    automatic=True,
-                    snapshots=snapshots,
+                backend_type = cast(
+                    "type[_ConcreteWrapperBackendType]", _BACKEND_TYPES[candidate]
                 )
+                if (
+                    backend_type._plan_capabilities.is_experimental
+                    and not experimental_auto_backends_allowed()
+                ):
+                    raise _BackendPlanUnsupportedError(
+                        "experimental backend requires "
+                        "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1"
+                    )
+                return backend_type.plan_from_wrapper(plan_args)
             except _BackendPlanUnsupportedError as error:
                 if len(candidates) == 1:
                     raise

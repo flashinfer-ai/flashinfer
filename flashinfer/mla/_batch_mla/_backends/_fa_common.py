@@ -441,19 +441,30 @@ class _BatchMLAGeneratedFaMechanics:
             ("kv_indices", self._kv_indices_buf, kv_indices, True),
             ("kv_len_arr", self._kv_len_arr_buf, kv_len_arr, False),
         )
+        self._validate_graph_metadata_buffers(self.device, named)
+        if any(reserved is None for _, reserved, _, _ in named):
+            raise ValueError(
+                "CUDA graph mode requires reserved qo_indptr, kv_indptr, "
+                "kv_indices, and kv_len_arr buffers."
+            )
+
+    @classmethod
+    def _validate_graph_metadata_buffers(
+        cls,
+        device: torch.device,
+        named: tuple[tuple[str, Optional[torch.Tensor], torch.Tensor, bool], ...],
+    ) -> None:
+        """Validate supplied buffers before classifying any missing buffers."""
         for name, reserved, source, allow_larger in named:
             if reserved is None:
-                raise ValueError(
-                    "CUDA graph mode requires reserved qo_indptr, kv_indptr, "
-                    "kv_indices, and kv_len_arr buffers."
-                )
+                continue
             if reserved.dtype != torch.int32:
                 raise ValueError(
                     f"CUDA graph reserved {name} buffer must have dtype torch.int32."
                 )
-            if reserved.device != self.device:
+            if reserved.device != device:
                 raise ValueError(
-                    f"CUDA graph reserved {name} buffer must be on {self.device}."
+                    f"CUDA graph reserved {name} buffer must be on {device}."
                 )
             if not reserved.is_contiguous():
                 raise ValueError(
@@ -471,7 +482,7 @@ class _BatchMLAGeneratedFaMechanics:
                     "incompatible capacity."
                 )
         intervals = [
-            (name, self._storage_interval(reserved))
+            (name, cls._storage_interval(reserved))
             for name, reserved, _, _ in named
             if reserved is not None
         ]
@@ -494,9 +505,9 @@ class _BatchMLAGeneratedFaMechanics:
             if reserved is not None
         }
         for source_name, _, source, _ in named:
-            source_interval = self._storage_interval(source)
+            source_interval = cls._storage_interval(source)
             for target_name, target in copy_targets.items():
-                target_interval = self._storage_interval(target)
+                target_interval = cls._storage_interval(target)
                 overlaps = source_interval[0] == target_interval[0] and max(
                     source_interval[1], target_interval[1]
                 ) < min(source_interval[2], target_interval[2])
@@ -838,6 +849,23 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         csr = args.csr()  # Malformed caller metadata is never a support refusal.
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
             raise _BackendPlanUnsupportedError(reason)
+        if args._use_cuda_graph:
+            named = (
+                ("qo_indptr", args._qo_indptr_buf, csr.qo_indptr, False),
+                ("kv_indptr", args._kv_indptr_buf, csr.kv_indptr, False),
+                ("kv_indices", args._kv_indices_buf, csr.kv_indices, True),
+                ("kv_len_arr", args._kv_len_arr_buf, csr.kv_len_arr, False),
+            )
+            cls._validate_graph_metadata_buffers(
+                args._float_workspace_buffer.device, named
+            )
+            # Absence is an FA-specific support limit; malformed supplied
+            # buffers above remain hard errors rather than enabling fallback.
+            if any(reserved is None for _, reserved, _, _ in named):
+                raise _BackendPlanUnsupportedError(
+                    f"{cls._plan_capabilities.backend_name} CUDA graph mode requires reserved "
+                    "qo_indptr, kv_indptr, kv_indices, and kv_len_arr buffers."
+                )
         _validate_generated_fa_plan(
             backend=cls._plan_capabilities.backend_name,
             device=args._float_workspace_buffer.device,
@@ -867,45 +895,63 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
     def plan_from_wrapper(
         cls: type[_FaBackendT], args: _MLAPlanArguments
     ) -> _FaBackendT:
-        assert cls._plan_capabilities is not None
-        cls.preflight_plan_from_wrapper(args)
-        csr = args.csr()
-        backend = cls(
-            float_workspace_buffer=args._float_workspace_buffer,
-            use_cuda_graph=args._use_cuda_graph,
-            qo_indptr_buf=args._qo_indptr_buf,
-            kv_indptr_buf=args._kv_indptr_buf,
-            kv_indices_buf=args._kv_indices_buf,
-            kv_len_arr_buf=args._kv_len_arr_buf,
-            query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
-            kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
-            int_workspace_buffer=args._graph_plan_int_workspace_buffer,
-        )
-        if args._use_cuda_graph:
-            backend._preflight_graph_metadata_buffers(
+        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        try:
+            assert cls._plan_capabilities is not None
+            cls.preflight_plan_from_wrapper(args)
+            csr = args.csr()
+            backend = cls(
+                float_workspace_buffer=args._float_workspace_buffer,
+                use_cuda_graph=args._use_cuda_graph,
+                qo_indptr_buf=args._qo_indptr_buf,
+                kv_indptr_buf=args._kv_indptr_buf,
+                kv_indices_buf=args._kv_indices_buf,
+                kv_len_arr_buf=args._kv_len_arr_buf,
+                query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
+                kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
+                int_workspace_buffer=args._graph_plan_int_workspace_buffer,
+            )
+            if args._use_cuda_graph:
+                backend._preflight_graph_metadata_buffers(
+                    qo_indptr=csr.qo_indptr,
+                    kv_indptr=csr.kv_indptr,
+                    kv_indices=csr.kv_indices,
+                    kv_len_arr=csr.kv_len_arr,
+                )
+            # Native FA planning writes shared integer storage and graph metadata.
+            # Float workspace and source metadata are read-only during planning.
+            if args._use_cuda_graph:
+                for buffer in (
+                    args._graph_plan_int_workspace_buffer,
+                    args._qo_indptr_buf,
+                    args._kv_indptr_buf,
+                    args._kv_indices_buf,
+                    args._kv_len_arr_buf,
+                ):
+                    if buffer is not None:
+                        snapshots.append((buffer, buffer.clone()))
+            backend.plan(
                 qo_indptr=csr.qo_indptr,
                 kv_indptr=csr.kv_indptr,
                 kv_indices=csr.kv_indices,
                 kv_len_arr=csr.kv_len_arr,
+                num_heads=args.num_heads,
+                head_dim_ckv=args.head_dim_ckv,
+                head_dim_kpe=args.head_dim_kpe,
+                page_size=args.page_size,
+                causal=args.causal,
+                sm_scale=args.sm_scale,
+                q_data_type=args.q_data_type,
+                kv_data_type=args.kv_data_type,
+                output_dtype=args.output_dtype,
+                scale_mode=args.scale_mode,
+                use_profiler=args.use_profiler,
             )
-        backend.plan(
-            qo_indptr=csr.qo_indptr,
-            kv_indptr=csr.kv_indptr,
-            kv_indices=csr.kv_indices,
-            kv_len_arr=csr.kv_len_arr,
-            num_heads=args.num_heads,
-            head_dim_ckv=args.head_dim_ckv,
-            head_dim_kpe=args.head_dim_kpe,
-            page_size=args.page_size,
-            causal=args.causal,
-            sm_scale=args.sm_scale,
-            q_data_type=args.q_data_type,
-            kv_data_type=args.kv_data_type,
-            output_dtype=args.output_dtype,
-            scale_mode=args.scale_mode,
-            use_profiler=args.use_profiler,
-        )
-        return backend
+            return backend
+        except BaseException:
+            for buffer, original in snapshots:
+                buffer.copy_(original)
+            raise
 
     def run_from_wrapper(
         self,

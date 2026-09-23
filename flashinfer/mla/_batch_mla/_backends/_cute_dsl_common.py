@@ -169,12 +169,15 @@ def _prepare_cute_dsl_mla_execution_state(
             "cute-dsl-monolithic multi-Q requires causal=True; "
             "cute-dsl-modular multi-Q requires causal=False."
         )
-    q_len = actual_max_q_len
     if max_q_len < actual_max_q_len:
         raise _BackendPlanUnsupportedError(
             "cute-dsl backend expects max_q_len to be at least the maximum "
             f"query length {actual_max_q_len}, got {max_q_len}."
         )
+    # Ragged kernels read actual lengths from device offsets. Reserve the full
+    # declared launch/workspace capacity so fixed-pointer graph replay can grow
+    # a request within that bound. Uniform kernels use q_len for tensor views.
+    q_len = actual_max_q_len if is_uniform else max_q_len
     if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
         raise _BackendPlanUnsupportedError(
             "cute-dsl backend expects rank-2 block_tables with batch dimension "

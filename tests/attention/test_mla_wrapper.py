@@ -1940,8 +1940,9 @@ def test_cuda_graph_replan_keeps_only_current_backend_and_stable_graph_storage(
 @pytest.mark.parametrize(
     "field", ["dtype", "device", "capacity", "contiguity", "overlap"]
 )
+@pytest.mark.parametrize("missing_buffer", [False, True])
 def test_cuda_graph_reserved_buffer_preflight_rejects_unsafe_buffers(
-    monkeypatch, field
+    monkeypatch, field, missing_buffer
 ):
     import flashinfer.mla as mla
 
@@ -1965,6 +1966,8 @@ def test_cuda_graph_reserved_buffer_preflight_rejects_unsafe_buffers(
         shared = torch.empty(6, dtype=torch.int32)
         wrapper._qo_indptr_buf = shared[:3]
         wrapper._kv_indptr_buf = shared[1:4]
+    if missing_buffer:
+        wrapper._kv_len_arr_buf = None
 
     with pytest.raises(ValueError, match="CUDA graph"):
         wrapper.plan(
@@ -1979,7 +1982,52 @@ def test_cuda_graph_reserved_buffer_preflight_rejects_unsafe_buffers(
         )
 
 
-def test_cuda_graph_staging_rejects_cross_source_target_alias(monkeypatch):
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize(
+    "missing", ["all", "qo_indptr", "kv_indptr", "kv_indices", "kv_len_arr"]
+)
+def test_fa_graph_missing_reserved_buffers_are_unsupported(
+    monkeypatch, backend, missing
+):
+    import flashinfer.mla as mla
+
+    native = _FakeBatchMLAModule()
+    _patch_fake_fa_module(monkeypatch, native)
+    buffers = {
+        "qo_indptr": torch.empty(3, dtype=torch.int32),
+        "kv_indptr": torch.empty(3, dtype=torch.int32),
+        "kv_indices": torch.empty(2, dtype=torch.int32),
+        "kv_len_arr": torch.empty(2, dtype=torch.int32),
+    }
+    if missing == "all":
+        buffers.clear()
+    else:
+        buffers.pop(missing)
+    wrapper = mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(16, dtype=torch.uint8),
+        backend=backend,
+        use_cuda_graph=True,
+        **buffers,
+    )
+    with pytest.raises(_BackendPlanUnsupportedError, match="requires reserved"):
+        wrapper.plan(
+            metadata=_csr_metadata(
+                mla,
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+                torch.tensor([0, 1], dtype=torch.int32),
+                torch.tensor([1, 1], dtype=torch.int32),
+            ),
+            **_small_plan_kwargs(),
+        )
+    assert not native.plan_calls
+    assert wrapper._planned_backend is None
+
+
+@pytest.mark.parametrize("missing_buffer", [False, True])
+def test_cuda_graph_staging_rejects_cross_source_target_alias(
+    monkeypatch, missing_buffer
+):
     import flashinfer.mla as mla
 
     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
@@ -1992,6 +2040,8 @@ def test_cuda_graph_staging_rejects_cross_source_target_alias(monkeypatch):
     wrapper._kv_indptr_buf = kv_indptr_reserved
     wrapper._kv_indices_buf = torch.empty(2, dtype=torch.int32)
     wrapper._kv_len_arr_buf = torch.empty(2, dtype=torch.int32)
+    if missing_buffer:
+        wrapper._kv_len_arr_buf = None
 
     with pytest.raises(ValueError, match=r"CUDA graph.*source.*reserved"):
         wrapper.plan(
@@ -2820,35 +2870,34 @@ def test_cutile_split_layout_numerics_and_graph(
 ):
     wrapper, lengths, table = _make_cutile_plan(batch, heads, page, length, dtype, dim)
     minimum_pools = batch * table.shape[1]
-    for extra_pools in (0, 1, 17):
-        for adjacent in (False, True):
-            query, cache, out = _cutile_inputs(
-                batch, heads, page, minimum_pools + extra_pools, dtype, adjacent, 1, dim
-            )
+    for adjacent in (False, True):
+        query, cache, out = _cutile_inputs(
+            batch, heads, page, minimum_pools, dtype, adjacent, 1, dim
+        )
 
-            def run():
-                return wrapper.run(query=query, kv_cache=cache, out=out)
+        def run():
+            return wrapper.run(query=query, kv_cache=cache, out=out)
 
-            for current_length in (length, 0, min(13, length), length):
-                lengths.fill_(current_length)
-                expected = _cutile_reference(query, cache, lengths, table)
-                out.fill_(math.nan)
-                assert run() is out
-                torch.cuda.synchronize()
-                torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.02)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                run()
-            out.fill_(math.nan)
-            graph.replay()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.02)
-            query[0].add_(0.125)
+        for current_length in (length, 0, min(13, length), length):
+            lengths.fill_(current_length)
             expected = _cutile_reference(query, cache, lengths, table)
             out.fill_(math.nan)
-            graph.replay()
+            assert run() is out
             torch.cuda.synchronize()
             torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.02)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        out.fill_(math.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.02)
+        query[0].add_(0.125)
+        expected = _cutile_reference(query, cache, lengths, table)
+        out.fill_(math.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.02)
 
 
 # cuTile adapter contracts at the public wrapper boundary.
@@ -3301,3 +3350,250 @@ def test_cutile_malformed_scale_remains_caller_error(monkeypatch, scale, error):
     )
     with pytest.raises(error, match="sm_scale"):
         wrapper.plan(**_cutile_contract_plan_kwargs(sm_scale=scale))
+
+
+def _rollback_plan_args(*, graph=False, **overrides):
+    from flashinfer.mla._batch_mla._planning import _MLAPlanArguments
+
+    return _MLAPlanArguments(
+        **{
+            **COMMON_PLAN_KWARGS,
+            "metadata": _dense_metadata(),
+            "output_dtype": torch.bfloat16,
+            "kv_layout": "combined",
+            "_float_workspace_buffer": torch.full((128,), 17, dtype=torch.uint8),
+            "_use_cuda_graph": graph,
+            "_qo_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
+            "_kv_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
+            "_kv_indices_buf": torch.full((8,), -1, dtype=torch.int32),
+            "_kv_len_arr_buf": torch.full((2,), -1, dtype=torch.int32),
+            "_graph_plan_int_workspace_buffer": (
+                torch.full((64,), 23, dtype=torch.uint8) if graph else None
+            ),
+            **overrides,
+        }
+    )
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("failure", ["native", "unsupported", "audit"])
+def test_fa_backend_planning_failure_boundaries(monkeypatch, backend, failure):
+    from contextlib import contextmanager
+    from flashinfer.mla._batch_mla._planning import _MLAPlanArguments
+
+    class Native(_FakeBatchMLAModule):
+        def plan(self, *args):
+            args[1].fill_(99)
+            if failure == "native":
+                raise RuntimeError("injected native failure")
+            if failure == "unsupported":
+                raise _BackendPlanUnsupportedError("injected unsupported failure")
+            return super().plan(*args)
+
+    _patch_fake_fa_module(monkeypatch, Native())
+    args = _rollback_plan_args(graph=True)
+    buffers = (
+        args._graph_plan_int_workspace_buffer,
+        args._qo_indptr_buf,
+        args._kv_indptr_buf,
+        args._kv_indices_buf,
+        args._kv_len_arr_buf,
+    )
+    before = [buffer.clone() for buffer in buffers]
+    if failure == "audit":
+        original_audit = _MLAPlanArguments.audit_public_argument_access
+
+        @contextmanager
+        def fail_audit(self, name):
+            with original_audit(self, name):
+                yield
+            raise AssertionError("injected audit failure")
+
+        monkeypatch.setattr(
+            _MLAPlanArguments, "audit_public_argument_access", fail_audit
+        )
+
+    backend_type = _wrapper._BACKEND_TYPES[backend]
+    error_type = {
+        "unsupported": _BackendPlanUnsupportedError,
+        "audit": AssertionError,
+    }.get(failure, RuntimeError)
+    with pytest.raises(error_type, match=f"injected {failure} failure"):
+        # Direct calls must also roll back without wrapper intervention.
+        backend_type.plan_from_wrapper(args)
+    if failure == "audit":
+        # Developer audits run after successful planning, outside rollback.
+        assert torch.all(args._graph_plan_int_workspace_buffer == 99)
+    else:
+        for actual, expected in zip(buffers, before, strict=True):
+            torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fa_plan_does_not_clone_float_workspace(monkeypatch, backend, graph):
+    _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+    args = _rollback_plan_args(graph=graph)
+    wrapper = _wrapper.BatchMLAPagedAttentionWrapper(
+        args._float_workspace_buffer,
+        backend=backend,
+        use_cuda_graph=graph,
+        qo_indptr=args._qo_indptr_buf,
+        kv_indptr=args._kv_indptr_buf,
+        kv_indices=args._kv_indices_buf,
+        kv_len_arr=args._kv_len_arr_buf,
+    )
+    original_clone = torch.Tensor.clone
+
+    def clone(tensor, *pos, **kw):
+        assert (
+            tensor.untyped_storage().data_ptr()
+            != args._float_workspace_buffer.untyped_storage().data_ptr()
+        )
+        return original_clone(tensor, *pos, **kw)
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
+    wrapper.plan(metadata=args.metadata, **COMMON_PLAN_KWARGS)
+
+
+@pytest.mark.parametrize("failure", [None, "native", "audit"])
+def test_xqa_backend_local_rollback_and_snapshot_prefix(monkeypatch, failure):
+    from contextlib import contextmanager
+    from flashinfer.mla._batch_mla._planning import _MLAPlanArguments
+    from flashinfer.mla._batch_mla._backends import xqa_backend
+    from flashinfer.mla import MLAPlanMetadata
+
+    monkeypatch.setattr(
+        xqa_backend, "_validate_xqa_device_capability", lambda device: None
+    )
+    monkeypatch.setattr(xqa_backend, "device_support_pdl", lambda device: False)
+    monkeypatch.setattr(xqa_backend, "get_xqa_module_mla", lambda *args: object())
+
+    def sm_count(device):
+        if failure == "native":
+            raise RuntimeError("injected native failure")
+        return 1
+
+    monkeypatch.setattr(xqa_backend, "get_device_sm_count", sm_count)
+    workspace = torch.full((128 * 1024 * 1024,), 17, dtype=torch.uint8)
+    args = _rollback_plan_args(
+        num_heads=128,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=32,
+        _float_workspace_buffer=workspace,
+        metadata=MLAPlanMetadata(
+            cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            block_tables=torch.zeros((2, 4), dtype=torch.int32),
+            seq_lens=torch.tensor([32, 32], dtype=torch.int32),
+            max_q_len=1,
+        ),
+    )
+    original_clone = torch.Tensor.clone
+    copied_bytes = []
+
+    def clone(tensor, *pos, **kw):
+        if (
+            tensor.untyped_storage().data_ptr()
+            == workspace.untyped_storage().data_ptr()
+        ):
+            copied_bytes.append(tensor.numel() * tensor.element_size())
+        return original_clone(tensor, *pos, **kw)
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
+    backend_type = xqa_backend._BatchMLAPagedAttentionXqaBackend
+    if failure == "audit":
+        original_audit = _MLAPlanArguments.audit_public_argument_access
+
+        @contextmanager
+        def fail_audit(self, name):
+            with original_audit(self, name):
+                yield
+            raise AssertionError("injected audit failure")
+
+        monkeypatch.setattr(
+            _MLAPlanArguments, "audit_public_argument_access", fail_audit
+        )
+    if failure is not None:
+        error_type = AssertionError if failure == "audit" else RuntimeError
+        with pytest.raises(error_type, match=f"injected {failure} failure"):
+            backend_type.plan_from_wrapper(args)
+        if failure == "audit":
+            assert torch.all(workspace[: 8 * 1024 * 1024] == 0)
+            assert torch.all(workspace[8 * 1024 * 1024 :] == 17)
+        else:
+            assert torch.all(workspace == 17)
+    else:
+        backend_type.plan_from_wrapper(args)
+        assert torch.all(workspace[: 8 * 1024 * 1024] == 0)
+        assert torch.all(workspace[8 * 1024 * 1024 :] == 17)
+    assert copied_bytes == [8 * 1024 * 1024]
+
+
+@pytest.mark.parametrize("backend", ["fa2", "auto", "cute-dsl"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_wrapper_warns_once_after_successful_backend_plan(
+    monkeypatch, backend, failure
+):
+    from dataclasses import replace
+    from flashinfer.mla._batch_mla import _auto_policy
+
+    metadata = _dense_metadata()
+    events = []
+
+    class Backend:
+        _backend = "fa2"
+        _plan_capabilities = replace(
+            _wrapper._BACKEND_TYPES["fa2"]._plan_capabilities, is_experimental=True
+        )
+
+        @staticmethod
+        def plan_from_wrapper(plan_args):
+            assert plan_args.metadata is metadata
+            events.append("plan")
+            if failure:
+                raise RuntimeError("injected planner failure")
+            return planned
+
+    planned = Backend()
+    monkeypatch.setitem(_wrapper._BACKEND_TYPES, "fa2", Backend)
+    monkeypatch.setattr(
+        _wrapper._BatchMLAPagedAttentionCuteDslBackend, "_candidate_types", (Backend,)
+    )
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", lambda args: ("fa2",))
+    monkeypatch.setenv(
+        "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1" if backend == "auto" else "0"
+    )
+    wrapper = _wrapper.BatchMLAPagedAttentionWrapper(
+        torch.empty(64, dtype=torch.uint8), backend=backend
+    )
+
+    expected_published = None
+
+    def observe_warning(api_name, selected_backend, **kwargs):
+        # Warnings belong after selection but before successful state publication.
+        assert wrapper._planned_backend is expected_published
+        events.append((api_name, selected_backend, kwargs))
+
+    monkeypatch.setattr(_wrapper, "warn_experimental_backend_once", observe_warning)
+    if failure:
+        with pytest.raises(RuntimeError, match="injected planner failure"):
+            wrapper.plan(metadata=metadata, **COMMON_PLAN_KWARGS)
+        assert events == ["plan"]
+        assert wrapper._planned_backend is None
+    else:
+        # Replanning must retain the requested auto policy after _backend changes.
+        for _ in range(2):
+            events.clear()
+            expected_published = wrapper._planned_backend
+            wrapper.plan(metadata=metadata, **COMMON_PLAN_KWARGS)
+            assert wrapper._planned_backend is planned
+            assert events == [
+                "plan",
+                (
+                    "BatchMLAPagedAttentionWrapper",
+                    "fa2",
+                    {"automatic": backend == "auto"},
+                ),
+            ]

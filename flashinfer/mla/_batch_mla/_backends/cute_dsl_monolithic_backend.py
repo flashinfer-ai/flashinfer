@@ -96,6 +96,15 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
                 else None
             ),
         )
+        if workspace_size:
+            # The reducer launches one grid-Y slot per query, independently
+            # of the main kernel's flattened query/head tile count.
+            try:
+                implementation._validate_nonpersistent_grid_y(1, q_len, False)
+            except ValueError as error:
+                raise _CuteDslKernelUnsupportedError(
+                    f"split-KV reducer: {error}"
+                ) from error
         compiled_kernel = implementation._get_compiled_mla_kernel(
             q_data_type,
             out_dtype,

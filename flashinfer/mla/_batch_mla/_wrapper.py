@@ -16,7 +16,6 @@ import torch
 from ...api_logging import (
     _warn_from_external_caller,
     flashinfer_api,
-    experimental_auto_backends_allowed,
     warn_experimental_backend_once,
 )
 from ...trace.templates.attention import mla_paged_decode_trace
@@ -91,76 +90,6 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-def _prepare_backend(
-    backend_type: type[_WrapperBackendType],
-    plan_args: _MLAPlanArguments,
-    *,
-    automatic: bool = False,
-    snapshots: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
-) -> _PlannedBackend:
-    """Prepare a concrete backend transactionally or delegate to a selector.
-
-    Selectors have no concrete capabilities; they call this helper for each
-    candidate, sharing snapshots so rejected attempts cannot affect later ones.
-    No outer snapshot is needed for a selector's own dispatch logic.
-    """
-    capabilities = getattr(backend_type, "_plan_capabilities", None)
-    if capabilities is None:
-        return backend_type.plan_from_wrapper(plan_args)
-
-    candidate = capabilities.backend_name
-    experimental = capabilities.is_experimental
-    if automatic and experimental and not experimental_auto_backends_allowed():
-        raise _BackendPlanUnsupportedError(
-            "experimental backend requires "
-            "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1"
-        )
-    if snapshots is None:
-        snapshots = []
-    try:
-        preflight = getattr(backend_type, "preflight_plan_from_wrapper", None)
-        if preflight is not None:
-            preflight(plan_args)
-        # Snapshot once, after cheap eligibility checks. Native planners may
-        # write caller workspaces and metadata, including unused buffer tails.
-        if not snapshots:
-            buffers = [
-                plan_args._float_workspace_buffer,
-                plan_args._qo_indptr_buf,
-                plan_args._kv_indptr_buf,
-                plan_args._kv_indices_buf,
-                plan_args._kv_len_arr_buf,
-                plan_args._graph_plan_int_workspace_buffer,
-            ]
-            buffers.extend(
-                getattr(plan_args.metadata, name)
-                for name in (
-                    "qo_indptr",
-                    "kv_indptr",
-                    "kv_indices",
-                    "kv_len_arr",
-                    "cum_seq_lens_q",
-                    "block_tables",
-                    "seq_lens",
-                )
-            )
-            seen = set()
-            for buffer in buffers:
-                if buffer is not None and id(buffer) not in seen:
-                    snapshots.append((buffer, buffer.clone()))
-                    seen.add(id(buffer))
-        planned_backend = backend_type.plan_from_wrapper(plan_args)
-        if experimental:
-            warn_experimental_backend_once(
-                "BatchMLAPagedAttentionWrapper", candidate, automatic=automatic
-            )
-        return planned_backend
-    except BaseException:
-        for buffer, original in snapshots:
-            buffer.copy_(original)
-        raise
-
-
 class _BatchMLAPagedAttentionCuteDslBackend:
     """Compatibility planner for the ``cute-dsl`` backend family alias."""
 
@@ -184,13 +113,12 @@ class _BatchMLAPagedAttentionCuteDslBackend:
                 candidate_types = sink_candidate_types
 
         typed_rejections: list[str] = []
-        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
         for backend_type in candidate_types:
             capabilities = backend_type._plan_capabilities
             try:
                 if reason := plan_capability_rejection_reason(plan_args, capabilities):
                     raise _BackendPlanUnsupportedError(reason)
-                return _prepare_backend(backend_type, plan_args, snapshots=snapshots)
+                return backend_type.plan_from_wrapper(plan_args)
             except _BackendPlanUnsupportedError as exc:
                 typed_rejections.append(f"{capabilities.backend_name}: {exc}")
                 continue
@@ -553,7 +481,15 @@ class BatchMLAPagedAttentionWrapper:
             Deprecated flat dense page-table metadata fields.
         max_q_len : Optional[int]
             Maximum dense query length; inferred from query metadata when
-            omitted.
+            omitted. For CuTe DSL monolithic plans created with nonuniform
+            query lengths, this also sets the per-request CUDA graph launch
+            capacity. Those plans may update query offsets in place while
+            preserving batch size, total tokens, tensor addresses/shapes, and
+            positive request lengths within this capacity. Initially uniform
+            plans keep query lengths fixed. Other selected backends retain
+            their own graph contracts; automatic selection does not guarantee
+            support for query redistribution. Direct graph replay does not
+            validate updated offsets in Python.
         num_heads : Optional[int]
             Number of query heads.
         head_dim_ckv, head_dim_kpe : Optional[int]
@@ -757,7 +693,14 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
-        planned_backend = _prepare_backend(self._backend_type, plan_args)
+        planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+        capabilities = planned_backend._plan_capabilities
+        if capabilities.is_experimental:
+            warn_experimental_backend_once(
+                "BatchMLAPagedAttentionWrapper",
+                capabilities.backend_name,
+                automatic=self._backend_type is _BatchMLAPagedAttentionAutoBackend,
+            )
 
         # ---------------------------------------------------------------------------
         # Publish the successful plan state

@@ -6,10 +6,12 @@ you may not use this file except in compliance with the License.
 """
 
 import functools
+import importlib.metadata
 import math
 from typing import ClassVar, Optional, Union, cast
 
 import torch
+from packaging.version import InvalidVersion, Version
 
 from ....utils import get_compute_capability
 from .._contracts import _are_adjacent_last_dim_views
@@ -79,6 +81,17 @@ def _get_compute_capability(device: torch.device):
 @functools.lru_cache(maxsize=1)
 def get_cutile_mla_decode():
     """Resolve executable preparation only after the cuTile plan is validated."""
+
+    try:
+        installed_version = Version(importlib.metadata.version("cuda-tile"))
+    except (importlib.metadata.PackageNotFoundError, InvalidVersion) as exc:
+        raise _BackendPlanUnsupportedError(
+            "cutile requires cuda-tile>=1.4 with valid package version metadata."
+        ) from exc
+    if installed_version < Version("1.4"):
+        raise _BackendPlanUnsupportedError(
+            f"cutile requires cuda-tile>=1.4, got {installed_version}."
+        )
 
     from ....cutile.cutile_common import is_cuda_tile_available
     from ._cutile_prepared import prepare_cutile_mla_decode
@@ -207,6 +220,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         kv_layouts=frozenset({"combined", "independent-split"}),
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default"}),
+        is_experimental=True,
         requires_packed_query=False,
         requires_packed_kv_cache=False,
     )

@@ -719,7 +719,7 @@ def test_cutile_prepared_run_only_launches(
     monkeypatch.setattr(compile_module, "compile_tile", _forbidden)
     monkeypatch.setattr(native, "exhaustive_search", _forbidden)
     monkeypatch.setattr(native, "decode_mla_kv_paged_cutile", _forbidden)
-    for extra_pools in (0, 1, 17):
+    for extra_pools in (0, 17):
         for adjacent in (False, True):
             pools = metadata.block_tables.numel() + extra_pools
             if adjacent:

@@ -573,7 +573,11 @@ the plan.
 
 ### cuTile
 
-cuTile supports explicit selection and SM100 auto. Native execution supports
+cuTile is experimental: explicit selection opts in and emits a warning, while
+SM100 auto considers it only with `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`,
+including when earlier candidates reject the request. Planning requires
+`cuda-tile>=1.4` and an available compiler; unsupported versions produce a typed
+rejection so auto can continue to the next eligible backend. Native execution supports
 SM100, SM103, SM120 and SM121 with matching FP16/BF16 query/KV/output,
 256 or 512 compressed dimensions, 64 positional dimensions, one query per
 request, positive query-head counts and power-of-two pages from 1 through 128.
@@ -638,8 +642,16 @@ updates stay within the compiled contract.
 
 A new backend instance owns the resources it creates while planning. The
 wrapper does not replace `_planned_backend` or `_input_contract` until
-`plan_from_wrapper()` returns successfully. Failed preparation restores shared
-buffers and leaves the previously published plan usable.
+`plan_from_wrapper()` returns successfully and any experimental warning is emitted.
+Backend planning failures restore shared buffers and leave the previously
+published plan usable. Each concrete backend owns snapshot and rollback directly in `plan_from_wrapper()`. Generated FA
+protects the shared integer workspace and reserved graph metadata; XQA protects
+only the 8 MiB semaphore prefix it zeroes. Float scratch and source metadata that
+planning only reads are not copied. Planners that do not mutate caller storage
+need no snapshots. The wrapper emits experimental-backend warnings after planning
+returns. Warnings promoted to exceptions do not roll back completed planning.
+The outer argument-audit decorator checks successful planners for development
+errors; its assertions are also outside the rollback boundary.
 
 Generated-FA CUDA Graph planning also stages metadata transactionally. Before
 copying, it verifies each reserved buffer's presence, rank where required,
@@ -658,7 +670,7 @@ candidate backend generation around that stable storage. Generated planning
 uses a private, allocator-aware pinned staging allocation for exactly the
 reported workspace prefix; that staging allocation is not public state and is
 not retained as a growing history of plans. If candidate planning or staging
-fails, the wrapper restores shared workspaces and metadata, including unused
+fails, the backend restores its shared integer workspace and metadata, including unused
 tails, and keeps the published plan and pointers intact. Fallback restores that
 storage before trying another candidate. Only after preparation succeeds does
 the wrapper publish its backend and input-contract state, so ownership is
@@ -682,10 +694,25 @@ metadata with all three tensors on the wrapper device, contiguous, and
 or conversion would hide the storage consumed by replay. Convert metadata to
 dense device tensors before planning and retain those tensors. Update
 `seq_lens` and `block_tables` in place before replay, keeping lengths within
-reserved page-table/cache capacity and page indices valid. Keep query offsets,
-query lengths, and all tensor shapes fixed; these are compiled plan facts.
+reserved page-table/cache capacity and page indices valid. Keep query offsets
+and query lengths fixed except for the already-ragged monolithic case below.
+All tensor addresses and shapes remain fixed.
 Non-graph plans continue accepting CPU and CSR metadata. CuTe DSL modular
 continues to reject graph mode entirely.
+
+CuTe DSL monolithic plans created with nonuniform query lengths use
+`max_q_len` as the per-request launch and workspace capacity. The graph may
+redistribute those query tokens by updating `cum_seq_lens_q` in place, provided
+offsets start at zero, remain strictly increasing, retain the same final total,
+and every request length stays within the planned capacity. Batch size,
+causality and the remaining plan contract also stay fixed. Output and LSE
+storage remain compact, sized by the fixed total query-token count. When
+`max_q_len` is omitted, capacity is the largest initial request length.
+Initially uniform plans retain their fixed-query specialization and cannot
+change query lengths during replay. This exception applies only when the
+concrete planned backend is monolithic CuTe; `backend="auto"` does not promise
+that every selected backend can redistribute queries. Direct graph replay
+does not execute Python validation of updated offsets.
 
 The wrapper does not currently expose a CUDA Graph plan-update API. Any future
 plan-update surface must remain capability-gated per concrete backend;
