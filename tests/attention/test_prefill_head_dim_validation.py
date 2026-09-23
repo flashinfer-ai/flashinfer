@@ -22,11 +22,14 @@ def _paged_inputs():
     return qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len
 
 
-@pytest.mark.parametrize("head_dim", [72, 96, 0])
-def test_single_prefill_rejects_unsafe_head_dim(head_dim):
-    q = torch.empty(16, 1, head_dim, dtype=torch.float16, device="cuda")
-    k = torch.empty(16, 1, head_dim, dtype=torch.float16, device="cuda")
-    v = torch.empty(16, 1, head_dim, dtype=torch.float16, device="cuda")
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo",
+    [(72, 72), (96, 96), (64, 96), (96, 64)],
+)
+def test_single_prefill_rejects_unsafe_head_dim(head_dim_qk, head_dim_vo):
+    q = torch.empty(16, 1, head_dim_qk, dtype=torch.float16, device="cuda")
+    k = torch.empty(16, 1, head_dim_qk, dtype=torch.float16, device="cuda")
+    v = torch.empty(16, 1, head_dim_vo, dtype=torch.float16, device="cuda")
 
     with pytest.raises(ValueError, match="positive multiples of 64"):
         flashinfer.single_prefill_with_kv_cache(q, k, v, backend="fa2")
@@ -44,24 +47,33 @@ def test_single_prefill_accepts_safe_head_dim():
 
 
 @pytest.mark.parametrize("method", ["workspace_size", "plan"])
-def test_paged_prefill_rejects_unsafe_head_dim(method):
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo",
+    [(96, 96), (64, 96), (96, 64)],
+)
+def test_paged_prefill_rejects_unsafe_head_dim(method, head_dim_qk, head_dim_vo):
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         _workspace(), backend="fa2"
     )
-    args = (*_paged_inputs(), 1, 1, 96, 16)
+    args = (*_paged_inputs(), 1, 1, head_dim_qk, 16)
+    kwargs = {"head_dim_vo": head_dim_vo}
 
     with pytest.raises(ValueError, match="positive multiples of 64"):
-        getattr(wrapper, method)(*args)
+        getattr(wrapper, method)(*args, **kwargs)
 
 
-def test_ragged_prefill_rejects_unsafe_head_dim():
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo",
+    [(96, 96), (64, 96), (96, 64)],
+)
+def test_ragged_prefill_rejects_unsafe_head_dim(head_dim_qk, head_dim_vo):
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         _workspace(), backend="fa2"
     )
     indptr = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
 
     with pytest.raises(ValueError, match="positive multiples of 64"):
-        wrapper.plan(indptr, indptr, 1, 1, 96)
+        wrapper.plan(indptr, indptr, 1, 1, head_dim_qk, head_dim_vo=head_dim_vo)
 
 
 def test_paged_workspace_size_selects_backend_with_head_dims(monkeypatch):

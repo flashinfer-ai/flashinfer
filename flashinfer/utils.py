@@ -199,14 +199,14 @@ def _check_kv_layout(kv_layout: str) -> None:
 
 def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
     """Validate the FA2 prefill head-dimension safety requirement."""
-    if backend != "fa2":
+    if head_dim_qk <= 0 or head_dim_vo <= 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive, got "
+            "head_dim_qk={}, head_dim_vo={}.".format(head_dim_qk, head_dim_vo)
+        )
+    if backend != "fa2":  # only FA2 silently corrupts for non-64-multiple head dims
         return
-    if (
-        head_dim_qk <= 0
-        or head_dim_vo <= 0
-        or head_dim_qk % 64 != 0
-        or head_dim_vo % 64 != 0
-    ):
+    if head_dim_qk % 64 != 0 or head_dim_vo % 64 != 0:
         raise ValueError(
             "head_dim_qk and head_dim_vo must be positive multiples of 64, got "
             "head_dim_qk={}, head_dim_vo={}. The FA2 prefill kernels only "
