@@ -770,12 +770,14 @@ entries to miss and the next explicit tune to consider the expanded list.
 
 These measurements used reviewed source tree
 `5f216e4aff2beb1b679178706e574d068ae81de8`, based on main
-`6870e3fff46b1e768ad423ea48d286e6f3e250fe`. The later integration onto main
-`621fd46e1497a609693d6532ed56325a4d2ce8b2` retains byte-identical SM90 kernel
-implementation files under `src/` and the
-same 39 ordered candidate lists for this workload (13 token counts times
-three precisions). The full performance campaign was not repeated after
-integration or after widening tail-candidate eligibility to other shapes.
+`6870e3fff46b1e768ad423ea48d286e6f3e250fe`. The integration at commit
+`5a22cbfe40eee83aeff6c64bc65873e4eaf39201`, based on main
+`621fd46e1497a609693d6532ed56325a4d2ce8b2`, retained byte-identical SM90 kernel
+implementation files under `src/` and the same 39 ordered candidate lists for
+this workload (13 token counts times three precisions). Subsequent review fixes
+consolidate the LDSM/conversion helpers and keep MXFP4 FC1 chunking independent
+of the FP8 environment override. The full performance campaign was not repeated
+after these changes; this table retains the original measured source above.
 
 **Workload and selection.** Four H200 GPUs, EP4, H7168/I3072/E384, top-k 6,
 clamp 10, dense BF16 inputs, block-permutation routing and the benchmark's

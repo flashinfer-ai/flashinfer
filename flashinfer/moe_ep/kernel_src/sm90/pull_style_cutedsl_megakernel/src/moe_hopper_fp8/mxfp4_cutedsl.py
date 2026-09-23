@@ -233,11 +233,12 @@ def make_expanded_offset_view_k256(
 
 
 @cute.jit
-def make_packed_a_ldsm_views(
+def _make_packed_a_ldsm_views(
     tiled_mma,
     packed_smem_a: cute.Tensor,
     fp8_fragment_a: cute.Tensor,
     thread_idx_in_warpgroup: Int32,
+    swizzle_b: cutlass.Constexpr,
 ):
     """Build LDSM source/copy views and the nested-K E2M1 RF tensor.
 
@@ -260,7 +261,7 @@ def make_packed_a_ldsm_views(
     packed_as_fp8 = cute.make_tensor(
         cute.recast_ptr(
             packed_smem_a.iterator,
-            cute.make_swizzle(2, 4, 3),
+            cute.make_swizzle(swizzle_b, 4, 3),
             dtype=cutlass.Float8E4M3FN,
         ),
         cute.recast_layout(
@@ -297,6 +298,19 @@ def make_packed_a_ldsm_views(
     )
     return tiled_copy, smem_partition, copy_view, packed_registers
 
+
+
+@cute.jit
+def make_packed_a_ldsm_views(
+    tiled_mma,
+    packed_smem_a: cute.Tensor,
+    fp8_fragment_a: cute.Tensor,
+    thread_idx_in_warpgroup: Int32,
+):
+    """Build K128 LDSM views using the S<2,4,3> swizzle."""
+    return _make_packed_a_ldsm_views(
+        tiled_mma, packed_smem_a, fp8_fragment_a, thread_idx_in_warpgroup, 2
+    )
 
 @cute.jit
 def make_packed_a_ldsm_views_k256(
@@ -305,54 +319,10 @@ def make_packed_a_ldsm_views_k256(
     fp8_fragment_a: cute.Tensor,
     thread_idx_in_warpgroup: Int32,
 ):
-    """K256 LDSM views using the SM90 256-column S<3,4,3> swizzle."""
-
-    ldsm_atom = cute.make_copy_atom(
-        warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-        cutlass.Float8E4M3FN,
+    """Build K256 LDSM views using the S<3,4,3> swizzle."""
+    return _make_packed_a_ldsm_views(
+        tiled_mma, packed_smem_a, fp8_fragment_a, thread_idx_in_warpgroup, 3
     )
-    tiled_copy = cute.make_tiled_copy_A(ldsm_atom, tiled_mma)
-    thread_copy = tiled_copy.get_slice(thread_idx_in_warpgroup)
-    packed_as_fp8 = cute.make_tensor(
-        cute.recast_ptr(
-            packed_smem_a.iterator,
-            cute.make_swizzle(3, 4, 3),
-            dtype=cutlass.Float8E4M3FN,
-        ),
-        cute.recast_layout(
-            8,
-            4,
-            packed_smem_a.layout,
-        ),
-    )
-    smem_partition = thread_copy.partition_S(packed_as_fp8)
-
-    k_blocks = cute.size(fp8_fragment_a, mode=[2])
-    ldsm_shape = (
-        fp8_fragment_a.shape[0],
-        fp8_fragment_a.shape[1],
-        k_blocks // 2,
-    )
-    ldsm_registers = cute.make_rmem_tensor(ldsm_shape, cutlass.Float8E4M3FN)
-    copy_view = thread_copy.retile(ldsm_registers)
-
-    first_mode = cute.size(ldsm_registers, mode=[0])
-    mma_m = ldsm_registers.shape[1]
-    half_k = cute.size(ldsm_registers, mode=[2])
-    packed_layout = cute.make_layout(
-        (first_mode, mma_m, (2, half_k)),
-        stride=(
-            1,
-            first_mode * 2,
-            (first_mode, first_mode * 2 * cute.size(mma_m)),
-        ),
-    )
-    packed_registers = cute.make_tensor(
-        cute.recast_ptr(ldsm_registers.iterator, dtype=cutlass.Float4E2M1FN),
-        packed_layout,
-    )
-    return tiled_copy, smem_partition, copy_view, packed_registers
-
 
 @cute.jit
 def make_packed_a_ldsm_views_k256_half(
@@ -361,57 +331,10 @@ def make_packed_a_ldsm_views_k256_half(
     fp8_fragment_a: cute.Tensor,
     thread_idx_in_warpgroup: Int32,
 ):
-    """Build a K128 register fragment over a K256 S<3,4,3> SMEM stage.
-
-    The returned source partition retains all four packed K64 chunks from the
-    K256 stage. Callers copy two chunks at a time into the two-chunk K128
-    register view, keeping only half of the converted A tile live.
-    """
-
-    ldsm_atom = cute.make_copy_atom(
-        warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-        cutlass.Float8E4M3FN,
+    """Build a K128 register fragment over a K256 S<3,4,3> SMEM stage."""
+    return _make_packed_a_ldsm_views(
+        tiled_mma, packed_smem_a, fp8_fragment_a, thread_idx_in_warpgroup, 3
     )
-    tiled_copy = cute.make_tiled_copy_A(ldsm_atom, tiled_mma)
-    thread_copy = tiled_copy.get_slice(thread_idx_in_warpgroup)
-    packed_as_fp8 = cute.make_tensor(
-        cute.recast_ptr(
-            packed_smem_a.iterator,
-            cute.make_swizzle(3, 4, 3),
-            dtype=cutlass.Float8E4M3FN,
-        ),
-        cute.recast_layout(8, 4, packed_smem_a.layout),
-    )
-    smem_partition = thread_copy.partition_S(packed_as_fp8)
-
-    k_blocks = cute.size(fp8_fragment_a, mode=[2])
-    ldsm_registers = cute.make_rmem_tensor(
-        (
-            fp8_fragment_a.shape[0],
-            fp8_fragment_a.shape[1],
-            k_blocks // 2,
-        ),
-        cutlass.Float8E4M3FN,
-    )
-    copy_view = thread_copy.retile(ldsm_registers)
-
-    first_mode = cute.size(ldsm_registers, mode=[0])
-    mma_m = ldsm_registers.shape[1]
-    half_k = cute.size(ldsm_registers, mode=[2])
-    packed_layout = cute.make_layout(
-        (first_mode, mma_m, (2, half_k)),
-        stride=(
-            1,
-            first_mode * 2,
-            (first_mode, first_mode * 2 * cute.size(mma_m)),
-        ),
-    )
-    packed_registers = cute.make_tensor(
-        cute.recast_ptr(ldsm_registers.iterator, dtype=cutlass.Float4E2M1FN),
-        packed_layout,
-    )
-    return tiled_copy, smem_partition, copy_view, packed_registers
-
 
 @cute.jit
 def convert_packed_a_kblock(
@@ -423,36 +346,10 @@ def convert_packed_a_kblock(
 ) -> None:
     """Convert one K32 register slot using its partitioned folded offsets."""
 
-    packed_slot = packed_registers[(None, None, k_block)]
-    fp8_slot = fp8_fragment_a[(None, None, k_block)]
-    packed_words = cute.recast_tensor(packed_slot, Int32)
-    fp8_words = cute.recast_tensor(fp8_slot, Int32)
-
-    offsets = partitioned_offsets[(None, None, k_block, stage_idx)]
-    offsets_div = cute.zipped_divide(offsets, cute.make_layout(8))
-    offsets_vm = cute.group_modes(offsets_div, 1, cute.rank(offsets_div))
-    pair_count = cute.size(packed_words) // 2
-    for pair in cutlass.range_constexpr(pair_count):
-        row_offsets = cute.filter(offsets_vm[(None, pair * 2)])
-        lo_offset = Int32(row_offsets[0])
-        scale_value_count = cute.size(row_offsets)
-        assert scale_value_count in (2, 8), (
-            "Humming pair conversion expects two compact row offsets or "
-            "one offset per E2M1 lane"
-        )
-        hi_index = 4 if scale_value_count == 8 else 1
-        hi_offset = Int32(row_offsets[hi_index])
-        out0, out1, out2, out3 = convert_mxfp4_pair_preprocessed_signs(
-            packed_words[pair * 2],
-            packed_words[pair * 2 + 1],
-            lo_offset,
-            hi_offset,
-        )
-        fp8_words[pair * 4] = out0
-        fp8_words[pair * 4 + 1] = out1
-        fp8_words[pair * 4 + 2] = out2
-        fp8_words[pair * 4 + 3] = out3
-
+    convert_packed_a_kblock_from_offset(
+        packed_registers, fp8_fragment_a, partitioned_offsets,
+        k_block, k_block, stage_idx,
+    )
 
 @cute.jit
 def convert_packed_a_kblock_from_offset(

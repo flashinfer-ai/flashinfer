@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import torch
@@ -78,6 +79,31 @@ def test_mxfp4_codegen_policy_is_fixed_and_has_no_hidden_environment_reads():
     )
     assert epilogue_constants["SwapABMxfp4ReuseFc1AccumScratch"] == 1
     assert "SwapABMxfp4SplitFc1StoreOverlap" not in epilogue_constants
+
+
+@pytest.mark.parametrize("configured_chunks", [1, 2, 4, 8])
+def test_fc1_chunk_override_only_affects_fp8_blockwise(configured_chunks):
+    # Execute the production selector without importing GPU-only kernel modules.
+    path = _VENDOR_ROOT / "moe_hopper_fp8/epilogue_fp8_swapab.py"
+    selector = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_resolve_swapab_fc1_group_chunks"
+    )
+    namespace = {
+        "Optional": Optional,
+        "SwapABBlockwiseFc1GroupChunks": configured_chunks,
+    }
+    exec(
+        compile(ast.Module(body=[selector], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    resolve = namespace[selector.name]
+    for groups, expected in ((2, 2), (4, 2), (8, 1), (16, 1)):
+        assert resolve("mxfp4_hybrid", token_group_count=groups) == expected
+        assert resolve("blockwise", token_group_count=groups) == configured_chunks
+        assert resolve("per_tensor", token_group_count=groups) == 1
 
 
 def test_quantized_stage_uses_one_full_hidden_scale_replicated_four_times():

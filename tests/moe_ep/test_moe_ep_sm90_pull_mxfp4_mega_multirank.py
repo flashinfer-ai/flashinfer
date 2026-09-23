@@ -8,7 +8,7 @@ use colliding top-level module names::
         -m "gpu_2 and arch_hopper"
     torchrun --nproc_per_node=4 -m pytest \
         tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py -v \
-        -m "gpu_2 and arch_hopper"
+        -m "arch_hopper"
     torchrun --standalone --nproc_per_node=8 -m pytest \
         tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py -v \
         -m "gpu_2 and arch_hopper"
@@ -161,6 +161,9 @@ def _make_tokens_and_routes(
         # transitions between empty and active on the SAME workspace.
         owner = (slot // LOCAL_EXPERTS + launch) % world_size
         local_expert = (token * 0 + slot) % LOCAL_EXPERTS
+        if world_size == 1:
+            # With one owner, rotate the active local expert between launches.
+            local_expert = (local_expert + launch) % LOCAL_EXPERTS
     elif routing_pattern not in ("cross_rank", "zero_source", "all_masked"):
         raise ValueError(f"unknown routing pattern: {routing_pattern}")
     topk_ids = owner * LOCAL_EXPERTS + local_expert
@@ -483,6 +486,8 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
         "launch this test with torchrun --nproc_per_node=1, 2, 4, or 8; "
         f"got WORLD_SIZE={world_size}"
     )
+    if routing_pattern == "zero_source" and world_size == 1:
+        pytest.skip("zero_source requires a peer rank that still sends tokens")
 
     bootstrap = BootstrapConfig(
         world_size=world_size,

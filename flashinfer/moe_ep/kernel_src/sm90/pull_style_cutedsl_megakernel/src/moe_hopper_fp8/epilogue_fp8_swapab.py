@@ -47,9 +47,6 @@ SwapABTileMChoices = (128, 256)
 # 8 is experimental (wgmma m64n8k32; every n-derived count divides): see TUNING.md.
 SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
 SwapABBlockwiseFc1GroupChunkChoices = (1, 2, 4, 8)
-SwapABBlockwiseFc1GroupChunksExplicit = (
-    "MEGA_SWAPAB_FC1_GROUP_CHUNKS" in os.environ
-)
 SwapABBlockwiseFc1GroupChunks = int(
     os.environ.get("MEGA_SWAPAB_FC1_GROUP_CHUNKS", "1")
 )
@@ -104,13 +101,12 @@ def _resolve_swapab_fc1_group_chunks(
     fp8_scale_mode: str,
     *,
     configured_chunks: int = SwapABBlockwiseFc1GroupChunks,
-    has_explicit_override: bool = SwapABBlockwiseFc1GroupChunksExplicit,
     token_group_count: Optional[int] = None,
 ) -> int:
     """Select the measured MXFP4 chunk count from the physical token tile."""
-    if fp8_scale_mode == "mxfp4_hybrid" and not has_explicit_override:
+    if fp8_scale_mode == "mxfp4_hybrid":
         return 1 if token_group_count is not None and token_group_count >= 8 else 2
-    if fp8_scale_mode in ("blockwise", "mxfp4_hybrid"):
+    if fp8_scale_mode == "blockwise":
         return configured_chunks
     return 1
 

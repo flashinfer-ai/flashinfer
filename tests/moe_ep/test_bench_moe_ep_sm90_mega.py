@@ -365,6 +365,61 @@ class BenchmarkContracts(TestCase):
                     )
                     self.assertEqual(config.knobs, candidate)
 
+    def test_fp8_json_combine_settings_reach_the_resolved_config(self):
+        from flashinfer.moe_ep.kernel_src.sm90 import (
+            pull_style_cutedsl_megakernel as sm90,
+        )
+        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.hopper_fp8 import (
+            resolve_hopper_fp8_mega_moe_config,
+        )
+
+        for scale_mode in ("blockwise", "per_tensor"):
+            base = sm90.hopper_fp8_candidates(
+                fp8_scale_mode=scale_mode, max_tokens=2048
+            )[0]
+            for grouped, combine_format in (
+                (False, "bf16"),
+                (True, "bf16"),
+                (True, "32e4m3xe8m0"),
+                (True, "32e5m2xe8m0"),
+            ):
+                with self.subTest(
+                    scale_mode=scale_mode, grouped=grouped, format=combine_format
+                ):
+                    tactic = dict(
+                        base,
+                        grouped_token_back=grouped,
+                        combine_format=combine_format,
+                        in_kernel_fc2_reduce=False,
+                        token_back_mode="reuse_dispatch_warps"
+                        if grouped
+                        else "epi_warps",
+                    )
+                    args = bench._parse_args(["--fp8-knobs-json", json.dumps(tactic)])
+                    _, orders, tile = bench._resolve_sweep(args, 4)
+                    config = bench._megakernel_config(
+                        args, scale_mode, orders[0], tile, tokens=2048
+                    )
+                    resolved = resolve_hopper_fp8_mega_moe_config(
+                        384,
+                        2048,
+                        6,
+                        7168,
+                        3072,
+                        0,
+                        4,
+                        fp8_scale_mode=scale_mode,
+                        knobs=config.knobs,
+                        token_back_mode=config.token_back_mode,
+                        grouped_token_back=config.grouped_token_back,
+                        combine_format=config.combine_format,
+                    )
+                    self.assertEqual(resolved.grouped_token_back, grouped)
+                    self.assertEqual(resolved.combine_format, combine_format)
+                    self.assertEqual(
+                        resolved.resolved_token_back_mode, tactic["token_back_mode"]
+                    )
+
     def test_fp8_json_tail_split_pairs_requires_boolean(self):
         from flashinfer.moe_ep.kernel_src.sm90 import (
             pull_style_cutedsl_megakernel as sm90,

@@ -83,7 +83,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
             SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
         ),
-        default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+        default=None,
         help="canonical routing workload identity (sm90_mxfp4 only; default: "
         "the PR4688 block-permutation workload)",
     )
@@ -176,15 +176,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
-    args._routing_profile_specified = any(
-        (
-            parser._option_string_actions.get(value.split("=", 1)[0])
-            or parser._get_option_tuples(value)[0][0]
-        ).dest
-        == "routing_profile"
-        for value in raw_argv
-        if value.startswith("--") and value != "--"
-    )
+    args._routing_profile_specified = args.routing_profile is not None
+    if args.routing_profile is None:
+        args.routing_profile = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION
     if args.fp8_scale_mode is None:
         args.fp8_scale_mode = (
             "mxfp4_hybrid" if args.dtype == "sm90_mxfp4" else "per_tensor"

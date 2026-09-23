@@ -1089,9 +1089,13 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
     cluster_shape_mnk = None
     accum_override = None
     token_back_override = None
+    grouped_token_back = args.grouped_token_back
+    combine_format = args.combine_format
     if fp8_knobs is not None:
         swap_ab = None
         mma_tiler_mnk = None
+        grouped_token_back = fp8_knobs.get("grouped_token_back", grouped_token_back)
+        combine_format = fp8_knobs.get("combine_format", combine_format)
     elif operand_order == "heuristic":
         # All geometry knobs None -> the shim resolves the drop's token-bucket
         # heuristic per point (keyed on scale mode and max tokens per rank).
@@ -1178,7 +1182,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         enable_in_kernel_fc2_reduce=False,
         token_back_mode=(
             "reuse_dispatch_warps"
-            if args.grouped_token_back
+            if grouped_token_back
             else (
                 token_back_override
                 if args.token_back == "heuristic"
@@ -1187,8 +1191,8 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         ),
         pingpong=pingpong,
         dedup_dispatch=args.dedup_dispatch,
-        grouped_token_back=args.grouped_token_back,
-        combine_format=args.combine_format,
+        grouped_token_back=grouped_token_back,
+        combine_format=combine_format,
         active_dispatch_warps=args.active_dispatch_warps,
         compact_pull_buffer=args.compact_pull_buffer,
         fc1_store_offload=args.fc1_store_offload,
