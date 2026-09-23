@@ -117,6 +117,7 @@ class _MLADecodeCompileSpec:
     write_final_lse: bool = True
     lse_mode: str = "none"
     scale_types: tuple[bool, bool, bool] = (False, False, False)
+    store_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ class _MLADecodePlanState:
     lse_mode: str = "none"
     softmax_scale: GlobalScale = 1.0
     output_scale: GlobalScale = 1.0
+    store_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -762,6 +764,32 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _validate_mla_softmax_stats(
+    query: torch.Tensor,
+    softmax_stats: Optional[torch.Tensor],
+    *,
+    enabled: bool,
+    validate: bool,
+) -> None:
+    """Check the compiled optional-output contract before any launch."""
+    if enabled != (softmax_stats is not None):
+        raise ValueError(
+            "softmax_stats must be supplied exactly when store_softmax_stats is enabled"
+        )
+    if not enabled or not validate:
+        return
+    if not isinstance(softmax_stats, torch.Tensor):
+        raise TypeError("softmax_stats must be a torch.Tensor")
+    if softmax_stats.dtype != torch.float32:
+        raise ValueError("softmax_stats must have dtype torch.float32")
+    if softmax_stats.device != query.device:
+        raise ValueError("softmax_stats must be on the query device")
+    if softmax_stats.shape != (*query.shape[:-1], 2):
+        raise ValueError("softmax_stats must have shape [*query.shape[:-1], 2]")
+    if not softmax_stats.is_contiguous() or softmax_stats.data_ptr() % 4:
+        raise ValueError("softmax_stats must be contiguous and 4-byte aligned")
+
+
 def _check_softmax_rescale_threshold_log2_range(
     threshold: object, *, q_dtype: torch.dtype
 ) -> float:
@@ -836,6 +864,7 @@ def _resolve_mla_decode_launch_spec(
     mask_type: str,
     seq_len_q: int = 1,
     softmax_rescale_threshold_log2: float = 0.0,
+    store_softmax_stats: bool = False,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -992,12 +1021,14 @@ def _resolve_mla_decode_launch_spec(
                 softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             kernel.runtime_split_kv = True
+            kernel.store_softmax_stats = store_softmax_stats
             final_cfg = kernel._make_config()
             split_kv = one_cta_split_kv
             workspace_size = compute_1cta_workspace_size(
                 cfg=final_cfg,
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
+                store_softmax_stats=store_softmax_stats,
             )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
@@ -1078,6 +1109,7 @@ def _resolve_mla_decode_launch_spec(
                 softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             kernel._configure_parallel_reduction_topology(split_kv)
+            kernel.store_softmax_stats = store_softmax_stats
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
                 num_q_tiles=int(launch_shape.num_tiles),
@@ -1086,6 +1118,7 @@ def _resolve_mla_decode_launch_spec(
                 split_kv=capacity,
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
+                store_softmax_stats=store_softmax_stats,
             )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
@@ -1163,12 +1196,14 @@ def _make_mla_decode_compile_spec(
     runtime_kv_lengths: bool = False,
     write_final_lse: bool = True,
     scale_types: tuple[bool, bool, bool] = (False, False, False),
+    store_softmax_stats: bool = False,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
     kernel = copy.copy(launch_spec.kernel)
     kernel.lse_base_on_e = False
     kernel.runtime_kv_lengths = runtime_kv_lengths
+    kernel.store_softmax_stats = store_softmax_stats
     return _MLADecodeCompileSpec(
         device_index=device_index,
         kernel_signature=_mla_kernel_compile_signature(kernel),
@@ -1188,6 +1223,7 @@ def _make_mla_decode_compile_spec(
         lse_mode=lse_mode,
         write_final_lse=write_final_lse,
         scale_types=scale_types,
+        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1372,6 +1408,16 @@ def _get_compiled_mla_decode(
             fake_scale(compile_spec.scale_types[2]),
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    stats_fake = None
+    if compile_spec.store_softmax_stats:
+        stats_rows = (
+            runtime_total_q * num_qo_heads
+            if packed_query
+            else batch_size * max_q_len * num_qo_heads
+        )
+        stats_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (stats_rows, 2), stride_order=(1, 0), assumed_align=4
+        )
 
     output_quant_args = _fake_output_quant_args(getattr(kernel, "output_quant", None))
 
@@ -1399,8 +1445,9 @@ def _get_compiled_mla_decode(
                 fake_scale(compile_spec.scale_types[0]),
                 fake_scale(compile_spec.scale_types[1]),
                 stream_fake,
-                output_quant_args=output_quant_args,
-                max_q_len=cutlass.Int32(0),
+                output_quant_args,
+                cutlass.Int32(0),
+                stats_fake,
                 options=_COMPILE_OPTIONS,
             )
 
@@ -1431,6 +1478,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     out_dtype: torch.dtype = torch.bfloat16,
     mask_type: Literal["dense", "causal"] = "causal",
     device=None,
+    store_softmax_stats: bool = False,
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
@@ -1446,6 +1494,8 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     contents to be initialized before first use.
     """
 
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
@@ -1485,6 +1535,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         # The skip-correction threshold does not change the workspace; pass the default
         # positionally so a default plan() hits the same cached spec.
         0.0,
+        store_softmax_stats,
     )
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes,
@@ -1602,6 +1653,7 @@ def _launch_mla_decode(
     compiled: Callable[..., object],
     lse: Optional[torch.Tensor] = None,
     max_q_len: int,
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1653,6 +1705,7 @@ def _launch_mla_decode(
         runtime.output_scale,
         runtime.output_quant_args,
         max_q_len,
+        softmax_stats.view(-1, 2) if softmax_stats is not None else None,
     )
     return runtime.out
 
@@ -1689,6 +1742,7 @@ class BatchMLADecodePagedTSWrapper:
         softmax_scale: GlobalScale = 1.0,
         output_scale: GlobalScale = 1.0,
         lse_mode: Literal["none", "base2"] = "none",
+        store_softmax_stats: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
         tuning: Optional[MLAAttentionTuning] = None,
@@ -1744,6 +1798,10 @@ class BatchMLADecodePagedTSWrapper:
             Query, K/V, and output dtypes used to compile the plan.
         mask_type : {"dense", "causal"}
             Attention mask mode.
+        store_softmax_stats : bool
+            Compile final FP32 maximum/denominator export. Supply its caller-owned
+            buffer to every run when enabled. Independent of ``lse_mode``;
+            requires zero softmax rescale threshold. Defaults to ``False``.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
@@ -1781,6 +1839,8 @@ class BatchMLADecodePagedTSWrapper:
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
         if validate:
             if not isinstance(packed_query, bool):
                 raise TypeError("packed_query must be a bool")
@@ -1805,6 +1865,10 @@ class BatchMLADecodePagedTSWrapper:
         softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
             0.0 if threshold is None else threshold, q_dtype=q_dtype
         )
+        if store_softmax_stats and softmax_rescale_threshold_log2 != 0.0:
+            raise ValueError(
+                "softmax statistics require an exact (zero-threshold) maximum"
+            )
 
         device, device_index = _resolve_cuda_device(device)
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", device)
@@ -1829,7 +1893,7 @@ class BatchMLADecodePagedTSWrapper:
             max_q_len,
         )
         spec = _resolve_mla_decode_launch_spec(
-            *spec_key, softmax_rescale_threshold_log2
+            *spec_key, softmax_rescale_threshold_log2, store_softmax_stats
         )
         compile_spec = _cached_mla_decode_compile_spec(
             spec,
@@ -1846,6 +1910,7 @@ class BatchMLADecodePagedTSWrapper:
             runtime_kv_lengths=True,
             write_final_lse=lse_mode != "none",
             scale_types=(*scale_types(softmax_scale, output_scale), False),
+            store_softmax_stats=store_softmax_stats,
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -1895,6 +1960,7 @@ class BatchMLADecodePagedTSWrapper:
             output_scale=output_scale,
             lse_mode=lse_mode,
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+            store_softmax_stats=store_softmax_stats,
         )
 
     @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -1912,6 +1978,7 @@ class BatchMLADecodePagedTSWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        softmax_stats: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Launch MLA using live query/cache, page tables and KV lengths.
@@ -1925,6 +1992,14 @@ class BatchMLADecodePagedTSWrapper:
         with the query shape minus its final dimension. return_lse controls tuple
         return only; an omitted enabled buffer is allocated. Output/LSE/workspace must
         be disjoint from inputs and live buffers. One wrapper serves one ordered lane.
+
+        A store_softmax_stats=True plan additionally requires a contiguous FP32
+        softmax_stats tensor of shape [*query.shape[:-1], 2] on the query device.
+        It stores the natural-log maximum and unscaled exponential denominator,
+        independently of LSE and without changing the return value. This buffer
+        must be disjoint from Q/KV/output/LSE/workspace and retained by captured
+        graphs. Presence is checked even with validate=False. Inactive zero-KV
+        requests preserve all output buffers, matching the ordinary dense API.
 
         Fixed queries use [B, Sq, H, 576]; packed queries use [total_q, H, 576] and
         qo_indptr with nonnegative per-request deltas. All-empty packed Q is a no-op.
@@ -1948,6 +2023,9 @@ class BatchMLADecodePagedTSWrapper:
         )
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", state.device
+        )
+        _validate_mla_softmax_stats(
+            query, softmax_stats, enabled=state.store_softmax_stats, validate=validate
         )
         runtime_qo_indptr = qo_indptr if state.packed_query else None
         runtime = _prepare_mla_runtime(
@@ -2009,6 +2087,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=state.compiled,
             lse=lse,
             max_q_len=max_q_len,
+            softmax_stats=softmax_stats,
         )
         return (result, lse) if return_lse else result
 
@@ -2034,6 +2113,8 @@ def batch_mla_decode_with_paged_kv_cache(
     lse_mode: Literal["base2"] = "base2",
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
+    store_softmax_stats: bool = False,
+    softmax_stats: Optional[torch.Tensor] = None,
     validate: bool = True,
     tuning: Optional[MLAAttentionTuning] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2200,6 +2281,7 @@ def batch_mla_decode_with_paged_kv_cache(
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         workspace_buffer=workspace_buffer,
+        store_softmax_stats=store_softmax_stats,
         validate=validate,
         tuning=tuning,
         lse_mode=validate_lse_mode(lse_mode)
@@ -2218,6 +2300,7 @@ def batch_mla_decode_with_paged_kv_cache(
         lse=lse,
         return_lse=return_lse,
         validate=validate,
+        softmax_stats=softmax_stats,
     )
 
 
