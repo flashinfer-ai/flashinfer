@@ -39,6 +39,9 @@ def load(arch: str):
         sources=[source],
         extra_cuda_cflags=list(flags),
         extra_include_paths=[_source_path("csrc/tvm_ffi_utils.h").parent, include],
+        # The epilogue must reproduce torch's fp32 adds bit for bit; -use_fast_math
+        # implies --ftz=true and flushes subnormal sums that torch keeps.
+        use_fast_math=False,
     ).build_and_load()
     return module.run
 

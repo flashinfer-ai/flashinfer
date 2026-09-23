@@ -368,3 +368,45 @@ def test_plan_cache_evicts_by_retained_workspace_bytes():
     _run(long, roomy)
     # the affine composite with rows retains well under the default budget
     assert 0 < roomy._bytes[next(reversed(roomy._entries))] < KDAPrefillPlanCache.DEFAULT_MAX_BYTES // 4
+
+
+def test_affine_fused_epilogue_keeps_subnormal_sums():
+    # The epilogue must reproduce torch's fp32 adds bit for bit.  Built with
+    # -use_fast_math (--ftz=true) it flushed subnormal sums to zero, which the
+    # 346-row source-vs-export validation caught on sm_100a (four affine rows
+    # differing by 4.8e-39); every operand here is a subnormal.
+    from flashinfer.jit.cake_kda_affine_epilogue import load_for_device
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    run = load_for_device(device)
+    heads, elems, tail_elems = 1, 128 * 128, 1024
+    gen = torch.Generator(device=device).manual_seed(3)
+
+    def subnormal(shape, dtype=torch.float32):
+        return (torch.randn(shape, device=device, generator=gen) * 1e-39).to(dtype)
+
+    def i64(values):
+        return torch.tensor(values, dtype=torch.int64, device=device)
+
+    main_rows, corr_rows = subnormal((2, elems)), subnormal((1, elems))
+    out_rows = torch.zeros((2, elems), device=device)
+    tail, corr_out = subnormal((tail_elems,), torch.bfloat16), subnormal(
+        (tail_elems,), torch.bfloat16
+    )
+    want_tail = (tail.float() + corr_out.float()).to(torch.bfloat16)
+    main_final, corr_final = subnormal((1, elems)), subnormal((1, elems))
+    final_compact = torch.zeros((1, elems), device=device)
+    final_pool = torch.zeros((3, elems), device=device)
+    run(
+        main_rows, corr_rows, out_rows, i64([0, 1]), i64([0, 0]), i64([0]), 1, 2,
+        tail, corr_out, main_final, corr_final, i64([0]), i64([0]), 0,
+        final_compact, final_pool, elems, i64([2]), 1, heads, tail_elems, 1,
+    )
+    torch.cuda.synchronize()
+    want_final = main_final + corr_final
+    assert (want_final != 0).any() and (want_final.abs() < 1.2e-38).all()
+    assert torch.equal(out_rows[0], main_rows[0])
+    assert torch.equal(out_rows[1], main_rows[1] + corr_rows[0])
+    assert torch.equal(tail, want_tail)
+    assert torch.equal(final_compact, want_final)
+    assert torch.equal(final_pool[2], want_final[0])
