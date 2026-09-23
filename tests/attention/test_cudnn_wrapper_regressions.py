@@ -136,6 +136,8 @@ def _reference(q, k, v, qo, ip, ix, last, *, causal, scale, sinks=None):
 def test_prefill_warm_run_does_not_rebuild_plan_metadata(
     monkeypatch, paged, return_lse
 ):
+    if not prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=paged):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
     q, k, v, qo, ip, ix, last = _paged_inputs()
     ws = torch.empty(128 << 20, dtype=torch.uint8, device=q.device)
     if paged:
@@ -160,9 +162,8 @@ def test_prefill_warm_run_does_not_rebuild_plan_metadata(
     def unexpected(*args, **kwargs):
         pytest.fail("warm run rebuilt plan metadata or override descriptors")
 
-    for name in ("resolve", "resolve_from_plan", "graph_kwargs"):
-        monkeypatch.setattr(prefill._PrefillMetadata, name, unexpected)
-    monkeypatch.setattr(prefill._CudnnPrefillPlan, "build_metadata", unexpected)
+    # Guard the four kinds of static work, without patching their callers too.
+    monkeypatch.setattr(prefill._PrefillMetadata, "resolve_from_plan", unexpected)
     for name in (
         "_prefill_descriptor_key",
         "_prefill_plan_bindings",
@@ -216,7 +217,15 @@ def test_prefill_plan_snapshots_layout_and_replan_rekeys(monkeypatch):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers():
+@pytest.mark.parametrize("force_legacy", [False, True])
+def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
+    monkeypatch, force_legacy
+):
+    if force_legacy:
+        monkeypatch.setattr(
+            prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: False
+        )
+    direct = prefill._cudnn_supports_direct_seqlens(torch.bfloat16)
     q = torch.randn(5, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(50, 2, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
@@ -236,7 +245,8 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers():
             plan = w._cudnn_plan
         else:
             assert w._qo_indptr_buf.data_ptr() == pointer
-            assert w._cudnn_plan is plan
+            if direct:
+                assert w._cudnn_plan is plan
         out, lse = w.run(q, k, v, return_lse=True)
         ref, stats = _reference(
             q,
@@ -499,60 +509,93 @@ def test_ragged_prefill_rejects_output_scale():
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-@pytest.mark.parametrize("scales", [None, (0.5, 0.25, 0.75)])
-def test_paged_fp8_default_and_scalar_scales(scales):
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("scale_type", ["default", "scalar", "tensor"])
+def test_fp8_prefill_scales_capture_replay(paged, scale_type):
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("cuDNN's unified FP8 prefill engine requires Blackwell or newer")
+    if not prefill._cudnn_supports_direct_seqlens(torch.float8_e4m3fn, mixed=paged):
+        pytest.skip("requires direct cuDNN FP8 cumulative sequence lengths")
     q, k, v, qo, ip, ix, last = _paged_inputs()
     q, k, v = (t.to(torch.float8_e4m3fn) for t in (q, k, v))
-    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
-        "NHD",
-        backend="cudnn",
-    )
-    w.plan(
-        qo,
-        ip,
-        ix,
-        last,
-        8,
-        2,
-        128,
-        16,
-        causal=True,
-        q_data_type=q.dtype,
-        o_data_type=torch.bfloat16,
-    )
-    kwargs = (
-        {}
-        if scales is None
-        else dict(zip(("q_scale", "k_scale", "v_scale"), scales, strict=True))
-    )
-    out, lse = w.run(q, (k, v), return_lse=True, lse_base="ln", **kwargs)
-    qs, ks, vs = (1, 1, 1) if scales is None else scales
-    ref, lse_ref = _reference(
-        q.float(),
-        k.float(),
-        v.float() * vs,
-        qo,
-        ip,
-        ix,
-        last,
-        causal=True,
-        scale=128**-0.5 * qs * ks,
-    )
-    torch.testing.assert_close(lse, lse_ref, atol=0.003, rtol=0.003)
-    # sdpa_fp8 also rounds the intermediate probabilities to FP8. Check
-    # relative L2 error against float32 math, without a near-zero relative
-    # elementwise test on that quantized intermediate.
-    assert torch.linalg.vector_norm(
-        out.float() - ref
-    ) < 0.05 * torch.linalg.vector_norm(ref)
-    if scales is None:
-        explicit = w.run(q, (k, v), q_scale=1.0, k_scale=1.0, v_scale=1.0)
-        torch.testing.assert_close(out, explicit, atol=0.001, rtol=0.001)
+    ws = torch.empty(128 << 20, device=q.device, dtype=torch.uint8)
+    plan_kwargs = dict(causal=True, q_data_type=q.dtype, o_data_type=torch.bfloat16)
+    if paged:
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="cudnn")
+        w.plan(qo, ip, ix, last, 8, 2, 128, 16, **plan_kwargs)
+        inputs = (q, (k, v))
     else:
-        torch.testing.assert_close(out.float(), ref, atol=0.03, rtol=0.03)
+        w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="cudnn")
+        w.plan(
+            qo, torch.tensor([0, 33, 50], dtype=torch.int32), 8, 2, 128, **plan_kwargs
+        )
+        keys, values = (
+            torch.cat([t[ix[:3]].flatten(0, 1)[:33], t[ix[3:]].flatten(0, 1)[:17]])
+            for t in (k, v)
+        )
+        inputs = (q, keys, values)
+
+    scale_names = ("q_scale", "k_scale", "v_scale")
+    scales = (1.0, 1.0, 1.0) if scale_type == "default" else (0.5, 0.25, 0.75)
+    kwargs = (
+        {} if scale_type == "default" else dict(zip(scale_names, scales, strict=True))
+    )
+    if scale_type == "tensor":
+        kwargs = {
+            name: torch.full((1,), value, dtype=torch.float32, device=q.device)
+            for name, value in kwargs.items()
+        }
+
+    def run(scale_kwargs):
+        return w.run(*inputs, return_lse=True, lse_base="ln", **scale_kwargs)
+
+    def check(out, lse, scale_values):
+        qs, ks, vs = scale_values
+        ref, lse_ref = _reference(
+            q.float(),
+            k.float(),
+            v.float() * vs,
+            qo,
+            ip,
+            ix,
+            last,
+            causal=True,
+            scale=128**-0.5 * qs * ks,
+        )
+        torch.testing.assert_close(lse, lse_ref, atol=0.003, rtol=0.003)
+        # sdpa_fp8 also rounds probabilities to FP8; retain the eager math gate.
+        assert torch.linalg.vector_norm(
+            out.float() - ref
+        ) < 0.05 * torch.linalg.vector_norm(ref)
+        if scale_type != "default":
+            torch.testing.assert_close(out.float(), ref, atol=0.03, rtol=0.03)
+
+    out, lse = run(kwargs)
+    check(out, lse, scales)
+    if scale_type == "default":
+        explicit, _ = run(dict.fromkeys(scale_names, 1.0))
+        torch.testing.assert_close(out, explicit, atol=0.001, rtol=0.001)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = run(kwargs)
+
+    # Replaying must read current inputs and GPU scales, while Python scalars
+    # stay fixed in this capture even after an eager call with different values.
+    q.copy_(-q.float())
+    alternate_scales = (0.75, 0.5, 0.25)
+    if scale_type == "tensor":
+        for name, value in zip(scale_names, alternate_scales, strict=True):
+            kwargs[name].fill_(value)
+        scales = alternate_scales
+    elif scale_type == "scalar":
+        eager_out, eager_lse = run(
+            dict(zip(scale_names, alternate_scales, strict=True))
+        )
+        check(eager_out, eager_lse, alternate_scales)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    check(out, lse, scales)
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")

@@ -1016,7 +1016,9 @@ def _prefill_plan_bindings(metadata, dtype, device):
             if scale is None:
                 scale = dummy_scale_tensor
             elif not isinstance(scale, torch.Tensor):
-                scale = torch.tensor([scale], device=device, dtype=torch.float32)
+                # Fill on the GPU: torch.tensor would copy unpinned host data
+                # during capture. Each call owns its scalar storage.
+                scale = torch.full((1,), scale, device=device, dtype=torch.float32)
             if (
                 scale.dtype != torch.float32
                 or scale.numel() != 1

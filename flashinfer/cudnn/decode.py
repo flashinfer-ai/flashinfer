@@ -561,20 +561,20 @@ def _batch_decode_with_kv_cache(
 
 
 class CudnnDecodeGraph:
-    """Wrapper-owned paged-decode graph and constant query-length/sink buffers.
+    """Reusable paged-decode graph with retained constant query-length storage.
 
     Each run binds a fresh variant pack; the plan never retains changing
     query, cache, output or metadata pointers. Callers check ``matches`` before
-    running, and invalidate this object on plan/workspace replacement.
+    running. Compatible replans retain this object; workspace replacement
+    invalidates it. Sink values are rebound or copied from the current input.
 
     The signature is the graph-cache key of :func:`_build_decode_graph`
     (shapes, strides, dtypes, scale, presence flags, mask parameters), so a
     prepared graph is reused exactly where the graph cache would replay the
     same graph; anything else re-prepares. Input validation happens in
     :func:`prepare_cudnn_batch_decode`; runtime devices are checked on every
-    rebind. The
-    constant per-batch query-length tensor the graph binds is allocated
-    there instead of on every step.
+    rebind. Wrappers own the constant per-batch query-length storage across
+    graph replacement; standalone preparation allocates it when needed.
     """
 
     __slots__ = (
