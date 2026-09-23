@@ -2954,7 +2954,7 @@ def prepare_cudnn_grouped_gemm_mxfp8_activations(
 
     Returns E4M3 ``[M, H]`` values and token-major ``uint8 [M, H // 32]`` UE8M0
     block scales, the unified API's MXFP8 activation encoding. ``H`` must be a
-    multiple of 32.
+    multiple of 128, the row tile of the cuDNN block-scaled grouped GEMM.
     """
     if hidden_states_bf16.dtype is not torch.bfloat16 or hidden_states_bf16.ndim != 2:
         raise ValueError(
@@ -2962,9 +2962,9 @@ def prepare_cudnn_grouped_gemm_mxfp8_activations(
             f"got shape={tuple(hidden_states_bf16.shape)}, "
             f"dtype={hidden_states_bf16.dtype}."
         )
-    if hidden_states_bf16.shape[1] % 32:
+    if hidden_states_bf16.shape[1] % 128:
         raise ValueError(
-            "MXFP8 activations require hidden_size divisible by 32, got "
+            "cuDNN MXFP8 activations require hidden_size divisible by 128, got "
             f"{hidden_states_bf16.shape[1]}."
         )
     return _quantize_mxfp8_rows(hidden_states_bf16.contiguous(), token_major=True)
@@ -3082,7 +3082,8 @@ def prepare_cudnn_grouped_gemm_nvfp4_activations(
 
     Returns packed E2M1 ``uint8 [M, H // 2]`` values and token-major
     ``float8_e4m3fn [M, H // 16]`` block scales with a global scale of one, the
-    unified API's NVFP4 activation encoding. ``H`` must be a multiple of 16.
+    unified API's NVFP4 activation encoding. ``H`` must be a multiple of 128,
+    the row tile of the cuDNN block-scaled grouped GEMM.
     Each block's E4M3 scale is its largest magnitude over 6: blocks below about
     0.09 in magnitude get subnormal scales with reduced precision and blocks
     below about 0.006 quantize to zero.
@@ -3096,9 +3097,10 @@ def prepare_cudnn_grouped_gemm_nvfp4_activations(
             f"dtype={hidden_states_bf16.dtype}."
         )
     num_tokens, hidden_size = hidden_states_bf16.shape
-    if hidden_size % 16:
+    if hidden_size % 128:
         raise ValueError(
-            f"NVFP4 activations require hidden_size divisible by 16, got {hidden_size}."
+            "cuDNN NVFP4 activations require hidden_size divisible by 128, got "
+            f"{hidden_size}."
         )
     quantized, scale = fp4_quantize(
         hidden_states_bf16.contiguous(),

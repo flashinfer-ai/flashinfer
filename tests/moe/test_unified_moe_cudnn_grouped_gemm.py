@@ -182,8 +182,28 @@ def _device_arch() -> int:
     return major * 10 + minor
 
 
+# cuDNN below 9.22 has no SM120 / SM121 engine for the block-scaled MoE grouped
+# GEMM although the flat ``grouped_mm_mxfp8`` / ``grouped_mm_fp4`` list those
+# architectures; the block-scaled backends are skipped there until the flat API
+# states the per-architecture minimum.
+_SM12X_BLOCK_SCALE_MIN_CUDNN = 92200
+_SM12X_BLOCK_SCALE_SKIP = (
+    "cuDNN < 9.22 has no SM120 / SM121 engine for the block-scaled MoE grouped GEMM"
+)
+
+
+def _sm12x_block_scale_unsupported() -> bool:
+    if not _cudnn_moe_available() or _device_arch() not in (120, 121):
+        return False
+    import cudnn
+
+    return cudnn.backend_version() < _SM12X_BLOCK_SCALE_MIN_CUDNN
+
+
 def _cudnn_backend_is_supported(key: str) -> bool:
-    return _cudnn_moe_available() and _device_arch() in _FAMILIES[key].archs
+    if not (_cudnn_moe_available() and _device_arch() in _FAMILIES[key].archs):
+        return False
+    return key not in _BLOCK_SCALE_KEYS or not _sm12x_block_scale_unsupported()
 
 
 cudnn_bf16_required = pytest.mark.skipif(
@@ -196,11 +216,19 @@ cudnn_fp8_required = pytest.mark.skipif(
 )
 cudnn_mxfp8_required = pytest.mark.skipif(
     not _cudnn_backend_is_supported(_MXFP8_KEY),
-    reason="requires cuDNN >= 9.21 with moe_grouped_matmul on a grouped_mm_mxfp8 arch",
+    reason=(
+        _SM12X_BLOCK_SCALE_SKIP
+        if _sm12x_block_scale_unsupported()
+        else "requires cuDNN >= 9.21 with moe_grouped_matmul on a grouped_mm_mxfp8 arch"
+    ),
 )
 cudnn_nvfp4_required = pytest.mark.skipif(
     not _cudnn_backend_is_supported(_NVFP4_KEY),
-    reason="requires cuDNN >= 9.21 with moe_grouped_matmul on a grouped_mm_fp4 arch",
+    reason=(
+        _SM12X_BLOCK_SCALE_SKIP
+        if _sm12x_block_scale_unsupported()
+        else "requires cuDNN >= 9.21 with moe_grouped_matmul on a grouped_mm_fp4 arch"
+    ),
 )
 moe_utils_required = pytest.mark.skipif(
     _device_arch() not in _MOE_UTILS_ARCHS,
@@ -356,11 +384,12 @@ def _detached_runner(key: str, config: MoEConfig, *, use_moe_utils: bool = True)
 
 
 def test_cudnn_check_support_rejects_unsupported_options():
-    for key in _FAMILY_KEYS:
+    if _cudnn_moe_available():
         # Finalize runs on every arch: torch ops where the moe_utils kernels are missing.
-        _detached_runner(
-            key, _config(key, finalize=MoEFinalizeConfig()), use_moe_utils=False
-        )._check_support()
+        for key in _FAMILY_KEYS:
+            _detached_runner(
+                key, _config(key, finalize=MoEFinalizeConfig()), use_moe_utils=False
+            )._check_support()
     with pytest.raises(NotImplementedError, match="does not support PDL"):
         _detached_runner(
             _BF16_KEY,
@@ -1089,8 +1118,11 @@ def test_cudnn_prepare_weights_and_activations_contract(key):
     with pytest.raises(ValueError, match="2D BF16"):
         family.config_cls.prepare_activations(x.float())
     if key in _BLOCK_SCALE_KEYS:
-        with pytest.raises(ValueError, match="hidden_size divisible"):
-            family.config_cls.prepare_activations(x[:, :40].contiguous())
+        for width in (40, 160):
+            with pytest.raises(ValueError, match="hidden_size divisible by 128"):
+                family.config_cls.prepare_activations(
+                    torch.randn(6, width, dtype=torch.bfloat16, device=device)
+                )
 
 
 @cudnn_bf16_required
@@ -1259,9 +1291,10 @@ def test_cudnn_block_scale_pack_inputs_fail_fast(key):
             weights,
         )
     narrow = MoEActivationPack(
-        *family.config_cls.prepare_activations(
-            torch.randn(8, 160, dtype=torch.bfloat16, device=device)
-        ),
+        act.hidden_states_q[:, : act.hidden_states_q.shape[1] // 2].contiguous(),
+        act.hidden_states_scale[
+            :, : act.hidden_states_scale.shape[1] // 2
+        ].contiguous(),
         act.topk_ids,
         act.topk_weights,
     )

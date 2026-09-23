@@ -387,7 +387,10 @@ class MoEFinalizeConfig:
         Whether to apply routing-weight scaling and accumulate the per-expert
         partial results into the output.  ``False`` returns the unreduced
         intermediates as ``[gemm2_output, expert_weights,
-        expanded_idx_to_permuted_idx]``, leaving the combine to the caller.
+        expanded_idx_to_permuted_idx]``, leaving the combine to the caller:
+        ``expanded_idx_to_permuted_idx[token * top_k + slot]`` is the row of
+        ``gemm2_output`` holding that assignment, or ``-1`` when its expert
+        is not local.
         For FromLogits routing, the routing kernel emits ``expert_weights`` in
         bfloat16 regardless of the routing-logits dtype. ``PackedPrecomputed``
         routing also yields bfloat16 weights: the caller's values are narrowed
@@ -1463,12 +1466,12 @@ class CudnnGroupedGemmNvfp4Config:
     dequant is applied by the finalize (or to the unfinalized rows).
     ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
 
-        Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
-        SM100 and SM103 and with torch ops elsewhere;
-        ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
-        ``[gemm2_out, expert_weights, token_to_row]`` instead.
+    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
+    SM100 and SM103 and with torch ops elsewhere;
+    ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+    ``[gemm2_out, expert_weights, token_to_row]`` instead.
     Supports expert parallelism and unpacked routing weights. Not part of the
-        default backend list.
+    default backend list.
     """
 
     @classmethod

@@ -1484,6 +1484,9 @@ _CUDNN_GROUPED_GEMM_BACKEND_KEYS = frozenset(
         "cudnn_grouped_gemm_nvfp4",
     )
 )
+_CUDNN_BLOCK_SCALE_BACKEND_KEYS = frozenset(
+    ("cudnn_grouped_gemm_mxfp8", "cudnn_grouped_gemm_nvfp4")
+)
 _FP8_BLOCK_BACKEND_KEY = "cutlass_fp8_block"
 
 # Cfg.variant string <-> handler lookup (random-generation ids stay unchanged).
@@ -2747,6 +2750,7 @@ def _contract_preflight_skip_reason(
     *,
     cuda_version: tuple[int, int] | None = None,
     cute_dsl_available: bool | None = None,
+    sm: int | None = None,
 ) -> str | None:
     if cfg.variant in _B12X_BACKEND_KEYS:
         if cuda_version is None:
@@ -2765,6 +2769,16 @@ def _contract_preflight_skip_reason(
     elif cfg.variant in _CUDNN_GROUPED_GEMM_BACKEND_KEYS:
         if not _cudnn_moe_available():
             return f"{cfg.variant} unified MoE {_ENV_NEEDS_CUDNN_MOE}"
+        if cfg.variant in _CUDNN_BLOCK_SCALE_BACKEND_KEYS and sm in (120, 121):
+            import cudnn
+
+            # The flat grouped_mm_mxfp8 / grouped_mm_fp4 list SM120 / SM121, but
+            # cuDNN below 9.22 has no block-scaled MoE grouped-GEMM engine there.
+            if cudnn.backend_version() < 92200:
+                return (
+                    f"{cfg.variant} unified MoE on SM{sm} requires cuDNN >= 9.22 "
+                    "(no SM12x engine for the block-scaled MoE grouped GEMM)"
+                )
     return None
 
 
@@ -2937,7 +2951,7 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
-    if reason := _contract_preflight_skip_reason(cfg):
+    if reason := _contract_preflight_skip_reason(cfg, sm=sm):
         pytest.skip(reason)
     if handler.variant == "w4a16" and sm == 103:
         pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")

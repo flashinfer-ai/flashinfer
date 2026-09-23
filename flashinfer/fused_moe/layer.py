@@ -332,9 +332,12 @@ class MoELayer:
         -------
         torch.Tensor or list of torch.Tensor
             The layer output. With ``config.finalize.do_finalize=False`` the
-            unreduced TRTLLM intermediates are returned instead, as
+            unreduced intermediates are returned instead, as
             ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``,
-            leaving the combine to the caller.
+            leaving the combine to the caller;
+            ``expanded_idx_to_permuted_idx[token * top_k + slot]`` is the row
+            of ``gemm2_output`` holding that assignment, or ``-1`` when its
+            expert is not local.
 
         Raises
         ------
