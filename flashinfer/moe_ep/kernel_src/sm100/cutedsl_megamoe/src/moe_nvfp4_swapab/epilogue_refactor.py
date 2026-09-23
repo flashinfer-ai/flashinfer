@@ -965,6 +965,10 @@ class NvFp4OptinalEpiArgs:
     # -----------------------------------
     # MoE domain (token, topk), deepgemm graph only? for transformer graph, we want reduce kernel to perform the score mul.
     topk_scores: Optional[cute.Tensor]
+    # -----------------------------------
+    # MoE domain (token,), nvfp4 only: per-token fp32 activation scale in pool
+    # order, folded into the fc1 dequant (before clamp / gated activation).
+    fc1_activation_per_token_scale: Optional[cute.Tensor] = None
 
 
 # TODO: Need to remove `Swiglu` and `Fp4` out of name, later this should be extended to other activations and dtypes.
@@ -1161,6 +1165,7 @@ class SwapABSwigluFp4Epilogue:
                 fc2_alpha=None,
                 fc1_norm_const=None,
                 topk_scores=None,
+                fc1_activation_per_token_scale=None,
             )
         tmem_acc = cute.make_tensor(
             cute.recast_ptr(tmem_ptr, dtype=cutlass.Float32),
@@ -1505,6 +1510,18 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             )  # (tokens_this_expert)
         else:
             topk_score_tensor = None
+        if cutlass.const_expr(
+            self.optional_epi_args.fc1_activation_per_token_scale is not None
+        ):
+            # Per-token fp32 activation scale (pool order), same expert-local
+            # slicing as the topk scores above.
+            act_scale_tensor, _ = self.sched_ext.get_gmem_tensor(
+                "fc1_activation_per_token_scale",
+                self.optional_epi_args.fc1_activation_per_token_scale,
+                work_tile_info,
+            )  # (tokens_this_expert)
+        else:
+            act_scale_tensor = None
 
         # Contract about the transposed acc (assume nvfp4 output):
         # (epi_tid, val_id) -> (token_idx, intermediate_down_idx)
@@ -1529,6 +1546,19 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             )
         else:
             topk_scores = None
+
+        # Per-token activation scale.  Tokens 0..31 are activated BEFORE the
+        # register transpose, so each lane's registers span 16 different
+        # tokens and the per-register scale is fetched via warp shuffle inside
+        # ``alpha_swiglu_clamp`` (scale_is_pretranspose=True).  Tokens 32..63
+        # are activated AFTER the transpose (one token per lane), so the scale
+        # this lane loaded applies to all of its registers directly.
+        if cutlass.const_expr(act_scale_tensor is not None):
+            act_scale_token_0_32 = act_scale_tensor[current_two_token_idices[0]]
+            act_scale_token_32_64 = act_scale_tensor[current_two_token_idices[1]]
+        else:
+            act_scale_token_0_32 = None
+            act_scale_token_32_64 = None
 
         # Step 0: load tmem
         if cutlass.const_expr(preload_acc is not None):
@@ -1586,7 +1616,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
-            gate_token_0_32, up_token_0_32, alpha_val
+            gate_token_0_32,
+            up_token_0_32,
+            alpha_val,
+            act_scale_token_0_32,
+            scale_is_pretranspose=True,
         )
 
         # gate_token_32_64 / up_token_32_64 are already in the transpose input
@@ -1607,6 +1641,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             gate_token_32_64_trans_pre_act,
             up_token_32_64_trans_pre_act,
             alpha_val,
+            act_scale_token_32_64,
+            scale_is_pretranspose=False,
         )
 
         token_0_32_tmem_trans = TmemTranspose16x32(
@@ -1670,6 +1706,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         gate_rmem: cute.Tensor,  # Raw fc1 acc (pre-dequant); even-size 1D fp32 rmem
         up_rmem: cute.Tensor,  # Raw fc1 acc (pre-dequant); even-size 1D fp32 rmem
         alpha_val: Optional[cutlass.Float32],
+        # Per-token fc1 activation scale loaded by this lane (None disables).
+        activation_scale: Optional[cutlass.Float32],
+        *,
+        # True: gate/up are in the pre-transpose register distribution, so each
+        # register pair fetches its own token scales via warp shuffle.
+        scale_is_pretranspose: cutlass.Constexpr[bool],
     ) -> cute.Tensor:
         # ── Input contract checks (compile-time): fp32, 1D, even-count, rmem ──
         # Wrapped in const_expr so the DSL evaluates them at trace time and the
@@ -1701,8 +1743,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # gate_rmem / up_rmem are the RAW fc1 fp32 accumulator (pre-dequant).
         # Order follows the NVFP4 -> fp32 -> SwiGLU contract and MUST be:
         #
-        #   1. dequant:  gate = alpha * gate_raw ; up = alpha * up_raw
-        #      (alpha = expert-wise global scale on the acc; None => alpha == 1.)
+        #   1. dequant:  gate = alpha * s_t * gate_raw ; up = alpha * s_t * up_raw
+        #      (alpha = expert-wise global scale on the acc; None => alpha == 1;
+        #       s_t = optional per-token activation scale; None => s_t == 1.)
         #   2. clamp the DEQUANTED (real) values, gpt-oss ``_apply_gate`` style:
         #        gate = min(gate, +limit)           (upper bound only)
         #        up   = clamp(up, -limit, +limit)   (symmetric)
@@ -1738,11 +1781,43 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             u0 = up_rmem[i]
             u1 = up_rmem[i + 1]
 
-            # 1) dequant raw acc to real values (skip entirely when alpha is None).
-            if cutlass.const_expr(alpha_val is not None):
-                alpha_pair = (alpha_val, alpha_val)
-                g0, g1 = cute.arch.mul_packed_f32x2((g0, g1), alpha_pair)
-                u0, u1 = cute.arch.mul_packed_f32x2((u0, u1), alpha_pair)
+            # 1) dequant raw acc to real values: gate/up *= alpha * s_t (skip
+            #    entirely when both alpha and the per-token scale are None).
+            if cutlass.const_expr(
+                alpha_val is not None or activation_scale is not None
+            ):
+                if cutlass.const_expr(activation_scale is not None):
+                    if cutlass.const_expr(scale_is_pretranspose):
+                        # Pre-transpose distribution (see TmemTranspose16x32):
+                        # register i of lane L holds token 2*i + (L//2)%2, and
+                        # lane T loaded the scale of token T, so pull each
+                        # register's scale from lane 2*i + parity.  16 SHFL per
+                        # lane per subtile; keeps the 3-transpose schedule.
+                        lane_parity = (
+                            self.lane_idx // cutlass.Int32(2)
+                        ) % cutlass.Int32(2)
+                        scale0 = cute.arch.shuffle_sync(
+                            activation_scale,
+                            cutlass.Int32(i * 2) + lane_parity,
+                        )
+                        scale1 = cute.arch.shuffle_sync(
+                            activation_scale,
+                            cutlass.Int32((i + 1) * 2) + lane_parity,
+                        )
+                        if cutlass.const_expr(alpha_val is not None):
+                            scale0 = scale0 * alpha_val
+                            scale1 = scale1 * alpha_val
+                        scale_pair = (scale0, scale1)
+                    else:
+                        # Post-transpose: this lane owns one token -> one scale.
+                        scale = activation_scale
+                        if cutlass.const_expr(alpha_val is not None):
+                            scale = scale * alpha_val
+                        scale_pair = (scale, scale)
+                else:
+                    scale_pair = (alpha_val, alpha_val)
+                g0, g1 = cute.arch.mul_packed_f32x2((g0, g1), scale_pair)
+                u0, u1 = cute.arch.mul_packed_f32x2((u0, u1), scale_pair)
 
             # 2) clamp the real values (skip when no clamp configured).
             if cutlass.const_expr(self.gate_up_clamp is not None):

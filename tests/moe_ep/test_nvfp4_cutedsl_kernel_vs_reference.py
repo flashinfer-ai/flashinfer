@@ -39,11 +39,17 @@ def _require_cuda():
         pytest.skip("needs CUDA")
 
 
-def _single_rank_problem(hidden=2048, intermediate=1024, *, num_experts=4, topk=4):
+def _single_rank_problem(
+    hidden=2048,
+    intermediate=1024,
+    *,
+    num_experts=4,
+    topk=4,
+    num_tokens=32,
+    max_tokens=64,
+):
     import torch
 
-    num_tokens = 32
-    max_tokens = 64
     num_local_experts = num_experts
     gate_up_clamp = 10.0
 
@@ -90,6 +96,29 @@ def _single_rank_problem(hidden=2048, intermediate=1024, *, num_experts=4, topk=
         w13=w13,
         w2=w2,
     )
+
+
+def _bf16_ulp(x: float) -> float:
+    """bf16 spacing at magnitude ``x`` (8 significand bits incl. the hidden one)."""
+    import math
+
+    if x <= 0.0:
+        return 0.0
+    return 2.0 ** (math.floor(math.log2(x)) - 7)
+
+
+def _oracle_atol(amax_ref: float) -> float:
+    """Absolute tolerance for kernel-vs-oracle compares.
+
+    ``2e-3 * amax`` covers NVFP4 RTNE flips at fc1-out plus GEMM accumulation-
+    order noise (measured rel_l2 <= 3e-3).  The extra ``2 * bf16_ulp(amax)``
+    covers one bf16 rounding flip of a per-(token, topk) fc2 term: both the
+    kernel and the oracle store each term in bf16 before the top-k sum, so an
+    fp32 accumulation-order difference at a rounding boundary shows up as one
+    term ulp even where the reduced output is small (terms cancel), which the
+    relative part of the compare cannot absorb.
+    """
+    return 2e-3 * amax_ref + 2.0 * _bf16_ulp(amax_ref)
 
 
 def _e2m1_decode_table(device):
@@ -199,6 +228,10 @@ def _torch_nvfp4_mega_reference(
     term_transform=None,
     swiglu_alpha=None,
     swiglu_beta=None,
+    fc1_activation_per_token_scale=None,  # (T,) fp32 or None
+    fc1_alpha=None,  # (E,) fp32 per-expert or None (identity)
+    fc2_alpha=None,  # (E,) fp32 per-expert or None (identity)
+    fc1_norm_const=None,  # (E,) fp32 per-expert or None (1.0)
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
 
@@ -210,6 +243,19 @@ def _torch_nvfp4_mega_reference(
     ``term_transform``, when set, is applied to each per-(token, topk) fc2
     output term before the topk sum; the multirank oracle uses it to model the
     quantized cross-rank combine wire (``combine_roundtrip_to_fp32``).
+
+    ``fc1_activation_per_token_scale``, when set, multiplies token ``t``'s
+    dequantized fc1 output by ``scale[t]`` BEFORE the clamp / activation --
+    the kernel's ``enable_fc1_activation_per_token_scale`` fold
+    (``real = fc1_alpha * scale_t * acc``).
+
+    ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` model the per-expert
+    epilogue scalars with the kernel's semantics: ``fc1_alpha[e]`` is folded
+    into the same single fp32 multiply as the per-token scale, the fc1-out
+    NVFP4 round-trip uses ``fc1_norm_const[e]`` (host quantizer mirrors the
+    kernel: SF = amax/6*c, data = y*c/SF, so the dequant is ``y*c`` and is NOT
+    divided back), and ``fc2_alpha[e]`` scales the fp32 fc2 accumulator
+    before the bf16 store.  ``None`` keeps the identity path.
     """
     import torch
 
@@ -236,6 +282,20 @@ def _torch_nvfp4_mega_reference(
             fc1_weight[expert], fc1_sf[expert], logical_cols=hidden
         )  # (2I, hidden)
         fc1_out = act_fp32[tokens] @ fc1_w.transpose(0, 1)  # (R, 2I)
+        # Dequant fold: one fp32 multiply by ``fc1_alpha[e] * scale_t`` (the
+        # kernel forms the product first, then multiplies the accumulator once),
+        # applied BEFORE the clamp / activation.
+        dequant = None
+        if fc1_alpha is not None:
+            dequant = fc1_alpha[expert].to(torch.float32)
+        if fc1_activation_per_token_scale is not None:
+            per_token = fc1_activation_per_token_scale[tokens].to(torch.float32)
+            dequant = per_token if dequant is None else dequant * per_token
+        if dequant is not None:
+            if dequant.dim() == 0:
+                fc1_out = fc1_out * dequant
+            else:
+                fc1_out = fc1_out * dequant.unsqueeze(-1)
 
         # SwiGLU over the 16-column gate/up interleave used by the NVFP4 kernel.
         m = fc1_out.shape[0]
@@ -257,13 +317,19 @@ def _torch_nvfp4_mega_reference(
         # (post-hoc weighting would NOT match — quant changes the magnitude).
         swiglu = swiglu * topk_weights[tokens, slots].unsqueeze(-1)
 
-        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(swiglu, 1.0)
+        norm_const = 1.0 if fc1_norm_const is None else float(fc1_norm_const[expert])
+        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(swiglu, norm_const)
+        # With a norm const the dequant is ``swiglu * norm_const`` (in range);
+        # the kernel does not divide it back -- the caller folds 1/c into
+        # fc2_alpha on the host.
         swiglu_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
 
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
         fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        if fc2_alpha is not None:
+            fc2_out = fc2_out * fc2_alpha[expert].to(torch.float32)
         # FC2 stores each expert term in BF16 before the top-k reduction.
         fc2_out = fc2_out.to(torch.bfloat16).float()
         if term_transform is not None:
@@ -487,3 +553,495 @@ def test_nvfp4_kernel_matches_torch_reference(
             assert rel_l2.item() < 0.02
     finally:
         symm_buffer.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "hidden,intermediate,num_experts,topk,num_tokens,activation,fc1_alpha",
+    [
+        # 32 tokens routed to every expert: exactly the first (pre-transpose,
+        # shuffle-fed) half of one 64-token epilogue subtile per expert.
+        pytest.param(2048, 1024, 4, 4, 32, "standard", None, id="regular-e4"),
+        # 128-misaligned hidden: ceil-div K tail + predicated epilogue.
+        pytest.param(2880, 2880, 4, 4, 32, "standard", None, id="tail-e4"),
+        pytest.param(2048, 1024, 4, 4, 32, "no-clamp", None, id="no-clamp"),
+        # MiniMax-style (1.702, 1.0) activation with a tight clamp: mixed
+        # saturated / unsaturated gate-up values, so the pre-activation
+        # position of the scale is observable.
+        pytest.param(2048, 1024, 4, 4, 32, "minimax", None, id="minimax-clamp"),
+        # ~96 tokens per expert (192 tokens, topk 2 of 4): a full 64-token
+        # subtile (both the shuffle-fed 0..31 half and the one-scale-per-lane
+        # 32..63 half carry valid tokens) plus a partial second subtile.
+        pytest.param(2048, 1024, 4, 2, 192, "standard", None, id="two-subtiles"),
+        # Same routing with a non-identity per-expert fc1_alpha: exercises the
+        # ``alpha * scale_t`` fold on both halves (the oracle folds 2*scale).
+        pytest.param(2048, 1024, 4, 2, 192, "standard", 2.0, id="alpha-fold"),
+        # Singleton expert (static expert extent 1) with 3 subtiles of tokens.
+        pytest.param(2048, 1024, 1, 1, 192, "standard", None, id="singleton-e1"),
+    ],
+)
+def test_nvfp4_kernel_per_token_scale_matches_torch_reference(
+    monkeypatch,
+    hidden,
+    intermediate,
+    num_experts,
+    topk,
+    num_tokens,
+    activation,
+    fc1_alpha,
+):
+    """``enable_fc1_activation_per_token_scale``: the kernel folds a runtime
+    ``(T,)`` fp32 per-token scale into the fc1 dequant before the clamp /
+    activation, matching the pure-torch oracle with the same fold.
+
+    The epilogue applies the scale on two register schedules per 64-token
+    subtile: tokens 0..31 are activated before the register transpose (scale
+    fetched per register via warp shuffle) and tokens 32..63 after it (one
+    scale per lane).  The 32-token cases cover the first half only; the
+    192-token cases put valid tokens on both halves and across subtile
+    boundaries.  Random {0.5, 1, 1.5, 2} scales differ per token, so a
+    lane/token mix-up shows up as a large error.  ``fc1_alpha`` (broadcast
+    per-expert scalar) checks the ``alpha * scale_t`` fold: the oracle has no
+    alpha leg, so it is fed ``alpha * scale`` instead (exact in fp32).
+    """
+    _require_cuda()
+
+    import torch
+
+    cap = torch.cuda.get_device_capability()
+    if cap[0] != 10:
+        pytest.skip(
+            f"nvfp4_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
+        )
+    pytest.importorskip("triton")
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        get_symm_buffer_for_mega_moe,
+        nvfp4_mega_moe,
+    )
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    problem = _single_rank_problem(
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        topk=topk,
+        num_tokens=num_tokens,
+        max_tokens=max(64, num_tokens),
+    )
+    swiglu_alpha, swiglu_beta = None, None
+    if activation == "no-clamp":
+        problem["gate_up_clamp"] = None
+    elif activation == "minimax":
+        problem["gate_up_clamp"] = 0.5
+        problem["hidden_states"].mul_(0.1)
+        problem["w13"].mul_(0.1)
+        swiglu_alpha, swiglu_beta = 1.702, 1.0
+    rank = 0
+    world_size = 1
+    num_tokens = problem["num_tokens"]
+
+    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
+    transformed_l1, transformed_l2 = preprocess_mega_weights(
+        pack,
+        intermediate_size=problem["intermediate"],
+        hidden_size=problem["hidden"],
+        gate_up_clamp=problem["gate_up_clamp"],
+    )
+    fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
+
+    symm_buffer = get_symm_buffer_for_mega_moe(
+        problem["num_experts"],
+        problem["max_tokens"],
+        problem["topk"],
+        problem["hidden"],
+        2 * problem["intermediate"],
+        rank,
+        world_size,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        gate_up_clamp=problem["gate_up_clamp"],
+        fc1_alpha=fc1_alpha,
+        enable_fc1_activation_per_token_scale=True,
+    )
+    try:
+        scale_buf = symm_buffer.fc1_activation_per_token_scale
+        assert scale_buf is not None
+        assert scale_buf.shape == (problem["max_tokens"],)
+        assert scale_buf.dtype == torch.float32
+        # Allocation-time default is the neutral scale.
+        assert torch.equal(scale_buf, torch.ones_like(scale_buf))
+
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            problem["topk_ids"],
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+        )
+        # Kernel-team tester value set {0.5, 1.0, 1.5, 2.0}: exactly
+        # representable, per-token distinct, and far from the neutral 1.0.
+        g = torch.Generator(device="cuda").manual_seed(23)
+        scale = (
+            torch.randint(1, 5, (num_tokens,), generator=g, device="cuda").to(
+                torch.float32
+            )
+            * 0.5
+        )
+        scale_buf[:num_tokens].copy_(scale)
+
+        ref_kwargs = dict(
+            act_packed=symm_buffer.x[:num_tokens],
+            act_sf=symm_buffer.x_sf[:num_tokens],
+            topk_idx=symm_buffer.topk_idx[:num_tokens],
+            topk_weights=symm_buffer.topk_weights[:num_tokens],
+            fc1_weight=fc1_plain,
+            fc1_sf=fc1_sf,
+            fc2_weight=fc2_plain,
+            fc2_sf=fc2_sf,
+            hidden=problem["hidden"],
+            intermediate=problem["intermediate"],
+            gate_up_clamp=problem["gate_up_clamp"],
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        # The oracle has no fc1_alpha leg: fold the (power-of-two) broadcast
+        # alpha into the per-token scale it is fed -- exact in fp32.
+        ref_scale = scale if fc1_alpha is None else scale * fc1_alpha
+        y_ref = _torch_nvfp4_mega_reference(
+            **ref_kwargs, fc1_activation_per_token_scale=ref_scale
+        )
+        y_ref_unscaled = _torch_nvfp4_mega_reference(**ref_kwargs)
+
+        y_kernel = torch.empty(
+            num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+        )
+        nvfp4_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=problem["gate_up_clamp"],
+        )
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(y_kernel).all()
+        yk = y_kernel.to(torch.float32)
+        yr = y_ref.to(torch.float32)
+        yu = y_ref_unscaled.to(torch.float32)
+        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
+        rel_l2_unscaled = (yk - yu).norm() / yu.norm().clamp_min(1e-6)
+        print(
+            f"[nvfp4 per-token-scale oracle {activation} tokens={num_tokens} "
+            f"experts={num_experts} topk={topk} alpha={fc1_alpha}] "
+            f"rel_l2={rel_l2.item():.4g} "
+            f"rel_l2(vs unscaled ref)={rel_l2_unscaled.item():.4g} "
+            f"max|d|={(yk - yr).abs().max().item():.4g} "
+            f"amax(ref)={yr.abs().max().item():.4g}"
+        )
+        # Same tolerance model as the unscaled oracle test (see _oracle_atol):
+        # NVFP4 RTNE flips at fc1-out + accumulation-order noise + one bf16
+        # term-rounding flip.
+        atol = _oracle_atol(yr.abs().max().item())
+        torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+        assert rel_l2.item() < 0.02
+        # The check has teeth: a kernel that ignored the scale (or applied it
+        # to the wrong tokens) would sit far from the scaled reference.
+        assert rel_l2_unscaled.item() > 0.05, (
+            "per-token scale had no observable effect -- test is not discriminating"
+        )
+    finally:
+        symm_buffer.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "epilogue",
+    [
+        # Random per-expert fc1_alpha / fc2_alpha / fc1_norm_const (the same
+        # value sets as make_dummy_epilogue_params) on top of the per-token
+        # scale: checks the alpha*scale_t fold, the norm-const SF shift and
+        # the fc2 alpha against an independent reference.
+        pytest.param("random", id="random-scalars"),
+        # Deployment recipe from the kernel-team design: quantize the fc1
+        # output with norm const 16 (SF shifted up 4 binades) and fold the
+        # 1/16 into fc2_alpha on the host.  Small-magnitude MiniMax-style
+        # values keep every SF inside the e4m3 normal range, where this must
+        # be indistinguishable from norm const 1 with the unfolded fc2_alpha.
+        pytest.param("deploy-norm16", id="deploy-norm16"),
+    ],
+)
+def test_nvfp4_kernel_per_token_scale_with_epilogue_scalars(monkeypatch, epilogue):
+    """Per-token scale combined with non-identity per-expert epilogue scalars,
+    vs the pure-torch oracle carrying the same scalars."""
+    _require_cuda()
+
+    import torch
+
+    cap = torch.cuda.get_device_capability()
+    if cap[0] != 10:
+        pytest.skip(
+            f"nvfp4_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
+        )
+    pytest.importorskip("triton")
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        get_symm_buffer_for_mega_moe,
+        make_dummy_epilogue_params,
+        nvfp4_mega_moe,
+    )
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    num_experts, topk, num_tokens = 4, 2, 192
+    problem = _single_rank_problem(
+        num_experts=num_experts, topk=topk, num_tokens=num_tokens, max_tokens=192
+    )
+    swiglu_alpha, swiglu_beta = None, None
+    g = torch.Generator(device="cuda").manual_seed(29)
+    fc1_alpha, fc2_alpha, fc1_norm_const = make_dummy_epilogue_params(
+        num_experts, generator=g
+    )
+    if epilogue == "deploy-norm16":
+        problem["gate_up_clamp"] = 0.5
+        problem["hidden_states"].mul_(0.1)
+        problem["w13"].mul_(0.1)
+        swiglu_alpha, swiglu_beta = 1.702, 1.0
+        fc2_alpha_unfolded = fc2_alpha
+        fc1_norm_const = torch.full_like(fc1_norm_const, 16.0)
+        fc2_alpha = fc2_alpha_unfolded / 16.0  # exact (power of two)
+
+    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
+    transformed_l1, transformed_l2 = preprocess_mega_weights(
+        pack,
+        intermediate_size=problem["intermediate"],
+        hidden_size=problem["hidden"],
+        gate_up_clamp=problem["gate_up_clamp"],
+    )
+    fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
+
+    symm_buffer = get_symm_buffer_for_mega_moe(
+        problem["num_experts"],
+        problem["max_tokens"],
+        problem["topk"],
+        problem["hidden"],
+        2 * problem["intermediate"],
+        0,
+        1,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        gate_up_clamp=problem["gate_up_clamp"],
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+        fc1_norm_const=fc1_norm_const,
+        enable_fc1_activation_per_token_scale=True,
+    )
+    try:
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            problem["topk_ids"],
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+        )
+        scale = (
+            torch.randint(1, 5, (num_tokens,), generator=g, device="cuda").to(
+                torch.float32
+            )
+            * 0.5
+        )
+        symm_buffer.fc1_activation_per_token_scale[:num_tokens].copy_(scale)
+
+        ref_kwargs = dict(
+            act_packed=symm_buffer.x[:num_tokens],
+            act_sf=symm_buffer.x_sf[:num_tokens],
+            topk_idx=symm_buffer.topk_idx[:num_tokens],
+            topk_weights=symm_buffer.topk_weights[:num_tokens],
+            fc1_weight=fc1_plain,
+            fc1_sf=fc1_sf,
+            fc2_weight=fc2_plain,
+            fc2_sf=fc2_sf,
+            hidden=problem["hidden"],
+            intermediate=problem["intermediate"],
+            gate_up_clamp=problem["gate_up_clamp"],
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            fc1_activation_per_token_scale=scale,
+            fc1_alpha=fc1_alpha,
+        )
+        # Exact kernel math: norm const in the SF, fc2_alpha applied as-is.
+        y_ref = _torch_nvfp4_mega_reference(
+            **ref_kwargs, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const
+        )
+
+        y_kernel = torch.empty(
+            num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+        )
+        nvfp4_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=problem["gate_up_clamp"],
+        )
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(y_kernel).all()
+        yk = y_kernel.to(torch.float32)
+        yr = y_ref.to(torch.float32)
+        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
+        msg = (
+            f"[nvfp4 per-token-scale + epilogue scalars {epilogue}] "
+            f"rel_l2={rel_l2.item():.4g} max|d|={(yk - yr).abs().max().item():.4g} "
+            f"amax(ref)={yr.abs().max().item():.4g}"
+        )
+        atol = _oracle_atol(yr.abs().max().item())
+        torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+        assert rel_l2.item() < 0.02
+
+        if epilogue == "deploy-norm16":
+            # The recipe is a pure SF-exponent shift (+4 binades): for every
+            # block whose SF stays inside the e4m3 normal range under both
+            # norm consts it reproduces the norm-const-1 / unfolded-fc2_alpha
+            # result bit for bit, so the two oracles differ only through the
+            # blocks the shift is meant to help (SF subnormal / flushed at c=1)
+            # or hurt (SF saturated at 448 for c=16; excluded here by the small
+            # magnitudes).  Bound that residual instead of demanding equality.
+            y_plain = _torch_nvfp4_mega_reference(
+                **ref_kwargs, fc2_alpha=fc2_alpha_unfolded, fc1_norm_const=None
+            )
+            yp = y_plain.to(torch.float32)
+            rel_l2_recipe = (yr - yp).norm() / yp.norm().clamp_min(1e-6)
+            msg += f" recipe-vs-plain rel_l2={rel_l2_recipe.item():.3g}"
+            assert rel_l2_recipe.item() < 0.02, (
+                "norm16 + fc2_alpha/16 deviates from norm 1 + fc2_alpha by "
+                f"rel_l2={rel_l2_recipe.item():.3g}: more than a few blocks left "
+                "the e4m3 normal range"
+            )
+        print(msg)
+    finally:
+        symm_buffer.destroy()
+
+
+def test_nvfp4_per_token_scale_forward_validation():
+    """``MoEEpTensors.fc1_activation_per_token_scale`` must be present iff the
+    kernel config enables it, and be ``(num_tokens,)`` fp32 CUDA."""
+    _require_cuda()
+
+    import torch
+
+    from flashinfer.moe_ep import MoEEpConfigError
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        validate_fc1_activation_per_token_scale,
+    )
+
+    ok = torch.ones(8, dtype=torch.float32, device="cuda")
+    validate_fc1_activation_per_token_scale(ok, num_tokens=8, enabled=True)
+    validate_fc1_activation_per_token_scale(None, num_tokens=8, enabled=False)
+    with pytest.raises(MoEEpConfigError, match="required"):
+        validate_fc1_activation_per_token_scale(None, num_tokens=8, enabled=True)
+    with pytest.raises(
+        MoEEpConfigError, match="enable_fc1_activation_per_token_scale=False"
+    ):
+        validate_fc1_activation_per_token_scale(ok, num_tokens=8, enabled=False)
+    with pytest.raises(MoEEpConfigError, match="shape"):
+        validate_fc1_activation_per_token_scale(ok[:4], num_tokens=8, enabled=True)
+    with pytest.raises(MoEEpConfigError, match="float32"):
+        validate_fc1_activation_per_token_scale(
+            ok.to(torch.bfloat16), num_tokens=8, enabled=True
+        )
+    with pytest.raises(MoEEpConfigError, match="CUDA"):
+        validate_fc1_activation_per_token_scale(ok.cpu(), num_tokens=8, enabled=True)
+
+
+def test_nvfp4_shim_per_token_scale_input_validation():
+    """The shim rejects a per-token scale that disagrees with the session flag
+    (present-but-disabled, missing-but-enabled, wrong shape / dtype) before
+    any compile or launch."""
+    _require_cuda()
+
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        MegaMoENvfp4Config,
+        MegaMoENvfp4Inputs,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.nvfp4 import (
+        MegaMoENvfp4Frontend,
+    )
+
+    tokens, topk, experts, hidden, intermediate = 64, 2, 4, 256, 256
+    base = dict(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=tokens,
+        num_topk=topk,
+        num_total_experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    dev = "cuda"
+    e = experts
+
+    def make_inputs(scale):
+        return MegaMoENvfp4Inputs(
+            activation=torch.zeros(
+                tokens, hidden // 2, dtype=torch.uint8, device=dev
+            ).view(torch.float4_e2m1fn_x2),
+            activation_sf=torch.zeros(
+                tokens, hidden // 16, dtype=torch.float8_e4m3fn, device=dev
+            ),
+            topk_idx=torch.zeros(tokens, topk, dtype=torch.int64, device=dev),
+            topk_weights=torch.zeros(tokens, topk, dtype=torch.float32, device=dev),
+            fc1_weight=torch.zeros(
+                e, hidden // 2, intermediate, dtype=torch.uint8, device=dev
+            ).view(torch.float4_e2m1fn_x2),
+            fc1_weight_sf=torch.zeros(e, 8, dtype=torch.float8_e4m3fn, device=dev),
+            fc2_weight=torch.zeros(
+                e, intermediate // 4, hidden, dtype=torch.uint8, device=dev
+            ).view(torch.float4_e2m1fn_x2),
+            fc2_weight_sf=torch.zeros(e, 8, dtype=torch.float8_e4m3fn, device=dev),
+            fc1_alpha=torch.ones(e, dtype=torch.float32, device=dev),
+            fc2_alpha=torch.ones(e, dtype=torch.float32, device=dev),
+            fc1_norm_const=torch.ones(e, dtype=torch.float32, device=dev),
+            output_activation=torch.zeros(
+                tokens, hidden, dtype=torch.bfloat16, device=dev
+            ),
+            fc1_activation_per_token_scale=scale,
+        )
+
+    scale = torch.ones(tokens, dtype=torch.float32, device=dev)
+    on = MegaMoENvfp4Frontend(
+        MegaMoENvfp4Config(**base, enable_fc1_activation_per_token_scale=True)
+    )
+    off = MegaMoENvfp4Frontend(MegaMoENvfp4Config(**base))
+
+    on._validate_inputs(make_inputs(scale), num_tokens=tokens)
+    off._validate_inputs(make_inputs(None), num_tokens=tokens)
+    with pytest.raises(ValueError, match="required"):
+        on._validate_inputs(make_inputs(None), num_tokens=tokens)
+    with pytest.raises(ValueError, match="enable_fc1_activation_per_token_scale=False"):
+        off._validate_inputs(make_inputs(scale), num_tokens=tokens)
+    with pytest.raises(ValueError, match="shape"):
+        on._validate_inputs(make_inputs(scale[: tokens // 2]), num_tokens=tokens)
+    with pytest.raises(ValueError, match="float32"):
+        on._validate_inputs(make_inputs(scale.to(torch.bfloat16)), num_tokens=tokens)

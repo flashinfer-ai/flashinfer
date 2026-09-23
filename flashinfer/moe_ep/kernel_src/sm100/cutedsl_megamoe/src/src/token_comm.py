@@ -199,6 +199,7 @@ class TokenSrcMetadata:
 _MLIR_VALUE_FIELDS = (
     "input_token_buffer",
     "input_sf_buffer",
+    "input_fc1_activation_per_token_scale_buffer",
     "topk_idx",
     "input_topk_weights_buffer",
     "expert_send_count",
@@ -207,6 +208,7 @@ _MLIR_VALUE_FIELDS = (
     "src_token_topk_idx",
     "fc1_input_token_buffer",
     "fc1_input_sf_buffer",
+    "dispatched_fc1_activation_per_token_scale_buffer",
     "fc1_input_topk_weights_buffer",
     "fc1_ready_counter",
     "token_src_metadata",
@@ -279,9 +281,19 @@ class TokenCommArgs:
         token_back_schedule_counter: cute.Pointer = None,
         combine_sf: cute.Tensor = None,
         fc2_output_sf: cute.Tensor = None,
+        # Optional per-token fc1 activation scale: the user's (T,) fp32 tensor
+        # on the symmetric heap (peer-pulled) and its pool-ordered local copy.
+        input_fc1_activation_per_token_scale_buffer: cute.Tensor = None,
+        dispatched_fc1_activation_per_token_scale_buffer: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
+        self.input_fc1_activation_per_token_scale_buffer = (
+            input_fc1_activation_per_token_scale_buffer
+        )
+        self.dispatched_fc1_activation_per_token_scale_buffer = (
+            dispatched_fc1_activation_per_token_scale_buffer
+        )
         self.topk_idx = topk_idx
         self.input_topk_weights_buffer = input_topk_weights_buffer
         self.expert_send_count = expert_send_count
@@ -818,6 +830,10 @@ class TokenInPullTokenBackPush:
         lane_idx,
         *,
         num_sms,
+        # Optional per-token fc1 activation scale (None disables both):
+        # user (T,) fp32 on the symmetric heap -> pool-ordered local staging.
+        input_fc1_activation_per_token_scale_buffer=None,
+        dispatched_fc1_activation_per_token_scale_buffer=None,
     ):
         # MemRange does not support dynamic indexing here; use raw pointers.
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
@@ -987,6 +1003,12 @@ class TokenInPullTokenBackPush:
                 if cutlass.const_expr(input_sf_buffer is not None):
                     inp_sf_local_base = input_sf_buffer.iterator.toint()
                 inp_w_local_base = input_topk_weights_buffer.iterator.toint()
+                if cutlass.const_expr(
+                    input_fc1_activation_per_token_scale_buffer is not None
+                ):
+                    inp_act_scale_local_base = (
+                        input_fc1_activation_per_token_scale_buffer.iterator.toint()
+                    )
 
                 with cute.arch.elect_one():
                     pull_buffer_warp_ptr = pull_buffer_ptr + (
@@ -1038,6 +1060,7 @@ class TokenInPullTokenBackPush:
                         sf_vals[i] = ldg_b32_raw(sf_addr)
 
                 weight = Float32(0.0)
+                act_scale = Float32(0.0)
                 if lane_idx == Int32(0):
                     weight_addr = (
                         inp_w_local_base
@@ -1047,6 +1070,16 @@ class TokenInPullTokenBackPush:
                         )
                     )
                     weight = ldg_f32_raw(weight_addr)
+                    if cutlass.const_expr(
+                        input_fc1_activation_per_token_scale_buffer is not None
+                    ):
+                        # Per-token (not per-route): one fp32 per source token.
+                        act_scale_addr = (
+                            inp_act_scale_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(4))
+                        )
+                        act_scale = ldg_f32_raw(act_scale_addr)
 
                 if _iket_pull_emit:
                     _iket.range_pop()  # Pull.SF_LDG_STG  (= LD phase)
@@ -1071,6 +1104,12 @@ class TokenInPullTokenBackPush:
 
                 if lane_idx == Int32(0):
                     fc1_input_topk_weights_buffer[pool_token_idx] = weight
+                    if cutlass.const_expr(
+                        dispatched_fc1_activation_per_token_scale_buffer is not None
+                    ):
+                        dispatched_fc1_activation_per_token_scale_buffer[
+                            pool_token_idx
+                        ] = act_scale
 
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -1637,6 +1676,12 @@ class TokenInPullTokenBackPush:
             local_warp_idx,
             lane_idx,
             num_sms=token_comm_args.sm_count,
+            input_fc1_activation_per_token_scale_buffer=(
+                token_comm_args.input_fc1_activation_per_token_scale_buffer
+            ),
+            dispatched_fc1_activation_per_token_scale_buffer=(
+                token_comm_args.dispatched_fc1_activation_per_token_scale_buffer
+            ),
         )
 
         if iket_active:

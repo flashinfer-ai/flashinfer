@@ -44,6 +44,13 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # Per-token fc1 activation scale (compile-time switch).  When True the
+    # workspace carries a ``(max_tokens_per_rank,)`` fp32 symmetric-heap tensor
+    # and every forward must supply ``MoEEpTensors.fc1_activation_per_token_scale``
+    # (``(num_tokens,)`` fp32).  The fc1 epilogue multiplies it into the
+    # dequantized fc1 output before the clamp / gated activation, so callers
+    # that quantize ``x_t / s_t`` to NVFP4 recover the per-token range in-kernel.
+    enable_fc1_activation_per_token_scale: bool = False
     # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).

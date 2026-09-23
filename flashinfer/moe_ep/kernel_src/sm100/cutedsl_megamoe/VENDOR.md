@@ -59,6 +59,26 @@ replace, what to audit) lives in `SKILL.md`.
   `_pack_fp4_kernel` is exempt because it widens its flat index to int64 for
   the > 2**31-element combine round-trip. Send upstream on the next re-sync.
 
+- FC1 per-token activation scale (`enable_fc1_activation_per_token_scale`),
+  ported from the kernel-team MR `qiangf/cutedsl_megamoe!1` (branch
+  `feature/nvfp4-static-per-token-scale`, head `71a70c7`, base `9d004cc`)
+  into the recorded drop. Touches `src/moe_nvfp4_swapab/{kernel_fc12,
+  megamoe_kernel,epilogue_refactor,custom_ext}.py` and `src/src/token_comm.py`:
+  a runtime `(T,)` fp32 tensor on the symmetric heap is peer-pulled by the
+  dispatch warps next to the topk weight into a new pool-ordered local region
+  (`l1_fc1_activation_per_token_scale_buffer`), and the fc1 epilogue folds it
+  into the dequant (`alpha * scale_t * acc`) before the clamp / gated
+  activation (pre-transpose half via warp shuffle, post-transpose half one
+  scale per lane -- same 3-transpose schedule). Only the per-token-scale part
+  of the MR is taken: the MR's compile-time `fc1_activation_norm_const` and
+  `gate_activation="quick_geglu"` are NOT ported (flashinfer keeps the runtime
+  per-expert `fc1_norm_const` tensor -- fold `1/norm_const` into `fc2_alpha`
+  on the host -- and already covers quick-GeGLU via `swiglu_alpha=1.702`).
+  Off by default: `name()` and the compile ABI are unchanged when disabled.
+  Upstream `main` has since moved this feature to the `next/` path (see the
+  kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
+  next re-sync.
+
 ## Related trees
 
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` is a **separate snapshot**
