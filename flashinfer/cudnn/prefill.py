@@ -1093,17 +1093,11 @@ class _CudnnPrefillPlan:
         device,
         previous=None,
         *,
-        exact=None,
-        inputs=None,
-        override_enabled=None,
+        exact,
+        inputs,
+        override_enabled,
     ):
-        self.inputs = (
-            inputs
-            if inputs is not None
-            else tuple(getattr(metadata, name) for name in self._tensor_fields)
-        )
-        if exact is None:
-            exact = _prefill_descriptor_key(**metadata.graph_kwargs(None))
+        self.inputs = inputs
         views = {}
         for name in self._tensor_fields:
             tensor = getattr(metadata, name)
@@ -1113,11 +1107,7 @@ class _CudnnPrefillPlan:
                 setattr(metadata, name, views[id(tensor)])
         self.metadata = metadata
         self.device = device
-        self.override_enabled = (
-            _cudnn_supports_shape_override()
-            if override_enabled is None
-            else override_enabled
-        )
+        self.override_enabled = override_enabled
         self.dtype = dtype
         if (
             previous is not None
@@ -1167,10 +1157,10 @@ class CudnnPrefillGraph:
     The signature is the graph-cache key of :func:`_build_prefill_graph`
     (declared shape or override class, dtypes, strides, scale, mask, flags), so
     a prepared graph is reused exactly where the graph cache would replay the
-    same graph and re-prepared otherwise. A shape-override graph memoizes its
-    real-shape execute kwargs for consecutive same-shape steps. The wrapper
-    owns the plan, rechecks its signature after planning, and invalidates it
-    on workspace replacement; each run binds fresh pointers. Planning and workspace replacement must not race
+    same graph and re-prepared otherwise. The wrapper owns a metadata plan
+    that caches real-shape execute kwargs, checks matches_plan before running,
+    and invalidates the prepared graph on workspace replacement. Each run
+    binds fresh pointers. Planning and workspace replacement must not race
     with a run on the same wrapper.
 
     ``out`` and ``lse`` are bound as given: callers validate their shapes
@@ -1183,7 +1173,6 @@ class CudnnPrefillGraph:
         "graph",
         "override_cache",
         "return_lse",
-        "_exec_cache",
     )
 
     def __init__(self, key, graph, *, override_cache, return_lse: bool):
@@ -1191,27 +1180,6 @@ class CudnnPrefillGraph:
         self.graph = graph
         self.override_cache = override_cache
         self.return_lse = return_lse
-        self._exec_cache: tuple = (None, {})
-
-    def matches(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        scale: float,
-        metadata: _PrefillMetadata,
-    ) -> bool:
-        """Match using the same complete descriptor mapping as graph building."""
-        if metadata.return_lse != self.return_lse:
-            return False
-        override = None
-        if self.override_cache is not None:
-            override = metadata.override_shape(q, k_cache)
-            if override is None:
-                return False
-        return self.key == _sdpa_prefill_key_fn(
-            q, k_cache, v_cache, scale, **metadata.graph_kwargs(override)
-        )
 
     def matches_plan(self, q, k_cache, v_cache, scale, plan, return_lse):
         metadata = plan.metadata
@@ -1306,32 +1274,17 @@ class CudnnPrefillGraph:
 
         execute_kwargs: dict = {}
         if self.override_cache is not None:
-            # Real (b, s_q, s_kv) and strides for the declared-at-class graph;
-            # rebuilt only when they change between steps.
-            batch_size = metadata.cu_seq_lens_q.shape[0] - 1
-            sig = (
-                batch_size,
-                metadata.max_token_per_sequence,
-                metadata.max_sequence_kv,
-                q.shape[1:],
-                k_cache.shape[1:],
-                v_cache.shape[1:],
-                q.stride(),
-                k_cache.stride(),
-                v_cache.stride(),
+            # The public entry point creates this wrapper per call. Repeated
+            # wrapper execution uses run_planned and its plan-owned kwargs.
+            execute_kwargs = _override_execute_kwargs(
+                q,
+                k_cache,
+                v_cache,
+                batch_size=metadata.cu_seq_lens_q.shape[0] - 1,
+                s_qo=metadata.max_token_per_sequence,
+                s_kv=metadata.max_sequence_kv,
+                with_stats=self.return_lse,
             )
-            cached_sig, execute_kwargs = self._exec_cache
-            if sig != cached_sig:
-                execute_kwargs = _override_execute_kwargs(
-                    q,
-                    k_cache,
-                    v_cache,
-                    batch_size=batch_size,
-                    s_qo=metadata.max_token_per_sequence,
-                    s_kv=metadata.max_sequence_kv,
-                    with_stats=self.return_lse,
-                )
-                self._exec_cache = (sig, execute_kwargs)
 
         return self._execute(
             q, out, lse, workspace_buffer, var_map, execute_kwargs, lse_base
@@ -1367,14 +1320,16 @@ def prepare_cudnn_batch_prefill(
     metadata: _PrefillMetadata,
 ) -> CudnnPrefillGraph:
     """Fetch (or build into the graph cache) the prefill graph for this call's
-    signature and wrap it for repeated :meth:`CudnnPrefillGraph.run`.
+    signature and wrap it for execution.
 
     Takes the resolved form :func:`cudnn_batch_prefill_with_kv_cache` hands to
     the low level: token-unit ``cu_seq_lens_*`` on the direct path (with the
     same buffers as ``batch_offsets_*``), or per-batch ``actual_seq_lens_*``
     with element-unit offsets. The wrappers call this directly and keep the
-    result across steps, re-preparing when :meth:`CudnnPrefillGraph.matches`
-    says the signature moved.
+    result across steps, using :meth:`CudnnPrefillGraph.matches_plan` and
+    :meth:`CudnnPrefillGraph.run_planned` with their plan-owned metadata.
+    The public low-level entry point instead calls :meth:`CudnnPrefillGraph.run`
+    with metadata resolved for that call.
     """
     override_cache = metadata.override_shape(q, k_cache)
 

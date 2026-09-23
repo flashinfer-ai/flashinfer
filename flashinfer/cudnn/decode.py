@@ -60,12 +60,9 @@ def _sdpa_decode_key_fn(
     scale: float,
     *,
     max_sequence_kv: int,
-    block_size: Optional[int] = 1,
     actual_seq_lens_q: Optional[torch.Tensor] = None,
     actual_seq_lens_kv: Optional[torch.Tensor] = None,
     block_tables: Optional[torch.Tensor] = None,
-    batch_offsets_q: Optional[torch.Tensor] = None,
-    batch_offsets_o: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     q_len_per_req: int = 1,
     window_left: int = -1,
@@ -135,12 +132,9 @@ if CUDNN_AVAILABLE:
         scale: float,
         *,
         max_sequence_kv: int,
-        block_size: Optional[int] = 1,
         actual_seq_lens_q: Optional[torch.Tensor] = None,
         actual_seq_lens_kv: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
-        batch_offsets_q: Optional[torch.Tensor] = None,
-        batch_offsets_o: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         q_len_per_req: int = 1,
         window_left: int = -1,
@@ -148,9 +142,8 @@ if CUDNN_AVAILABLE:
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
-        # WAR: override batch offsets for now, as it leads to a poor performance
-        batch_offsets_q = None
-        batch_offsets_o = None
+        # Decode represents fixed-length queries with dense strided Q/O
+        # descriptors; public batch offsets are only used by the cubin path.
 
         # Q and O carry explicit data types (K/V inherit theirs from the torch
         # tensors via tensor_like below); derive them from q.dtype instead of
@@ -194,10 +187,6 @@ if CUDNN_AVAILABLE:
                 stride=q_stride,
                 data_type=cudnn_q_data_type,
             )
-            if batch_offsets_q is not None:
-                ragged_q = g.tensor_like(batch_offsets_q)
-                ragged_q.set_uid(UIDs.RAGGED_Q_UID.value)
-                cudnn_q.set_ragged_offset(ragged_q)
 
             cudnn_k_cache = g.tensor_like(k_cache)
             cudnn_v_cache = g.tensor_like(v_cache)
@@ -269,11 +258,6 @@ if CUDNN_AVAILABLE:
                 compute_data_type=cudnn.data_type.FLOAT,
                 **mask_kwargs,
             )
-
-            if batch_offsets_o is not None:
-                ragged_o = g.tensor_like(batch_offsets_o)
-                ragged_o.set_uid(UIDs.RAGGED_O_UID.value)
-                O.set_ragged_offset(ragged_o)
 
             # O is bound to a contiguous (batch * s_qo, h_qo, d_vo) buffer:
             # token-major rows, heads inside a row.
@@ -461,8 +445,6 @@ def _execute_decode(
     block_tables,
     return_lse,
     sinks,
-    batch_offsets_q=None,
-    batch_offsets_o=None,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
     handle_ = _create_cudnn_handle(torch.cuda.current_stream(q.device))
@@ -482,11 +464,6 @@ def _execute_decode(
     if actual_seq_lens_kv is not None:
         var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
 
-    if batch_offsets_q is not None:
-        var_map[UIDs.RAGGED_Q_UID.value] = batch_offsets_q
-    if batch_offsets_o is not None:
-        var_map[UIDs.RAGGED_O_UID.value] = batch_offsets_o
-
     if block_tables is not None:
         var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
         var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
@@ -499,65 +476,6 @@ def _execute_decode(
         lse.mul_(log2e)
 
     return out
-
-
-def _batch_decode_with_kv_cache(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    scale: float,
-    workspace_buffer: torch.Tensor,
-    *,
-    max_sequence_kv: int,
-    actual_seq_lens_q: Optional[torch.Tensor] = None,
-    actual_seq_lens_kv: Optional[torch.Tensor] = None,
-    block_tables: Optional[torch.Tensor] = None,
-    block_size: Optional[int] = 1,
-    batch_offsets_q: Optional[torch.Tensor] = None,
-    batch_offsets_o: Optional[torch.Tensor] = None,
-    batch_offsets_k: Optional[torch.Tensor] = None,
-    batch_offsets_v: Optional[torch.Tensor] = None,
-    out: torch.Tensor,
-    return_lse: bool = False,
-    lse: Optional[torch.Tensor] = None,
-    q_len_per_req: int = 1,
-    window_left: int = -1,
-    sinks: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    graph, tensors = _build_decode_graph(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        scale=scale,
-        max_sequence_kv=max_sequence_kv,
-        actual_seq_lens_q=actual_seq_lens_q,
-        actual_seq_lens_kv=actual_seq_lens_kv,
-        block_tables=block_tables,
-        block_size=block_size,
-        batch_offsets_q=batch_offsets_q if batch_offsets_q is not None else None,
-        batch_offsets_o=batch_offsets_q if batch_offsets_q is not None else None,
-        return_lse=return_lse,
-        q_len_per_req=q_len_per_req,
-        window_left=window_left,
-        sinks=sinks,
-    )
-
-    return _execute_decode(
-        graph,
-        q,
-        k_cache,
-        v_cache,
-        out,
-        lse,
-        workspace_buffer,
-        actual_seq_lens_q=actual_seq_lens_q,
-        actual_seq_lens_kv=actual_seq_lens_kv,
-        block_tables=block_tables,
-        return_lse=return_lse,
-        sinks=sinks,
-        batch_offsets_q=batch_offsets_q,
-        batch_offsets_o=batch_offsets_o,
-    )
 
 
 class CudnnDecodeGraph:
@@ -667,7 +585,6 @@ class CudnnDecodeGraph:
             v_cache,
             scale,
             max_sequence_kv=max_sequence_kv,
-            block_size=k_cache.shape[2],
             actual_seq_lens_q=self.seq_lens_q,
             actual_seq_lens_kv=actual_seq_lens_kv,
             block_tables=block_tables,
@@ -786,7 +703,6 @@ def prepare_cudnn_batch_decode(
     q_graph = _decode_q_view(q, bs, q_len_per_req)
     kwargs = dict(
         max_sequence_kv=max_sequence_kv,
-        block_size=k_cache.shape[2],
         actual_seq_lens_q=seq_lens_q,
         actual_seq_lens_kv=actual_seq_lens_kv,
         block_tables=block_tables,
@@ -985,30 +901,37 @@ def cudnn_batch_decode_with_kv_cache(
         actual_seq_lens_q = torch.full(
             (bs, 1, 1, 1), q_len_per_req, device=q.device, dtype=torch.int32
         )
-        block_size = k_cache.shape[2]
         # Multi-token rows are presented to the graph as (batch, heads,
         # q_len_per_req, d): a strided view, no copy (the rows of one request
         # are consecutive in q, whatever its batch stride).
         q_graph = _decode_q_view(q, bs, q_len_per_req)
 
-        _batch_decode_with_kv_cache(
+        graph, _ = _build_decode_graph(
             q=q_graph,
             k_cache=k_cache,
             v_cache=v_cache,
             scale=scale,
-            workspace_buffer=workspace_buffer,
             max_sequence_kv=max_sequence_kv,
             actual_seq_lens_q=actual_seq_lens_q,
             actual_seq_lens_kv=actual_seq_lens_kv,
             block_tables=block_tables,
-            batch_offsets_q=batch_offsets_q,
-            batch_offsets_o=batch_offsets_o,
-            block_size=block_size,
-            out=out,
             return_lse=return_lse,
-            lse=lse,
             q_len_per_req=q_len_per_req,
             window_left=window_left,
+            sinks=sinks_view,
+        )
+        _execute_decode(
+            graph,
+            q_graph,
+            k_cache,
+            v_cache,
+            out,
+            lse,
+            workspace_buffer,
+            actual_seq_lens_q=actual_seq_lens_q,
+            actual_seq_lens_kv=actual_seq_lens_kv,
+            block_tables=block_tables,
+            return_lse=return_lse,
             sinks=sinks_view,
         )
 

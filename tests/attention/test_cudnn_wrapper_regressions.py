@@ -84,12 +84,14 @@ def test_prefill_override_respects_indptr_layout(monkeypatch):
         metadata,
         **dict.fromkeys(offset_names, torch.empty(4, device="meta", dtype=torch.int32)),
     )
-    assert graph.matches(q, k, k, 0.125, larger)
+    plan = prefill._CudnnPrefillPlan.prepare(larger, q.dtype, q.device)
+    assert graph.matches_plan(q, k, k, 0.125, plan, False)
     strided = replace(
         metadata, batch_offsets_q=torch.empty(6, device="meta", dtype=torch.int32)[::2]
     )
     assert strided.override_shape(q, k) is None
-    assert not graph.matches(q, k, k, 0.125, strided)
+    plan = prefill._CudnnPrefillPlan.prepare(strided, q.dtype, q.device)
+    assert not graph.matches_plan(q, k, k, 0.125, plan, False)
 
 
 def _paged_inputs():
@@ -282,12 +284,13 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
 @pytest.mark.parametrize("explicit_metadata", [False, True])
 def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metadata):
     q, k, v, qo, ip, ix, last = _paged_inputs()
+    last = last + 4
     ws = torch.empty(128 << 20, dtype=torch.uint8, device=q.device)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, layout, backend="cudnn")
     metadata = {}
     if explicit_metadata:
         metadata = dict(
-            seq_lens=torch.tensor([33, 17], device=q.device, dtype=torch.int32),
+            seq_lens=torch.tensor([37, 21], device=q.device, dtype=torch.int32),
             seq_lens_q=torch.tensor([3, 2], device=q.device, dtype=torch.int32),
             block_tables=torch.tensor(
                 [[3, 0, 4], [2, 1, 0]], device=q.device, dtype=torch.int32
@@ -300,6 +303,29 @@ def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metad
     )
     cache = (k, v) if layout == "NHD" else (k.transpose(1, 2), v.transpose(1, 2))
     out, lse = w.run(q, cache, return_lse=True, lse_base=lse_base)
+    ref, lse_ref = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(
+        lse,
+        lse_ref * (math.log2(math.e) if lse_base == "log2" else 1),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(q, cache, out=out, lse=lse, return_lse=True, lse_base=lse_base)
+    lengths_ptr = w._seq_lens_kv.data_ptr()
+    last = last - 2
+    if explicit_metadata:
+        metadata["seq_lens"].sub_(2)
+    w.plan(
+        qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype, **metadata
+    )
+    assert w._seq_lens_kv.data_ptr() == lengths_ptr
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
     ref, lse_ref = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
     torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
     torch.testing.assert_close(

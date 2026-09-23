@@ -3136,22 +3136,26 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "cuDNN requires int32 qo_indptr buffers in CUDA-graph mode"
                     )
                 self._qo_indptr_buf = self._qo_indptr_buf.to(torch.int32)
-            # Stage both masks from the plan's CSR metadata, even when callers
-            # supplied max lengths. Replanning must update captured addresses.
-            kv_host = (
-                seq_lens.cpu().flatten()
-                if seq_lens is not None
-                else get_seq_lens(
-                    paged_kv_indptr.to("cpu"),
-                    paged_kv_last_page_len.to("cpu"),
-                    page_size,
+            # Without an explicit maximum, KV lengths were already staged
+            # above to compute _max_kv_len. With one, still update the captured
+            # buffer on every plan; the bound does not replace actual lengths.
+            if max_sequence_kv is not None:
+                kv_host = (
+                    seq_lens.cpu().flatten()
+                    if seq_lens is not None
+                    else get_seq_lens(
+                        paged_kv_indptr.to("cpu"),
+                        paged_kv_last_page_len.to("cpu"),
+                        page_size,
+                    )
                 )
-            )
-            if batch_size > self._kv_lens_buffer.shape[0]:
-                self._kv_lens_buffer = torch.empty(
-                    batch_size, dtype=torch.int32, device=self.device
+                if batch_size > self._kv_lens_buffer.shape[0]:
+                    self._kv_lens_buffer = torch.empty(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                self._kv_lens_buffer[:batch_size].copy_(
+                    kv_host, non_blocking=non_blocking
                 )
-            self._kv_lens_buffer[:batch_size].copy_(kv_host, non_blocking=non_blocking)
             self._seq_lens_kv = self._kv_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1
             )

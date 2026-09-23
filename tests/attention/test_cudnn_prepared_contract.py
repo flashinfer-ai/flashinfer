@@ -52,12 +52,20 @@ def test_decode_public_allocation_and_copy_prepared_boundary(
     assert q.stride(-1) == 2
     seen = {}
 
-    def run(**call):
-        seen.update(call)
-        call["out"].copy_(call["q"])
-        call["lse"].fill_(1)
+    def execute(pack, **unused):
+        seen.update(pack)
+        output = pack[decode.UIDs.O_UID.value]
+        output.copy_(pack[decode.UIDs.Q_UID.value].view_as(output))
+        pack[decode.UIDs.STATS_UID.value].fill_(1)
 
-    monkeypatch.setattr(decode, "_batch_decode_with_kv_cache", run)
+    monkeypatch.setattr(
+        decode,
+        "_build_decode_graph",
+        lambda **kw: (SimpleNamespace(execute=execute), []),
+        raising=False,
+    )
+    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     out, lse = decode.cudnn_batch_decode_with_kv_cache(
         q,
         k,
@@ -69,8 +77,8 @@ def test_decode_public_allocation_and_copy_prepared_boundary(
     )
     torch.testing.assert_close(out, q)
     assert lse.shape == (2, 4)
-    assert seen["q"].stride(-1) == 1
-    assert seen["sinks"].shape == (1, 4, 1, 1)
+    assert seen[decode.UIDs.Q_UID.value].stride(-1) == 1
+    assert seen[decode.UIDs.SINK_UID.value].shape == (1, 4, 1, 1)
     with pytest.raises(ValueError, match="unit innermost stride"):
         decode.prepare_cudnn_batch_decode(
             q, k, v, 0.5, max_sequence_kv=8, window_left=-1, **kwargs
@@ -167,28 +175,23 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
         actual_seq_lens_kv=actual_kv,
     )
 
-    # A graph-cache key can add a descriptor without changing the prepared
-    # wrapper: build and match must receive that same descriptor.
-    def key(q, k, v, scale, *, actual_seq_lens_kv, **kwargs):
-        return actual_seq_lens_kv.shape, actual_seq_lens_kv.stride()
-
-    monkeypatch.setattr(prefill, "_sdpa_prefill_key_fn", key)
     monkeypatch.setattr(
         prefill, "_build_prefill_graph", lambda **kw: (object(), []), raising=False
     )
     prepared = prefill.prepare_cudnn_batch_prefill(
         q, kv, kv, 0.5, torch.empty(0), metadata=metadata
     )
-    assert prepared.matches(q, kv, kv, 0.5, metadata)
-    assert not prepared.matches(
-        q,
-        kv,
-        kv,
-        0.5,
-        replace(metadata, actual_seq_lens_kv=torch.empty(4, dtype=torch.int32)[::2]),
+
+    def matches(metadata):
+        plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
+        return prepared.matches_plan(q, kv, kv, 0.5, plan, metadata.return_lse)
+
+    assert matches(metadata)
+    assert not matches(
+        replace(metadata, actual_seq_lens_kv=torch.empty(4, dtype=torch.int32)[::2])
     )
-    with pytest.raises(TypeError, match="unexpected keyword"):
-        prefill._PrefillMetadata(2, 4, False, False, batch_offset_q=None)
+    assert not matches(replace(metadata, return_lse=True))
+    assert not matches(replace(metadata, causal=True))
 
 
 @pytest.mark.parametrize(
