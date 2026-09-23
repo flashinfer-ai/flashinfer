@@ -75,7 +75,9 @@ def main():
         torch.cuda.synchronize()
         max_abs = float((out_cake.float() - out_cute.float()).abs().max())
         cake_ms = float(
-            torch.tensor(bench_gpu_time(prepared.launch, cold_l2_cache=True)).median()
+            torch.tensor(
+                bench_gpu_time(prepared.launch, cold_l2_cache=True, enable_cupti=True)
+            ).median()
         )
         cute_ms = float(
             torch.tensor(
@@ -84,6 +86,7 @@ def main():
                         a, b, a_scale, b_scale, m_indices, out=out_cute
                     ),
                     cold_l2_cache=True,
+                    enable_cupti=True,
                 )
             ).median()
         )

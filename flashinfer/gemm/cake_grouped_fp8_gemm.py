@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared contiguous grouped FP8 GEMM launches on Blackwell SM100a.
 
-This is the generated Weave-IR program family for the same mathematical
+This is the generated Cake program family for the same mathematical
 contract as :func:`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous`:
 ``out[r, :] = sum_q (a[r, q-block] . b[g_r, :, q-block]) * a_scale[r, q] *
 b_scale[g_r, :, q]`` with FP8 E4M3 operands, per-row 128-wide K-block A scales,

@@ -174,7 +174,7 @@ def test_scalar_output_route_for_unaligned_output():
     )
     m = sum(group_counts)
     storage = torch.empty(m * n + 8, dtype=torch.bfloat16, device=device)
-    out = storage[1:].view(m, n)
+    out = storage[1 : 1 + m * n].view(m, n)
     assert out.data_ptr() % 16 != 0 and out.is_contiguous()
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a, b, a_scale, b_scale, m_indices, out=out
