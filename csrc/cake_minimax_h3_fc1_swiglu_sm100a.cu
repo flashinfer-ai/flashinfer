@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// clang-format off
 // MiniMax-H3 fused RMSNorm + indexed AdaLN + FC1 GEMM + SwiGLU for sm_100a (Blackwell,
 // compute capability 10.0).  Generated device code; three operator variants share one
 // translation unit:
@@ -3917,3 +3918,4 @@ void minimax_h3_fc1_swiglu_nvfp4(TensorView x, TensorView x_norm_weight, TensorV
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_fc1_swiglu, minimax_h3_fc1_swiglu);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_fc1_swiglu_mxfp8, minimax_h3_fc1_swiglu_mxfp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_fc1_swiglu_nvfp4, minimax_h3_fc1_swiglu_nvfp4);
+// clang-format on
