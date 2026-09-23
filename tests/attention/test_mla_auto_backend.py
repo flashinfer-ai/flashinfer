@@ -1506,6 +1506,12 @@ def test_fa_plan_without_torch_shared_memory_properties(monkeypatch, backend):
 
 @pytest.mark.usefixtures("_sm100_reference_precision")
 def test_auto_falls_back_when_cutile_library_budget_is_full(monkeypatch):
+    pytest.importorskip("cuda.tile.compilation")
+    from flashinfer.cutile.cutile_common import is_cuda_tile_available
+
+    if not is_cuda_tile_available():
+        pytest.skip("cuTile compiler toolchain is unavailable")
+
     from flashinfer.mla._batch_mla._backends import _cutile_prepared as prepared
 
     monkeypatch.setattr(prepared, "_LOADED_LIBRARIES", {})
