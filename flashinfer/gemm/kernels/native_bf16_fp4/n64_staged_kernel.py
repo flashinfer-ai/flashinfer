@@ -1,100 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Asynchronous canonical weight staging for small-M W4A16."""
+"""Stage 64 weight columns and the live activation rows for small-M W4A16."""
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Uint32
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass import Float32, Int32, Uint32
 
 from ....cute_dsl.fp4_common import (
     get_ptr_as_int64,
     get_smem_ptr_as_int32,
 )
 from .kernel import _DIRECT_BF16_CVT, mma_bf16, reduce_split_k, scaled_bf16_pair
-
-
-@dsl_user_op
-def copy_async_16(dst: Int32, src: Int64, valid: Int32, *, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [
-            Int32(dst).ir_value(loc=loc, ip=ip),
-            Int64(src).ir_value(loc=loc, ip=ip),
-            Int32(valid).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.cg.shared.global [$0], [$1], 16, $2;",
-        "r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def scaled_pair_e4m3(packed: Uint32, scale: Uint32, *, loc=None, ip=None):
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Uint32(packed).ir_value(loc=loc, ip=ip),
-                Uint32(scale).ir_value(loc=loc, ip=ip),
-            ],
-            "{ .reg .b8 q; .reg .b16 s; .reg .b32 packed_s, values, scales; "
-            "cvt.u8.u32 q, $1; mul.lo.u32 packed_s, $2, 257; "
-            "cvt.u16.u32 s, packed_s; cvt.rn.bf16x2.e4m3x2 scales, s; "
-            "cvt.rn.bf16x2.e2m1x2 values, q; mul.rn.bf16x2 $0, values, scales; }",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def ld_shared_v2_u32(addr: Int32, *, loc=None, ip=None):
-    values = llvm.inline_asm(
-        ir.Type.parse("!llvm.struct<(i32, i32)>"),
-        [Int32(addr).ir_value(loc=loc, ip=ip)],
-        "ld.shared.v2.u32 {$0, $1}, [$2];",
-        "=r,=r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        Uint32(llvm.extractvalue(T.i32(), values, [i], loc=loc, ip=ip))
-        for i in range(2)
-    )
-
-
-@dsl_user_op
-def load_matrix_a(addr: Int32, *, loc=None, ip=None):
-    values = llvm.inline_asm(
-        ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>"),
-        [Int32(addr).ir_value(loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        Uint32(llvm.extractvalue(T.i32(), values, [i], loc=loc, ip=ip))
-        for i in range(4)
-    )
+from .staged_kernel import (
+    copy_async_16,
+    ld_shared_v2_u32,
+    load_matrix_a,
+    scaled_pair_e4m3,
+)
 
 
 class NativeN64Bf16Fp4Kernel:

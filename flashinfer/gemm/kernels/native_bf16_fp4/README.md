@@ -34,49 +34,21 @@ and N*K, M*K and M*N below 2**31. The scale buffer contains the padded 128x4 lay
 weight rows and output columns may have tails. Output is BF16 or FP16.
 Alpha is an optional live GPU float32 scalar with shape `(1,)`.
 
-CuTe DSL kernels consume the same buffers. Calls with M greater than 16 use
-a general kernel tiled across activation rows, without split-K scratch or
-weight preparation. This extends functional coverage; the specialized
-small-M kernels remain the performance focus. For M at most 16,
-16-byte-aligned inputs and K divisible by 64, asynchronous copies stage canonical
-weights, activations and scales in shared memory. Two or three buffers overlap loading with computation.
-Matrix loads feed BF16 tensor cores, while FP4 decoding and scaling happen in
-registers. Scalar-load MMA and SIMD kernels handle other alignments and K tails.
-All accumulate in FP32. CUDA 13.2 or newer compilers use direct packed conversions;
-older compilers decode through FP16 and FP32. Activations retain BF16 range.
+Small-M kernels use asynchronous shared-memory staging, scalar-load MMA or
+SIMD depending on shape and alignment. For BF16 output with alpha and M <= 4,
+a 64-column tactic stages only the live activation rows plus one zero row.
+Larger M uses tiled MMA with weight fragments reused across activation rows,
+or scalar-load MMA for unaligned inputs and K tails. Accumulation is FP32.
+CUDA 13.2 and newer use direct packed BF16 conversions; older compilers decode
+through FP16 and FP32 without narrowing BF16 activations.
 
-For BF16 output with alpha and M at most four, tuning also considers a
-64-column kernel with 128- or 256-element K tiles. It stages only the live
-activation rows plus one zero row and reads the same canonical weight and
-scale buffers. FP16 output and calls without alpha retain the existing tactics.
+Autotuning selects staging depth, warp count, tile shape and split-K count.
+Split-K allocates `splits * M * N` FP32 elements for deterministic reduction.
+Warm shapes and tactics before CUDA graph capture. A caller-owned output
+avoids output allocation; split-K scratch remains separate.
 
-Tactics vary staging depth, warp count, row reuse and split-K count. Split-K uses a temporary
-FP32 buffer of `splits * M * N` elements and a deterministic reduction kernel.
-It never materializes the full dequantized weight matrix. Staged tactics use up
-to eight splits. The scalar-load MMA fallback also considers up to 64 for N
-below 8192 and K at least 4096. Larger split counts trade more scratch space
-for more parallel work. Staging uses only per-CTA shared memory.
-Warm each shape/tactic outside CUDA graph capture. A
-caller-owned output avoids output allocation; split-K scratch remains separate.
-
-This initial backend does not add W4A4 kernels or select activation precision.
-Keep selection explicit: the useful crossover depends on hardware and shape.
-The native implementation passed 29 focused GPU tests on SM120 and SM121.
-In a combined vLLM integration with the CuTe W4A4 serving implementation, a
-300 W RTX PRO 6000 Max-Q benefited from native W4A16 for single-token down
-projections. The same integration on DGX Spark favored W4A4 throughout.
-The vLLM integration is tracked in
+Dynamic W4A4/W4A16 selection is implemented separately in
 [vllm-project/vllm#54614](https://github.com/vllm-project/vllm/pull/54614).
-Those serving measurements use a separate W4A4 source overlay and are not
-performance results for this standalone FlashInfer patch alone.
-
-The paired 64-question model screen scored 61/64 for both stock and dynamic
-on Max-Q, but does not establish general quality parity. Compilation, tuning
-and CUDA graph warmup remain necessary. The combined integration's first
-launch also reported a larger temporary memory peak than its warm repeat;
-sharing weights does not imply identical peak startup memory.
-Native checkpoint scale layouts other than 128x4 are not supported.
-Trace export describes the canonical scale layout and BF16 or FP16 output.
 
 Run correctness tests with:
 

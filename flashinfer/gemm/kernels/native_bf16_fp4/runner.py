@@ -24,7 +24,7 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
 
     kind, extent, warps, splits = tactic[:4]
     if kind == "n64":
-        from .n64_runner import _compile as compile_n64
+        from .n64_compile import _compile as compile_n64
 
         if dtype != torch.bfloat16 or not has_alpha:
             raise ValueError("The 64-column tactic needs BF16 output and alpha")

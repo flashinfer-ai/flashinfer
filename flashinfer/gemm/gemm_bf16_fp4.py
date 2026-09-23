@@ -403,9 +403,8 @@ def mm_bf16_fp4(
             whatever ``prepare_bf16_fp4_weights`` returned -- it may be
             ``None`` if the backend folded it into ``b_descale``.
         backend: Same identifier passed to ``prepare_bf16_fp4_weights``.
-            Explicit ``cute-dsl-native`` accepts canonical packed weights and
-            128x4 scales directly on SM120/121 for positive M. Small batches
-            (M <= 16) use specialized kernels; larger M uses a general tiled kernel.
+            ``cute-dsl-native`` accepts canonical packed weights and 128x4
+            scales directly on SM120/121.
         out_dtype: Output dtype.  Defaults to ``a.dtype`` (``bfloat16``).
         out: Optional preallocated ``(M, N)`` output tensor.
         block_size: SF block size.  Always 16 for FP4.
