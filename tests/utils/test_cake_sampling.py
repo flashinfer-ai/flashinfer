@@ -622,7 +622,8 @@ def test_stage1_variants_respect_the_device_smem_limit():
         assert pick in small and not pick[2]
     with pytest.raises(ValueError, match="exceeds the frozen stage-1 capacity"):
         choose_stage1(16, 262144, sm_count=148, smem_limit=99 * 1024)
-    assert choose_stage1(16, 262144, sm_count=148, smem_limit=None)[2]
+    # (explicit 227 KB limit: the default is the current device's opt-in, 64 KB on a T4)
+    assert choose_stage1(16, 262144, sm_count=148, smem_limit=232448)[2]
 
 
 # --------------------------------------------------------------------------- adversarial
