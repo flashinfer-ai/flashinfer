@@ -36,39 +36,35 @@ def minimax_h3_nvfp4_physical_module(device: torch.device):
     )
 
 
-def minimax_h3_nvfp4_route_record(device: torch.device, M: int, P: int) -> dict:
-    return minimax_h3_nvfp4_physical_module(device).minimax_h3_nvfp4_route_record(M, P)
+def minimax_h3_nvfp4_route_record(device: torch.device, P: int) -> dict:
+    return minimax_h3_nvfp4_physical_module(device).minimax_h3_nvfp4_route_record(P)
 
 
 def gen_minimax_h3_nvfp4_stage_module(
     device: torch.device,
-    M: int,
     P: int,
     stage: MiniMaxH3Nvfp4Stage,
 ):
     return minimax_h3_nvfp4_physical_module(device).gen_minimax_h3_nvfp4_stage_module(
-        M, P, stage
+        P, stage
     )
 
 
 def load_minimax_h3_nvfp4_stage_module(
     device: torch.device,
-    M: int,
     P: int,
     stage: MiniMaxH3Nvfp4Stage,
 ):
     return minimax_h3_nvfp4_physical_module(device).load_minimax_h3_nvfp4_stage_module(
-        M, P, stage
+        P, stage
     )
 
 
-def load_minimax_h3_nvfp4_route(device: torch.device, M: int, P: int):
+def load_minimax_h3_nvfp4_route(device: torch.device, P: int):
     module = minimax_h3_nvfp4_physical_module(device)
     return (
-        module.load_minimax_h3_nvfp4_stage_module(M, P, "norm_adaln_nvfp4_quantize"),
-        module.load_minimax_h3_nvfp4_stage_module(
-            M, P, "qk_rope_destination_nvfp4_pack"
-        ),
+        module.load_minimax_h3_nvfp4_stage_module(P, "norm_adaln_nvfp4_quantize"),
+        module.load_minimax_h3_nvfp4_stage_module(P, "qk_rope_destination_nvfp4_pack"),
     )
 
 

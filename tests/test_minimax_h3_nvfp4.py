@@ -146,7 +146,7 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         ),
         "out_sf": torch.full((P, out_sf_stride), 255, dtype=torch.uint8, device=device),
     }
-    route = router.minimax_h3_nvfp4_route_record(device, M, P)
+    route = router.minimax_h3_nvfp4_route_record(device, P)
     norm_backing, norm_workspace = _aligned_workspace(
         int(route["stages"]["norm_adaln_nvfp4_quantize"]["tma_workspace_bytes"]),
         device,
@@ -270,21 +270,60 @@ def test_aot_inventory_covers_every_exact_route(monkeypatch) -> None:
 
     class _PhysicalModule:
         @staticmethod
-        def minimax_h3_nvfp4_route_record(M, P):
-            return {"target": "sm103a", "M": M, "P": P}
+        def minimax_h3_nvfp4_route_record(P):
+            return {"target": "sm103a", "P": P}
 
         @staticmethod
-        def gen_minimax_h3_nvfp4_stage_module(M, P, stage):
-            calls.append((M, P, stage))
-            return SimpleNamespace(name=f"{M}_{P}_{stage}")
+        def gen_minimax_h3_nvfp4_stage_module(P, stage):
+            calls.append((P, stage))
+            # The norm stage does not depend on P: one shared spec.
+            name = stage if stage == "norm_adaln_nvfp4_quantize" else f"{P}_{stage}"
+            return SimpleNamespace(name=name)
 
     monkeypatch.setattr(jit.importlib, "import_module", lambda *_args: _PhysicalModule)
     specs = jit.gen_minimax_h3_nvfp4_aot_modules("sm103a")
 
-    assert len(jit.MINIMAX_H3_NVFP4_SHAPES) == 44
-    assert len(calls) == 88
-    assert len(specs) == 88
-    assert {stage for _, _, stage in calls} == {
+    assert jit.MINIMAX_H3_NVFP4_PARTITIONS == (1, 2, 4, 8)
+    assert len(calls) == 8
+    assert len(specs) == 5
+    assert {stage for _, stage in calls} == {
         "norm_adaln_nvfp4_quantize",
         "qk_rope_destination_nvfp4_pack",
     }
+
+
+@pytest.mark.parametrize(
+    ("M", "P", "expected_norm", "expected_post"),
+    [
+        (1, 8, (64, 1, 1), (3, 8, 1)),
+        (129, 8, (128, 1, 1), (87, 8, 1)),
+        (4824, 8, (2432, 1, 1), (3166, 8, 1)),
+        (9648, 4, (4864, 1, 1), (12663, 4, 1)),
+        (19296, 2, (9664, 1, 1), (50652, 2, 1)),
+        (38592, 1, (19328, 1, 1), (202608, 1, 1)),
+        (38591, 1, (19328, 1, 1), (202608, 1, 1)),
+    ],
+)
+def test_stage_launch_grids_follow_the_runtime_token_count(
+    M, P, expected_norm, expected_post
+) -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+
+    norm_record = {
+        "launch_grid_rule": {
+            "kind": "norm_rows",
+            "rows_per_cta": 2,
+            "row_alignment": 128,
+        }
+    }
+    post_record = {
+        "launch_grid_rule": {
+            "kind": "post_warps_2d",
+            "rows_per_warp": 4,
+            "warps_per_cta": 8,
+        }
+    }
+    assert ops._stage_launch_grid(norm_record, M=M, P=P) == expected_norm
+    assert ops._stage_launch_grid(post_record, M=M, P=P) == expected_post
+    with pytest.raises(RuntimeError, match="launch grid rule"):
+        ops._stage_launch_grid({"launch_grid_rule": {"kind": "other"}}, M=M, P=P)

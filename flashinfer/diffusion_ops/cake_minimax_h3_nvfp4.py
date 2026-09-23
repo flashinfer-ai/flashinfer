@@ -85,6 +85,29 @@ def _stage_workspace(
     return value
 
 
+def _stage_launch_grid(record: dict, *, M: int, P: int) -> tuple[int, int, int]:
+    """Launch grid of one generated stage for the runtime token count ``M``.
+
+    The route record carries the rule with the constants of the generated
+    program (rows per CTA, warps per CTA); the token count is not part of the
+    program identity, so the grid is computed here for every call.
+    """
+    rule = record["launch_grid_rule"]
+    kind = str(rule["kind"])
+    if kind == "norm_rows":
+        # One CTA per ``rows_per_cta`` rows of the ``row_alignment``-padded
+        # activation scale tile (the padding rows are zeroed by the stage).
+        rows = _round_up(M, int(rule["row_alignment"]))
+        return (rows // int(rule["rows_per_cta"]), 1, 1)
+    if kind == "post_warps_2d":
+        # grid.x: one warp per (token group, local head, kind) of one
+        # destination; grid.y: the destination.
+        token_groups = -(-M // int(rule["rows_per_warp"]))
+        warps = token_groups * (_HEADS // P) * _KINDS
+        return (-(-warps // int(rule["warps_per_cta"])), P, 1)
+    raise RuntimeError(f"generated stage has unsupported launch grid rule {kind!r}")
+
+
 def _stage_call_args(
     record: dict,
     values: dict,
@@ -274,8 +297,7 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     )
     if any(debug_present) and not all(debug_present):
         raise ValueError(
-            "debug_q_bf16, debug_k_bf16, and debug_adaln_bf16 must be supplied "
-            "together"
+            "debug_q_bf16, debug_k_bf16, and debug_adaln_bf16 must be supplied together"
         )
     write_debug = int(all(debug_present))
     if debug_q_bf16 is None:
@@ -310,7 +332,7 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         and debug_adaln_bf16 is not None
     )
 
-    route = minimax_h3_nvfp4_route_record(device, M, P)
+    route = minimax_h3_nvfp4_route_record(device, P)
     norm_record = route["stages"]["norm_adaln_nvfp4_quantize"]
     post_record = route["stages"]["qk_rope_destination_nvfp4_pack"]
     norm_descriptor_workspace = _stage_workspace(
@@ -325,7 +347,7 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         record=post_record,
         device=device,
     )
-    norm_module, post_module = load_minimax_h3_nvfp4_route(device, M, P)
+    norm_module, post_module = load_minimax_h3_nvfp4_route(device, P)
 
     # FlashInfer ``mm_fp4`` runner order (gemm_base.mm_fp4): a, b, a_descale,
     # b_descale, alpha, out_dtype, out, block_size, use_nvfp4, workspace.
@@ -386,18 +408,24 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         "debug_k_bf16": debug_k_bf16,
         "write_debug": write_debug,
         "eps": eps,
+        # Runtime shape parameters of the generated stages (M is not part of
+        # the program identity; the derived strides follow the tensor layout
+        # validated above).
+        "M": M,
+        "ROWS_PER_DESTINATION": rows_per_destination,
+        "SCALE_STRIDE": out_sf_stride,
     }
     norm_args = _stage_call_args(
         norm_record,
         values,
         workspace=norm_descriptor_workspace,
-        grid=tuple(int(value) for value in norm_record["launch_grid"]),
+        grid=_stage_launch_grid(norm_record, M=M, P=P),
     )
     post_args = _stage_call_args(
         post_record,
         values,
         workspace=post_descriptor_workspace,
-        grid=tuple(int(value) for value in post_record["launch_grid"]),
+        grid=_stage_launch_grid(post_record, M=M, P=P),
     )
 
     # Realistic activation operands before profiling the exact M.

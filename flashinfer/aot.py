@@ -636,9 +636,7 @@ def gen_all_modules(
     )
     for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
         if enabled:
-            jit_specs.extend(
-                gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target)
-            )
+            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.

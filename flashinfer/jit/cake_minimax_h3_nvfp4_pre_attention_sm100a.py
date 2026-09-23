@@ -20,7 +20,7 @@ MiniMaxH3Nvfp4Stage = Literal[
 
 _TARGET = "sm100a"
 _TARGET_FLAGS = sm100a_nvcc_flags
-# Populated by the Cake exporter (``export-loom-kernels``); the empty table is
+# Populated by the Cake generated-program export; the empty table is
 # the source-only placeholder and every route lookup fails until it is filled.
 _ROUTES: dict[str, dict[str, Any]] = json.loads(r"""{}""")
 
@@ -68,8 +68,13 @@ def _verified_source(record: dict[str, str]) -> Path:
     return path
 
 
-def minimax_h3_nvfp4_route_record(M: int, P: int) -> dict:
-    key = f"{_TARGET}:{M}:{P}"
+def minimax_h3_nvfp4_route_record(P: int) -> dict:
+    """Route record for one destination partition count ``P`` (1, 2, 4, 8).
+
+    Both generated stages take the token count ``M`` as a runtime parameter,
+    so one route per ``P`` serves every ``M``.
+    """
+    key = f"{_TARGET}:{P}"
     try:
         return _ROUTES[key]
     except KeyError as exc:
@@ -78,11 +83,10 @@ def minimax_h3_nvfp4_route_record(M: int, P: int) -> dict:
 
 @functools.cache
 def gen_minimax_h3_nvfp4_stage_module(
-    M: int,
     P: int,
     stage: MiniMaxH3Nvfp4Stage,
 ) -> JitSpec:
-    route = minimax_h3_nvfp4_route_record(M, P)
+    route = minimax_h3_nvfp4_route_record(P)
     try:
         record = route["stages"][stage]
     except KeyError as exc:
@@ -106,11 +110,10 @@ def gen_minimax_h3_nvfp4_stage_module(
 
 @functools.cache
 def load_minimax_h3_nvfp4_stage_module(
-    M: int,
     P: int,
     stage: MiniMaxH3Nvfp4Stage,
 ):
-    return gen_minimax_h3_nvfp4_stage_module(M, P, stage).build_and_load()
+    return gen_minimax_h3_nvfp4_stage_module(P, stage).build_and_load()
 
 
 __all__ = [

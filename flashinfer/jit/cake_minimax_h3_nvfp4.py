@@ -23,52 +23,11 @@ from .core import JitSpec
 
 MiniMaxH3Nvfp4Target = Literal["sm100a", "sm103a"]
 
-MINIMAX_H3_NVFP4_SHAPES = (
-    (33472, 1),
-    (16736, 2),
-    (8368, 4),
-    (4184, 8),
-    (38592, 1),
-    (19296, 2),
-    (9648, 4),
-    (4824, 8),
-    (48768, 1),
-    (24384, 2),
-    (12192, 4),
-    (6096, 8),
-    (58944, 1),
-    (29472, 2),
-    (14736, 4),
-    (7368, 8),
-    (74240, 1),
-    (37120, 2),
-    (18560, 4),
-    (9280, 8),
-    (109952, 1),
-    (54976, 2),
-    (27488, 4),
-    (13744, 8),
-    (38528, 1),
-    (38656, 1),
-    (19264, 2),
-    (19328, 2),
-    (9632, 4),
-    (9664, 4),
-    (4816, 8),
-    (4832, 8),
-    (38591, 1),
-    (38593, 1),
-    (19295, 2),
-    (19297, 2),
-    (9647, 4),
-    (9649, 4),
-    (4823, 8),
-    (4825, 8),
-    (1, 8),
-    (127, 8),
-    (128, 8),
-    (129, 8),
-)
+# Destination partition counts of the generated stage-3 pack program. The
+# token count M is a runtime parameter of both stages, so the inventory is
+# one route per partition count (five programs per target: one norm stage
+# shared by every route plus one pack stage per P).
+MINIMAX_H3_NVFP4_PARTITIONS = (1, 2, 4, 8)
 
 _STAGES = (
     "norm_adaln_nvfp4_quantize",
@@ -87,20 +46,20 @@ def gen_minimax_h3_nvfp4_aot_modules(
         f".cake_minimax_h3_nvfp4_pre_attention_{target}", __package__
     )
     specs: dict[str, JitSpec] = {}
-    for M, P in MINIMAX_H3_NVFP4_SHAPES:
-        route = module.minimax_h3_nvfp4_route_record(M, P)
-        if route.get("target") != target or route.get("M") != M or route.get("P") != P:
+    for P in MINIMAX_H3_NVFP4_PARTITIONS:
+        route = module.minimax_h3_nvfp4_route_record(P)
+        if route.get("target") != target or route.get("P") != P:
             raise RuntimeError(
-                f"MiniMax-H3 NVFP4 route identity mismatch for {target}:{M}:{P}"
+                f"MiniMax-H3 NVFP4 route identity mismatch for {target}:{P}"
             )
         for stage in _STAGES:
-            spec = module.gen_minimax_h3_nvfp4_stage_module(M, P, stage)
+            spec = module.gen_minimax_h3_nvfp4_stage_module(P, stage)
             specs.setdefault(spec.name, spec)
     return tuple(specs.values())
 
 
 __all__ = [
-    "MINIMAX_H3_NVFP4_SHAPES",
+    "MINIMAX_H3_NVFP4_PARTITIONS",
     "MiniMaxH3Nvfp4Target",
     "gen_minimax_h3_nvfp4_aot_modules",
 ]
