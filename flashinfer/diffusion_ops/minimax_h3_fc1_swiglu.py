@@ -37,8 +37,8 @@ MINIMAX_H3_MAX_ROWS = 1 << 24
 # GEMM tiling facts the host-side workspace sizing depends on.
 _BLOCK_M = 128
 _CTA_GROUP = 2
-_N_TILE_ROWS = 112  # gate/up weight rows per CTA of the quantized GEMMs
-_QUANT_N_TILES = MINIMAX_H3_FFN // _N_TILE_ROWS  # 128 output tiles
+_N_TILE_ROWS = 128  # gate/up weight rows per CTA of the quantized GEMMs
+_QUANT_N_TILES = MINIMAX_H3_FFN // _N_TILE_ROWS  # 112 output tiles
 
 # FlashInfer 128x4 swizzled scale-factor tiles: 512 bytes = 128 rows x 4 K-blocks, byte offset
 # (row % 32) * 16 + (row // 32) * 4 + kblock inside the tile; tiles ordered (row block, K set).
@@ -51,7 +51,7 @@ NVFP4_BLOCK = 16
 NVFP4_PACKED_COLS = MINIMAX_H3_HIDDEN // 2  # 2688 E2M1 nibble pairs per row
 NVFP4_SF_COLS = MINIMAX_H3_HIDDEN // NVFP4_BLOCK  # 336 UE4M3 scales per row
 NVFP4_SF_K_TILES = NVFP4_SF_COLS // 4  # 84 tiles per 128-row block
-# Combined 224-row (padded to 256) gate/up weight scale tiles: [tile][k_set][half][512 bytes].
+# Combined 256-row gate/up weight scale tiles: [tile][k_set][half][512 bytes].
 MXFP8_FC1_SCALE_TILE_BYTES = _QUANT_N_TILES * MXFP8_SF_K_TILES * 2 * _SF_TILE_BYTES
 NVFP4_FC1_SCALE_TILE_BYTES = _QUANT_N_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
 
@@ -245,10 +245,10 @@ def _unswizzle_sf_128x4(
 def _combined_weight_scale_tiles(sf_linear: torch.Tensor) -> torch.Tensor:
     """``[28672, C]`` linear weight scales -> flat combined tiles ``[tile][k_set][half][512]``.
 
-    Output tile ``t`` (128 tiles of 112 output columns) pairs gate rows ``[112 t, 112 (t + 1))``
-    with the matching up rows into one 224-row block (rows 224..255 zero); each 128-K set of that
-    block is two 512-byte 128x4 tiles (combined rows 0-127, then 128-255), the order the 2-CTA
-    block-scaled MMA reads its B scale factors in."""
+    Output tile ``t`` (112 tiles of 128 output columns) pairs gate rows ``[128 t, 128 (t + 1))``
+    with the matching up rows into one 256-row block; each 128-K set of that block is two 512-byte
+    128x4 tiles (gate rows 0-127, then up rows 128-255), the order the 2-CTA block-scaled MMA
+    reads its B scale factors in."""
     if tuple(sf_linear.shape[:1]) != (MINIMAX_H3_FC1_ROWS,):
         raise ValueError(
             f"weight scales must have {MINIMAX_H3_FC1_ROWS} rows, got {tuple(sf_linear.shape)}"
@@ -292,8 +292,8 @@ def prepare_minimax_h3_fc1_weight_mxfp8(
     E4M3 round-to-nearest-even of ``w / scale``; an all-zero block keeps scale byte 0).
 
     Returns ``(fc1_weight_q, fc1_scale_tiles)``: the ``float8_e4m3fn`` ``[28672, 5376]`` weights
-    and a flat ``uint8`` tensor of ``128 * 42 * 1024`` bytes holding the weight scales in the
-    combined 224-row gate/up tile order the fused GEMM streams (see
+    and a flat ``uint8`` tensor of ``112 * 42 * 1024`` bytes holding the weight scales in the
+    combined 256-row gate/up tile order the fused GEMM streams (see
     :func:`_combined_weight_scale_tiles`).  Relies on ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``
     returning the scales in the 128x4 swizzled layout with rows padded to 128 and columns to a
     multiple of 4 (both exact for this shape), which is unswizzled here before re-tiling.
@@ -350,8 +350,8 @@ def prepare_minimax_h3_fc1_weight_nvfp4(
     saturation of ``w * g / scale``; an all-zero block writes scale 0 and codes 0).
 
     Returns ``(fc1_weight_q, fc1_scale_tiles)``: packed E2M1 ``uint8`` ``[28672, 2688]`` weights
-    (even element in the low nibble) and a flat ``uint8`` tensor of ``128 * 84 * 1024`` bytes with
-    the weight scales in the combined 224-row gate/up tile order.  Relies on
+    (even element in the low nibble) and a flat ``uint8`` tensor of ``112 * 84 * 1024`` bytes with
+    the weight scales in the combined 256-row gate/up tile order.  Relies on
     ``nvfp4_quantize(..., sfLayout=SfLayout.layout_128x4, do_shuffle=False)`` returning the scales
     in the 128x4 swizzled layout with rows padded to 128 and columns to a multiple of 4.
     """
@@ -655,7 +655,7 @@ def minimax_h3_fc1_swiglu_mxfp8(
         ``float8_e4m3fn`` ``[28672, 5376]`` weights from :func:`prepare_minimax_h3_fc1_weight_mxfp8`
         (gate rows then up rows).
     fc1_scale_tiles : torch.Tensor
-        Flat ``uint8`` ``[128 * 42 * 1024]`` weight scale tiles from the same call.
+        Flat ``uint8`` ``[112 * 42 * 1024]`` weight scale tiles from the same call.
     out : Optional[torch.Tensor]
         Optional ``bfloat16`` ``[M, 14336]`` output.
     workspace_q : Optional[torch.Tensor]
@@ -760,7 +760,7 @@ def minimax_h3_fc1_swiglu_nvfp4(
         Packed E2M1 ``uint8`` ``[28672, 2688]`` weights from :func:`prepare_minimax_h3_fc1_weight_nvfp4`
         (gate rows then up rows).
     fc1_scale_tiles : torch.Tensor
-        Flat ``uint8`` ``[128 * 84 * 1024]`` weight scale tiles from the same call.
+        Flat ``uint8`` ``[112 * 84 * 1024]`` weight scale tiles from the same call.
     alpha : torch.Tensor
         ``float32`` ``[1]`` = ``1 / (a_global_scale * w_global_scale)`` (:func:`minimax_h3_nvfp4_alpha`).
     out : Optional[torch.Tensor]
