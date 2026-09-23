@@ -175,6 +175,7 @@ from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
+from .jit.cake_sampling import gen_cake_sampling_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -885,6 +886,11 @@ def gen_all_modules(
         ]
         if has_sm100 or has_sm103:
             jit_specs.append(gen_blackwell_softmax_module())
+        # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
+        if any(
+            (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)
+        ):
+            jit_specs.append(gen_cake_sampling_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:

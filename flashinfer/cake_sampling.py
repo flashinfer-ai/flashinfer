@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Fused radix top-k -> sparse top-p -> sampling for Hopper and newer (compute capability 9.0,
-10.0, 10.3, 10.7, 11.0; one frozen source compiled per device capability).
+Fused radix top-k -> sparse top-p -> sampling for Hopper and newer (compute capability 9.x,
+10.x, 11.x, 12.x; one frozen source compiled once into a fatbin for the CompilationContext
+targets).
 
 Two frozen kernels per row of probabilities:
 
@@ -100,9 +101,15 @@ def _capability(device: torch.device) -> Optional[tuple[int, int]]:
     return supported_capability(torch.cuda.get_device_capability(device))
 
 
-def _stage1_variants() -> list[tuple[int, int, bool]]:
+def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, bool]]:
+    """Frozen stage-1 variants whose dynamic shared memory fits ``smem_limit`` (all when None).
+
+    The frozen variants were sized for the 227 KB opt-in limit of 9.x-11.x devices; 12.x devices
+    opt in to 99 KB, so the larger register-resident variants are not candidates there."""
     return [
-        (v["cluster"], v["ept"], bool(v["stream"])) for v in load_manifest()["stage1"]
+        (v["cluster"], v["ept"], bool(v["stream"]))
+        for v in load_manifest()["stage1"]
+        if smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit
     ]
 
 
@@ -119,13 +126,23 @@ def _sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
 
+@functools.cache
+def _smem_optin(device_index: int) -> int:
+    return int(
+        torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+    )
+
+
 def _wave_ctas(sm_count: int) -> dict[int, int]:
     nearest = min(_WAVE_CTAS_BY_SM_COUNT, key=lambda n: (abs(n - sm_count), -n))
     return _WAVE_CTAS_BY_SM_COUNT[nearest]
 
 
 def choose_stage1(
-    batch: int, vocab: int, sm_count: Optional[int] = None
+    batch: int,
+    vocab: int,
+    sm_count: Optional[int] = None,
+    smem_limit: Optional[int] = None,
 ) -> tuple[int, int, bool]:
     """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries.
 
@@ -136,15 +153,18 @@ def choose_stage1(
     resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table is
     selected by ``sm_count`` (the current device's SM count when omitted; B200 148 and H100 132
     are measured), the cost constants were fitted on B200 and rank the frozen variants on every
-    device."""
+    device.  Variants needing more dynamic shared memory than ``smem_limit`` (the current
+    device's opt-in limit when omitted) are not candidates."""
     if sm_count is None:
         sm_count = (
             _sm_count(torch.cuda.current_device())
             if torch.cuda.is_available()
             else _DEFAULT_SM_COUNT
         )
+    if smem_limit is None and torch.cuda.is_available():
+        smem_limit = _smem_optin(torch.cuda.current_device())
     wave_ctas = _wave_ctas(int(sm_count))
-    variants = _stage1_variants()
+    variants = _stage1_variants(smem_limit)
     epts = sorted({e for _, e, st in variants if not st})
     available = {(c, e) for c, e, st in variants if not st}
     streaming = [(c, e) for c, e, st in variants if st]
@@ -373,7 +393,7 @@ def top_k_top_p_sampling_from_probs(
     else:
         p_arr, p_scalar, p_kind = top_p, 0.0, _TOPP_PER_ROW
     renorm = renorm_out if renorm_out is not None else vals
-    module = load_cake_sampling_module(capability)
+    module = load_cake_sampling_module()
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
     module.radix_topk(
         probs,
@@ -473,7 +493,7 @@ def top_k_probs_to_slab(
     else:
         k_arr, k_scalar, k_kind = top_k, 0, _TOPK_PER_ROW
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
-    load_cake_sampling_module(capability).radix_topk(
+    load_cake_sampling_module().radix_topk(
         probs,
         k_arr,
         k_scalar,

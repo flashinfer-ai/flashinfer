@@ -4,9 +4,9 @@ flashinfer.cake_sampling
 ========================
 
 ``cake_sampling`` is a thread-block-cluster implementation of top-k-then-top-p sampling from
-probabilities for Hopper and newer GPUs (compute capability 9.0, 10.0, 10.3, 10.7 and 11.0).
-It is measured on H100 (9.0), B200 (10.0), B300 / GB300 (10.3) and Rubin R200 (10.7); 11.0 is a
-compile target that has not been run on hardware.  It fuses the three stages of
+probabilities for Hopper and newer GPUs (compute capability 9.x, 10.x, 11.x and 12.x).  It is
+measured on H100 (9.0), B200 (10.0), B300 / GB300 (10.3) and Rubin R200 (10.7); 11.x and 12.x are
+compile targets that have not been run on hardware.  It fuses the three stages of
 :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
 ``filter_apply_order="top_k_first"`` into two kernels per call:
 
@@ -33,18 +33,22 @@ through the generator) follow the ``top_k_first`` route with two extra guarantee
 
 Requests the frozen kernels cannot serve are dispatched to the ``top_k_first`` route
 (``deterministic=True``): top-k disabled or ``k >= vocab``, ``k > 1024``, non-``float32`` or
-non-contiguous rows, or a device outside the compiled compute capabilities.  A capability is
-compiled only when the installed ``nvcc`` lists its virtual architecture in
-``nvcc --list-gpu-arch`` (queried once per process); a public CUDA toolkit that predates a
-device's architecture (for example ``compute_107`` on CUDA 13.3) therefore also takes the
-``top_k_first`` route instead of failing the JIT build.  Large
+non-contiguous rows, or a device outside the build targets.  The build targets are FlashInfer's
+``CompilationContext`` targets (``FLASHINFER_CUDA_ARCH_LIST`` when set, as in AOT builds on
+hosts without a GPU; otherwise the capabilities of the visible devices) restricted to the
+supported majors 9-12; a device whose architecture is not among them takes the ``top_k_first``
+route instead of failing at launch.  Large
 ``batch * vocab`` launches run on the streaming stage-1 variants (a cluster of 1-4 CTAs walks the
 row in register chunks), so there is no size-based fallback.  :func:`cake_sampling_route` reports the decision without launching.
 
 The checked-in source product lives in ``csrc/cake_sampling/generated/`` as one translation
 unit plus a manifest that records every frozen variant's launch resources; FlashInfer verifies
-the source hash and JIT-compiles it once per device compute capability with that capability's
-``-gencode`` flags.
+the source hash and compiles it once into a single fatbin with one ``-gencode`` per build target
+(the kernels use only clusters, distributed shared memory, programmatic dependent launch and
+``redux.sync``, so no per-architecture source exists).  Stage-1 variants whose dynamic shared
+memory exceeds the device's opt-in limit are not dispatch candidates: on 12.x (99 KB) the
+streaming variants drop out, so vocabularies above the register-resident capacity (196608)
+take the ``top_k_first`` route there.
 
 The stage-1 variant is chosen per call by a cost model whose single-wave CTA capacity table is
 keyed by the device's SM count (148 for B200 / B300, 132 for H100; other devices use the nearest

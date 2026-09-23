@@ -27,10 +27,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import pytest
-import subprocess
 import torch
 
 from flashinfer.cake_sampling import (
+    _stage1_variants,
     cake_sampling_route,
     choose_stage1,
     choose_stage23,
@@ -41,7 +41,6 @@ import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
     load_manifest,
-    parse_gpu_arch_list,
     supported_capabilities,
     supported_capability,
 )
@@ -522,90 +521,64 @@ def test_per_request_tensors_and_routes():
     assert res.dtype == torch.int32 and res.shape == (batch,)
 
 
-# --------------------------------------------------------------------------- toolkit guard
-
-_TABLE = ((9, 0), (10, 0), (10, 3), (10, 7), (11, 0))
-# `nvcc --list-gpu-arch` of CUDA 13.3 (public toolkit): no compute_107.
-_CUDA_13_3_ARCH_LIST = (
-    "compute_75\ncompute_80\ncompute_86\ncompute_87\ncompute_88\ncompute_89\ncompute_90\n"
-    "compute_100\ncompute_110\ncompute_103\ncompute_120\ncompute_121\n"
-)
+# --------------------------------------------------------------------------- build targets
 
 
-def test_toolkit_guard_parses_nvcc_arch_list():
-    archs = parse_gpu_arch_list(_CUDA_13_3_ARCH_LIST)
-    assert {"compute_90", "compute_100", "compute_103", "compute_110"} <= archs
-    assert "compute_107" not in archs
-    # Suffixed spellings collapse onto the base virtual architecture.
-    assert parse_gpu_arch_list("compute_90a compute_100f") == {
-        "compute_90",
-        "compute_100",
-    }
-    assert parse_gpu_arch_list("") == frozenset()
-    assert parse_gpu_arch_list("sm_90a\nnot-an-arch") == frozenset()
+@pytest.fixture
+def arch_list(monkeypatch):
+    """Pin ``FLASHINFER_CUDA_ARCH_LIST`` for one test and drop the cached target set around it."""
+
+    def _set(value: str) -> None:
+        monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", value)
+        cake_sampling_jit.target_capabilities.cache_clear()
+
+    yield _set
+    cake_sampling_jit.target_capabilities.cache_clear()
 
 
-def test_toolkit_guard_rejects_capabilities_nvcc_cannot_target(monkeypatch):
-    archs = parse_gpu_arch_list(_CUDA_13_3_ARCH_LIST)
-    monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: archs)
+def _gencode(flags):
+    return [f for f in flags if f.startswith("-gencode")]
+
+
+def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list):
+    # AOT builds run on hosts without a GPU and name their targets through
+    # FLASHINFER_CUDA_ARCH_LIST; the module compiles one cubin per listed architecture into a
+    # single fatbin and serves exactly those capabilities.  (Suffixed entries skip the toolkit
+    # version probe of CompilationContext so this test also runs without nvcc.)
+    arch_list("9.0 10.3 12.0f")
+    assert supported_capabilities() == ((9, 0), (10, 3), (12, 0))
     assert supported_capability((9, 0)) == (9, 0)
-    assert supported_capability((10, 0)) == (10, 0)
-    assert supported_capability((10, 3)) == (10, 3)
-    assert supported_capability((11, 0)) == (11, 0)
-    # compute_107 is only known to the internal Rubin toolchain: a public toolkit must not
-    # attempt the JIT build for an SM107 device.
-    assert supported_capability((10, 7)) is None
-    assert (
-        supported_capability((8, 0)) is None and supported_capability((12, 0)) is None
-    )
-    assert supported_capabilities() == ((9, 0), (10, 0), (10, 3), (11, 0))
-    # (the JIT spec generator is cached per capability, so probe through the uncached URI helper:
-    # on a real 10.7 device an earlier test may already have generated the spec)
-    with pytest.raises(ValueError, match="not compiled for compute capability 10.7"):
-        cake_sampling_jit.get_cake_sampling_uri((10, 7))
-
-    hopper_only = frozenset({"compute_80", "compute_90"})
-    monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: hopper_only)
-    assert supported_capability((9, 0)) == (9, 0)
-    assert all(supported_capability(cap) is None for cap in _TABLE[1:])
-    assert supported_capabilities() == ((9, 0),)
+    assert supported_capability((12, 0)) == (12, 0)
+    assert supported_capability((10, 0)) is None  # not a build target
+    assert supported_capability((8, 0)) is None
+    assert _gencode(cake_sampling_jit.nvcc_flags()) == [
+        "-gencode=arch=compute_90a,code=sm_90a",
+        "-gencode=arch=compute_103a,code=sm_103a",
+        "-gencode=arch=compute_120f,code=sm_120f",
+    ]
+    arch_list("10.7 11.0")
+    assert supported_capabilities() == ((10, 7), (11, 0))
+    assert _gencode(cake_sampling_jit.nvcc_flags()) == [
+        "-gencode=arch=compute_107a,code=sm_107a",
+        "-gencode=arch=compute_110a,code=sm_110a",
+    ]
 
 
-def test_toolkit_guard_keeps_table_when_nvcc_cannot_be_queried(monkeypatch):
-    monkeypatch.setattr(cake_sampling_jit, "_nvcc_gpu_archs", lambda: None)
-    assert all(supported_capability(cap) == cap for cap in _TABLE)
-    assert supported_capabilities() == _TABLE
+def test_build_targets_outside_supported_majors_are_dropped(arch_list):
+    assert cake_sampling_jit.SUPPORTED_MAJOR_VERSIONS == (9, 10, 11, 12)
+    arch_list("8.0 8.9 12.1a")
+    assert supported_capabilities() == ((12, 1),)
     assert supported_capability((8, 9)) is None
+    assert _gencode(cake_sampling_jit.nvcc_flags()) == [
+        "-gencode=arch=compute_121a,code=sm_121a"
+    ]
+    arch_list("7.5 8.0")
+    assert supported_capabilities() == ()
+    with pytest.raises(RuntimeError, match="No supported CUDA architectures"):
+        cake_sampling_jit.nvcc_flags()
 
 
-def test_toolkit_guard_queries_nvcc_once(monkeypatch):
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        assert cmd[-1] == "--list-gpu-arch"
-        return subprocess.CompletedProcess(cmd, 0, _CUDA_13_3_ARCH_LIST, "")
-
-    monkeypatch.setattr(cake_sampling_jit.subprocess, "run", fake_run)
-    monkeypatch.setattr(cake_sampling_jit, "_nvcc_executable", lambda: "nvcc")
-    cake_sampling_jit._nvcc_gpu_archs.cache_clear()
-    try:
-        for _ in range(3):
-            assert supported_capability((10, 7)) is None
-            assert supported_capability((10, 3)) == (10, 3)
-        assert len(calls) == 1
-        monkeypatch.setattr(
-            cake_sampling_jit.subprocess,
-            "run",
-            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "unknown option"),
-        )
-        cake_sampling_jit._nvcc_gpu_archs.cache_clear()
-        assert cake_sampling_jit._nvcc_gpu_archs() is None
-    finally:
-        cake_sampling_jit._nvcc_gpu_archs.cache_clear()
-
-
-def test_toolkit_guard_routes_untargetable_device_to_top_k_first(monkeypatch):
+def test_device_outside_build_targets_routes_to_top_k_first(arch_list):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from flashinfer.sampling import top_k_top_p_sampling_from_probs as reference
@@ -621,10 +594,9 @@ def test_toolkit_guard_routes_untargetable_device_to_top_k_first(monkeypatch):
         seed=7,
         offset=8,
     )
-    monkeypatch.setattr(
-        cake_sampling_jit, "_nvcc_gpu_archs", lambda: frozenset({"compute_50"})
-    )
-    assert supported_capability(torch.cuda.get_device_capability()) is None
+    major, minor = torch.cuda.get_device_capability()
+    arch_list("9.0" if (major, minor) != (9, 0) else "10.0")
+    assert supported_capability((major, minor)) is None
     assert cake_sampling_route(probs, 50) == "fallback:arch"
     got = top_k_top_p_sampling_from_probs(
         probs, 50, 0.9, philox_seed=7, philox_offset=8
@@ -634,6 +606,23 @@ def test_toolkit_guard_routes_untargetable_device_to_top_k_first(monkeypatch):
         top_k_top_p_sampling_from_probs(
             probs, 50, 0.9, renorm_out=torch.empty(batch, SLAB, device="cuda")
         )
+
+
+def test_stage1_variants_respect_the_device_smem_limit():
+    variants = _stage1_variants()
+    assert _stage1_variants(None) == variants
+    # 12.x devices opt in to 99 KB of dynamic shared memory: the streaming variants (145 KB) drop
+    # out, the register-resident ones stay, and a vocabulary beyond the resident capacity takes
+    # the existing ``fallback:vocab_too_large`` route instead of a launch failure.
+    small = _stage1_variants(99 * 1024)
+    assert small and all(v in variants for v in small)
+    assert [v for v in variants if v not in small] == [v for v in variants if v[2]]
+    for vocab in (32768, 128256, 196608):
+        pick = choose_stage1(16, vocab, sm_count=148, smem_limit=99 * 1024)
+        assert pick in small and not pick[2]
+    with pytest.raises(ValueError, match="exceeds the frozen stage-1 capacity"):
+        choose_stage1(16, 262144, sm_count=148, smem_limit=99 * 1024)
+    assert choose_stage1(16, 262144, sm_count=148, smem_limit=None)[2]
 
 
 # --------------------------------------------------------------------------- adversarial
