@@ -1,6 +1,225 @@
 {
   "schema": "mega_moe_v3.v1",
   "programs": {
+    "cake_mega_moe_v3_sm103a_1988c44fba7c9e0ef431_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "buffer",
+          "SFB1"
+        ],
+        [
+          "buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "b8730d617265dff72eb840d2e773d0bc36e3d4e6f29d5b81561a11cbcebbd8e2",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 512,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_1988c44fba7c9e0ef431_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_1988c44fba7c9e0ef431_binding.cu"
+      ]
+    },
     "cake_mega_moe_v3_sm103a_25056122573221721a93_kernel": {
       "ffi_entry": "run",
       "arg_plan": [
@@ -250,141 +469,6 @@
       "sources": [
         "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_25056122573221721a93_kernel.cu",
         "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_25056122573221721a93_binding.cu"
-      ]
-    },
-    "cake_mega_moe_v3_sm103a_357f423bb481759e10c9_kernel": {
-      "ffi_entry": "run",
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "A"
-        ],
-        [
-          "tma_buffer",
-          "B1"
-        ],
-        [
-          "buffer",
-          "SFA1"
-        ],
-        [
-          "buffer",
-          "SFB1"
-        ],
-        [
-          "buffer",
-          "routing_weights"
-        ],
-        [
-          "buffer",
-          "I_fp8_w"
-        ],
-        [
-          "buffer",
-          "SF_I_w"
-        ],
-        [
-          "tma_buffer",
-          "A2"
-        ],
-        [
-          "tma_buffer",
-          "B2"
-        ],
-        [
-          "buffer",
-          "SFA2"
-        ],
-        [
-          "buffer",
-          "SFB2"
-        ],
-        [
-          "buffer",
-          "Out"
-        ],
-        [
-          "buffer",
-          "tile_expert"
-        ],
-        [
-          "buffer",
-          "tile_m_local"
-        ],
-        [
-          "buffer",
-          "expert_row_offsets"
-        ],
-        [
-          "buffer",
-          "l1_arrival"
-        ],
-        [
-          "parameter",
-          "M_total"
-        ],
-        [
-          "parameter",
-          "N1"
-        ],
-        [
-          "parameter",
-          "K1"
-        ],
-        [
-          "parameter",
-          "grid_n1"
-        ],
-        [
-          "parameter",
-          "K1_tiles"
-        ],
-        [
-          "parameter",
-          "N2"
-        ],
-        [
-          "parameter",
-          "K2"
-        ],
-        [
-          "parameter",
-          "grid_n2"
-        ],
-        [
-          "parameter",
-          "K2_tiles"
-        ],
-        [
-          "parameter",
-          "total_m_tiles"
-        ],
-        [
-          "workspace",
-          "tma_descriptor_workspace"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "closure_sha256": "b1ca07ba3f18542d71574b3412a7ae7dbd71f30dd2823eb19b0fa4a3cd83daff",
-      "ffi_prepare_entry": "run_prepare",
-      "tma_workspace_bytes": 512,
-      "sources": [
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_357f423bb481759e10c9_kernel.cu",
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_357f423bb481759e10c9_binding.cu"
       ]
     },
     "cake_mega_moe_v3_sm103a_449586525e4a9bc31aa9_kernel": {
@@ -782,101 +866,6 @@
       "sources": [
         "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_49300ccdc211370698ae_kernel.cu",
         "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_49300ccdc211370698ae_binding.cu"
-      ]
-    },
-    "cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_kernel": {
-      "ffi_entry": "run",
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "A"
-        ],
-        [
-          "tma_buffer",
-          "B"
-        ],
-        [
-          "buffer",
-          "SFA"
-        ],
-        [
-          "buffer",
-          "SFB"
-        ],
-        [
-          "buffer",
-          "C_fp8"
-        ],
-        [
-          "buffer",
-          "SF_out"
-        ],
-        [
-          "buffer",
-          "routing_weights"
-        ],
-        [
-          "buffer",
-          "tile_expert"
-        ],
-        [
-          "buffer",
-          "tile_m_local"
-        ],
-        [
-          "buffer",
-          "expert_row_offsets"
-        ],
-        [
-          "parameter",
-          "M_total"
-        ],
-        [
-          "parameter",
-          "N"
-        ],
-        [
-          "parameter",
-          "K"
-        ],
-        [
-          "parameter",
-          "grid_n"
-        ],
-        [
-          "parameter",
-          "K_tiles"
-        ],
-        [
-          "parameter",
-          "total_m_tiles"
-        ],
-        [
-          "workspace",
-          "tma_descriptor_workspace"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "closure_sha256": "22fdf77a5a946e8801c6db0365a9cb9de33121cbe2b7f2428c200d7d23a5262c",
-      "ffi_prepare_entry": "run_prepare",
-      "tma_workspace_bytes": 256,
-      "sources": [
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_kernel.cu",
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_binding.cu"
       ]
     },
     "cake_mega_moe_v3_sm103a_66a66e1725eff2419b2c_kernel": {
@@ -1381,64 +1370,56 @@
         "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_77db2be22799cb44b3e9_binding.cu"
       ]
     },
-    "cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_kernel": {
+    "cake_mega_moe_v3_sm103a_83aedb2c20ee0d8e81b1_kernel": {
       "ffi_entry": "run",
       "arg_plan": [
-        [
-          "buffer",
-          "topk_idx_i32"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "x_fp8"
-        ],
-        [
-          "buffer",
-          "x_sf"
-        ],
         [
           "tma_buffer",
           "A"
         ],
         [
-          "buffer",
-          "pool_fp8"
+          "tma_buffer",
+          "B1"
         ],
         [
           "buffer",
-          "pool_sf"
+          "SFA1"
         ],
         [
           "buffer",
-          "routing_weight_pool"
+          "SFB1"
         ],
         [
           "buffer",
-          "token_to_permuted"
+          "routing_weights"
         ],
         [
           "buffer",
-          "meta_token"
+          "I_fp8_w"
         ],
         [
           "buffer",
-          "meta_slot"
+          "SF_I_w"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
         ],
         [
           "buffer",
-          "expert_counts"
+          "SFA2"
         ],
         [
           "buffer",
-          "expert_row_offsets"
+          "SFB2"
         ],
         [
           "buffer",
-          "expert_scatter_offsets"
+          "Out"
         ],
         [
           "buffer",
@@ -1450,83 +1431,15 @@
         ],
         [
           "buffer",
-          "total_m_tiles_out"
-        ],
-        [
-          "tma_buffer",
-          "B1"
-        ],
-        [
-          "buffer",
-          "SFB1"
-        ],
-        [
-          "buffer",
-          "I_fp8_w"
-        ],
-        [
-          "buffer",
-          "SF_I_w"
-        ],
-        [
-          "buffer",
-          "l1_bf16_capture"
-        ],
-        [
-          "tma_buffer",
-          "A2"
-        ],
-        [
-          "buffer",
-          "SFA2"
-        ],
-        [
-          "tma_buffer",
-          "B2"
-        ],
-        [
-          "buffer",
-          "SFB2"
-        ],
-        [
-          "buffer",
-          "expert_output"
-        ],
-        [
-          "buffer",
-          "y"
-        ],
-        [
-          "buffer",
-          "histogram_done"
-        ],
-        [
-          "buffer",
-          "prefix_done"
-        ],
-        [
-          "buffer",
-          "dispatch_done"
+          "expert_row_offsets"
         ],
         [
           "buffer",
           "l1_arrival"
         ],
         [
-          "buffer",
-          "l2_done"
-        ],
-        [
           "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "top_k"
-        ],
-        [
-          "parameter",
-          "num_experts"
+          "M_total"
         ],
         [
           "parameter",
@@ -1565,14 +1478,6 @@
           "total_m_tiles"
         ],
         [
-          "parameter",
-          "M_total"
-        ],
-        [
-          "parameter",
-          "activation_clamp"
-        ],
-        [
           "workspace",
           "tma_descriptor_workspace"
         ],
@@ -1592,12 +1497,12 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "closure_sha256": "d83e78741754816a7e85ba8133834de14d3eb2eed94a31c8e29ba2e62292ec4f",
+      "closure_sha256": "c0dc36fb28bd019e2c9a31698052aeb06a677ab447a7ae1993d7db31a5f95994",
       "ffi_prepare_entry": "run_prepare",
       "tma_workspace_bytes": 512,
       "sources": [
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_kernel.cu",
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_binding.cu"
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_83aedb2c20ee0d8e81b1_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_83aedb2c20ee0d8e81b1_binding.cu"
       ]
     },
     "cake_mega_moe_v3_sm103a_c37663a2b4195a741053_kernel": {
@@ -1852,7 +1757,7 @@
         "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_c37663a2b4195a741053_binding.cu"
       ]
     },
-    "cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_kernel": {
+    "cake_mega_moe_v3_sm103a_dee043c6cb40f5820639_kernel": {
       "ffi_entry": "run",
       "arg_plan": [
         [
@@ -2063,12 +1968,107 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "closure_sha256": "562bafbd8a6ecadfd4242c2c8d93109a4601cbb1edd86317a2e0e901ea1699e8",
+      "closure_sha256": "def7cd6c6cf28b7e9b28f5378573b63ec12a65739d017202e57d0db2d5e461bb",
       "ffi_prepare_entry": "run_prepare",
       "tma_workspace_bytes": 512,
       "sources": [
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_kernel.cu",
-        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_binding.cu"
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_dee043c6cb40f5820639_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_dee043c6cb40f5820639_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_f7f05ae0300807c3915f_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "buffer",
+          "SFA"
+        ],
+        [
+          "buffer",
+          "SFB"
+        ],
+        [
+          "buffer",
+          "C_fp8"
+        ],
+        [
+          "buffer",
+          "SF_out"
+        ],
+        [
+          "buffer",
+          "routing_weights"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "78136e9863ce3fe3f0a18d78a7135ade46abcabfce8b1f3862640f42ff4a4539",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 256,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_f7f05ae0300807c3915f_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_f7f05ae0300807c3915f_binding.cu"
       ]
     }
   },
@@ -2335,7 +2335,7 @@
       "stages": [
         {
           "name": "pipeline",
-          "program": "cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_kernel"
+          "program": "cake_mega_moe_v3_sm103a_dee043c6cb40f5820639_kernel"
         }
       ]
     },
@@ -2446,7 +2446,7 @@
       "stages": [
         {
           "name": "pipeline",
-          "program": "cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_kernel"
+          "program": "cake_mega_moe_v3_sm103a_1988c44fba7c9e0ef431_kernel"
         }
       ]
     },
@@ -2478,7 +2478,7 @@
       "stages": [
         {
           "name": "main",
-          "program": "cake_mega_moe_v3_sm103a_357f423bb481759e10c9_kernel"
+          "program": "cake_mega_moe_v3_sm103a_83aedb2c20ee0d8e81b1_kernel"
         }
       ]
     },
@@ -2546,7 +2546,7 @@
       "stages": [
         {
           "name": "main",
-          "program": "cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_kernel"
+          "program": "cake_mega_moe_v3_sm103a_f7f05ae0300807c3915f_kernel"
         }
       ]
     }
