@@ -640,6 +640,7 @@ class MlaWorkQueue(WorkQueue):
 class PageOffsetWindowResource(HighThroughputMlaResource):
     """GMEM page table cached as one register per lane of the TMA warp."""
 
+    request_lengths: Any = field(init=False, default=None)
     page_offsets: Any = None  # GMEM page-offset tensor
     smem_sparse_offsets: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
@@ -695,15 +696,35 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         ),
     )
 
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_sparse_state(self, stage_info: StageInfo):
+        del stage_info
+        # Allocate outside skipped-work guards; refresh values for every tile.
+        self.request_lengths = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def bind_sparse_request(self, stage_info: StageInfo):
+        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+            row = stage_info.work_tile.tile_idx[2]
+            self.request_lengths[0] = Int32(self.page_offsets.sl[row])
+            self.request_lengths[1] = Int32(self.page_offsets.cl[row])
+
     @producer_work
     @cute.jit
     def load_sparse_offsets(self, stage_info: StageInfo):
         lane = cute.arch.thread_idx()[0] % 32
         k_index = stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
         token = k_index * Int32(128) + lane * Int32(4)
-        quad = load_sparse_quad(
-            self.page_offsets, stage_info.work_tile.tile_idx[2], token
-        )
+        row = stage_info.work_tile.tile_idx[2]
+        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+            routes = self.page_offsets.for_request(
+                row, self.request_lengths[0], self.request_lengths[1]
+            )
+        else:
+            routes = self.page_offsets
+        quad = load_sparse_quad(routes, row, token)
         self.smem_sparse_offsets.data_ptr(stage_info.stage_idx * 128 + lane * 4).store(
             quad.load(0, 4), alignment=16
         )
@@ -2079,6 +2100,7 @@ class TmemSResource(HighThroughputMlaResource):
     is_leader: Any = field(init=False, default=None)
     row_max_state: Any = field(init=False, default=None)
     row_sum_state: Any = field(init=False, default=None)
+    request_lengths: Any = field(init=False, default=None)
     qk_acc_regs: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -2184,6 +2206,8 @@ class TmemSResource(HighThroughputMlaResource):
         self.is_leader = self.cta_rank == 0
         self.row_max_state = Float32(-Float32.inf)
         self.row_sum_state = Float32(0)
+        # Allocate outside skipped-work guards; refresh values for every tile.
+        self.request_lengths = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
         return (
             cutlass.Array(
                 Float32,
@@ -2231,6 +2255,15 @@ class TmemSResource(HighThroughputMlaResource):
             Float32(0),
             Int32(0),
         )
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def bind_sparse_request(self, stage_info: StageInfo):
+        """Cache live source lengths once per query tile, including graph replay."""
+        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+            row = stage_info.work_tile.tile_idx[2]
+            self.request_lengths[0] = Int32(self.page_offsets.sl[row])
+            self.request_lengths[1] = Int32(self.page_offsets.cl[row])
 
     @producer_work
     @cute.jit
@@ -2473,6 +2506,12 @@ class TmemSResource(HighThroughputMlaResource):
 
         if cutlass.const_expr(cfg.page_size == 1):
             group_needs_mask = True
+        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+            mask_page_offsets = self.page_offsets.for_request(
+                work_tile.tile_idx[2], self.request_lengths[0], self.request_lengths[1]
+            )
+        else:
+            mask_page_offsets = self.page_offsets
         if cutlass.const_expr(cached_mask_low is not None):
             mask_routes = CachedSparseMask((cached_mask_low, cached_mask_high), False)
             # The cached invalid bits already include the live K boundary.
@@ -2481,7 +2520,7 @@ class TmemSResource(HighThroughputMlaResource):
                 group_needs_mask = (cached_mask_low | cached_mask_high) != Int32(0)
         else:
             raw_mask_routes = (
-                self.page_offsets.mask_for_tile(tile_offset_k, work_tile.tile_idx[2])
+                mask_page_offsets.mask_for_tile(tile_offset_k, work_tile.tile_idx[2])
                 if cutlass.const_expr(hasattr(self.page_offsets, "mask_for_tile"))
                 else self.page_offsets
             )

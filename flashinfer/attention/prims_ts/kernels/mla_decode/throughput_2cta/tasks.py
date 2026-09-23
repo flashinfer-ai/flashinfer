@@ -482,6 +482,8 @@ def create_sparse_offsets_task(
 
     @schedule
     def offsets_schedule(page_offsets, work_queue=None):
+        page_offsets.init_sparse_state()
+        page_offsets.bind_sparse_request()
         with domain_loop(loop_start, loop_end, loop_step):
             page_offsets.acquire()
             page_offsets.load_sparse_offsets()
@@ -1033,6 +1035,7 @@ def create_softmax_task(
             no_correction_out,
         ) = softmax_state
 
+        tmem_s.bind_sparse_request()
         with domain_loop(loop_start, loop_end, loop_step):
             mask_kwargs = {}
             if page_offsets is not None:

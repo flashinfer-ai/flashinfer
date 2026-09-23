@@ -228,14 +228,19 @@ class SparseBatchRouteView:
         )
 
     @cute.jit
-    def for_request(self, request):
+    def for_request(self, request, primary_length=None, extra_length=None):
+        # Persistent consumers may reuse lengths loaded at query-tile entry.
         row = Int64(request)
         return SparseRouteView(
             (
                 self.si,
                 self.ci,
-                Int32(self.sl[row]),
-                Int32(self.cl[row]),
+                Int32(self.sl[row])
+                if cutlass.const_expr(primary_length is None)
+                else primary_length,
+                Int32(self.cl[row])
+                if cutlass.const_expr(extra_length is None)
+                else extra_length,
                 row,
             ),
             self.capacity,
