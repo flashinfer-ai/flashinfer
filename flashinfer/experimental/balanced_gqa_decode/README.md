@@ -25,6 +25,15 @@ the whole batch:
 - Because nothing about the plan is decided on the host, a runner captured
   once into a CUDA Graph replays correctly for any KV-length distribution
   written into `seq_lens` afterwards (validated in the tests).
+- Speculative / MTP verification (`q_len_per_req` 3 to 8) runs a packed-row
+  program: the eight query heads of every draft token of a request are packed
+  into one `N = 8 * q_len_per_req` MMA tile (32 or 64 rows), so each KV block is
+  streamed once per request instead of once per draft row. The scheduler
+  chooses the chunk length that minimises the launch makespan (waves of chunk
+  tickets plus the merge tail) and the split-KV merge combines the FP32
+  partials of all packed rows. `q_len_per_req` 1 and 2 use the single-row
+  program. The program is selected at preparation from `q_len_per_req`, so a
+  captured runner replays for any KV lengths but keeps its `q_len_per_req`.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
@@ -50,24 +59,35 @@ from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
 batch, num_kv_heads, max_pages = 16, 1, 16384  # up to 256K tokens per request
 num_q_heads = 8 * num_kv_heads
 q = torch.randn(batch, num_q_heads, 128, dtype=torch.bfloat16, device="cuda")
-k_cache = torch.randn(batch * max_pages, num_kv_heads, 16, 128, dtype=torch.bfloat16, device="cuda")
+k_cache = torch.randn(
+    batch * max_pages, num_kv_heads, 16, 128, dtype=torch.bfloat16, device="cuda"
+)
 v_cache = torch.randn_like(k_cache)
-block_tables = torch.arange(batch * max_pages, dtype=torch.int32, device="cuda").view(batch, max_pages)
-seq_lens = torch.randint(1, max_pages * 16 + 1, (batch,), dtype=torch.int32, device="cuda")
-workspace = torch.empty(balanced_gqa_decode_workspace_size(q.device), dtype=torch.uint8, device="cuda")
+block_tables = torch.arange(batch * max_pages, dtype=torch.int32, device="cuda").view(
+    batch, max_pages
+)
+seq_lens = torch.randint(
+    1, max_pages * 16 + 1, (batch,), dtype=torch.int32, device="cuda"
+)
+workspace = torch.empty(
+    balanced_gqa_decode_workspace_size(q.device), dtype=torch.uint8, device="cuda"
+)
 
 decode = prepare_balanced_batch_decode_with_kv_cache(
     q, (k_cache, v_cache), block_tables, seq_lens, workspace
 )
-out = decode()                      # launches on the current stream, returns out
-seq_lens.copy_(torch.randint(1, max_pages * 16 + 1, (batch,), dtype=torch.int32, device="cuda"))
-out = decode()                      # same runner (or a captured graph), new lengths
+out = decode()  # launches on the current stream, returns out
+seq_lens.copy_(
+    torch.randint(1, max_pages * 16 + 1, (batch,), dtype=torch.int32, device="cuda")
+)
+out = decode()  # same runner (or a captured graph), new lengths
 ```
 
 Preparation validates the inputs, zeroes the kernel's counters once inside
 `workspace_buffer` and binds the tensors to the generated program; it makes no
 host copy of `seq_lens`. `balanced_gqa_decode_workspace_size(device)` bounds
-the workspace for any batch on that device (about 10.7 MB on a 160-SM GPU);
+the workspace for any batch on that device (about 85.2 MB on a 160-SM GPU,
+sized for the packed-row MTP program's 64-row partial slots);
 the counters are reset by the kernel itself at the end of every launch, so the
 workspace region must not be reused by other work between launches of the
 same runner. Block tables whose width is not a multiple of eight pages are
@@ -88,6 +108,6 @@ tcgen05/TMEM path). No attention sinks, sliding window or LSE output.
 
 See `tests/experimental/test_cake_balanced_gqa_decode.py` for the torch
 reference and validated shape set (uniform, ragged, the AgentX-derived
-pattern of #4832, MTP `q_len_per_req=7`, CUDA Graph replay) and
+pattern of #4832, packed-row MTP `q_len_per_req` 3/7/8, CUDA Graph replay) and
 `benchmarks/bench_cake_balanced_gqa_decode.py` for the CUPTI benchmark against
 `trtllm_batch_decode_with_kv_cache(backend="trtllm-gen")` on the same tensors.

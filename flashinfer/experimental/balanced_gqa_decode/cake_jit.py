@@ -114,13 +114,16 @@ ARCH_NVCC_FLAGS = {
 }
 
 
-def select_module(arch: str) -> str:
-    """Return the registered module name for ``arch`` (``sm_100a`` / ``sm_103a``)."""
+# Program kinds: "row" = the row-tile kernel (any q_len_per_req), "mtp32" /
+# "mtp64" = the packed-row MTP kernel instances (32- and 64-row tiles).  Records
+# without a "kind" field are the row-tile program.
+def select_module(arch: str, kind: str = "row") -> str:
+    """Return the registered module name for ``arch`` and program ``kind``."""
     for name, record in MODULES.items():
-        if record["arch"] == arch:
+        if record["arch"] == arch and record.get("kind", "row") == kind:
             return name
     raise NotImplementedError(
-        "The generated balanced GQA decode program for "
+        f"The generated balanced GQA decode program ({kind}) for "
         f"{arch} is not registered in this checkout yet "
         "(see flashinfer-ai/flashinfer#4832)"
     )

@@ -87,6 +87,10 @@ ROWS = {
     "uniform_b128_hkv8_s32768": ([32768] * 128, 8, 1),
     "uniform_b128_hkv8_s4096": ([4096] * 128, 8, 1),
     "agentx_b16_hkv1_mtp7": (_agentx(16), 1, 7),
+    "uniform_b8_hkv8_s4096_mtp3": ([4096] * 8, 8, 3),
+    "uniform_b8_hkv8_s4096_mtp7": ([4096] * 8, 8, 7),
+    "uniform_b1_hkv1_s60007_mtp7": ([60007], 1, 7),
+    "ragged_b4_hkv2_mtp7": ([300, 257, 5000, 777], 2, 7),
 }
 
 

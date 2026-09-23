@@ -23,6 +23,14 @@ only needs these constants and bounds to carve the caller-owned workspace and
 to bound the kernel's ticket loop, so one prepared launch replays for any
 length distribution.  The exact host mirror of the planner used by the tests
 lives in ``tests/test_helpers/cake_balanced_gqa_plan.py``.
+
+Two generated programs share the workspace: the row-tile kernel (one 8-head
+query row per item, any ``q_len_per_req``) and the packed-row MTP kernel
+(``q_len_per_req`` 3..8: one ``8 * q_len``-row tile per ``(request, kv head)``
+so each KV chunk is streamed once per request instead of once per draft row).
+The packed kernel plans ``items_per_chunk = num_kv_heads`` from the longest
+row and appends ``2 * q_len`` merge tickets per split tile; its partial slots
+hold a 64 x 128 FP32 tile and 128 statistics words.
 """
 
 from __future__ import annotations
@@ -36,6 +44,48 @@ MAX_REQUESTS = MAX_REQUEST_GROUPS * REQUEST_GROUP
 TARGET_CHUNK_PAIRS = 64
 MAX_BALANCE_FACTOR = 8
 DEFAULT_PAIRS_MIN = 2
+
+
+# Packed-row MTP kernel (q_len_per_req in [MTP_MIN_Q_LEN, MTP_MAX_Q_LEN]).
+MTP_MIN_Q_LEN = 3
+MTP_MAX_Q_LEN = 8
+MTP_GROUP = 8  # query heads per KV head
+MTP_MERGE_ROWS = 4  # packed rows folded per merge ticket (one per correction warp)
+MTP_MAX_N_ROWS = 64
+MTP_PARTIAL_O_PER_SLOT = MTP_MAX_N_ROWS * 128  # FP32 O^T[64, 128] per split item
+MTP_STATS_PER_SLOT = 2 * MTP_MAX_N_ROWS  # max[64] then sum[64]
+MTP_COUNTERS_PER_TILE = 2  # arrivals, merges done (both reset by the last merge)
+
+
+def uses_packed_mtp(q_len_per_req: int) -> bool:
+    """True when ``q_len_per_req`` is served by the packed-row MTP program."""
+    return MTP_MIN_Q_LEN <= q_len_per_req <= MTP_MAX_Q_LEN
+
+
+def mtp_n_rows(q_len_per_req: int) -> int:
+    """Packed tile rows (32 or 64) of the MTP instance serving ``q_len_per_req``."""
+    if not uses_packed_mtp(q_len_per_req):
+        raise ValueError(
+            f"packed MTP serves q_len_per_req in [{MTP_MIN_Q_LEN}, {MTP_MAX_Q_LEN}]"
+        )
+    return 32 if q_len_per_req * MTP_GROUP <= 32 else 64
+
+
+def mtp_merge_slices_per_tile(q_len_per_req: int) -> int:
+    """Merge tickets appended per split ``(request, kv head)`` tile."""
+    return q_len_per_req * MTP_GROUP // MTP_MERGE_ROWS
+
+
+def mtp_max_items_bound(
+    batch: int, q_len_per_req: int, num_kv_heads: int, num_ctas: int
+) -> int:
+    """Packed kernel ticket-loop bound: whole tiles, split items and merge tickets."""
+    max_split_items, max_split_tiles = workspace_bounds(num_ctas)
+    return (
+        batch * num_kv_heads
+        + max_split_items
+        + max_split_tiles * mtp_merge_slices_per_tile(q_len_per_req)
+    )
 
 
 def workspace_bounds(num_ctas: int) -> tuple[int, int]:

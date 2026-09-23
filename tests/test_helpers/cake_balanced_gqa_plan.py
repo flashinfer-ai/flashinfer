@@ -197,11 +197,13 @@ def plan_balanced_work(
     num_ctas: int,
     balance_factor: Optional[int] = None,
     pairs_min: int = DEFAULT_PAIRS_MIN,
+    chunk_pairs: Optional[int] = None,
 ) -> BalancedWorkPlan:
     """Enumerate the device ticket space for one launch.
 
     ``balance_factor`` overrides the adaptive integer ``k`` (diagnostics only;
-    the kernel always uses the adaptive rule).
+    the kernel always uses the adaptive rule).  ``chunk_pairs`` fixes the
+    length outright (used with ``mtp_chunk_pairs`` for the packed-row program).
     """
     lens = [int(s) for s in seq_lens]
     if not lens or len(lens) > MAX_REQUESTS:
@@ -216,14 +218,21 @@ def plan_balanced_work(
         raise ValueError("every KV length must be at least q_len")
 
     items_per_chunk = q_len * num_kv_heads
-    chunk_pairs, balance_factor_used = chunk_pairs_for(
-        lens,
-        q_len=q_len,
-        num_kv_heads=num_kv_heads,
-        num_ctas=num_ctas,
-        balance_factor=balance_factor,
-        pairs_min=pairs_min,
-    )
+    if chunk_pairs is None:
+        chunk_pairs, balance_factor_used = chunk_pairs_for(
+            lens,
+            q_len=q_len,
+            num_kv_heads=num_kv_heads,
+            num_ctas=num_ctas,
+            balance_factor=balance_factor,
+            pairs_min=pairs_min,
+        )
+    else:
+        # Fixed length (the packed-row MTP kernel refines the length itself;
+        # see mtp_chunk_pairs).
+        if chunk_pairs < pairs_min:
+            raise ValueError("chunk_pairs must be at least pairs_min")
+        balance_factor_used = 0
 
     pairs = [_ceil_div(s - (q_len - 1), PAIR_TOKENS) for s in lens]
     n_chunks = [_ceil_div(p, chunk_pairs) for p in pairs]
@@ -336,3 +345,81 @@ __all__ = [
     "simulate_greedy_makespan",
     "split_is_worthwhile",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Packed-row MTP program (q_len_per_req 3..8)
+# ---------------------------------------------------------------------------
+
+MTP_ITEM_OVERHEAD_PAIRS = 1
+MTP_MERGE_WAVE_PAIRS = 1
+
+
+def mtp_chunk_pairs(
+    seq_lens: Sequence[int], *, q_len: int, num_kv_heads: int, num_ctas: int
+) -> int:
+    """Chunk length chosen by the packed-row MTP kernel's device planner.
+
+    The packed kernel plans ``items_per_chunk = num_kv_heads`` from the longest
+    query row.  It starts from ``chunk_pairs_for`` (``q_len = 1``) and then
+    evaluates ``ceil(total / (k * CTAs))`` for ``k = 1..MAX_BALANCE_FACTOR``,
+    that length and whole tiles, keeping the smallest
+    ``waves * (L + 1) + merge_waves * 1`` (ties go to the coarser candidate).
+    """
+    from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
+        mtp_merge_slices_per_tile,
+    )
+
+    pairs = [_ceil_div(int(s), PAIR_TOKENS) for s in seq_lens]
+    total_work = sum(pairs) * num_kv_heads
+    base, _ = chunk_pairs_for(
+        seq_lens, q_len=1, num_kv_heads=num_kv_heads, num_ctas=num_ctas
+    )
+    merges = mtp_merge_slices_per_tile(q_len)
+    best_cost, best = None, base
+    prev = 0
+    for kc in range(MAX_BALANCE_FACTOR + 2):
+        if kc < MAX_BALANCE_FACTOR:
+            cand = max(_ceil_div(total_work, (kc + 1) * num_ctas), DEFAULT_PAIRS_MIN)
+        elif kc == MAX_BALANCE_FACTOR:
+            cand = base
+        else:
+            cand = max(pairs)
+        if cand == prev:
+            continue
+        prev = cand
+        n_chunks = [_ceil_div(p, cand) for p in pairs]
+        tickets = sum(n_chunks) * num_kv_heads
+        split = sum(1 for n in n_chunks if n > 1)
+        waves = _ceil_div(tickets, num_ctas)
+        merge_waves = _ceil_div(split * num_kv_heads * merges, num_ctas)
+        cost = (
+            waves * (cand + MTP_ITEM_OVERHEAD_PAIRS)
+            + merge_waves * MTP_MERGE_WAVE_PAIRS
+        )
+        if best_cost is None or cost < best_cost:
+            best_cost, best = cost, cand
+    return best
+
+
+def mtp_device_plan(
+    seq_lens: Sequence[int], *, q_len: int, num_kv_heads: int, num_ctas: int
+) -> tuple[int, int]:
+    """``(chunk_pairs, tickets)`` the packed-row kernel publishes in its queue counters."""
+    from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
+        mtp_merge_slices_per_tile,
+    )
+
+    chunk = mtp_chunk_pairs(
+        seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=num_ctas
+    )
+    plan = plan_balanced_work(
+        seq_lens,
+        q_len=1,
+        num_kv_heads=num_kv_heads,
+        num_ctas=num_ctas,
+        chunk_pairs=chunk,
+    )
+    return chunk, plan.num_items + plan.num_split_tiles * mtp_merge_slices_per_tile(
+        q_len
+    )
