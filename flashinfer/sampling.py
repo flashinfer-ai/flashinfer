@@ -629,6 +629,7 @@ def get_sampling_module():
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
         row_states_buffer: torch.Tensor,
+        is_deterministic: bool = False,
     ) -> torch.Tensor:
         # Support FP32, FP16, BF16
         assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
@@ -641,6 +642,7 @@ def get_sampling_module():
             renorm_probs,
             maybe_top_k_arr,
             top_k_val,
+            is_deterministic,
             row_states_buffer,
         )
         return renorm_probs
@@ -651,6 +653,7 @@ def get_sampling_module():
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
         row_states_buffer: torch.Tensor,
+        is_deterministic: bool = False,
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
@@ -2016,6 +2019,7 @@ top_p_renorm_prob = top_p_renorm_probs
 def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
+    is_deterministic: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
 
@@ -2030,6 +2034,13 @@ def top_k_renorm_probs(
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We keep the top-k probabilities, set the rest to zero, and renormalize the probabilities.
+    is_deterministic: bool
+        If True, accumulate the renormalization sum with order-independent
+        fixed-point integer atomics so results are bitwise reproducible across
+        invocations (the default float accumulation depends on CTA arrival
+        order). Useful when replicas (e.g. tensor-parallel ranks) must compute
+        identical outputs from identical inputs. Slightly affects performance.
+        Default is False.
 
     Returns
     -------
@@ -2082,7 +2093,10 @@ def top_k_renorm_probs(
     )
 
     return get_sampling_module().top_k_renorm_probs(
-        probs, *_to_tensor_scalar_tuple(top_k), row_states_buffer
+        probs,
+        *_to_tensor_scalar_tuple(top_k),
+        row_states_buffer,
+        is_deterministic=is_deterministic,
     )
 
 
