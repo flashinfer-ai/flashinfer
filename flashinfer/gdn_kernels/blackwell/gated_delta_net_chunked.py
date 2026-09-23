@@ -220,6 +220,7 @@ class GatedDeltaNetChunkedKernel:
         store_final_state: bool = True,
         enable_checkpoints: bool = False,
         is_persistent: bool = True,
+        num_householder: int = 1,
     ):
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
@@ -236,6 +237,14 @@ class GatedDeltaNetChunkedKernel:
         self.store_final_state = store_final_state
         self.enable_checkpoints = enable_checkpoints
         self.is_persistent = is_persistent
+        # Gated DeltaProduct: n_h householder micro-steps per real token.  The
+        # state recurrence genuinely runs over all of them, so chunking stays in
+        # MICRO-STEPS (b_t of them per chunk).  Only q / gate / O are per REAL
+        # token; the kernel indexes those directly instead of having the caller
+        # materialise an n_h-times-longer copy.  n_h == 1 is plain GDN.
+        self.num_householder = num_householder
+        # const_expr switch: n_h == 1 keeps the original code paths verbatim.
+        self.n_h_aware = num_householder > 1
 
         # ------------------------------------------------------------------
         # Warp assignments  (12 warps total)
@@ -1328,7 +1337,12 @@ class GatedDeltaNetChunkedKernel:
                             a_inv_ready_producer,
                             qk_ready_producer,
                         ),
-                        (pair_idx == 0, pair_idx < num_pairs_b - 1),
+                        (
+                            pair_idx == 0,
+                            pair_idx < num_pairs_b - 1,
+                            batch_start + (2 * pair_idx) * self.b_t,
+                            batch_start + (2 * pair_idx + 1) * self.b_t,
+                        ),
                     )
 
                 scheduler.advance_to_next_work()
@@ -1426,6 +1440,7 @@ class GatedDeltaNetChunkedKernel:
                                 head_idx,
                                 seqlen_b,
                                 is_first_chunk,
+                                batch_start + chunk_iter * self.b_t,
                             ),
                         )
                         is_first_chunk = False
@@ -1650,10 +1665,17 @@ class GatedDeltaNetChunkedKernel:
                 # All warp roles skip empty workloads at the same granularity.
                 if num_chunks_b > 0:
                     # Bounded descriptors zero-fill partial and padded chunks.
+                    # q is indexed by REAL token under GDP, so its bound is the
+                    # sequence end in real tokens; k/v stay in micro-steps.
+                    q_batch_end = (
+                        batch_end // self.num_householder
+                        if cutlass.const_expr(self.n_h_aware)
+                        else batch_end
+                    )
                     bounded_q = cute.make_tensor(
                         mQ.iterator,
                         cute.make_layout(
-                            (batch_end, mQ.shape[1], mQ.shape[2]),
+                            (q_batch_end, mQ.shape[1], mQ.shape[2]),
                             stride=(mQ.stride[0], mQ.stride[1], mQ.stride[2]),
                         ),
                     )
@@ -1769,10 +1791,19 @@ class GatedDeltaNetChunkedKernel:
                 # chunk predicate without introducing divergent loop state.
                 if num_chunks_b > 0:
                     num_valid_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
+                    # O is written per REAL token under GDP.  The bound also
+                    # supplies the tail predicate: rows past the sequence end are
+                    # dropped by TMA, and rows past this chunk's queries but
+                    # inside the sequence are rewritten by the next chunk.
+                    o_batch_end = (
+                        batch_end // self.num_householder
+                        if cutlass.const_expr(self.n_h_aware)
+                        else batch_end
+                    )
                     bounded_o = cute.make_tensor(
                         mO.iterator,
                         cute.make_layout(
-                            (mO.shape[0], batch_end, mO.shape[2]),
+                            (mO.shape[0], o_batch_end, mO.shape[2]),
                             stride=(mO.stride[0], mO.stride[1], mO.stride[2]),
                         ),
                     )
@@ -1948,8 +1979,16 @@ class GatedDeltaNetChunkedKernel:
         # ------------------------------------------------------------------
         # Q  (A operand of GEMM-qk, single-buffered)
         # ------------------------------------------------------------------
+        # Under GDP the queries of this micro-step chunk are the CONTIGUOUS real
+        # tokens starting at chunk_offset // n_h (batch_start is always a
+        # multiple of n_h, since every sequence is n_h micro-steps per token).
+        q_chunk_offset = (
+            chunk_offset // self.num_householder
+            if cutlass.const_expr(self.n_h_aware)
+            else chunk_offset
+        )
         mQ = cute.domain_offset(
-            (chunk_offset, cutlass.Int32(0)), tma_q.tma_tensor[None, None, head_idx]
+            (q_chunk_offset, cutlass.Int32(0)), tma_q.tma_tensor[None, None, head_idx]
         )
         gQ = cute.flat_divide(mQ, qk_tile)
         tCgQ = thr_mma_qk.partition_A(gQ)
@@ -2092,7 +2131,22 @@ class GatedDeltaNetChunkedKernel:
                 tGpGate[i] = cute.elem_less(tGcGate[i][0], batch_end)
 
         # --- Gate load ---
-        if is_last_tile:
+        if cutlass.const_expr(self.n_h_aware):
+            # GDP: the forget gate belongs to the REAL token, and applies on its
+            # FIRST micro-step; the other n_h-1 micro-steps are neutral.  Gather
+            # gate[m // n_h] where m % n_h == 0 instead of having the caller
+            # materialise an n_h-times-longer copy.  The valid m form a
+            # contiguous run of real tokens, but the per-element index is
+            # cheaper to compute than to express as a strided tiled copy.
+            n_h = self.num_householder
+            mGateReal = gate[None, head_idx]
+            tGrGate.fill(1.0)
+            for i in cutlass.range_constexpr(cute.size(tGrGate)):
+                m = tGcGate[i][0]
+                if m % n_h == 0:
+                    if cute.elem_less(m, batch_end):
+                        tGrGate[i] = mGateReal[m // n_h]
+        elif is_last_tile:
             # OOB neutral: 1.0 -> log2 ~= 0.0 (no decay contribution)
             tGrGate.fill(1.0)
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate, pred=tGpGate)
@@ -2481,7 +2535,7 @@ class GatedDeltaNetChunkedKernel:
             a_inv_ready_producer,
             qk_ready_producer,
         ) = pipeline_args
-        _, _ = work_args
+        _, _, chunk0_offset, chunk1_offset = work_args
 
         # ------------------------------------------------------------------
         # Preamble: identical to compute_group_0
@@ -2571,6 +2625,47 @@ class GatedDeltaNetChunkedKernel:
         sCumsumlog1 = sCumsumlog[None, 0, gate1_handle.index]
         row_cumsumlog1 = sCumsumlog1[row_coord]
         tGrCumsumlog_1 = cute.make_rmem_tensor_like(tTR_tScS, self.acc_dtype)
+
+        # Under GDP the shared accumulator's rows mean different things to its
+        # two consumers: for kk they are micro-steps, but for qk they are REAL
+        # tokens (sQ holds q[t0 + i]; see tma_qkv_warp).  Real token i sits at
+        # chunk-local micro-step b + i*n_h, so qk needs its own decay fragment
+        # -- reusing kk's would apply row i's decay to token i.  Rows whose
+        # micro-step falls outside the chunk are zeroed, which zeroes their O
+        # rows too; those land on real tokens owned by a later chunk, which
+        # rewrites them (or past the sequence end, where the bounded O
+        # descriptor drops the store).
+        if cutlass.const_expr(self.n_h_aware):
+            n_h = self.num_householder
+            b0 = (chunk0_offset // n_h) * n_h + (n_h - 1) - chunk0_offset
+            b1 = (chunk1_offset // n_h) * n_h + (n_h - 1) - chunk1_offset
+            # row_coord comes from a coordinate tensor; make the arithmetic
+            # explicitly Int32 so the index selects below type-check.
+            qrow0 = cutlass.Int32(b0 + row_coord * n_h)
+            qrow1 = cutlass.Int32(b1 + row_coord * n_h)
+            qin0 = qrow0 < self.b_t
+            qin1 = qrow1 < self.b_t
+            qcsl0 = sCumsumlog0[qrow0 if qin0 else cutlass.Int32(0)]
+            qcsl1 = sCumsumlog1[qrow1 if qin1 else cutlass.Int32(0)]
+            tGrQkDecay_0 = cute.make_rmem_tensor_like(tTR_tScS, self.acc_dtype)
+            tGrQkDecay_1 = cute.make_rmem_tensor_like(tTR_tScS, self.acc_dtype)
+            for k in cutlass.range_constexpr(cute.size(tTR_tScS)):
+                col = tTR_tScS[k][1]
+                v0 = (
+                    cute.math.exp2(qcsl0 - sCumsumlog0[col], fastmath=True)
+                    if qrow0 >= col
+                    else 0.0
+                )
+                v1 = (
+                    cute.math.exp2(qcsl1 - sCumsumlog1[col], fastmath=True)
+                    if qrow1 >= col
+                    else 0.0
+                )
+                tGrQkDecay_0[k] = v0 if qin0 else 0.0
+                tGrQkDecay_1[k] = v1 if qin1 else 0.0
+        else:
+            tGrQkDecay_0 = tGrCumsumlog_0
+            tGrQkDecay_1 = tGrCumsumlog_1
 
         # The triangular predicate is identical for both chunks in the pair.
         # Compute the two named register fragments together so the predicate
@@ -2688,9 +2783,7 @@ class GatedDeltaNetChunkedKernel:
             for k in cutlass.range(
                 cute.size(tGrCumsumlog_0.shape[0]), vectorize=True, unroll_full=True
             ):
-                tQKrQK[k, 0, sub] = (
-                    tQKrQK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * scale
-                )
+                tQKrQK[k, 0, sub] = tQKrQK[k, 0, sub] * tGrQkDecay_0[k, 0, sub] * scale
             tQKrQK_out[None, 0, sub].store(
                 tQKrQK[None, 0, sub].load().to(self.io_dtype)
             )
@@ -2719,9 +2812,7 @@ class GatedDeltaNetChunkedKernel:
             for k in cutlass.range(
                 cute.size(tGrCumsumlog_1.shape[0]), vectorize=True, unroll_full=True
             ):
-                tQKrQK[k, 0, sub] = (
-                    tQKrQK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * scale
-                )
+                tQKrQK[k, 0, sub] = tQKrQK[k, 0, sub] * tGrQkDecay_1[k, 0, sub] * scale
             tQKrQK_out[None, 0, sub].store(
                 tQKrQK[None, 0, sub].load().to(self.io_dtype)
             )
@@ -3772,7 +3863,9 @@ class GatedDeltaNetChunkedKernel:
             o_store_producer,
         ) = pipeline_args
         tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv = mma_args
-        chunk_iter, num_pairs_b, head_idx, seqlen_b, is_first_chunk = work_args
+        chunk_iter, num_pairs_b, head_idx, seqlen_b, is_first_chunk, chunk_offset = (
+            work_args
+        )
 
         # ------------------------------------------------------------------
         # Preamble (identical to compute_group_1)
@@ -4151,6 +4244,20 @@ class GatedDeltaNetChunkedKernel:
         for k in cutlass.range_constexpr(cute.size(tTR_tCcShared)):
             coord = tTR_tCcShared[k]
             tGrCumprod[k] = sCumprod[coord[1], 0, gate_handle.index]
+        # KS is indexed by micro-step, but QS is indexed by REAL token (its
+        # columns are sQ's rows).  Under GDP the two need different decays:
+        # token i carries the cumulative gate at micro-step b + i*n_h.
+        if cutlass.const_expr(self.n_h_aware):
+            n_h = self.num_householder
+            b_q = (chunk_offset // n_h) * n_h + (n_h - 1) - chunk_offset
+            tGrQsCumprod = cute.make_rmem_tensor_like(tGrCumprod, self.acc_dtype)
+            for k in cutlass.range_constexpr(cute.size(tTR_tCcShared)):
+                qm = cutlass.Int32(b_q + tTR_tCcShared[k][1] * n_h)
+                qok = qm < self.b_t
+                v = sCumprod[qm if qok else cutlass.Int32(0), 0, gate_handle.index]
+                tGrQsCumprod[k] = v if qok else 0.0
+        else:
+            tGrQsCumprod = tGrCumprod
         last_cumsumlog = sCumsumlog[self.b_t - 1, 0, gate_handle.index]
         for k in cutlass.range_constexpr(0, cute.size(tTR_tCcShared), 2):
             coord0 = tTR_tCcShared[k]
@@ -4211,7 +4318,7 @@ class GatedDeltaNetChunkedKernel:
                 tTR_rQS[None, None, 0],
             )
             for k in cutlass.range(cute.size(tTR_rQS), vectorize=True):
-                tTR_rQS[k] = tTR_rQS[k] * tGrCumprod[k] * scale
+                tTR_rQS[k] = tTR_rQS[k] * tGrQsCumprod[k] * scale
             cute.copy(
                 tiled_qs_r2t,
                 tTR_rQS[None, None, 0],
@@ -4332,8 +4439,13 @@ class GatedDeltaNetChunkedKernel:
         o_tile = cute.select(self.mma_tiler_qkv, mode=[0, 1])
 
         # Position global O tile at current chunk / head
+        o_chunk_offset = (
+            chunk_offset // self.num_householder
+            if cutlass.const_expr(self.n_h_aware)
+            else chunk_offset
+        )
         mO = cute.domain_offset(
-            (cutlass.Int32(0), chunk_offset),
+            (cutlass.Int32(0), o_chunk_offset),
             tma_o.tma_tensor[None, None, head_idx],
         )
         # (BT, DV, num_o_tiles, ...)

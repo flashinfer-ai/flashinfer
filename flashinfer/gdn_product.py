@@ -39,11 +39,6 @@ def chunk_gated_delta_product(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
-    # expansion scratch -- required for cudagraph capture, else allocated here
-    expanded_q: Optional[torch.Tensor] = None,  # [T*n_h, num_q_heads,  D]
-    expanded_g: Optional[torch.Tensor] = None,  # [T*n_h, num_sab_heads]
-    expanded_output: Optional[torch.Tensor] = None,  # [T*n_h, num_o_heads, Dv]
-    expanded_cu_seqlens: Optional[torch.Tensor] = None,  # [num_seqs + 1]
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct attention for prefill.
 
@@ -78,29 +73,6 @@ def chunk_gated_delta_product(
     initial_state, output_state, state_indices, cu_seqlens, ...
         As in ``chunk_gated_delta_rule``. Note the state shape does NOT depend
         on ``num_householder``.
-    expanded_q : torch.Tensor, optional
-        Scratch for the expanded query,
-        ``[total_seq_len * num_householder, num_q_heads, head_size]``, dtype of
-        ``q``.
-    expanded_g : torch.Tensor, optional
-        Scratch for the expanded gate,
-        ``[total_seq_len * num_householder, num_sab_heads]``. **Must be
-        float32** -- ``g`` and ``beta`` are always fp32 in this API even when
-        ``q``/``k``/``v`` are fp16/bf16, and a strided assignment into a
-        half-precision buffer downcasts silently.
-        The wrapper fills non-first microsteps with the multiplicative neutral
-        value ``1.0`` on every call.
-    expanded_output : torch.Tensor, optional
-        Scratch for the kernel's output,
-        ``[total_seq_len * num_householder, num_o_heads, head_size_v]`` where
-        ``num_o_heads = max(num_q_heads, num_v_heads)``. Note this is **not**
-        ``num_q_heads`` -- under GVA the output is wider than the query.
-        Takes ``output``'s dtype when ``output`` is supplied, else ``q``'s, so
-        the final strided copy never silently casts.
-    expanded_cu_seqlens : torch.Tensor, optional
-        Scratch for ``cu_seqlens * num_householder``. Must match the shape,
-        dtype, and device of ``cu_seqlens``.
-
     Returns
     -------
     Same contract as ``chunk_gated_delta_rule``: ``output`` when
@@ -176,64 +148,6 @@ def chunk_gated_delta_product(
     if beta is not None:
         beta = torch.flatten(beta, start_dim=0, end_dim=1)
 
-    if expanded_q is None:
-        expanded_q = torch.empty(
-            q.size(0) * num_householder, *q.shape[1:], dtype=q.dtype, device=q.device
-        )
-    elif expanded_q.shape != (q.size(0) * num_householder, *q.shape[1:]):
-        raise ValueError("expanded_q shape must be [T*n_h, num_q_heads,  D]")
-    elif expanded_q.dtype != q.dtype:
-        raise ValueError(
-            f"expanded_q.dtype and q.dtype must match, got {expanded_q.dtype} != {q.dtype}"
-        )
-    elif expanded_q.device != q.device:
-        raise ValueError("expanded_q must be on the same device as q")
-
-    expanded_q.zero_()
-    expanded_q[num_householder - 1 :: num_householder] = q
-
-    if g is not None:
-        if expanded_g is None:
-            expanded_g = torch.ones(
-                g.size(0) * num_householder,
-                *g.shape[1:],
-                dtype=g.dtype,
-                device=g.device,
-            )
-        elif expanded_g.shape != (g.size(0) * num_householder, *g.shape[1:]):
-            raise ValueError("expanded_g shape must be [T*n_h, num_sab_heads]")
-        elif expanded_g.dtype != torch.float32:
-            raise ValueError(
-                f"expanded_g must be float32 (g/beta are always fp32 in this API, "
-                f"unlike q/k/v); got {expanded_g.dtype}"
-            )
-        elif expanded_g.device != q.device:
-            raise ValueError("expanded_g must be on the same device as q")
-        expanded_g.fill_(1.0)
-        expanded_g[::num_householder] = g
-    else:
-        expanded_g = None
-
-    if expanded_output is None:
-        expanded_output = torch.empty(
-            expanded_q.size(0),
-            max(q.size(1), v.size(1)),
-            head_size_v,
-            dtype=output.dtype if output is not None else q.dtype,
-            device=output.device if output is not None else q.device,
-        )
-    elif expanded_output.shape != (
-        expanded_q.size(0),
-        max(q.size(1), v.size(1)),
-        head_size_v,
-    ):
-        raise ValueError("expanded_output shape must be [T*n_h, num_o_heads,  D]")
-    expected_output_dtype = output.dtype if output is not None else q.dtype
-    if expanded_output.dtype != expected_output_dtype:
-        raise ValueError(f"expanded_output must have dtype {expected_output_dtype}")
-    if expanded_output.device != q.device:
-        raise ValueError("expanded_output must be on the same device as q")
-
     if output is not None:
         expected_output_shape = (total_tokens, num_sab_heads, head_size_v)
         if output.shape != expected_output_shape:
@@ -243,42 +157,38 @@ def chunk_gated_delta_product(
         if output.device != q.device:
             raise ValueError("output must be on the same device as q")
 
-    if expanded_cu_seqlens is None:
-        expanded_cu_seqlens = cu_seqlens * num_householder
-    else:
-        if (
-            expanded_cu_seqlens.shape != cu_seqlens.shape
-            or expanded_cu_seqlens.dtype != cu_seqlens.dtype
-            or expanded_cu_seqlens.device != cu_seqlens.device
-        ):
-            raise ValueError(
-                "expanded_cu_seqlens must match cu_seqlens shape, dtype, and device"
-            )
-        torch.mul(cu_seqlens, num_householder, out=expanded_cu_seqlens)
+    # k / v / beta already carry the householder axis next to the token axis, so
+    # the micro-step view above is a free reshape.  q / g / output stay per REAL
+    # token: the kernel indexes them directly, so GDP needs no expansion scratch
+    # at all.  cu_seqlens is the only thing still scaled, and it is [N+1] ints.
+    if output is None:
+        output = torch.empty(
+            total_tokens,
+            num_sab_heads,
+            head_size_v,
+            dtype=q.dtype,
+            device=q.device,
+        )
 
     out = chunk_gated_delta_rule(
-        expanded_q,
+        q,
         k,
         v,
-        expanded_g,
+        g,
         beta,
         scale,
         initial_state,
         output_final_state,
-        expanded_cu_seqlens,
+        cu_seqlens * num_householder,
         use_qk_l2norm_in_kernel,
-        output=expanded_output,
+        output=output,
         output_state=output_state,
         state_indices=state_indices,
         # CP scheduling operates on the expanded micro-step sequence and is
         # not validated for GDP's sparse Q / neutral-gate layout.
         use_cp=False,
+        num_householder=num_householder,
     )
-
-    if output is not None:
-        output[:] = expanded_output[num_householder - 1 :: num_householder]
-    else:
-        output = expanded_output[num_householder - 1 :: num_householder].clone()
 
     if output_final_state:
         return output, out[-1]

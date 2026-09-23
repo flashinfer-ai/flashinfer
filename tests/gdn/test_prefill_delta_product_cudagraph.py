@@ -73,24 +73,6 @@ def test_cudagraph_capture_and_replay(qkv_factory, num_householder, num_heads, d
         dtype=torch.float32,
         device=device,
     )
-    expanded_q = torch.full(
-        (total_seqlen * n_h, num_q_heads, head_size),
-        float("nan"),
-        dtype=dtype,
-        device=device,
-    )
-    expanded_g = torch.full(
-        (total_seqlen * n_h, num_sab_heads),
-        float("nan"),
-        dtype=torch.float32,
-        device=device,
-    )
-    expanded_output = torch.empty(
-        (total_seqlen * n_h, num_o_heads, head_size),
-        dtype=dtype,
-        device=device,
-    )
-    expanded_cu_seqlens = torch.empty_like(cu_seqlens)
 
     def run_op():
         chunk_gated_delta_product(
@@ -106,10 +88,6 @@ def test_cudagraph_capture_and_replay(qkv_factory, num_householder, num_heads, d
             True,  # use_qk_l2norm_in_kernel
             output=our_o,
             output_state=our_state,
-            expanded_q=expanded_q,
-            expanded_g=expanded_g,
-            expanded_output=expanded_output,
-            expanded_cu_seqlens=expanded_cu_seqlens,
         )
 
     # Warm up on a side stream. This is not politeness: flashinfer JIT-compiles
