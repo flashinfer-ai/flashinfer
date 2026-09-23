@@ -1869,6 +1869,46 @@ def test_kv256_ring_depth_follows_element_width_and_fits_smem(
     assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
+@pytest.mark.parametrize("k_block_size", [16, 1])
+def test_kv256_explicit_ring_depth_beyond_smem_capacity_is_rejected(
+    k_block_size: int,
+) -> None:
+    """A ring depth that fits the pipeline bound but not the SM is rejected.
+
+    The static KV256 check counts the Q and K/V pipelines only; the metadata,
+    the Sage scale rings, the tail exchange and the barriers are known once the
+    schedule is built, and that is where an explicit ``kv_stages`` past the
+    capacity has to fail.
+    """
+    from dataclasses import replace
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        _validate_kv256_static_config,
+    )
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _build_decode_gen_schedule,
+    )
+
+    key = make_block_sparse_compile_key(
+        seq_len_kv=4096,
+        num_qo_heads=8,
+        num_kv_heads=8,
+        dtype_key="int8",
+        use_persistent_scheduler=True,
+        sparse_format="bitmask",
+        out_dtype_key="bfloat16",
+        v_dtype_key="float8_e4m3fn",
+        sage=prims_ts.SageAttentionConfig(k_block_size=k_block_size),
+    )
+    cfg = replace(block_sparse_config._make_block_sparse_config(key), kv_stages=6)
+    _validate_kv256_static_config(cfg)
+    cfg.total_kv_tiles = 16
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with pytest.raises(ValueError, match="shared-memory capacity"):
+            _build_decode_gen_schedule(cfg, total_kv_tiles=16, num_heads_kv=8)
+
+
 def test_sage_static_profile_requires_one_qk_dtype_and_a_config() -> None:
     """The compile key names one Q/K dtype; the recipe is a SageAttentionConfig."""
 

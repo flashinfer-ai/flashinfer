@@ -32,6 +32,7 @@ Entry points:
 import math
 
 import cutlass
+from cutlass import utils as cutlass_utils
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
 from .direct_sparse_metadata import DirectSparseMetadataView, HeadIndexedMetadataView
@@ -74,7 +75,6 @@ from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
-    TOTAL_SMEM_BUDGET_KIB,
     MAX_KV_STAGE_SMEM_KIB,
 )
 from .fmha_decode_resources import (
@@ -1470,20 +1470,35 @@ def _build_decode_gen_schedule(
             allocator.total_smem_bytes + cfg.stensor_align - 1
         ) // cfg.stensor_align * cfg.stensor_align + allocator.barrier_smem_bytes
 
+    # The static profile checks bound only the Q and K/V pipelines; the
+    # complete layout (metadata, scale rings, tail exchange, barriers) is
+    # known here and is measured against the shared-memory capacity of the
+    # architecture the DSL compiles for (the capacity query without an
+    # argument).
+    smem_capacity_bytes = cutlass_utils.get_smem_capacity_in_bytes()
     smem_allocator, clc_response_alloc = allocate_smem()
-    if cfg.uses_q_token_kv_block_sparse_page_membership:
-        budget = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
-        if smem_bytes(smem_allocator) > budget:
-            # A full union can be much larger than a KV tile. Keep small routes
-            # cached, but let Softmax read immutable packed GMEM words on demand
-            # when the complete resource layout cannot hold the membership row.
-            # This also accounts for the fixed K/V rings of one-inst D256.
-            assert smem_page_offsets is not None
-            smem_page_offsets.cache_memberships_in_smem = False
-            smem_page_offsets._init_placeholder_state()
-            smem_allocator, clc_response_alloc = allocate_smem()
-        if smem_bytes(smem_allocator) > budget:
-            raise ValueError("QToken sparse attention resources exceed the SMEM budget")
+    if (
+        cfg.uses_q_token_kv_block_sparse_page_membership
+        and smem_bytes(smem_allocator) > smem_capacity_bytes
+    ):
+        # A full union can be much larger than a KV tile. Keep small routes
+        # cached, but let Softmax read immutable packed GMEM words on demand
+        # when the complete resource layout cannot hold the membership row.
+        # This also accounts for the fixed K/V rings of one-inst D256.
+        assert smem_page_offsets is not None
+        smem_page_offsets.cache_memberships_in_smem = False
+        smem_page_offsets._init_placeholder_state()
+        smem_allocator, clc_response_alloc = allocate_smem()
+    # An explicit ring depth that fits the pipeline bound but not the SM, or
+    # a QToken layout that does not fit even with GMEM memberships, cannot
+    # reach the launch.
+    launch_smem_bytes = smem_bytes(smem_allocator)
+    if launch_smem_bytes > smem_capacity_bytes:
+        raise ValueError(
+            "decode resources exceed the SM shared-memory capacity: "
+            f"q_stages={cfg.q_stages}, kv_stages={cfg.kv_stages} need "
+            f"{launch_smem_bytes} bytes, capacity is {smem_capacity_bytes} bytes"
+        )
     if clc_response_alloc is not None:
         # The slots are a compile-time offset from the unified base address that
         # every role already holds; this is the one place the scheduler config

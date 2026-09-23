@@ -3018,7 +3018,12 @@ def _finalize_static_decode_config(
 
 
 def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
-    """Validate the effective KV256 profile after implicit defaults are filled."""
+    """Validate the effective KV256 profile after implicit defaults are filled.
+
+    The shared-memory check here bounds the Q and K/V pipelines alone; the
+    kernel's schedule builder checks the complete layout against the SM
+    capacity once every resource is allocated.
+    """
     if cfg.tile_size_kv != 256:
         return
 
