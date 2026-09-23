@@ -87,7 +87,7 @@ def _mask_padding_rows_nonlocal(
     every stage bounded by them - the permute/gather, both GEMMs, the activation and
     the finalize.
 
-    Returns the inputs unchanged when there is no remote expert to point at. 
+    Returns the inputs unchanged when there is no remote expert to point at.
     """
     if num_experts is None or num_local_experts >= num_experts:
         return selected_experts, final_scales
@@ -100,7 +100,9 @@ def _mask_padding_rows_nonlocal(
 
     device = selected_experts.device
     m = selected_experts.shape[0]
-    remote_id = (local_expert_offset + num_local_experts) % num_experts # First expert past this ranks block
+    remote_id = (
+        local_expert_offset + num_local_experts
+    ) % num_experts  # First expert past this ranks block
 
     if m != num_local_experts * cap:
         raise ValueError(
