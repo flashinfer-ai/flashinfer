@@ -41,9 +41,7 @@ _HIDDEN = 3072
 _INTERMEDIATE = 5120
 _FC1_ROWS = 2 * _INTERMEDIATE
 _MAX_TOKENS_PER_RANK = 64
-_EXPERT_ROW_SEGMENTS = (32, 16, 16)
-_EXPERT_ROWS = sum(_EXPERT_ROW_SEGMENTS)
-_SUPPORTED_TOKENS = (16, 32, _MAX_TOKENS_PER_RANK)
+_EXPERT_ROWS = 64
 _FUSED_GRID_CTAS = 144
 _MAX_LAUNCH_EPOCH = (2**31 - 1) // _FUSED_GRID_CTAS - 1
 
@@ -209,6 +207,79 @@ def _validate_launch_epoch(epoch: int) -> None:
         )
 
 
+def _tensor_version(tensor: torch.Tensor, name: str) -> int:
+    try:
+        return int(tensor._version)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"{name} must be created outside torch.inference_mode() so session immutability can be checked"
+        ) from exc
+
+
+def _resolve_policy(
+    tokens: int, tile_n: int | str, return_protocol: str
+) -> tuple[str, tuple[int, ...]]:
+    if (
+        isinstance(tokens, bool)
+        or not isinstance(tokens, int)
+        or not 1 <= tokens <= _MAX_TOKENS_PER_RANK
+    ):
+        raise ValueError("tokens per rank must be an integer in [1, 64]")
+    if tile_n != "mixed" and (
+        isinstance(tile_n, bool)
+        or not isinstance(tile_n, int)
+        or tile_n not in (16, 32)
+    ):
+        raise ValueError("tile_n must be 'mixed', 16, or 32")
+    if return_protocol not in ("auto", "cta0", "all_cta"):
+        raise ValueError("return_protocol must be 'auto', 'cta0', or 'all_cta'")
+    protocol = (
+        ("all_cta" if 16 < tokens <= 32 else "cta0")
+        if return_protocol == "auto"
+        else return_protocol
+    )
+    family = "mixed" if tile_n == "mixed" else f"n{tile_n}"
+    segments = (
+        (tile_n,) * (_EXPERT_ROWS // tile_n)
+        if isinstance(tile_n, int)
+        else (32, 16, 16)
+    )
+    return f"{family}_{protocol}", segments
+
+
+def _agree_configuration(
+    tokens: int,
+    policy_id: str,
+    *,
+    process_group: dist.ProcessGroup,
+    device: torch.device,
+    local_error: str | None = None,
+) -> None:
+    """Agree fixed-size metadata before any shape-dependent collective/allocation."""
+    policies = tuple(
+        f"{family}_{protocol}"
+        for family in ("mixed", "n16", "n32")
+        for protocol in ("cta0", "all_cta")
+    )
+    local = torch.tensor(
+        [int(local_error is not None), tokens, policies.index(policy_id)],
+        dtype=torch.int64,
+        device=device,
+    )
+    gathered = torch.empty((_WORLD_SIZE * 3,), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(gathered, local, group=process_group)
+    metadata = gathered.reshape(_WORLD_SIZE, 3)
+    invalid_ranks = torch.nonzero(metadata[:, 0], as_tuple=True)[0].tolist()
+    if invalid_ranks:
+        raise ValueError(
+            f"invalid session inputs on EP16 ranks {invalid_ranks}; local error: {local_error}"
+        )
+    if not bool(torch.all(metadata[:, 1:] == local[1:]).item()):
+        raise ValueError(
+            "all EP16 ranks must use the same batch extent and resolved tile/return policy"
+        )
+
+
 def _validate_routing_capacity(
     topk_ids: torch.Tensor,
     *,
@@ -216,10 +287,8 @@ def _validate_routing_capacity(
     device: torch.device,
 ) -> None:
     tokens = int(topk_ids.shape[0])
-    if tokens not in _SUPPORTED_TOKENS:
-        raise ValueError(
-            f"tokens per rank must be one of {_SUPPORTED_TOKENS}, got {tokens}"
-        )
+    if not 1 <= tokens <= _MAX_TOKENS_PER_RANK:
+        raise ValueError(f"tokens per rank must be in [1, 64], got {tokens}")
     _require_tensor(
         topk_ids,
         name="topk_ids",
@@ -284,6 +353,7 @@ class _Workspace:
         device: torch.device,
         group_name: str,
         tokens: int,
+        row_segments: tuple[int, ...],
     ) -> None:
         self.flags = _allocate_symmetric(
             (2,),
@@ -353,7 +423,7 @@ class _Workspace:
             device=device,
         )
         self.fc1_done = torch.zeros(
-            (_LOCAL_EXPERTS * len(_EXPERT_ROW_SEGMENTS),),
+            (_LOCAL_EXPERTS * len(row_segments),),
             dtype=torch.uint32,
             device=device,
         )
@@ -376,11 +446,15 @@ class CakeMxfp8MegaMoeEp16:
     """Prepared EP16 MXFP8 MegaMoE session for exact SM103a devices.
 
     The route supports 512 experts, hidden size 3072, intermediate size 5120,
-    top-k 8, 16/32/64 tokens per rank, and up to 64 routes per expert. Routing
+    top-k 8, 1..64 runtime tokens per rank, and up to 64 routes per expert. Routing
     is validated once at construction and must remain immutable. Construction
     owns all symmetric memory and scratch storage. A session must be used
     serially from one CUDA stream. :meth:`run` submits without allocating, and
     CUDA Graph capture is not supported.
+
+    ``tile_n="mixed"`` is the throughput route. Pin ``tile_n=16`` or ``32``
+    across sessions to select a uniform arithmetic tile. Prepared weights can
+    be reused across sessions; batch size is not a JIT compilation key.
     """
 
     def __init__(
@@ -389,6 +463,8 @@ class CakeMxfp8MegaMoeEp16:
         topk_ids: torch.Tensor,
         *,
         process_group: dist.ProcessGroup | None = None,
+        tile_n: int | str = "mixed",
+        return_protocol: str = "auto",
     ) -> None:
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized")
@@ -403,15 +479,50 @@ class CakeMxfp8MegaMoeEp16:
             raise RuntimeError(
                 f"Cake MXFP8 MegaMoE requires compute capability 10.3, got {major}.{minor}"
             )
-        self._validate_weights(weights, device=device)
+        # Keep all ranks in the fixed-size admission collective even when one
+        # rank has malformed local inputs. No variable-size gather/allocation
+        # may run until every rank has accepted the same configuration.
+        local_error = None
+        self.tokens, self.policy_id = 1, "mixed_cta0"
+        try:
+            self._validate_weights(weights, device=device)
+            self.tokens = int(topk_ids.shape[0])
+            self.policy_id, self.row_segments = _resolve_policy(
+                self.tokens, tile_n, return_protocol
+            )
+            _require_tensor(
+                topk_ids,
+                name="topk_ids",
+                shape=(self.tokens, _TOP_K),
+                dtype=torch.int64,
+                device=device,
+            )
+            self._routing_ids_version = _tensor_version(topk_ids, "topk_ids")
+            self._weight_bindings = tuple(
+                (tensor, _tensor_version(tensor, f"weights.{name}"))
+                for name, tensor in (
+                    ("w13", weights.w13),
+                    ("w13_scale", weights.w13_scale),
+                    ("w2", weights.w2),
+                    ("w2_scale", weights.w2_scale),
+                )
+            )
+        except (TypeError, ValueError, RuntimeError, IndexError, AttributeError) as exc:
+            local_error = str(exc)
+        _agree_configuration(
+            self.tokens,
+            self.policy_id,
+            process_group=self._group,
+            device=device,
+            local_error=local_error,
+        )
         self.weights = weights
         _validate_routing_capacity(
             topk_ids,
             process_group=self._group,
             device=device,
         )
-        self.tokens = int(topk_ids.shape[0])
-        self._routing_ids_ptr = int(topk_ids.data_ptr())
+        self._routing_ids = topk_ids
         self._w13 = weights.w13.view(torch.uint8)
         self._w13_scale = weights.w13_scale.view(torch.uint8).reshape(-1, 128)
         self._w2 = weights.w2.view(torch.uint8)
@@ -426,9 +537,12 @@ class CakeMxfp8MegaMoeEp16:
             device=device,
             group_name=group_name,
             tokens=self.tokens,
+            row_segments=self.row_segments,
         )
         self._output = self._workspace.output_bf16
-        self._module = load_cake_mxfp8_megamoe_ep16_module(device=device)
+        self._module = load_cake_mxfp8_megamoe_ep16_module(
+            device=device, policy_id=self.policy_id
+        )
         with torch.cuda.device(device), tvm_ffi.use_torch_stream():
             self._module.setup_tma(
                 self._w13,
@@ -482,7 +596,7 @@ class CakeMxfp8MegaMoeEp16:
 
     @property
     def workspace_output(self) -> torch.Tensor:
-        """Return the fixed-token caller-visible output tensor."""
+        """Return this session's caller-visible output tensor."""
 
         return self._output
 
@@ -521,10 +635,27 @@ class CakeMxfp8MegaMoeEp16:
             dtype=torch.int64,
             device=device,
         )
-        if int(topk_ids.data_ptr()) != self._routing_ids_ptr:
+        if (
+            topk_ids is not self._routing_ids
+            or int(topk_ids._version) != self._routing_ids_version
+        ):
             raise ValueError(
                 "topk_ids must be the immutable tensor prepared by this session"
             )
+        for tensor, (prepared_tensor, version) in zip(
+            (
+                self.weights.w13,
+                self.weights.w13_scale,
+                self.weights.w2,
+                self.weights.w2_scale,
+            ),
+            self._weight_bindings,
+            strict=True,
+        ):
+            if tensor is not prepared_tensor or int(tensor._version) != version:
+                raise ValueError(
+                    "prepared weights must remain immutable for the session lifetime"
+                )
         _require_tensor(
             topk_weights,
             name="topk_weights",

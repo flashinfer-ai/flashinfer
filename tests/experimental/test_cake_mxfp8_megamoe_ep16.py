@@ -33,6 +33,8 @@ from flashinfer.experimental.cake_mxfp8_megamoe_ep16.backend import (
     _interleave_gate_up_16,
     _pack_scale_n128_k128,
     _quantize_mxfp8_block32,
+    _resolve_policy,
+    _tensor_version,
     _validate_gathered_routing_capacity,
     _validate_launch_epoch,
 )
@@ -53,13 +55,67 @@ def test_public_entry_points_are_experimental() -> None:
 
 def test_generated_source_closure() -> None:
     _, manifest = _read_manifest()
-    sequence = manifest["sequences"][0]
-    assert sequence["arch"] == "sm_103a"
-    assert len(sequence["translation_units"]["devices"]) == 3
-    assert sequence["setup_ffi_entry"] == "setup_tma"
-    assert sequence["launches_per_call"] == 2
-    assert sequence["setup_launches"] == 1
-    assert sequence["max_launch_epoch"] == _MAX_LAUNCH_EPOCH
+    assert len(manifest["sequences"]) == 6
+    assert (
+        len(
+            {
+                path
+                for sequence in manifest["sequences"]
+                for path in sequence["translation_units"]["devices"]
+            }
+        )
+        == 7
+    )
+    for sequence in manifest["sequences"]:
+        assert sequence["arch"] == "sm_103a"
+        assert len(sequence["translation_units"]["devices"]) == 2
+        assert sequence["setup_ffi_entry"] == "setup_tma"
+        assert sequence["launches_per_call"] == 2
+        assert sequence["setup_launches"] == 1
+        assert sequence["max_launch_epoch"] == _MAX_LAUNCH_EPOCH
+
+
+@pytest.mark.parametrize("tokens", (1, 16, 17, 32, 33, 63, 64))
+@pytest.mark.parametrize("tile_n", ("mixed", 16, 32))
+def test_runtime_batch_policy(tokens, tile_n) -> None:
+    policy_id, segments = _resolve_policy(tokens, tile_n, "auto")
+    family = "mixed" if tile_n == "mixed" else f"n{tile_n}"
+    protocol = "all_cta" if 16 < tokens <= 32 else "cta0"
+    assert policy_id == f"{family}_{protocol}"
+    assert segments == (
+        (32, 16, 16) if tile_n == "mixed" else (tile_n,) * (64 // tile_n)
+    )
+    for forced in ("cta0", "all_cta"):
+        assert _resolve_policy(tokens, tile_n, forced)[0] == f"{family}_{forced}"
+
+
+@pytest.mark.parametrize(
+    "tokens,tile_n,protocol",
+    (
+        (0, "mixed", "auto"),
+        (65, 32, "cta0"),
+        (True, 32, "cta0"),
+        (1, 32.0, "cta0"),
+        (1, True, "cta0"),
+        (1, 8, "cta0"),
+        (1, 32, "bad"),
+    ),
+)
+def test_runtime_batch_policy_rejects_invalid(tokens, tile_n, protocol) -> None:
+    with pytest.raises(ValueError):
+        _resolve_policy(tokens, tile_n, protocol)
+
+
+def test_session_version_admission_uses_real_tensors() -> None:
+    tensor = torch.zeros(1)
+    version = _tensor_version(tensor, "routing")
+    tensor.add_(1)
+    assert _tensor_version(tensor, "routing") == version + 1
+    with torch.inference_mode():
+        assert _tensor_version(tensor, "routing") == version + 1
+        unversioned = torch.zeros(1)
+    with pytest.raises(ValueError, match="created outside torch.inference_mode"):
+        _tensor_version(unversioned, "routing")
 
 
 def test_jit_resolves_flashinfer_headers() -> None:
@@ -76,28 +132,24 @@ def _write_test_manifest(tmp_path, manifest: dict) -> None:
     )
 
 
-def test_manifest_rejects_aggregate_identity_drift(tmp_path, monkeypatch) -> None:
+def test_manifest_rejects_aggregate_identity_drift(tmp_path) -> None:
     _, manifest = _read_manifest()
     mutated = copy.deepcopy(manifest)
     mutated["sequences"][0]["max_launch_epoch"] += 1
     _write_test_manifest(tmp_path, mutated)
-    monkeypatch.setattr(_jit, "_get_csrc_root", lambda: tmp_path)
     with pytest.raises(
         RuntimeError, match="aggregate source-closure identity mismatch"
     ):
-        _read_manifest()
+        _read_manifest(tmp_path)
 
 
-def test_manifest_requires_translation_units_to_equal_closure(
-    tmp_path, monkeypatch
-) -> None:
+def test_manifest_requires_translation_units_to_equal_closure(tmp_path) -> None:
     _, manifest = _read_manifest()
     mutated = copy.deepcopy(manifest)
     mutated["sequences"][0]["translation_units"]["devices"].pop()
     _write_test_manifest(tmp_path, mutated)
-    monkeypatch.setattr(_jit, "_get_csrc_root", lambda: tmp_path)
     with pytest.raises(RuntimeError, match="translation units must exactly equal"):
-        _read_manifest()
+        _read_manifest(tmp_path)
 
 
 def test_host_binding_argument_count() -> None:
@@ -313,10 +365,7 @@ def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         pytest.skip("requires CUDA")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
-    if local_world_size > torch.cuda.device_count():
-        pytest.skip("requires one visible CUDA device per local rank")
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
     device = torch.device("cuda", torch.cuda.current_device())
     if torch.cuda.get_device_capability(device) != (10, 3):
         pytest.skip("requires exact SM103")
@@ -339,7 +388,13 @@ def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
             dtype=torch.float32,
             device=device,
         )
-        for tokens in (16, 32, 64):
+        cases = (
+            (tile_n, protocol, tokens)
+            for tile_n in ("mixed", 16, 32)
+            for protocol in ("cta0", "all_cta")
+            for tokens in (1, 16, 17, 32, 33, 63, 64)
+        )
+        for tile_n, protocol, tokens in cases:
             local_tokens = torch.arange(tokens, dtype=torch.int64, device=device)
             global_tokens = rank * tokens + local_tokens
             topk_ids = _mixed_width_tail_routing(tokens, rank, device)
@@ -355,7 +410,11 @@ def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
                 hidden_states, topk_ids, topk_weights
             )
 
-            session = CakeMxfp8MegaMoeEp16(weights, topk_ids)
+            session = CakeMxfp8MegaMoeEp16(
+                weights, topk_ids, tile_n=tile_n, return_protocol=protocol
+            )
+            assert session.weights is weights
+            assert session._workspace.fc1_done.numel() == 32 * len(session.row_segments)
             first_output = session.run(
                 hidden_states,
                 topk_ids,

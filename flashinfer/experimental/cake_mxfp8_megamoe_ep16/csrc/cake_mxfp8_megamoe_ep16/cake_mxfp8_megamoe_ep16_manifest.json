@@ -1,35 +1,42 @@
 {
-  "schema": "flashinfer.experimental.source_closure.v1",
+  "schema": "flashinfer.experimental.source_closure.v2",
   "sequences": [
     {
       "arch": "sm_103a",
+      "policy_id": "mixed_cta0",
+      "tile_n": "mixed",
+      "return_protocol": "cta0",
+      "row_segments": [
+        32,
+        16,
+        16
+      ],
+      "runtime_tokens_per_rank": [
+        1,
+        64
+      ],
       "ffi_entry": "run",
       "setup_ffi_entry": "setup_tma",
       "closure": [
         {
-          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16_kernel.cu",
-          "sha256": "7f8fae7b20fbca2c4e56fcea654bdc2ef58f8477e27541b753bee391abd8281a"
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_da3f3041fa9c5c2672cb_kernel.cu",
+          "sha256": "891ca34ef0be508c884ceaa06980369fdf26dcb0beca3c6d4101dfbb5e0805b3"
         },
         {
-          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36_kernel.cu",
-          "sha256": "d2aac4d0775f448f5029546d4e7fbcfa6f44648f5896b8280d4a7c72b1d74361"
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu",
+          "sha256": "8715d050239199b094359bf480d9bbcc561e69e0ca621d03827cc556ba875690"
         },
         {
-          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127_kernel.cu",
-          "sha256": "ce306da5f2d04112537b68a159b3e986625158a9dc1a7f565f10158eb0780fb5"
-        },
-        {
-          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_b6463fb4cca601f89fce_binding.cu",
-          "sha256": "b6463fb4cca601f89fce3caf17ee85fcd235a67f36d807c06158e0f032ff44e2"
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_98ae4488bbc064229f26_binding.cu",
+          "sha256": "98ae4488bbc064229f26afe9fb45c6c59aa60708058ddf9c5ce745d4b71326bc"
         }
       ],
       "translation_units": {
         "devices": [
-          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16_kernel.cu",
-          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36_kernel.cu",
-          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127_kernel.cu"
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_da3f3041fa9c5c2672cb_kernel.cu",
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu"
         ],
-        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_b6463fb4cca601f89fce_binding.cu"
+        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_98ae4488bbc064229f26_binding.cu"
       },
       "arg_plan": [
         [
@@ -203,18 +210,1128 @@
           "tma_descriptor_workspace"
         ]
       ],
-      "token_specializations": {
-        "16": "kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16",
-        "32": "kernel_cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36",
-        "64": "kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16"
-      },
+      "fused_symbol": "kernel_cake_mxfp8_megamoe_ep16_da3f3041fa9c5c2672cb",
+      "reducer_symbol": "kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58",
+      "dynamic_smem_bytes": 76800,
+      "tma_descriptor_count": 8,
       "launches_per_call": 2,
       "setup_launches": 1,
       "max_launch_epoch": 14913079,
       "compile_flags": [
         "--use_fast_math"
       ],
-      "closure_sha256": "e45d35443cf91090d5633235a5b3f680e3aac672f64cbdc8020bf9a329d54cac"
+      "snapshot_sha256": "c055e08f6d96837b2d21d6b8236301940d224e04ae8725fd4aaf01e8b77e27c6",
+      "closure_sha256": "1b53ff2f463ce37911256a79b0670a03f1b6e3febe5a75a641770b2396aa7b88"
+    },
+    {
+      "arch": "sm_103a",
+      "policy_id": "mixed_all_cta",
+      "tile_n": "mixed",
+      "return_protocol": "all_cta",
+      "row_segments": [
+        32,
+        16,
+        16
+      ],
+      "runtime_tokens_per_rank": [
+        1,
+        64
+      ],
+      "ffi_entry": "run",
+      "setup_ffi_entry": "setup_tma",
+      "closure": [
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3_kernel.cu",
+          "sha256": "9dcf8f5757dbde51933c1641ed3f38e548600e318df1d0e671436470a2cd32c0"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu",
+          "sha256": "8715d050239199b094359bf480d9bbcc561e69e0ca621d03827cc556ba875690"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_befe2e0675c14eb62ec2_binding.cu",
+          "sha256": "befe2e0675c14eb62ec234459900d237f247181f37a9ef64ef009dedb71ac77a"
+        }
+      ],
+      "translation_units": {
+        "devices": [
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3_kernel.cu",
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu"
+        ],
+        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_befe2e0675c14eb62ec2_binding.cu"
+      },
+      "arg_plan": [
+        [
+          "buffer",
+          "source_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "source_topk_ids_i64"
+        ],
+        [
+          "buffer",
+          "source_topk_weights_f32"
+        ],
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "buffer",
+          "fc2_output_bf16"
+        ],
+        [
+          "buffer",
+          "route_map_i32"
+        ],
+        [
+          "buffer",
+          "route_scale_f32"
+        ],
+        [
+          "buffer",
+          "route_counts_u32"
+        ],
+        [
+          "buffer",
+          "fc1_done"
+        ],
+        [
+          "buffer",
+          "publication_done"
+        ],
+        [
+          "buffer",
+          "publication_visible"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "compute_done"
+        ],
+        [
+          "buffer",
+          "return_done"
+        ],
+        [
+          "buffer",
+          "return_visible"
+        ],
+        [
+          "parameter",
+          "launch_epoch"
+        ],
+        [
+          "parameter",
+          "tokens_per_rank"
+        ],
+        [
+          "parameter",
+          "mega_pg_world"
+        ],
+        [
+          "parameter",
+          "mega_pg_rank"
+        ],
+        [
+          "buffer",
+          "mega_pg_flags"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32_peers"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16_peers"
+        ],
+        [
+          "buffer",
+          "output_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "setup_arg_plan": [
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "fused_symbol": "kernel_cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3",
+      "reducer_symbol": "kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58",
+      "dynamic_smem_bytes": 76800,
+      "tma_descriptor_count": 8,
+      "launches_per_call": 2,
+      "setup_launches": 1,
+      "max_launch_epoch": 14913079,
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "snapshot_sha256": "c055e08f6d96837b2d21d6b8236301940d224e04ae8725fd4aaf01e8b77e27c6",
+      "closure_sha256": "0eafd5e797d9565b311bcd70c85cd60086b2320c2918e20fd50622e6f54d6e0a"
+    },
+    {
+      "arch": "sm_103a",
+      "policy_id": "n16_cta0",
+      "tile_n": 16,
+      "return_protocol": "cta0",
+      "row_segments": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "runtime_tokens_per_rank": [
+        1,
+        64
+      ],
+      "ffi_entry": "run",
+      "setup_ffi_entry": "setup_tma",
+      "closure": [
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_9d9cb25a824b684eda88_kernel.cu",
+          "sha256": "ca1cc8d3770b3713e4415f169275b2f00241228f0f5283ab492e490eec0fb0e1"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu",
+          "sha256": "8715d050239199b094359bf480d9bbcc561e69e0ca621d03827cc556ba875690"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_f1e9189fb643e4a6dced_binding.cu",
+          "sha256": "f1e9189fb643e4a6dced2286d2f87f5f04e2b4e9e98127cc603ba431eeea7800"
+        }
+      ],
+      "translation_units": {
+        "devices": [
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_9d9cb25a824b684eda88_kernel.cu",
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu"
+        ],
+        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_f1e9189fb643e4a6dced_binding.cu"
+      },
+      "arg_plan": [
+        [
+          "buffer",
+          "source_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "source_topk_ids_i64"
+        ],
+        [
+          "buffer",
+          "source_topk_weights_f32"
+        ],
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "buffer",
+          "fc2_output_bf16"
+        ],
+        [
+          "buffer",
+          "route_map_i32"
+        ],
+        [
+          "buffer",
+          "route_scale_f32"
+        ],
+        [
+          "buffer",
+          "route_counts_u32"
+        ],
+        [
+          "buffer",
+          "fc1_done"
+        ],
+        [
+          "buffer",
+          "publication_done"
+        ],
+        [
+          "buffer",
+          "publication_visible"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "compute_done"
+        ],
+        [
+          "buffer",
+          "return_done"
+        ],
+        [
+          "buffer",
+          "return_visible"
+        ],
+        [
+          "parameter",
+          "launch_epoch"
+        ],
+        [
+          "parameter",
+          "tokens_per_rank"
+        ],
+        [
+          "parameter",
+          "mega_pg_world"
+        ],
+        [
+          "parameter",
+          "mega_pg_rank"
+        ],
+        [
+          "buffer",
+          "mega_pg_flags"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32_peers"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16_peers"
+        ],
+        [
+          "buffer",
+          "output_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "setup_arg_plan": [
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "fused_symbol": "kernel_cake_mxfp8_megamoe_ep16_9d9cb25a824b684eda88",
+      "reducer_symbol": "kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58",
+      "dynamic_smem_bytes": 72704,
+      "tma_descriptor_count": 8,
+      "launches_per_call": 2,
+      "setup_launches": 1,
+      "max_launch_epoch": 14913079,
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "snapshot_sha256": "c055e08f6d96837b2d21d6b8236301940d224e04ae8725fd4aaf01e8b77e27c6",
+      "closure_sha256": "2d9ff291142155850cff37edef7aa9e41aebd5f29e75111657168b3cb8affdb7"
+    },
+    {
+      "arch": "sm_103a",
+      "policy_id": "n16_all_cta",
+      "tile_n": 16,
+      "return_protocol": "all_cta",
+      "row_segments": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "runtime_tokens_per_rank": [
+        1,
+        64
+      ],
+      "ffi_entry": "run",
+      "setup_ffi_entry": "setup_tma",
+      "closure": [
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_5450d3698a229ccaec6c_kernel.cu",
+          "sha256": "d2a7f6d52f48990bb4bb1fbc7fad348beafb659be8ef77826d4c9eefeddde8d8"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu",
+          "sha256": "8715d050239199b094359bf480d9bbcc561e69e0ca621d03827cc556ba875690"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_4eb080976052c60c6382_binding.cu",
+          "sha256": "4eb080976052c60c6382e43a28f78094d25246d7afe1f4494eb9937d3b3ed019"
+        }
+      ],
+      "translation_units": {
+        "devices": [
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_5450d3698a229ccaec6c_kernel.cu",
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu"
+        ],
+        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_4eb080976052c60c6382_binding.cu"
+      },
+      "arg_plan": [
+        [
+          "buffer",
+          "source_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "source_topk_ids_i64"
+        ],
+        [
+          "buffer",
+          "source_topk_weights_f32"
+        ],
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "buffer",
+          "fc2_output_bf16"
+        ],
+        [
+          "buffer",
+          "route_map_i32"
+        ],
+        [
+          "buffer",
+          "route_scale_f32"
+        ],
+        [
+          "buffer",
+          "route_counts_u32"
+        ],
+        [
+          "buffer",
+          "fc1_done"
+        ],
+        [
+          "buffer",
+          "publication_done"
+        ],
+        [
+          "buffer",
+          "publication_visible"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "compute_done"
+        ],
+        [
+          "buffer",
+          "return_done"
+        ],
+        [
+          "buffer",
+          "return_visible"
+        ],
+        [
+          "parameter",
+          "launch_epoch"
+        ],
+        [
+          "parameter",
+          "tokens_per_rank"
+        ],
+        [
+          "parameter",
+          "mega_pg_world"
+        ],
+        [
+          "parameter",
+          "mega_pg_rank"
+        ],
+        [
+          "buffer",
+          "mega_pg_flags"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32_peers"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16_peers"
+        ],
+        [
+          "buffer",
+          "output_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "setup_arg_plan": [
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "fused_symbol": "kernel_cake_mxfp8_megamoe_ep16_5450d3698a229ccaec6c",
+      "reducer_symbol": "kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58",
+      "dynamic_smem_bytes": 72704,
+      "tma_descriptor_count": 8,
+      "launches_per_call": 2,
+      "setup_launches": 1,
+      "max_launch_epoch": 14913079,
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "snapshot_sha256": "c055e08f6d96837b2d21d6b8236301940d224e04ae8725fd4aaf01e8b77e27c6",
+      "closure_sha256": "603caeb074c92efb655675828a312fb618455098623d774c7982acf67a30fe42"
+    },
+    {
+      "arch": "sm_103a",
+      "policy_id": "n32_cta0",
+      "tile_n": 32,
+      "return_protocol": "cta0",
+      "row_segments": [
+        32,
+        32
+      ],
+      "runtime_tokens_per_rank": [
+        1,
+        64
+      ],
+      "ffi_entry": "run",
+      "setup_ffi_entry": "setup_tma",
+      "closure": [
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_bf452007a49e3b0a0786_kernel.cu",
+          "sha256": "0172d11b78b35536e51a8fbf9a77f587ac75116b2c1ca7f682fadb26d828eeb8"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu",
+          "sha256": "8715d050239199b094359bf480d9bbcc561e69e0ca621d03827cc556ba875690"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_f5d169c1f5b526a254aa_binding.cu",
+          "sha256": "f5d169c1f5b526a254aa19c63607e1a12fd4fc9ee4e2d51fab424945a13a9826"
+        }
+      ],
+      "translation_units": {
+        "devices": [
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_bf452007a49e3b0a0786_kernel.cu",
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu"
+        ],
+        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_f5d169c1f5b526a254aa_binding.cu"
+      },
+      "arg_plan": [
+        [
+          "buffer",
+          "source_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "source_topk_ids_i64"
+        ],
+        [
+          "buffer",
+          "source_topk_weights_f32"
+        ],
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "buffer",
+          "fc2_output_bf16"
+        ],
+        [
+          "buffer",
+          "route_map_i32"
+        ],
+        [
+          "buffer",
+          "route_scale_f32"
+        ],
+        [
+          "buffer",
+          "route_counts_u32"
+        ],
+        [
+          "buffer",
+          "fc1_done"
+        ],
+        [
+          "buffer",
+          "publication_done"
+        ],
+        [
+          "buffer",
+          "publication_visible"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "compute_done"
+        ],
+        [
+          "buffer",
+          "return_done"
+        ],
+        [
+          "buffer",
+          "return_visible"
+        ],
+        [
+          "parameter",
+          "launch_epoch"
+        ],
+        [
+          "parameter",
+          "tokens_per_rank"
+        ],
+        [
+          "parameter",
+          "mega_pg_world"
+        ],
+        [
+          "parameter",
+          "mega_pg_rank"
+        ],
+        [
+          "buffer",
+          "mega_pg_flags"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32_peers"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16_peers"
+        ],
+        [
+          "buffer",
+          "output_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "setup_arg_plan": [
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "fused_symbol": "kernel_cake_mxfp8_megamoe_ep16_bf452007a49e3b0a0786",
+      "reducer_symbol": "kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58",
+      "dynamic_smem_bytes": 76800,
+      "tma_descriptor_count": 8,
+      "launches_per_call": 2,
+      "setup_launches": 1,
+      "max_launch_epoch": 14913079,
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "snapshot_sha256": "c055e08f6d96837b2d21d6b8236301940d224e04ae8725fd4aaf01e8b77e27c6",
+      "closure_sha256": "3645908ec83b7a44bf58506757977ef1701d95ffeebe6e03081437b255b7d8ba"
+    },
+    {
+      "arch": "sm_103a",
+      "policy_id": "n32_all_cta",
+      "tile_n": 32,
+      "return_protocol": "all_cta",
+      "row_segments": [
+        32,
+        32
+      ],
+      "runtime_tokens_per_rank": [
+        1,
+        64
+      ],
+      "ffi_entry": "run",
+      "setup_ffi_entry": "setup_tma",
+      "closure": [
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_ba203667fde2f000c9ee_kernel.cu",
+          "sha256": "9e6540fa153d0c664cf7959acd7828dbb3b761d2652dff257e0ce9cadbadda15"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu",
+          "sha256": "8715d050239199b094359bf480d9bbcc561e69e0ca621d03827cc556ba875690"
+        },
+        {
+          "path": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_bf7a8bfdbc66fe0f1e0e_binding.cu",
+          "sha256": "bf7a8bfdbc66fe0f1e0e98c91114eff8365940754c8a4382b9e1d43aba716eff"
+        }
+      ],
+      "translation_units": {
+        "devices": [
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_ba203667fde2f000c9ee_kernel.cu",
+          "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_e613768488357082ea58_kernel.cu"
+        ],
+        "binding": "csrc/cake_mxfp8_megamoe_ep16/sm_103a/cake_mxfp8_megamoe_ep16_seq_bf7a8bfdbc66fe0f1e0e_binding.cu"
+      },
+      "arg_plan": [
+        [
+          "buffer",
+          "source_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "source_topk_ids_i64"
+        ],
+        [
+          "buffer",
+          "source_topk_weights_f32"
+        ],
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "buffer",
+          "fc2_output_bf16"
+        ],
+        [
+          "buffer",
+          "route_map_i32"
+        ],
+        [
+          "buffer",
+          "route_scale_f32"
+        ],
+        [
+          "buffer",
+          "route_counts_u32"
+        ],
+        [
+          "buffer",
+          "fc1_done"
+        ],
+        [
+          "buffer",
+          "publication_done"
+        ],
+        [
+          "buffer",
+          "publication_visible"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "compute_done"
+        ],
+        [
+          "buffer",
+          "return_done"
+        ],
+        [
+          "buffer",
+          "return_visible"
+        ],
+        [
+          "parameter",
+          "launch_epoch"
+        ],
+        [
+          "parameter",
+          "tokens_per_rank"
+        ],
+        [
+          "parameter",
+          "mega_pg_world"
+        ],
+        [
+          "parameter",
+          "mega_pg_rank"
+        ],
+        [
+          "buffer",
+          "mega_pg_flags"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16"
+        ],
+        [
+          "buffer",
+          "published_hidden_bf16_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32"
+        ],
+        [
+          "buffer",
+          "published_topk_ids_i32_peers"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32"
+        ],
+        [
+          "buffer",
+          "published_topk_weights_f32_peers"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16"
+        ],
+        [
+          "buffer",
+          "route_terms_bf16_peers"
+        ],
+        [
+          "buffer",
+          "output_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "setup_arg_plan": [
+        [
+          "tma_buffer",
+          "fc1_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc1_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "activation_bf16"
+        ],
+        [
+          "tma_buffer",
+          "fc2_weight_e4m3"
+        ],
+        [
+          "tma_buffer",
+          "fc2_blocked_e8m0"
+        ],
+        [
+          "tma_buffer",
+          "fc1_workspace_bf16"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ]
+      ],
+      "fused_symbol": "kernel_cake_mxfp8_megamoe_ep16_ba203667fde2f000c9ee",
+      "reducer_symbol": "kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58",
+      "dynamic_smem_bytes": 76800,
+      "tma_descriptor_count": 8,
+      "launches_per_call": 2,
+      "setup_launches": 1,
+      "max_launch_epoch": 14913079,
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "snapshot_sha256": "c055e08f6d96837b2d21d6b8236301940d224e04ae8725fd4aaf01e8b77e27c6",
+      "closure_sha256": "89029290f1d0475a4594e09fec4185a154beb1e9d3daf01f0a30b4ae528290d3"
     }
   ]
 }

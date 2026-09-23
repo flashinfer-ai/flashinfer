@@ -31,13 +31,11 @@
 #include <vector>
 
 struct CakeTensorMap;
-extern "C" __global__ void kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16(__nv_bfloat16* __restrict__ source_hidden_bf16, long long* __restrict__ source_topk_ids_i64, float* __restrict__ source_topk_weights_f32, CakeTensorMap const* fc1_weight_e4m3, CakeTensorMap const* fc1_blocked_e8m0, CakeTensorMap const* activation_bf16, CakeTensorMap const* activation_bf16_n16, __nv_bfloat16* __restrict__ activation_bf16_ptr, CakeTensorMap const* fc2_weight_e4m3, CakeTensorMap const* fc2_blocked_e8m0, CakeTensorMap const* fc1_workspace_bf16_tma, CakeTensorMap const* fc1_workspace_bf16_tma_n16, __nv_bfloat16* __restrict__ fc1_workspace_bf16, __nv_bfloat16* __restrict__ fc2_output_bf16, int* __restrict__ route_map_i32, float* __restrict__ route_scale_f32, unsigned int* __restrict__ route_counts_u32, unsigned int* __restrict__ fc1_done, unsigned int* __restrict__ publication_done, unsigned int* __restrict__ publication_visible, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ compute_done, unsigned int* __restrict__ return_done, unsigned int* __restrict__ return_visible, int launch_epoch, int tokens_per_rank, int32_t mega_pg_world, int32_t mega_pg_rank, unsigned* const* __restrict__ mega_pg_flags, __nv_bfloat16* __restrict__ published_hidden_bf16, __nv_bfloat16* const* __restrict__ published_hidden_bf16_peers, int* __restrict__ published_topk_ids_i32, int* const* __restrict__ published_topk_ids_i32_peers, float* __restrict__ published_topk_weights_f32, float* const* __restrict__ published_topk_weights_f32_peers, __nv_bfloat16* __restrict__ route_terms_bf16, __nv_bfloat16* const* __restrict__ route_terms_bf16_peers);
-struct CakeTensorMap;
-extern "C" __global__ void kernel_cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36(__nv_bfloat16* __restrict__ source_hidden_bf16, long long* __restrict__ source_topk_ids_i64, float* __restrict__ source_topk_weights_f32, CakeTensorMap const* fc1_weight_e4m3, CakeTensorMap const* fc1_blocked_e8m0, CakeTensorMap const* activation_bf16, CakeTensorMap const* activation_bf16_n16, __nv_bfloat16* __restrict__ activation_bf16_ptr, CakeTensorMap const* fc2_weight_e4m3, CakeTensorMap const* fc2_blocked_e8m0, CakeTensorMap const* fc1_workspace_bf16_tma, CakeTensorMap const* fc1_workspace_bf16_tma_n16, __nv_bfloat16* __restrict__ fc1_workspace_bf16, __nv_bfloat16* __restrict__ fc2_output_bf16, int* __restrict__ route_map_i32, float* __restrict__ route_scale_f32, unsigned int* __restrict__ route_counts_u32, unsigned int* __restrict__ fc1_done, unsigned int* __restrict__ publication_done, unsigned int* __restrict__ publication_visible, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ compute_done, unsigned int* __restrict__ return_done, unsigned int* __restrict__ return_visible, int launch_epoch, int tokens_per_rank, int32_t mega_pg_world, int32_t mega_pg_rank, unsigned* const* __restrict__ mega_pg_flags, __nv_bfloat16* __restrict__ published_hidden_bf16, __nv_bfloat16* const* __restrict__ published_hidden_bf16_peers, int* __restrict__ published_topk_ids_i32, int* const* __restrict__ published_topk_ids_i32_peers, float* __restrict__ published_topk_weights_f32, float* const* __restrict__ published_topk_weights_f32_peers, __nv_bfloat16* __restrict__ route_terms_bf16, __nv_bfloat16* const* __restrict__ route_terms_bf16_peers);
-extern "C" __global__ void kernel_cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127(__nv_bfloat16* __restrict__ route_terms_bf16, __nv_bfloat16* __restrict__ output_bf16, int tokens_per_rank);
+extern "C" __global__ void kernel_cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3(__nv_bfloat16* __restrict__ source_hidden_bf16, long long* __restrict__ source_topk_ids_i64, float* __restrict__ source_topk_weights_f32, CakeTensorMap const* fc1_weight_e4m3, CakeTensorMap const* fc1_blocked_e8m0, CakeTensorMap const* activation_bf16, CakeTensorMap const* activation_bf16_n16, __nv_bfloat16* __restrict__ activation_bf16_ptr, CakeTensorMap const* fc2_weight_e4m3, CakeTensorMap const* fc2_blocked_e8m0, CakeTensorMap const* fc1_workspace_bf16_tma, CakeTensorMap const* fc1_workspace_bf16_tma_n16, __nv_bfloat16* __restrict__ fc1_workspace_bf16, __nv_bfloat16* __restrict__ fc2_output_bf16, int* __restrict__ route_map_i32, float* __restrict__ route_scale_f32, unsigned int* __restrict__ route_counts_u32, unsigned int* __restrict__ fc1_done, unsigned int* __restrict__ publication_done, unsigned int* __restrict__ publication_visible, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ compute_done, unsigned int* __restrict__ return_done, unsigned int* __restrict__ return_visible, int launch_epoch, int tokens_per_rank, int32_t mega_pg_world, int32_t mega_pg_rank, unsigned* const* __restrict__ mega_pg_flags, __nv_bfloat16* __restrict__ published_hidden_bf16, __nv_bfloat16* const* __restrict__ published_hidden_bf16_peers, int* __restrict__ published_topk_ids_i32, int* const* __restrict__ published_topk_ids_i32_peers, float* __restrict__ published_topk_weights_f32, float* const* __restrict__ published_topk_weights_f32_peers, __nv_bfloat16* __restrict__ route_terms_bf16, __nv_bfloat16* const* __restrict__ route_terms_bf16_peers);
+extern "C" __global__ void kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58(__nv_bfloat16* __restrict__ route_terms_bf16, __nv_bfloat16* __restrict__ output_bf16, int tokens_per_rank);
 
 
-namespace cake_host_shim_ec1e932a42d34687 {
+namespace cake_host_shim_70837c28e761d28a {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -688,7 +686,6 @@ struct PreparedLaunch {
   dim3 grid;
   dim3 block;
   void* kargs[37] = {};
-  std::vector<TensorView> retained;
 };
 
 inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16, TensorView arg_source_topk_ids_i64, TensorView arg_source_topk_weights_f32, TensorView arg_fc1_weight_e4m3, TensorView arg_fc1_blocked_e8m0, TensorView arg_activation_bf16, TensorView arg_activation_bf16_n16, TensorView arg_activation_bf16_ptr, TensorView arg_fc2_weight_e4m3, TensorView arg_fc2_blocked_e8m0, TensorView arg_fc1_workspace_bf16_tma, TensorView arg_fc1_workspace_bf16_tma_n16, TensorView arg_fc1_workspace_bf16, TensorView arg_fc2_output_bf16, TensorView arg_route_map_i32, TensorView arg_route_scale_f32, TensorView arg_route_counts_u32, TensorView arg_fc1_done, TensorView arg_publication_done, TensorView arg_publication_visible, TensorView arg_dispatch_done, TensorView arg_compute_done, TensorView arg_return_done, TensorView arg_return_visible, int64_t arg_launch_epoch, int64_t arg_tokens_per_rank, int64_t arg_mega_pg_world, int64_t arg_mega_pg_rank, TensorView arg_mega_pg_flags, TensorView arg_published_hidden_bf16, TensorView arg_published_hidden_bf16_peers, TensorView arg_published_topk_ids_i32, TensorView arg_published_topk_ids_i32_peers, TensorView arg_published_topk_weights_f32, TensorView arg_published_topk_weights_f32_peers, TensorView arg_route_terms_bf16, TensorView arg_route_terms_bf16_peers, TensorView arg_tma_descriptor_workspace, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
@@ -861,42 +858,6 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
       << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
       << ") must be divisible by cluster dims (2, 1, 1)";
 
-  prepared.retained.clear();
-  prepared.retained.reserve(34);
-  prepared.retained.push_back(arg_source_hidden_bf16);
-  prepared.retained.push_back(arg_source_topk_ids_i64);
-  prepared.retained.push_back(arg_source_topk_weights_f32);
-  prepared.retained.push_back(arg_fc1_weight_e4m3);
-  prepared.retained.push_back(arg_fc1_blocked_e8m0);
-  prepared.retained.push_back(arg_activation_bf16);
-  prepared.retained.push_back(arg_activation_bf16_n16);
-  prepared.retained.push_back(arg_activation_bf16_ptr);
-  prepared.retained.push_back(arg_fc2_weight_e4m3);
-  prepared.retained.push_back(arg_fc2_blocked_e8m0);
-  prepared.retained.push_back(arg_fc1_workspace_bf16_tma);
-  prepared.retained.push_back(arg_fc1_workspace_bf16_tma_n16);
-  prepared.retained.push_back(arg_fc1_workspace_bf16);
-  prepared.retained.push_back(arg_fc2_output_bf16);
-  prepared.retained.push_back(arg_route_map_i32);
-  prepared.retained.push_back(arg_route_scale_f32);
-  prepared.retained.push_back(arg_route_counts_u32);
-  prepared.retained.push_back(arg_fc1_done);
-  prepared.retained.push_back(arg_publication_done);
-  prepared.retained.push_back(arg_publication_visible);
-  prepared.retained.push_back(arg_dispatch_done);
-  prepared.retained.push_back(arg_compute_done);
-  prepared.retained.push_back(arg_return_done);
-  prepared.retained.push_back(arg_return_visible);
-  prepared.retained.push_back(arg_mega_pg_flags);
-  prepared.retained.push_back(arg_published_hidden_bf16);
-  prepared.retained.push_back(arg_published_hidden_bf16_peers);
-  prepared.retained.push_back(arg_published_topk_ids_i32);
-  prepared.retained.push_back(arg_published_topk_ids_i32_peers);
-  prepared.retained.push_back(arg_published_topk_weights_f32);
-  prepared.retained.push_back(arg_published_topk_weights_f32_peers);
-  prepared.retained.push_back(arg_route_terms_bf16);
-  prepared.retained.push_back(arg_route_terms_bf16_peers);
-  prepared.retained.push_back(arg_tma_descriptor_workspace);
 
   DLDevice dev = arg_source_hidden_bf16.device();
   static std::mutex smem_mu;
@@ -914,15 +875,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
       }
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16),
+            reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             76800);
-      if (smem_status == cudaSuccess) {
-        smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36),
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            76800);
-      }
       }
       smem_status_by_device->emplace(dev.device_id, smem_status);
     } else {
@@ -930,7 +885,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_source_hidden_bf16,
     }
   }
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute for kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16 failed: "
+      << "cudaFuncSetAttribute for kernel_cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3 failed: "
       << cudaGetErrorString(smem_status);
   prepared.p_source_hidden_bf16 = arg_source_hidden_bf16.data_ptr();
   prepared.p_source_topk_ids_i64 = arg_source_topk_ids_i64.data_ptr();
@@ -1037,10 +992,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(
-          prepared.v_tokens_per_rank == 32 ? kernel_cake_mxfp8_megamoe_ep16_2670aaff9ad59db52e36 : kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_mxfp8_megamoe_ep16_755cbcfb83b38527fe16 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_mxfp8_megamoe_ep16_d14a9ecdd789bcff5de3 failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -1056,7 +1010,6 @@ struct PreparedLaunch {
   dim3 grid;
   dim3 block;
   void* kargs[3] = {};
-  std::vector<TensorView> retained;
 };
 
 inline void Prepare(PreparedLaunch& prepared, TensorView arg_route_terms_bf16, TensorView arg_output_bf16, int64_t arg_tokens_per_rank, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
@@ -1075,10 +1028,6 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_route_terms_bf16, T
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
 
-  prepared.retained.clear();
-  prepared.retained.reserve(2);
-  prepared.retained.push_back(arg_route_terms_bf16);
-  prepared.retained.push_back(arg_output_bf16);
 
 
   prepared.p_route_terms_bf16 = arg_route_terms_bf16.data_ptr();
@@ -1102,9 +1051,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.dynamicSmemBytes = 0u;
   config.stream = stream;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_mxfp8_megamoe_ep16_e613768488357082ea58 failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -1185,6 +1134,11 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   TVM_FFI_CHECK(launch_epoch >= 0 && launch_epoch <= 14913079, ValueError)
       << "Cake MXFP8 MegaMoE launch_epoch must be in [0, 14913079], got "
       << launch_epoch;
+  int64_t tokens_per_rank = args[21].cast<int64_t>();
+  TVM_FFI_CHECK(tokens_per_rank >= 1 && tokens_per_rank <= 64, ValueError)
+      << "Cake MXFP8 MegaMoE tokens_per_rank must be in [1, 64]";
+  TVM_FFI_CHECK(args[13].cast<TensorView>().numel() == 96, ValueError)
+      << "Cake MXFP8 MegaMoE fc1_done has the wrong policy extent";
   DLDevice dev = args[0].cast<TensorView>().device();
   ScopedCudaDevice device_guard(dev.device_id);
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(
@@ -1202,14 +1156,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_topk_reduce::Submit(prepared_topk_reduce, stream);
 }
 
-}  // namespace cake_host_shim_ec1e932a42d34687
+}  // namespace cake_host_shim_70837c28e761d28a
 
 extern "C" {
 TVM_FFI_DLL_EXPORT int __tvm_ffi_run(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_ec1e932a42d34687::RunPacked(
+  cake_host_shim_70837c28e761d28a::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();
@@ -1218,7 +1172,7 @@ TVM_FFI_DLL_EXPORT int __tvm_ffi_setup_tma(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_ec1e932a42d34687::SetupTmaPacked(
+  cake_host_shim_70837c28e761d28a::SetupTmaPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();

@@ -30,7 +30,11 @@ from flashinfer.moe_ep import (
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", type=int, choices=(16, 32, 64), default=16)
+    parser.add_argument("--tokens", type=int, choices=range(1, 65), default=16)
+    parser.add_argument("--tile-n", choices=("mixed", "16", "32"), default="mixed")
+    parser.add_argument(
+        "--return-protocol", choices=("auto", "cta0", "all_cta"), default="auto"
+    )
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -62,7 +66,10 @@ def main() -> None:
         device=device,
     )
 
-    session = CakeMxfp8MegaMoeEp16(weights, topk_ids)
+    tile_n = "mixed" if args.tile_n == "mixed" else int(args.tile_n)
+    session = CakeMxfp8MegaMoeEp16(
+        weights, topk_ids, tile_n=tile_n, return_protocol=args.return_protocol
+    )
     output = session.run(
         hidden_states,
         topk_ids,
