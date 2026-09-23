@@ -151,6 +151,8 @@ def sink_attention_varlen_ref(
     )
 
 
+# Preserve pairwise coverage independently for each backend.
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @parametrize_product(
     {
         "dtype": [torch.float16, torch.bfloat16],
@@ -160,7 +162,6 @@ def sink_attention_varlen_ref(
         "num_kv_heads": [8, 32],
         "window_left": [-1, 128],
         "causal": [True, False],
-        "backend": ["fa2", "fa3"],
     },
     regular=pairwise_product_cases,
 )
