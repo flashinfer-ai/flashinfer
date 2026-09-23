@@ -264,7 +264,11 @@ BT16_N16_MAX_DIRECT_WAVES = 3
 BT16_MID_MIN_SEQ_LEN = 4096
 BT16_LONG_MIN_SEQ_LEN = 65536
 BT16_MID_MAX_TASKS = 32
-AFFINE_SPLIT_MAX_TASKS = 32
+# Sequence x head tasks the affine composite accepts.  The window budget
+# (``sm_count // num_heads`` windows) keeps the part grid to one wave; the cap
+# only bounds host-side plan size (8 sequences x 16 heads).
+AFFINE_SPLIT_MAX_TASKS = 128
+LEGACY_AFFINE_SPLIT_MAX_TASKS = 32
 AFFINE_SPLIT_MIN_CHUNKS = 256
 AFFINE_SPLIT_MIN_CHUNKS_PER_PART = 32
 AFFINE_SPLIT_MIN_PARTS = 8
@@ -306,6 +310,29 @@ class _PersistentM128Roofline:
     piece_ns: float
 
 
+def _affine_split_policy() -> str:
+    """``packed`` (default) or ``legacy``.
+
+    ``packed`` gates a multi-sequence call on its longest sequence: the split
+    is taken when any sequence of the pack crosses the single-sequence part
+    crossover (the sequential body's makespan is that sequence's chunk chain,
+    while the composite splits it across the window budget).  ``legacy``
+    keeps the pre-2026-09-23 gate (aggregate sequence x head tasks, 32-task
+    cap) for A/B measurement.
+    """
+    import os
+
+    return os.environ.get("FLASHINFER_KDA_AFFINE_POLICY", "packed")
+
+
+def _affine_max_tasks() -> int:
+    return (
+        LEGACY_AFFINE_SPLIT_MAX_TASKS
+        if _affine_split_policy() == "legacy"
+        else AFFINE_SPLIT_MAX_TASKS
+    )
+
+
 def _affine_split_part_count(
     *,
     sm_count: int,
@@ -325,7 +352,7 @@ def _affine_split_part_count(
         min_chunks = max(64, tasks * 8)
     if (
         tasks <= 0
-        or tasks > AFFINE_SPLIT_MAX_TASKS
+        or tasks > _affine_max_tasks()
         or 2 * tasks > sm_count
         or (chunks < min_chunks)
     ):
@@ -360,10 +387,11 @@ def _affine_split_windows(
     if (
         not sequence_lengths
         or min(sequence_lengths) <= 0
-        or tasks > AFFINE_SPLIT_MAX_TASKS
+        or tasks > _affine_max_tasks()
     ):
         raise ValueError(
-            "affine requires nonempty sequences and at most32 sequence/head tasks"
+            "affine requires nonempty sequences and at most "
+            f"{_affine_max_tasks()} sequence/head tasks"
         )
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
@@ -4852,17 +4880,40 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
         return False
-    return (
-        detect_gpu_arch() in ("sm_100a", "sm_103a")
-        and _affine_split_part_count(
-            sm_count=_device_sm_count(q.device),
-            tasks=len(lengths) * int(q.shape[2]),
-            chunks=(max(lengths) + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK,
-            fp32_indexed_state=initial_state.dtype == torch.float32,
-            shared_tf32_factors=compute_dtype == "tf32",
-            unbounded_softplus=argument(9, "lower_bound") is None,
+    if detect_gpu_arch() not in ("sm_100a", "sm_103a"):
+        return False
+    heads = int(q.shape[2])
+    crossover = dict(
+        sm_count=_device_sm_count(q.device),
+        fp32_indexed_state=initial_state.dtype == torch.float32,
+        shared_tf32_factors=compute_dtype == "tf32",
+        unbounded_softplus=argument(9, "lower_bound") is None,
+    )
+    chunk_counts = [
+        (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in lengths
+    ]
+    if len(lengths) == 1 or _affine_split_policy() == "legacy":
+        return (
+            _affine_split_part_count(
+                tasks=len(lengths) * heads, chunks=max(chunk_counts), **crossover
+            )
+            >= 2
         )
-        >= 2
+    # Packed call: the sequential body's makespan is the longest sequence's
+    # chunk chain (GB300 H16, rows every 64: ~3.7 us per chunk), while the
+    # composite costs ~0.93 ms for a 16K pack regardless of how it is split.
+    # Measured break-even is a 256-chunk (8192-token) longest member: packs
+    # with a longer member gain up to 1.5x (1000+12000+3384: 1.39 -> 0.97 ms),
+    # balanced packs below it lose (4x4096: 0.52 -> 0.96 ms).  Packs beyond
+    # half the SM count in sequence x head tasks get too few windows for the
+    # long member (6x500+13384: 1.64 -> 1.78 ms) and stay sequential.
+    tasks = len(lengths) * heads
+    if tasks > _affine_max_tasks() or 2 * tasks > crossover["sm_count"]:
+        return False
+    longest = max(chunk_counts)
+    return (
+        longest >= AFFINE_SPLIT_MIN_CHUNKS
+        and _affine_split_part_count(tasks=heads, chunks=longest, **crossover) >= 2
     )
 
 

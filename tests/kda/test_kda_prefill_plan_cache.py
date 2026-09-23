@@ -303,3 +303,43 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
     )
     _assert_same(got, want)
 
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        [3000, 13384],
+        [8192, 300],
+        [2000, 8192, 6192],
+        [1000, 12000, 3384],
+        [500, 12000, 2000, 1884],
+    ],
+)
+def test_packed_calls_take_the_affine_split_and_cache_bitwise(lengths):
+    # A pack whose longest sequence reaches the measured 8192-token break-even
+    # takes the split (the sequential body's makespan is that sequence's
+    # chain); non-first single-part sequences ride the zero carry the scan
+    # stores at sequence boundaries.  The composite plan caches and rebinds
+    # bitwise.
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs(lengths, 16, seed=21)
+    pool = d["pool"].clone()
+    call = _run(d, cache)
+    assert "affine" in str(call.schedule)
+    assert cache.uncacheable == 0 and len(cache) == 1
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    _run(d, cache)
+    assert cache.hits == 1
+    _assert_same(got, _snapshot(d))
+
+
+@pytest.mark.parametrize(
+    "lengths", [[5461, 5461, 5462], [4096] * 4, [500] * 6 + [13384], [2048] * 8]
+)
+def test_packed_calls_below_the_break_even_keep_the_sequential_body(lengths):
+    # Balanced packs below the 8192-token longest member, and packs beyond half
+    # the SM count in sequence x head tasks, are faster on the sequential body.
+    d = _inputs(lengths, 16, seed=22)
+    call = _run(d)
+    assert "affine" not in str(call.schedule)
