@@ -3369,6 +3369,7 @@ def create_correction_task(
     domain: int | cutlass.Int32,
     tmem_stats_done0: MemoryResource | None = None,
     tmem_stats_done1: MemoryResource | None = None,
+    sage_v_scales: MemoryResource | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
@@ -3382,6 +3383,7 @@ def create_correction_task(
         tmem_corr1: MemoryResource,
         tmem_stats_done0: MemoryResource | None,
         tmem_stats_done1: MemoryResource | None,
+        sage_v_scales: MemoryResource | None,
     ) -> None:
         """Schedule two-instance O correction and final output normalization."""
 
@@ -3493,6 +3495,13 @@ def create_correction_task(
         _, tail_0, tail_1 = tmem_o.init_stage_state()
         tmem_corr0.init_epilogue_state()
         tmem_corr1.init_epilogue_state()
+        if sage_v_scales is not None:
+            # ProdAcquire/ProdWork/ProdCommit: stage the work tile's V channel
+            # scales while no output is pending; the acquire waits for the
+            # previous tile's tail to release the block.
+            sage_v_scales.acquire()
+            sage_v_scales.stage_tile()
+            sage_v_scales.commit()
 
         # HEAD: drain the first softmax-local handoff. No O is corrected here;
         # this aligns the stats pipeline before loop work starts.
@@ -3575,6 +3584,9 @@ def create_correction_task(
             tail_o_stage_idx_1=tail_1,
             inst_idx=KV_INST1,
         )
+        if sage_v_scales is not None:
+            # ConsWait: every lane reads the scales the other lanes staged.
+            sage_v_scales.wait()
         tmem_corr1.correction_tail_epilogue(
             o_stage_idx=o_stage_idx,
             tail_o_stage_idx_0=tail_0,
@@ -3586,12 +3598,17 @@ def create_correction_task(
             inst1_new_max_arr=inst1_new_max_arr,
             inst1_sum_arr=inst1_sum_arr,
         )
+        if sage_v_scales is not None:
+            # ConsRelease: the tail has read the block; the next work tile
+            # may restage it.
+            sage_v_scales.release()
         # Inst1 final reduction consumes both O0 and O1, so defer O0 release
         # until after inst1 has finished reading it.
         tmem_o.release()
         tmem_o.release()
 
-    def run_correction_schedule(
+    @_schedule_with_optional_resources
+    def correction_schedule(
         tmem_softmax_local0: MemoryResource,
         tmem_softmax_local1: MemoryResource,
         tmem_o: MemoryResource,
@@ -3599,9 +3616,10 @@ def create_correction_task(
         tmem_corr1: MemoryResource,
         tmem_stats_done0: MemoryResource | None,
         tmem_stats_done1: MemoryResource | None,
+        sage_v_scales: MemoryResource | None,
         work_queue: WorkQueue | None,
     ) -> None:
-        """Wrap correction with optional stats lifetime gates."""
+        """Capture correction with its optional stats gates and scale staging."""
         _decode_work_tile_schedule(
             cfg,
             work_queue,
@@ -3613,106 +3631,38 @@ def create_correction_task(
                 tmem_corr1,
                 tmem_stats_done0,
                 tmem_stats_done1,
+                sage_v_scales,
             ),
         )
 
-    @schedule
-    def correction_schedule(
-        tmem_softmax_local0: MemoryResource,
-        tmem_softmax_local1: MemoryResource,
-        tmem_o: MemoryResource,
-        tmem_corr0: MemoryResource,
-        tmem_corr1: MemoryResource,
-        work_queue: WorkQueue | None = None,
-    ) -> None:
-        """Capture the Swaps correction schedule."""
-        run_correction_schedule(
-            tmem_softmax_local0,
-            tmem_softmax_local1,
-            tmem_o,
-            tmem_corr0,
-            tmem_corr1,
-            None,
-            None,
-            work_queue,
-        )
-
-    @schedule
-    def correction_keeps_schedule(
-        tmem_softmax_local0: MemoryResource,
-        tmem_softmax_local1: MemoryResource,
-        tmem_o: MemoryResource,
-        tmem_corr0: MemoryResource,
-        tmem_corr1: MemoryResource,
-        tmem_stats_done0: MemoryResource,
-        tmem_stats_done1: MemoryResource,
-        work_queue: WorkQueue | None = None,
-    ) -> None:
-        """Capture Keeps correction with explicit stats lifetime gates."""
-        run_correction_schedule(
-            tmem_softmax_local0,
-            tmem_softmax_local1,
-            tmem_o,
-            tmem_corr0,
-            tmem_corr1,
-            tmem_stats_done0,
-            tmem_stats_done1,
-            work_queue,
-        )
-
+    # The Keeps stats lifetime gates come as a pair; the Swaps path has none.
     if tmem_stats_done0 is None or tmem_stats_done1 is None:
-        if work_queue is None:
-            captured_schedule = correction_schedule(
-                tmem_softmax_local0,
-                tmem_softmax_local1,
-                tmem_o,
-                tmem_corr0,
-                tmem_corr1,
-            )
-        else:
-            captured_schedule = correction_schedule(
-                tmem_softmax_local0,
-                tmem_softmax_local1,
-                tmem_o,
-                tmem_corr0,
-                tmem_corr1,
-                work_queue,
-            )
-        src = [tmem_softmax_local0, tmem_softmax_local1, tmem_o]
-    else:
-        if work_queue is None:
-            captured_schedule = correction_keeps_schedule(
-                tmem_softmax_local0,
-                tmem_softmax_local1,
-                tmem_o,
-                tmem_corr0,
-                tmem_corr1,
-                tmem_stats_done0,
-                tmem_stats_done1,
-            )
-        else:
-            captured_schedule = correction_keeps_schedule(
-                tmem_softmax_local0,
-                tmem_softmax_local1,
-                tmem_o,
-                tmem_corr0,
-                tmem_corr1,
-                tmem_stats_done0,
-                tmem_stats_done1,
-                work_queue,
-            )
-        src = [
-            tmem_softmax_local0,
-            tmem_softmax_local1,
-            tmem_o,
-            tmem_stats_done0,
-            tmem_stats_done1,
-        ]
+        tmem_stats_done0 = None
+        tmem_stats_done1 = None
+    captured_schedule = correction_schedule(
+        tmem_softmax_local0,
+        tmem_softmax_local1,
+        tmem_o,
+        tmem_corr0,
+        tmem_corr1,
+        tmem_stats_done0,
+        tmem_stats_done1,
+        sage_v_scales,
+        work_queue,
+    )
+    src = [tmem_softmax_local0, tmem_softmax_local1, tmem_o]
+    if tmem_stats_done0 is not None:
+        src.extend([tmem_stats_done0, tmem_stats_done1])
+    dst = [tmem_corr0, tmem_corr1]
+    if sage_v_scales is not None:
+        # The scale block is produced and consumed by this task.
+        src.append(sage_v_scales)
+        dst.append(sage_v_scales)
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_corr0, tmem_corr1],
+        dst_resources=dst,
         q_bound_resources=((tmem_corr0, True), (tmem_corr1, True)),
         cfg=cfg,
         warp_idx=cfg.correction_warp_idx,
@@ -3733,6 +3683,7 @@ def create_correction_task_one_inst_qkv(
     *,
     tmem_stats_done: MemoryResource,
     domain: int | cutlass.Int32,
+    sage_v_scales: MemoryResource | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
@@ -3743,6 +3694,7 @@ def create_correction_task_one_inst_qkv(
         tmem_o: MemoryResource,
         tmem_corr: MemoryResource,
         tmem_stats_done: MemoryResource,
+        sage_v_scales: MemoryResource | None,
     ) -> None:
         """Schedule one-inst O correction and final output normalization."""
 
@@ -3848,6 +3800,13 @@ def create_correction_task_one_inst_qkv(
         local_state = tmem_softmax_local.init_stats_state()
         _, tail_0, tail_1 = tmem_o.init_stage_state()
         tmem_corr.init_epilogue_state()
+        if sage_v_scales is not None:
+            # ProdAcquire/ProdWork/ProdCommit: stage the work tile's V channel
+            # scales while no output is pending; the acquire waits for the
+            # previous tile's tail to release the block.
+            sage_v_scales.acquire()
+            sage_v_scales.stage_tile()
+            sage_v_scales.commit()
 
         # HEAD: drain the first stats handoff. The first payload only seeds
         # the correction state; there is no prior O stage to rescale.
@@ -3885,6 +3844,9 @@ def create_correction_task_one_inst_qkv(
             tail_o_stage_idx_1=tail_1,
             inst_idx=KV_INST0,
         )
+        if sage_v_scales is not None:
+            # ConsWait: every lane reads the scales the other lanes staged.
+            sage_v_scales.wait()
         # ProdWork: tail phase normalizes and stores final O.
         tmem_corr.correction_tail_epilogue(
             o_stage_idx=o_stage_idx,
@@ -3897,16 +3859,21 @@ def create_correction_task_one_inst_qkv(
             inst1_new_max_arr=inst_new_max_arr,
             inst1_sum_arr=inst_sum_arr,
         )
+        if sage_v_scales is not None:
+            # ConsRelease: the tail has read the block; the next work tile
+            # may restage it.
+            sage_v_scales.release()
         # ConsRelease: the final O stage is no longer needed.
         tmem_o.release()
 
-    @schedule
+    @_schedule_with_optional_resources
     def correction_schedule(
         tmem_softmax_local: MemoryResource,
         tmem_o: MemoryResource,
         tmem_corr: MemoryResource,
         tmem_stats_done: MemoryResource,
-        work_queue: WorkQueue | None = None,
+        sage_v_scales: MemoryResource | None,
+        work_queue: WorkQueue | None,
     ) -> None:
         """Wrap one-inst correction in packed persistent skip handling."""
         _decode_work_tile_schedule(
@@ -3917,31 +3884,29 @@ def create_correction_task_one_inst_qkv(
                 tmem_o,
                 tmem_corr,
                 tmem_stats_done,
+                sage_v_scales,
             ),
         )
 
-    schedule_result = (
-        correction_schedule(
-            tmem_softmax_local,
-            tmem_o,
-            tmem_corr,
-            tmem_stats_done,
-        )
-        if work_queue is None
-        else correction_schedule(
-            tmem_softmax_local,
-            tmem_o,
-            tmem_corr,
-            tmem_stats_done,
-            work_queue,
-        )
+    schedule_result = correction_schedule(
+        tmem_softmax_local,
+        tmem_o,
+        tmem_corr,
+        tmem_stats_done,
+        sage_v_scales,
+        work_queue,
     )
     src = [tmem_softmax_local, tmem_o, tmem_stats_done]
+    dst = [tmem_corr]
+    if sage_v_scales is not None:
+        # The scale block is produced and consumed by this task.
+        src.append(sage_v_scales)
+        dst.append(sage_v_scales)
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_corr],
+        dst_resources=dst,
         q_bound_resources=((tmem_corr, True),),
         cfg=cfg,
         warp_idx=cfg.correction_warp_idx,

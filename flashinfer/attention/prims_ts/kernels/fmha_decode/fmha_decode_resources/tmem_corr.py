@@ -88,12 +88,7 @@ from .helpers_softmax import (
     _attention_sink_for_scale_idx,
     _pack_float4_to_fp8_e4m3,
 )
-from .sage_scales import (
-    SageScaleTensors,
-    load_staged_v_channel_scales,
-    stage_v_channel_scales,
-    staged_v_channel_scale_entries,
-)
+from .sage_scales import SageVScalesResource
 from .smem_p import SmemPResource
 from .tmem_softmax_stats import TmemSoftmaxLocalResource
 
@@ -127,7 +122,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     partial_stats_ptr: cute.Pointer = None
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
-    scale_tensors: SageScaleTensors | None = None
+    # The correction task's staged ``sfV`` / ``v_mean`` resource; ``None``
+    # without Sage attention.
+    sage_v_scales: SageVScalesResource | None = None
     seqlens_kv: cute.Pointer = None
     max_seq_len_kv: Constexpr[int] = 0
     seq_len_q: Int32 = None
@@ -158,7 +155,6 @@ class TmemCorrResource(DecodeGenResourceBase):
     _cluster_mbarrier: cutlass.Array = None
     _kv_tile_256_exchange_alloc: Constexpr[SmemAllocation | None] = None
     _kv_tile_256_exchange: cutlass.Array = None
-    _sage_v_scale_alloc: Constexpr[SmemAllocation | None] = None
     _sage_v_scales: cutlass.Array = None
 
     def get_o_stage_dtype_bytes(self) -> int:
@@ -220,7 +216,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             self._kv_tile_256_exchange_entries(),
         )
         self._sage_v_scales = _placeholder_smem_array(
-            Float32, max(staged_v_channel_scale_entries(self.cfg), 1)
+            Float32,
+            self.sage_v_scales.entries if self.sage_v_scales is not None else 1,
         )
 
     def _owns_final_epilogue(self) -> bool:
@@ -345,15 +342,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                 size_bytes=self._kv_tile_256_exchange_entries() * 4,
                 alignment=16,
             )
-        if self.cfg.use_sage_attention and self._sage_v_scale_alloc is None:
-            # One KV head's per-channel V scales and means, staged once per
-            # work tile so the output store reads SMEM instead of waiting on
-            # global loads at the tile tail.
-            self._sage_v_scale_alloc = SmemAllocation(
-                name=f"{self.name}_sageVScales",
-                size_bytes=staged_v_channel_scale_entries(self.cfg) * 4,
-                alignment=16,
-            )
         allocs = []
         if self._alloc is not None:
             allocs.append(self._alloc)
@@ -369,8 +357,6 @@ class TmemCorrResource(DecodeGenResourceBase):
             allocs.append(self._cluster_mbarrier_alloc)
         if self._kv_tile_256_exchange_alloc is not None:
             allocs.append(self._kv_tile_256_exchange_alloc)
-        if self._sage_v_scale_alloc is not None:
-            allocs.append(self._sage_v_scale_alloc)
         return allocs
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
@@ -967,8 +953,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         Sage attention multiplies column ``c`` by ``norm_scale * sfV[c]`` and
         adds ``v_mean[c]`` when V was quantized around its channel mean, so the
         normalization is consumed here and the caller continues with a unit
-        scale. The scales come from the SMEM copy staged by
-        ``init_epilogue_state``. Without Sage attention the values and
+        scale. The scales come from the block the correction task's
+        ``SageVScalesResource`` staged for the work tile and waited on before
+        the tail. Without Sage attention the values and
         ``norm_scale`` pass through untouched.
 
         Empty attention rows have no V contribution, so their channel mean
@@ -982,11 +969,8 @@ class TmemCorrResource(DecodeGenResourceBase):
         cfg = self.cfg
         if cutlass.const_expr(not cfg.use_sage_attention):
             return norm_scale
-        v_scales, v_means = load_staged_v_channel_scales(
-            cfg,
-            self._sage_v_scales,
-            first_col=first_col,
-            count=count,
+        v_scales, v_means = self.sage_v_scales.channel_scales(
+            self._sage_v_scales, first_col=first_col, count=count
         )
         if cutlass.const_expr(cfg.sage_v_mean):
             if not row_has_mass:
@@ -1360,45 +1344,19 @@ class TmemCorrResource(DecodeGenResourceBase):
         if cutlass.const_expr(
             context is not None
             and context.smem_base is not None
-            and self._sage_v_scale_alloc is not None
+            and self.sage_v_scales is not None
         ):
-            self._sage_v_scales = cutlass.Array(
-                context.smem_base.data_ptr() + self._sage_v_scale_alloc.offset,
-                dtype=Float32,
-                shape=(staged_v_channel_scale_entries(self.cfg),),
-                addrspace=3,
-            )
+            self._sage_v_scales = self.sage_v_scales.staged(context)
         return {}
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def init_epilogue_state(self, stage_info: StageInfo) -> None:
-        """Stage the work tile's Sage V channel scales before the stats pipeline.
-
-        Function variables are materialized before ``TaskManager.run()`` so
-        cluster mbarriers are visible before peer async stores; this slot
-        keeps the captured schedule structure and, with Sage attention, lets
-        the epilogue owner copy the tile's KV head ``sfV`` and ``v_mean`` into
-        SMEM while no output is pending. The KV256 tail orders the copy before
-        its reads with the stats exchange barrier and protects the next tile's
-        copy with its closing barrier; the Q128 tail adds both barriers itself.
-        """
-        # ProdAuxWork: no pipeline resource is touched here.
-        cfg = self.cfg
-        if cutlass.const_expr(
-            not (cfg.use_sage_attention and self._owns_final_epilogue())
-        ):
-            return
-        task_cache = _decode_gen_task_cache(stage_info)
-        logical_h_k_idx, _ = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
-        stage_v_channel_scales(
-            cfg,
-            self.scale_tensors,
-            self._sage_v_scales,
-            kv_head_idx=logical_h_k_idx,
-            thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],
-            num_threads=cfg.correction_barrier_threads,
-        )
+        """Preserve the correction init schedule slot after eager SMEM binding."""
+        # ProdAuxWork: function variables are materialized before TaskManager.run()
+        # so cluster mbarriers are visible before peer async stores. Keep this as
+        # a captured-schedule placeholder for existing task structure.
+        return
 
     @cute.jit
     def _sync_gmem_split_reducers(
@@ -3551,13 +3509,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                     )
             return
 
-        if cutlass.const_expr(cfg.use_sage_attention):
-            # Every lane reads all staged V channel scales written by the
-            # other correction lanes in init_epilogue_state.
-            prims.barrier_cta_sync(
-                self.store_barrier_id,
-                thread_count=cfg.correction_barrier_threads,
-            )
         regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
         for store_idx in cutlass.range_constexpr(output_pair_regs // 4):
             chunk_col = store_idx * 8
@@ -3670,12 +3621,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                         regs_o_chunk.data_ptr().load(count=4, alignment=4),
                         alignment=16,
                     )
-        if cutlass.const_expr(cfg.use_sage_attention):
-            # The next persistent work tile restages the scales in place.
-            prims.barrier_cta_sync(
-                self.store_barrier_id,
-                thread_count=cfg.correction_barrier_threads,
-            )
         return
 
     @cute.jit

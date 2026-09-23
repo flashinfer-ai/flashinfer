@@ -102,6 +102,7 @@ from .fmha_decode_resources.sage_scales import (
     SAGE_K_SCALES_RING_STAGES,
     SageKScalesResource,
     SageScaleTensors,
+    SageVScalesResource,
 )
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
@@ -1188,6 +1189,27 @@ def _build_decode_gen_schedule(
             name="smemKv",
         )
 
+    # The work tile's ``sfV`` / ``v_mean`` block is a resource the correction
+    # task produces and consumes itself through a one-stage pipeline of the
+    # correction warps: staged at the start of the tile, read by the tail.
+    sage_v_scales = None
+    if cfg.use_sage_attention:
+        sage_v_scales = SageVScalesResource(
+            pipeline_config=PipelineConfig(
+                num_stages=1,
+                num_bytes=0,
+                producer_group=correction_grp,
+                consumer_group=correction_grp,
+                pipeline_type=PipelineType.AsyncAsync,
+                cta_layout_vmnk=cta_layout,
+                advance_on_wait=True,
+            ),
+            cfg=cfg,
+            scale_tensors=sage_scale_tensors,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            name="sageVScales",
+        )
     # Each softmax instance's ``sfK`` words are a resource the softmax task
     # produces and consumes itself; the S and P resources read it one
     # fragment at a time. The SMEM form is a two-stage pipeline whose producer
@@ -1429,7 +1451,7 @@ def _build_decode_gen_schedule(
         active_splits_kv=active_splits_kv,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
-        scale_tensors=sage_scale_tensors,
+        sage_v_scales=sage_v_scales,
     )
     tmem_corr1 = TmemCorrResource(
         inst_id=1,
@@ -1453,7 +1475,7 @@ def _build_decode_gen_schedule(
         active_splits_kv=active_splits_kv,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr1",
-        scale_tensors=sage_scale_tensors,
+        sage_v_scales=sage_v_scales,
     )
     tmem_corr1.smem_p0_ref = smem_p0
     tmem_corr1.smem_p1_ref = smem_p1
@@ -1521,6 +1543,8 @@ def _build_decode_gen_schedule(
     smem_resources.append(tmem_corr0)
     if not use_one_inst_qkv:
         smem_resources.append(tmem_corr1)
+    if sage_v_scales is not None:
+        smem_resources.append(sage_v_scales)
 
     def allocate_smem() -> tuple[SmemAllocator, SmemAllocation | None]:
         allocator = SmemAllocator()
@@ -1837,6 +1861,7 @@ def _build_decode_gen_schedule(
             work_queue,
             cfg,
             tmem_stats_done=tmem_stats_done0,
+            sage_v_scales=sage_v_scales,
             domain=corr_domain,
             domain_bias=0,
             **task_runtime_kwargs,
@@ -1853,6 +1878,7 @@ def _build_decode_gen_schedule(
             domain=corr_domain,
             tmem_stats_done0=tmem_stats_done0,
             tmem_stats_done1=tmem_stats_done1,
+            sage_v_scales=sage_v_scales,
             domain_bias=0,
             **task_runtime_kwargs,
         )

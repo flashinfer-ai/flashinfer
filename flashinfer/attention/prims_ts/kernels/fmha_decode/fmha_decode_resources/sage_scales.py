@@ -73,6 +73,24 @@ gathers ``k_summary_scale`` from the route's staged atom origins. A mixed
 plan holds two resources per instance, one per geometry, each routing its own
 array; the route kind, uniform across the CTA, selects which one serves the
 tile, and the other one leaves its array at ones.
+
+The per-channel V scales of one KV head are the second resource of this
+module, :class:`SageVScalesResource`.
+
+Sage attention dequantizes the output tile per V channel: column ``c`` is
+multiplied by ``sfV[c]`` and, when V was quantized around its channel mean,
+``v_mean[c]`` is added back. The correction task copies the work tile's KV
+head's scales and means into SMEM once, at the start of the tile while no
+output is pending, so the tile tail reads SMEM instead of waiting on global
+loads.
+
+:class:`SageVScalesResource` owns that SMEM block and the pipeline that
+orders it. The correction task produces and consumes it itself through a
+one-stage pipeline of the correction warps: the acquire waits until the
+previous tile's tail has released the block, ``stage_tile`` (producer work)
+copies the scales with every correction thread, the commit publishes them,
+the wait before the tail epilogue makes the stores of the other lanes
+visible, and the release after the last read lets the next tile restage.
 """
 
 from collections.abc import Callable
@@ -813,3 +831,77 @@ class SageKScalesResource(DecodeGenResourceBase):
             groups = self.groups
             for entry in cutlass.range_constexpr(self.arr_size - groups):
                 view[entry] = Float32(view[entry + groups])
+
+
+@dataclass(kw_only=True)
+class SageVScalesResource(DecodeGenResourceBase):
+    """The staged ``sfV`` and ``v_mean`` of the work tile's KV head.
+
+    ``scale_tensors`` carries the plan's ``[Hkv, D]`` FP32 V scales and, when
+    the recipe restores a channel mean, the means. The pipeline is the
+    correction warps' own one-stage pipeline.
+    """
+
+    cfg: Constexpr[FmhaDecodeConfig] = None
+    scale_tensors: SageScaleTensors | None = None
+    h_k_idx: Int32 | None = None
+    b_idx: Int32 | None = None
+    _alloc: Constexpr[SmemAllocation | None] = None
+
+    @property
+    def entries(self) -> int:
+        """Return the FP32 entries of the block: the scales, then the means."""
+        return staged_v_channel_scale_entries(self.cfg)
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Allocate the one-stage block of scales and means."""
+        if self._alloc is None:
+            self._alloc = SmemAllocation(
+                name=self.name,
+                size_bytes=self.entries * 4,
+                alignment=16,
+            )
+        return [self._alloc]
+
+    def get_tmem_requirements(self) -> list[TmemAllocation]:
+        """The scales live in SMEM only."""
+        return []
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def stage_tile(self, stage_info: StageInfo) -> None:
+        """Copy the work tile's KV head scales and means into the acquired block."""
+        cfg = self.cfg
+        task_cache = _decode_gen_task_cache(stage_info)
+        kv_head_idx, _ = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
+        stage_v_channel_scales(
+            cfg,
+            self.scale_tensors,
+            self.staged(stage_info.context),
+            kv_head_idx=kv_head_idx,
+            thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],
+            num_threads=cfg.correction_barrier_threads,
+        )
+
+    @cute.jit
+    def staged(self, context: ResourceContext) -> cutlass.Array:
+        """Return the block as an FP32 SMEM array."""
+        return cutlass.Array(
+            context.smem_base.data_ptr() + self._alloc.offset,
+            dtype=Float32,
+            shape=(self.entries,),
+            addrspace=3,
+        )
+
+    @cute.jit
+    def channel_scales(
+        self, staged: cutlass.Array, *, first_col: Int32, count: Constexpr[int]
+    ) -> tuple[cutlass.Array, cutlass.Array]:
+        """Return ``count`` scales and means from ``first_col`` of the waited block.
+
+        Without ``sage_v_mean`` the means are zero so callers apply one fused
+        multiply-add.
+        """
+        return load_staged_v_channel_scales(
+            self.cfg, staged, first_col=first_col, count=count
+        )
