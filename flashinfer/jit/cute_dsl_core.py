@@ -225,11 +225,16 @@ class JitSpecCuteDsl(JitSpec):
         is best-effort (``build()`` logs and continues on failure) and the
         on-disk cache can be disabled outright.
         """
-        if self.object_path.exists():
+        from filelock import FileLock
+
+        # Under the module lock: a sibling with a different expected_meta can
+        # wipe the directory between the check and the read.
+        with FileLock(self.module_lock_path, thread_local=False):
+            if self.object_path.exists():
+                return self._load_from_disk()
+            if self._compiled_kernel is not None:
+                return self._compiled_kernel
             return self._load_from_disk()
-        if self._compiled_kernel is not None:
-            return self._compiled_kernel
-        return self._load_from_disk()
 
     def _load_from_disk(self) -> Any:
         import cutlass.cute as cute
