@@ -4,9 +4,7 @@ The current implementation combines the FP8 tree merged by #4688
 (`9a791d724f382673eec291e018e7eca2f845832e`, final PR head
 `c969e2c19f4404a507d9c153cd217d16fe475008`) with the local fused Humming
 MXFP4 overlay, on main including the FP8 update from #5338
-(`28fae4f2e0ce6b7d9230f828291ca96aa0473ec9`). Both PRs are already in main;
-the older pinned base below is historical provenance, not an outstanding
-dependency.
+(`28fae4f2e0ce6b7d9230f828291ca96aa0473ec9`). Both PRs are already in main.
 
 ## Current local overlay
 

@@ -846,7 +846,7 @@ def resolve_hopper_mxfp4_knobs(
     from .knob_cache import lookup_knobs
     from .mxfp4_tuner import (
         hopper_mxfp4_cache_provenance_sha256,
-        hopper_mxfp4_ordered_candidates,
+        _ordered_base_candidates,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
     )
@@ -886,7 +886,7 @@ def resolve_hopper_mxfp4_knobs(
     # Prefer the bucket winner when legal; smaller shapes may require the
     # first legal tactic in the stable manifest union instead.
     return _validate_complete_mxfp4_tactic(
-        hopper_mxfp4_ordered_candidates(
+        _ordered_base_candidates(
             num_max_tokens,
             hidden=hidden,
             intermediate=intermediate,

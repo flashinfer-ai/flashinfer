@@ -104,7 +104,6 @@ MXFP4_BACKEND = "sm90_fp8_mxfp4_bf16_pull_cutedsl"
 SUPPORTED_BACKENDS = (FP8_BACKEND, MXFP4_BACKEND)
 ROUTING_SEED = 1234
 ACTIVATION_AND_TOPK_WEIGHT_SEED_BASE = 42
-MXFP4_WEIGHT_SEED_BASE = 0x4D584650
 FP8_WEIGHT_SEED_BASE = 13
 
 # Phase-A known-correct baseline. These fields are passed explicitly to the
@@ -117,11 +116,6 @@ MXFP4_CLUSTER = (1, 1, 1)
 MXFP4_PINGPONG = False
 MXFP4_TOKEN_BACK = "epi_warps"
 
-# Raw E8M0 bytes encode powers of two as 2**(e-127). A compact, finite span
-# gives realistic small weights and stays well inside Humming's range-11
-# contract; the payload itself still samples every legal E2M1 nibble code.
-MXFP4_E8M0_MIN = 118
-MXFP4_E8M0_MAX_EXCLUSIVE = 124
 E4M3_MAX = 448.0
 # Static per-tensor calibration scalars (identical on every EP rank by the
 # kernel's dequant contract) — same derivation as the multirank parity test:
@@ -987,65 +981,17 @@ def _make_point_inputs(args, tokens: int, rank: int, world_size: int, device):
     return hidden_states, topk_ids, topk_weights.to(torch.float32)
 
 
-def _raw_mxfp4_shapes(
-    *, local_experts: int, hidden: int, intermediate: int
-) -> dict[str, tuple[int, int, int]]:
-    if local_experts <= 0:
-        raise ValueError("local_experts must be positive")
-    if hidden <= 0 or hidden % 128:
-        raise ValueError("MXFP4 hidden must be a positive multiple of 128")
-    if intermediate <= 0 or intermediate % 128:
-        raise ValueError("MXFP4 intermediate must be a positive multiple of 128")
-    return {
-        "w13": (local_experts, 2 * intermediate, hidden // 2),
-        "w13_scale": (local_experts, 2 * intermediate, hidden // 32),
-        "w2": (local_experts, hidden, intermediate // 2),
-        "w2_scale": (local_experts, hidden, intermediate // 32),
-    }
-
-
 def _make_raw_mxfp4_weights(args, local_experts: int, rank: int, device):
-    """Deterministic canonical packed E2M1 payload + raw K32 E8M0 scales."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl.tuner import (
+        create_tuning_weights,
+    )
 
-    import torch
-
-    from flashinfer.moe_ep.weights import PrequantizedMoEWeights
-
-    shapes = _raw_mxfp4_shapes(
+    return create_tuning_weights(
         local_experts=local_experts,
         hidden=args.hidden,
         intermediate=args.intermediate,
-    )
-    generator = torch.Generator(device=device).manual_seed(
-        MXFP4_WEIGHT_SEED_BASE + rank
-    )
-
-    def payload(name: str) -> torch.Tensor:
-        # Every uint8 is exactly two canonical E2M1 nibbles.
-        return torch.randint(
-            0,
-            256,
-            shapes[name],
-            dtype=torch.uint8,
-            device=device,
-            generator=generator,
-        )
-
-    def exponent(name: str) -> torch.Tensor:
-        return torch.randint(
-            MXFP4_E8M0_MIN,
-            MXFP4_E8M0_MAX_EXCLUSIVE,
-            shapes[name],
-            dtype=torch.uint8,
-            device=device,
-            generator=generator,
-        )
-
-    return PrequantizedMoEWeights(
-        w13=payload("w13"),
-        w2=payload("w2"),
-        w13_scale=exponent("w13_scale"),
-        w2_scale=exponent("w2_scale"),
+        rank=rank,
+        device=device,
     )
 
 

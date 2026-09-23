@@ -23,7 +23,7 @@ from .mxfp4_tuner import (
     MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
     MXFP4_TUNING_TOKEN_BUCKETS,
     hopper_mxfp4_default_tactic,
-    hopper_mxfp4_ordered_candidates,
+    _ordered_base_candidates,
     validate_hopper_mxfp4_tactic,
 )
 
@@ -224,7 +224,7 @@ def hopper_mxfp4_optimization_candidates(
     Token capacity only orders the existing geometry candidates. It never
     changes strategy eligibility or selects an alternate source tree.
     """
-    base = hopper_mxfp4_ordered_candidates(
+    base = _ordered_base_candidates(
         max_tokens,
         hidden=hidden,
         intermediate=intermediate,

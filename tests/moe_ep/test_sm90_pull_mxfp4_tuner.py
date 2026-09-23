@@ -1,57 +1,38 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as sm90_mega
-
-import pytest
-
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
     normalize_sm90_routing_profile,
 )
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-    MXFP4_TUNING_PROVENANCE,
     autotune as autotune_module,
     hopper_mxfp4,
     knob_cache,
     mxfp4_tuner,
-    MXFP4_TUNING_TOKEN_BUCKETS,
-    hopper_mxfp4_candidate_records,
-    hopper_mxfp4_candidates,
-    hopper_mxfp4_candidates_for_shape,
-    hopper_mxfp4_default_tactic,
-    hopper_mxfp4_ordered_candidates,
-    hopper_mxfp4_tuning_manifest,
-    is_valid_hopper_mxfp4_tactic,
-    validate_hopper_mxfp4_tactic,
 )
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
-    MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
-    MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE,
-    MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
-    MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
-    MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE,
     MXFP4_TUNING_ROUTING_PROFILES,
+    MXFP4_TUNING_TOKEN_BUCKETS,
+    _base_candidates,
+    _ordered_base_candidates,
     hopper_mxfp4_cache_provenance_sha256,
-    hopper_mxfp4_tuning_provenance,
-    hopper_mxfp4_runtime_candidates,
-    hopper_mxfp4_runtime_candidates_for_shape,
+    hopper_mxfp4_default_tactic,
     is_hopper_mxfp4_tactic_shape_compatible,
     normalize_hopper_mxfp4_routing_profile,
+    validate_hopper_mxfp4_tactic,
 )
-
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
     expand_mxfp4_optimization_candidates,
     hopper_mxfp4_optimization_candidates,
@@ -60,465 +41,379 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
     resolve_mxfp4_tactic_optimizations,
 )
 
-
-_EXPECTED_BLOCK_PROVENANCE = {
-    "artifact_manifest_sha256": "852cbb019a17a9e76991b4f82b5ae64fb3df3245f6e72ec43a20bb407cbbd477",
-    "candidate_union_sha256": "dce1c6e5f22ac482928ebc2b07ba682665a41464ae44f367c306d2065c3b1926",
-    "domain_sha256": "bff57fb6a658b968e40a8f0c0ec7b4d3e52392070905dae574de808cdeccc6ba",
-    "external_schema_version": 1,
-    "input_recipe_sha256": "ca6258b91b1b64a7953d9c4e1376f6503085df0af856845b0844f6e4a7829de8",
-    "policy_sha256": "d3349c7ca1976b02ab076dcd87617de7552164d640481d7d614256d70da9a4cf",
-    "routing_identity_sha256": "bedd230fa8afa768cc841438a91c0156de8fa6954f1af4ebbcb471478805190b",
-    "runtime_manifest_sha256": "94ae92677c24630f28192d5df57704ff3ca7d6d94e9a24ebf46b761c198d9bf8",
-    "source_manifest_sha256": "1081ba172754b107a9ab2360a6fac8d2e854fd5c1fc45305b571c935885d5277",
-    "workload_recipe_sha256": "f4381c345df95b7da21bbe27766427aa5723aefa64f842c04c95fafae7f53352",
-}
-
-_EXPECTED_BLOCK_RUNTIME_SHA256 = _EXPECTED_BLOCK_PROVENANCE["runtime_manifest_sha256"]
-_EXPECTED_BLOCK_CANDIDATE_UNION_SHA256 = _EXPECTED_BLOCK_PROVENANCE[
-    "candidate_union_sha256"
-]
-
-_EXPECTED_WINNER_IDS = {
-    8: "e66dbeaf780401025f44e6543492740a0a0471a0edea7548ada45b7f42a06420",
-    32: "f3f218e0009b41b3f0a2aef60cde244c1faf1d1988e6cd71e7d56020006ca50e",
-    64: "c8ce6c465c70a34b5c1f5923319d07753efb199bdd164e352239bf53925c61a7",
-    128: "0a635083f8a826f49f3bc5bbdcbcab108d93e880ffc86335d7d490668d01d8e8",
-    256: "0fc1560a23803ffe743e1a6e3f0ecbe5dad93f544066cbe74e4a81b5d21e730a",
-    512: "f573e32fe8c9c8d94754fd7002be6544925c063e77e461290d83505dad8d9c8b",
-    1024: "851b0aa827a934c5e94fee613460b35b2ff19c38c0edf6884ef0f1ba9aa63eb7",
-    2048: "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
-}
-_EXPECTED_BLOCK_CANDIDATE_IDS = tuple(sorted(_EXPECTED_WINNER_IDS.values()))
-
-_EXPECTED_FUSED_RUNTIME_CANDIDATE_IDS = (
-    "0a635083f8a826f49f3bc5bbdcbcab108d93e880ffc86335d7d490668d01d8e8",
-    "0fc1560a23803ffe743e1a6e3f0ecbe5dad93f544066cbe74e4a81b5d21e730a",
-    "1630f29e2346f2d817477c82aa520672961445712ec504cd8591581169e5c626",
-    "170e811b97e04d5e5a2795335891fd647a404a6e8bc24f1cf4b5c701e293c8aa",
-    "38265fb512a81b2b69d9ca7b156601a3e5363b2e15ba237615a9f4d3900813d6",
-    "3df511dac7954f726e9002cb3cbbe86ce5b5479ca43e243a0d890cc48f6921d2",
-    "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
-    "78a5836d443416669b66535372b920ffe1dfe252903d350afdc12699f7b5046e",
-    "851b0aa827a934c5e94fee613460b35b2ff19c38c0edf6884ef0f1ba9aa63eb7",
-    "89927bf6af211d5047bc8a2e6be10ae892c65c85d2848ade50c742a47df3ee56",
-    "b66df770384bc5c406d13b0d71d6f701aec6879498ed9d9e2edc209db6522c2f",
-    "c8ce6c465c70a34b5c1f5923319d07753efb199bdd164e352239bf53925c61a7",
-    "e2c39aa656b37beeb8dbc5a1533ede68a09fe7fb1101581bfab210a63c207b1f",
-    "e66dbeaf780401025f44e6543492740a0a0471a0edea7548ada45b7f42a06420",
-    "f3f218e0009b41b3f0a2aef60cde244c1faf1d1988e6cd71e7d56020006ca50e",
-    "f573e32fe8c9c8d94754fd7002be6544925c063e77e461290d83505dad8d9c8b",
-    "f9e97da647c04c0999bb38fe7a5c26c30e74060e856b037c90a1bd661136c341",
-)
-_FOLDED_FUSED_CANDIDATE_IDS = {
-    "851b0aa827a934c5e94fee613460b35b2ff19c38c0edf6884ef0f1ba9aa63eb7",
-    "f573e32fe8c9c8d94754fd7002be6544925c063e77e461290d83505dad8d9c8b",
-    "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
-}
-
-_EXPECTED_EXACT_ARTIFACT_SHA256 = (
-    "62733c7605f7233ac81c341084e0d589f4a91ca3f1aaaf1fac0660f7d1842a61"
+_OPTIMIZATION_SHAPE = dict(
+    hidden=7168, intermediate=3072, num_experts=384, world_size=4
 )
 
-_EXPECTED_EXACT_RUNTIME_SHA256 = (
-    "f4112c7d0d7ead640239c1df3d7f4af74e2a1fb35cf5e821edd1beba9bba3e99"
-)
-
-_EXPECTED_EXACT_CANDIDATE_IDS = (
-    "1ab53d2740841966553b91b615f8e600b59afb1b9f4d5ab7c4ba5f6261daba16",
-    "489f2dde9c54076b5d1b8f040f7ad67416066cc379c339509d6b9e6746a398c9",
-    "79ed474eb1b459fd6e934edfc0fcddb81470ee36a7f356a2b291c63aa0e36e02",
-    "7e8b06c53cb13fb0cc356f05f927472f74d2ad1cf71ec3858b3f04088f538cd7",
-    "8f0b7bffc6d79127d296b90bafdd11c43509a156b304ef70f75d35352ec59676",
-    "d606939892f020b7e7527235737cb37adbbad233da8fd6a314c09876104ad114",
-    "de1e74bcd73b339753d2ad90ad2165b93d835ee50712fe87d7cdd610ea05b6d4",
-)
-
-_EXPECTED_EXACT_WINNER_IDS = {
-    8: "8f0b7bffc6d79127d296b90bafdd11c43509a156b304ef70f75d35352ec59676",
-    32: "489f2dde9c54076b5d1b8f040f7ad67416066cc379c339509d6b9e6746a398c9",
-    64: "489f2dde9c54076b5d1b8f040f7ad67416066cc379c339509d6b9e6746a398c9",
-    128: "de1e74bcd73b339753d2ad90ad2165b93d835ee50712fe87d7cdd610ea05b6d4",
-    256: "7e8b06c53cb13fb0cc356f05f927472f74d2ad1cf71ec3858b3f04088f538cd7",
-    512: "1ab53d2740841966553b91b615f8e600b59afb1b9f4d5ab7c4ba5f6261daba16",
-    1024: "79ed474eb1b459fd6e934edfc0fcddb81470ee36a7f356a2b291c63aa0e36e02",
-    2048: "d606939892f020b7e7527235737cb37adbbad233da8fd6a314c09876104ad114",
-}
-
-_H20_FUSED_RUNTIME_ANCHOR_IDS = {
-    "1630f29e2346f2d817477c82aa520672961445712ec504cd8591581169e5c626",
-    "89927bf6af211d5047bc8a2e6be10ae892c65c85d2848ade50c742a47df3ee56",
-}
-_EXPECTED_FUSED_RUNTIME_CANDIDATE_UNION_SHA256 = (
-    "103cb31f7cbcc44ced8264689d66735386c7ee0df717898d514321d9fb735526"
-)
-_FUSED_LAYOUT_FIELDS = {
+_DEFAULT_FIELDS = (
+    "mma_tiler_mnk",
+    "cluster_shape_mnk",
+    "group_hint",
+    "num_sched_stages",
+    "pingpong",
+    "load_balance_mode",
+    "token_back_mode",
     "dedup_dispatch",
-    "grouped_token_back",
-    "combine_format",
     "active_dispatch_warps",
     "fc1_store_offload",
     "fc1_early_done_publish",
     "fold_producer_warps",
+)
+_EXPECTED_DEFAULTS = {
+    "block_permutation_v1": (
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            132,
+            1,
+            False,
+            "static",
+            "epi_warps",
+            False,
+            4,
+            True,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            132,
+            1,
+            False,
+            "static",
+            "epi_warps",
+            True,
+            4,
+            True,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            132,
+            1,
+            False,
+            "static",
+            "epi_warps",
+            False,
+            1,
+            True,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            512,
+            1,
+            False,
+            "static",
+            "epi_warps",
+            True,
+            2,
+            True,
+            False,
+            False,
+        ),
+        (
+            (256, 32, 128),
+            (1, 1, 1),
+            330,
+            1,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            2,
+            True,
+            False,
+            False,
+        ),
+        (
+            (256, 64, 256),
+            (2, 1, 1),
+            512,
+            1,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            True,
+            1,
+            False,
+            True,
+            True,
+        ),
+        (
+            (256, 64, 256),
+            (2, 1, 1),
+            528,
+            2,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            1,
+            False,
+            True,
+            True,
+        ),
+        (
+            (256, 64, 256),
+            (2, 1, 1),
+            512,
+            1,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            1,
+            False,
+            True,
+            True,
+        ),
+    ),
+    "published_exact_balanced_v1": (
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            396,
+            1,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            512,
+            1,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            512,
+            1,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            512,
+            2,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (256, 16, 256),
+            (2, 1, 1),
+            396,
+            2,
+            False,
+            "static",
+            "epi_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (256, 32, 128),
+            (2, 1, 1),
+            396,
+            2,
+            False,
+            "atomic_counter",
+            "epi_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (128, 64, 256),
+            (2, 1, 1),
+            330,
+            2,
+            False,
+            "atomic_counter",
+            "reuse_dispatch_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+        (
+            (128, 64, 256),
+            (1, 1, 1),
+            528,
+            2,
+            False,
+            "atomic_counter",
+            "reuse_dispatch_warps",
+            False,
+            4,
+            False,
+            False,
+            False,
+        ),
+    ),
 }
 
 
-def _frozen_fused_projection(tactic: dict[str, object]) -> dict[str, object]:
-    return {
-        key: value for key, value in tactic.items() if key not in _FUSED_LAYOUT_FIELDS
-    }
-
-
-def _manifest_sha256(value: object) -> str:
-    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _fused_tactic_id(tactic: object) -> str:
-    raw = json.dumps(
-        {"implementation": "mxfp4_fused", "tactic": tactic},
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _candidate_union_sha256(records: list[dict[str, object]]) -> str:
-    payload = [
-        {
-            "candidate_id": record["candidate"]["candidate_id"],
-            "tactic": record["candidate"]["effective_tactic"],
-        }
-        for record in records
-    ]
-    raw = json.dumps(
-        payload,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return hashlib.sha256(raw).hexdigest()
-
-
-def test_embedded_manifest_is_byte_canonical() -> None:
-    manifest = hopper_mxfp4_tuning_manifest()
-    provenance = hopper_mxfp4_tuning_provenance()
-
-    assert _manifest_sha256(manifest) == _EXPECTED_BLOCK_RUNTIME_SHA256
-    assert dict(provenance) == _EXPECTED_BLOCK_PROVENANCE
-    assert (
-        manifest["artifact_manifest_sha256"] == provenance["artifact_manifest_sha256"]
-    )
-    assert manifest["external_schema_version"] == 1
-    assert manifest["implementation"] == "mxfp4_fused"
-    assert manifest["routing_profile"] == MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE
-    assert manifest["runtime_schema_version"] == 1
-    assert _candidate_union_sha256(manifest["candidate_union"]) == (
-        _EXPECTED_BLOCK_CANDIDATE_UNION_SHA256
-    )
-    assert set(map(int, manifest["per_token_winners"])) == set(
-        MXFP4_TUNING_TOKEN_BUCKETS
-    )
-
-
-def test_default_profile_identity_and_public_provenance_are_current() -> None:
-    assert MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE == (
-        SM90_ROUTING_PROFILE_BLOCK_PERMUTATION
-    )
-    assert MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE == (
-        SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED
-    )
-    assert MXFP4_TUNING_ROUTING_PROFILES == (
-        SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-        SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
-    )
-    assert dict(MXFP4_TUNING_PROVENANCE) == _EXPECTED_BLOCK_PROVENANCE
-    assert (
-        MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE[
-            MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE
-        ]
-        == MXFP4_TUNING_PROVENANCE
-    )
-
-
-def test_explicit_block_profile_is_identical_to_omitted_profile() -> None:
-    profile = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE
-
-    assert (
-        hopper_mxfp4_candidate_records(routing_profile=profile)
-        == hopper_mxfp4_candidate_records()
-    )
-    assert hopper_mxfp4_candidates(routing_profile=profile) == hopper_mxfp4_candidates()
-    assert hopper_mxfp4_candidates_for_shape(
-        hidden=7168,
-        intermediate=3072,
-        routing_profile=profile,
-    ) == hopper_mxfp4_candidates_for_shape(hidden=7168, intermediate=3072)
-    assert hopper_mxfp4_default_tactic(
-        512, routing_profile=profile
-    ) == hopper_mxfp4_default_tactic(512)
-    assert hopper_mxfp4_ordered_candidates(
-        512,
-        hidden=7168,
-        intermediate=3072,
-        routing_profile=profile,
-    ) == hopper_mxfp4_ordered_candidates(512, hidden=7168, intermediate=3072)
-    assert (
-        hopper_mxfp4_tuning_manifest(routing_profile=profile)
-        == hopper_mxfp4_tuning_manifest()
-    )
-    assert (
-        hopper_mxfp4_tuning_provenance(routing_profile=profile)
-        == MXFP4_TUNING_PROVENANCE
-    )
-
-
-def test_published_exact_manifest_and_provenance_are_frozen() -> None:
-    profile = MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE
-    manifest = hopper_mxfp4_tuning_manifest(routing_profile=profile)
-    provenance = hopper_mxfp4_tuning_provenance(routing_profile=profile)
-
-    assert manifest["artifact_manifest_sha256"] == (_EXPECTED_EXACT_ARTIFACT_SHA256)
-    assert manifest["routing_profile"] == profile
-    assert manifest["runtime_schema_version"] == 1
-    assert manifest["external_schema_version"] == (1)
-    assert _manifest_sha256(manifest) == _EXPECTED_EXACT_RUNTIME_SHA256
-    assert provenance["artifact_manifest_sha256"] == (_EXPECTED_EXACT_ARTIFACT_SHA256)
-    assert provenance["runtime_manifest_sha256"] == (_EXPECTED_EXACT_RUNTIME_SHA256)
-    assert set(map(int, manifest["per_token_winners"])) == set(
-        MXFP4_TUNING_TOKEN_BUCKETS
-    )
-    assert all(
-        "requested_tactic_aliases" not in record["candidate"]
-        for record in manifest["candidate_union"]
-    )
-
-
-def test_cache_provenance_is_deterministic_hex_and_domain_scoped() -> None:
-    fingerprints = {
-        profile: hopper_mxfp4_cache_provenance_sha256(
-            routing_profile=profile,
+@pytest.mark.parametrize("profile", MXFP4_TUNING_ROUTING_PROFILES)
+def test_defaults_and_complete_candidate_order(profile):
+    for token, expected in zip(
+        MXFP4_TUNING_TOKEN_BUCKETS, _EXPECTED_DEFAULTS[profile], strict=True
+    ):
+        tactic = hopper_mxfp4_default_tactic(token, routing_profile=profile)
+        assert tuple(tactic[key] for key in _DEFAULT_FIELDS) == expected
+        assert tactic["swap_ab"] is True
+        assert tactic["fp8_accum_mode"] == "1xacc"
+        assert tactic["in_kernel_fc2_reduce"] is False
+        assert tactic["grouped_token_back"] is False
+        assert tactic["combine_format"] == "bf16"
+        candidates = hopper_mxfp4_optimization_candidates(
+            token, routing_profile=profile, **_OPTIMIZATION_SHAPE
         )
-        for profile in MXFP4_TUNING_ROUTING_PROFILES
+        assert candidates[0] == normalize_mxfp4_optimization_tactic(tactic)
+
+
+def test_cache_identity_preserves_existing_winners_and_tracks_domain(monkeypatch):
+    expected = {
+        "block_permutation_v1": "0e34a82c58bf39fc04cd25c54a3d62ae88cc7d46f2449b8d5a36e388022d8682",
+        "published_exact_balanced_v1": "ab16d80c9766ee9de4c0f57ffbfd93de7bd5aa4fe71947578aadf3fd2b7e2443",
     }
-
-    assert len(set(fingerprints.values())) == len(fingerprints)
-    assert all(
-        len(value) == 64 and set(value) <= set("0123456789abcdef")
-        for value in fingerprints.values()
+    for profile, identity in expected.items():
+        assert hopper_mxfp4_cache_provenance_sha256(routing_profile=profile) == identity
+    changed = (
+        *mxfp4_tuner._BASE_TACTICS,
+        dict(mxfp4_tuner._BASE_TACTICS[0], group_hint=999),
     )
-    assert fingerprints == {
-        identity: hopper_mxfp4_cache_provenance_sha256(
-            routing_profile=identity,
-        )
-        for identity in fingerprints
-    }
-
-
-def test_published_exact_union_is_legal_complete_and_profile_isolated() -> None:
-    profile = MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE
-    records = hopper_mxfp4_candidate_records(routing_profile=profile)
-    tactics = hopper_mxfp4_candidates(routing_profile=profile)
-    candidate_ids = tuple(record["candidate"]["candidate_id"] for record in records)
-
-    assert candidate_ids == _EXPECTED_EXACT_CANDIDATE_IDS
-    assert candidate_ids == tuple(sorted(set(candidate_ids)))
-    assert set(candidate_ids) != {
-        record["candidate"]["candidate_id"]
-        for record in hopper_mxfp4_candidate_records()
-    }
-    assert {
-        token for record in records for token in record["winner_for_tokens"]
-    } == set(MXFP4_TUNING_TOKEN_BUCKETS)
-    for record, tactic in zip(records, tactics, strict=True):
-        assert (
-            _frozen_fused_projection(tactic) == record["candidate"]["effective_tactic"]
-        )
-        assert set(tactic) == (
-            set(record["candidate"]["effective_tactic"]) | _FUSED_LAYOUT_FIELDS
-        )
-        assert is_valid_hopper_mxfp4_tactic(tactic)
-
-
-def test_fused_runtime_union_is_routing_independent_and_provenance_tracked() -> None:
-    block = hopper_mxfp4_runtime_candidates(
-        routing_profile=MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
-    )
-    exact = hopper_mxfp4_runtime_candidates(
-        routing_profile=MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
-    )
-
-    assert block == exact
-    assert len(block) == 17
-    assert len({json.dumps(tactic, sort_keys=True) for tactic in block}) == len(block)
-    assert (
-        MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256
-        == _EXPECTED_FUSED_RUNTIME_CANDIDATE_UNION_SHA256
-    )
-    assert MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE == {
-        "device": "NVIDIA H20-3e",
-        "compute_capability": (9, 0),
-        "sm_count": 78,
-        "world_size": 8,
-        "tokens_per_rank": 1,
-        "hidden": 3072,
-        "intermediate": 1280,
-        "num_experts": 384,
-        "topk": 8,
-        "routing_profile": MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
-        "routing_seed": 1234,
-        "route_ids_sha256": (
-            "d95ea5e18e4bb5010dd9cdadf928c6a43e085537615c5dbd166027a64de844eb"
-        ),
-        "winner_manifest_sha256": (
-            "ffb3f8df0edef5e6a07d8685b35e9759e4da691e6010d4251c0df9b37ca40ce7"
-        ),
-        "formal_manifest_sha256": (
-            "fe5cca19a9bc8e30a74f28a47561fd08755ba3f5ab22f90e50b63ebaceabafd6"
-        ),
-        "artifact_files_sha256": (
-            "ae23042d2d4505794867cbdd3523e5469be785506211d38a6266821fe45514f7"
-        ),
-    }
-
-    runtime_ids = tuple(_fused_tactic_id(tactic) for tactic in block)
-    assert runtime_ids == _EXPECTED_FUSED_RUNTIME_CANDIDATE_IDS
-    assert set(runtime_ids) >= _H20_FUSED_RUNTIME_ANCHOR_IDS
-    for profile in MXFP4_TUNING_ROUTING_PROFILES:
-        assert all(
-            tactic in block
-            for tactic in hopper_mxfp4_candidates(
-                routing_profile=profile,
+    with monkeypatch.context() as patch:
+        patch.setattr(mxfp4_tuner, "_BASE_TACTICS", changed)
+        for profile, identity in expected.items():
+            assert (
+                hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
+                != identity
             )
-        )
-
-
-def test_h20_runtime_anchors_are_shape_legal_but_not_heuristic_winners() -> None:
-    legal = hopper_mxfp4_runtime_candidates_for_shape(
-        hidden=3072,
-        intermediate=1280,
-        routing_profile=MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.src.moe_hopper_fp8 import (
+        mxfp4_policy,
     )
-    legal_ids = {_fused_tactic_id(tactic) for tactic in legal}
-    assert legal_ids >= _H20_FUSED_RUNTIME_ANCHOR_IDS
+
+    monkeypatch.setattr(
+        mxfp4_policy, "MXFP4_OPTIMIZATION_VERSION", "changed-test-domain"
+    )
+    for profile, identity in expected.items():
+        assert hopper_mxfp4_cache_provenance_sha256(routing_profile=profile) != identity
+
+
+def test_h20_anchors_are_candidates_but_not_defaults():
+    candidates = hopper_mxfp4_optimization_candidates(
+        1, hidden=3072, intermediate=1280, num_experts=384, world_size=8
+    )
     anchors = [
-        tactic
-        for tactic in legal
-        if _fused_tactic_id(tactic) in _H20_FUSED_RUNTIME_ANCHOR_IDS
+        t for t in candidates if t["group_hint"] == 78 and not t["tail_split_pairs"]
     ]
     assert len(anchors) == 2
-    assert all(
-        hopper_mxfp4_default_tactic(
-            token,
-            routing_profile=MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
-        )
-        not in anchors
-        for token in MXFP4_TUNING_TOKEN_BUCKETS
+    assert {t["num_sched_stages"] for t in anchors} == {1, 2}
+    assert all(t["mma_tiler_mnk"] == (128, 16, 256) and t["pingpong"] for t in anchors)
+    for profile in MXFP4_TUNING_ROUTING_PROFILES:
+        for token in MXFP4_TUNING_TOKEN_BUCKETS:
+            assert (
+                hopper_mxfp4_default_tactic(token, routing_profile=profile)[
+                    "group_hint"
+                ]
+                != 78
+            )
+
+
+def test_small_shape_uses_legal_candidates_from_both_profiles():
+    candidates = hopper_mxfp4_optimization_candidates(
+        512, hidden=128, intermediate=128, num_experts=8, world_size=1
     )
-
-
-def test_published_exact_default_leads_runtime_ordering() -> None:
-    profile = MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE
-    manifest = hopper_mxfp4_tuning_manifest(routing_profile=profile)
-
-    for token, expected_id in _EXPECTED_EXACT_WINNER_IDS.items():
-        default = hopper_mxfp4_default_tactic(token, routing_profile=profile)
-        winner = manifest["per_token_winners"][str(token)]
-        ordered = hopper_mxfp4_ordered_candidates(
-            token,
-            hidden=7168,
-            intermediate=3072,
-            routing_profile=profile,
-        )
-        assert winner["candidate_id"] == expected_id
-        assert (
-            _frozen_fused_projection(default) == winner["candidate"]["effective_tactic"]
-        )
-        assert ordered[0] == default
-
+    assert {t["mma_tiler_mnk"][2] for t in candidates} == {128}
+    assert {t["group_hint"] for t in candidates} >= {330, 396}
     assert (
-        hopper_mxfp4_default_tactic(1024, routing_profile=profile)["token_back_mode"]
-        == "reuse_dispatch_warps"
+        normalize_mxfp4_optimization_tactic(hopper_mxfp4_default_tactic(512))
+        not in candidates
     )
-    assert hopper_mxfp4_default_tactic(2048, routing_profile=profile)[
-        "cluster_shape_mnk"
-    ] == (1, 1, 1)
 
 
-def test_candidate_union_is_legal_sorted_deduplicated_and_complete() -> None:
-    records = hopper_mxfp4_candidate_records()
-    tactics = hopper_mxfp4_candidates()
-    candidate_ids = tuple(record["candidate"]["candidate_id"] for record in records)
-
-    assert len(records) == len(tactics) == 8
-    assert candidate_ids == _EXPECTED_BLOCK_CANDIDATE_IDS
-    assert candidate_ids == tuple(sorted(set(candidate_ids)))
-    assert {
-        token for record in records for token in record["winner_for_tokens"]
-    } == set(MXFP4_TUNING_TOKEN_BUCKETS)
-    for record, tactic in zip(records, tactics, strict=True):
-        candidate = record["candidate"]
-        candidate_id = candidate["candidate_id"]
-        requested = candidate["requested_tactic"]
-        effective = candidate["effective_tactic"]
-        assert candidate["implementation"] == "mxfp4_fused"
-        assert candidate["requested_tactic_aliases"] == [requested]
-        assert effective == tactic
-        assert _fused_tactic_id(effective) == candidate_id
-        if candidate_id in _FOLDED_FUSED_CANDIDATE_IDS:
-            changed = {key for key in requested if requested[key] != effective[key]}
-            assert changed == {"fc1_store_offload", "fc1_early_done_publish"}
-            assert requested["fold_producer_warps"] is True
-            assert requested["active_dispatch_warps"] == 1
-            assert requested["fc1_store_offload"] is True
-            assert requested["fc1_early_done_publish"] is False
-            assert effective["fc1_store_offload"] is False
-            assert effective["fc1_early_done_publish"] is True
-        else:
-            assert requested == effective
-        assert validate_hopper_mxfp4_tactic(tactic) == tactic
-        assert is_valid_hopper_mxfp4_tactic(tactic)
-
-
-def test_h128_fused_uses_all_legal_cross_profile_candidates() -> None:
-    profile_legal = hopper_mxfp4_candidates_for_shape(hidden=128, intermediate=128)
-    assert len(profile_legal) == 1
-    assert profile_legal[0]["mma_tiler_mnk"][2] == 128
-
-    runtime_legal = hopper_mxfp4_runtime_candidates_for_shape(
-        hidden=128, intermediate=128
+@pytest.mark.parametrize("profile", MXFP4_TUNING_ROUTING_PROFILES)
+def test_candidates_and_defaults_return_fresh_copies(profile):
+    candidates = hopper_mxfp4_optimization_candidates(
+        8, routing_profile=profile, **_OPTIMIZATION_SHAPE
     )
-    assert len(runtime_legal) > len(profile_legal)
-    assert profile_legal[0] in runtime_legal
-    assert {tactic["mma_tiler_mnk"][2] for tactic in runtime_legal} == {128}
-    default = hopper_mxfp4_default_tactic(512)
-    assert default not in runtime_legal
+    expected = copy.deepcopy(candidates)
+    candidates[0].clear()
+    candidates.clear()
+    default = hopper_mxfp4_default_tactic(8, routing_profile=profile)
+    expected_default = dict(default)
+    default.clear()
     assert (
-        hopper_mxfp4_ordered_candidates(
-            512,
-            hidden=128,
-            intermediate=128,
+        hopper_mxfp4_optimization_candidates(
+            8, routing_profile=profile, **_OPTIMIZATION_SHAPE
         )
-        == runtime_legal
+        == expected
     )
+    assert hopper_mxfp4_default_tactic(8, routing_profile=profile) == expected_default
 
 
-def test_per_token_defaults_are_the_exact_manifest_winners() -> None:
-    manifest = hopper_mxfp4_tuning_manifest()
-
-    for token, expected_id in _EXPECTED_WINNER_IDS.items():
-        expected = manifest["per_token_winners"][str(token)]
-        actual = hopper_mxfp4_default_tactic(token)
-        ordered = hopper_mxfp4_ordered_candidates(
-            token,
-            hidden=7168,
-            intermediate=3072,
-        )
-        assert expected["candidate_id"] == expected_id
-        assert actual == expected["candidate"]["effective_tactic"]
-        assert _fused_tactic_id(actual) == expected_id
-        assert ordered[0] == actual
+@pytest.mark.parametrize(
+    "bad_profile",
+    (
+        None,
+        True,
+        "",
+        "block_permutation",
+        "published_exact_balanced",
+        "BLOCK_PERMUTATION_V1",
+    ),
+)
+def test_profile_aware_apis_reject_noncanonical_profile(bad_profile):
+    calls = (
+        lambda: normalize_hopper_mxfp4_routing_profile(bad_profile),
+        lambda: normalize_sm90_routing_profile(bad_profile),
+        lambda: hopper_mxfp4_cache_provenance_sha256(routing_profile=bad_profile),
+        lambda: hopper_mxfp4_default_tactic(8, routing_profile=bad_profile),
+        lambda: hopper_mxfp4_optimization_candidates(
+            8, routing_profile=bad_profile, **_OPTIMIZATION_SHAPE
+        ),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match="routing_profile"):
+            call()
 
 
 @pytest.mark.parametrize(
@@ -539,40 +434,8 @@ def test_default_rejects_invalid_token_count(bad_tokens: object) -> None:
         hopper_mxfp4_default_tactic(bad_tokens)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize(
-    "profile",
-    (
-        MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
-        MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
-    ),
-)
-def test_candidate_apis_return_fresh_copies(profile: str) -> None:
-    tactics = hopper_mxfp4_candidates(routing_profile=profile)
-    records = hopper_mxfp4_candidate_records(routing_profile=profile)
-    default = hopper_mxfp4_default_tactic(8, routing_profile=profile)
-
-    tactics[0].clear()
-    candidate = records[0]["candidate"]
-    candidate["effective_tactic"].clear()
-    candidate["requested_tactic"].clear()
-    if "requested_tactic_aliases" in candidate:
-        candidate["requested_tactic_aliases"][0].clear()
-        candidate["requested_tactic_aliases"].clear()
-    records[0]["winner_for_tokens"].clear()
-    default.clear()
-
-    fresh = hopper_mxfp4_candidate_records(routing_profile=profile)[0]
-    assert hopper_mxfp4_candidates(routing_profile=profile)[0]
-    assert fresh["candidate"]["effective_tactic"]
-    assert fresh["candidate"]["requested_tactic"]
-    if profile == MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE:
-        assert fresh["candidate"]["requested_tactic_aliases"]
-    assert fresh["winner_for_tokens"]
-    assert hopper_mxfp4_default_tactic(8, routing_profile=profile)
-
-
 def test_fused_validator_rejects_fields_types_and_illegal_geometry() -> None:
-    tactic = hopper_mxfp4_candidates()[0]
+    tactic = _base_candidates()[0]
 
     for key, value, message in (
         ("swap_ab", False, "swap_ab"),
@@ -618,86 +481,10 @@ def test_fused_validator_rejects_fields_types_and_illegal_geometry() -> None:
             },
         )
 
-    frozen = hopper_mxfp4_candidate_records(
-        routing_profile=MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
-    )[0]["candidate"]
-    with pytest.raises(ValueError, match="fields differ"):
-        validate_hopper_mxfp4_tactic(frozen["effective_tactic"])
-
-
-@pytest.mark.parametrize(
-    "bad_profile",
-    (
-        None,
-        True,
-        "",
-        "block_permutation",
-        "published_exact_balanced",
-        "BLOCK_PERMUTATION_V1",
-        "legacy",
-    ),
-)
-def test_all_profile_aware_apis_reject_noncanonical_profile(
-    bad_profile: object,
-) -> None:
-    with pytest.raises(ValueError, match="routing_profile"):
-        normalize_hopper_mxfp4_routing_profile(bad_profile)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="routing_profile"):
-        normalize_sm90_routing_profile(bad_profile)
-
-    calls = (
-        lambda: hopper_mxfp4_cache_provenance_sha256(
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_candidate_records(
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_candidates(
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_candidates_for_shape(
-            hidden=7168,
-            intermediate=3072,
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_runtime_candidates(
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_runtime_candidates_for_shape(
-            hidden=7168,
-            intermediate=3072,
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_default_tactic(
-            8,
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_ordered_candidates(
-            8,
-            hidden=7168,
-            intermediate=3072,
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_tuning_manifest(
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-        lambda: hopper_mxfp4_tuning_provenance(
-            routing_profile=bad_profile,  # type: ignore[arg-type]
-        ),
-    )
-    for call in calls:
-        with pytest.raises(ValueError, match="routing_profile"):
-            call()
-
 
 def test_validator_requires_a_mapping() -> None:
     with pytest.raises(TypeError, match="mapping"):
         validate_hopper_mxfp4_tactic([])  # type: ignore[arg-type]
-
-
-_OPTIMIZATION_SHAPE = dict(
-    hidden=7168, intermediate=3072, num_experts=384, world_size=4
-)
 
 
 def _optimization_anchor(**overrides):
@@ -755,10 +542,7 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
             normalize_mxfp4_optimization_tactic(dict(enabled, fc1_ready_mode="k256"))
 
     def test_expansion_is_bounded_and_keeps_originals_first(self):
-        original = hopper_mxfp4_runtime_candidates_for_shape(
-            hidden=_OPTIMIZATION_SHAPE["hidden"],
-            intermediate=_OPTIMIZATION_SHAPE["intermediate"],
-        )
+        original = _base_candidates()
         frozen = copy.deepcopy(original)
         expanded = expand_mxfp4_optimization_candidates(original, **_OPTIMIZATION_SHAPE)
         self.assertEqual(original, frozen)
@@ -870,7 +654,7 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
                 actual = hopper_mxfp4_optimization_candidates(
                     token, routing_profile=profile, **_OPTIMIZATION_SHAPE
                 )
-                original = hopper_mxfp4_ordered_candidates(
+                original = _ordered_base_candidates(
                     token,
                     routing_profile=profile,
                     hidden=_OPTIMIZATION_SHAPE["hidden"],
@@ -939,7 +723,7 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
         ):
             with self.subTest(override=override):
                 shape = dict(_OPTIMIZATION_SHAPE, **override)
-                base = hopper_mxfp4_ordered_candidates(
+                base = _ordered_base_candidates(
                     2048, hidden=shape["hidden"], intermediate=shape["intermediate"]
                 )
                 previous = expand_mxfp4_optimization_candidates(base, **shape)
@@ -968,21 +752,6 @@ class TestMxfp4OptimizationCandidates(unittest.TestCase):
                 for candidate in actual:
                     resolve_mxfp4_tactic_optimizations(candidate, **shape)
 
-    def test_historical_fused_manifests_are_unchanged(self):
-        for profile in MXFP4_TUNING_ROUTING_PROFILES:
-            manifest = hopper_mxfp4_tuning_manifest(routing_profile=profile)
-            raw = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
-            expected = hopper_mxfp4_tuning_provenance(routing_profile=profile)
-            self.assertEqual(
-                hashlib.sha256(raw).hexdigest(), expected["runtime_manifest_sha256"]
-            )
-            for token in MXFP4_TUNING_TOKEN_BUCKETS:
-                tactic = hopper_mxfp4_default_tactic(token, routing_profile=profile)
-                self.assertEqual(
-                    tactic,
-                    validate_hopper_mxfp4_tactic(tactic),
-                )
-
 
 @pytest.fixture
 def allow_mock_tuning_device(monkeypatch):
@@ -993,7 +762,7 @@ def allow_mock_tuning_device(monkeypatch):
         )
 
 
-def test_fused_full_union_records_only_fused_identity_and_manifest(
+def test_full_union_records_effective_winner_and_cache_identity(
     monkeypatch, allow_mock_tuning_device
 ):
     cfg = SimpleNamespace(
@@ -1102,10 +871,6 @@ def test_fused_full_union_records_only_fused_identity_and_manifest(
             routing_profile=cfg.routing_profile,
         )
     )
-    provenance = hopper_mxfp4_tuning_provenance(
-        routing_profile=cfg.routing_profile,
-    )
-    assert provenance["runtime_manifest_sha256"] in kwargs["source"]
     assert mxfp4_optimization_candidate_sha256(candidates) in kwargs["source"]
 
 
@@ -1124,9 +889,7 @@ def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
         routing_profile=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     )
     buffer = SimpleNamespace(_frontend=SimpleNamespace(config=cfg, release=mock.Mock()))
-    union = hopper_mxfp4_runtime_candidates(
-        routing_profile=cfg.routing_profile,
-    )
+    union = _base_candidates()
     subset = [union[2], union[0]]
     supplied = [
         {
@@ -1351,7 +1114,7 @@ def test_complete_explicit_tactics_bypass_device_guard(monkeypatch) -> None:
         "require_hopper_mxfp4_fused_tuning_device",
         fused_guard,
     )
-    fused = mxfp4_tuner.hopper_mxfp4_candidates()[0]
+    fused = mxfp4_tuner._base_candidates()[0]
     assert hopper_mxfp4._resolve_mxfp4_knobs(
         fused,
         **_resolver_kwargs(),

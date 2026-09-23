@@ -759,7 +759,8 @@ Only the complete canonical ordered list may populate its production cache
 identity. A subset or reordered experiment can use its measured winner but
 cannot publish that winner as a full-list result. MXFP4 cache matching binds
 device/architecture/SM count, precision, EP size, shape, top-k, clamp, routing
-profile, format/protocol version, manifests and candidate provenance. Token
+profile, format/protocol version, executable candidates and a stable cache
+namespace. Historical measurement reports are not loaded at runtime. Token
 capacity uses an exact bucket when available, otherwise the smallest larger
 bucket, otherwise the largest smaller bucket. The per-candidate eligibility
 policy is part of provenance, so widening candidate eligibility causes old

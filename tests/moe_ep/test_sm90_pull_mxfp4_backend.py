@@ -57,10 +57,10 @@ def _config(**overrides):
 
 def _fused_tactic(**overrides):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
-        hopper_mxfp4_ordered_candidates,
+        _ordered_base_candidates,
     )
 
-    tactic = hopper_mxfp4_ordered_candidates(
+    tactic = _ordered_base_candidates(
         64,
         hidden=128,
         intermediate=128,

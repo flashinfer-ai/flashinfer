@@ -541,8 +541,7 @@ def autotune_hopper_mxfp4_mega_moe(
     zero persists the agreed winner under the versioned MXFP4 fused identity.
 
     This entry point intentionally does not share candidates, heuristics, or
-    cache entries with ordinary FP8. Historical split entries cannot match the
-    fused identity.
+    cache entries with ordinary FP8. Cache matching includes the MXFP4 format and tuning domain.
     """
     from .hopper_mxfp4 import (
         _MXFP4_TUNING_DTYPE_ID,
@@ -552,8 +551,7 @@ def autotune_hopper_mxfp4_mega_moe(
     from .comm import resolve_gate_up_clamp
     from .mxfp4_tuner import (
         hopper_mxfp4_cache_provenance_sha256,
-        hopper_mxfp4_runtime_candidates,
-        hopper_mxfp4_tuning_provenance,
+        _base_candidates,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
     )
@@ -594,9 +592,7 @@ def autotune_hopper_mxfp4_mega_moe(
         candidates = [
             normalize_mxfp4_optimization_tactic(candidate) for candidate in candidates
         ]
-        runtime_candidates = hopper_mxfp4_runtime_candidates(
-            routing_profile=cfg.routing_profile,
-        )
+        runtime_candidates = _base_candidates()
         # The complete domain also contains bounded geometry neighbors. Use
         # its core projections here; the full strategy check below still
         # rejects combinations that were never admitted to live tuning.
@@ -660,13 +656,6 @@ def autotune_hopper_mxfp4_mega_moe(
             from .knob_cache import record_knobs
 
             record_cfg = symm_buffer._frontend.config
-            provenance = hopper_mxfp4_tuning_provenance(
-                routing_profile=record_cfg.routing_profile,
-            )
-            manifest_sha256 = provenance.get("manifest_sha256")
-            if manifest_sha256 is None:
-                manifest_sha256 = provenance["runtime_manifest_sha256"]
-
             record_knobs(
                 effective_winner,
                 dtype=_MXFP4_TUNING_DTYPE_ID,
@@ -684,9 +673,7 @@ def autotune_hopper_mxfp4_mega_moe(
                 ),
                 p50_us=p50_s * 1e6,
                 source=(
-                    "autotune:sm90_mxfp4_fused:runtime_union:"
-                    f"{strategy_union_sha256}:"
-                    f"heuristic_manifest:{manifest_sha256}"
+                    f"autotune:sm90_mxfp4_fused:runtime_union:{strategy_union_sha256}"
                 ),
             )
 

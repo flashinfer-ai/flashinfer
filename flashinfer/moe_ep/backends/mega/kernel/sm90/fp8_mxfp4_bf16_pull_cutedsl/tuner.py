@@ -28,6 +28,9 @@ _MXFP4_SCALE_MODE: Literal["mxfp4_hybrid"] = "mxfp4_hybrid"
 _MXFP4_WEIGHT_SEED = 0x4D584650
 _ACTIVATION_SEED = 42
 _ROUTING_SEED = 1234
+# Raw E8M0 bytes encode powers of two as 2**(e-127). A compact, finite span
+# gives realistic small weights and stays well inside Humming's range-11
+# contract; the payload itself still samples every legal E2M1 nibble code.
 _MXFP4_E8M0_MIN = 118
 _MXFP4_E8M0_MAX_EXCLUSIVE = 124
 
@@ -77,38 +80,27 @@ def _raw_mxfp4_shapes(
     }
 
 
-def _create_canonical_inputs(
-    args,
+def create_tuning_weights(
+    *,
+    local_experts: int,
+    hidden: int,
+    intermediate: int,
     rank: int,
-    world_size: int,
-    max_tokens: int,
-    live_tokens: int,
-    initial_tactic: dict[str, Any],
+    device: Any,
+    seed: int = 0,
 ):
-    """Build canonical raw weights, preprocess them, and stage live inputs."""
+    """Shared deterministic packed weights for offline tuning and benchmarks."""
     import torch
 
-    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        get_symm_buffer_for_hopper_mxfp4_mega_moe,
-    )
     from ......weights import PrequantizedMoEWeights
-    from .staging import stage_mega_moe_inputs
-    from .weights import preprocess_mega_weights
 
-    if live_tokens < 0 or live_tokens > max_tokens:
-        raise ValueError(f"live_tokens must be in [0, {max_tokens}], got {live_tokens}")
-    if args.num_experts <= 0 or args.num_experts % world_size:
-        raise ValueError("--num-experts must be positive and divisible by world size")
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    local_experts = args.num_experts // world_size
     shapes = _raw_mxfp4_shapes(
         local_experts=local_experts,
-        hidden=args.hidden,
-        intermediate=args.intermediate,
+        hidden=hidden,
+        intermediate=intermediate,
     )
     weight_gen = torch.Generator(device=device).manual_seed(
-        _MXFP4_WEIGHT_SEED + args.seed + rank
+        _MXFP4_WEIGHT_SEED + seed + rank
     )
 
     def _payload(name: str) -> torch.Tensor:
@@ -131,11 +123,45 @@ def _create_canonical_inputs(
             generator=weight_gen,
         )
 
-    raw = PrequantizedMoEWeights(
+    return PrequantizedMoEWeights(
         w13=_payload("w13"),
         w2=_payload("w2"),
         w13_scale=_exponent("w13_scale"),
         w2_scale=_exponent("w2_scale"),
+    )
+
+
+def _create_canonical_inputs(
+    args,
+    rank: int,
+    world_size: int,
+    max_tokens: int,
+    live_tokens: int,
+    initial_tactic: dict[str, Any],
+):
+    """Build canonical raw weights, preprocess them, and stage live inputs."""
+    import torch
+
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        get_symm_buffer_for_hopper_mxfp4_mega_moe,
+    )
+    from .staging import stage_mega_moe_inputs
+    from .weights import preprocess_mega_weights
+
+    if live_tokens < 0 or live_tokens > max_tokens:
+        raise ValueError(f"live_tokens must be in [0, {max_tokens}], got {live_tokens}")
+    if args.num_experts <= 0 or args.num_experts % world_size:
+        raise ValueError("--num-experts must be positive and divisible by world size")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    local_experts = args.num_experts // world_size
+    raw = create_tuning_weights(
+        local_experts=local_experts,
+        hidden=args.hidden,
+        intermediate=args.intermediate,
+        rank=rank,
+        device=device,
+        seed=args.seed,
     )
     transformed_l1, transformed_l2 = preprocess_mega_weights(
         raw,
@@ -146,7 +172,7 @@ def _create_canonical_inputs(
 
     symm_buffer: Any = None
     try:
-        # Explicit manifest tactics keep stale cache contents out of the
+        # An explicit initial tactic keeps stale cache contents out of the
         # offline sweep.
         common = (
             args.num_experts,
