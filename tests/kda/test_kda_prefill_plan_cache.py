@@ -57,7 +57,9 @@ def _inputs(lengths, heads, *, seed, storage_extra=0):
         state_indices=torch.arange(len(lengths), device="cuda", dtype=torch.int32) + 1,
         cu_seqlens=torch.tensor(offsets, device="cuda", dtype=torch.int64),
         checkpoint_cu_starts=torch.tensor(cp_offsets, device="cuda", dtype=torch.int64),
-        state_checkpoints=torch.empty(
+        # Zero-filled so an unrequested checkpoint buffer stays comparable and
+        # any stray write into it (stale pointer, out-of-bounds row) shows up.
+        state_checkpoints=torch.zeros(
             (cp_offsets[-1], heads, HEAD_DIM, HEAD_DIM), device="cuda", dtype=torch.bfloat16
         ),
         lengths=tuple(lengths),
@@ -104,8 +106,11 @@ def _snapshot(d):
 
 
 def _assert_same(got, want):
+    # Bit patterns, not values: NaN payloads must compare equal too.
     for name, a, b in zip(("out", "state", "checkpoints"), got, want, strict=True):
-        assert torch.equal(a, b), f"{name} differs after rebind"
+        assert torch.equal(
+            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+        ), f"{name} differs after rebind"
 
 
 @pytest.mark.parametrize(
