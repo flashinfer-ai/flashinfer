@@ -171,9 +171,9 @@ class JitSpecCuteDsl(JitSpec):
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
 
         ``build_and_load()`` holds the per-kernel ``lock_path`` across this call.
-        ``module_lock_path`` is taken twice and briefly instead, around the
-        stale-module wipe and the export, so one specialization's compile never
-        blocks a sibling's.
+        ``module_lock_path`` is taken briefly instead, around the stale-module
+        wipe and the export, so one specialization's compile never blocks a
+        sibling's.
 
         Persistence failures degrade gracefully: the in-process kernel is
         kept for load(); only the disk write is lost.
@@ -181,6 +181,12 @@ class JitSpecCuteDsl(JitSpec):
         """
         from filelock import FileLock
 
+        logger.info(f"Compiling CuTe-DSL kernel {self.name}")
+        self._compiled_kernel = self.compile_fn()
+
+        # One critical section for the wipe and the export: a sibling with a
+        # different expected_meta could otherwise commit between them and leave
+        # an artifact meta.json does not describe.
         with FileLock(self.module_lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
@@ -190,11 +196,6 @@ class JitSpecCuteDsl(JitSpec):
                     f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
                 )
                 shutil.rmtree(self.module_dir, ignore_errors=True)
-
-        logger.info(f"Compiling CuTe-DSL kernel {self.name}")
-        self._compiled_kernel = self.compile_fn()
-
-        with FileLock(self.module_lock_path, thread_local=False):
             try:
                 self._export()
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
