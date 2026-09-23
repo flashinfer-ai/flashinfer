@@ -197,8 +197,10 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
-def _check_head_dim(head_dim_qk: int, head_dim_vo: int) -> None:
+def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
     """Validate the FA2 prefill head-dimension safety requirement."""
+    if backend != "fa2":
+        return
     if (
         head_dim_qk <= 0
         or head_dim_vo <= 0

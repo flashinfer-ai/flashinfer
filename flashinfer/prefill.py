@@ -1492,9 +1492,6 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
-    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim.
-    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
-    _check_head_dim(q.shape[-1], out_head_dim)
 
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
@@ -1559,7 +1556,6 @@ def single_prefill_with_kv_cache(
             head_dim_qk=q.shape[-1],
             head_dim_vo=out_head_dim,
         )
-
     _check_head_dim(q.shape[-1], out_head_dim, backend)
 
     # Unpack NVFP4 scale factors
@@ -2470,7 +2466,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-        _check_head_dim(head_dim_qk, head_dim_vo)
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -2753,7 +2749,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -3043,6 +3038,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
+
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -4299,7 +4296,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
         if logits_soft_cap is None:
@@ -4835,6 +4831,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 *args,
             )
+
+        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
