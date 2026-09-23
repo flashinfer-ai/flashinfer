@@ -1,8 +1,8 @@
 {
   "files": {
     "csrc/fused_moe/warp_decode/cake_warp_decode_binding.cu": "bb1c55d242b55a6d2fd347daee22942288d5a19b3afb0abda77fc8c889599e8a",
-    "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh": "d3266e7de5b4e5c25902d85faaac10065ba7969c973b5a3a5a7c5348d9c088db",
-    "csrc/fused_moe/warp_decode/generated/cake_warp_decode_generated_manifest.cuh": "f41840236e1fcefba69cad958ce76f6425de3d2874db5c77d861037dc32ca2ab",
+    "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh": "1e1581df42f2cec61cfe607381c66c623a67f04297d142ebbbe741e4f3437b66",
+    "csrc/fused_moe/warp_decode/generated/cake_warp_decode_generated_manifest.cuh": "1ffc4d2f2bcea4cf0cf10741fe4b61b535a50016e8babe98f3caef9942fa78e2",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_01ad94fd0e5308715f89_binding.cu": "6ab45edf2e0753233a6d05fb65bbb3315bb5301ae8943f5005e8e23847301173",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_01ad94fd0e5308715f89_kernel.cu": "1bc77e809c1d0fd85e4eedf1c0144cb8ff18c157d0cc470f7646c00c2f79bde4",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_024bed5eb8061821a022_binding.cu": "3bc08da482f9c8c4c796f10593ae0088ad0e4322c65d4dbadda0ddcffc24b6ad",
@@ -994,7 +994,7 @@
       "role": "kernel"
     }
   ],
-  "program_hash": "148dbf66014f0392c327402001f1a01ab97d49c1eabeec3b31b14151368b065d",
+  "program_hash": "237a18be3c34cc81b34b4e273de9473340f7ea2049720a28fda56e15249bd4e2",
   "routes": [
     {
       "arch": "sm_100a",
@@ -18023,34 +18023,42 @@
         "top_k": 8
       },
       "sequence": {
-        "name": "cake_warp_decode_seq_3fa15a27c5f579a44089",
+        "name": "cake_warp_decode_seq_df414901678a79e36e45",
         "role": "sequence"
       },
       "shape": "sm103a_swiglu_e128_h2048_i768_k8_t14",
       "stages": [
         {
           "module": {
-            "name": "cake_warp_decode_6d96f9ab40505e53392c",
+            "name": "cake_warp_decode_ee7526ffca9f2aa5aa46",
+            "role": "kernel"
+          },
+          "name": "route_pack",
+          "template": "route_pack_generic"
+        },
+        {
+          "module": {
+            "name": "cake_warp_decode_34ef8576076046df901b",
             "role": "kernel"
           },
           "name": "fc1",
-          "template": "fc1_swiglu_persistent"
+          "template": "fc1_swiglu_device_workfeed"
         },
         {
           "module": {
-            "name": "cake_warp_decode_659627650e61d48e0223",
+            "name": "cake_warp_decode_b6954a357eb9b691d6e1",
             "role": "kernel"
           },
           "name": "fc2",
-          "template": "fc2_sm103_refined_k256"
+          "template": "fc2_sm103_refined_k256_workfeed_prefetch"
         },
         {
           "module": {
-            "name": "cake_warp_decode_c7113a73c61cc97c1593",
+            "name": "cake_warp_decode_556f9752297212b1bcdc",
             "role": "kernel"
           },
           "name": "finalize",
-          "template": "finalize_direct_t128"
+          "template": "finalize_packed_t128"
         }
       ]
     },
@@ -18066,34 +18074,42 @@
         "top_k": 8
       },
       "sequence": {
-        "name": "cake_warp_decode_seq_3fa15a27c5f579a44089",
+        "name": "cake_warp_decode_seq_df414901678a79e36e45",
         "role": "sequence"
       },
       "shape": "sm103a_swiglu_e128_h2048_i768_k8_t15",
       "stages": [
         {
           "module": {
-            "name": "cake_warp_decode_6d96f9ab40505e53392c",
+            "name": "cake_warp_decode_ee7526ffca9f2aa5aa46",
+            "role": "kernel"
+          },
+          "name": "route_pack",
+          "template": "route_pack_generic"
+        },
+        {
+          "module": {
+            "name": "cake_warp_decode_34ef8576076046df901b",
             "role": "kernel"
           },
           "name": "fc1",
-          "template": "fc1_swiglu_persistent"
+          "template": "fc1_swiglu_device_workfeed"
         },
         {
           "module": {
-            "name": "cake_warp_decode_659627650e61d48e0223",
+            "name": "cake_warp_decode_b6954a357eb9b691d6e1",
             "role": "kernel"
           },
           "name": "fc2",
-          "template": "fc2_sm103_refined_k256"
+          "template": "fc2_sm103_refined_k256_workfeed_prefetch"
         },
         {
           "module": {
-            "name": "cake_warp_decode_c7113a73c61cc97c1593",
+            "name": "cake_warp_decode_556f9752297212b1bcdc",
             "role": "kernel"
           },
           "name": "finalize",
-          "template": "finalize_direct_t128"
+          "template": "finalize_packed_t128"
         }
       ]
     },
@@ -18109,34 +18125,42 @@
         "top_k": 8
       },
       "sequence": {
-        "name": "cake_warp_decode_seq_3fa15a27c5f579a44089",
+        "name": "cake_warp_decode_seq_df414901678a79e36e45",
         "role": "sequence"
       },
       "shape": "sm103a_swiglu_e128_h2048_i768_k8_t16",
       "stages": [
         {
           "module": {
-            "name": "cake_warp_decode_6d96f9ab40505e53392c",
+            "name": "cake_warp_decode_ee7526ffca9f2aa5aa46",
+            "role": "kernel"
+          },
+          "name": "route_pack",
+          "template": "route_pack_generic"
+        },
+        {
+          "module": {
+            "name": "cake_warp_decode_34ef8576076046df901b",
             "role": "kernel"
           },
           "name": "fc1",
-          "template": "fc1_swiglu_persistent"
+          "template": "fc1_swiglu_device_workfeed"
         },
         {
           "module": {
-            "name": "cake_warp_decode_659627650e61d48e0223",
+            "name": "cake_warp_decode_b6954a357eb9b691d6e1",
             "role": "kernel"
           },
           "name": "fc2",
-          "template": "fc2_sm103_refined_k256"
+          "template": "fc2_sm103_refined_k256_workfeed_prefetch"
         },
         {
           "module": {
-            "name": "cake_warp_decode_c7113a73c61cc97c1593",
+            "name": "cake_warp_decode_556f9752297212b1bcdc",
             "role": "kernel"
           },
           "name": "finalize",
-          "template": "finalize_direct_t128"
+          "template": "finalize_packed_t128"
         }
       ]
     },
@@ -22040,18 +22064,18 @@
         "top_k": 10
       },
       "sequence": {
-        "name": "cake_warp_decode_seq_a6a1d72ca69637d0a135",
+        "name": "cake_warp_decode_seq_3fa15a27c5f579a44089",
         "role": "sequence"
       },
       "shape": "sm103a_swiglu_e512_h4096_i1024_k10_t01",
       "stages": [
         {
           "module": {
-            "name": "cake_warp_decode_a13d42e0deb96a0425d6",
+            "name": "cake_warp_decode_6d96f9ab40505e53392c",
             "role": "kernel"
           },
           "name": "fc1",
-          "template": "fc1_swiglu_static"
+          "template": "fc1_swiglu_persistent"
         },
         {
           "module": {
