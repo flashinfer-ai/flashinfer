@@ -898,7 +898,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v_dtype",
         "out_dtype",
         "packed_query",
-        "enable_softmax_stats",
+        "store_softmax_stats",
         "mask_type",
         "window_left",
         "softmax_scale",
@@ -937,7 +937,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
-    assert plan_parameters["enable_softmax_stats"].default is False
+    assert plan_parameters["store_softmax_stats"].default is False
     assert run_parameters["softmax_stats"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["softmax_stats"].default is None
     assert plan_parameters["sage"].default is None
@@ -1116,10 +1116,10 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert run_kwargs["out"] is out
 
 
-@pytest.mark.parametrize("enable_softmax_stats", [False, True])
+@pytest.mark.parametrize("store_softmax_stats", [False, True])
 @pytest.mark.parametrize("lse_mode", ["none", "base2"])
 def test_attention_ts_context_stats_reuses_dynamic_requests(
-    monkeypatch, enable_softmax_stats, lse_mode
+    monkeypatch, store_softmax_stats, lse_mode
 ):
     compile_calls, launches = [], []
 
@@ -1149,7 +1149,7 @@ def test_attention_ts_context_stats_reuses_dynamic_requests(
         q_dtype=torch.float16,
         k_dtype=torch.float16,
         packed_query=True,
-        enable_softmax_stats=enable_softmax_stats,
+        store_softmax_stats=store_softmax_stats,
         lse_mode=lse_mode,
     )
     for q_lens, k_lens in (((3, 5), (4, 6)), ((6, 1), (0, 9))):
@@ -1159,7 +1159,7 @@ def test_attention_ts_context_stats_reuses_dynamic_requests(
         qo = torch.tensor(_cumulative(q_lens), dtype=torch.int32)
         ko = torch.tensor(_cumulative(k_lens), dtype=torch.int32)
         out = torch.empty_like(q)
-        stats = torch.empty(*q.shape[:-1], 2) if enable_softmax_stats else None
+        stats = torch.empty(*q.shape[:-1], 2) if store_softmax_stats else None
         lse = torch.empty(*q.shape[:-1]) if lse_mode != "none" else None
         with pytest.raises(ValueError, match="softmax_stats must be supplied exactly"):
             wrapper.run(
@@ -1169,7 +1169,7 @@ def test_attention_ts_context_stats_reuses_dynamic_requests(
                 qo,
                 ko,
                 out=out,
-                softmax_stats=None if enable_softmax_stats else torch.empty(1),
+                softmax_stats=None if store_softmax_stats else torch.empty(1),
                 validate=False,
             )
         returned = wrapper.run(
@@ -1194,7 +1194,7 @@ def test_attention_ts_context_stats_reuses_dynamic_requests(
         assert launches[-1][6] == pytest.approx(0.25 * math.log2(math.e))
         assert launches[-1][7] == 0.5
     assert len(compile_calls) == 1
-    assert compile_calls[0].enable_softmax_stats is enable_softmax_stats
+    assert compile_calls[0].store_softmax_stats is store_softmax_stats
     assert compile_calls[0].lse_mode == lse_mode
 
 
@@ -1211,7 +1211,7 @@ def test_attention_ts_context_stats_rejects_unqualified_recipes(extra):
             head_dim=128,
             q_dtype=torch.bfloat16,
             k_dtype=torch.bfloat16,
-            enable_softmax_stats=True,
+            store_softmax_stats=True,
             **{extra: True if extra == "use_attention_sinks" else object()},
         )
 
@@ -1394,7 +1394,7 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
         geometry=SimpleNamespace(
-            packed_query=False, mask_type="dense", vc=None, enable_softmax_stats=False
+            packed_query=False, mask_type="dense", vc=None, store_softmax_stats=False
         ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
@@ -5054,7 +5054,7 @@ def test_attention_ts_context_softmax_stats(
         mask_type="causal" if causal else "dense",
         softmax_scale=sm_scale,
         output_scale=output_scale,
-        enable_softmax_stats=True,
+        store_softmax_stats=True,
     )
     with pytest.raises(ValueError, match="softmax_stats must be supplied"):
         wrapper.run(q, k, v, qo, ko, out=out)
@@ -5101,7 +5101,7 @@ def test_attention_ts_context_mla_chunk_merge(heads, dtype):
             k_dtype=dtype,
             out_dtype=torch.bfloat16,
             mask_type=mask,
-            enable_softmax_stats=True,
+            store_softmax_stats=True,
         )
         stats = torch.empty((*q.shape[:-1], 2), device="cuda")
         out = wrapper.run(
@@ -5162,7 +5162,7 @@ def test_attention_ts_context_empty_mla_chunk(dtype):
         out_dtype=torch.bfloat16,
         packed_query=True,
         mask_type="dense",
-        enable_softmax_stats=True,
+        store_softmax_stats=True,
     )
     out = wrapper.run(q, k, v, qo, ko, softmax_stats=stats)
     torch.testing.assert_close(out[:65], torch.zeros_like(out[:65]), atol=0, rtol=0)
