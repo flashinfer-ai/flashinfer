@@ -83,19 +83,21 @@ __global__ void __launch_bounds__(kThreads) affine_epilogue_kernel(Params p) {
       const int64_t r = e / p.row_elems;
       const int64_t within = e - r * p.row_elems;
       const int64_t dst = p.cu_starts[p.seq_ids[r]] + p.offsets[r];
-      const uint4 mv = *reinterpret_cast<const uint4*>(
-          static_cast<const __nv_bfloat16*>(p.main_rows) + e);
+      const uint4 mv =
+          *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.main_rows) + e);
       uint4 ov = mv;
       if (r >= p.first_rows) {
-        const uint4 cv = *reinterpret_cast<const uint4*>(
-            static_cast<const __nv_bfloat16*>(p.corr_rows) + (r - p.first_rows) * p.row_elems + within);
+        const uint4 cv =
+            *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.corr_rows) +
+                                            (r - p.first_rows) * p.row_elems + within);
         const __nv_bfloat16* m = reinterpret_cast<const __nv_bfloat16*>(&mv);
         const __nv_bfloat16* c = reinterpret_cast<const __nv_bfloat16*>(&cv);
         __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(&ov);
 #pragma unroll
         for (int i = 0; i < 8; ++i) o[i] = add_bf16(m[i], c[i]);
       }
-      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.out_rows) + dst * p.row_elems + within) = ov;
+      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.out_rows) + dst * p.row_elems +
+                                within) = ov;
     } else {
       const int64_t e = vec * 4;
       const int64_t r = e / p.row_elems;
@@ -105,7 +107,10 @@ __global__ void __launch_bounds__(kThreads) affine_epilogue_kernel(Params p) {
       if (r >= p.first_rows) {
         const float4 cv = *reinterpret_cast<const float4*>(
             static_cast<const float*>(p.corr_rows) + (r - p.first_rows) * p.row_elems + within);
-        mv.x += cv.x; mv.y += cv.y; mv.z += cv.z; mv.w += cv.w;
+        mv.x += cv.x;
+        mv.y += cv.y;
+        mv.z += cv.z;
+        mv.w += cv.w;
       }
       *reinterpret_cast<float4*>(static_cast<float*>(p.out_rows) + dst * p.row_elems + within) = mv;
     }
@@ -129,14 +134,19 @@ __global__ void __launch_bounds__(kThreads) affine_epilogue_kernel(Params p) {
   const int64_t e = vec * 4;
   const int64_t s = e / p.row_elems;
   const int64_t within = e - s * p.row_elems;
-  float4 v = *reinterpret_cast<const float4*>(p.main_final + p.last_parts[s] * p.row_elems + within);
+  float4 v =
+      *reinterpret_cast<const float4*>(p.main_final + p.last_parts[s] * p.row_elems + within);
   // torch adds an explicitly zeroed correction for a first sequence with a
   // single part; adding 0.0f reproduces it (including the -0.0 -> +0.0 case).
   float4 c = make_float4(0.f, 0.f, 0.f, 0.f);
   if (!(p.zero_first_correction && s == 0)) {
-    c = *reinterpret_cast<const float4*>(p.corr_final + p.last_corr_parts[s] * p.row_elems + within);
+    c = *reinterpret_cast<const float4*>(p.corr_final + p.last_corr_parts[s] * p.row_elems +
+                                         within);
   }
-  v.x += c.x; v.y += c.y; v.z += c.z; v.w += c.w;
+  v.x += c.x;
+  v.y += c.y;
+  v.z += c.z;
+  v.w += c.w;
   *reinterpret_cast<float4*>(p.final_compact + e) = v;
   const int64_t slot = p.state_indices[s];
   if (p.pool_bf16) {
@@ -144,14 +154,20 @@ __global__ void __launch_bounds__(kThreads) affine_epilogue_kernel(Params p) {
     __nv_bfloat162 hi = __floats2bfloat162_rn(v.z, v.w);
     __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(
         static_cast<__nv_bfloat16*>(p.final_pool) + slot * p.pool_slot_stride + within);
-    dst[0] = lo; dst[1] = hi;
+    dst[0] = lo;
+    dst[1] = hi;
   } else {
-    *reinterpret_cast<float4*>(static_cast<float*>(p.final_pool) + slot * p.pool_slot_stride + within) = v;
+    *reinterpret_cast<float4*>(static_cast<float*>(p.final_pool) + slot * p.pool_slot_stride +
+                               within) = v;
   }
 }
 
-inline bool is_bf16(const TensorView& t) { return t.dtype().code == kDLBfloat && t.dtype().bits == 16; }
-inline bool is_f32(const TensorView& t) { return t.dtype().code == kDLFloat && t.dtype().bits == 32; }
+inline bool is_bf16(const TensorView& t) {
+  return t.dtype().code == kDLBfloat && t.dtype().bits == 16;
+}
+inline bool is_f32(const TensorView& t) {
+  return t.dtype().code == kDLFloat && t.dtype().bits == 32;
+}
 inline bool is_i64(const TensorView& t) { return t.dtype().code == kDLInt && t.dtype().bits == 64; }
 
 void Run(TensorView main_rows, TensorView corr_rows, TensorView out_rows, TensorView offsets,

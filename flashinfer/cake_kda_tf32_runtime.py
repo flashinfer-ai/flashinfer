@@ -217,7 +217,7 @@ def _build_kda_module(factory, *args, **kwargs):
 import heapq
 from dataclasses import dataclass, field
 from functools import cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -2866,9 +2866,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             host_uploads["task_token_starts"] = list(host_task_token_starts)
             host_uploads["task_token_counts"] = list(host_task_token_counts)
             host_uploads["task_state_sources"] = list(host_task_state_sources)
-            host_uploads["task_state_destinations"] = list(
-                host_task_state_destinations
-            )
+            host_uploads["task_state_destinations"] = list(host_task_state_destinations)
             mid_state = torch.empty(
                 (handoff_count, HEAD_DIM, HEAD_DIM),
                 dtype=torch.float32 if use_tf32_persistent_m128 else torch.bfloat16,
@@ -4195,7 +4193,9 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 torch.bfloat16,
                 torch.float32,
             ):
-                raise TypeError("affine checkpoint output must be contiguous BF16 or FP32")
+                raise TypeError(
+                    "affine checkpoint output must be contiguous BF16 or FP32"
+                )
             if (
                 state_checkpoints.dtype == torch.float32
                 and initial_state.dtype != torch.float32
@@ -4556,8 +4556,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._final_correction_selected = torch.empty_like(self._final_compact)
             if self._checkpoint_output is not None:
                 self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
-                self._checkpoint_merged_first = self._checkpoint_merged[: self._first_cp_count]
-                self._checkpoint_merged_tail = self._checkpoint_merged[self._first_cp_count :]
+                self._checkpoint_merged_first = self._checkpoint_merged[
+                    : self._first_cp_count
+                ]
+                self._checkpoint_merged_tail = self._checkpoint_merged[
+                    self._first_cp_count :
+                ]
         self._use_cuda_graph = True
         self._cuda_graph_warmed = False
         self._cuda_graph = None
@@ -4996,8 +5000,8 @@ def rebind_signature(inputs: dict) -> tuple:
     packed ``q``/``k``/``v`` slices of one projection buffer, ...).
     """
     storage_groups: dict[int, int] = {}
-    facts = []
-    aliases = []
+    facts: list[Optional[tuple]] = []
+    aliases: list[Optional[int]] = []
     for name in REBIND_INPUT_NAMES:
         tensor = inputs.get(name)
         if tensor is None:
@@ -5172,6 +5176,7 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
                             )
                         )
                         break
+
     def owned_items(owner):
         return tuple(
             item
@@ -5218,7 +5223,13 @@ def rebind_prepared_launch(
     resolved: dict[tuple, Any] = {}
 
     def view_for(spec: _RebindView):
-        cache_key = (spec.input_name, spec.byte_offset, spec.shape, spec.stride, spec.dtype)
+        cache_key = (
+            spec.input_name,
+            spec.byte_offset,
+            spec.shape,
+            spec.stride,
+            spec.dtype,
+        )
         tensor = resolved.get(cache_key)
         if tensor is not None:
             return tensor
@@ -5230,7 +5241,9 @@ def rebind_prepared_launch(
             and tuple(source.stride()) == spec.stride
         ):
             tensor = source
-        elif source.dtype == spec.dtype and spec.byte_offset % source.element_size() == 0:
+        elif (
+            source.dtype == spec.dtype and spec.byte_offset % source.element_size() == 0
+        ):
             tensor = source.as_strided(
                 spec.shape,
                 spec.stride,
@@ -5264,9 +5277,9 @@ def rebind_prepared_launch(
             if owner is not impl and owner not in stale_owners:
                 stale_owners.append(owner)
         container[spec.key] = replacement
-    for spec in plan.addresses:
-        containers[spec.container][spec.key] = (
-            inputs[spec.input_name].data_ptr() + spec.byte_offset
+    for address in plan.addresses:
+        containers[address.container][address.key] = (
+            inputs[address.input_name].data_ptr() + address.byte_offset
         )
     new_inputs = tuple(
         inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None

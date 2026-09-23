@@ -7409,7 +7409,10 @@ def kda_prefill_supports_fp32_checkpoints(device=None, *, lower_bound=None) -> b
     except Exception:  # noqa: BLE001 - no CUDA device or unsupported arch
         return False
     gate_kind = "unbounded_softplus" if lower_bound is None else "lower_bound"
-    variants = FACTORIES.get(arch, {}).get("compiled_bf16_fused_m128", {})
+    variants = cast(
+        "Mapping[tuple, str]",
+        FACTORIES.get(arch, {}).get("compiled_bf16_fused_m128", {}),
+    )
     return any(
         ("checkpoint_dtype_is_fp32", True) in key[1]
         and ("gate_kind", gate_kind) in key[1]
@@ -7454,8 +7457,8 @@ class KDAPrefillPlanCache:
             raise ValueError("plan cache byte budget must be positive")
         self.capacity = int(capacity)
         self.max_bytes = int(max_bytes)
-        self._entries = OrderedDict()
-        self._bytes = {}
+        self._entries: "OrderedDict[object, object]" = OrderedDict()
+        self._bytes: dict[object, int] = {}
         self.bytes = 0
         self.hits = 0
         self.misses = 0

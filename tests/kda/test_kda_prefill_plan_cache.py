@@ -52,7 +52,9 @@ def _inputs(lengths, heads, *, seed, storage_extra=0):
         beta=randn(1, tokens + storage_extra, heads + 24)[:, :, 8 : 8 + heads],
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.full((heads, HEAD_DIM), -2.0, device="cuda"),
-        out=torch.empty(1, tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16),
+        out=torch.empty(
+            1, tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+        ),
         pool=randn(pool_slots, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32) * 0.1,
         state_indices=torch.arange(len(lengths), device="cuda", dtype=torch.int32) + 1,
         cu_seqlens=torch.tensor(offsets, device="cuda", dtype=torch.int64),
@@ -60,7 +62,9 @@ def _inputs(lengths, heads, *, seed, storage_extra=0):
         # Zero-filled so an unrequested checkpoint buffer stays comparable and
         # any stray write into it (stale pointer, out-of-bounds row) shows up.
         state_checkpoints=torch.zeros(
-            (cp_offsets[-1], heads, HEAD_DIM, HEAD_DIM), device="cuda", dtype=torch.bfloat16
+            (cp_offsets[-1], heads, HEAD_DIM, HEAD_DIM),
+            device="cuda",
+            dtype=torch.bfloat16,
         ),
         lengths=tuple(lengths),
     )
@@ -190,7 +194,9 @@ def test_split_sequence_affine_route_caches_and_rebinds():
 
 
 @pytest.mark.parametrize("checkpoints", [True, False])
-def test_long_unbounded_sequence_on_fp32_state_takes_affine_split_and_caches(checkpoints):
+def test_long_unbounded_sequence_on_fp32_state_takes_affine_split_and_caches(
+    checkpoints,
+):
     # The FP32 external state pool is the serving contract: with or without a
     # checkpoint request an unbounded long sequence takes the affine split
     # (FP32 state carrier in every part), and the composite plan is cacheable
@@ -245,7 +251,9 @@ def test_fp32_checkpoint_probe_is_per_gate_kind():
     assert kda_prefill_supports_fp32_checkpoints(device, lower_bound=None) is True
     assert kda_prefill_supports_fp32_checkpoints(device, lower_bound=-5.0) is False
     d = _inputs([200, 130], 16, seed=7)
-    d["state_checkpoints"] = torch.empty_like(d["state_checkpoints"], dtype=torch.float32)
+    d["state_checkpoints"] = torch.empty_like(
+        d["state_checkpoints"], dtype=torch.float32
+    )
     call = _run(d)
     assert "fp32_checkpoint" in str(call.schedule)
     assert torch.isfinite(d["state_checkpoints"]).all()
@@ -258,7 +266,9 @@ def test_bf16_checkpoint_rows_keep_the_bf16_carrier_on_fp32_state():
     d = _inputs([64] * 4, 12, seed=8)
     call = _run(d)
     assert "fp32" not in str(call.schedule)
-    assert torch.isfinite(d["out"]).all() and torch.isfinite(d["state_checkpoints"]).all()
+    assert (
+        torch.isfinite(d["out"]).all() and torch.isfinite(d["state_checkpoints"]).all()
+    )
 
 
 def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
@@ -302,7 +312,6 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
         d, True, monkeypatch, checkpoints=checkpoints, lower_bound=lower_bound
     )
     _assert_same(got, want)
-
 
 
 @pytest.mark.parametrize(
@@ -367,7 +376,11 @@ def test_plan_cache_evicts_by_retained_workspace_bytes():
     long = _inputs([16384], 16, seed=33)
     _run(long, roomy)
     # the affine composite with rows retains well under the default budget
-    assert 0 < roomy._bytes[next(reversed(roomy._entries))] < KDAPrefillPlanCache.DEFAULT_MAX_BYTES // 4
+    assert (
+        0
+        < roomy._bytes[next(reversed(roomy._entries))]
+        < KDAPrefillPlanCache.DEFAULT_MAX_BYTES // 4
+    )
 
 
 def test_affine_fused_epilogue_keeps_subnormal_sums():
@@ -390,17 +403,38 @@ def test_affine_fused_epilogue_keeps_subnormal_sums():
 
     main_rows, corr_rows = subnormal((2, elems)), subnormal((1, elems))
     out_rows = torch.zeros((2, elems), device=device)
-    tail, corr_out = subnormal((tail_elems,), torch.bfloat16), subnormal(
-        (tail_elems,), torch.bfloat16
+    tail, corr_out = (
+        subnormal((tail_elems,), torch.bfloat16),
+        subnormal((tail_elems,), torch.bfloat16),
     )
     want_tail = (tail.float() + corr_out.float()).to(torch.bfloat16)
     main_final, corr_final = subnormal((1, elems)), subnormal((1, elems))
     final_compact = torch.zeros((1, elems), device=device)
     final_pool = torch.zeros((3, elems), device=device)
     run(
-        main_rows, corr_rows, out_rows, i64([0, 1]), i64([0, 0]), i64([0]), 1, 2,
-        tail, corr_out, main_final, corr_final, i64([0]), i64([0]), 0,
-        final_compact, final_pool, elems, i64([2]), 1, heads, tail_elems, 1,
+        main_rows,
+        corr_rows,
+        out_rows,
+        i64([0, 1]),
+        i64([0, 0]),
+        i64([0]),
+        1,
+        2,
+        tail,
+        corr_out,
+        main_final,
+        corr_final,
+        i64([0]),
+        i64([0]),
+        0,
+        final_compact,
+        final_pool,
+        elems,
+        i64([2]),
+        1,
+        heads,
+        tail_elems,
+        1,
     )
     torch.cuda.synchronize()
     want_final = main_final + corr_final
