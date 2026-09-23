@@ -309,13 +309,17 @@ def test_defaults_and_complete_candidate_order(profile):
         assert candidates[0] == normalize_mxfp4_optimization_tactic(tactic)
 
 
-def test_cache_identity_preserves_existing_winners_and_tracks_domain(monkeypatch):
-    expected = {
+def test_cache_identity_invalidates_unfenced_winners_and_tracks_domain(monkeypatch):
+    unfenced = {
         "block_permutation_v1": "0e34a82c58bf39fc04cd25c54a3d62ae88cc7d46f2449b8d5a36e388022d8682",
         "published_exact_balanced_v1": "ab16d80c9766ee9de4c0f57ffbfd93de7bd5aa4fe71947578aadf3fd2b7e2443",
     }
+    expected = {
+        profile: hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
+        for profile in unfenced
+    }
     for profile, identity in expected.items():
-        assert hopper_mxfp4_cache_provenance_sha256(routing_profile=profile) == identity
+        assert identity != unfenced[profile]
     changed = (
         *mxfp4_tuner._BASE_TACTICS,
         dict(mxfp4_tuner._BASE_TACTICS[0], group_hint=999),
@@ -330,6 +334,21 @@ def test_cache_identity_preserves_existing_winners_and_tracks_domain(monkeypatch
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.src.moe_hopper_fp8 import (
         mxfp4_policy,
     )
+
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
+        mxfp4_optimization,
+    )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mxfp4_policy, "MXFP4_OPTIMIZATION_VERSION", "fused_local_v2")
+        patch.setattr(
+            mxfp4_optimization, "MXFP4_OPTIMIZATION_VERSION", "fused_local_v2"
+        )
+        for profile, identity in unfenced.items():
+            assert (
+                hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
+                == identity
+            )
 
     monkeypatch.setattr(
         mxfp4_policy, "MXFP4_OPTIMIZATION_VERSION", "changed-test-domain"

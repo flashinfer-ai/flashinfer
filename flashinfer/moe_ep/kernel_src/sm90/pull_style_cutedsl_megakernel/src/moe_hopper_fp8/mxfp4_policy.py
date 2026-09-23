@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from .fused_comm_policy import resolve_fused_comm_optimizations
 
 
-MXFP4_OPTIMIZATION_VERSION = "fused_local_v2"
+# Register-A fence ordering is part of the compiled implementation.
+MXFP4_OPTIMIZATION_VERSION = "fused_local_v3"
 MXFP4_READY_MODES = ("tile", "k256")
 
 

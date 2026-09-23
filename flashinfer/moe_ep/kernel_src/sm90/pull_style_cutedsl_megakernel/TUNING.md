@@ -775,9 +775,11 @@ These measurements used reviewed source tree
 `621fd46e1497a609693d6532ed56325a4d2ce8b2`, retained byte-identical SM90 kernel
 implementation files under `src/` and the same 39 ordered candidate lists for
 this workload (13 token counts times three precisions). Subsequent review fixes
-consolidate the LDSM/conversion helpers and keep MXFP4 FC1 chunking independent
-of the FP8 environment override. The full performance campaign was not repeated
-after these changes; this table retains the original measured source above.
+consolidate the LDSM/conversion helpers, keep MXFP4 FC1 chunking independent
+of the FP8 environment override, and fence converted A registers before WGMMA.
+The fence fix advances the implementation version so earlier tuning records
+miss the cache. The full 13-point performance campaign was not repeated after
+these changes; this table retains the original measured source above.
 
 **Workload and selection.** Four H200 GPUs, EP4, H7168/I3072/E384, top-k 6,
 clamp 10, dense BF16 inputs, block-permutation routing and the benchmark's

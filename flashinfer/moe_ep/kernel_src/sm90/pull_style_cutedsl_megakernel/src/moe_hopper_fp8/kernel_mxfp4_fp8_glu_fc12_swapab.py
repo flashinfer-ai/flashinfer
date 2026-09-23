@@ -782,7 +782,6 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             partitioned_offsets = thr_mma.partition_A(offsets_wg)
 
             tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-            warpgroup.fence()
             for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(ab_consumer_state)
                 weight_sf_pipeline.consumer_wait(ab_consumer_state)
@@ -802,6 +801,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                         k_block,
                         stage_idx,
                     )
+                # Order the converted A registers before WGMMA reads them.
+                warpgroup.fence()
                 for k_block in cutlass.range_constexpr(
                     MXFP4_K_TILE // 32
                 ):
@@ -885,7 +886,6 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
             accumulators.fill(0.0)
             tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-            warpgroup.fence()
             for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(ab_consumer_state)
                 weight_sf_pipeline.consumer_wait(ab_consumer_state)
@@ -916,6 +916,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                         k_block,
                         stage_idx,
                     )
+                # Order the converted A registers before WGMMA reads them.
+                warpgroup.fence()
                 for k_block in cutlass.range_constexpr(
                     MXFP4_K_TILE // 32
                 ):
@@ -994,7 +996,6 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
             accumulators.fill(0.0)
             tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-            warpgroup.fence()
 
             if local_warp_idx == cutlass.Int32(0):
                 iket.range_push("mx_f1_wait0")
@@ -1020,6 +1021,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     k_block,
                     stage_idx,
                 )
+                warpgroup.fence()
                 if local_warp_idx == cutlass.Int32(0):
                     iket.range_pop()
                     iket.range_push("mx_f1_mma0")
@@ -1053,6 +1055,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     k_block,
                     stage_idx,
                 )
+                warpgroup.fence()
                 if local_warp_idx == cutlass.Int32(0):
                     iket.range_pop()
                     iket.range_push("mx_f1_mma1")
@@ -1092,6 +1095,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                         k_block,
                         stage_idx,
                     )
+                    warpgroup.fence()
                     cute.gemm(
                         tiled_mma,
                         accum_temp,
@@ -1109,6 +1113,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                         k_block,
                         stage_idx,
                     )
+                    warpgroup.fence()
                     cute.gemm(
                         tiled_mma,
                         accum_temp,
