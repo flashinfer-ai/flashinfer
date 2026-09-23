@@ -57,6 +57,7 @@ from .pcie_ipc_policy import (
     MAX_BLOCKS,
     IpcLaunchConfig,
     IpcVariant,
+    _is_fused_launchable,
     _is_launchable,
 )
 
@@ -64,20 +65,51 @@ from .pcie_ipc_policy import (
 # every cache file rather than mis-resolving one.
 PCIE_IPC_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce"
 
+# The fused op searches under its own name rather than as extra variants of the
+# one above. Two reasons, and either alone would be enough: candidate_tactics()
+# enumerates every IpcVariant, so a fused entry there would be swept by the
+# plain search, which has no residual or weight to pass it; and the two ops
+# rank different kernels over the same (blocks, threads) grid, so sharing a
+# name would let one's winner be read back as the other's.
+PCIE_IPC_FUSED_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce_fused_add_rmsnorm"
+
 # Bump when a variant's meaning, the scratch-region assignment, or the
 # candidate encoding changes. The autotuner's own metadata records library and
 # driver versions but nothing about this op, and a dev checkout does not move
 # the FlashInfer version.
+#
+# 2: the fused kernels moved from the block scratch region to the pack region,
+# and gained a transport choice of their own.
+# 3: fused tactics gained a fourth field, transport_blocks, and the fused
+# kernels changed shape (collective verbatim, then a grid barrier, then the
+# normalisation) -- a tactic measured against the old shape names a different
+# kernel.
 PCIE_IPC_TUNE_VERSION = 3
 # Only workspaces that admit stream publication search the additional tactic.
 # Preserve their existing namespace without invalidating original-path caches.
 _PCIE_IPC_MEMOP_TUNE_VERSION = 4
+
+# Versions the fused search alone, on top of the head above. Separate because
+# what invalidates one search does not invalidate the other: both are keyed by
+# the same workspace head and told apart only by op name, so folding this into
+# PCIE_IPC_TUNE_VERSION would discard every tuned plain configuration for a
+# change the plain dispatch never saw.
+#
+# 2: at world 8 kStaged moved from the flat push to the island-block kernel and
+# the flat push moved to kFlatStaged, aligning the fused variant mapping with
+# the plain one. The same persisted tactic now names a different kernel there.
+PCIE_IPC_FUSED_TUNE_VERSION = 2
 
 # Not all powers of two: the extra entries are block counts the search selected
 # on real hardware, and it cannot converge on a configuration its own grid
 # cannot name.
 TUNE_BLOCKS: Tuple[int, ...] = (1, 2, 4, 8, 12, 16, 32, 64, 96, 128)
 TUNE_THREADS: Tuple[int, ...] = (64, 128, 256, 512, 1024)
+
+# Fused only: how many of the launched blocks run the collective. Short, and
+# short on purpose -- the collective's optimum is a handful of blocks on this
+# fabric, and 0 (meaning "all of them") covers the case where it is not.
+TUNE_TRANSPORT_BLOCKS: Tuple[int, ...] = (1, 2, 4, 8, 0)
 
 # Batch buckets. Floor semantics, so a bucket is always a batch the tuner
 # actually measured. Matches the benchmark's default sweep.
@@ -96,6 +128,11 @@ TABLE_TACTIC = -1
 # exactly representable, which is what lets verification use a zero tolerance
 # despite the kernels summing in a different order than NCCL.
 INIT_MAX_VALUE = 16
+
+# Epsilon used when screening fused candidates. Any value serves -- the
+# reference is built with the same one -- but it is fixed here so the screening
+# does not depend on what the caller happens to pass at serving time.
+_TUNE_EPS = 1e-6
 
 
 # Above this payload the grid is narrowed before profiling. The screen is a
@@ -185,7 +222,62 @@ def _candidate_tactics_cached(
     return tuple(out)
 
 
-def config_to_tactic(config: IpcLaunchConfig) -> Tuple[int, int, int]:
+def fused_candidate_tactics(
+    world_size: int,
+    hidden: int,
+    elem_size: int,
+    max_blocks: int = MAX_BLOCKS,
+    sm_count: Optional[int] = None,
+    blocks: Tuple[int, ...] = TUNE_BLOCKS,
+    threads: Tuple[int, ...] = TUNE_THREADS,
+    numel: Optional[int] = None,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Every fused launch configuration the dispatch can reach, as tactics.
+
+    Takes ``hidden`` where :func:`candidate_tactics` does not: the fused kernels
+    hold a row in registers, so the row width sets a floor under the thread
+    count and the candidate list genuinely differs between hidden sizes. It is
+    a group-identical argument like the rest, so every rank still derives the
+    same list in the same order.
+
+    Every variant the plain op reaches, both data planes. ``numel`` is required
+    for the copy-engine ones, whose shard divisibility is a function of the
+    payload rather than of the shape alone; without it they are refused rather
+    than guessed at.
+    """
+    return _fused_candidate_tactics_cached(
+        world_size, hidden, elem_size, max_blocks, sm_count, blocks, threads, numel
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_candidate_tactics_cached(
+    world_size, hidden, elem_size, max_blocks, sm_count, blocks, threads, numel
+):
+    out = []
+    for variant in IpcVariant:
+        for b in blocks:
+            for t in threads:
+                for tb in TUNE_TRANSPORT_BLOCKS:
+                    # 0 means every block; naming it explicitly as well would
+                    # enumerate the same kernel twice.
+                    if tb == b:
+                        continue
+                    config = IpcLaunchConfig(b, t, variant, tb)
+                    if _is_fused_launchable(
+                        world_size,
+                        config,
+                        max_blocks,
+                        hidden,
+                        elem_size,
+                        sm_count,
+                        numel,
+                    ):
+                        out.append(config_to_tactic(config))
+    return tuple(out)
+
+
+def config_to_tactic(config: IpcLaunchConfig) -> Tuple[int, ...]:
     """Encode a configuration as a tactic.
 
     Plain ints, because a tactic has to survive a JSON round-trip: the
@@ -193,16 +285,31 @@ def config_to_tactic(config: IpcLaunchConfig) -> Tuple[int, int, int]:
     Self-describing rather than an index into :func:`candidate_tactics`, so
     editing the grid cannot repoint a persisted entry at a different kernel.
     """
+    if config.transport_blocks:
+        return (
+            int(config.variant),
+            int(config.blocks),
+            int(config.threads),
+            int(config.transport_blocks),
+        )
     return (int(config.variant), int(config.blocks), int(config.threads))
 
 
 def tactic_to_config(tactic: Sequence[int]) -> IpcLaunchConfig:
-    """Decode a tactic. Raises ``ValueError`` on anything malformed."""
-    if len(tactic) != 3:
-        raise ValueError(f"expected a 3-element tactic, got {tactic!r}")
-    variant, blocks, threads = (int(v) for v in tactic)
+    """Decode a tactic. Raises ``ValueError`` on anything malformed.
+
+    Three fields for the plain op, four for the fused one, whose extra field is
+    ``transport_blocks``. Both lengths are accepted here because one persisted
+    cache holds both, and a 3-element tactic means "every block transports",
+    which is the only thing the plain kernels do.
+    """
+    if len(tactic) not in (3, 4):
+        raise ValueError(f"expected a 3- or 4-element tactic, got {tactic!r}")
+    values = [int(v) for v in tactic]
+    variant, blocks, threads = values[0], values[1], values[2]
+    transport_blocks = values[3] if len(values) == 4 else 0
     try:
-        return IpcLaunchConfig(blocks, threads, IpcVariant(variant))
+        return IpcLaunchConfig(blocks, threads, IpcVariant(variant), transport_blocks)
     except ValueError as exc:
         raise ValueError(f"tactic {tactic!r} names no variant: {exc}") from exc
 
@@ -248,13 +355,18 @@ def cache_covers_workspace(
     """
     from ..autotuner import AutoTuner
 
-    prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
+    # Both ops, because either one alone being tuned still means the workspace
+    # has measurements. Matching on the plain name only would also match
+    # nothing for the fused op -- its key is a longer string that does not start
+    # with `('flashinfer::pcie_ipc_all_reduce'` once the closing quote is
+    # included -- so the fused entries would be invisible here.
+    prefixes = (f"('{PCIE_IPC_CUSTOM_OP}'", f"('{PCIE_IPC_FUSED_CUSTOM_OP}'")
     # cache_key_extras up to the dtype, with the closing paren traded for the
     # separator that must follow it.
     head = _cache_key_head(world_size, profile, max_blocks, max_numel, memop_supported)
     needle = repr(head)[:-1] + ", "
     return any(
-        key.startswith(prefix) and needle in key
+        key.startswith(prefixes) and needle in key
         for key in AutoTuner.get()._file_configs
     )
 
@@ -279,6 +391,36 @@ def resolve_tuned_config(
     except (TypeError, ValueError):
         return table_config
     if not _is_launchable(world_size, config, max_blocks):
+        return table_config
+    return config
+
+
+def resolve_tuned_fused_config(
+    table_config: IpcLaunchConfig,
+    tactic,
+    world_size: int,
+    max_blocks: int,
+    hidden: int,
+    elem_size: int,
+    sm_count: Optional[int] = None,
+    numel: Optional[int] = None,
+) -> IpcLaunchConfig:
+    """:func:`resolve_tuned_config` for the fused op, with its own admission.
+
+    Same guard and the same reason: a cached tactic is not checked by the
+    autotuner against the shape it is reused for, and here the row width bounds
+    the thread count, so a cache written at one hidden size names configurations
+    another cannot launch.
+    """
+    if tactic is None or tactic == TABLE_TACTIC:
+        return table_config
+    try:
+        config = tactic_to_config(tactic)
+    except (TypeError, ValueError):
+        return table_config
+    if not _is_fused_launchable(
+        world_size, config, max_blocks, hidden, elem_size, sm_count, numel
+    ):
         return table_config
     return config
 
@@ -376,9 +518,18 @@ def cache_key_extras(
 
 
 def pack_config(config: IpcLaunchConfig) -> int:
-    """Pack a configuration into one integer for a cross-rank comparison."""
+    """Pack a configuration into one integer for a cross-rank comparison.
+
+    All four fields: ranks that agreed on (blocks, threads, variant) but not on
+    transport_blocks would launch different numbers of transporting blocks, and
+    the peer barriers pair block b with block b -- so the ones past the smaller
+    count would wait for a partner that never arrives.
+    """
     return (
-        (int(config.variant) << 32) | (int(config.blocks) << 16) | int(config.threads)
+        (int(config.variant) << 48)
+        | (int(config.transport_blocks) << 32)
+        | (int(config.blocks) << 16)
+        | int(config.threads)
     )
 
 
@@ -507,17 +658,19 @@ def tuned_batches_for(
     return tuple(b for b in batches if b * hidden <= max_numel)
 
 
-def warn_no_tune_group(stacklevel: int = 2) -> None:
+def warn_no_tune_group(what: str = "all-reduce", stacklevel: int = 2) -> None:
     """Say why a tuning session left this collective untuned.
 
-    Raised from two places that reach the same dead end -- the runner, when the
+    Raised from the places that reach the same dead end -- a runner, when the
     autotuner does ask it for candidates, and the workspace, when it declines
     to ask at all. The generic "nothing is tuned" advice does not fit here: the
     caller *is* tuning, so telling them to tune is a dead end. What they are
-    missing is the reduction group, and that is what this names.
+    missing is the reduction group, and that is what this names. ``what`` says
+    which of the two searches declined, since they are tuned in one pass and
+    only one of them may be affected.
     """
     warnings.warn(
-        "PCIe IPC all-reduce skipped autotuning: no matching "
+        f"PCIe IPC {what} skipped autotuning: no matching "
         "autotune process group is installed on every rank. Call "
         "PcieIpcAllReduceWorkspace.tune(), or install one with "
         "set_autotune_process_group() before entering autotune().",
@@ -748,10 +901,203 @@ class PcieIpcAllReduceRunner(TunableRunner):
         return out
 
 
+class PcieIpcFusedRmsNormRunner(PcieIpcAllReduceRunner):
+    """Adapts the fused all-reduce to the autotuner.
+
+    Inherits the plain runner's bookkeeping -- the hash, the cache-key extras
+    and the group-searchability check are the same question -- and replaces
+    what a second output and two extra inputs change.
+
+    ``residual_in`` and ``rms_gamma`` are built here rather than taken from
+    ``inputs``. The fusion adds the residual once, on whichever rank owns the
+    pack, so a group whose ranks disagree about it computes a result stitched
+    together from several residuals; the autotuner's initializer draws from an
+    unseeded generator, which is right for the contribution and wrong for these
+    two. Seeded here, so every rank profiles the same problem.
+    """
+
+    # Same tolerance the correctness test uses. The residual is compared
+    # exactly -- small-integer inputs make the group sum exact -- while the
+    # normalisation goes through rsqrt and cannot be.
+    _NORM_RTOL = 0.05
+    _NORM_ATOL = 0.15
+    _SHARED_SEED = 0
+
+    def __init__(self, workspace) -> None:
+        super().__init__(workspace)
+        self._fused_cache: Dict[Tuple[Tuple[int, ...], torch.dtype], Tuple] = {}
+
+    def get_cache_key_extras(self, inputs) -> Tuple:
+        """The plain head, plus what versions this search and not the other.
+
+        Both searches share a workspace head and are told apart by op name
+        alone, so a fused-only invalidation has nowhere else to live. Appending
+        rather than replacing keeps every field the plain key already carries --
+        world size, profile, grid bound, capacity, dtype -- which all still
+        decide what a fused tactic means.
+        """
+        return super().get_cache_key_extras(inputs) + (PCIE_IPC_FUSED_TUNE_VERSION,)
+
+    def __hash__(self) -> int:
+        return hash((super().__hash__(), PCIE_IPC_FUSED_TUNE_VERSION))
+
+    def _buffers_for(self, inp: torch.Tensor) -> Tuple:
+        """(residual_in, gamma, residual_out, norm_out) for a shape, cached.
+
+        Allocated once per shape because get_valid_tactics() must not allocate
+        inside its candidate loop: every rank has to issue exactly the same
+        launches in the same order, and an allocation there could fail on one
+        rank alone.
+        """
+        key = (tuple(inp.shape), inp.dtype)
+        cached = self._fused_cache.get(key)
+        if cached is not None:
+            return cached
+        hidden = inp.shape[-1]
+        generator = torch.Generator(device=inp.device).manual_seed(self._SHARED_SEED)
+        residual_in = torch.randint(
+            0,
+            INIT_MAX_VALUE,
+            tuple(inp.shape),
+            device=inp.device,
+            dtype=torch.int32,
+            generator=generator,
+        ).to(inp.dtype)
+        gamma = torch.randint(
+            1,
+            5,
+            (hidden,),
+            device=inp.device,
+            dtype=torch.int32,
+            generator=generator,
+        ).to(inp.dtype)
+        buffers = (
+            residual_in,
+            gamma,
+            torch.empty_like(inp),
+            torch.empty_like(inp),
+        )
+        self._fused_cache[key] = buffers
+        return buffers
+
+    def _table_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
+        return self._ws.fused_launch_config(inp)
+
+    def get_valid_tactics(self, inputs, profile) -> List:
+        """Candidates that computed the right answer, in a group-agreed order.
+
+        Two verdicts per candidate rather than one. The residual carries the
+        collective and is exact, so it catches a transport that took stale data
+        from a sentinel slot; the normalisation is what the row reduction
+        produces, and a candidate can get the residual right while its
+        denominator is wrong. Neither alone covers the kernel.
+
+        The cardinality rule from the plain runner holds unchanged: barrier
+        first, every buffer allocated before the loop, and a loop body that does
+        not branch.
+        """
+        inp = inputs[0]
+        ws = self._ws
+        table_config = self._table_config(inp)
+        if table_config is None:
+            return [TABLE_TACTIC]
+        if not self.can_profile(inp.device):
+            warn_no_tune_group("fused rmsnorm", stacklevel=3)
+            return [TABLE_TACTIC]
+
+        hidden = int(inp.shape[-1])
+        tactics = fused_candidate_tactics(
+            ws.world_size,
+            hidden,
+            ws.elem_size,
+            ws.max_blocks,
+            ws.sm_count,
+            numel=inp.numel(),
+        )
+        configs = [table_config] + [tactic_to_config(t) for t in tactics]
+
+        residual_in, gamma, residual_out, norm_out = self._buffers_for(inp)
+        reduced = inp.clone()
+        dist.all_reduce(reduced, group=ws.group)
+        ref_residual = (reduced + residual_in).to(inp.dtype)
+        pre = ref_residual.to(torch.float64)
+        ref_norm = (
+            pre
+            * torch.rsqrt(pre.pow(2).mean(dim=-1, keepdim=True) + _TUNE_EPS)
+            * gamma.to(torch.float64)
+        )
+        wrong = torch.zeros(len(configs), dtype=torch.int32, device=inp.device)
+
+        dist.barrier(group=ws.group)
+        for i, config in enumerate(configs):
+            # A kernel that leaves part of the payload unwritten would
+            # otherwise show the previous candidate's correct result.
+            residual_out.fill_(float("nan"))
+            norm_out.fill_(float("nan"))
+            ws._launch_fused(
+                inp, residual_in, gamma, residual_out, norm_out, _TUNE_EPS, config
+            )
+            wrong[i] = (
+                torch.ne(residual_out, ref_residual).any()
+                | torch.isclose(
+                    norm_out.to(torch.float64),
+                    ref_norm,
+                    rtol=self._NORM_RTOL,
+                    atol=self._NORM_ATOL,
+                )
+                .logical_not()
+                .any()
+            )
+        reduce_verdict(wrong, ws.group)
+
+        verdict = wrong.tolist()
+        if verdict[0]:
+            raise RuntimeError(
+                "the seed configuration for shape "
+                f"{tuple(inp.shape)} ({table_config}) does not match a "
+                "reference fused all-reduce; refusing to tune on top of it"
+            )
+        survivors = zip(tactics, verdict[1:], strict=True)
+        return [TABLE_TACTIC] + [t for t, bad in survivors if not bad]
+
+    def forward(
+        self, inputs, tactic=TABLE_TACTIC, do_preparation: bool = False, **kwargs
+    ):
+        inp = inputs[0]
+        residual_in, gamma, residual_out, norm_out = self._buffers_for(inp)
+        if do_preparation:
+            return norm_out
+        table_config = self._table_config(inp)
+        if table_config is None:
+            raise RuntimeError(
+                f"shape {tuple(inp.shape)} is not one the fused kernels "
+                "support; the tuner must not have been asked about it"
+            )
+        config = resolve_tuned_fused_config(
+            table_config,
+            tactic,
+            self._ws.world_size,
+            self._ws.max_blocks,
+            int(inp.shape[-1]),
+            self._ws.elem_size,
+            self._ws.sm_count,
+            inp.numel(),
+        )
+        self._ws._launch_fused(
+            inp, residual_in, gamma, residual_out, norm_out, _TUNE_EPS, config
+        )
+        return norm_out
+
+
 __all__ = [
     "PCIE_IPC_CUSTOM_OP",
+    "PCIE_IPC_FUSED_CUSTOM_OP",
     "PcieIpcAllReduceRunner",
+    "PcieIpcFusedRmsNormRunner",
+    "fused_candidate_tactics",
+    "resolve_tuned_fused_config",
     "PCIE_IPC_TUNE_VERSION",
+    "PCIE_IPC_FUSED_TUNE_VERSION",
     "TABLE_TACTIC",
     "TUNE_BATCHES",
     "TUNE_BLOCKS",

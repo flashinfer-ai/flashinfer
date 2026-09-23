@@ -30,20 +30,27 @@ from ..trace.templates.comm import pcie_ipc_all_reduce_trace
 from ..jit.comm import gen_pcie_ipc_comm_module
 from ..utils import register_custom_op
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
-from .pcie_ipc_policy import IpcLaunchConfig, get_pcie_ipc_launch_config
+from .pcie_ipc_policy import (
+    IpcLaunchConfig,
+    get_pcie_ipc_fused_launch_config,
+    get_pcie_ipc_launch_config,
+)
 from .pcie_ipc_topology import resolve_pcie_ipc_profile
 from .pcie_ipc_tuning import (
     PCIE_IPC_CUSTOM_OP,
+    PCIE_IPC_FUSED_CUSTOM_OP,
     TUNE_REPEAT,
     TUNE_WARMUP,
     generate_tune_batches,
     PcieIpcAllReduceRunner,
+    PcieIpcFusedRmsNormRunner,
     cache_covers_workspace,
     default_cache_path,
     pack_config,
     pcie_ipc_tuning_config,
     TABLE_TACTIC,
     resolve_tuned_config,
+    resolve_tuned_fused_config,
     tuned_batches_for,
     warn_no_tune_group,
 )
@@ -96,11 +103,47 @@ def get_pcie_ipc_comm_module():
             handle, inp, out, blocks, threads, variant, enable_pdl
         )
 
+    @register_custom_op(
+        "flashinfer::pcie_ipc_all_reduce_fused_add_rmsnorm",
+        mutates_args=["residual_out", "norm_out"],
+    )
+    def all_reduce_fused_add_rmsnorm(
+        handle: int,
+        inp: torch.Tensor,
+        residual_in: torch.Tensor,
+        gamma: torch.Tensor,
+        residual_out: torch.Tensor,
+        norm_out: torch.Tensor,
+        hidden: int,
+        eps: float,
+        blocks: int,
+        threads: int,
+        transport_blocks: int,
+        variant: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.pcie_ipc_all_reduce_fused_add_rmsnorm(
+            handle,
+            inp,
+            residual_in,
+            gamma,
+            residual_out,
+            norm_out,
+            hidden,
+            eps,
+            blocks,
+            threads,
+            transport_blocks,
+            variant,
+            enable_pdl,
+        )
+
     return SimpleNamespace(
         workspace_size=workspace_size,
         init=init,
         dispose=dispose,
         all_reduce=all_reduce,
+        all_reduce_fused_add_rmsnorm=all_reduce_fused_add_rmsnorm,
         memop_supported=module.pcie_ipc_memop_supported,
         set_memop_enabled=module.pcie_ipc_set_memop_enabled,
     )
@@ -205,6 +248,12 @@ class PcieIpcAllReduceWorkspace:
         self.elem_size = 0
         self.max_numel = max_numel
         self.max_blocks = max_blocks
+        # Bounds the fused grid: every fused kernel ends in a rendezvous of all
+        # its blocks, which only completes if all of them are resident, and
+        # __launch_bounds__(1024, 1) puts at most one block on an SM.
+        self.sm_count = torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
         self.profile = ""
         self.memop_supported = False
         self.profile_reason = ""
@@ -212,7 +261,12 @@ class PcieIpcAllReduceWorkspace:
         # AutoTuner call because even a pure cache lookup there takes a global
         # lock, which is real overhead at this operator's scale.
         self._tuned: Dict[Tuple[int, int, torch.dtype], IpcLaunchConfig] = {}
+        # Kept apart from _tuned: the two ops rank different kernels over the
+        # same (blocks, threads) grid, so one key space would let a plain
+        # winner be read back as a fused one.
+        self._fused_tuned: Dict[Tuple[int, int, torch.dtype], IpcLaunchConfig] = {}
         self._runner: Optional[PcieIpcAllReduceRunner] = None
+        self._fused_runner: Optional[PcieIpcFusedRmsNormRunner] = None
         self._tune_group: Optional[ProcessGroup] = None
         # None means "derive a ladder from max_numel at tune() time". An
         # explicit list is honoured as given and only checked for coverage; see
@@ -262,6 +316,11 @@ class PcieIpcAllReduceWorkspace:
             # that disagree would resolve different configurations.
             "tune_batches": self._tune_batches,
             "tune_cache": self._tune_cache,
+            # The fused kernels end in a device-local rendezvous, so their grid
+            # may not exceed what the device can hold. Gathered rather than
+            # read locally: ranks that disagree would admit different
+            # configurations, and on a collective that is a hang.
+            "sm_count": self.sm_count,
         }
         self._joint_check(local, "validating arguments")
 
@@ -474,6 +533,7 @@ class PcieIpcAllReduceWorkspace:
     def _init_tuning(self) -> None:
         """Build the runner and load any persisted configurations. Collective."""
         self._runner = PcieIpcAllReduceRunner(self)
+        self._fused_runner = PcieIpcFusedRmsNormRunner(self)
         path = self._tune_cache
         exists = os.path.isfile(path)
         # Whether the file is there has to be a group fact before anyone acts
@@ -569,12 +629,14 @@ class PcieIpcAllReduceWorkspace:
         """
         from ..autotuner import AutoTuner
 
-        prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
+        # Both ops: a rank whose *fused* table differs from its peers' resolves
+        # different fused configurations, and that is a hang just the same.
+        prefixes = (f"('{PCIE_IPC_CUSTOM_OP}'", f"('{PCIE_IPC_FUSED_CUSTOM_OP}'")
         tuner = AutoTuner.get()
         entries = sorted(
             (key, repr(value))
             for key, value in tuner._file_configs.items()
-            if key.startswith(prefix)
+            if key.startswith(prefixes)
         )
         return hashlib.sha256(repr(entries).encode()).hexdigest()[:16]
 
@@ -757,6 +819,280 @@ class PcieIpcAllReduceWorkspace:
         self._launch(inp, out, config, enable_pdl)
         return out
 
+    def fused_launch_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
+        """Configuration for the fused all-reduce, or ``None`` if unsupported.
+
+        A pure function of shape, dtype and the workspace's immutable attributes,
+        for the same reason :meth:`launch_config` is: every rank must reach the
+        same answer without negotiating one.
+        """
+        if inp.device != self.device:
+            raise ValueError(
+                f"input is on {inp.device} but the workspace was built on {self.device}"
+            )
+        if self._handle is None:
+            return None
+        if inp.dtype not in _SUPPORTED_DTYPES:
+            return None
+        if inp.element_size() != self.elem_size:
+            return None
+        if not inp.is_contiguous() or inp.dim() < 2:
+            return None
+        numel = inp.numel()
+        if numel > self.max_numel:
+            return None
+        return get_pcie_ipc_fused_launch_config(
+            self.world_size,
+            numel,
+            inp.shape[-1],
+            self.elem_size,
+            self.max_blocks,
+            self.sm_count,
+        )
+
+    def tuned_fused_launch_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
+        """Fused configuration for ``inp``, measured if one has been persisted.
+
+        The fused counterpart of :meth:`tuned_launch_config`, and split from it
+        the same way: admission first and final, a hot cache consulted outside
+        tuning mode, and the search or lookup only on a miss.
+        """
+        seed = self.fused_launch_config(inp)
+        if seed is None:
+            return None
+        from ..autotuner import AutoTuner
+
+        tuner = AutoTuner.get()
+        key = (inp.numel(), inp.shape[-1], inp.dtype)
+        if not tuner.is_tuning_mode:
+            cached = self._fused_tuned.get(key)
+            if cached is not None:
+                return cached
+        # As in tuned_launch_config: resolving is collective and its verdict is
+        # read back on the host, so a shape first seen inside a capture cannot
+        # be resolved there. The fused op has its own cache, so a shape prepared
+        # for the plain call is still unresolved here.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"the fused launch configuration for shape {tuple(inp.shape)} "
+                f"dtype {inp.dtype} has not been resolved yet, and resolving it "
+                "inside a CUDA graph capture is not possible: the ranks agree "
+                "on it with a collective whose result is read back on the "
+                "host. Call workspace.prepare() with every shape you intend to "
+                "capture -- after tune(), which clears this cache -- or pass "
+                "config= explicitly at the call site."
+            )
+        config = self._resolve_tuned_fused(inp, seed, tuner)
+        self._fused_tuned[key] = config
+        return config
+
+    def _fused_seed_for_bucket(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
+        """The seed as the tuner measured it: on the bucket, not on the shape.
+
+        Tactic ``-1`` means "the seed was fastest", and the autotuner timed it at
+        the bucket shape. Re-deriving it from the real shape can name a
+        *different* transport, because the seed's crossover is a byte threshold
+        and the buckets are powers of two -- at four ranks the threshold falls
+        between batch 2 and 3, which share bucket 2. Serving what was measured
+        keeps a constant fitted on one machine from deciding a shape that was
+        tuned on another.
+        """
+        hidden = int(inp.shape[-1])
+        batch = inp.numel() // hidden
+        # Through _batches_for, not the raw field: the ladder is derived from
+        # the payload when the caller did not name one, and the serving lookup
+        # has to land on the bucket the search actually measured.
+        bucket = max(
+            (b for b in self._batches_for(hidden) if b <= batch), default=batch
+        )
+        return get_pcie_ipc_fused_launch_config(
+            self.world_size,
+            bucket * hidden,
+            hidden,
+            self.elem_size,
+            self.max_blocks,
+            self.sm_count,
+        )
+
+    def _resolve_tuned_fused(
+        self, inp: torch.Tensor, seed: IpcLaunchConfig, tuner
+    ) -> IpcLaunchConfig:
+        """Cold path: search or look up, then make the group agree."""
+        hidden = int(inp.shape[-1])
+        batch = inp.numel() // hidden
+        tuning_config = pcie_ipc_tuning_config(self._batches_for(hidden))
+        can_profile = tuner.is_tuning_mode and self._fused_runner.can_profile(
+            inp.device
+        )
+        if can_profile:
+            _, tactic = tuner.choose_one(
+                PCIE_IPC_FUSED_CUSTOM_OP, [self._fused_runner], tuning_config, [inp]
+            )
+        else:
+            # Same reasoning as _resolve_tuned, and the same two consequences of
+            # getting it wrong: an enclosing autotune context that belongs to
+            # another operator has replaced the global file cache, and profiling
+            # a collective without a matching tune group is unsafe. Profiling
+            # anyway persists the seed tactic for the life of the process.
+            if tuner.is_tuning_mode:
+                warn_no_tune_group("fused rmsnorm", stacklevel=4)
+                if self._tune_cache_exists:
+                    tuner.load_configs(self._tune_cache)
+            _, _, tactic, _ = tuner.search_cache(
+                PCIE_IPC_FUSED_CUSTOM_OP,
+                [self._fused_runner],
+                ((batch, hidden),),
+                tuning_config,
+                inputs=[inp],
+            )
+        # `-1` resolves to the configuration the tuner actually timed; anything
+        # unusable still falls back to the seed for the real shape.
+        table_config = self._fused_seed_for_bucket(inp) or seed
+        config = resolve_tuned_fused_config(
+            table_config,
+            tactic,
+            self.world_size,
+            self.max_blocks,
+            hidden,
+            self.elem_size,
+            self.sm_count,
+            inp.numel(),
+        )
+
+        # Unconditional, for the reason given in _resolve_tuned: the ranks
+        # would otherwise have to agree on whether to run this collective
+        # before running it.
+        packed = pack_config(config)
+        bounds = torch.tensor([packed, -packed], dtype=torch.int64, device=self.device)
+        dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=self.group)
+        if int(bounds[0]) != -int(bounds[1]):
+            warnings.warn(
+                "ranks resolved different tuned fused configurations for shape "
+                f"{tuple(inp.shape)}; falling back to the seed configuration. "
+                "The tune cache is inconsistent across ranks -- delete "
+                f"{self._tune_cache} and re-tune.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return seed
+        if not tuner.is_tuning_mode:
+            self._warn_if_untuned()
+        return config
+
+    def supports_fused_add_rms_norm(self, inp: torch.Tensor) -> bool:
+        """Whether the fused kernel can run ``inp``.
+
+        Stricter than :meth:`supports`: the fused kernel holds a whole row in
+        registers, so a row wider than the grid mapping allows is refused here
+        while the plain all-reduce still takes it.
+        """
+        return self.fused_launch_config(inp) is not None
+
+    @flashinfer_api
+    def all_reduce_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        *,
+        residual_in: torch.Tensor,
+        rms_gamma: torch.Tensor,
+        rms_eps: float = 1e-6,
+        residual_out: Optional[torch.Tensor] = None,
+        norm_out: Optional[torch.Tensor] = None,
+        config: Optional[IpcLaunchConfig] = None,
+        enable_pdl: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce ``inp``, add ``residual_in``, and RMSNorm the result.
+
+        Equivalent to ``all_reduce`` followed by
+        :func:`~flashinfer.norm.fused_add_rmsnorm`, in one launch. Both outputs
+        are full shape on every rank.
+
+        ``norm_out`` is exactly ``rmsnorm(residual_out)``: the sum of squares is
+        taken over the stored, rounded residual rather than an unrounded
+        accumulator, because a rank that does not own a pack only ever sees the
+        rounded value. That matches the other fusion backends, so the three are
+        interchangeable.
+
+        A **collective**, with the same contract as :meth:`all_reduce`: every
+        rank issues it with the same shape, dtype and configuration, in the same
+        order.
+
+        Parameters
+        ----------
+        inp : torch.Tensor
+            ``[rows, hidden]``, this rank's contribution. Not modified.
+        residual_in : torch.Tensor
+            Added once, by whichever rank owns the pack, after the reduction.
+            **Must be identical on every rank** -- it is replicated in tensor
+            parallelism, and a group that disagrees about it gets a result
+            stitched together from several residuals rather than an error.
+        rms_gamma : torch.Tensor
+            ``[hidden]`` RMSNorm weight. Identical on every rank, for the same
+            reason as ``residual_in``.
+        rms_eps : float
+            Added to the mean square before the reciprocal square root.
+        residual_out, norm_out : torch.Tensor, optional
+            Destinations. Allocated when omitted. Must not alias each other.
+        config : IpcLaunchConfig, optional
+            Launch geometry and transport. Resolved from the tune cache or the
+            seed when omitted; pass one explicitly only to benchmark or to reach
+            a configuration neither would choose. ``variant`` selects the
+            transport, and names the same kernel it names on :meth:`all_reduce`:
+            ``UNSTAGED`` the one-shot, ``STAGED`` the staged push (island-block
+            at eight ranks), ``STAGED_RING`` neighbour order, ``FLAT_STAGED``
+            the topology-blind push at eight ranks only. Ranks that disagree on
+            it hang.
+
+        Returns
+        -------
+        tuple
+            ``(norm_out, residual_out)``.
+
+        Raises
+        ------
+        ValueError
+            If the fused kernel cannot run this shape. Check
+            :meth:`supports_fused_add_rms_norm` first and fall back.
+        """
+        if config is None:
+            config = self.tuned_fused_launch_config(inp)
+            if config is None:
+                raise ValueError(
+                    f"fused rmsnorm does not support shape {tuple(inp.shape)} "
+                    f"dtype {inp.dtype} at {self.world_size} ranks; check "
+                    "supports_fused_add_rms_norm() first"
+                )
+        self._check_stream()
+        for name, tensor in (("residual_in", residual_in), ("rms_gamma", rms_gamma)):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device} but the workspace was built "
+                    f"on {self.device}"
+                )
+        if residual_out is None:
+            residual_out = torch.empty_like(inp)
+        if norm_out is None:
+            norm_out = torch.empty_like(inp)
+        if residual_out.data_ptr() == norm_out.data_ptr():
+            raise ValueError("residual_out and norm_out must not alias")
+
+        get_pcie_ipc_comm_module().all_reduce_fused_add_rmsnorm(
+            self.handle,
+            inp,
+            residual_in,
+            rms_gamma,
+            residual_out,
+            norm_out,
+            int(inp.shape[-1]),
+            float(rms_eps),
+            config.blocks,
+            config.threads,
+            config.effective_transport_blocks(),
+            int(config.variant),
+            enable_pdl,
+        )
+        return norm_out, residual_out
+
     def _launch(
         self,
         inp: torch.Tensor,
@@ -777,6 +1113,39 @@ class PcieIpcAllReduceWorkspace:
             out,
             config.blocks,
             config.threads,
+            int(config.variant),
+            enable_pdl,
+        )
+
+    def _launch_fused(
+        self,
+        inp: torch.Tensor,
+        residual_in: torch.Tensor,
+        gamma: torch.Tensor,
+        residual_out: torch.Tensor,
+        norm_out: torch.Tensor,
+        eps: float,
+        config: IpcLaunchConfig,
+        enable_pdl: bool = False,
+    ) -> None:
+        """Issue one fused collective with an explicit configuration.
+
+        The launch without the admission, device and stream checks around it,
+        for the same caller :meth:`_launch` has: the tuner, sweeping many
+        configurations over one validated set of buffers.
+        """
+        get_pcie_ipc_comm_module().all_reduce_fused_add_rmsnorm(
+            self.handle,
+            inp,
+            residual_in,
+            gamma,
+            residual_out,
+            norm_out,
+            int(inp.shape[-1]),
+            float(eps),
+            config.blocks,
+            config.threads,
+            config.effective_transport_blocks(),
             int(config.variant),
             enable_pdl,
         )
@@ -815,12 +1184,18 @@ class PcieIpcAllReduceWorkspace:
             Which of the two supported dtypes to resolve for. The cache is
             keyed by dtype, so resolve each one that will be used.
 
+        Both entry points are prepared: :meth:`all_reduce` and
+        :meth:`all_reduce_fused_add_rms_norm` resolve against separate caches,
+        so preparing one would leave the other uncapturable.
+
         Returns
         -------
         dict
-            ``{(batch, hidden): config}``, with ``None`` for shapes the kernels
-            do not support -- those fall back to another backend at call time
-            and never reach a capture.
+            ``{(batch, hidden): config}`` for the plain all-reduce, with ``None``
+            for shapes the kernels do not support -- those fall back to another
+            backend at call time and never reach a capture. The fused
+            configuration is resolved too but not returned; read it with
+            :meth:`fused_launch_config` if it is wanted.
         """
         shapes = [(int(batch), int(hidden)) for batch, hidden in shapes]
         # Same reasoning as tune(): the loop below issues one collective per
@@ -833,6 +1208,13 @@ class PcieIpcAllReduceWorkspace:
         for batch, hidden in shapes:
             probe = torch.empty((batch, hidden), dtype=dtype, device=self.device)
             resolved[(batch, hidden)] = self.tuned_launch_config(probe)
+            # The fused op keeps its own cache, so preparing the plain call
+            # leaves it unresolved and uncapturable. Which of the two the caller
+            # will use is not knowable here, and the extra cost is one small
+            # reduction per shape on a call that is already collective and
+            # made once. Shapes the fused kernels cannot run resolve to None
+            # without issuing anything.
+            self.tuned_fused_launch_config(probe)
         return resolved
 
     def tune(
@@ -844,6 +1226,7 @@ class PcieIpcAllReduceWorkspace:
         tune_group=None,
         warmup: int = TUNE_WARMUP,
         repeat: int = TUNE_REPEAT,
+        fused: bool = True,
     ) -> Dict[Tuple[int, int], IpcLaunchConfig]:
         """Measure the launch configuration for every tuned shape. Collective.
 
@@ -892,6 +1275,13 @@ class PcieIpcAllReduceWorkspace:
             Untimed and timed iterations per candidate. The library defaults
             time too short a span to resolve candidates for a collective this
             fast, so these default higher.
+        fused : bool
+            Also measure :meth:`all_reduce_fused_add_rms_norm`, which searches
+            its own kernels under its own name and roughly doubles the run.
+            Shapes whose row is too wide for the fused kernels are skipped
+            without affecting the plain search. Its winners are not in the
+            return value; read them back with
+            :meth:`tuned_fused_launch_config`.
 
         Returns
         -------
@@ -927,6 +1317,10 @@ class PcieIpcAllReduceWorkspace:
                 "warmup": warmup,
                 "repeat": repeat,
                 "tune_batches": self._tune_batches,
+                # A rank that searched the fused op while its peers did not
+                # would issue a whole extra sequence of collectives into a
+                # group that is not expecting them.
+                "fused": bool(fused),
                 "blocklist": os.environ.get("FLASHINFER_TACTICS_BLOCKLIST", ""),
                 "digest": self._cache_digest(),
             },
@@ -949,6 +1343,7 @@ class PcieIpcAllReduceWorkspace:
         # this operator's scale.
         tuner.warmup, tuner.repeat = warmup, repeat
         covered: List[Tuple[int, int]] = []
+        fused_covered: List[Tuple[int, int]] = []
         skipped: List[int] = []
         try:
             for hidden in hiddens:
@@ -986,6 +1381,21 @@ class PcieIpcAllReduceWorkspace:
                             [inp],
                         )
                         covered.append((hidden, batch))
+                        # The fused op is a separate search under its own name,
+                        # over its own candidate set. Skipped rather than
+                        # refused where the row is too wide for it: the plain
+                        # op still has an answer for that shape.
+                        if fused and self.supports_fused_add_rms_norm(inp):
+                            tuner.choose_one(
+                                PCIE_IPC_FUSED_CUSTOM_OP,
+                                [self._fused_runner],
+                                # The same ladder the plain search just used at
+                                # this hidden: two searches bucketing one shape
+                                # differently would resolve against each other.
+                                pcie_ipc_tuning_config(tuple(requested)),
+                                [inp],
+                            )
+                            fused_covered.append((hidden, batch))
         finally:
             tuner.warmup, tuner.repeat = previous_counts
             # Restore rather than clear: a caller may be tuning something else
@@ -1005,6 +1415,7 @@ class PcieIpcAllReduceWorkspace:
         # Winners live in the in-memory cache now, so drop anything this
         # workspace resolved from the seed.
         self._tuned.clear()
+        self._fused_tuned.clear()
         self._tuned_configs_loaded = True
         dist.barrier(group=self.group)
         # What makes this worth refusing rather than warning is stated to the

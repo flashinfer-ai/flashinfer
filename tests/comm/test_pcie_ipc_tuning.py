@@ -644,7 +644,129 @@ def test_pinning_a_searched_dimension_moved_the_tune_version() -> None:
 def test_custom_op_name_is_stable() -> None:
     """It is baked into every persisted cache key; renaming it orphans the file."""
     assert tuning.PCIE_IPC_CUSTOM_OP == "flashinfer::pcie_ipc_all_reduce"
+    assert (
+        tuning.PCIE_IPC_FUSED_CUSTOM_OP
+        == "flashinfer::pcie_ipc_all_reduce_fused_add_rmsnorm"
+    )
     assert tuning.PCIE_IPC_TUNE_VERSION == 3
+    # The fused search carries its own version on top of that one. Bumped to 2
+    # when the world-8 kStaged moved from the flat push to the island-block
+    # kernel and the flat push moved to kFlatStaged: an entry written before
+    # that names a different kernel at eight ranks. It is separate so the bump
+    # does not discard tuned plain configurations, which the remap never
+    # touched.
+    assert tuning.PCIE_IPC_FUSED_TUNE_VERSION == 2
+
+
+def test_the_two_ops_have_distinct_names() -> None:
+    """One cache file holds both searches, keyed by op name.
+
+    They rank different kernels over the same (blocks, threads) grid, so a
+    shared name would let the plain winner be resolved as the fused one.
+    """
+    assert tuning.PCIE_IPC_CUSTOM_OP != tuning.PCIE_IPC_FUSED_CUSTOM_OP
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_fused_candidates_match_the_plain_variant_space(world_size: int) -> None:
+    """Both dispatches now name the same kernel for the same variant.
+
+    The fused op keeps its own candidate function -- it prices a different
+    kernel over the same grid, and its admission rules differ -- but the variant
+    space it draws from is the plain one, so that a tactic read off one search
+    means the same transport in the other. FLAT_STAGED is eight ranks only, on
+    both sides.
+    """
+    reachable = {
+        tuning.IpcVariant.UNSTAGED,
+        tuning.IpcVariant.STAGED,
+        tuning.IpcVariant.STAGED_RING,
+    }
+    if world_size == 8:
+        reachable.add(tuning.IpcVariant.FLAT_STAGED)
+    seen = set()
+    # No payload: the copy-engine variants are refused rather than guessed at,
+    # so this call sees the SM plane alone.
+    for tactic in tuning.fused_candidate_tactics(world_size, 6144, 2):
+        variant = tuning.tactic_to_config(tactic).variant
+        assert variant in reachable, (world_size, variant)
+        seen.add(variant)
+    if world_size == 8:
+        assert tuning.IpcVariant.FLAT_STAGED in seen, (
+            "the flat push is still reachable at eight ranks, under its own "
+            "variant now that kStaged names the island-block kernel"
+        )
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_fused_candidates_reach_the_copy_engine_when_the_payload_is_known(
+    world_size: int,
+) -> None:
+    """Both data planes, and the payload is what decides the second one.
+
+    The copy-engine ring splits the payload into shards of whole packs, so
+    whether a configuration can run is a function of numel and not of the shape
+    alone. Refusing without it is deliberate -- the alternative is offering the
+    tuner a candidate the binding will reject -- but it means a caller that
+    forgets to pass it silently searches half the space, which is what this
+    pins.
+    """
+    copy_engine = {
+        tuning.IpcVariant.COPY_ENGINE_RING,
+        tuning.IpcVariant.COPY_ENGINE_ISLAND,
+        tuning.IpcVariant.COPY_ENGINE_RING_MEMOP,
+    }
+    hidden, batch = 6144, 64
+    without = tuning.fused_candidate_tactics(world_size, hidden, 2)
+    with_numel = tuning.fused_candidate_tactics(
+        world_size, hidden, 2, numel=batch * hidden
+    )
+    assert not [t for t in without if tuning.tactic_to_config(t).variant in copy_engine]
+    found = {
+        tuning.tactic_to_config(t).variant
+        for t in with_numel
+        if tuning.tactic_to_config(t).variant in copy_engine
+    }
+    if world_size == 2:
+        # Two ranks are one reduce-scatter hop and one all-gather hop with
+        # nothing to pipeline against; the plane excludes them.
+        assert not found
+        return
+    assert tuning.IpcVariant.COPY_ENGINE_RING in found, world_size
+    assert (tuning.IpcVariant.COPY_ENGINE_ISLAND in found) == (world_size == 8)
+    # Everything the SM plane offered is still offered.
+    assert set(without) <= set(with_numel)
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_fused_candidates_respect_the_row_register_bound(world_size: int) -> None:
+    """A row is held in registers, so hidden puts a floor under the threads."""
+    hidden = 6144
+    packs = hidden // 8  # bfloat16
+    for tactic in tuning.fused_candidate_tactics(world_size, hidden, 2):
+        config = tuning.tactic_to_config(tactic)
+        assert packs <= policy.FUSED_MAX_PACKS_PER_THREAD * config.threads
+        assert config.threads >= world_size
+
+
+def test_fused_candidates_have_no_ring_at_two_ranks() -> None:
+    """Neighbour ordering needs peers to order, and no TP2 ring kernel exists."""
+    for tactic in tuning.fused_candidate_tactics(2, 6144, 2):
+        assert (
+            tuning.tactic_to_config(tactic).variant is not tuning.IpcVariant.STAGED_RING
+        )
+
+
+def test_fused_candidates_respect_the_transport_split() -> None:
+    """transport_blocks names a slice of the launch grid, never more than it.
+
+    A tactic asking more blocks to transport than were launched is refused by
+    the launcher, on the rank that asked and nowhere else.
+    """
+    for world_size in _WORLD_SIZES:
+        for tactic in tuning.fused_candidate_tactics(world_size, 6144, 2):
+            config = tuning.tactic_to_config(tactic)
+            assert 0 < config.effective_transport_blocks() <= config.blocks, tactic
 
 
 def test_pack_config_is_injective_over_the_candidate_space() -> None:
@@ -723,3 +845,63 @@ def test_memop_candidate_requires_group_capability_and_single_piece(world_size):
     assert legacy <= enabled
     assert tuning.TUNE_RANK_ROUNDS == 3
     assert tuning.TUNE_SURVIVORS == 48
+
+
+def test_unrelated_autotune_context_preserves_the_fused_cache(monkeypatch) -> None:
+    """The fused search reaches the same dead end, and must handle it the same.
+
+    Both entry points resolve under one process-global tuning flag, so an
+    autotune context opened for another operator sweeps them both. The fused
+    one has its own runner and its own op name but the same hazard: profiling a
+    collective without a matching group is unsafe, and settling for the seed
+    persists that choice for the life of the process.
+    """
+
+    class Runner:
+        def can_profile(self, device) -> bool:
+            return False
+
+    class Tuner:
+        is_tuning_mode = True
+
+        def __init__(self) -> None:
+            self.loaded = []
+            self.lookups = 0
+
+        def load_configs(self, path: str) -> None:
+            self.loaded.append(path)
+
+        def search_cache(self, *args, **kwargs):
+            self.lookups += 1
+            return True, 0, (int(IpcVariant.STAGED_RING), 8, 256, 4), None
+
+        def choose_one(self, *args, **kwargs):
+            raise AssertionError(
+                "collective profiling must not run without a tune group"
+            )
+
+    workspace = PcieIpcAllReduceWorkspace.__new__(PcieIpcAllReduceWorkspace)
+    workspace._fused_runner = Runner()
+    workspace._tune_batches = tuning.TUNE_BATCHES
+    workspace._tune_cache = "/tmp/pcie-ipc-tuned.json"
+    workspace._tune_cache_exists = True
+    workspace._tuned_configs_loaded = True
+    workspace._warned_untuned = False
+    workspace.world_size = 4
+    workspace.max_blocks = MAX_BLOCKS
+    workspace.elem_size = 2
+    workspace.sm_count = None
+    workspace.group = object()
+    workspace.device = torch.device("cpu")
+
+    monkeypatch.setattr(
+        "flashinfer.comm.pcie_ipc_ar.dist.all_reduce", lambda *a, **k: None
+    )
+    tuner = Tuner()
+    seed = IpcLaunchConfig(8, 256, IpcVariant.STAGED)
+    with pytest.warns(RuntimeWarning, match="fused rmsnorm"):
+        result = workspace._resolve_tuned_fused(torch.empty(4, 6144), seed, tuner)
+
+    assert tuner.loaded == [workspace._tune_cache]
+    assert tuner.lookups == 1
+    assert result.variant is IpcVariant.STAGED_RING

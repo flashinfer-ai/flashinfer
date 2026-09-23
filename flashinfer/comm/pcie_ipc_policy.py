@@ -78,6 +78,13 @@ class IpcLaunchConfig:
     blocks: int
     threads: int
     variant: IpcVariant
+    # Fused only: blocks that run the collective, the rest joining just for the
+    # normalisation. 0 means "all of them", which is what the plain kernels do
+    # and the only value they accept.
+    transport_blocks: int = 0
+
+    def effective_transport_blocks(self) -> int:
+        return self.transport_blocks or self.blocks
 
 
 # Payload above which reduce-scatter/all-gather beats pushing to every peer.
@@ -149,6 +156,201 @@ def _seed(
     # Eight ranks below the crossover: the island-partitioned push has no
     # barriers, which is what the staged path's six island barriers must beat.
     return IpcLaunchConfig(min(16, max_blocks), 256, IpcVariant.UNSTAGED)
+
+
+# Packs one thread holds across a row's normalisation; mirrors
+# kFusedMaxPacksPerThread in the header. Wider rows would have to be re-read from
+# HBM, which is the traffic the fusion exists to remove.
+FUSED_MAX_PACKS_PER_THREAD = 4
+# Below this the block reduction is mostly idle warps, and the row is small
+# enough that the thread count is not what limits it.
+_FUSED_MIN_THREADS = 256
+
+
+def fused_rms_norm_threads(hidden: int, elem_size: int) -> Optional[int]:
+    """Threads per block for the fused kernel, or ``None`` if the row is too wide.
+
+    A block covers a whole row so the denominator is a block reduction rather
+    than a grid-wide one; that is what keeps the fused kernel free of the
+    co-residency requirement a cross-block row reduction would impose.
+    """
+    pack_elems = 16 // elem_size
+    if hidden <= 0 or hidden % pack_elems != 0:
+        return None
+    hidden_packs = hidden // pack_elems
+    needed = -(-hidden_packs // FUSED_MAX_PACKS_PER_THREAD)
+    threads = _FUSED_MIN_THREADS
+    while threads < needed:
+        threads *= 2
+    return threads if threads <= 1024 else None
+
+
+# Payload above which the fused path takes the neighbour-ordered transport.
+# Keyed on world size, unlike the plain path's single threshold: the flat push
+# has seven concurrent destinations at eight ranks against three at four, and
+# it collapses in proportion, so the crossover moves. Measured at hidden 6144,
+# where one row is 12 KiB -- TP4 crosses between two rows (27 us flat, 30 ring)
+# and three (48 flat, 34 ring), TP8 between one (41 flat, 60 ring) and two (89
+# flat, 67 ring).
+_FUSED_SEED_RING_BYTES = {4: 32 * 1024, 8: 16 * 1024}
+
+# Same cap as the plain ring, and measured rather than assumed: the row-affine
+# normalisation has a claim on the grid that the plain kernel does not, so this
+# was expected to want more blocks, and it does not. At TP4/hidden 6144 the
+# neighbour-ordered transport still decides the total, and four blocks is the
+# minimum of the curve at every batch from 16 up (batch 128: 231 us at four
+# blocks against 264 at eight and 531 at one).
+#
+# Unlike the plain seed this does not scale the count with the payload. Below
+# 256 KiB that formula yields a single block, which costs the normalisation
+# more than the transport saves -- batch 16 is 85 us at one block against 56 at
+# four.
+_FUSED_SEED_RING_MAX_BLOCKS = 4
+
+
+def _is_fused_launchable(
+    world_size: int,
+    config: IpcLaunchConfig,
+    max_blocks: int,
+    hidden: int,
+    elem_size: int,
+    sm_count: Optional[int] = None,
+    numel: Optional[int] = None,
+) -> bool:
+    """Reject configurations the fused kernels cannot accept.
+
+    Separate from :func:`_is_launchable` because the two dispatches accept
+    different things: the fused entry point takes only the two transports, its
+    thread count is bounded below by the row it has to hold in registers, and
+    its grid is bounded above by what the device can hold.
+
+    ``sm_count`` is that upper bound: every fused kernel ends in a rendezvous of
+    all its blocks, which never completes if one of them was not scheduled, and
+    ``__launch_bounds__(1024, 1)`` puts at most one block on an SM. The launcher
+    refuses such a grid too; rejecting here keeps the tuner from ever proposing
+    one. ``None`` skips the check, for callers that have no device in hand.
+    """
+    if not 0 < config.blocks <= max_blocks:
+        return False
+    if sm_count is not None and config.blocks > sm_count:
+        return False
+    if not 0 < config.effective_transport_blocks() <= config.blocks:
+        return False
+    if not world_size <= config.threads <= 1024:
+        return False
+    # Both data planes, on the same (world_size, variant) -> kernel mapping the
+    # plain dispatch uses, so a tactic means the same thing on both paths. The
+    # copy-engine variants reach the collective they already name followed by a
+    # normalisation pass rather than a fused kernel -- the engine cannot
+    # transform data, so there is nothing at the end of its all-gather to fold
+    # into. Excluding them cost the fused path the fastest transport on any
+    # fabric where the engine wins, which is a larger loss than the pass.
+    copy_engine = config.variant in (
+        IpcVariant.COPY_ENGINE_RING,
+        IpcVariant.COPY_ENGINE_ISLAND,
+        IpcVariant.COPY_ENGINE_RING_MEMOP,
+    )
+    if not copy_engine and config.variant not in (
+        IpcVariant.UNSTAGED,
+        IpcVariant.STAGED,
+        IpcVariant.STAGED_RING,
+        IpcVariant.FLAT_STAGED,
+    ):
+        return False
+    if copy_engine:
+        # `blocks` is the ring's sub-chunk depth here and `threads` belongs to
+        # its add kernel, so the SM plane's bounds below do not apply. The
+        # normalisation pass derives its own width, bounded by the widest block
+        # rather than by this thread count.
+        #
+        # Refused without a payload rather than admitted on the checks that can
+        # still be made: the ring's shard divisibility is a function of numel,
+        # and a caller who cannot say what it is cannot be told this will run.
+        if numel is None:
+            return False
+        if not _is_launchable(world_size, config, max_blocks, numel, elem_size):
+            return False
+        pack_elems = 16 // elem_size
+        if hidden <= 0 or hidden % pack_elems != 0:
+            return False
+        return hidden // pack_elems <= FUSED_MAX_PACKS_PER_THREAD * 1024
+    # Neighbour ordering needs peers to order; at two ranks it is one outbound
+    # stream either way, and no ring kernel is dispatched there.
+    if config.variant == IpcVariant.STAGED_RING and world_size == 2:
+        return False
+    # The topology-blind push is the world-8 fallback only, as on the plain path.
+    if config.variant == IpcVariant.FLAT_STAGED and world_size != 8:
+        return False
+    # The world-8 island-block kernel takes its chunk from blockIdx.x & 3 and its
+    # stride from transport_blocks >> 2: four blocks per chunk minimum, on both
+    # counts, or the grid-stride loops never advance.
+    if config.variant == IpcVariant.STAGED and world_size == 8:
+        if config.blocks % 4 != 0 or config.effective_transport_blocks() % 4 != 0:
+            return False
+    pack_elems = 16 // elem_size
+    if hidden <= 0 or hidden % pack_elems != 0:
+        return False
+    # The row is held in registers across the normalisation.
+    return hidden // pack_elems <= FUSED_MAX_PACKS_PER_THREAD * config.threads
+
+
+def get_pcie_ipc_fused_launch_config(
+    world_size: int,
+    numel: int,
+    hidden: int,
+    elem_size: int,
+    max_blocks: int = MAX_BLOCKS,
+    sm_count: Optional[int] = None,
+) -> Optional[IpcLaunchConfig]:
+    """Launch configuration for the fused all-reduce, or ``None`` if unsupported.
+
+    The variant field names the *transport*, on the same crossover as
+    :func:`_seed`: push to every peer at once while the payload is small,
+    neighbour-ordered once it is not. The fused kernel is still reached through
+    its own entry point rather than through the plain variant dispatch.
+    """
+    if not _admits(world_size, numel, elem_size):
+        return None
+    if numel % hidden != 0:
+        return None
+    threads = fused_rms_norm_threads(hidden, elem_size)
+    if threads is None or threads < world_size:
+        return None
+    # Block count is capped by the row count under either transport: the
+    # normalisation is row-affine, so blocks past the last row have nothing to
+    # normalise. What the cap is below that differs, and only the ring's was
+    # measured to be the same as the plain path's -- see the two constants.
+    rows = numel // hidden
+    if sm_count is not None:
+        max_blocks = min(max_blocks, sm_count)
+    # The grid is the normalisation's -- one block per row, capped by the device
+    # -- and the collective runs on a slice of it. Sizing the launch to the
+    # collective instead would starve the normalisation, which is HBM-bound.
+    blocks = max(1, min(rows, max_blocks))
+    ring_bytes = _FUSED_SEED_RING_BYTES.get(world_size)
+    if ring_bytes is not None and numel * elem_size >= ring_bytes:
+        config = IpcLaunchConfig(
+            blocks,
+            threads,
+            IpcVariant.STAGED_RING,
+            min(blocks, _FUSED_SEED_RING_MAX_BLOCKS),
+        )
+    elif world_size == 4:
+        # Below the crossover at four ranks, staging still cuts egress and the
+        # all-to-all form pays only two barriers, so the one-shot is never the
+        # answer -- the same reasoning _seed() uses, and measured the same way
+        # (batch 1, hidden 6144: 11.7 us staged against 32.8 one-shot).
+        config = IpcLaunchConfig(blocks, threads, IpcVariant.STAGED, blocks)
+    else:
+        # Two ranks have nothing to stage, and eight below the crossover are
+        # served by the island-decomposed one-shot, which has no barriers at all
+        # (batch 1, hidden 6144: 17.0 us against 32.4 for the flat staged form).
+        config = IpcLaunchConfig(blocks, threads, IpcVariant.UNSTAGED, blocks)
+    if not _is_fused_launchable(
+        world_size, config, max_blocks, hidden, elem_size, sm_count, numel
+    ):
+        return None
+    return config
 
 
 CE_MAX_PIECES = 4
