@@ -491,12 +491,40 @@ def test_per_request_tensors_and_routes():
     assert (
         cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
     )
-    assert choose_stage1(1, 128256) == (8, 32, False)
-    assert choose_stage1(8, 65536) == (8, 16, False)
-    assert choose_stage1(16, 128256) == (4, 16, True)
-    assert choose_stage1(64, 128256) == (2, 16, True)
-    assert choose_stage1(16, 262144) == (4, 16, True)
-    assert choose_stage1(64, 262144)[2] and choose_stage1(128, 151936)[2]
+    # B200 wave table (148 SMs).
+    assert choose_stage1(1, 128256, sm_count=148) == (8, 32, False)
+    assert choose_stage1(8, 65536, sm_count=148) == (8, 16, False)
+    assert choose_stage1(16, 128256, sm_count=148) == (4, 16, True)
+    assert choose_stage1(32, 128256, sm_count=148) == (4, 16, True)
+    assert choose_stage1(64, 128256, sm_count=148) == (2, 16, True)
+    assert choose_stage1(16, 262144, sm_count=148) == (4, 16, True)
+    assert choose_stage1(64, 262144, sm_count=148)[2]
+    assert choose_stage1(128, 151936, sm_count=148)[2]
+    # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
+    # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
+    # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.
+    for batch, vocab in (
+        (1, 128256),
+        (8, 65536),
+        (16, 128256),
+        (64, 128256),
+        (16, 262144),
+    ):
+        assert choose_stage1(batch, vocab, sm_count=132) == choose_stage1(
+            batch, vocab, sm_count=148
+        )
+    assert choose_stage1(32, 128256, sm_count=132) == (2, 16, True)
+    assert choose_stage1(32, 262144, sm_count=132) == (2, 16, True)
+    assert choose_stage1(32, 32768, sm_count=132) == (2, 32, False)
+    assert choose_stage1(32, 32768, sm_count=148) == (4, 16, False)
+    # Other SM counts use the nearest measured table.
+    assert choose_stage1(32, 128256, sm_count=152) == choose_stage1(
+        32, 128256, sm_count=148
+    )
+    assert choose_stage1(32, 128256, sm_count=114) == choose_stage1(
+        32, 128256, sm_count=132
+    )
+    assert choose_stage1(32, 128256) in {(2, 16, True), (4, 16, True)}
     assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)

@@ -52,6 +52,7 @@ unsupported GPU) are dispatched to :func:`flashinfer.sampling.top_k_top_p_sampli
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Optional, Union
 
@@ -69,8 +70,16 @@ _THREADS = 512
 _MAX_CLUSTER = 8
 _TOPK_SCALAR, _TOPK_PER_ROW = 1, 2
 _TOPP_SCALAR, _TOPP_PER_ROW = 1, 2
-# Clusters are co-scheduled inside one GPC; measured B200 single-wave CTA capacity per cluster size.
-_WAVE_CTAS = {1: 148, 2: 144, 4: 128, 8: 64}
+# Clusters are co-scheduled inside one GPC, so the number of stage-1 CTAs that run in a single
+# wave depends on the cluster size and on the device's SM / GPC layout.  Measured single-wave CTA
+# capacity per cluster size, keyed by SM count: 148 = B200 / GB300 (B300 tracks it), 132 = H100
+# SXM (64 cluster-4 CTAs run in one wave and 128 take two, so the GPC layout bounds the capacity
+# to 112-127; 120 is used).  A device with another SM count uses the table of the nearest SM count.
+_WAVE_CTAS_BY_SM_COUNT: dict[int, dict[int, int]] = {
+    148: {1: 148, 2: 144, 4: 128, 8: 64},
+    132: {1: 132, 2: 132, 4: 120, 8: 64},
+}
+_DEFAULT_SM_COUNT = 148
 _PREFERRED_MIN_EPT = 16
 # Stage-1 cost model (fitted on B200 stage-1 CUPTI microseconds, k = 50, 49 (vocab, batch)
 # cells): a register-resident wave costs _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per register
@@ -105,15 +114,36 @@ def _slab() -> int:
     return int(load_manifest()["slab_entries"])
 
 
-def choose_stage1(batch: int, vocab: int) -> tuple[int, int, bool]:
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _wave_ctas(sm_count: int) -> dict[int, int]:
+    nearest = min(_WAVE_CTAS_BY_SM_COUNT, key=lambda n: (abs(n - sm_count), -n))
+    return _WAVE_CTAS_BY_SM_COUNT[nearest]
+
+
+def choose_stage1(
+    batch: int, vocab: int, sm_count: Optional[int] = None
+) -> tuple[int, int, bool]:
     """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries.
 
     Register-resident candidates: fewest waves, then a register chunk of at least 16 entries,
     then the larger cluster.  That resident choice is compared with every streaming variant
     through the fitted cost model (resident ``waves * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US *
     ept)`` against streaming ``waves * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)``); the
-    resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table
-    and the cost constants were fitted on B200 and rank the frozen variants on every device."""
+    resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table is
+    selected by ``sm_count`` (the current device's SM count when omitted; B200 148 and H100 132
+    are measured), the cost constants were fitted on B200 and rank the frozen variants on every
+    device."""
+    if sm_count is None:
+        sm_count = (
+            _sm_count(torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else _DEFAULT_SM_COUNT
+        )
+    wave_ctas = _wave_ctas(int(sm_count))
     variants = _stage1_variants()
     epts = sorted({e for _, e, st in variants if not st})
     available = {(c, e) for c, e, st in variants if not st}
@@ -129,7 +159,7 @@ def choose_stage1(batch: int, vocab: int) -> tuple[int, int, bool]:
         candidates.append((cluster, ept))
 
     def waves(c: int) -> int:
-        return -(-(batch * c) // _WAVE_CTAS[c])
+        return -(-(batch * c) // wave_ctas[c])
 
     resident = None
     if candidates:
