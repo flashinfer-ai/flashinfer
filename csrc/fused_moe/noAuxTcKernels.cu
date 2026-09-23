@@ -27,6 +27,9 @@ static constexpr int MaxNumExpertsUnit = 128;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroups = 4;
+// The grouped schedule of ``deepseek_v3_topk_kernel`` launches one warp per
+// group score slot, so at most ``MaxNumGroupScores`` groups can be scored.
+static constexpr int MaxNumGroupScores = NumDeepseekExperts / WARP_SIZE;
 
 static __device__ inline float sigmoid_accurate(float x) { return 0.5f * tanhf(0.5f * x) + 0.5f; }
 
@@ -182,7 +185,9 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       int32_t intermidiateExpert[NumInterTopKPerThread];
       for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE) {
         int ii = i / WARP_SIZE;
-        if (i < NumInterTopK) {
+        // Stage one fills only the first ``topk`` of each ``MaxNumTopExperts``
+        // slot block, so the other slots are uninitialized reads; mask them out.
+        if (i < NumInterTopK && (i % MaxNumTopExperts) < topk) {
           intermidiateScore[ii] = smemInterTopScores[i];
           intermidiateExpert[ii] = smemInterTopExperts[i];
         } else {
@@ -239,17 +244,19 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                    bool const launch_with_pdl, cudaStream_t const stream,
                    int16_t* routing_replay_out) {
 #ifdef FLASHINFER_CAKE_BACKEND
+  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
   bool const cake_common = num_tokens > 0 && num_experts > 0 && n_group > 0 &&
                            num_experts % n_group == 0 && topk > 0 && topk <= 8 &&
-                           topk <= num_experts && topk_group > 0 && topk_group <= n_group &&
-                           topk_group * n_group >= topk;
-  bool const cake_single_group = cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
-  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
+                           topk <= num_experts && topk_group > 0 && topk_group <= n_group;
+  // The single-group Cake schedules write one winner per token: top-1 only.
+  bool const cake_single_group =
+      cake_common && (n_group == 1) && (topk == 1) && (num_experts <= NumKimiK2Experts);
   bool const cake_multi_group = cake_common && (n_group >= 2) && (n_group <= 8) &&
                                 (topk_group <= 4) && (num_experts <= NumDeepseekExperts) &&
                                 (cake_experts_per_group >= 2) &&
                                 (cake_experts_per_group <= WARP_SIZE) &&
-                                (cake_experts_per_group * topk_group <= MaxNumExpertsUnit);
+                                (cake_experts_per_group * topk_group <= MaxNumExpertsUnit) &&
+                                (topk <= cake_experts_per_group * topk_group);
   TLLM_CHECK_WITH_INFO(cake_single_group || cake_multi_group,
                        "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, "
                        "topk_group=%ld). Please use original pytorch implementation.",
@@ -263,13 +270,16 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
   return;
 #endif
 
-  // Check if we can use the optimized deepseek_v3_topk_kernel
-  bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  // Check if we can use the optimized deepseek_v3_topk_kernel.  The grouped
+  // schedule scores at most ``MaxNumGroupScores`` groups, tracks at most
+  // ``MaxNumTopGroups`` selected groups, and needs >= 2 experts per group.
+  int64_t const experts_per_group = n_group > 0 ? num_experts / n_group : 0;  // 0 => unsupported
 
-  int64_t const experts_per_group = num_experts / n_group;
-  bool const is_multi_group = (n_group != 1) && (num_experts <= NumDeepseekExperts) &&
-                              (experts_per_group <= WARP_SIZE) &&
-                              (experts_per_group * topk_group <= MaxNumExpertsUnit);
+  bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
+  bool const is_multi_group =
+      (n_group > 1) && (n_group <= MaxNumGroupScores) && (num_experts <= NumDeepseekExperts) &&
+      (topk_group <= MaxNumTopGroups) && (experts_per_group >= NumTopGroupScores) &&
+      (experts_per_group <= WARP_SIZE) && (experts_per_group * topk_group <= MaxNumExpertsUnit);
 
   if (is_single_group || is_multi_group) {
     cudaLaunchConfig_t config;
@@ -358,13 +368,17 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
       << "scores and bias must be on the same device";
   TVM_FFI_ICHECK(bias.dim() == 1 && bias.numel() == num_experts)
       << "bias must be 1D with length == number of experts (%ld)";
+  // This scalar routing contract is re-checked here because this FFI entry point
+  // is reachable with ``skip_check=True`` (``n_group`` is a divisor below).
+  TVM_FFI_ICHECK(n_group >= 1) << "n_group should be greater than or equal to 1";
+  TVM_FFI_ICHECK(n_group <= 8) << "n_group should be smaller than or equal to 8";
   TVM_FFI_ICHECK(num_experts % n_group == 0) << "num_experts should be divisible by n_group";
-  TVM_FFI_ICHECK(n_group <= 32)
-      << "n_group should be smaller than or equal to 32 for now";  //@todo: remove this restriction
-                                                                   // later
-  TVM_FFI_ICHECK(topk <= 32)
-      << "topk should be smaller than or equal to 32 for now";  //@todo: remove this restriction
-                                                                // later
+  TVM_FFI_ICHECK(topk_group >= 1 && topk_group <= n_group)
+      << "topk_group should be between 1 and n_group";
+  TVM_FFI_ICHECK(topk >= 1 && topk <= 8) << "topk should be between 1 and 8";
+  TVM_FFI_ICHECK(topk <= topk_group * (num_experts / n_group))
+      << "topk should be smaller than or equal to the number of experts reachable from the "
+         "selected topk_group groups";
   TVM_FFI_ICHECK(topk_values.dim() == 2) << "topk_values must be a 2D Tensor";
   TVM_FFI_ICHECK(topk_indices.dim() == 2) << "topk_indices must be a 2D Tensor";
   TVM_FFI_ICHECK(topk_values.sizes()[0] == num_tokens)
