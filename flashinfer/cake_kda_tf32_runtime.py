@@ -1055,7 +1055,14 @@ def _uniform_persistent_worker_count(total_tasks: int, *, worker_cap: int) -> in
 
 
 def _upload_int32_batch(device, host_lists: dict[str, list[int]]):
-    """Upload several host int32 lists with one pinned, stream-ordered copy.
+    """Upload several host int32 lists with one pinned, stream-ordered copy."""
+    import torch
+
+    return _upload_int_batch(device, host_lists, torch.int32)
+
+
+def _upload_int_batch(device, host_lists: dict[str, list[int]], dtype):
+    """Upload several host int32/int64 lists with one pinned, stream-ordered copy.
 
     Preparation used to issue one pageable ``torch.tensor(..., device=cuda)``
     per metadata list; each pageable copy stages through the driver and
@@ -1071,12 +1078,13 @@ def _upload_int32_batch(device, host_lists: dict[str, list[int]]):
     lengths = [len(host_lists[name]) for name in names]
     total = sum(lengths)
     if total == 0:
-        empty = torch.empty(0, dtype=torch.int32, device=device)
+        empty = torch.empty(0, dtype=dtype, device=device)
         return {name: empty for name in names}
     flat: list[int] = []
     for name in names:
         flat.extend(host_lists[name])
-    host = torch.frombuffer(array("i", flat), dtype=torch.int32).pin_memory()
+    typecode = {torch.int32: "i", torch.int64: "q"}[dtype]
+    host = torch.frombuffer(array(typecode, flat), dtype=dtype).pin_memory()
     device_flat = host.to(device, non_blocking=True)
     # The pinned source is kept alive by the returned dict so that a copy
     # captured into a CUDA graph replays from stable host memory.
@@ -4216,26 +4224,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         num_parts = len(token_offsets) - 1
         self._num_sequences = num_sequences
         self.sequence_lengths = resolved_lengths
-        self._part_cu_seqlens = torch.tensor(
-            part_offsets, dtype=torch.int32, device=q.device
-        )
-        self._first_parts = torch.tensor(
-            part_offsets[:-1], dtype=torch.int64, device=q.device
-        )
-        self._last_parts = torch.tensor(
-            [end - 1 for end in part_offsets[1:]], dtype=torch.int64, device=q.device
-        )
-        self._last_correction_parts = torch.tensor(
-            [max(0, end - 2) for end in part_offsets[1:]],
-            dtype=torch.int64,
-            device=q.device,
-        )
-        self._zero_first_correction = part_offsets[1] == 1
-        self._part_state_indices = torch.full(
-            (num_parts,), -1, dtype=torch.int32, device=q.device
-        )
+        # Every host-side metadata list of the composite (part windows, part
+        # selectors, checkpoint-row plan) goes up in two pinned, stream-ordered
+        # copies (int32 / int64) after the lists are complete; one pageable
+        # ``torch.tensor(..., device=cuda)`` per list synchronized the host on
+        # every plan-cache miss (Phase A contract for the fused body).
         first_part_tokens = token_offsets[1]
         tail_offsets = [offset - first_part_tokens for offset in token_offsets[1:]]
+        host_i32 = {
+            "part_cu_seqlens": list(part_offsets),
+            "part_state_indices": [-1] * num_parts,
+        }
+        host_i64 = {
+            "first_parts": list(part_offsets[:-1]),
+            "last_parts": [end - 1 for end in part_offsets[1:]],
+            "last_correction_parts": [max(0, end - 2) for end in part_offsets[1:]],
+            "split_cu_seqlens": list(token_offsets),
+            "tail_cu_seqlens": list(tail_offsets),
+        }
+        self._zero_first_correction = part_offsets[1] == 1
         self.num_parts = num_parts
         self.split_parts = num_parts
         state_shape = (num_sequences, heads, HEAD_DIM, HEAD_DIM)
@@ -4280,10 +4287,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._zero_v = torch.zeros_like(v[:, first_part_tokens:])
         self._map_out = torch.empty_like(out[:, first_part_tokens:])
         self._correction_out = torch.empty_like(out[:, first_part_tokens:])
-        split_cu_seqlens = torch.tensor(
-            token_offsets, dtype=torch.int64, device=q.device
-        )
-        tail_cu_seqlens = torch.tensor(tail_offsets, dtype=torch.int64, device=q.device)
         main_checkpoint_kwargs = {}
         correction_checkpoint_kwargs = {}
         if state_checkpoints is not None:
@@ -4316,33 +4319,45 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._first_cp_count = first_cp_count
             self._checkpoint_main_first = self._checkpoint_main[:first_cp_count]
             self._checkpoint_main_tail = self._checkpoint_main[first_cp_count:]
-            self._checkpoint_offsets = torch.tensor(
-                [row for count in cp_counts for row in range(count)],
-                dtype=torch.int64,
-                device=q.device,
+            host_i64["checkpoint_offsets"] = [
+                row for count in cp_counts for row in range(count)
+            ]
+            host_i64["checkpoint_sequence_ids"] = [
+                seq for seq, count in enumerate(cp_counts) for _ in range(count)
+            ]
+            host_i64["main_cp_offsets"] = list(main_cp_offsets)
+            host_i64["correction_cp_offsets"] = list(correction_cp_offsets)
+            self._checkpoint_indices = torch.empty(
+                (cp_count,), dtype=torch.int64, device=q.device
             )
-            self._checkpoint_sequence_ids = torch.tensor(
-                [seq for seq, count in enumerate(cp_counts) for _ in range(count)],
-                dtype=torch.int64,
-                device=q.device,
-            )
-            self._checkpoint_indices = torch.empty_like(self._checkpoint_offsets)
             self._checkpoint_start = checkpoint_cu_starts[:num_sequences]
+            self.schedule += "_checkpoint64"
+        uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
+        uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
+        self._metadata_host = (
+            uploaded_i32.get("_host_pinned"),
+            uploaded_i64.get("_host_pinned"),
+        )
+        self._part_cu_seqlens = uploaded_i32["part_cu_seqlens"]
+        self._part_state_indices = uploaded_i32["part_state_indices"]
+        self._first_parts = uploaded_i64["first_parts"]
+        self._last_parts = uploaded_i64["last_parts"]
+        self._last_correction_parts = uploaded_i64["last_correction_parts"]
+        split_cu_seqlens = uploaded_i64["split_cu_seqlens"]
+        tail_cu_seqlens = uploaded_i64["tail_cu_seqlens"]
+        if state_checkpoints is not None:
+            self._checkpoint_offsets = uploaded_i64["checkpoint_offsets"]
+            self._checkpoint_sequence_ids = uploaded_i64["checkpoint_sequence_ids"]
             main_checkpoint_kwargs = dict(
                 state_checkpoints=self._checkpoint_main,
-                checkpoint_cu_starts=torch.tensor(
-                    main_cp_offsets, dtype=torch.int64, device=q.device
-                ),
+                checkpoint_cu_starts=uploaded_i64["main_cp_offsets"],
                 checkpoint_every_n_tokens=64,
             )
             correction_checkpoint_kwargs = dict(
                 state_checkpoints=self._checkpoint_correction,
-                checkpoint_cu_starts=torch.tensor(
-                    correction_cp_offsets, dtype=torch.int64, device=q.device
-                ),
+                checkpoint_cu_starts=uploaded_i64["correction_cp_offsets"],
                 checkpoint_every_n_tokens=64,
             )
-            self.schedule += "_checkpoint64"
         main_factor_kwargs = {}
         tail_factor_kwargs = {}
         self._factor_cache = None
