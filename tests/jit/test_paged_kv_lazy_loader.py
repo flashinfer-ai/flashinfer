@@ -1,7 +1,7 @@
 """Shared lazy paged-KV loader contracts for persistent attention and prefill."""
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 import threading
 import time
@@ -56,6 +56,7 @@ def holder_factory(request):
 def _isolate_cuda_and_jit(monkeypatch):
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
 
 @pytest.fixture
