@@ -2118,9 +2118,14 @@ def _uses_smem_p(cfg: FmhaConfig, *, has_variable_window: bool) -> bool:
     """Stage fp8 P in SMEM for the dense query-paired D128 schedule with a 16-bit
     output. It needs a 128-byte P row, one SW128 atom, and an O tile stored in
     64-wide halves. The 192/128 path keeps 128-wide K/V staging instead, and an
-    8-bit output has no 64-wide TMA store granule."""
+    8-bit output has no 64-wide TMA store granule.
+
+    Not under two-CTA UMMA: the SMEM P-ready handoff is CTA-local, while the
+    leader's M=256 PV reads both CTAs' P tiles, so that form keeps P in TMEM
+    where the cluster-scope P-prefix pipeline already orders it."""
     return (
         not cfg.single_qkv_instance
+        and not cfg.two_cta_umma
         and cfg.logical_head_dim_qk == 128
         and cfg.v_dtype.width == 8
         and cfg.o_dtype.width == 16
