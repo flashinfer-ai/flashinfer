@@ -259,3 +259,57 @@ def test_bf16_checkpoint_rows_keep_the_bf16_carrier_on_fp32_state():
     call = _run(d)
     assert "fp32" not in str(call.schedule)
     assert torch.isfinite(d["out"]).all() and torch.isfinite(d["state_checkpoints"]).all()
+
+
+def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
+    import flashinfer.cake_kda_tf32_runtime as runtime
+
+    monkeypatch.setattr(
+        runtime, "_fused_affine_epilogue_enabled", lambda: fused, raising=True
+    )
+    call = _run(d, checkpoints=checkpoints, lower_bound=lower_bound)
+    assert "affine" in str(call.schedule)
+    assert ("_fused_epilogue" in str(call.schedule)) == fused
+    return _snapshot(d)
+
+
+@pytest.mark.parametrize(
+    "lengths,checkpoints,lower_bound",
+    [
+        ([8192], True, None),
+        ([8192], False, None),
+        ([5000, 5384], True, None),
+        ([3000, 8192, 4096], True, None),
+        ([8192], False, -5.0),
+        ([2048, 8192], True, -5.0),
+    ],
+)
+def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
+    monkeypatch, lengths, checkpoints, lower_bound
+):
+    # The fused epilogue kernel (checkpoint-row merge + scatter, output tail
+    # add, final-state select/add and pool scatter) replaces ~10 torch launches
+    # and must reproduce them bit for bit on every row it writes.
+    d = _inputs(lengths, 12, seed=11)
+    pool = d["pool"].clone()
+    want = _run_affine_epilogue(
+        d, False, monkeypatch, checkpoints=checkpoints, lower_bound=lower_bound
+    )
+    d["pool"].copy_(pool)
+    d["out"].zero_()
+    d["state_checkpoints"].zero_()
+    got = _run_affine_epilogue(
+        d, True, monkeypatch, checkpoints=checkpoints, lower_bound=lower_bound
+    )
+    _assert_same(got, want)
+
+
+def test_affine_fused_epilogue_bf16_state_pool_matches_torch(monkeypatch):
+    d = _inputs([8192], 12, seed=12)
+    d["pool"] = (d["pool"] * 1.0).to(torch.bfloat16)
+    pool = d["pool"].clone()
+    want = _run_affine_epilogue(d, False, monkeypatch, checkpoints=False, lower_bound=-5.0)
+    d["pool"].copy_(pool)
+    d["out"].zero_()
+    got = _run_affine_epilogue(d, True, monkeypatch, checkpoints=False, lower_bound=-5.0)
+    _assert_same(got, want)

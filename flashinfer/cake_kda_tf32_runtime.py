@@ -945,6 +945,68 @@ def _device_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
+def _fused_affine_epilogue_enabled() -> bool:
+    """Return whether the affine composite fuses its torch epilogue.
+
+    ``FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE=0`` restores the torch glue
+    (checkpoint merge + index_copy_, tail add, final-state select/add and pool
+    scatter); both paths are bitwise identical, the fused one saves the host
+    time of ~10 torch launches per call.
+    """
+    import os
+
+    return os.environ.get("FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE", "1") != "0"
+
+
+@dataclass(frozen=True)
+class _FusedAffineEpilogue:
+    """Static arguments of the fused affine epilogue launch."""
+
+    run: Any
+    heads: int
+    tail_elems: int
+    pool_slot_stride: int
+    first_rows: int
+    num_rows: int
+
+    @staticmethod
+    def build(impl) -> "_FusedAffineEpilogue | None":
+        import torch
+
+        from flashinfer.jit.cake_kda_affine_epilogue import load_for_device
+
+        out_tail = impl._out_tail
+        pool = impl._final_pool
+        heads = int(impl._main_final.shape[1])
+        row_elems = heads * HEAD_DIM * HEAD_DIM
+        if not out_tail.is_contiguous() or out_tail.numel() % 8:
+            return None
+        if pool.ndim != 4 or pool.stride(0) % 8 or not pool[0].is_contiguous():
+            return None
+        if pool.dtype not in (torch.float32, torch.bfloat16):
+            return None
+        if pool.shape[1:] != (heads, HEAD_DIM, HEAD_DIM):
+            return None
+        first_rows = num_rows = 0
+        if impl._checkpoint_output is not None:
+            num_rows = int(impl._checkpoint_main.shape[0])
+            first_rows = num_rows - int(impl._checkpoint_correction.shape[0])
+            if impl._checkpoint_output.stride(0) != row_elems:
+                return None
+        try:
+            run = load_for_device(impl._launch_device)
+        except NotImplementedError:
+            return None
+        return _FusedAffineEpilogue(
+            run=run,
+            heads=heads,
+            tail_elems=int(out_tail.numel()),
+            pool_slot_stride=int(pool.stride(0)),
+            first_rows=first_rows,
+            num_rows=num_rows,
+        )
+
+
 def _uses_measured_sm100_persistent_policy(*, gpu_arch: str, sm_count: int) -> bool:
     """Return whether an exact measured SM100 persistent policy applies."""
     return gpu_arch == "sm_100a" and sm_count in (148, 152)
@@ -4434,6 +4496,11 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             tail_cu_seqlens,
         )
         self._launch_device = q.device
+        self._fused_epilogue = None
+        if not self._use_output_projection and _fused_affine_epilogue_enabled():
+            self._fused_epilogue = _FusedAffineEpilogue.build(self)
+            if self._fused_epilogue is not None:
+                self.schedule += "_fused_epilogue"
         self._use_cuda_graph = True
         self._cuda_graph_warmed = False
         self._cuda_graph = None
@@ -4476,6 +4543,9 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 )
             else:
                 self._correction.launch()
+            if self._fused_epilogue is not None:
+                self._launch_fused_epilogue()
+                return
             if self._checkpoint_output is not None:
                 self._checkpoint_merged_first.copy_(self._checkpoint_main_first)
                 torch.add(
@@ -4537,6 +4607,49 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._final_pool.index_copy_(
                     0, self._state_indices_long, self._final_external
                 )
+
+    def _launch_fused_epilogue(self) -> None:
+        """One kernel: checkpoint-row merge/scatter, tail add, final state."""
+        fused = self._fused_epilogue
+        if self._checkpoint_output is not None:
+            rows = (
+                self._checkpoint_main,
+                self._checkpoint_correction,
+                self._checkpoint_output,
+                self._checkpoint_offsets,
+                self._checkpoint_sequence_ids,
+                self._checkpoint_start,
+            )
+        else:
+            # Unused by the kernel (has_rows=0); any tensors of the right kind.
+            rows = (
+                self._main_final,
+                self._main_final,
+                self._main_final,
+                self._last_parts,
+                self._last_parts,
+                self._last_parts,
+            )
+        fused.run(
+            *rows,
+            fused.first_rows,
+            fused.num_rows,
+            self._out_tail,
+            self._correction_out,
+            self._main_final,
+            self._correction_final,
+            self._last_parts,
+            self._last_correction_parts,
+            int(self._zero_first_correction),
+            self._final_compact,
+            self._final_pool,
+            fused.pool_slot_stride,
+            self._state_indices_long,
+            self._num_sequences,
+            fused.heads,
+            fused.tail_elems,
+            int(self._checkpoint_output is not None),
+        )
 
     def close(self) -> None:
         self._cuda_graph = None
