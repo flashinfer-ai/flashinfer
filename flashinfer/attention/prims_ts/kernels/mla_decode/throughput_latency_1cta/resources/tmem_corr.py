@@ -67,7 +67,7 @@ from ...helpers.math import (
     partial_output_dtype,
 )
 from ...helpers.ops import (
-    fp8_quant_scale_rcp,
+    fp8_p_scale_rcp,
     pack_float4_to_fp8_e4m3,
     store_transposed_smem8b_x2,
     store_transposed_smem8b_x4,
@@ -520,10 +520,10 @@ class TmemCorrResource(MlaResource):
                 )
                 lse_sum = reduced_sum[scale_idx]
                 if cutlass.const_expr(self.cfg.is_fp8_qkv()):
-                    # FP8 P is quantized as 448 * softmax(P) for BMM2.  The
-                    # online sum tracks the same scale, so undo it for the
-                    # externally visible log-sum-exp value.
-                    lse_sum = lse_sum * fp8_quant_scale_rcp()
+                    # FP8 P is quantized as 448 * softmax(P) for BMM2 (1.75 *
+                    # softmax(P) with skip correction).  The online sum tracks
+                    # the same scale, so undo it for the visible log-sum-exp.
+                    lse_sum = lse_sum * fp8_p_scale_rcp(self.cfg)
                 lse_val = (
                     cute.math.log2(lse_sum, fastmath=True)
                     + self.scale_softmax_log2 * final_max[scale_idx]

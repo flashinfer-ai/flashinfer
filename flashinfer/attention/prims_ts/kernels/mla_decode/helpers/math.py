@@ -36,6 +36,9 @@ mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
 fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
 ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
+# These carry an explicit ``.rn`` and are never contracted by ptxas. The
+# contractible mul+add pair for the softmax affine transform is
+# ``ops.affine2_contractible_f32``.
 
 
 def ceil_div(a, b):
@@ -145,18 +148,25 @@ def qk_desc_stride_byte_offset(cfg) -> int:
 
 def p_desc_layout(cfg):
     """Return the UMMA descriptor layout for P in SMEM."""
+    if cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128:
+        # K128 P descriptor: leading=8192, stride=1024, SWIZZLE_128B.
+        return 2
     del cfg
     return 4
 
 
 def p_desc_leading_byte_offset(cfg) -> int:
     """Return the descriptor leading byte offset for P in SMEM."""
+    if cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128:
+        return 8192
     del cfg
     return 16
 
 
 def p_desc_stride_byte_offset(cfg) -> int:
     """Return the descriptor stride byte offset for P in SMEM."""
+    if cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128:
+        return 1024
     del cfg
     return 512
 
