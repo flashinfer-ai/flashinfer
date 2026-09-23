@@ -70,15 +70,21 @@ def _gen_product_inputs(
     dtype,
     qkv_factory,
     device,
+    head_size_v=None,
 ):
     """Build q/k/v/alpha/beta with a householder axis at dim 1 of k and v.
 
     Reuses ``conftest.gen_qkv`` by generating n_h times as many k/v rows and
     folding the extra rows into the householder axis -- so the element
     distribution matches the existing GDN tests exactly.
+
+    ``head_size_v`` defaults to ``head_size`` (square state); pass a smaller
+    value to exercise the rectangular-state path.
     """
     total_seqlen = sum(seq_lens)
     num_sab_heads = max(num_q_heads, num_v_heads)
+    if head_size_v is None:
+        head_size_v = head_size
 
     with device:
         # one q per real token; n_h keys/values per real token
@@ -92,9 +98,10 @@ def _gen_product_inputs(
             num_v_heads,
             head_size,
             dtype,
+            head_size_v=head_size_v,
         )
         k = k.reshape(total_seqlen, num_householder, num_k_heads, head_size)
-        v = v.reshape(total_seqlen, num_householder, num_v_heads, head_size)
+        v = v.reshape(total_seqlen, num_householder, num_v_heads, head_size_v)
         # l2 norm k to avoid numerical instability (as the GDN tests do)
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
 
@@ -110,7 +117,9 @@ def _gen_product_inputs(
     [[64], [128], [64, 128, 512]],
     ids=lambda seqlens: "seq_lens=" + ",".join(map(str, seqlens)),
 )
-@pytest.mark.parametrize("head_size", [128], ids=lambda hs: f"head_size={hs}")
+@pytest.mark.parametrize(
+    "head_size, head_size_v", [(128, 128), (128, 64)], ids=lambda hs: f"{hs}"
+)
 @pytest.mark.parametrize(
     "num_heads",
     [(8, 8, 8), (8, 8, 16)],
@@ -118,9 +127,14 @@ def _gen_product_inputs(
 )  # (q, k, v) -- GVA
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_reference_nh1_equals_delta_rule(
-    qkv_factory, seq_lens, head_size, num_heads, dtype, seed=0
+    qkv_factory, seq_lens, head_size, head_size_v, num_heads, dtype, seed=0
 ):
-    """At n_h == 1, DeltaProduct IS DeltaNet. Exact equality -- same fp ops, same order."""
+    """At n_h == 1, DeltaProduct IS DeltaNet. Exact equality -- same fp ops, same order.
+
+    Runs on any CUDA device: this compares the two references against each
+    other, so it pins the rectangular-state (``head_size_v < head_size``)
+    generalisation of both without needing the SM100 kernel.
+    """
     random.seed(seed)
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -139,7 +153,9 @@ def test_reference_nh1_equals_delta_rule(
         dtype,
         qkv_factory,
         device,
+        head_size_v=head_size_v,
     )
+    assert v.shape[-1] == head_size_v
 
     prod_o, prod_state = delta_product(
         q.float(),
@@ -167,7 +183,11 @@ def test_reference_nh1_equals_delta_rule(
 @pytest.mark.parametrize(
     "num_householder", [1, 2, 3, 4], ids=lambda nh: f"num_householder={nh}"
 )
-@pytest.mark.parametrize("head_size", [64, 128], ids=lambda hs: f"head_size={hs}")
+@pytest.mark.parametrize(
+    "head_size, head_size_v",
+    [(64, 64), (128, 128), (128, 64)],
+    ids=lambda hs: f"{hs}",
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [[128], [64, 128, 512]],
@@ -179,13 +199,16 @@ def test_reference_nh1_equals_delta_rule(
     ids=lambda qkv: "num_heads={0}/{1}/{2}".format(*qkv),
 )
 def test_reference_equals_expanded_delta_rule(
-    qkv_factory, num_householder, seq_lens, num_heads, seed=0
+    qkv_factory, num_householder, head_size, head_size_v, seq_lens, num_heads, seed=0
 ):
     """GDP is GDN on a sequence n_h times longer.
 
     Gate on the first micro-step of each token (neutral value 1.0 -- alpha here
     is multiplicative, not log-space), query only on the last, then read every
     n_h-th output row.
+
+    Reference-vs-reference, so it runs on any CUDA device and covers the
+    rectangular-state case without the SM100 kernel.
     """
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -193,7 +216,7 @@ def test_reference_equals_expanded_delta_rule(
 
     num_q_heads, num_k_heads, num_v_heads = num_heads
     num_sab_heads = max(num_q_heads, num_v_heads)
-    head_size, n_h = 128, num_householder
+    n_h = num_householder
     total_seqlen = sum(seq_lens)
     device = torch.device("cuda")
 
@@ -207,6 +230,7 @@ def test_reference_equals_expanded_delta_rule(
         torch.float16,
         qkv_factory,
         device,
+        head_size_v=head_size_v,
     )
     q, k, v = q.float(), k.float(), v.float()
 
@@ -220,7 +244,7 @@ def test_reference_equals_expanded_delta_rule(
     rule_o, rule_state = delta_rule(
         q_flat,
         k.reshape(total_seqlen * n_h, num_k_heads, head_size),
-        v.reshape(total_seqlen * n_h, num_v_heads, head_size),
+        v.reshape(total_seqlen * n_h, num_v_heads, head_size_v),
         [s * n_h for s in seq_lens],
         alpha=alpha_flat,
         beta=beta.reshape(total_seqlen * n_h, num_sab_heads),
@@ -234,6 +258,11 @@ def test_reference_equals_expanded_delta_rule(
     "num_householder", [1, 2, 3, 4], ids=lambda nh: f"num_householder={nh}"
 )
 @pytest.mark.parametrize(
+    "head_size, head_size_v",
+    [(64, 64), (128, 128), (128, 64)],
+    ids=lambda hs: f"{hs}",
+)
+@pytest.mark.parametrize(
     "seq_lens",
     [[64], [256], [64, 128, 512]],
     ids=lambda s: "seq_lens=" + ",".join(map(str, s)),
@@ -245,7 +274,14 @@ def test_reference_equals_expanded_delta_rule(
 )
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_matches_reference(
-    qkv_factory, num_householder, head_size, seq_lens, num_heads, dtype, seed=0
+    qkv_factory,
+    num_householder,
+    head_size,
+    head_size_v,
+    seq_lens,
+    num_heads,
+    dtype,
+    seed=0,
 ):
     """chunk_gated_delta_product == delta_product reference, on real kernels."""
     _skip_if_unsupported()
@@ -262,6 +298,8 @@ def test_prefill_kernel_matches_reference(
 
     if head_size == 64 and torch.cuda.get_device_capability(device)[0] != 10:
         pytest.skip("head_size=64 GDP prefill is currently supported on SM100 only")
+    if head_size_v != head_size and torch.cuda.get_device_capability(device)[0] != 10:
+        pytest.skip("rectangular state is currently supported on SM100 only")
 
     q, k, v, alpha, beta, cu_seqlens = _gen_product_inputs(
         seq_lens,
@@ -273,16 +311,17 @@ def test_prefill_kernel_matches_reference(
         dtype,
         qkv_factory,
         device,
+        head_size_v=head_size_v,
     )
 
     our_o = torch.full(
-        (total_seqlen, num_o_heads, head_size),
+        (total_seqlen, num_o_heads, head_size_v),
         float("nan"),
         dtype=q.dtype,
         device=device,
     )
     our_state = torch.full(
-        (num_seqs, num_sab_heads, head_size, head_size),
+        (num_seqs, num_sab_heads, head_size_v, head_size),
         float("nan"),
         dtype=torch.float32,
         device=device,
@@ -304,7 +343,7 @@ def test_prefill_kernel_matches_reference(
     torch.cuda.synchronize()
 
     # state shape must not depend on n_h -- this is the whole selling point
-    assert our_state.shape == (num_seqs, num_sab_heads, head_size, head_size)
+    assert our_state.shape == (num_seqs, num_sab_heads, head_size_v, head_size)
     assert not our_o.isnan().any(), "output buffer left partially unwritten"
 
     our_state = our_state.transpose(-1, -2)  # kernel [.., V, K] -> ref [.., K, V]

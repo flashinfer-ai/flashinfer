@@ -28,7 +28,7 @@ from .gdn_prefill import chunk_gated_delta_rule
 def chunk_gated_delta_product(
     q: torch.Tensor,  # [total_seq_len,      num_q_heads, head_size]
     k: torch.Tensor,  # [total_seq_len, n_h, num_k_heads, head_size]
-    v: torch.Tensor,  # [total_seq_len, n_h, num_v_heads, head_size]
+    v: torch.Tensor,  # [total_seq_len, n_h, num_v_heads, head_size_v]
     g: Optional[torch.Tensor] = None,  # [total_seq_len,      num_sab_heads]
     beta: Optional[torch.Tensor] = None,  # [total_seq_len, n_h, num_sab_heads]
     scale: Optional[float] = None,
@@ -42,7 +42,7 @@ def chunk_gated_delta_product(
     # expansion scratch -- required for cudagraph capture, else allocated here
     expanded_q: Optional[torch.Tensor] = None,  # [T*n_h, num_q_heads,  D]
     expanded_g: Optional[torch.Tensor] = None,  # [T*n_h, num_sab_heads]
-    expanded_output: Optional[torch.Tensor] = None,  # [T*n_h, num_o_heads,  D]
+    expanded_output: Optional[torch.Tensor] = None,  # [T*n_h, num_o_heads, Dv]
     expanded_cu_seqlens: Optional[torch.Tensor] = None,  # [num_seqs + 1]
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct attention for prefill.
@@ -56,11 +56,17 @@ def chunk_gated_delta_product(
     q : torch.Tensor
         Queries, ``[total_seq_len, num_q_heads, head_size]``. **One per real
         token** -- the query axis is not expanded.
-    k, v : torch.Tensor
-        Keys/values, ``[total_seq_len, num_householder, num_*_heads, head_size]``.
+    k : torch.Tensor
+        Keys, ``[total_seq_len, num_householder, num_k_heads, head_size]``.
         The householder axis sits immediately after the token axis so that
         ``reshape(total_seq_len * n_h, ...)`` yields the ``(t n) h d`` ordering
         the expansion needs.
+    v : torch.Tensor
+        Values, ``[total_seq_len, num_householder, num_v_heads, head_size_v]``,
+        same householder placement as ``k``.  ``head_size_v`` may be narrower
+        than ``head_size`` (rectangular state); see
+        :func:`~flashinfer.gdn_prefill.chunk_gated_delta_rule` for which
+        architectures implement that.
     g : torch.Tensor, optional
         Forget gate (alpha), ``[total_seq_len, num_sab_heads]``. **One per real
         token** -- the gate models time passing, while the ``n_h`` householders
@@ -86,7 +92,7 @@ def chunk_gated_delta_product(
         value ``1.0`` on every call.
     expanded_output : torch.Tensor, optional
         Scratch for the kernel's output,
-        ``[total_seq_len * num_householder, num_o_heads, head_size]`` where
+        ``[total_seq_len * num_householder, num_o_heads, head_size_v]`` where
         ``num_o_heads = max(num_q_heads, num_v_heads)``. Note this is **not**
         ``num_q_heads`` -- under GVA the output is wider than the query.
         Takes ``output``'s dtype when ``output`` is supplied, else ``q``'s, so
@@ -99,7 +105,7 @@ def chunk_gated_delta_product(
     -------
     Same contract as ``chunk_gated_delta_rule``: ``output`` when
     ``output_final_state`` is False, else ``(output, final_state)``. ``output``
-    has one row per REAL token, ``[total_seq_len, num_o_heads, head_size]``.
+    has one row per REAL token, ``[total_seq_len, num_o_heads, head_size_v]``.
     When ``output`` is supplied it is written in place and returned; otherwise
     a freshly allocated tensor is returned.
     """
@@ -113,6 +119,7 @@ def chunk_gated_delta_product(
         raise ValueError("num_householder must be at least 1")
     total_tokens, num_q_heads, head_size = q.shape
     num_v_heads = v.size(2)
+    head_size_v = v.size(3)
     num_sab_heads = max(num_q_heads, num_v_heads)
     if k.size(0) != total_tokens or v.size(0) != total_tokens:
         raise ValueError("q, k, and v must have the same token dimension")
@@ -120,8 +127,8 @@ def chunk_gated_delta_product(
         raise ValueError(
             f"k/v householder counts differ: {num_householder} vs {v.size(1)}"
         )
-    if k.size(3) != head_size or v.size(3) != head_size:
-        raise ValueError("q, k, and v must have the same head size")
+    if k.size(3) != head_size:
+        raise ValueError("q and k must have the same head size")
     if q.device != k.device or q.device != v.device:
         raise ValueError("q, k, and v must be on the same device")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -211,14 +218,14 @@ def chunk_gated_delta_product(
         expanded_output = torch.empty(
             expanded_q.size(0),
             max(q.size(1), v.size(1)),
-            q.size(2),
+            head_size_v,
             dtype=output.dtype if output is not None else q.dtype,
             device=output.device if output is not None else q.device,
         )
     elif expanded_output.shape != (
         expanded_q.size(0),
         max(q.size(1), v.size(1)),
-        q.size(2),
+        head_size_v,
     ):
         raise ValueError("expanded_output shape must be [T*n_h, num_o_heads,  D]")
     expected_output_dtype = output.dtype if output is not None else q.dtype
@@ -228,7 +235,7 @@ def chunk_gated_delta_product(
         raise ValueError("expanded_output must be on the same device as q")
 
     if output is not None:
-        expected_output_shape = (total_tokens, num_sab_heads, head_size)
+        expected_output_shape = (total_tokens, num_sab_heads, head_size_v)
         if output.shape != expected_output_shape:
             raise ValueError(
                 f"expected output shape {expected_output_shape}, got {tuple(output.shape)}"

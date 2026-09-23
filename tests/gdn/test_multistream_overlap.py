@@ -307,6 +307,7 @@ def test_blackwell_prefill_workspace_not_in_compile_cache():
         HQ,
         HV,
         DK,
+        DK,
         HQ >= HV,
         True,
         True,

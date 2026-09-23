@@ -30,7 +30,7 @@ from .reference_delta_rule import exclusive_cumsum, matmul
 def delta_product(
     q: torch.Tensor,  # [total_seq_len,      num_q_heads, head_size]
     k: torch.Tensor,  # [total_seq_len, n_h, num_k_heads, head_size]
-    v: torch.Tensor,  # [total_seq_len, n_h, num_v_heads, head_size]
+    v: torch.Tensor,  # [total_seq_len, n_h, num_v_heads, head_size_v]
     seq_lens: list[int],
     *,
     alpha: torch.Tensor | None = None,  # [total_seq_len,      num_sab_heads]
@@ -41,8 +41,8 @@ def delta_product(
 ):
     """Returns (output, final_state).
 
-    output      [total_seq_len, num_o_heads, head_size]   -- one row per REAL token
-    final_state [num_seqs, num_sab_heads, head_size, head_size]   (K-major, [.., K, V])
+    output      [total_seq_len, num_o_heads, head_size_v] -- one row per REAL token
+    final_state [num_seqs, num_sab_heads, head_size, head_size_v] (K-major, [.., K, V])
 
     ``initial_state`` seeds each sequence instead of starting from zero. Needed
     by the decode tests, where a step continues an existing state rather than
@@ -62,6 +62,7 @@ def delta_product(
     num_v_heads = v.size(2)
     num_sab_heads = max(num_q_heads, num_v_heads)
     head_size = k.size(3)
+    head_size_v = v.size(3)
 
     if alpha is None:
         # same alpha for all householders for each real token
@@ -100,7 +101,7 @@ def delta_product(
             state_HKV = torch.zeros(
                 num_state_heads,
                 head_size,
-                head_size,
+                head_size_v,
                 dtype=state_dtype,
                 device=q.device,
             )
