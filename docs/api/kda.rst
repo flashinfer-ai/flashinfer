@@ -18,11 +18,12 @@ entry point for every phase. The public ``recurrent_kda`` classifies the call
 and serves decode and speculative decode through the same shared decode
 dispatcher that :ref:`apikda_decode` uses, while dispatching eligible ordinary
 multi-token prefill to the optimized backend described in
-:ref:`apikda_prefill`. Which
-prefill backend that is depends on the device: SM100a and SM103a use the frozen
-FlashKDA-compatible kernels, SM120a uses a CuTe-DSL backend of its own. The two
-architecture sets are disjoint, so the public signature and every call outside
-the eligible prefill subset are unaffected either way.
+:ref:`apikda_prefill`. The automatic prefill selection depends on the device
+and workload: eligible SM100a and SM103a calls with small logical
+batch-times-head count use the bundled small-BH CuTe-DSL kernel; other calls
+follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
+backend of its own. These prefill routes leave decode and speculative-decode
+dispatch unchanged.
 
 .. currentmodule:: flashinfer.kda
 
