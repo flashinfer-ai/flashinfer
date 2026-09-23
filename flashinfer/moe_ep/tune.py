@@ -4,11 +4,13 @@ This module is only the command-line frontend: it parses arguments and
 dispatches to the tuner that lives NEXT TO the backend being tuned
 (``backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/tuner.py`` for
 ``--dtype nvfp4``, ``.../mxfp8_mxfp8_bf16_cutedsl/tuner.py`` for the mxfp8
-kinds).  Shared sweep machinery lives in ``backends/mega/kernel/tuning.py``.
+kinds, ``.../bf16_bf16_bf16_cutedsl/tuner.py`` for ``bf16`` and
+``.../bf16_mxfp8_bf16_cutedsl/tuner.py`` for the mixed kinds).  Shared sweep
+machinery lives in ``backends/mega/kernel/tuning.py``.
 
 The sweep runs the collective autotune OUTSIDE any serving engine and
 persists the winners in the knob cache (see
-``kernel_src/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
+``kernel_src/sm100/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
 that constructs the mega layer with ``knobs=None`` (the default) resolves the
 recorded winner with a pure dict lookup — no compiles, no collectives, no
 timing on the hot path.
@@ -31,7 +33,8 @@ recorded cache keys match engine-time lookups exactly.
 
 Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
 default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
-winner makes the engine's output accumulation order nondeterministic).
+winner makes the engine's output accumulation order nondeterministic).  The
+engine still must opt into ``enable_in_kernel_fc2_reduce=True``.
 """
 
 from __future__ import annotations
@@ -47,7 +50,24 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
     )
     parser.add_argument(
-        "--dtype", choices=("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"), default="nvfp4"
+        "--dtype",
+        choices=(
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "sm90_fp8_e4m3",
+            "sm90_fp8_e5m2",
+            "bf16",
+            "bf16_mxfp8_e4m3",
+            "bf16_mxfp8_e5m2",
+        ),
+        default="nvfp4",
+    )
+    parser.add_argument(
+        "--fp8-scale-mode",
+        choices=("per_tensor", "blockwise"),
+        default="per_tensor",
+        help="FP8 scale ABI (sm90_fp8_* dtypes only)",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -134,6 +154,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dtype == "nvfp4":
         from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
+            run_tuning,
+        )
+    elif args.dtype.startswith("sm90_fp8"):
+        from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.tuner import (
+            run_tuning as run_sm90_tuning,
+        )
+
+        return run_sm90_tuning(args)
+    elif args.dtype == "bf16":
+        from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.tuner import (
+            run_tuning,
+        )
+    elif args.dtype.startswith("bf16_mxfp8"):
+        from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.tuner import (
             run_tuning,
         )
     else:

@@ -19,6 +19,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 import flashinfer
 from flashinfer.jit import env as jit_env
@@ -205,13 +206,18 @@ def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
         previous = out.clone()
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
-@pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("contiguous", [True, False])
+@parametrize_product(
+    {
+        "batch_size": [1, 19, 99, 989],
+        "hidden_size": [111, 500, 1024, 3072, 3584, 4096, 8192, 16384],
+        "dtype": [torch.float16, torch.bfloat16],
+        "quant_dtype": [torch.float8_e4m3fn, torch.float8_e5m2],
+        "quant_scale": [0.01, 1.0, 10.0],
+        "enable_pdl": [True, False],
+        "contiguous": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_norm_quant(
     batch_size, hidden_size, dtype, quant_dtype, quant_scale, enable_pdl, contiguous
 ):
@@ -302,13 +308,18 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
-@pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("contiguous", [True, False])
+@parametrize_product(
+    {
+        "batch_size": [1, 19, 99, 989],
+        "hidden_size": [111, 500, 1024, 3072, 3584, 4096, 8192, 16384],
+        "dtype": [torch.float16, torch.bfloat16],
+        "quant_dtype": [torch.float8_e4m3fn, torch.float8_e5m2],
+        "quant_scale": [0.01, 1.0, 10.0],
+        "enable_pdl": [True, False],
+        "contiguous": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_fused_add_rmsnorm_quant(
     batch_size, hidden_size, dtype, quant_dtype, quant_scale, enable_pdl, contiguous
 ):

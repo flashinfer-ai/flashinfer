@@ -1,6 +1,6 @@
 {
   "name": "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "One-shot PrimTS GQA decode over FlashInfer native CSR paged KV metadata using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
+  "description": "One-shot PrimTS GQA decode over a fixed row-strided page table using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.batch_decode_with_paged_kv_cache",
@@ -17,6 +17,10 @@
       "type": "const",
       "value": 4,
       "description": "Fixed query length per request."
+    },
+    "workspace_size": {
+      "type": "var",
+      "description": "Optional caller scratch size in bytes."
     },
     "num_qo_heads": {
       "type": "const",
@@ -38,13 +42,9 @@
       "type": "const",
       "value": 32
     },
-    "len_indptr": {
+    "max_pages_per_seq": {
       "type": "var",
-      "description": "Length of the native CSR indptr."
-    },
-    "num_kv_indices": {
-      "type": "var",
-      "description": "Number of referenced page IDs."
+      "description": "Physical page-table capacity per request."
     },
     "len_qo_indptr": {
       "type": "var",
@@ -53,10 +53,11 @@
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
-    "page_size in (16, 32, 64, 128)",
-    "len_indptr == batch_size + 1",
+    "page_size in (4, 8, 16, 32, 64, 128)",
+    "max_pages_per_seq * page_size >= max(seq_lens_kv)",
+    "min(seq_lens_kv) >= 1",
     "num_qo_heads % num_kv_heads == 0",
-    "1 <= num_qo_heads // num_kv_heads <= 32",
+    "1 <= num_qo_heads // num_kv_heads <= 128",
     "window_left == -1 or mask_type == 'causal'",
     "kv_layout == 'HND'",
     "seq_len_q >= 2"
@@ -89,23 +90,35 @@
       ],
       "dtype": "bfloat16"
     },
-    "paged_kv_indptr": {
+    "block_tables": {
       "shape": [
-        "len_indptr"
+        "batch_size",
+        "max_pages_per_seq"
       ],
       "dtype": "int32"
     },
-    "paged_kv_indices": {
-      "shape": [
-        "num_kv_indices"
-      ],
-      "dtype": "int32"
-    },
-    "paged_kv_last_page_len": {
+    "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32"
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "uint8",
+      "optional": true
+    },
+    "max_kv_len": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
     },
     "qo_indptr": {
       "shape": [
@@ -152,6 +165,11 @@
     "out_dtype": {
       "shape": null,
       "dtype": "dtype",
+      "optional": true
+    },
+    "split_kv": {
+      "shape": null,
+      "dtype": "bool",
       "optional": true
     }
   },

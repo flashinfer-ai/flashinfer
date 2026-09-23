@@ -25,10 +25,14 @@ output_column_dict = {
         "causal",
         "q_dtype",
         "kv_dtype",
+        "v_dtype",
         "avg_actual_seq_len",
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "timing_metric",
+        "row_activity_mode",
+        "calls_per_sample",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
@@ -69,6 +73,8 @@ output_column_dict = {
         "refcheck_passed",
         "fp4_mode",
         "cold_l2_cache",
+        "prequantized_median_time",
+        "prequantized_std_time",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",
@@ -385,6 +391,20 @@ def is_close_stats(input, other, rtol=1e-5, atol=1e-8):
     )
 
 
+def to_float8(x, dtype=torch.float8_e4m3fn):
+    """Quantize ``x`` to FP8 with a per-tensor scale and return the inverse scale.
+
+    Matches the test_trtllm_gen_attention_decode.py approach: the scale keeps a
+    10x headroom below the FP8 max so attention inputs do not saturate.
+    """
+    finfo = torch.finfo(dtype)
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    scale = finfo.max / amax * 0.1
+    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    return x_scl_sat.to(dtype), scale.float().reciprocal()
+
+
 def dtype_str_to_torch_dtype(dtype_str):
     if dtype_str == "bfloat16":
         return torch.bfloat16
@@ -408,16 +428,18 @@ routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache
+        # NOTE: cudnn-native calls cudnn_batch_decode_with_kv_cache
         "7.5": ["fa2", "auto"],
-        "8.0": ["fa2", "fa2_tc", "auto", "cudnn"],
-        "8.6": ["fa2", "fa2_tc", "auto", "cudnn"],
-        "8.9": ["fa2", "fa2_tc", "auto", "cudnn"],
-        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
+        "8.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
+        "8.6": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
+        "8.9": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
         "10.0": [
             "fa2",
             "fa2_tc",
             "auto",
             "cudnn",
+            "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
@@ -427,13 +449,22 @@ routine_cc_to_supported_backends = {
             "fa2_tc",
             "auto",
             "cudnn",
+            "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
         ],
-        "10.7": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
-        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
+        "10.7": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+        ],
+        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
+        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
