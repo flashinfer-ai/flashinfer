@@ -1,6 +1,6 @@
 """Persistent attention factory, dispatch and prewarm contracts."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +37,7 @@ def _isolate_caches_and_cuda(monkeypatch):
     attention.get_holistic_attention_independent_module.cache_clear()
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     yield
     attention.get_holistic_attention_module.cache_clear()
     attention.get_holistic_attention_independent_module.cache_clear()
