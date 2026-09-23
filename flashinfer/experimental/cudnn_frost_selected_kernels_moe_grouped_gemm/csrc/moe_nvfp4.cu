@@ -33,6 +33,7 @@ __global__ void histogram(const int32_t* ids, int32_t* counts, int rows, int exp
   }
 }
 
+template <bool SplitColumns = false>
 __global__ void finalize(const __nv_bfloat16* grouped, const int32_t* ids, const int32_t* mapping,
                          const float* scores, __nv_bfloat16* out, int tokens, int hidden, int topk,
                          int experts) {
@@ -40,10 +41,13 @@ __global__ void finalize(const __nv_bfloat16* grouped, const int32_t* ids, const
     int4 words;
     __nv_bfloat16 values[8];
   };
-  // One CTA per token: no per-element division, 128-bit data loads/stores,
-  // and deterministic FP32 top-k reduction before a single BF16 conversion.
-  for (int64_t t = blockIdx.x; t < tokens; t += gridDim.x) {
-    for (int h = threadIdx.x; h < hidden / 8; h += blockDim.x) {
+  // Vectorized data accesses and deterministic FP32 top-k reduction before
+  // a single BF16 conversion. Small batches expose independent column tiles.
+  const int tiles = SplitColumns ? (hidden / 8 + 127) / 128 : 1;
+  for (int64_t task = blockIdx.x; task < int64_t(tokens) * tiles; task += gridDim.x) {
+    const int64_t t = task / tiles;
+    const int part = task % tiles;
+    for (int h = part * blockDim.x + threadIdx.x; h < hidden / 8; h += blockDim.x * tiles) {
       float sum[8] = {};
       for (int k = 0; k < topk; ++k) {
         int64_t r = t * topk + k;
@@ -123,6 +127,73 @@ __global__ void gather(const uint8_t* x, const uint8_t* input_sf, const int32_t*
   }
 }
 
+// Small batches compute stable routing and expert-local scale segments per CTA.
+// No CTA consumes metadata written by another CTA in this launch.
+__global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
+                            int32_t* offsets, int32_t* sf_offsets, int32_t* mapping,
+                            int32_t* row_experts, uint8_t* grouped, uint8_t* sf, float* scale,
+                            int rows, int hidden, int topk, int experts, bool swizzled) {
+  const int r = blockIdx.x;
+  const bool active = r < rows;
+  const int raw = active ? ids[r] : 0;
+  const bool valid = active && raw >= 0 && raw < experts;
+  const int expert = valid ? raw : 0;
+  __shared__ int counts[256];
+  __shared__ int partial[4];
+  __shared__ int destination, row_begin, row_sf_begin;
+  for (int e = threadIdx.x; e < experts; e += blockDim.x) counts[e] = 0;
+  __syncthreads();
+  int before = 0;
+  for (int j = threadIdx.x; j < rows; j += blockDim.x) {
+    const int value = ids[j];
+    const int e = value >= 0 && value < experts ? value : 0;
+    atomicAdd(counts + e, 1);
+    before += e < expert || (e == expert && j < r);
+  }
+  before = __reduce_add_sync(0xffffffff, before);
+  if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = before;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    destination = partial[0] + partial[1] + partial[2] + partial[3];
+    int begin = 0, sf_begin = 0;
+    for (int e = 0; e < experts; ++e) {
+      if (e == r) {
+        offsets[r] = begin;
+        sf_offsets[r] = sf_begin;
+      }
+      if (e == expert) {
+        row_begin = begin;
+        row_sf_begin = sf_begin;
+      }
+      begin += counts[e];
+      sf_begin += (counts[e] + 127) / 128 * 128;
+    }
+    if (active) {
+      mapping[r] = destination;
+      row_experts[destination] = expert;
+    }
+    if (r == 0) {
+      scale[0] = 1.f;
+      scale[1] = 4.f;
+      scale[2] = 25.f;
+    }
+  }
+  __syncthreads();
+  if (active) {
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 32);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(destination) * (hidden / 32);
+    for (int h = threadIdx.x; h < hidden / 32; h += blockDim.x)
+      target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
+    const int cols = hidden / 16;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+      int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
+      int64_t dst = int64_t(row_sf_begin) * cols + sf_index(destination - row_begin, col, cols);
+      sf[dst] = valid ? input_sf[src] : 0;
+    }
+  }
+}
+
+template <bool SplitColumns = false>
 __global__ void requantize(const __nv_bfloat16* input, const int32_t* row_experts,
                            const int32_t* offsets, const int32_t* sf_offsets, uint8_t* output,
                            uint8_t* scales, const float* global_scale, int rows, int width) {
@@ -134,9 +205,14 @@ __global__ void requantize(const __nv_bfloat16* input, const int32_t* row_expert
     uint32_t words;
     uint8_t values[4];
   };
-  for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+  // Column tiles contain whole 16-element blocks, preserving scale reductions.
+  const int tiles = SplitColumns ? (width + 1023) / 1024 : 1;
+  for (int64_t task = blockIdx.x; task < int64_t(rows) * tiles; task += gridDim.x) {
+    const int64_t row = task / tiles;
+    const int part = task % tiles;
     int e = row_experts[row];
-    for (int col = threadIdx.x * 8; col < width; col += blockDim.x * 8) {
+    for (int col = (part * blockDim.x + threadIdx.x) * 8; col < width;
+         col += blockDim.x * 8 * tiles) {
       InputPack in;
       in.words = reinterpret_cast<const int4*>(input)[(row * width + col) / 8];
       float values[8], maximum = 0.f;
@@ -303,13 +379,20 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     auto scale = reinterpret_cast<float*>(base + scale_pos_);
     auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
-    checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-    histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts, s_,
-                                                                             e_);
-    prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
-    gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-        static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
-        offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+    if (s_ <= 512 && e_ <= 256) {
+      route_small<<<std::max(s_, e_), 128, 0, stream>>>(
+          static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
+          expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
+          swizzled_);
+    } else {
+      checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
+      histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
+                                                                               s_, e_);
+      prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
+      gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+          static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
+          offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+    }
     checked(cudaGetLastError());
 
     int64_t xshape[]{s_, h_ / 2, 1}, qshape[]{s_, i_ / 2, 1};
@@ -350,7 +433,8 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     int64_t yshape_sw[]{h_, s_, 1}, ystride_sw[]{1, h_, s_ * h_};
     DLTensor tm_sw{mid, device_, 3, dl_bfloat16, mshape_sw, mstride_sw, 0};
     DLTensor ty_sw{gy, device_, 3, dl_bfloat16, yshape_sw, ystride_sw, 0};
-    checked(cudaMemsetAsync(scratch, 0, scratch1_, stream));
+    // The frozen host resets its scheduler counter on every invocation, and
+    // the kernel initializes operand/scale/output descriptors before use.
     // Own the TensorView descriptors until the borrowed AnyView arguments return.
     std::array<TensorView, 14> tensors{TensorView(&first),
                                        TensorView(&desc),
@@ -377,12 +461,17 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     args[argc++] = static_cast<void*>(stream);
     tvm::ffi::Any result;
     fc1_.CallPacked(args, argc, &result);
-    requantize<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-        mid, row_experts, offsets, sf_offsets, qm, sfm, static_cast<float*>(global2.data_ptr()), s_,
-        i_);
+    if (s_ <= 8) {
+      requantize<true><<<std::min<int64_t>(s_ * ((i_ + 1023) / 1024), 4096), 128, 0, stream>>>(
+          mid, row_experts, offsets, sf_offsets, qm, sfm, static_cast<float*>(global2.data_ptr()),
+          s_, i_);
+    } else {
+      requantize<false><<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+          mid, row_experts, offsets, sf_offsets, qm, sfm, static_cast<float*>(global2.data_ptr()),
+          s_, i_);
+    }
     checked(cudaGetLastError());
     if (stages) return;
-    checked(cudaMemsetAsync(scratch, 0, scratch2_, stream));
     dshape[0] = scratch2_ / 8;
     std::array<TensorView, 8> second{TensorView(&first),
                                      TensorView(&desc),
@@ -398,9 +487,15 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     for (auto slot : tail2_) args[argc++] = second[slot == 0 ? 6 : 7];
     args[argc++] = static_cast<void*>(stream);
     fc2_.CallPacked(args, argc, &result);
-    finalize<<<std::min<int64_t>(t_, 4096), 128, 0, stream>>>(
-        gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
-        static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+    if (t_ <= 8) {
+      finalize<true><<<std::min<int64_t>(t_ * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+    } else {
+      finalize<false><<<std::min<int64_t>(t_, 4096), 128, 0, stream>>>(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+    }
     checked(cudaGetLastError());
   }
 
