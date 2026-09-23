@@ -146,3 +146,15 @@ cache zero-copy:
    magnitude `~|V|/sqrt(N)`. The `flashinfer.msa_ops` NVFP4 decode tests use
    unit-RMS inputs, an FP32-from-bytes reference, and a relative-Frobenius
    bound with a cosine floor for exactly this reason.
+
+## 7. Generated Cake decode program
+
+`flashinfer.msa_ops.prepare_msa_nvfp4_sparse_decode` (experimental, Cake
+backend under `flashinfer/experimental/msa_nvfp4_decode/`) is a second reader
+of exactly this contract on compute capability 10.0/10.3: it consumes the four
+strided views of section 4 in place, folds `k_global_scale` into the softmax
+scale, applies `v_global_scale` in its epilogue, and takes the head-major
+top-k selection of section 5. It adds no layout, encoding or selection rule of
+its own; `tests/experimental/test_cake_msa_nvfp4_decode.py` checks it against
+the FP32 oracle of the existing route and against that route on the same
+pages.
