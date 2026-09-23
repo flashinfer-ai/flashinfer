@@ -1,7 +1,7 @@
 {
   "arch": "sm_103a",
   "programs": {
-    "cake_fp8_batched_gemm_sm103a_112cfb7f635e37824189_kernel": {
+    "deepgemm_fp8_batched_gemm_sm103a_132cf3b0b2fbdd0352ab_kernel": {
       "arg_plan": [
         [
           "tma_buffer",
@@ -56,18 +56,18 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": "fbc998882d5c072d1d2d818fc12161066df6bb2d17a604a774bbae929e50d09a",
+      "closure_sha256": "f9e9c6c8ff48d3d24e7523f87db98999307626160f979629ab39627c78240947",
       "compile_flags": [],
       "ffi_entry": "run",
-      "name": "cake_fp8_batched_gemm_sm103a_112cfb7f635e37824189",
+      "name": "deepgemm_fp8_batched_gemm_sm103a_132cf3b0b2fbdd0352ab",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_112cfb7f635e37824189_kernel.cu",
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_112cfb7f635e37824189_binding.cu"
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_132cf3b0b2fbdd0352ab_kernel.cu",
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_132cf3b0b2fbdd0352ab_binding.cu"
       ],
       "tma_workspace_bytes": 0
     },
-    "cake_fp8_batched_gemm_sm103a_863b9a2ab2c3c44cdea3_kernel": {
+    "deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6_kernel": {
       "arg_plan": [
         [
           "tma_buffer",
@@ -122,18 +122,18 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": "a453ec61528c0c93b9af21c89ddce2e3310bec0dc267d8445d2a7910ab161f1d",
+      "closure_sha256": "a83100613e255992bb8afe2bad8487f43c049e632f7a918a8e11f86c64da3937",
       "compile_flags": [],
       "ffi_entry": "run",
-      "name": "cake_fp8_batched_gemm_sm103a_863b9a2ab2c3c44cdea3",
+      "name": "deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_863b9a2ab2c3c44cdea3_kernel.cu",
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_863b9a2ab2c3c44cdea3_binding.cu"
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6_kernel.cu",
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6_binding.cu"
       ],
       "tma_workspace_bytes": 0
     },
-    "cake_fp8_batched_gemm_sm103a_8e154d65f2abfa099717_kernel": {
+    "deepgemm_fp8_batched_gemm_sm103a_5a097d7a6f758ac82a2f_kernel": {
       "arg_plan": [
         [
           "tma_buffer",
@@ -188,18 +188,18 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": "29486c4e14e72abb8711727af373ce60d5b529c15fc6200be6d78bae6f52ef2d",
+      "closure_sha256": "7458e14248562b2d7d3199beb4360bce236ddbfb675d18eaa1f647f3bc06fd1a",
       "compile_flags": [],
       "ffi_entry": "run",
-      "name": "cake_fp8_batched_gemm_sm103a_8e154d65f2abfa099717",
+      "name": "deepgemm_fp8_batched_gemm_sm103a_5a097d7a6f758ac82a2f",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_8e154d65f2abfa099717_kernel.cu",
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_8e154d65f2abfa099717_binding.cu"
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_5a097d7a6f758ac82a2f_kernel.cu",
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_5a097d7a6f758ac82a2f_binding.cu"
       ],
       "tma_workspace_bytes": 0
     },
-    "cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c_kernel": {
+    "deepgemm_fp8_batched_gemm_sm103a_9d398626db29e4fd1e30_kernel": {
       "arg_plan": [
         [
           "tma_buffer",
@@ -254,18 +254,18 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": "740f78aad56dfb73d2a7505ad246a3da25745f84daf21e244505f57e6c24c0bb",
+      "closure_sha256": "97f9f9f511330a61412f060539c2a8d72a3989736bd5971f7a8187a19c29ab7d",
       "compile_flags": [],
       "ffi_entry": "run",
-      "name": "cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c",
+      "name": "deepgemm_fp8_batched_gemm_sm103a_9d398626db29e4fd1e30",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c_kernel.cu",
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c_binding.cu"
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_9d398626db29e4fd1e30_kernel.cu",
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_9d398626db29e4fd1e30_binding.cu"
       ],
       "tma_workspace_bytes": 0
     },
-    "cake_fp8_batched_gemm_sm103a_d2158d9a7832e4dd0a2e_kernel": {
+    "deepgemm_fp8_batched_gemm_sm103a_a538354424eb56ee7455_kernel": {
       "arg_plan": [
         [
           "tma_buffer",
@@ -320,14 +320,80 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": "9efff967cc8311d54bc644ec0af05ec89f30a2319b2a062f5491ab02e824c21a",
+      "closure_sha256": "44e2c3069dfbdd7b6a90eb5f3bd676e9dca6212e8f8138aee123df6bb1ef2d7e",
       "compile_flags": [],
       "ffi_entry": "run",
-      "name": "cake_fp8_batched_gemm_sm103a_d2158d9a7832e4dd0a2e",
+      "name": "deepgemm_fp8_batched_gemm_sm103a_a538354424eb56ee7455",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_d2158d9a7832e4dd0a2e_kernel.cu",
-        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/cake_fp8_batched_gemm_sm103a_d2158d9a7832e4dd0a2e_binding.cu"
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_a538354424eb56ee7455_kernel.cu",
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_a538354424eb56ee7455_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "deepgemm_fp8_batched_gemm_sm103a_ce682f8c1c3fec5ffa6b_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "D"
+        ],
+        [
+          "buffer",
+          "SFD"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "sfd_stride"
+        ],
+        [
+          "parameter",
+          "alpha"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "f13c52f593d87ec2820112483f5fb234be03a702305df954a8141ce2e7dcd1fa",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "deepgemm_fp8_batched_gemm_sm103a_ce682f8c1c3fec5ffa6b",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_ce682f8c1c3fec5ffa6b_kernel.cu",
+        "csrc/experimental/deepgemm_batched_gemm/generated/sm_103a/deepgemm_fp8_batched_gemm_sm103a_ce682f8c1c3fec5ffa6b_binding.cu"
       ],
       "tma_workspace_bytes": 0
     }
@@ -349,12 +415,12 @@
         "num_stages": 5,
         "route": "general"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_863b9a2ab2c3c44cdea3_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_132cf3b0b2fbdd0352ab_kernel"
     },
     "128:8:4096:1024:152:5:bf16": {
       "config": {
         "block_k": 128,
-        "block_m": 128,
+        "block_m": 64,
         "block_n": 128,
         "epilogue": "bf16",
         "grid": [
@@ -362,12 +428,12 @@
           1,
           1
         ],
-        "grid_m": 1,
+        "grid_m": 2,
         "num_sms": 152,
-        "num_stages": 5,
-        "route": "general"
+        "num_stages": 10,
+        "route": "bf16_t128"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_112cfb7f635e37824189_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_a538354424eb56ee7455_kernel"
     },
     "128:8:4096:1024:152:5:fp8": {
       "config": {
@@ -385,7 +451,7 @@
         "num_stages": 10,
         "route": "swap_ab"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_d2158d9a7832e4dd0a2e_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_5a097d7a6f758ac82a2f_kernel"
     },
     "16:8:4096:1024:152:5:fp8": {
       "config": {
@@ -403,7 +469,7 @@
         "num_stages": 12,
         "route": "swap_ab"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6_kernel"
     },
     "1:8:4096:1024:152:5:fp8": {
       "config": {
@@ -421,7 +487,7 @@
         "num_stages": 12,
         "route": "swap_ab"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6_kernel"
     },
     "4096:8:4096:1024:152:5:fp8": {
       "config": {
@@ -439,7 +505,7 @@
         "num_stages": 5,
         "route": "n256"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_8e154d65f2abfa099717_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_9d398626db29e4fd1e30_kernel"
     },
     "4:8:4096:1024:152:5:alpha": {
       "config": {
@@ -457,12 +523,12 @@
         "num_stages": 5,
         "route": "general"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_863b9a2ab2c3c44cdea3_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_132cf3b0b2fbdd0352ab_kernel"
     },
     "4:8:4096:1024:152:5:bf16": {
       "config": {
         "block_k": 128,
-        "block_m": 128,
+        "block_m": 16,
         "block_n": 128,
         "epilogue": "bf16",
         "grid": [
@@ -472,10 +538,10 @@
         ],
         "grid_m": 1,
         "num_sms": 152,
-        "num_stages": 5,
-        "route": "general"
+        "num_stages": 12,
+        "route": "bf16_t4"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_112cfb7f635e37824189_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_ce682f8c1c3fec5ffa6b_kernel"
     },
     "4:8:4096:1024:152:5:fp8": {
       "config": {
@@ -493,7 +559,7 @@
         "num_stages": 12,
         "route": "swap_ab"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_92d9e4c5f75a923d0b8c_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_1d52198fbb8272f8e2b6_kernel"
     },
     "512:8:4096:1024:152:5:fp8": {
       "config": {
@@ -511,7 +577,7 @@
         "num_stages": 5,
         "route": "n256"
       },
-      "program": "cake_fp8_batched_gemm_sm103a_8e154d65f2abfa099717_kernel"
+      "program": "deepgemm_fp8_batched_gemm_sm103a_9d398626db29e4fd1e30_kernel"
     }
   },
   "schema": "fp8_batched_gemm.v1"
