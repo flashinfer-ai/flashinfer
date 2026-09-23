@@ -355,6 +355,8 @@ def test_batch_mla_without_kpe(backend):
     torch.testing.assert_close(lse, lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("num_heads", [16, 64])
 @parametrize_product(
     {
         "batch_size": [1, 3, 5, 7],
@@ -362,10 +364,8 @@ def test_batch_mla_without_kpe(backend):
         "kv_len_1": [17, 33, 79, 114],
         "kv_len_2": [514, 2743, 8736],
         "qo_len": [1, 3, 5, 7, 9, 11, 13, 15, 17],
-        "num_heads": [16, 64],
         "causal": [False, True],
         "page_size": [1],
-        "backend": ["fa2", "fa3"],
         "dtype": [torch.half],
     },
     regular=pairwise_product_cases,
