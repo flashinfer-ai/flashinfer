@@ -1853,11 +1853,12 @@ def test_trtllm_batch_decode_mla_use_fp16_softmax(
 def test_trtllm_batch_decode_mla_empty_kv_rows_are_neutral(
     num_heads: int, q_len_per_request: int, dtype: torch.dtype
 ):
-    """Rows with ``seq_lens == 0`` must come back as ``out = 0`` / ``lse = -inf``.
+    """``fill_empty_kv_rows`` turns ``seq_lens == 0`` rows into ``out = 0`` / ``lse = -inf``.
 
     A decode-context-parallel rank that owns no KV slice of a request, or a
     chunked-KV merge, feeds such rows into ``merge_state``; stale ``out`` memory
-    would poison the merge even with a zero weight.
+    would poison the merge even with a zero weight. Without the flag the kernel
+    keeps its padding semantics and leaves those rows alone.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -1894,7 +1895,7 @@ def test_trtllm_batch_decode_mla_empty_kv_rows_are_neutral(
     workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     bmm1_scale = 1.0 / ((qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
 
-    def run(query, block_tables, seq_lens, out=None, lse=None):
+    def run(query, block_tables, seq_lens, out=None, lse=None, fill=True):
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -1911,9 +1912,23 @@ def test_trtllm_batch_decode_mla_empty_kv_rows_are_neutral(
             out=out,
             lse=lse,
             return_lse=True,
+            fill_empty_kv_rows=fill,
         )
 
-    # Sentinels: the kernel must overwrite both buffers for the empty rows.
+    # Default (fill_empty_kv_rows=False) keeps the kernel's padding semantics:
+    # empty rows are skipped and their `out` is left untouched.
+    out = torch.full(
+        (batch_size, q_len_per_request, num_heads, kv_lora_rank),
+        7.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    run(query, block_tables, seq_lens, out=out, fill=False)
+    torch.cuda.synchronize()
+    empty = seq_lens == 0
+    assert torch.all(out[empty] == 7.0), "default must not touch empty-KV rows"
+
+    # Sentinels: with the flag, the kernel must overwrite both buffers for the empty rows.
     out = torch.full(
         (batch_size, q_len_per_request, num_heads, kv_lora_rank),
         7.0,
@@ -1931,7 +1946,6 @@ def test_trtllm_batch_decode_mla_empty_kv_rows_are_neutral(
     assert lse_ret is lse
     torch.cuda.synchronize()
 
-    empty = seq_lens == 0
     lse_rows = lse.view(batch_size, q_len_per_request, num_heads)
     assert torch.all(out[empty] == 0), "empty-KV rows must produce out = 0"
     assert torch.isneginf(lse_rows[empty]).all(), (
@@ -1950,3 +1964,30 @@ def test_trtllm_batch_decode_mla_empty_kv_rows_are_neutral(
         atol=2e-2,
         rtol=2e-2,
     )
+
+
+def test_trtllm_batch_decode_mla_fill_empty_kv_rows_requires_lse():
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+    device = "cuda:0"
+    query = torch.randn(2, 1, 16, 576, device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(4, 1, 64, 576, device=device, dtype=torch.bfloat16)
+    block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([64, 0], dtype=torch.int32, device=device)
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="requires return_lse=True"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=64,
+            bmm1_scale=1.0 / (192**0.5),
+            backend="trtllm-gen",
+            fill_empty_kv_rows=True,
+        )

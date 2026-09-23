@@ -451,22 +451,6 @@ void trtllm_paged_attention_launcher(
   }
 
   fmha_runner->run(runner_params);
-
-  // Only callers that request the LSE merge partial attention states, and only a merge can
-  // observe an empty-KV row, so the fixup is skipped (zero cost) on the plain decode path.
-  // Scope: dense MLA decode without attention sinks. A sink contributes to the softmax
-  // denominator, so an empty-KV row with sinks has a finite LSE that must not be overwritten with
-  // -inf. Block-sparse attention carries per-head lengths and sparse MLA has no empty-row
-  // contract, so both are left untouched as well.
-  if (mode == TllmPagedAttentionMode::ForGen && is_mla_decode && lse != nullptr &&
-      seq_lens != nullptr && attention_sinks == nullptr && !enable_block_sparse_attention &&
-      sparse_mla_top_k <= 0) {
-    int64_t const out_row_bytes = num_qo_heads * head_dim_vo * get_size_in_bits(o_data_type) / 8;
-    int64_t const q_len_per_request = cum_seq_lens_q == nullptr ? sum_seq_q / batch_size : 0;
-    launch_fixup_empty_kv_rows(out, out_row_bytes, lse, lse_stride_tokens, lse_stride_heads,
-                               num_qo_heads, seq_lens, cum_seq_lens_q, q_len_per_request, max_q_len,
-                               batch_size, stream);
-  }
 }
 
 inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
@@ -504,7 +488,7 @@ void trtllm_paged_attention_decode(
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, double lse_scale,
     int64_t lse_stride_tokens, int64_t lse_stride_heads, bool enable_block_sparse_attention,
     Optional<TensorView> sparse_mla_top_k_lens, int64_t bf16q_fp8kv_transform_mode,
-    Optional<bool> use_fp16_softmax) {
+    Optional<bool> use_fp16_softmax, bool fill_empty_kv_rows) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -681,6 +665,30 @@ void trtllm_paged_attention_decode(
       lse_stride_tokens, lse_stride_heads, lse_scale, bf16q_fp8kv_transform_mode,
       use_fp16_softmax_value, uses_spcompress_value, /*dsv4_inv_rope_cos_sin_cache=*/nullptr,
       /*dsv4_output_scale=*/nullptr, /*dsv4_scale_buf_m=*/0, stream);
+
+  // Opt-in: materialize the empty-attention identity (out = 0, lse = -inf) for requests with
+  // seq_lens == 0 so a downstream merge of partial states (DCP, chunked KV) can ignore them. Off
+  // by default because the same rows are padding for other callers, who expect the kernel to
+  // leave them untouched. Dense MLA decode only; with attention sinks the empty-row LSE is
+  // finite (the sink is in the denominator), and block-sparse / sparse MLA carry different
+  // length semantics.
+  if (fill_empty_kv_rows) {
+    bool const is_dense_mla_decode =
+        ((head_dim_q == 576 && head_dim_o == 512) || (head_dim_q == 320 && head_dim_o == 256)) &&
+        sparse_mla_top_k <= 0;
+    TVM_FFI_CHECK(is_dense_mla_decode, "fill_empty_kv_rows is only supported for dense MLA decode");
+    TVM_FFI_CHECK(lse_ptr != nullptr, "fill_empty_kv_rows requires the LSE output");
+    TVM_FFI_CHECK(attention_sinks_ptr == nullptr,
+                  "fill_empty_kv_rows is not supported with attention sinks");
+    TVM_FFI_CHECK(!enable_block_sparse_attention,
+                  "fill_empty_kv_rows is not supported with block-sparse attention");
+    int64_t const out_row_bytes = num_qo_heads * head_dim_o * get_size_in_bits(o_data_type) / 8;
+    int64_t const q_len_per_request = cum_seq_lens_q_ptr == nullptr ? sum_seq_q / batch_size : 0;
+    launch_fixup_empty_kv_rows(out.data_ptr(), out_row_bytes, lse_ptr, lse_stride_tokens,
+                               lse_stride_heads, num_qo_heads,
+                               static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
+                               q_len_per_request, max_q_len, batch_size, stream);
+  }
 }
 
 void trtllm_paged_attention_context(

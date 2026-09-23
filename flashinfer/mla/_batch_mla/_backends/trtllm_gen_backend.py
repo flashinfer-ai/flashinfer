@@ -672,4 +672,5 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             None,  # sparse_mla_top_k_lens
             0,  # bf16q_fp8kv_transform_mode
             None,  # use_fp16_softmax
+            False,  # fill_empty_kv_rows
         )

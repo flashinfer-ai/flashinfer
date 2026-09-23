@@ -338,9 +338,9 @@ def test_planned_trtllm_launch_lse_scale(with_lse):
         lse_stride_heads=head_stride,
     )
     (args,) = calls
-    assert len(args) == 36
+    assert len(args) == 37
     assert args[28] is lse
-    assert args[29:] == (1.0, token_stride, head_stride, False, None, 0, None)
+    assert args[29:] == (1.0, token_stride, head_stride, False, None, 0, None, False)
 
 
 def test_planned_monolithic_launch_lse_scale():
