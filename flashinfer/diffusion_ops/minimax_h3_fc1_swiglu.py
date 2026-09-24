@@ -37,11 +37,17 @@ MINIMAX_H3_MAX_ROWS = 1 << 24
 # GEMM tiling facts the host-side workspace sizing depends on.
 _BLOCK_M = 128
 _CTA_GROUP = 2
-_MXFP8_N_TILE_ROWS = 128  # gate/up weight rows per CTA of the MXFP8 GEMM (256x256 pair tile)
+_MXFP8_N_TILE_ROWS = (
+    128  # gate/up weight rows per CTA of the MXFP8 GEMM (256x256 pair tile)
+)
 _MXFP8_N_TILES = MINIMAX_H3_FFN // _MXFP8_N_TILE_ROWS  # 112 output tiles of 128 columns
 _NVFP4_N_TILE_ROWS = 112  # gate/up weight rows per MMA of the NVFP4 GEMM (256x448 pair tile, two N = 224 MMAs)
-_NVFP4_WEIGHT_SF_TILES = MINIMAX_H3_FFN // _NVFP4_N_TILE_ROWS  # 128 combined weight scale sub-tiles
-_NVFP4_N_TILES = _NVFP4_WEIGHT_SF_TILES // 2  # 64 output tiles of 224 columns (sub-tiles 2t, 2t + 1)
+_NVFP4_WEIGHT_SF_TILES = (
+    MINIMAX_H3_FFN // _NVFP4_N_TILE_ROWS
+)  # 128 combined weight scale sub-tiles
+_NVFP4_N_TILES = (
+    _NVFP4_WEIGHT_SF_TILES // 2
+)  # 64 output tiles of 224 columns (sub-tiles 2t, 2t + 1)
 
 # FlashInfer 128x4 swizzled scale-factor tiles: 512 bytes = 128 rows x 4 K-blocks, byte offset
 # (row % 32) * 16 + (row // 32) * 4 + kblock inside the tile; tiles ordered (row block, K set).
@@ -57,7 +63,9 @@ NVFP4_SF_K_TILES = NVFP4_SF_COLS // 4  # 84 tiles per 128-row block
 # Combined gate/up weight scale tiles: [tile][k_set][half][512 bytes]; MXFP8 tiles pair 128 gate + 128
 # up rows, NVFP4 sub-tiles pair 112 gate + 112 up rows (rows 224..255 of each 256-row block are zero).
 MXFP8_FC1_SCALE_TILE_BYTES = _MXFP8_N_TILES * MXFP8_SF_K_TILES * 2 * _SF_TILE_BYTES
-NVFP4_FC1_SCALE_TILE_BYTES = _NVFP4_WEIGHT_SF_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
+NVFP4_FC1_SCALE_TILE_BYTES = (
+    _NVFP4_WEIGHT_SF_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
+)
 
 _E4M3_MAX = 448.0
 _E2M1_MAX = 6.0
@@ -246,7 +254,9 @@ def _unswizzle_sf_128x4(
     )
 
 
-def _combined_weight_scale_tiles(sf_linear: torch.Tensor, n_tile_rows: int) -> torch.Tensor:
+def _combined_weight_scale_tiles(
+    sf_linear: torch.Tensor, n_tile_rows: int
+) -> torch.Tensor:
     """``[28672, C]`` linear weight scales -> flat combined tiles ``[tile][k_set][half][512]``.
 
     Output tile ``t`` (``14336 / n_tile_rows`` tiles of ``n_tile_rows`` output columns) pairs gate
@@ -259,7 +269,9 @@ def _combined_weight_scale_tiles(sf_linear: torch.Tensor, n_tile_rows: int) -> t
             f"weight scales must have {MINIMAX_H3_FC1_ROWS} rows, got {tuple(sf_linear.shape)}"
         )
     if MINIMAX_H3_FFN % n_tile_rows or 2 * n_tile_rows > 2 * _SF_TILE_ROWS:
-        raise ValueError(f"n_tile_rows={n_tile_rows} must divide {MINIMAX_H3_FFN} and be at most {_SF_TILE_ROWS}")
+        raise ValueError(
+            f"n_tile_rows={n_tile_rows} must divide {MINIMAX_H3_FFN} and be at most {_SF_TILE_ROWS}"
+        )
     n_tiles = MINIMAX_H3_FFN // n_tile_rows
     cols = int(sf_linear.shape[1])
     gate = sf_linear[:MINIMAX_H3_FFN].reshape(n_tiles, n_tile_rows, cols)
@@ -274,7 +286,12 @@ def _combined_weight_scale_tiles(sf_linear: torch.Tensor, n_tile_rows: int) -> t
     tiles = _swizzle_sf_128x4(combined.reshape(n_tiles * 2 * _SF_TILE_ROWS, cols))
     k_sets = -(-cols // 4)
     # swizzle order is (row tile = n_tile * 2 + half, k_set) -> (n_tile, k_set, half)
-    return tiles.reshape(n_tiles, 2, k_sets, _SF_TILE_BYTES).permute(0, 2, 1, 3).contiguous().reshape(-1)
+    return (
+        tiles.reshape(n_tiles, 2, k_sets, _SF_TILE_BYTES)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(-1)
+    )
 
 
 # --------------------------------------------------------------------------------------------
