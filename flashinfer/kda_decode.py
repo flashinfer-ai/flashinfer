@@ -676,8 +676,8 @@ def packed_fused_kda_decode(
     bfloat16-state and softplus-gate support. The optional
     ``t1_state_indices`` optimization is strictly T=1-only; passing it for
     T>1 fails closed. T>1 uses the SM10x CuTe DSL packed backend, which
-    requires FP32
-    recurrent state and a finite negative ``lower_bound``. Both paths require
+    accepts float32 or bfloat16 recurrent state and requires a finite negative
+    ``lower_bound``. Both paths require
     head dimension 128, convolution width four, and 12, 24, 32, 48, or 96
     heads. Other tensors follow :func:`fused_kda_decode`, with the packed row
     count supplied by ``x``.
@@ -735,7 +735,8 @@ def packed_fused_kda_decode(
             function.
         state:
             Paged recurrent state with shape ``[num_slots, H, 128, 128]``.
-            T=1 accepts float32 or bfloat16; T>1 requires float32.
+            float32 or bfloat16. T>1 keeps the recurrence in float32 and
+            rounds only when writing each bfloat16 checkpoint.
         output_gate:
             Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
             ``[1, num_rows, H, 128]`` and dtype bfloat16.
