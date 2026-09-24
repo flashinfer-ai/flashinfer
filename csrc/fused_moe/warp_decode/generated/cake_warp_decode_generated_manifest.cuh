@@ -4423,7 +4423,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && (fc1_kernel == 6
           || false)
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && inv.shape.num_tokens >= 10 && inv.shape.num_tokens <= 16
+      && inv.shape.num_tokens >= 10 && inv.shape.num_tokens <= 19
       && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
       && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
       && inv.shape.top_k == 8;
@@ -9729,7 +9729,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && (fc1_kernel == 10
           || fc1_kernel == 11)
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
-      && inv.shape.num_tokens >= 10 && inv.shape.num_tokens <= 16
+      && inv.shape.num_tokens >= 10 && inv.shape.num_tokens <= 19
       && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
       && inv.shape.num_experts == 128 && inv.shape.local_num_experts == 128
       && inv.shape.top_k == 8;

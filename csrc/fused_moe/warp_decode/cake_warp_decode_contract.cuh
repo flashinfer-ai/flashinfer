@@ -263,7 +263,7 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
   }
 
   if (IsGeometry(shape, 2048, 768, 128, 8) &&
-      shape.num_tokens >= 10 && shape.num_tokens <= 16) {
+      shape.num_tokens >= 10 && shape.num_tokens <= 19) {
     return {true,
             Geometry::kH2048I768E128K8,
             RouteLayout::kGpuPacked,
@@ -275,7 +275,7 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
             144};
   }
 
-  if (IsGeometry(shape, 2048, 768, 128, 8) && shape.num_tokens >= 17 && shape.num_tokens <= 32) {
+  if (IsGeometry(shape, 2048, 768, 128, 8) && shape.num_tokens >= 20 && shape.num_tokens <= 32) {
     return {true,
             Geometry::kH2048I768E128K8,
             RouteLayout::kGpuPacked,
@@ -665,7 +665,7 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
       if (tokens == 0 || tokens == 33) {
         if (schedule.supported) return false;
       } else if (geometry == Geometry::kH2048I768E128K8 &&
-                 (tokens == 10 || tokens == 11 || tokens == 12 || (target == 1 && tokens >= 13 && tokens <= 16) || (target == 0 && (tokens == 13 || tokens == 14 || tokens == 15 || tokens == 16 || tokens == 17 ||
+                 (tokens == 10 || tokens == 11 || tokens == 12 || (target == 1 && tokens >= 13 && tokens <= 19) || (target == 0 && (tokens == 13 || tokens == 14 || tokens == 15 || tokens == 16 || tokens == 17 ||
                   ((tokens >= 20 && tokens <= 28) || tokens == 29 || tokens == 30 || tokens == 31))))) {
         if (!schedule.supported || schedule.geometry != geometry ||
             ActivationForGeometry(geometry) != activation ||
@@ -689,7 +689,7 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
             schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
             schedule.workfeed_ctas != 144) return false;
       } else if (geometry == Geometry::kH2048I768E128K8 &&
-                 (tokens == 32 || (target == 1 && tokens >= 17 && tokens <= 31)
+                 (tokens == 32 || (target == 1 && tokens >= 20 && tokens <= 31)
                   || (target == 0 && (tokens == 18 || tokens == 19)))) {
         if (!schedule.supported || schedule.geometry != geometry ||
             ActivationForGeometry(geometry) != activation ||
