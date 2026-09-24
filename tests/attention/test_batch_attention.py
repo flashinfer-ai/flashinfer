@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import pytest
 import torch
@@ -24,8 +21,15 @@ import torch
 import flashinfer
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.jit.attention.modules import _gen_batch_prefill_primary_module
-from flashinfer.quantization.fp4_quantization import gen_fp4_quantization_sm90_module
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from tests.test_helpers.jit_utils import (
+    gen_fp4_quantization_module_for_device,
+    prebuild_jit_specs,
+)
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 
 @pytest.fixture(
@@ -33,18 +37,12 @@ from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
     scope="module",
 )
 def warmup_jit():
-    """Prebuild, in parallel, exactly the modules this file loads.
+    """Prebuild the modules this file loads.
 
-    test_batch_attention_correctness loads one holistic batch-attention module
-    per (dtype, head_dim, soft-cap) and, for its reference, the FA2 primary
-    (equal K/V stride) paged-prefill module for the same combination. The NVFP4
-    tests add the fp4-KV batch-attention variants and the SM90 fp4 quantization
-    module. Specs already in the AOT cache are skipped.
-
-    Each spec is built with its own ninja (in parallel) rather than through
-    flashinfer.jit.build_jit_specs: that helper's combined ninja logs to the
-    cached_ops root, so the per-module ninja that build_and_load() later runs
-    finds no record of the outputs and recompiles them.
+    One holistic batch-attention module per (dtype, head_dim, soft-cap) and
+    the FA2 primary paged-prefill module used as its reference, plus the
+    NVFP4 tests' fp4-KV variants, fp4 quantization module and FA3
+    single-prefill references.
     """
     cc = get_compute_capability(torch.device("cuda:0"))
     f16, bf16, i32 = torch.float16, torch.bfloat16, torch.int32
@@ -81,14 +79,19 @@ def warmup_jit():
                     dtype, fp4, dtype, i32, 128, 128, NONE, False, False
                 )
             )
-        if cc == (9, 0):
-            specs.append(gen_fp4_quantization_sm90_module())
+        fp4_quant = gen_fp4_quantization_module_for_device()
+        if fp4_quant is not None:
+            specs.append(fp4_quant)
+    if is_sm90a_supported(torch.device("cuda:0")):
+        # The NVFP4 tests' per-item single_prefill reference resolves to FA3.
+        for dtype in (f16, bf16):
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa3", dtype, dtype, dtype, 128, 128, NONE, False, False, False
+                )
+            )
 
-    to_build = [spec for spec in specs if not spec.is_aot]
-    if to_build:
-        workers = min(len(to_build), max(1, (os.cpu_count() or 8) // 8))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda spec: spec.build(need_lock=True), to_build))
+    prebuild_jit_specs(specs)
 
 
 # -------------------------  Configuration generation function  ----------------------------- #

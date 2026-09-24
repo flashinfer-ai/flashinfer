@@ -17,8 +17,6 @@ limitations under the License.
 import math
 
 import numpy
-import os
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -31,7 +29,11 @@ from flashinfer.jit.attention.modules import (
     _gen_batch_prefill_independent_paged_module,
     _gen_batch_prefill_primary_module,
 )
-from flashinfer.quantization.fp4_quantization import gen_fp4_quantization_sm90_module
+from flashinfer.quantization import gen_quantization_module
+from tests.test_helpers.jit_utils import (
+    gen_fp4_quantization_module_for_device,
+    prebuild_jit_specs,
+)
 from flashinfer.utils import (
     get_compute_capability,
     has_flashinfer_jit_cache,
@@ -106,19 +108,13 @@ def _assert_no_ref_mismatch(mismatch_counts):
     scope="module",
 )
 def warmup_jit():
-    """Prebuild, in parallel, exactly the FA2 modules this file loads.
+    """Prebuild the modules this file loads.
 
-    Every wrapper in this file resolves to FA2. The batch path loads the
-    primary (equal K/V stride) module, and the unequal-stride tests load the
-    independent paged module, so those are the variants listed here (the same
-    generators aot.py uses). Without this, ~30 modules compile lazily, one per
-    first-touching test, for roughly 700 s on a cold H100 cache.
-
-    Specs already in the AOT cache are skipped. Each spec is built with its own
-    ninja (in parallel) rather than through flashinfer.jit.build_jit_specs:
-    that helper's combined ninja logs to the cached_ops root, so the per-module
-    ninja that build_and_load() later runs finds no record of the outputs and
-    recompiles them.
+    FA2 wrappers load the primary (equal K/V stride) module and the
+    unequal-stride tests the independent paged module; backend="auto"
+    resolves to FA3 on SM90a for NONE without a custom mask; references call
+    single_prefill_with_kv_cache. tests/attention/conftest.py also prebuilds
+    for this file; anything already built is skipped.
     """
     cc = get_compute_capability(torch.device("cuda:0"))
     f16, bf16, i32 = torch.float16, torch.bfloat16, torch.int32
@@ -135,9 +131,7 @@ def warmup_jit():
         )
 
     specs = []
-    # 16-bit paged/tuple/ragged/custom-mask grids: head_dim 128/256 across all
-    # position encodings, with and without logits soft cap; head_dim 64 needs
-    # only the ROPE variant (the NONE variant ships in the AOT cache).
+    # fp16 paged/tuple/ragged/custom-mask grids.
     for head_dim in (128, 256):
         for pe in (NONE, ROPE_LLAMA, ALIBI):
             for cap in (False, True):
@@ -154,6 +148,52 @@ def warmup_jit():
         specs.append(independent(f16, f16, 512, 512))
         specs.append(primary(f16, f16, 448, 256, NONE))
         specs.append(independent(f16, f16, 448, 256))
+        # single_prefill references of the head_dim 512 and NVFP4 large-head tests.
+        for dtype in (f16, bf16):
+            for pe in (NONE, ROPE_LLAMA):
+                specs.append(
+                    flashinfer.prefill.gen_single_prefill_module(
+                        "fa2", dtype, dtype, dtype, 512, 512, pe, False, False, False
+                    )
+                )
+    fa3 = is_sm90a_supported(torch.device("cuda:0"))
+    for head_dim in (64, 128, 256):
+        # single_prefill references (FA2; FA3 for NONE on SM90a) and FA3 wrappers.
+        for pe in (NONE, ROPE_LLAMA):
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa2", f16, f16, f16, head_dim, head_dim, pe, False, False, False
+                )
+            )
+        if fa3:
+            specs.append(
+                flashinfer.prefill.gen_batch_prefill_module(
+                    "fa3",
+                    f16,
+                    f16,
+                    f16,
+                    i32,
+                    head_dim,
+                    head_dim,
+                    NONE,
+                    False,
+                    False,
+                    False,
+                )
+            )
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa3", f16, f16, f16, head_dim, head_dim, NONE, False, False, False
+                )
+            )
+    # multi-item scoring: FA2 single-prefill reference with logits soft cap.
+    specs.append(
+        flashinfer.prefill.gen_single_prefill_module(
+            "fa2", f16, f16, f16, 128, 128, ROPE_LLAMA, False, True, False
+        )
+    )
+    # packbits for the custom-mask tests.
+    specs.append(gen_quantization_module())
     if cc[0] >= 9:
         # NVFP4 KV cache tests.
         fp4 = torch.float4_e2m1fn_x2
@@ -163,23 +203,34 @@ def warmup_jit():
             specs.append(primary(q, fp4, 512, 512, NONE))
             specs.append(primary(q, fp4, 512, 512, ROPE_LLAMA))
         specs.append(independent(f16, fp4, 128, 128))
-        if cc == (9, 0):
-            specs.append(gen_fp4_quantization_sm90_module())
-        if is_sm90a_supported(torch.device("cuda:0")):
-            # bf16 reference for the NVFP4 head_dim 256 test resolves to FA3.
-            specs.append(
-                flashinfer.prefill.gen_single_prefill_module(
-                    "fa3", bf16, bf16, bf16, 256, 256, NONE, False, False, False
+        fp4_quant = gen_fp4_quantization_module_for_device()
+        if fp4_quant is not None:
+            specs.append(fp4_quant)
+        if fa3:
+            # bf16 references of the NVFP4 tests resolve to FA3.
+            for head_dim in (128, 256):
+                specs.append(
+                    flashinfer.prefill.gen_single_prefill_module(
+                        "fa3",
+                        bf16,
+                        bf16,
+                        bf16,
+                        head_dim,
+                        head_dim,
+                        NONE,
+                        False,
+                        False,
+                        False,
+                    )
                 )
-            )
-
-    to_build = [spec for spec in specs if not spec.is_aot]
-    if to_build:
-        # Each ninja spawns at most a handful of nvcc processes (one per TU),
-        # so cap concurrent ninjas by core count rather than running all at once.
-        workers = min(len(to_build), max(1, (os.cpu_count() or 8) // 8))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda spec: spec.build(need_lock=True), to_build))
+    if cc[0] >= 10:
+        # Asymmetric NVFP4 (SM100+) and the FP8-KV qk448/vo256 smem probe.
+        fp4 = torch.float4_e2m1fn_x2
+        for qk, vo in ((512, 256), (256, 128)):
+            specs.append(primary(bf16, fp4, qk, vo, NONE))
+            specs.append(independent(bf16, fp4, qk, vo))
+        specs.append(primary(f16, torch.float8_e4m3fn, 448, 256, NONE))
+    prebuild_jit_specs(specs)
     yield
 
 

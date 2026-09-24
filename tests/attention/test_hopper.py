@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
-from concurrent.futures import ThreadPoolExecutor
-
 import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.jit_utils import prebuild_jit_specs
 from flashinfer.jit.attention.modules import _gen_batch_prefill_primary_module
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
 
@@ -30,21 +28,10 @@ from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
     scope="module",
 )
 def warmup_jit():
-    """Build every prefill module this file needs up front, in parallel.
+    """Prebuild the FA2/FA3 single and batch prefill modules this file loads.
 
-    Without this, the first test to reach each FA2/FA3 specialization pays a
-    12-50 s nvcc compile, one module at a time (about 19 modules, ~7 min
-    serial on H100). Specs already present in the AOT cache are skipped.
-    The FA2 batch path loads the primary (equal K/V stride) module, so that
-    is the variant prebuilt here; the same generator is used by aot.py.
-
-    Each spec is built with its own ninja invocation (in parallel) rather
-    than via flashinfer.jit.build_jit_specs: that helper runs one combined
-    ninja from the cached_ops root, so its .ninja_log/.ninja_deps land there,
-    and the per-module ninja that build_and_load() later runs from the
-    module directory has no record of the outputs and recompiles them.
-    Per-spec build() writes the log next to the module, so the later
-    build_and_load() is a no-op load.
+    The FA2 batch path loads the primary (equal K/V stride) module, the same
+    generator aot.py uses. See prebuild_jit_specs for how they are built.
     """
     if not is_sm90a_supported(torch.device("cuda")):
         return
@@ -129,11 +116,7 @@ def warmup_jit():
                 False,
             )
         )
-    to_build = [spec for spec in specs if not spec.is_aot]
-    if to_build:
-        workers = min(len(to_build), max(1, (os.cpu_count() or 8) // 8))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda spec: spec.build(need_lock=True), to_build))
+    prebuild_jit_specs(specs)
 
 
 @pytest.mark.parametrize("seq_len", [11, 99, 1763, 9999, 32767])

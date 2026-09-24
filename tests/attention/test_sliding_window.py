@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
-from concurrent.futures import ThreadPoolExecutor
-
 import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.jit_utils import prebuild_jit_specs
 from flashinfer.jit.attention.modules import _gen_batch_prefill_primary_module
+from flashinfer.quantization import gen_quantization_module
 from flashinfer.utils import (
     get_compute_capability,
     has_flashinfer_jit_cache,
@@ -44,18 +43,11 @@ def skip_if_head_dim_unsupported(head_dim: int):
     scope="module",
 )
 def warmup_jit():
-    """Prebuild, in parallel, exactly the modules this file loads.
+    """Prebuild the decode and prefill modules this file loads.
 
     Per head_dim: single/batch decode with and without a sliding window, FA2
-    single prefill and the FA2 primary (equal K/V stride) batch prefill module
-    that the wrappers load, and, on SM90a, the FA3 single/batch prefill modules
-    that backend="auto" resolves to (FA3 has no head_dim 512). Specs already in
-    the AOT cache are skipped.
-
-    Each spec is built with its own ninja (in parallel) rather than through
-    flashinfer.jit.build_jit_specs: that helper's combined ninja logs to the
-    cached_ops root, so the per-module ninja that build_and_load() later runs
-    finds no record of the outputs and recompiles them.
+    single prefill and the FA2 primary batch prefill module, and on SM90a the
+    FA3 modules that backend="auto" resolves to (FA3 has no head_dim 512).
     """
     f16, i32 = torch.float16, torch.int32
     NONE = 0
@@ -125,11 +117,9 @@ def warmup_jit():
                     )
                 )
 
-    to_build = [spec for spec in specs if not spec.is_aot]
-    if to_build:
-        workers = min(len(to_build), max(1, (os.cpu_count() or 8) // 8))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda spec: spec.build(need_lock=True), to_build))
+    # packbits for the custom-mask reference in test_single_prefill_sliding_window.
+    specs.append(gen_quantization_module())
+    prebuild_jit_specs(specs)
     yield
 
 
