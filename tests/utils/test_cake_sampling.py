@@ -37,6 +37,7 @@ from flashinfer.cake_sampling import (
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
+import flashinfer.compilation_context as compilation_context
 import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
@@ -540,11 +541,15 @@ def _gencode(flags):
     return [f for f in flags if f.startswith("-gencode")]
 
 
-def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list):
+def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list, monkeypatch):
     # AOT builds run on hosts without a GPU and name their targets through
     # FLASHINFER_CUDA_ARCH_LIST; the module compiles one cubin per listed architecture into a
     # single fatbin and serves exactly those capabilities.  (Suffixed entries skip the toolkit
     # version probe of CompilationContext so this test also runs without nvcc.)
+    # get_nvcc_flags_list rewrites 10.7 to sm_100f whenever the local nvcc cannot emit
+    # compute_107 (every CUDA 12.x toolkit, e.g. the cu129 CI image). This test is about which
+    # targets are named, not about the toolkit on the test host, so pin the probe.
+    monkeypatch.setattr(compilation_context, "_nvcc_supports_sm107", lambda: True)
     arch_list("9.0 10.3 12.0f")
     assert supported_capabilities() == ((9, 0), (10, 3), (12, 0))
     assert supported_capability((9, 0)) == (9, 0)
