@@ -4,6 +4,7 @@
 Compares NVFP4 and BF16 MoE backends on DeepSeek-V3 configuration:
 - CuteDSL W4A4: NVFP4 activations and weights
 - CuteDSL W4A16: BF16 activations with NVFP4 weights decoded online
+- CuteDSL W4A8: MXFP8 activations with MXFP4 weights
 - CUTLASS: NVIDIA CUTLASS-based implementation
 - TRTLLM NVFP4: TensorRT-LLM's NVFP4 implementation
 - TRTLLM BF16: unquantized BF16 activations and weights
@@ -363,7 +364,8 @@ def bench_cute_dsl(
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
-        quant: QuantConfig selecting W4A4 (NVFP4×NVFP4) or W4A16 (NVFP4×BF16).
+        quant: QuantConfig selecting W4A4 (NVFP4×NVFP4), W4A16 (NVFP4×BF16) or
+            W4A8 (MXFP4xMXFP8).
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         include_activation_quant: Include the initial activation FP4
@@ -373,8 +375,8 @@ def bench_cute_dsl(
             cudaProfilerStart/Stop instead of benchmarking.
         profile_iters: Number of cold-L2 graph replays to capture.
     """
-    from flashinfer import SfLayout, nvfp4_quantize
-    from flashinfer.fused_moe import QuantFormat
+    from flashinfer import SfLayout, mxfp8_quantize, nvfp4_quantize
+    from flashinfer.fused_moe import CuteDslConfig, QuantFormat
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -388,8 +390,20 @@ def bench_cute_dsl(
     if quant.pair not in (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.NVFP4, QuantFormat.BF16),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
     ):
         raise ValueError(f"Unsupported CuTe DSL quant: {quant!r}")
+    is_w4a8 = quant.activation is QuantFormat.MXFP8
+    if is_w4a8 and (use_per_token_activation or not use_fused_finalize):
+        raise ValueError(
+            "CuTe DSL W4A8 supports neither per-token activation scaling nor "
+            "the deterministic two-stage finalize"
+        )
+
+    def mxfp8_quantize_activation(x):
+        # Linear (unswizzled) MXFP8 scales, one uint8 per 32 elements.
+        x_q, x_sf = mxfp8_quantize(x, is_sf_swizzled_layout=False, alignment=128)
+        return x_q, x_sf.view(torch.uint8).reshape(x_q.shape[0], x_q.shape[1] // 32)
 
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
@@ -413,6 +427,9 @@ def bench_cute_dsl(
         xf = inputs["hidden_bf16"]
         xs = None
         hidden_per_token_scale = None
+    elif is_w4a8:
+        xf, xs = mxfp8_quantize_activation(inputs["hidden_bf16"])
+        hidden_per_token_scale = None
     elif use_per_token_activation:
         xf, xs, hidden_per_token_scale = nvfp4_quantize(
             inputs["hidden_bf16"],
@@ -424,14 +441,16 @@ def bench_cute_dsl(
     else:
         xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
         hidden_per_token_scale = None
-    if xs is not None:
+    if xs is not None and not is_w4a8:
         xs = xs.unsqueeze(-1)
 
     def prepare_activation(x, x_sf):
         per_token_scale = hidden_per_token_scale
         if quant.activation is QuantFormat.BF16:
             return x, None, None
-        if include_activation_quant:
+        if include_activation_quant and is_w4a8:
+            x, x_sf = mxfp8_quantize_activation(x)
+        elif include_activation_quant:
             if use_per_token_activation:
                 x, x_sf, per_token_scale = nvfp4_quantize(
                     x,
@@ -453,26 +472,41 @@ def bench_cute_dsl(
     w1_local = inputs["w1_bf16"][expert_start:expert_end]
     w2_local = inputs["w2_bf16"][expert_start:expert_end]
 
-    w1i = interleave(w1_local, 64)
-    w1f = w1i.view(num_local_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
-    w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
-    w1q = w1q.view(num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
-    w1s = convert_sf_to_mma_layout(
-        w1s, 2 * CFG.intermediate_size, CFG.hidden_size, num_local_experts, sv
-    )
+    if is_w4a8:
+        # MXFP4 weights with UE8M0 32-element scales in the MMA layout.
+        view = CuteDslConfig.prepare_weights(
+            w1_local,
+            w2_local,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=CFG.intermediate_size,
+        )
+        w1q, w1s = view["w1_weight"], view["w1_weight_sf"]
+        w2q, w2s = view["w2_weight"], view["w2_weight_sf"]
+    else:
+        w1i = interleave(w1_local, 64)
+        w1f = w1i.view(num_local_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
+        w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
+        w1q = w1q.view(
+            num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2
+        )
+        w1s = convert_sf_to_mma_layout(
+            w1s, 2 * CFG.intermediate_size, CFG.hidden_size, num_local_experts, sv
+        )
 
-    w2f = w2_local.view(num_local_experts * CFG.hidden_size, CFG.intermediate_size)
-    w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
-    w2q = w2q.view(num_local_experts, CFG.hidden_size, CFG.intermediate_size // 2)
-    w2s = convert_sf_to_mma_layout(
-        w2s, CFG.hidden_size, CFG.intermediate_size, num_local_experts, sv
-    )
+        w2f = w2_local.view(num_local_experts * CFG.hidden_size, CFG.intermediate_size)
+        w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
+        w2q = w2q.view(num_local_experts, CFG.hidden_size, CFG.intermediate_size // 2)
+        w2s = convert_sf_to_mma_layout(
+            w2s, CFG.hidden_size, CFG.intermediate_size, num_local_experts, sv
+        )
 
     # Alpha sized for LOCAL experts only
     alpha = torch.ones(num_local_experts, device=dev)
     fc2sc = (
         None
-        if quant.activation is QuantFormat.BF16
+        if quant.activation in (QuantFormat.BF16, QuantFormat.MXFP8)
         else torch.tensor([1.0], device=dev)
     )
 
@@ -1191,6 +1225,13 @@ def _benchmark_single(
         None,
         "cute-dsl-w4a16",
     )
+    # W4A8 has no per-token activation scale and requires the fused finalize.
+    run_cute_dsl_w4a8 = (
+        "cutedsl" in selected
+        and profile_backend in (None, "cute-dsl-w4a8")
+        and not use_per_token_activation
+        and use_fused_finalize
+    )
     run_cutlass = "cutlass" in selected and profile_backend in (None, "cutlass")
     run_trtllm_nvfp4 = "trtllm-nvfp4" in selected and profile_backend in (
         None,
@@ -1234,6 +1275,25 @@ def _benchmark_single(
             use_wrapper=use_wrapper,
             do_autotune=do_autotune,
             quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
+            use_fused_finalize=use_fused_finalize,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
+            autotune_cache=autotune_cache,
+        )
+    if run_cute_dsl_w4a8:
+        lat["CuteDSL W4A8"] = bench_cute_dsl(
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            use_wrapper=use_wrapper,
+            do_autotune=do_autotune,
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
             use_per_token_activation=use_per_token_activation,
             include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
@@ -1306,16 +1366,16 @@ def _print_header(
     use_fused_finalize=True,
 ):
     """Print benchmark header."""
-    table_width = 173 if use_per_token_activation else 212
+    table_width = 191 if use_per_token_activation else 230
     print("\n" + "=" * table_width)
     if use_per_token_activation:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4 / TRTLLM BF16 "
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16/W4A8 vs TRTLLM NVFP4 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     else:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM BF16 "
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16/W4A8 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     print("=" * table_width)
@@ -1357,6 +1417,7 @@ def _print_header(
             f"{'Tokens':>6} | "
             f"{'CuteDSL W4A4':^15} | "
             f"{'CuteDSL W4A16':^15} | "
+            f"{'CuteDSL W4A8':^15} | "
             f"{'TRTLLM NVFP4':^15} | "
             f"{'TRTLLM BF16':^15} | "
             f"{'Speedup vs TRTLLM NVFP4':^23} | "
@@ -1367,6 +1428,7 @@ def _print_header(
         )
         print(
             f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
@@ -1382,6 +1444,7 @@ def _print_header(
             f"{'Tokens':>6} | "
             f"{'CuteDSL W4A4':^15} | "
             f"{'CuteDSL W4A16':^15} | "
+            f"{'CuteDSL W4A8':^15} | "
             f"{'CUTLASS':^15} | "
             f"{'TRTLLM NVFP4':^15} | "
             f"{'TRTLLM BF16':^15} | "
@@ -1394,6 +1457,7 @@ def _print_header(
         )
         print(
             f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
@@ -1420,6 +1484,12 @@ def _print_row(results, histogram_record):
     )
     cutlass = r.get("CUTLASS")
     bf16 = r["TRTLLM BF16"]
+    w4a8 = r.get("CuteDSL W4A8")
+    w4a8_text = (
+        f"{w4a8.latency_ms:>7.3f} {w4a8.tflops:>7.1f}"
+        if w4a8 is not None
+        else f"{'n/a':>7} {'':>7}"
+    )
 
     # Calculate speedups (> 1.0 means CuteDSL is faster)
     nvfp4_speedups = (
@@ -1438,6 +1508,7 @@ def _print_row(results, histogram_record):
     winner = {
         "CuteDSL W4A4": "W4A4",
         "CuteDSL W4A16": "W4A16",
+        "CuteDSL W4A8": "W4A8",
     }.get(winner, winner)
 
     active_experts = f"{histogram_record['active_local_experts']:>3}"
@@ -1452,6 +1523,7 @@ def _print_row(results, histogram_record):
             f"{w4a4.tokens:>6} | "
             f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
+            f"{w4a8_text} | "
             f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
             f"{speedups:>23} | "
@@ -1473,6 +1545,7 @@ def _print_row(results, histogram_record):
             f"{w4a4.tokens:>6} | "
             f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
+            f"{w4a8_text} | "
             f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
             f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
@@ -1487,11 +1560,12 @@ def _print_row(results, histogram_record):
 
 def _print_footer(use_per_token_activation):
     """Print benchmark footer."""
-    table_width = 173 if use_per_token_activation else 212
+    table_width = 191 if use_per_token_activation else 230
     print("-" * table_width)
     print(
         "Speedup > 1.0 means that CuTe DSL mode is faster than the comparison backend"
     )
+    print("CuteDSL W4A8 is n/a with --use-per-token-activation or --no-fused-finalize.")
 
 
 def _collect_expert_histogram(inputs, num_local, local_offset):
@@ -1650,6 +1724,7 @@ def main():
         choices=[
             "cute-dsl",
             "cute-dsl-w4a16",
+            "cute-dsl-w4a8",
             "cutlass",
             "trtllm-nvfp4",
             "trtllm-bf16",
@@ -1698,7 +1773,7 @@ def main():
     if backends and args.profile_backend is not None:
         profile_backend = (
             "cutedsl"
-            if args.profile_backend in ("cute-dsl", "cute-dsl-w4a16")
+            if args.profile_backend in ("cute-dsl", "cute-dsl-w4a16", "cute-dsl-w4a8")
             else args.profile_backend
         )
         if profile_backend not in backends:
@@ -1707,6 +1782,13 @@ def main():
             )
     if args.profile_backend == "cutlass" and args.use_per_token_activation:
         parser.error("CUTLASS does not consume the per-token activation scale")
+    if args.profile_backend == "cute-dsl-w4a8" and (
+        args.use_per_token_activation or args.no_fused_finalize
+    ):
+        parser.error(
+            "CuteDSL W4A8 supports neither --use-per-token-activation nor "
+            "--no-fused-finalize"
+        )
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
@@ -1732,7 +1814,9 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
-    print("CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4 and TRTLLM BF16")
+    print(
+        "CuteDSL modes: W4A4, W4A16 and W4A8; baselines: TRTLLM NVFP4 and TRTLLM BF16"
+    )
     print(f"Tensor parallelism simulation: TP={args.tp}")
     print(f"CUDA profiler capture: {args.profile_cuda}")
     print(

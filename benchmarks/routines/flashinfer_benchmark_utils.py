@@ -257,7 +257,7 @@ benchmark_apis = {
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
-        "cute_dsl_fp4_block_scale_moe",
+        "cute_dsl_fused_moe",
         "cute_dsl_bf16_moe",
         "b12x_fused_moe",
         "unified_nvfp4_moe",
@@ -690,7 +690,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
     },
-    "cute_dsl_fp4_block_scale_moe": {
+    "cute_dsl_fused_moe": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
