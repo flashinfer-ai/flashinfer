@@ -491,3 +491,23 @@ def test_prepare_rejects_mismatched_arguments() -> None:
             P=8,
             format="mxfp8",
         )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_flat_source_views_cover_the_addressed_span(fused: bool) -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_qkv_pack as ops
+
+    M = 5
+    if fused:
+        parent = torch.arange(M * 56 * 3 * 128, dtype=torch.float32).to(torch.bfloat16)
+        parent = parent.view(M, 56, 3, 128)
+        sources = [parent[:, :, kind] for kind in range(3)]
+    else:
+        sources = [torch.randn(M, 56, 128, dtype=torch.bfloat16) for _ in range(3)]
+    token_stride, head_stride = sources[0].stride(0), sources[0].stride(1)
+    for source in sources:
+        flat = ops._flat_source_view(source, M, token_stride, head_stride)
+        assert flat.dim() == 1 and flat.is_contiguous()
+        assert flat.data_ptr() == source.data_ptr()
+        assert flat.numel() == (M - 1) * token_stride + 55 * head_stride + 128
+        assert flat[3 * token_stride + 7 * head_stride + 9] == source[3, 7, 9]

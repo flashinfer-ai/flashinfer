@@ -170,6 +170,23 @@ def _stage_launch_grid(record: dict, *, M: int, P: int) -> tuple[int, int, int]:
     raise RuntimeError(f"generated program has unsupported launch grid rule {kind!r}")
 
 
+def _flat_source_view(
+    tensor: torch.Tensor, M: int, token_stride: int, head_stride: int
+) -> torch.Tensor:
+    """Stride-1 view over the address span of one ``[M, 56, 128]`` source.
+
+    The generated host shim binds tensor arguments only when they are
+    contiguous; the program addresses the source through ``token_stride`` /
+    ``head_stride`` from its base pointer, so the kind slice of a fused
+    projection output is exposed as the flat span it covers instead of being
+    copied.
+    """
+    span = (M - 1) * token_stride + (_HEADS - 1) * head_stride + _HEAD_DIM
+    if tensor.is_contiguous() and tensor.numel() == span:
+        return tensor.reshape(-1)
+    return tensor.as_strided((span,), (1,), tensor.storage_offset())
+
+
 def _stage_call_args(record: dict, values: dict, *, grid: tuple[int, ...]) -> tuple:
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     args = []
@@ -294,9 +311,9 @@ def prepare_minimax_h3_qkv_quantize_pack(
     module = load_minimax_h3_qkv_pack_module(device, P, fmt)
 
     values = {
-        "q": q,
-        "k": k,
-        "v": v,
+        "q": _flat_source_view(q, M, token_stride, head_stride),
+        "k": _flat_source_view(k, M, token_stride, head_stride),
+        "v": _flat_source_view(v, M, token_stride, head_stride),
         "out_q": out_q,
         "out_sf": out_sf,
         # Runtime shape parameters of the generated program (M is not part of
