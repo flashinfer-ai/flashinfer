@@ -10,7 +10,12 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
 from ..utils import check_lse_base, log2e
-from .utils import get_cudnn_fmha_gen_module, get_cudnn_attention_handle
+from .utils import (
+    execute_cudnn_backend,
+    get_cudnn_fmha_gen_module,
+    get_cudnn_attention_handle,
+    prepare_cudnn_backend_execution,
+)
 
 try:
     import cudnn
@@ -1135,11 +1140,13 @@ class _CudnnPrefillPlan:
         self.execution_shape = exact[0][0]
         self.bound_graph = None
         self.execute_kwargs = {}
+        self.backend_execution = None
         # Real shape overrides depend on bounds and on the prepared graph's
         # runtime tensor layout, not on the new indptr pointers or values.
         if previous is not None and previous.execution_shape == self.execution_shape:
             self.bound_graph = previous.bound_graph
             self.execute_kwargs = previous.execute_kwargs
+            self.backend_execution = previous.backend_execution
 
     def build_metadata(self, return_lse):
         # The output-only variant is needed only when preparing a new graph.
@@ -1222,6 +1229,9 @@ class CudnnPrefillGraph:
                 if self.override_cache is not None
                 else {}
             )
+            plan.backend_execution = prepare_cudnn_backend_execution(
+                self.graph, **plan.execute_kwargs
+            )
             plan.bound_graph = self
         var_map = plan.bindings[self.return_lse].copy()
         var_map.update(
@@ -1235,7 +1245,14 @@ class CudnnPrefillGraph:
         if self.return_lse:
             var_map[UIDs.STATS_UID.value] = lse
         return self._execute(
-            q, out, lse, workspace_buffer, var_map, plan.execute_kwargs, lse_base
+            q,
+            out,
+            lse,
+            workspace_buffer,
+            var_map,
+            plan.execute_kwargs,
+            lse_base,
+            backend_execution=plan.backend_execution,
         )
 
     def run(
@@ -1291,12 +1308,23 @@ class CudnnPrefillGraph:
         )
 
     def _execute(
-        self, q, out, lse, workspace_buffer, var_map, execute_kwargs, lse_base
+        self,
+        q,
+        out,
+        lse,
+        workspace_buffer,
+        var_map,
+        execute_kwargs,
+        lse_base,
+        backend_execution=None,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
-        self.graph.execute(
-            var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs
-        )
+        if backend_execution is None:
+            self.graph.execute(
+                var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs
+            )
+        else:
+            execute_cudnn_backend(backend_execution, var_map, workspace_buffer, handle)
 
         if self.return_lse:
             # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer

@@ -21,6 +21,68 @@ import pytest
 import torch
 
 from flashinfer.cudnn import decode, prefill
+from flashinfer.cudnn.utils import (
+    execute_cudnn_backend,
+    prepare_cudnn_backend_execution,
+)
+
+
+def test_backend_execution_rebinds_pointer_frame_and_handle():
+    calls = []
+    native = SimpleNamespace(
+        uids=(3, 8),
+        execute=lambda pointers, **kwargs: calls.append((pointers, kwargs)),
+    )
+    prepared = prepare_cudnn_backend_execution(
+        SimpleNamespace(_prepare_backend_execution=lambda: native)
+    )
+    inputs = [torch.empty(4), torch.empty(4)]
+    outputs = [torch.empty(4), torch.empty(4)]
+    workspaces = [torch.empty(16, dtype=torch.uint8) for _ in range(2)]
+    for i in range(2):
+        # Map insertion order differs from the native execution UID order.
+        execute_cudnn_backend(
+            prepared,
+            {8: outputs[i], 3: inputs[i]},
+            workspaces[i],
+            SimpleNamespace(backend_handle=100 + i),
+        )
+    for i, (pointers, kwargs) in enumerate(calls):
+        assert pointers.tolist() == [inputs[i].data_ptr(), outputs[i].data_ptr()]
+        assert kwargs == dict(workspace=workspaces[i].data_ptr(), handle=100 + i)
+    assert calls[0][0] is not calls[1][0]
+
+
+@pytest.mark.parametrize("error", [NotImplementedError, ValueError, RuntimeError])
+def test_backend_preparation_only_falls_back_for_unsupported_plans(error):
+    assert prepare_cudnn_backend_execution(object()) is None
+
+    def prepare():
+        raise error("prepare failed")
+
+    graph = SimpleNamespace(_prepare_backend_execution=prepare)
+    if error is NotImplementedError:
+        assert prepare_cudnn_backend_execution(graph) is None
+    else:
+        with pytest.raises(error, match="prepare failed"):
+            prepare_cudnn_backend_execution(graph)
+
+
+def test_backend_execution_errors_are_not_retried():
+    calls = []
+
+    def execute(*args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("stale execution plan")
+
+    prepared = prepare_cudnn_backend_execution(
+        SimpleNamespace(
+            _prepare_backend_execution=lambda: SimpleNamespace(uids=(), execute=execute)
+        )
+    )
+    with pytest.raises(RuntimeError, match="stale execution plan"):
+        execute_cudnn_backend(prepared, {}, torch.empty(0), 17)
+    assert len(calls) == 1
 
 
 @pytest.fixture
