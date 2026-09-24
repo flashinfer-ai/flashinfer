@@ -43,10 +43,17 @@ def _reference(q, k, v, q_lens, kv_lens, scale):
     return torch.cat(outputs), torch.cat(stats)
 
 
-def test_prepared_ragged_interleaved_wrappers_capture_replan():
+@pytest.mark.parametrize("require_native", [False, True], ids=["compatible", "native"])
+def test_prepared_ragged_interleaved_wrappers_capture_replan(
+    monkeypatch, require_native
+):
     """Shared graph-cache entries must not share shapes or changing bindings."""
     if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
         pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    if require_native and not callable(
+        getattr(cudnn_prefill.cudnn.pygraph, "_prepare_backend_execution", None)
+    ):
+        pytest.skip("requires FE native prepared execution support")
     torch.manual_seed(52)
     scale = 128**-0.5
     cases = []
@@ -93,6 +100,20 @@ def test_prepared_ragged_interleaved_wrappers_capture_replan():
         plan(case)
         run(case)
         check(case)
+    if require_native:
+        if any(
+            case[0]._cudnn_prepared.graph.selected_engine is not None for case in cases
+        ):
+            pytest.skip("selected provider is not the native cuDNN backend")
+        for case in cases:
+            assert case[0]._cudnn_plan.backend_execution is not None
+
+        def unexpected_fallback(*args, **kwargs):
+            pytest.fail("native prepared execution fell back to graph.execute")
+
+        # Guard the class so newly created graphs after replan/workspace changes
+        # cannot silently turn this native-isolation test into a fallback test.
+        monkeypatch.setattr(cudnn_prefill.cudnn.pygraph, "execute", unexpected_fallback)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(cases[0])
