@@ -21,7 +21,7 @@ class MLAPlanCapabilities:
     requires_packed_kv_cache: bool = False
 
 
-class _BackendPlanUnsupportedError(RuntimeError):
+class _BackendPlanUnsupportedError(ValueError):
     """Typed signal for backend preflight rejection before launch/compile."""
 
 

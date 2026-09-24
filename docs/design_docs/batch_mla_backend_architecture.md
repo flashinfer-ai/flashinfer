@@ -393,9 +393,12 @@ prepared backend. Eager replanning may select another backend; graph replanning,
 where supported, retains the existing backend. Normal `run()` never selects,
 compiles or tunes a backend.
 
-Only `_BackendPlanUnsupportedError` permits trying another candidate. Other
-errors propagate, and failed preparation restores shared buffers before fallback
-or returning control to the caller. Experimental auto candidates require
+Only `_BackendPlanUnsupportedError`, a `ValueError` subclass, permits trying
+another candidate. All typed unsupported-plan rejections use this value-error
+contract; callers that previously caught them as `RuntimeError` must catch
+`ValueError` instead. Ordinary `ValueError` and runtime errors propagate without
+fallback. Failed preparation restores shared buffers before fallback or returning
+control to the caller. Experimental auto candidates require
 `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`; explicit selection is an opt-in.
 The legacy FA2/FA3 selection produces one candidate without additional fallback.
 

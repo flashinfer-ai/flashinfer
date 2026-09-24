@@ -481,8 +481,9 @@ def test_cpu_all_rejected_diagnostics_and_order_are_deterministic(_cpu_planners)
     for _ in range(2):
         _cpu_planners.calls.clear()
         wrapper, kwargs, _ = _cpu_request()
-        with pytest.raises(_BackendPlanUnsupportedError) as error:
+        with pytest.raises(ValueError) as error:
             wrapper.plan(**kwargs)
+        assert isinstance(error.value, _BackendPlanUnsupportedError)
         orders.append(tuple(_cpu_planners.calls))
         assert set(orders[-1]) == set(_SM100_BACKENDS)
         for name in _SM100_BACKENDS:
@@ -540,10 +541,9 @@ def test_cpu_auto_propagates_fatal_planner_errors(_cpu_planners, error_type):
 def test_cpu_explicit_backend_is_strict(_cpu_planners):
     _cpu_planners.handler = _reject
     wrapper, kwargs, _ = _cpu_request("trtllm-gen")
-    with pytest.raises(
-        _BackendPlanUnsupportedError, match="deliberate support rejection"
-    ):
+    with pytest.raises(ValueError, match="deliberate support rejection") as error:
         wrapper.plan(**kwargs)
+    assert isinstance(error.value, _BackendPlanUnsupportedError)
     assert _cpu_planners.calls == ["trtllm-gen"]
     assert wrapper._planned_backend is None
 

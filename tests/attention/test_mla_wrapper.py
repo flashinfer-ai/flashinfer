@@ -2671,7 +2671,7 @@ def test_cute_dsl_modular_wrapper_rejects_cuda_graph_planning():
         plan=False,
     )
 
-    with pytest.raises(RuntimeError, match="does not support CUDA graph"):
+    with pytest.raises(ValueError, match="does not support CUDA graph"):
         case["wrapper"].plan(**case["plan_kwargs"])
 
 
@@ -3028,7 +3028,7 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     wrapper = BatchMLAPagedAttentionWrapper(
         torch.empty(1024, dtype=torch.uint8), backend="cutile"
     )
-    with pytest.raises(RuntimeError, match="head_dim"):
+    with pytest.raises(ValueError, match="head_dim"):
         wrapper.plan(**_cutile_contract_plan_kwargs(metadata, head_dim_ckv=128))
     assert getter_calls == []
 
