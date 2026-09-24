@@ -951,6 +951,42 @@ def unswizzle_sf(
     return sf_unswizzle_sliced.contiguous()
 
 
+@cute_dsl_available
+@blackwell_required
+@pytest.mark.parametrize("hidden_size", [64, 80, 528, 4112, 7168])
+@pytest.mark.parametrize("batch_size", [3, 7])
+@pytest.mark.parametrize("swizzled", [False, True])
+def test_bf16_padded_rows_graph_replay(hidden_size, batch_size, swizzled):
+    """Exercise partial row tiles and padding with changing graph inputs/scales."""
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+    torch.manual_seed(73)
+    x = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(hidden_size, device="cuda", dtype=torch.bfloat16)
+    global_scale = torch.tensor([32.0], device="cuda")
+    kwargs = dict(global_scale=global_scale, is_sf_swizzled_layout=swizzled)
+    q, scales = rmsnorm_fp4quant(x, weight, **kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rmsnorm_fp4quant(x, weight, q, scales, **kwargs)
+    for scale_value in (1.0, 32.0):
+        global_scale.fill_(scale_value)
+        x.normal_()
+        # Zero and constant rows expose uninitialized padding and wrong ownership.
+        x[0].zero_()
+        x[1].fill_(1.0)
+        graph.replay()
+        sf = unswizzle_sf(scales, batch_size, hidden_size) if swizzled else scales
+        actual = dequantize_fp4_output(q, sf, 16, global_scale)
+        reference = x.float() * torch.rsqrt(
+            x.float().square().mean(-1, keepdim=True) + 1e-6
+        )
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual[0], reference[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], reference[1], rtol=0.04, atol=0.01)
+        assert (actual - reference).norm() / reference.norm() < 0.15
+
+
 @pytest.mark.skipif(not is_cute_dsl_available(), reason="CuTe-DSL not available")
 @pytest.mark.skipif(get_cc() < 100, reason="Requires SM100+")
 class TestSwizzledScaleFactors:
