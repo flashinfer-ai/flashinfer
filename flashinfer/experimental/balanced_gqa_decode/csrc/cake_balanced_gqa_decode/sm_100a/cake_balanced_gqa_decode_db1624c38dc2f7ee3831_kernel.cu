@@ -517,7 +517,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_balanced_gqa_decode_27b47222f1570d742ffb(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
+kernel_cake_balanced_gqa_decode_db1624c38dc2f7ee3831(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale, int num_q_heads, int num_kv_heads, int group_ratio, int batch_size, int q_len, unsigned int max_items)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -853,30 +853,30 @@ kernel_cake_balanced_gqa_decode_27b47222f1570d742ffb(const __grid_constant__ CUt
                         }
                     }
                     float pair_max[2];
-                    float _max_1 = max_noftz(sv[0], sv[2]);
-                    float _max_2 = max_noftz(sv[4], sv[6]);
-                    float _max_3 = max_noftz(_max_1, _max_2);
-                    pair_max[0] = _max_3;
-                    float _max_4 = max_noftz(sv[1], sv[3]);
-                    float _max_5 = max_noftz(sv[5], sv[7]);
-                    float _max_6 = max_noftz(_max_4, _max_5);
-                    pair_max[1] = _max_6;
+                    float _max_5 = max_noftz(sv[0], sv[2]);
+                    float _max_6 = max_noftz(sv[4], sv[6]);
+                    float _max_7 = max_noftz(_max_5, _max_6);
+                    pair_max[0] = _max_7;
+                    float _max_8 = max_noftz(sv[1], sv[3]);
+                    float _max_9 = max_noftz(sv[5], sv[7]);
+                    float _max_10 = max_noftz(_max_8, _max_9);
+                    pair_max[1] = _max_10;
                     #pragma unroll
                     for (int c_1 = 0; c_1 < 2; c_1++) {
                         float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, pair_max[c_1], 16);
-                        float _max_7 = max_noftz(pair_max[c_1], _shfl_xor_0);
-                        pair_max[c_1] = _max_7;
+                        float _max_11 = max_noftz(pair_max[c_1], _shfl_xor_0);
+                        pair_max[c_1] = _max_11;
                         float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, pair_max[c_1], 8);
-                        float _max_8 = max_noftz(pair_max[c_1], _shfl_xor_1);
-                        pair_max[c_1] = _max_8;
+                        float _max_12 = max_noftz(pair_max[c_1], _shfl_xor_1);
+                        pair_max[c_1] = _max_12;
                     }
                     float old_max_pair[2];
                     float new_max_pair[2];
                     #pragma unroll
                     for (int c_2 = 0; c_2 < 2; c_2++) {
                         old_max_pair[c_2] = row_max_pair[c_2];
-                        float _max_9 = max_noftz(row_max_pair[c_2], pair_max[c_2]);
-                        new_max_pair[c_2] = _max_9;
+                        float _max_13 = max_noftz(row_max_pair[c_2], pair_max[c_2]);
+                        new_max_pair[c_2] = _max_13;
                     }
                     if (lane < 8) {
                         uint32_t _amf_u_1 = __float_as_uint(new_max_pair[0]);
@@ -1281,8 +1281,8 @@ kernel_cake_balanced_gqa_decode_27b47222f1570d742ffb(const __grid_constant__ CUt
                     float m1 = smem_exch1[stats_head];
                     float s0 = smem_corr0[stats_head];
                     float s1 = smem_corr1[stats_head];
-                    float _max_10 = max_noftz(m0, m1);
-                    float fm = _max_10;
+                    float _max_14 = max_noftz(m0, m1);
+                    float fm = _max_14;
                     float d0 = softmax_scale * (m0 - fm);
                     float d1 = softmax_scale * (m1 - fm);
                     float _expf_4 = __expf(d0);
@@ -1379,8 +1379,8 @@ kernel_cake_balanced_gqa_decode_27b47222f1570d742ffb(const __grid_constant__ CUt
                             if (lane < 8) {
                                 int slot_a = slot_tile_base_c + c_a * slot_stride;
                                 float m_a = partial_stats[slot_a * 16 + lane];
-                                float _max_11 = max_noftz(merge_max, m_a);
-                                merge_max = _max_11;
+                                float _max_15 = max_noftz(merge_max, m_a);
+                                merge_max = _max_15;
                             }
                         }
                         float merge_acc[8];
@@ -2141,6 +2141,131 @@ kernel_cake_balanced_gqa_decode_27b47222f1570d742ffb(const __grid_constant__ CUt
                     }
                 }
             }
+            unsigned int whole_u = (unsigned int)whole_items;
+            unsigned int ctas_u = (unsigned int)num_ctas;
+            if (whole_items > num_ctas) {
+                if (p_max >= 8 * (p_max - p_min)) {
+                    unsigned int k_max_div = 8 * ctas_u;
+                    unsigned int l_min = (total_work + k_max_div - 1) / k_max_div;
+                    if (l_min < 2) {
+                        l_min = 2;
+                    }
+                    unsigned int cand = p_max;
+                    if (lane_0 < 8) {
+                        unsigned int k_div = (unsigned int)(lane_0 + 1) * ctas_u;
+                        cand = (total_work + k_div - 1) / k_div;
+                    }
+                    if (lane_0 >= 8) {
+                        if (lane_0 < 15) {
+                            unsigned int n_div = (unsigned int)(lane_0 - 6);
+                            cand = (p_max + n_div - 1) / n_div;
+                        }
+                    }
+                    if (cand < 2) {
+                        cand = 2;
+                    }
+                    if (cand < l_min) {
+                        cand = p_max;
+                    }
+                    unsigned int full_per_tile = p_max / cand;
+                    unsigned int remainder = p_max - full_per_tile * cand;
+                    unsigned int unit = 4 * cand + 4;
+                    unsigned int full_items = full_per_tile * whole_u;
+                    unsigned int full_waves = full_items / ctas_u;
+                    unsigned int n_last = full_items - full_waves * ctas_u;
+                    unsigned int cost = full_waves * unit * ctas_u;
+                    unsigned int rem_items = 0;
+                    if (remainder > 0) {
+                        rem_items = whole_u;
+                    }
+                    unsigned int rem_unit = 4 * remainder + 4;
+                    unsigned int idle = ctas_u - n_last;
+                    unsigned int absorbed = idle * (unit / rem_unit);
+                    if (absorbed > rem_items) {
+                        absorbed = rem_items;
+                    }
+                    unsigned int _min_1 = ((idle) < (rem_items) ? (idle) : (rem_items));
+                    unsigned int active = n_last + _min_1;
+                    if (n_last > 0) {
+                        int _max_1 = ((96) > (active) ? (96) : (active));
+                        cost += unit * (unsigned int)_max_1;
+                        rem_items -= absorbed;
+                    }
+                    unsigned int rounds = (rem_items + ctas_u - 1) / ctas_u;
+                    if (rem_items > 0) {
+                        unsigned int _min_2 = ((rem_items) < (ctas_u) ? (rem_items) : (ctas_u));
+                        int _max_2 = ((96) > (_min_2) ? (96) : (_min_2));
+                        cost += rounds * rem_unit * (unsigned int)_max_2;
+                    }
+                    if (full_per_tile > 1) {
+                        cost += 3 * ctas_u;
+                    }
+                    if (full_per_tile <= 1) {
+                        if (remainder > 0) {
+                            cost += 3 * ctas_u;
+                        }
+                    }
+                    unsigned int cand_cost = cost;
+                    if (cand >= p_max) {
+                        cand_cost = 4294967295;
+                    }
+                    unsigned int full_per_tile_0 = p_max / p_max;
+                    unsigned int remainder_1 = p_max - full_per_tile_0 * p_max;
+                    unsigned int unit_2 = 4 * p_max + 4;
+                    unsigned int full_items_3 = full_per_tile_0 * whole_u;
+                    unsigned int full_waves_4 = full_items_3 / ctas_u;
+                    unsigned int n_last_5 = full_items_3 - full_waves_4 * ctas_u;
+                    unsigned int cost_6 = full_waves_4 * unit_2 * ctas_u;
+                    unsigned int rem_items_7 = 0;
+                    if (remainder_1 > 0) {
+                        rem_items_7 = whole_u;
+                    }
+                    unsigned int rem_unit_8 = 4 * remainder_1 + 4;
+                    unsigned int idle_9 = ctas_u - n_last_5;
+                    unsigned int absorbed_10 = idle_9 * (unit_2 / rem_unit_8);
+                    if (absorbed_10 > rem_items_7) {
+                        absorbed_10 = rem_items_7;
+                    }
+                    unsigned int _min_3 = ((idle_9) < (rem_items_7) ? (idle_9) : (rem_items_7));
+                    unsigned int active_11 = n_last_5 + _min_3;
+                    if (n_last_5 > 0) {
+                        int _max_3 = ((96) > (active_11) ? (96) : (active_11));
+                        cost_6 += unit_2 * (unsigned int)_max_3;
+                        rem_items_7 -= absorbed_10;
+                    }
+                    unsigned int rounds_12 = (rem_items_7 + ctas_u - 1) / ctas_u;
+                    if (rem_items_7 > 0) {
+                        unsigned int _min_4 = ((rem_items_7) < (ctas_u) ? (rem_items_7) : (ctas_u));
+                        int _max_4 = ((96) > (_min_4) ? (96) : (_min_4));
+                        cost_6 += rounds_12 * rem_unit_8 * (unsigned int)_max_4;
+                    }
+                    if (full_per_tile_0 > 1) {
+                        cost_6 += 3 * ctas_u;
+                    }
+                    if (full_per_tile_0 <= 1) {
+                        if (remainder_1 > 0) {
+                            cost_6 += 3 * ctas_u;
+                        }
+                    }
+                    unsigned int whole_cost = cost_6;
+                    unsigned int _warp_redux_u32_3;
+                    asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_3) : "r"(cand_cost));
+                    unsigned int min_cost = _warp_redux_u32_3;
+                    unsigned int pick = 0;
+                    if (cand_cost == min_cost) {
+                        pick = cand;
+                    }
+                    unsigned int _warp_redux_u32_4;
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_4) : "r"(pick));
+                    unsigned int best_l = _warp_redux_u32_4;
+                    chunk_pairs_u = p_max;
+                    if (min_cost < whole_cost) {
+                        if (whole_cost - min_cost >= whole_cost / 50) {
+                            chunk_pairs_u = best_l;
+                        }
+                    }
+                }
+            }
             int chunk_pairs = (int)chunk_pairs_u;
             float _rcp_0 = approx_rcp((float)chunk_pairs_u);
             float chunk_rcp = _rcp_0;
@@ -2187,15 +2312,15 @@ kernel_cake_balanced_gqa_decode_27b47222f1570d742ffb(const __grid_constant__ CUt
                         pack2 = (unsigned int)(1 << 8 * (rb2 - 1));
                     }
                 }
-                unsigned int _warp_redux_u32_3;
-                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_3) : "r"(full2));
-                n_full_chunks += _warp_redux_u32_3;
-                unsigned int _warp_redux_u32_4;
-                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_4) : "r"(n2));
-                n_chunks_total += _warp_redux_u32_4;
                 unsigned int _warp_redux_u32_5;
-                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_5) : "r"(pack2));
-                unsigned int pack_group = _warp_redux_u32_5;
+                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_5) : "r"(full2));
+                n_full_chunks += _warp_redux_u32_5;
+                unsigned int _warp_redux_u32_6;
+                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_6) : "r"(n2));
+                n_chunks_total += _warp_redux_u32_6;
+                unsigned int _warp_redux_u32_7;
+                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_7) : "r"(pack2));
+                unsigned int pack_group = _warp_redux_u32_7;
                 #pragma unroll
                 for (int bi_1 = 1; bi_1 < 4; bi_1++) {
                     rem_bucket_total[bi_1] = rem_bucket_total[bi_1] + (pack_group >> (unsigned int)(8 * (bi_1 - 1)) & 255);
