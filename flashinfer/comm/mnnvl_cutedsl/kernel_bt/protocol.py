@@ -23,7 +23,7 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Int32, Int64
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import VEC_BF16
@@ -116,6 +116,7 @@ class _PathKwargs(TypedDict):
     top_k: int
     capacity_m: int
     write_residual_output: bool
+    output_dtype: torch.dtype
 
 
 class _BTPath:
@@ -126,11 +127,13 @@ class _BTPath:
         top_k: int,
         capacity_m: int,
         write_residual_output: bool,
+        output_dtype: torch.dtype,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
         self.capacity_m = capacity_m
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
 
     def _outputs(
         self,
@@ -141,7 +144,7 @@ class _BTPath:
         shape = (m, self.hidden_size)
         device = torch.device("cuda", torch.cuda.current_device())
         if norm_output is None:
-            norm_output = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            norm_output = torch.empty(shape, dtype=self.output_dtype, device=device)
         if self.write_residual_output and residual_output is None:
             residual_output = torch.empty(shape, dtype=torch.bfloat16, device=device)
         return norm_output, residual_output
@@ -166,11 +169,11 @@ class _BTPath:
         norm_output: torch.Tensor,
         residual_output: torch.Tensor | None,
         m: int,
+        norm_output_bf16: torch.Tensor | None,
+        output_scale: torch.Tensor | None,
     ) -> None:
-        residual_arg = residual_source if residual_source is not None else norm_output
-        residual_output_arg = (
-            residual_output if residual_output is not None else norm_output
-        )
+        residual_arg = residual_source if residual_source is not None else gamma
+        residual_output_arg = residual_output if residual_output is not None else gamma
         stream = current_cu_stream()
         tail.reduce(
             to_cute(state.contribution_mailbox.tensor.flatten(), 16),
@@ -188,6 +191,12 @@ class _BTPath:
                 divisibility=self.hidden_size,
             ),
             to_cute_dynamic(norm_output.flatten(), 16, divisibility=self.hidden_size),
+            to_cute_dynamic(
+                norm_output_bf16.flatten(), 16, divisibility=self.hidden_size
+            )
+            if norm_output_bf16 is not None
+            else None,
+            to_cute(output_scale, 4) if output_scale is not None else None,
             to_cute(gamma, 16),
             to_cute(state.stage_state, 4),
             Int32(m),
@@ -213,10 +222,12 @@ class FinalizeAllReduceRMSNormBTKernel(_BTPath):
         state: BTProtocolState,
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_state(state, m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
-        shared_arg = shared_output if shared_output is not None else norm_output
+        shared_arg = shared_output if shared_output is not None else gamma
         peers = cast(torch.Tensor, state.contribution_mailbox.peer_addresses)
         self._compiled.publish(
             to_cute_dynamic(routed_output.flatten(), 16, divisibility=self.hidden_size),
@@ -236,6 +247,8 @@ class FinalizeAllReduceRMSNormBTKernel(_BTPath):
             norm_output,
             residual_output,
             m,
+            norm_output_bf16,
+            output_scale,
         )
         return norm_output, residual_output
 
@@ -255,6 +268,8 @@ class AllReduceRMSNormBTKernel(_BTPath):
         state: BTProtocolState,
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_state(state, m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
@@ -278,6 +293,8 @@ class AllReduceRMSNormBTKernel(_BTPath):
             norm_output,
             residual_output,
             m,
+            norm_output_bf16,
+            output_scale,
         )
         return norm_output, residual_output
 
@@ -302,6 +319,8 @@ class BTProtocol:
         finalize_tunings: tuple[BTFinalizeTuning, ...],
         all_reduce_tunings: tuple[BTAllReduceTuning, ...],
         group: dist.ProcessGroup,
+        output_dtype: torch.dtype = torch.bfloat16,
+        write_norm_output: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
@@ -315,6 +334,8 @@ class BTProtocol:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
+        self.write_norm_output = write_norm_output
 
         tail_cache = {
             tuning: self._compile_tail(tuning)
@@ -351,6 +372,7 @@ class BTProtocol:
             "top_k": self.top_k,
             "capacity_m": self.capacity_m,
             "write_residual_output": self.write_residual_output,
+            "output_dtype": self.output_dtype,
         }
 
     def _compile_finalize(self, tuning: BTFinalizeTuning):
@@ -464,8 +486,18 @@ class BTProtocol:
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
             make_fake_dynamic_compact_tensor(
-                BFloat16, alignment=16, divisibility=self.hidden_size
+                Float8E4M3FN if self.output_dtype == torch.float8_e4m3fn else BFloat16,
+                alignment=16,
+                divisibility=self.hidden_size,
             ),
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            )
+            if self.write_norm_output
+            else None,
+            make_fake_compact_tensor(Float32, (1,), assumed_align=4)
+            if self.output_dtype == torch.float8_e4m3fn
+            else None,
             make_fake_compact_tensor(BFloat16, (self.hidden_size,), assumed_align=16),
             make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),

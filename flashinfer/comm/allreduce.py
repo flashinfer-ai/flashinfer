@@ -636,6 +636,14 @@ def allreduce_fusion(
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
         Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
+
+        This reference checkout also supports static E4M3 output on the
+        MNNVL CuTe DSL backend. Construct its workspace with
+        ``output_dtype=torch.float8_e4m3fn`` for patterns 2/4, or for pattern 7
+        with quantization. Pattern 4 additionally requires the workspace's
+        ``write_norm_output=True``; pattern 2 requires ``False``. Pattern 7
+        accepts either setting and returns ``quant_out`` for an FP8 workspace.
+        All three protocols retain BF16 communication and residual outputs.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch. MNNVL CuTe DSL presets determine
         their compiled PDL mode and warn when it differs from this value.
@@ -670,6 +678,11 @@ def allreduce_fusion(
         RMSNorm epsilon for numerical stability.
     scale_factor : Optional[Union[torch.Tensor, float]]
         Output scale used by FP8/NVFP4 quantization.
+        The reference MNNVL CuTe DSL static FP8 path requires a device FP32
+        scalar tensor (shape ``[]`` or ``[1]``), with a positive finite value
+        identical across ranks. It computes ``quant_out = FP8(norm_bf16 / scale)``.
+        The value is read on the GPU, so it may be updated in place between
+        CUDA Graph replays. No per-token scale estimation or ``scale_out`` is used.
     layout_code : Optional[int]
         NVFP4 scale-factor layout (``QuantizationSFLayout``). MNNVL
         supports ``SWIZZLED_128x4`` and ``LINEAR``; ``SWIZZLED_8x4``
@@ -726,6 +739,8 @@ def allreduce_fusion(
         Output tensor for the selected pattern. Quant patterns return
         ``quant_out``, RMSNorm patterns return ``norm_out``, and
         ``kAllReduce`` returns ``output``.
+        The reference MNNVL CuTe DSL FP8 workspace also returns ``quant_out``
+        for ``kMoEFinalizeARResidualRMSNorm``.
 
     Examples
     --------

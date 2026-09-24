@@ -86,6 +86,12 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     Workspace construction compiles the selected kernels and must finish before
     the first invocation. Calls using the same workspace must not overlap.
     Feature-disabled tensor slots use internal placeholders that are not read.
+
+    Reference static FP8 specialization: set ``output_dtype=torch.float8_e4m3fn``.
+    Inputs, communication buffers, residual outputs and norm weights remain BF16.
+    ``write_norm_output=True`` additionally materializes the BF16 norm result.
+    Output mode is fixed when kernels compile; use a separate workspace for a
+    different mode. Existing shape profiles are reused without retuning.
     """
 
     _destroyed: bool
@@ -107,6 +113,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         add_residual: bool = True,
         write_residual_output: bool = True,
         config: MNNVLCuteDSLConfig = DEFAULT_CONFIG,
+        output_dtype: torch.dtype = torch.bfloat16,
+        write_norm_output: bool = False,
     ) -> None:
         if tp_size not in (2, 4, 8, 16):
             raise ValueError("tp_size must be 2, 4, 8, or 16")
@@ -116,6 +124,10 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             raise ValueError("max_token_num must be positive")
         if dtype != torch.bfloat16:
             raise ValueError("MNNVL CuTe DSL kernels only support torch.bfloat16")
+        if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("output_dtype must be bfloat16 or float8_e4m3fn")
+        if write_norm_output and output_dtype != torch.float8_e4m3fn:
+            raise ValueError("write_norm_output is only used with FP8 output")
         if not torch.cuda.is_available():
             raise RuntimeError("MNNVL CuTe DSL kernels require CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
@@ -147,6 +159,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
+        self.write_norm_output = write_norm_output
         self.config = config
         self.profile = config.resolve(
             tp_size=tp_size,
@@ -180,6 +194,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 include_shared_expert=include_shared_expert,
                 add_residual=add_residual,
                 write_residual_output=write_residual_output,
+                output_dtype=output_dtype,
+                write_norm_output=write_norm_output,
                 group=group,
             )
             instance: LLProtocol | BTProtocol | HTProtocol
@@ -238,7 +254,11 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def _uses_pdl(self, pattern: int, m: int) -> bool:
         if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
             target = self.profile.finalize_routes.select(m)
-        elif pattern == AllReduceFusionPattern.kARResidualRMSNorm:
+        elif pattern in (
+            AllReduceFusionPattern.kARResidualRMSNorm,
+            AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+            AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+        ):
             target = self.profile.all_reduce_routes.select(m)
         else:
             raise NotImplementedError("Unsupported MNNVL CuTe DSL fusion pattern")
@@ -280,6 +300,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         *,
         norm_output: torch.Tensor | None,
         residual_output: torch.Tensor | None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         target = self.profile.finalize_routes.select(m)
         protocol = cast(Any, self._protocols[target.protocol])
@@ -295,6 +317,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             state=protocol.state,
             norm_output=norm_output,
             residual_output=residual_output,
+            norm_output_bf16=norm_output_bf16,
+            output_scale=output_scale,
         )
 
     def _all_reduce_rms_norm(
@@ -306,6 +330,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         *,
         norm_output: torch.Tensor | None,
         residual_output: torch.Tensor | None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         target = self.profile.all_reduce_routes.select(m)
         protocol = cast(Any, self._protocols[target.protocol])
@@ -318,6 +344,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             state=protocol.state,
             norm_output=norm_output,
             residual_output=residual_output,
+            norm_output_bf16=norm_output_bf16,
+            output_scale=output_scale,
         )
 
     def destroy(self) -> None:
@@ -325,6 +353,73 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             return
         self._protocols.clear()
         self._destroyed = True
+
+
+def _prepare_output_tensors(
+    workspace: MNNVLCuteDSLAllReduceFusionWorkspace,
+    pattern: int,
+    m: int,
+    device: torch.device,
+    norm_out: torch.Tensor | None,
+    quant_out: torch.Tensor | None,
+    scale_factor: torch.Tensor | float | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Validate the compiled output mode and select primary/companion buffers."""
+    p = AllReduceFusionPattern
+    if workspace.output_dtype == torch.bfloat16:
+        if pattern not in (p.kARResidualRMSNorm, p.kMoEFinalizeARResidualRMSNorm):
+            raise ValueError(
+                "FP8 patterns require a workspace with output_dtype=float8_e4m3fn"
+            )
+        if quant_out is not None or scale_factor is not None:
+            raise ValueError("BF16 workspace does not accept quant_out or scale_factor")
+        return norm_out, None, None
+
+    if pattern == p.kARResidualRMSNorm:
+        raise ValueError(
+            "FP8 workspace requires an FP8 pattern or the MoE finalize pattern"
+        )
+    if pattern == p.kARResidualRMSNormFP8Quant and workspace.write_norm_output:
+        raise ValueError("Pattern 2 requires write_norm_output=False")
+    if pattern == p.kARResidualRMSNormOutFP8Quant and not workspace.write_norm_output:
+        raise ValueError("Pattern 4 requires write_norm_output=True")
+    if not workspace.write_norm_output and norm_out is not None:
+        raise ValueError("norm_out requires write_norm_output=True")
+    if not isinstance(scale_factor, torch.Tensor):
+        raise ValueError(
+            "Static FP8 requires scale_factor as a device FP32 scalar tensor"
+        )
+    if scale_factor.shape not in (torch.Size([]), torch.Size([1])):
+        raise ValueError("scale_factor must be a scalar or have shape (1,)")
+    _check_tensor(
+        scale_factor,
+        "scale_factor",
+        shape=tuple(scale_factor.shape),
+        dtype=torch.float32,
+        device=device,
+        alignment=4,
+    )
+    # No .item(): the caller supplies a finite positive value, identical across
+    # ranks. Keep its device address live so capture/replay can update the scale.
+    device_scale = scale_factor.reshape(1)
+    if quant_out is not None:
+        _check_tensor(
+            quant_out,
+            "quant_out",
+            shape=(m, workspace.hidden_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+            alignment=16,
+        )
+    else:
+        quant_out = torch.empty(
+            (m, workspace.hidden_dim), dtype=torch.float8_e4m3fn, device=device
+        )
+    if workspace.write_norm_output and norm_out is None:
+        norm_out = torch.empty(
+            (m, workspace.hidden_dim), dtype=torch.bfloat16, device=device
+        )
+    return quant_out, norm_out, device_scale
 
 
 def _mnnvl_cutedsl_allreduce_fusion(
@@ -361,6 +456,8 @@ def _mnnvl_cutedsl_allreduce_fusion(
         )
     if pattern not in (
         AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
         AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
     ):
         raise NotImplementedError("Unsupported MNNVL CuTe DSL fusion pattern")
@@ -368,9 +465,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
         name
         for name, value in (
             ("output", output),
-            ("quant_out", quant_out),
             ("scale_out", scale_out),
-            ("scale_factor", scale_factor),
             ("layout_code", layout_code),
             ("use_oneshot", use_oneshot),
             ("block_quant_group_size", block_quant_group_size),
@@ -414,7 +509,11 @@ def _mnnvl_cutedsl_allreduce_fusion(
         alignment=16,
     )
 
-    if pattern == AllReduceFusionPattern.kARResidualRMSNorm:
+    if pattern in (
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+    ):
         if any(
             value is not None
             for value in (
@@ -463,15 +562,21 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 device=device,
                 alignment=16,
             )
-        norm_out, _ = workspace._all_reduce_rms_norm(
+        primary_out, companion_out, device_scale = _prepare_output_tensors(
+            workspace, pattern, m, device, norm_out, quant_out, scale_factor
+        )
+        result, _ = workspace._all_reduce_rms_norm(
             input,
             residual_in,
             rms_gamma,
             input.shape[0],
-            norm_output=norm_out,
+            # Protocol-internal norm_output names the primary BF16/FP8 result.
+            norm_output=primary_out,
             residual_output=residual_out,
+            norm_output_bf16=companion_out,
+            output_scale=device_scale,
         )
-        return norm_out
+        return result
 
     if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
         if expanded_idx_to_permuted_idx is None:
@@ -550,7 +655,10 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 device=device,
                 alignment=16,
             )
-        norm_out, _ = workspace._finalize_all_reduce_rms_norm(
+        primary_out, companion_out, device_scale = _prepare_output_tensors(
+            workspace, pattern, m, device, norm_out, quant_out, scale_factor
+        )
+        result, _ = workspace._finalize_all_reduce_rms_norm(
             input,
             expert_scale_factor,
             expanded_idx_to_permuted_idx,
@@ -558,9 +666,12 @@ def _mnnvl_cutedsl_allreduce_fusion(
             residual_in,
             rms_gamma,
             m,
-            norm_output=norm_out,
+            # Protocol-internal norm_output names the primary BF16/FP8 result.
+            norm_output=primary_out,
             residual_output=residual_out,
+            norm_output_bf16=companion_out,
+            output_scale=device_scale,
         )
-        return norm_out
+        return result
 
     raise AssertionError("unreachable")
