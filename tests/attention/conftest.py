@@ -146,9 +146,10 @@ def _fmha_v2_specs(items):
     The attention-sink tests additionally compile an fa2/fa3 customize batch
     prefill module (the AttentionSink variant) as reference.
     """
-    from flashinfer.jit import gen_customize_batch_prefill_module, gen_fmha_v2_module
-    from flashinfer.jit.attention.variants import attention_sink_decl
-    from flashinfer.jit.utils import filename_safe_dtype_map
+    from flashinfer.jit import (
+        gen_batch_prefill_attention_sink_module,
+        gen_fmha_v2_module,
+    )
     from flashinfer.utils import is_sm12x_supported, is_sm90a_supported
 
     device = torch.device("cuda")
@@ -206,26 +207,9 @@ def _fmha_v2_specs(items):
         add(gen_fmha_v2_module(layout, dtype, o_dtype))
     for dtype, use_swa, head_dim in sorted(sink_keys, key=str):
         # Reference path: BatchAttentionWithAttentionSinkWrapper(backend="fa3")
-        # (see flashinfer/attention/_core.py jit_args construction).
         add(
-            gen_customize_batch_prefill_module(
-                "fa3",
-                f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{use_swa}_fa3",
-                dtype,  # dtype_q
-                dtype,  # dtype_kv
-                dtype,  # dtype_o
-                torch.int32,  # idtype
-                head_dim,
-                head_dim,
-                ["sink"],
-                ["float"],
-                ["sm_scale"],
-                ["double"],
-                "AttentionSink",
-                attention_sink_decl["fa3"],
-                pos_encoding_mode=0,
-                use_sliding_window=use_swa,
-                use_fp16_qk_reduction=False,
+            gen_batch_prefill_attention_sink_module(
+                "fa3", dtype, dtype, dtype, torch.int32, head_dim, head_dim, 0, use_swa
             )
         )
     return list(specs.values())
