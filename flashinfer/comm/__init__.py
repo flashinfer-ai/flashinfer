@@ -12,12 +12,8 @@ from .trtllm_ar import (
 from .trtllm_ar import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .trtllm_ar import trtllm_allreduce_fusion as trtllm_allreduce_fusion
 from .trtllm_ar import (
-    trtllm_create_ipc_workspace_for_all_reduce as trtllm_create_ipc_workspace_for_all_reduce,
-)
-from .trtllm_ar import (
     trtllm_create_ipc_workspace_for_all_reduce_fusion as trtllm_create_ipc_workspace_for_all_reduce_fusion,
 )
-from .trtllm_ar import trtllm_custom_all_reduce as trtllm_custom_all_reduce
 from .trtllm_ar import (
     trtllm_destroy_ipc_workspace_for_all_reduce as trtllm_destroy_ipc_workspace_for_all_reduce,
 )
@@ -57,11 +53,18 @@ from .pcie_ipc_topology import (
     resolve_pcie_ipc_profile as resolve_pcie_ipc_profile,
 )
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
+from .ulysses import UlyssesWorkspace as UlyssesWorkspace
 from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
 from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
 from .ulysses import get_ulysses_a2a_module as get_ulysses_a2a_module
 from .ulysses import init_ulysses_a2a as init_ulysses_a2a
 from .ulysses import ulysses_a2a as ulysses_a2a
+from .ulysses_head_chunk import (
+    merge_ulysses_output_head_chunk as merge_ulysses_output_head_chunk,
+)
+from .ulysses_head_chunk import (
+    pack_ulysses_qkv_head_chunk as pack_ulysses_qkv_head_chunk,
+)
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
@@ -106,6 +109,13 @@ from .dcp_alltoall import (
 )
 from .dcp_alltoall import decode_cp_a2a_init_workspace as decode_cp_a2a_init_workspace
 from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspace_size
+from .dcp_lse_reduce import decode_cp_a2a_lse_reduce as decode_cp_a2a_lse_reduce
+from .dcp_lse_reduce import (
+    decode_cp_a2a_lse_reduce_create_workspace as decode_cp_a2a_lse_reduce_create_workspace,
+)
+from .dcp_lse_reduce import (
+    decode_cp_a2a_lse_reduce_workspace_size as decode_cp_a2a_lse_reduce_workspace_size,
+)
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 

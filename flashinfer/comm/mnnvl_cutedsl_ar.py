@@ -92,6 +92,14 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     ``write_norm_output=True`` additionally materializes the BF16 norm result.
     Output mode is fixed when kernels compile; use a separate workspace for a
     different mode. Existing shape profiles are reused without retuning.
+    FP8 output requires ``apply_rms_norm=True``.
+
+    ``apply_rms_norm=False`` compiles the collective without its normalisation:
+    the chain stops after finalize, shared-expert add, all-reduce and the
+    optional residual add, and writes that value to ``residual_out``. It then
+    requires ``write_residual_output=True`` -- otherwise nothing would be
+    written -- and ``rms_gamma`` and ``norm_out`` must be ``None``. The
+    high-throughput protocol fuses the norm into a warp group and rejects it.
     """
 
     _destroyed: bool
@@ -112,20 +120,44 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         include_shared_expert: bool = True,
         add_residual: bool = True,
         write_residual_output: bool = True,
+        apply_rms_norm: bool = True,
         config: MNNVLCuteDSLConfig = DEFAULT_CONFIG,
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
     ) -> None:
+        # Every validation below raises before super().__init__() can set this,
+        # and __del__ reads it. Mark the object destroyed up front so a rejected
+        # construction tears down quietly instead of raising AttributeError
+        # inside __del__.
+        self._destroyed = True
         if tp_size not in (2, 4, 8, 16):
             raise ValueError("tp_size must be 2, 4, 8, or 16")
         if not 0 <= tp_rank < tp_size:
             raise ValueError("tp_rank must be in [0, tp_size)")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
+        if (
+            config.applies_rms_norm is not None
+            and config.applies_rms_norm != apply_rms_norm
+        ):
+            raise ValueError(
+                "config routing boundaries were measured with "
+                f"apply_rms_norm={config.applies_rms_norm}, but the workspace "
+                f"requests apply_rms_norm={apply_rms_norm}; pair a norm-on "
+                "config with apply_rms_norm=True and NO_NORM_CONFIG with "
+                "apply_rms_norm=False"
+            )
+        if not apply_rms_norm and not write_residual_output:
+            raise ValueError(
+                "write_residual_output must be True when apply_rms_norm is False; "
+                "otherwise the fusion produces no output"
+            )
         if dtype != torch.bfloat16:
             raise ValueError("MNNVL CuTe DSL kernels only support torch.bfloat16")
         if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise ValueError("output_dtype must be bfloat16 or float8_e4m3fn")
+        if not apply_rms_norm and output_dtype == torch.float8_e4m3fn:
+            raise ValueError("FP8 output requires apply_rms_norm=True")
         if write_norm_output and output_dtype != torch.float8_e4m3fn:
             raise ValueError("write_norm_output is only used with FP8 output")
         if not torch.cuda.is_available():
@@ -161,6 +193,17 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.write_residual_output = write_residual_output
         self.output_dtype = output_dtype
         self.write_norm_output = write_norm_output
+        self.apply_rms_norm = apply_rms_norm
+        # The compiled kernels still take gamma and norm_output arguments when
+        # the norm is guarded out, but never read or write them. A small owned
+        # placeholder keeps the signature satisfied without allocating another
+        # (capacity_m, hidden_dim) buffer -- residual_out stands in for
+        # norm_output at the call site.
+        self._gamma_placeholder = (
+            None
+            if apply_rms_norm
+            else torch.empty(hidden_dim, dtype=dtype, device=device)
+        )
         self.config = config
         self.profile = config.resolve(
             tp_size=tp_size,
@@ -196,6 +239,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 write_residual_output=write_residual_output,
                 output_dtype=output_dtype,
                 write_norm_output=write_norm_output,
+                apply_rms_norm=apply_rms_norm,
                 group=group,
             )
             instance: LLProtocol | BTProtocol | HTProtocol
@@ -489,8 +533,12 @@ def _mnnvl_cutedsl_allreduce_fusion(
         raise ValueError("rms_eps does not match the compiled workspace")
     if weight_bias != workspace.weight_bias:
         raise ValueError("weight_bias does not match the compiled workspace")
-    if rms_gamma is None:
+    if workspace.apply_rms_norm and rms_gamma is None:
         raise ValueError("rms_gamma is required")
+    if not workspace.apply_rms_norm and rms_gamma is not None:
+        raise ValueError("rms_gamma must be None for this compiled workspace")
+    if not workspace.apply_rms_norm and norm_out is not None:
+        raise ValueError("norm_out must be None for this compiled workspace")
     if workspace.add_residual and residual_in is None:
         raise ValueError("residual_in is required by the compiled workspace")
     if not workspace.add_residual and residual_in is not None:
@@ -500,14 +548,17 @@ def _mnnvl_cutedsl_allreduce_fusion(
 
     device = torch.device("cuda", torch.cuda.current_device())
     hidden = workspace.hidden_dim
-    _check_tensor(
-        rms_gamma,
-        "rms_gamma",
-        shape=(hidden,),
-        dtype=torch.bfloat16,
-        device=device,
-        alignment=16,
-    )
+    if workspace.apply_rms_norm:
+        _check_tensor(
+            rms_gamma,
+            "rms_gamma",
+            shape=(hidden,),
+            dtype=torch.bfloat16,
+            device=device,
+            alignment=16,
+        )
+    else:
+        rms_gamma = workspace._gamma_placeholder
 
     if pattern in (
         AllReduceFusionPattern.kARResidualRMSNorm,
@@ -565,18 +616,25 @@ def _mnnvl_cutedsl_allreduce_fusion(
         primary_out, companion_out, device_scale = _prepare_output_tensors(
             workspace, pattern, m, device, norm_out, quant_out, scale_factor
         )
-        result, _ = workspace._all_reduce_rms_norm(
+        # With the norm compiled out the kernel writes only residual_output.
+        # Allocate that slot here when the caller omitted it, and hand the same
+        # tensor to norm_output: letting the protocol allocate the two slots
+        # independently would leave the returned norm buffer unwritten.
+        if not workspace.apply_rms_norm and residual_out is None:
+            residual_out = torch.empty((m, hidden), dtype=torch.bfloat16, device=device)
+        norm_target = primary_out if workspace.apply_rms_norm else residual_out
+        result, residual_out = workspace._all_reduce_rms_norm(
             input,
             residual_in,
             rms_gamma,
             input.shape[0],
             # Protocol-internal norm_output names the primary BF16/FP8 result.
-            norm_output=primary_out,
+            norm_output=norm_target,
             residual_output=residual_out,
             norm_output_bf16=companion_out,
             output_scale=device_scale,
         )
-        return result
+        return result if workspace.apply_rms_norm else residual_out
 
     if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
         if expanded_idx_to_permuted_idx is None:
@@ -658,7 +716,14 @@ def _mnnvl_cutedsl_allreduce_fusion(
         primary_out, companion_out, device_scale = _prepare_output_tensors(
             workspace, pattern, m, device, norm_out, quant_out, scale_factor
         )
-        result, _ = workspace._finalize_all_reduce_rms_norm(
+        # With the norm compiled out the kernel writes only residual_output.
+        # Allocate that slot here when the caller omitted it, and hand the same
+        # tensor to norm_output: letting the protocol allocate the two slots
+        # independently would leave the returned norm buffer unwritten.
+        if not workspace.apply_rms_norm and residual_out is None:
+            residual_out = torch.empty((m, hidden), dtype=torch.bfloat16, device=device)
+        norm_target = primary_out if workspace.apply_rms_norm else residual_out
+        result, residual_out = workspace._finalize_all_reduce_rms_norm(
             input,
             expert_scale_factor,
             expanded_idx_to_permuted_idx,
@@ -667,11 +732,11 @@ def _mnnvl_cutedsl_allreduce_fusion(
             rms_gamma,
             m,
             # Protocol-internal norm_output names the primary BF16/FP8 result.
-            norm_output=primary_out,
+            norm_output=norm_target,
             residual_output=residual_out,
             norm_output_bf16=companion_out,
             output_scale=device_scale,
         )
-        return result
+        return result if workspace.apply_rms_norm else residual_out
 
     raise AssertionError("unreachable")

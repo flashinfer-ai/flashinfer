@@ -26,6 +26,9 @@ _BENCHMARK = runpy.run_path(
     )
 )
 _resolve_recorded_cake_route = _BENCHMARK["_resolve_recorded_cake_route"]
+_resolve_recorded_generated_cake_route = _BENCHMARK[
+    "_resolve_recorded_generated_cake_route"
+]
 _timing_iteration_budget = _BENCHMARK["_timing_iteration_budget"]
 
 
@@ -56,6 +59,46 @@ def test_recorded_cake_route_serializes_bt16_physical_pair():
         "sm100f",
         ["bt16_prepare_beta_tma", "bt16_chain_m64_s8"],
     )
+
+
+def test_recorded_generated_cake_route_serializes_single_physical_module():
+    variant_id = "sm_100a:flashkda_generated_bf16_fused_m128_example"
+    assert _resolve_recorded_generated_cake_route(
+        [("direct_m128", "main", "sm100a", variant_id)]
+    ) == ("direct_m128", "sm100a", [variant_id])
+
+
+def test_recorded_generated_cake_route_serializes_bt16_physical_pair():
+    prepare = "sm_103a:flashkda_generated_bf16_bt16_prepare_example"
+    chain = "sm_103a:flashkda_generated_bf16_bt16_chain_m64_example"
+    assert _resolve_recorded_generated_cake_route(
+        [
+            ("bt16_prepare_chain_m64", "bt16_prepare", "sm103a", prepare),
+            ("bt16_prepare_chain_m64", "main", "sm103a", chain),
+        ]
+    ) == ("bt16_prepare_chain_m64", "sm103a", [prepare, chain])
+
+
+@pytest.mark.parametrize(
+    "routes",
+    [
+        [
+            ("bt16_prepare_chain_m64", "main", "sm100a", "chain"),
+            ("bt16_prepare_chain_m64", "bt16_prepare", "sm100a", "prepare"),
+        ],
+        [
+            ("direct_m128", "main", "sm100a", "first"),
+            ("independent_dvsplit_m64", "main", "sm100a", "second"),
+        ],
+        [
+            ("bt16_prepare_chain_m64", "bt16_prepare", "sm100a", "prepare"),
+            ("bt16_prepare_chain_m64", "main", "sm103a", "chain"),
+        ],
+    ],
+)
+def test_recorded_generated_cake_route_rejects_inconsistent_modules(routes):
+    with pytest.raises(RuntimeError, match="generated Cake"):
+        _resolve_recorded_generated_cake_route(routes)
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ import cuda.bindings.driver as cuda
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
 
 # ============================================================================
 # Constants for PRETRANSPOSE version ([B*HV, V, K])
@@ -901,6 +902,7 @@ _CUTE_DSL_MODULE = "gdn_decode_pretranspose"
 
 
 def _pretranspose_kernel_name(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -918,6 +920,7 @@ def _pretranspose_kernel_name(
     every parameter that affects codegen."""
     return make_kernel_name(
         "decode",
+        target_arch(target_key),
         T,
         H,
         HV,
@@ -935,6 +938,7 @@ def _pretranspose_kernel_name(
 
 @functools.cache
 def _get_compiled_decode_kernel(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -1000,7 +1004,9 @@ def run_pretranspose_decode(
         )
     else:
         stride1 = stride2 = stride3 = 0
+    target = gdn_device_target(q.device)
     cache_key = (
+        target.compile_key,
         T,
         H,
         HV,
@@ -1036,7 +1042,7 @@ def run_pretranspose_decode(
         h0_out_indices = h0_indices
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         if use_pool_indexing:
             # Pool capacity and the distance between slots do not affect codegen.
@@ -1081,7 +1087,9 @@ def run_pretranspose_decode(
         compiled = build_and_load_cute_dsl_kernel(
             _CUTE_DSL_MODULE,
             _pretranspose_kernel_name(*cache_key),
-            lambda: cute.compile(
+            lambda: cute.compile[
+                gdn_compile_options(q.device, cute.EnableTVMFFI(True))
+            ](
                 run_func,
                 h0_source_tensor,
                 A_log_tensor,
@@ -1108,7 +1116,6 @@ def run_pretranspose_decode(
                 use_pool_indexing=use_pool_indexing,
                 is_varlen=False,
                 stream=stream,
-                options="--enable-tvm-ffi",
             ),
             extra_key_files=(__file__,),
         )
@@ -1117,7 +1124,7 @@ def run_pretranspose_decode(
         compiled = cache["compiled"]
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     cache["compiled"](
         h0_source,
         A_log,

@@ -36,7 +36,10 @@ from flashinfer.quantization.fp8_quantization import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
-from tests.moe.utils import assert_trtllm_packed_call_contract
+from tests.moe.utils import (
+    assert_trtllm_packed_call_contract,
+    fp8_per_tensor_global_scale,
+)
 
 
 def _build_per_tensor_fp8_runner(config):
@@ -758,12 +761,6 @@ def test_block_fp8_prerouted_cuda_graph(variant):
 # ---------------------------------------------------------------------------
 
 
-def _per_tensor_global_scale(x: torch.Tensor) -> torch.Tensor:
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = x.float().abs().amax()
-    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
-
-
 def _per_tensor_quant_dequant_experts(
     weights: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -879,7 +876,7 @@ def _make_per_tensor_fp8_case(
         )
     selected_experts = selected_experts.to(torch.int32)
 
-    input_scale = _per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     intermediate_scale = torch.tensor(64.0, device=device)
     x_q, x_scale = TrtllmFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=input_scale

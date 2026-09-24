@@ -5,8 +5,14 @@ kernels for NVIDIA Blackwell GPUs. Scheduling, tile selection, and split-KV
 reduction are implementation details; the public interfaces expose attention
 and cache semantics without tuning knobs.
 
+Public entry points marked with `@flashinfer_experimental_api` warn once on
+first use and provide no compatibility guarantee. Calling an API is the opt-in;
+no environment variable is required. Existing API logging and `fi_trace`
+bindings remain available.
+
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but is not yet signoff-qualified.
+The QToken-KvBlock-Sparse-Attention extension is separately validated on SM103/GB300.
 
 ## Guides and public APIs
 
@@ -15,17 +21,65 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
-| FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prims_ts_batch_decode_with_kv_cache` |
+| FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
+| QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
-| MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size`, `prims_ts_batch_mla_decode_with_kv_cache` |
+| MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
+### Unified decode entry points
+
+`batch_decode_with_paged_kv_cache` and `batch_mla_decode_with_paged_kv_cache`
+support both convenience and explicit caller-workspace execution. Existing
+calls retain their validated convenience behavior, including FMHA's
+length-specialized policies. For allocation-free, synchronization-free
+steady-state launches, provide `workspace_buffer`, `max_kv_len`, `out`,
+and `validate=False`. Packed Q additionally requires `max_seq_len_q`
+(FMHA also accepts its non-default `seq_len_q` alias).
+Both APIs size and allocate scratch only when it is omitted, then pass it to
+the same wrapper plan/run path. Trusted calls select the existing cached
+kernel from static Python/tensor attributes without allocating or reading
+metadata values back to the host. FMHA preserves initialized caller scratch
+by planning with `initialize_workspace=False`.
+
+Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
+capture. FMHA scratch must be zero-initialized and re-zeroed when any workspace
+layout input (including batch size) changes. Scratch and output must not
+overlap any live input or each other; each concurrent launch/graph needs its
+own scratch. Warm up the exact topology before capture, retain stable storage,
+and update metadata only between completed replays. Validation is enabled by
+default and reads metadata values on the host; `validate=False` transfers
+all shape, dtype, stride, capacity, active page-ID, packed-offset, and lifetime
+obligations to the caller. The required decode control resets are unchanged.
+
+For example, given validated FMHA Q/cache/metadata and a correctly sized,
+zero-initialized `workspace`:
+
+```python
+import torch
+from flashinfer.attention.prims_ts import batch_decode_with_paged_kv_cache
+
+def decode():
+    return batch_decode_with_paged_kv_cache(
+        q, paged_kv_cache, block_tables, seq_lens,
+        workspace_buffer=workspace, max_kv_len=max_kv_len,
+        out=out, validate=False,
+    )
+
+decode()  # Warm up outside capture.
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    decode()
+graph.replay()
+```
+
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
 capacity, shape, dtype, and storage-mode specialization without retaining
-request tensors or metadata. Paged context plans may additionally freeze
+request tensors or metadata. FMHA decode can optionally own a fixed sequence-length
+vector for the plan's lifetime. Paged context plans may additionally freeze
 explicit exact-uniform-length, zero-causal-offset, or zeroed-V-tail promises.
 Context `run()` receives current packed offsets or fixed-table paged metadata;
 per-token variable-window bounds for fixed-shape inputs are also per-run, with
@@ -40,24 +94,125 @@ default; callers that have already validated their inputs may use
 every dtype, device, shape, stride, alignment, value, aliasing, and lifetime
 obligation.
 
+All PrimTS APIs leave cross-tensor storage overlap unchecked, regardless of
+`validate`. Output must not overlap inputs, live metadata, or plan-owned
+buffers. Caller-provided workspace must be disjoint from the public input and
+output tensors; its internal views retain their documented layout. Callers
+must preserve these preconditions when rebinding tensors and replaying graphs.
+Writable-buffer aliasing is unsupported, not an in-place execution mode.
+TensorMap stride/alignment and workspace-capacity checks remain in place.
+
+The standalone sparse-attention example suggests G for both packed prefill
+and fixed decode using a caller-cached SM count, then fixes G for each plan.
+
+## QToken-KvBlock-Sparse-Attention interface
+
+QToken-KvBlock-Sparse-Attention consumes per-query indexer output directly.
+`indexer_block_ids` contains logical K/V-block IDs: `[total_q, block_topk]`
+when `share_pattern_across_kv_heads=True` (default), otherwise
+`[total_q, Hkv, block_topk]`. It is deliberately not named `block_indices`,
+which belongs to BSR. The last dimension is contiguous.
+`block_table[num_requests, max_storage_pages]` maps each request's logical
+storage pages to separate HND K/V caches shaped
+`[num_pages, Hkv, page_size, D]`. `kv_block_size` is the semantic indexer
+atom, supporting 4/8/16/32/64/128 tokens; `page_size` is the independent
+physical cache-page extent and must be a positive multiple of four. Semantic
+blocks may cross physical pages. The loader resolves each fragment of size
+`gcd(kv_block_size, page_size)` through the dense table, without assuming
+physical adjacency. The KV-cache writer must zero-fill unused page padding.
+
+The public lifecycle matches paged block-sparse attention:
+
+```python
+wrapper = QTokenKvBlockSparsePagedTSWrapper()
+wrapper.plan(...)  # geometry, capacity, dtypes, workspace; outside capture
+wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
+```
+
+`plan` binds the single caller-owned byte workspace and fixes
+`batch_size`, `seq_len_q`, head geometry, `block_topk`,
+`max_seq_len_kv`, dtypes, and packed-versus-fixed Q layout. The first eager
+`run` binds the live tensor ABI, compiles the selected kernels, and
+initializes split-KV state. Capture only later `run` calls. One wrapper
+revision owns mutable route and split-KV scratch, so unordered concurrent runs
+need distinct wrappers.
+
+Packed prefill uses `q[total_q, Hq, D]`, `qo_indptr`, and
+`use_packed_q=True`; planned `seq_len_q` is the maximum request-safe route
+length. Fixed MTP decode uses `q[B, Nq, G, Hq, D]` without `qo_indptr`,
+where planned `batch_size = B * Nq` and `seq_len_q = G`. Q lengths need not
+be divisible by a suggested group: packed mode permits a shorter final route,
+while fixed mode may append consecutive semantic dummy rows and discard their
+outputs.
+
+`split_kv=False` selects nonsplit execution and omits reduction scratch;
+`split_kv=True` permits useful automatic splitting. The caller chooses the
+phase policy: typically False for prefill and True for decode. This choice is
+independent of packed/fixed Q and must match workspace sizing and planning.
+
+`get_q_token_kv_block_sparse_workspace_size` sizes persistent compact route
+metadata plus disjoint attention scratch. The model's per-request
+`max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
+the plan. Each group and pattern head forms at most
+`G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
+them in one CTA, and ORs per-query membership bits. It processes only candidate
+IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
+group; independent patterns prepare one per group and KV head. G1 resolves
+selected blocks and the causal tail inside attention, without a metadata launch.
+
+Nonsplit sparse grids larger than one service wave use the common CLC
+persistent scheduler. Each work item resolves its own request, query group and
+KV-head metadata. Page producers stage locators with `cp.async`; grouped
+membership storage is retained until all softmax consumers finish the item.
+The same paths support fixed and packed Q, including partial and empty packed
+groups. `split_kv=False` disables splitting, not persistent scheduling.
+
+The production specialization supports D64/D128/D256, matching FP16/BF16
+Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
+non-windowed, uses KV128 for Q1--Q8, and requires
+`seq_len_q * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
+use TileQ128; per-fragment query membership still occupies one byte.
+The pure-host
+`suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
+count and prefers the largest legal group that can fill one service wave using
+independent routes plus useful split-KV work. It falls back toward Q1 when a
+large union would leave SMs idle. The helper never queries device properties
+or reads tensors.
+
+`q_token_kv_block_sparse_attention_with_paged_kv_cache` is the eager
+plan-plus-run convenience API and is not graph-capturable. Shared argument
+spellings intentionally match paged block-sparse attention: `q`,
+`paged_kv_cache`, `kv_block_size`, `mask_type`,
+`sm_scale`, `seq_len_q`, and `max_seq_len_kv`. The optional runtime
+`v_scale` applies the value-cache dequantization scale and defaults to one.
+The convenience API infers physical page size from `paged_kv_cache`; only
+the prepared wrapper's `plan` takes `page_size` explicitly.
+
+On SM90 and newer, the combined route-builder and attention launch use PDL.
+Attention initializes its independent resources before acquiring immediately
+ahead of the first metadata-dependent read. Split-KV attention releases its
+reducer only after producer completion and TMEM teardown; the reducer
+initializes local resources before all threads acquire. Older architectures
+retain stream ordering.
+
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
-request metadata. Every `run` reads live paged-KV row offsets, physical page
-IDs, per-request K/V lengths, per-KV-head sparse routes, and optional token
-bits from device tensors. The physical-page ID tensor is capacity: its live
-prefix ends at `paged_kv_indptr[-1]`, which may be smaller than its `numel()`.
-The caller owns every live value contract: dense K/V lengths must be in
-`[1, max_seq_len_kv]`, and causal lengths must be in `[Sq, max_seq_len_kv]`.
-`paged_kv_indptr` must start at zero and contain bounded, monotone rows with at
-least `ceil(seq_lens_kv[b] / page_size)` entries; every physical page ID in
-the live prefix ending at `paged_kv_indptr[-1]` must lie in `[0, P)`. Every BSR
-row must have bounded offsets, strictly increasing unique block IDs, and at
-most the planned `max_blocks_per_row` entries. Contiguous IDs must lie below
+request metadata. Every `run` reads live page tables, per-request K/V lengths,
+sparse routes, and optional token bits from device tensors.
+`block_tables` is Int32 `[B, C]`, contiguous within each row and free to use a
+padded outer row stride; `C * page_size` must cover `max_seq_len_kv`, and only
+the first `ceil(seq_lens_kv[b] / page_size)` entries of each row are read. The
+caller owns every live value contract: dense K/V lengths must be in
+`[1, max_seq_len_kv]`, causal lengths must be in `[Sq, max_seq_len_kv]`, and
+every live physical page ID must lie in `[0, P)`. Every BSR row must have
+bounded offsets, strictly increasing unique block IDs, and at most the planned
+`max_blocks_per_row` entries. Contiguous IDs must lie below
 `ceil(seq_len_kv / kv_block_size)`; paged IDs must start below the owning
 request's live K/V length.
 
-Reusable wrappers validate tensor structure but read values directly without
-host synchronization. Invalid values therefore have undefined behavior and
+Reusable wrappers validate tensor structure by default and read values
+directly without host synchronization; `validate=False` skips the
+structural checks as well. Invalid values therefore have undefined behavior and
 may access out of bounds. Set `CUTE_DSL_ENABLE_ASSERTIONS=1` before the process
 first compiles these kernels to diagnose violations encountered while preparing
 selected routes; such assertions report asynchronously and leave the CUDA
@@ -67,15 +222,16 @@ their temporary plans and cannot run during CUDA Graph capture.
 
 The one-shot `block_sparse_attention_with_paged_kv_cache` API takes
 `max_seq_len_kv` as the static capacity and requires `seq_lens_kv` with the
-live per-request logical lengths. Paged PrimTS does not support packed or
+live per-request logical lengths. This paged block-sparse API does not support packed or
 mixed/variable Q lengths.
 Eager launches retain all launch tensors on the run stream; CUDA Graph users
 must keep the wrapper and Q/cache/output/runtime-metadata tensors alive and
 unmodified until replay completes. Values may change between completed replays
 while tensor addresses, shapes, dtypes, and strides remain stable.
 
-Qualified Q64/coarse-KV profiles retain KV256 routes for page sizes 64 and
-128. Optional `kv_valid_bits` is a `torch.uint32` per-request bitset with shape
+For the separate block-sparse FMHA API, qualified Q64/coarse-KV profiles retain
+KV256 routes for page sizes 64 and 128. Optional `kv_valid_bits` is a
+`torch.uint32` per-request bitset with shape
 `[B, ceil(max_seq_len_kv / 32)]` over logical KV tokens; it is shared by all KV
 heads and independent of the physical page mapping.
 
@@ -89,21 +245,24 @@ tighter caller-provided bound. Proxy routes are supported across the existing
 contiguous block-sparse profiles and preserve the profile's Q tile, KV route,
 and KeepsAB/SWAPAB geometry. Proxy routes currently require
 `mask_type="dense"`; paged K/V proxy execution remains unsupported. Route rows
-are owned by `(batch, KV head, Q block)`, so all Q heads in one GQA/MQA group
-share sparsity. A proxy run supplies one K arithmetic mean and one V sum per
+are owned by `(batch, pattern head, Q block)`. Both block-sparse APIs default
+to `share_pattern_across_kv_heads=False`; True uses a singleton pattern-head
+axis shared by all KV heads. K/V and proxy summaries retain their physical
+head axis in either mode. A proxy run supplies one K arithmetic mean and one V sum per
 semantic KV block. The final partial block uses only its structural tokens.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
 proxy summaries or their represented mass.
 
 ## Validation
 
-Run the numerical, graph, scheduler/resource, alias-safety, and public-surface
+Run the numerical, graph, scheduler/resource, and public-surface
 contracts:
 
 ```bash
 pytest -q \
   tests/attention/test_attention_ts_context.py \
   tests/attention/test_attention_ts_decode.py \
+  tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
   tests/attention/test_attention_ts_mla_decode.py

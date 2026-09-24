@@ -12,118 +12,154 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplate for recurrent Key-Driven Attention (KDA) decode."""
+"""TraceTemplates for recurrent Key-Driven Attention (KDA)."""
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
-recurrent_kda_trace = TraceTemplate(
-    op_type="kda",
+# Shared by the phase-neutral facade and the deprecated decode facade, which
+# accept the same call and so must describe it identically; only the name and
+# the stage they advertise differ.
+def _recurrent_kda_template(
+    *, name_prefix: str, description: str, tags: list[str]
+) -> TraceTemplate:
+    """Build a template for one of the two ``recurrent_kda`` facades.
+
+    A factory rather than a shared dict so the two templates cannot alias
+    each other's axes, inputs, outputs or constraints; several call sites
+    mutate ``template.axes`` after construction.
+    """
+
+    return TraceTemplate(
+        op_type="kda",
+        name_prefix=name_prefix,
+        description=description,
+        tags=tags,
+        axes={
+            "batch_size": Var(description="Number of input batch rows."),
+            "seq_len": Var(description="Tokens carried by each input batch row."),
+            "num_q_heads": Const(
+                description="Number of query and key heads.", abbrev="q"
+            ),
+            "num_v_heads": Const(description="Number of value heads.", abbrev="v"),
+            "head_dim": Const(
+                description="Query, key, and value head dimension.", abbrev="d"
+            ),
+            "state_pool_size": Var(description="Number of writable state slots."),
+            "source_pool_size": Var(description="Number of committed-state slots."),
+            "num_sequences": Var(description="Number of state-source indices."),
+            "num_checkpoints": Var(description="Number of packed prefill checkpoints."),
+            "num_checkpoint_offsets": Var(
+                description="Number of packed checkpoint cumulative offsets."
+            ),
+            "kg_dim": Var(description="Key/gate cache row width (2 * head_dim)."),
+        },
+        inputs={
+            "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
+            "k": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
+            "v": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
+            "g": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
+            "beta": Tensor(["batch_size", "seq_len", "num_v_heads"]),
+            "initial_state": Tensor(
+                ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
+                optional=True,
+            ),
+            "initial_state_source": Tensor(
+                ["source_pool_size", "num_v_heads", "head_dim", "head_dim"],
+                optional=True,
+                description="Read-only committed-state pool.",
+            ),
+            "initial_state_indices": Tensor(
+                ["num_sequences"],
+                optional=True,
+                description="Committed-state slot selected for each sequence.",
+            ),
+            "ssm_state_indices": Tensor(
+                ["num_sequences"],
+                optional=True,
+                description="Writable state-pool slot selected for each prefill sequence.",
+            ),
+            "state_checkpoints": Tensor(
+                ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
+                optional=True,
+                description="Caller-owned packed KDA pre-block state output.",
+            ),
+            "checkpoint_cu_starts": Tensor(
+                ["num_checkpoint_offsets"],
+                optional=True,
+                description="Per-sequence cumulative packed checkpoint counts.",
+            ),
+            "scale": Scalar("float32", optional=True),
+            "output_final_state": Scalar("int32", optional=True),
+            "use_qk_l2norm_in_kernel": Scalar("int32", optional=True),
+            "use_gate_in_kernel": Scalar("int32", optional=True),
+            "lower_bound": Scalar("float32", optional=True),
+            "num_spec_tokens": Scalar("int32", optional=True),
+            "beta_is_logit": Scalar("int32", optional=True),
+            "disable_state_update": Scalar("int32", optional=True),
+            "correction_cache": Tensor(
+                ["source_pool_size", "num_v_heads", "seq_len", "head_dim"],
+                optional=True,
+                description=(
+                    "Frozen-verify only: slot-indexed float32 per-token "
+                    "delta-rule corrections for a commit/recovery kernel."
+                ),
+            ),
+            "kg_cache": Tensor(
+                ["source_pool_size", "num_v_heads", "seq_len", "kg_dim"],
+                optional=True,
+                description=(
+                    "Frozen-verify only: slot-indexed (normalized key | raw "
+                    "gate) cache; kg_dim == 2 * head_dim."
+                ),
+            ),
+            "checkpoint_every_n_tokens": Scalar("int32", optional=True),
+        },
+        outputs={
+            "output": Tensor(
+                ["batch_size", "seq_len", "num_v_heads", "head_dim"],
+                dtype_from="q",
+            ),
+            "final_state": Tensor(
+                ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
+                dtype="bfloat16",
+                optional=True,
+            ),
+            "state_checkpoints": Tensor(
+                ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
+                dtype="bfloat16",
+                optional=True,
+                param="state_checkpoints",
+            ),
+        },
+        constraints=[
+            "num_v_heads % num_q_heads == 0",
+            "head_dim in (64, 128)",
+            "num_checkpoint_offsets == num_sequences + 1",
+        ],
+    )
+
+
+recurrent_kda_trace = _recurrent_kda_template(
     name_prefix="recurrent_kda",
     description=(
-        "Recurrent Key-Driven Attention decode with per-key-dimension gating "
-        "and an optional read-only committed-state source."
+        "Recurrent Key-Driven Attention with per-key-dimension gating and an "
+        "optional read-only committed-state source. Classifies the call's "
+        "phase and serves prefill or decode accordingly."
     ),
-    axes={
-        "batch_size": Var(description="Number of input batch rows."),
-        "seq_len": Var(description="Tokens carried by each input batch row."),
-        "num_q_heads": Const(description="Number of query and key heads.", abbrev="q"),
-        "num_v_heads": Const(description="Number of value heads.", abbrev="v"),
-        "head_dim": Const(
-            description="Query, key, and value head dimension.", abbrev="d"
-        ),
-        "state_pool_size": Var(description="Number of writable state slots."),
-        "source_pool_size": Var(description="Number of committed-state slots."),
-        "num_sequences": Var(description="Number of state-source indices."),
-        "num_checkpoints": Var(description="Number of packed prefill checkpoints."),
-        "num_checkpoint_offsets": Var(
-            description="Number of packed checkpoint cumulative offsets."
-        ),
-        "kg_dim": Var(description="Key/gate cache row width (2 * head_dim)."),
-    },
-    inputs={
-        "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
-        "k": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
-        "v": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
-        "g": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
-        "beta": Tensor(["batch_size", "seq_len", "num_v_heads"]),
-        "initial_state": Tensor(
-            ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
-            optional=True,
-        ),
-        "initial_state_source": Tensor(
-            ["source_pool_size", "num_v_heads", "head_dim", "head_dim"],
-            optional=True,
-            description="Read-only committed-state pool.",
-        ),
-        "initial_state_indices": Tensor(
-            ["num_sequences"],
-            optional=True,
-            description="Committed-state slot selected for each sequence.",
-        ),
-        "ssm_state_indices": Tensor(
-            ["num_sequences"],
-            optional=True,
-            description="Writable state-pool slot selected for each prefill sequence.",
-        ),
-        "state_checkpoints": Tensor(
-            ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
-            optional=True,
-            description="Caller-owned packed KDA pre-block state output.",
-        ),
-        "checkpoint_cu_starts": Tensor(
-            ["num_checkpoint_offsets"],
-            optional=True,
-            description="Per-sequence cumulative packed checkpoint counts.",
-        ),
-        "scale": Scalar("float32", optional=True),
-        "output_final_state": Scalar("int32", optional=True),
-        "use_qk_l2norm_in_kernel": Scalar("int32", optional=True),
-        "use_gate_in_kernel": Scalar("int32", optional=True),
-        "lower_bound": Scalar("float32", optional=True),
-        "num_spec_tokens": Scalar("int32", optional=True),
-        "beta_is_logit": Scalar("int32", optional=True),
-        "disable_state_update": Scalar("int32", optional=True),
-        "correction_cache": Tensor(
-            ["source_pool_size", "num_v_heads", "seq_len", "head_dim"],
-            optional=True,
-            description=(
-                "Frozen-verify only: slot-indexed float32 per-token "
-                "delta-rule corrections for a commit/recovery kernel."
-            ),
-        ),
-        "kg_cache": Tensor(
-            ["source_pool_size", "num_v_heads", "seq_len", "kg_dim"],
-            optional=True,
-            description=(
-                "Frozen-verify only: slot-indexed (normalized key | raw "
-                "gate) cache; kg_dim == 2 * head_dim."
-            ),
-        ),
-        "checkpoint_every_n_tokens": Scalar("int32", optional=True),
-    },
-    outputs={
-        "output": Tensor(
-            ["batch_size", "seq_len", "num_v_heads", "head_dim"],
-            dtype_from="q",
-        ),
-        "final_state": Tensor(
-            ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
-            dtype="bfloat16",
-            optional=True,
-        ),
-        "state_checkpoints": Tensor(
-            ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
-            dtype="bfloat16",
-            optional=True,
-            param="state_checkpoints",
-        ),
-    },
-    constraints=[
-        "num_v_heads % num_q_heads == 0",
-        "head_dim in (64, 128)",
-        "num_checkpoint_offsets == num_sequences + 1",
-    ],
+    # Two stages because this facade serves both, unlike every other template
+    # here; the decode-only variant below keeps the single decode stage.
+    tags=["stage:prefill", "stage:decode", "status:verified"],
+)
+
+
+recurrent_kda_decode_trace = _recurrent_kda_template(
+    name_prefix="recurrent_kda_decode",
+    description=(
+        "Recurrent Key-Driven Attention decode reached through the deprecated "
+        "flashinfer.kda_decode.recurrent_kda facade, which dispatches decode "
+        "directly without classifying the call's phase."
+    ),
     tags=["stage:decode", "status:verified"],
 )
 
@@ -246,4 +282,70 @@ fused_kda_decode_trace = TraceTemplate(
         "conv_history == 3",
     ],
     tags=["stage:decode", "status:verified"],
+)
+
+
+packed_fused_kda_decode_trace = TraceTemplate(
+    op_type="kda",
+    name_prefix="packed_fused_kda_decode",
+    description=(
+        "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, "
+        "and gated RMSNorm with one recurrent checkpoint per token."
+    ),
+    axes={
+        "num_sequences": Var(description="Number of independent sequences."),
+        "num_tokens": Const(description="Maximum tokens per sequence.", abbrev="t"),
+        "num_rows": Var(description="Total packed tokens."),
+        "num_sequence_offsets": Var(
+            description="Number of packed sequence boundaries."
+        ),
+        "num_heads": Const(description="Number of KDA heads.", abbrev="h"),
+        "head_dim": Const(description="KDA head dimension.", abbrev="d"),
+        "singleton": Const(description="Leading singleton dimension.", abbrev=""),
+        "projection_groups": Const(
+            description="Packed QKV projection groups.", abbrev=""
+        ),
+        "hidden_size": Const(description="Channels in one projection.", abbrev=""),
+        "qkv_width": Const(description="Packed QKV width.", abbrev=""),
+        "conv_width": Const(description="Depthwise convolution width.", abbrev=""),
+        "conv_history": Const(description="Cached convolution history.", abbrev=""),
+        "num_slots": Var(description="Number of cache slots."),
+    },
+    inputs={
+        "x": Tensor(["num_rows", "qkv_width"]),
+        "weight": Tensor(["projection_groups", "conv_width", "hidden_size"]),
+        "conv_state": Tensor(["num_slots", "qkv_width", "conv_history"]),
+        "raw_gate": Tensor(["singleton", "num_rows", "num_heads", "head_dim"]),
+        "raw_beta": Tensor(["singleton", "num_rows", "num_heads"]),
+        "A_log": Tensor(["num_heads"]),
+        "dt_bias": Tensor(["hidden_size"]),
+        "state_indices": Tensor(["num_sequences", "num_tokens"]),
+        "query_start_loc": Tensor(["num_sequence_offsets"]),
+        "num_accepted_tokens": Tensor(["num_sequences"]),
+        "t1_state_indices": Tensor(["num_rows"], optional=True),
+        "state": Tensor(["num_slots", "num_heads", "head_dim", "head_dim"]),
+        "output_gate": Tensor(["num_rows", "num_heads", "head_dim"]),
+        "norm_weight": Tensor(["head_dim"]),
+        "lower_bound": Scalar("float32", optional=True),
+        "norm_eps": Scalar("float32", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["singleton", "num_rows", "num_heads", "head_dim"], dtype_from="x"
+        ),
+    },
+    constraints=[
+        "num_rows <= num_sequences * num_tokens",
+        "num_sequence_offsets == num_sequences + 1",
+        "num_tokens >= 1",
+        "qkv_width == 3 * num_heads * head_dim",
+        "hidden_size == num_heads * head_dim",
+        "singleton == 1",
+        "projection_groups == 3",
+        "head_dim == 128",
+        "num_heads in (12, 24, 32, 48, 96)",
+        "conv_width == 4",
+        "conv_history == num_tokens + 2",
+    ],
+    tags=["stage:decode", "status:experimental"],
 )

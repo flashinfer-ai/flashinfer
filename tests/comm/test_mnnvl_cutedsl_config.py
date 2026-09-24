@@ -24,6 +24,7 @@ from flashinfer.comm.mnnvl_cutedsl import (
     DEFAULT_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
+    NO_NORM_CONFIG,
 )
 from flashinfer.comm.mnnvl_cutedsl.config import (
     KernelTarget,
@@ -42,6 +43,24 @@ from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
 )
+from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
+
+
+@pytest.mark.parametrize("write_norm_output", (False, True))
+def test_static_fp8_requires_rms_norm(write_norm_output):
+    with pytest.raises(ValueError, match="FP8 output requires apply_rms_norm=True"):
+        MNNVLCuteDSLAllReduceFusionWorkspace(
+            tp_size=4,
+            tp_rank=0,
+            max_token_num=1,
+            hidden_dim=5120,
+            dtype=torch.bfloat16,
+            top_k=6,
+            config=NO_NORM_CONFIG,
+            apply_rms_norm=False,
+            output_dtype=torch.float8_e4m3fn,
+            write_norm_output=write_norm_output,
+        )
 
 
 def _target(protocol: ProtocolKind, preset: str) -> KernelTarget[str]:
