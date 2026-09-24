@@ -2,26 +2,6 @@ import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
 
-def matmul_get_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": BM,
-                "BLOCK_SIZE_N": BN,
-                "BLOCK_SIZE_K": BK,
-                "GROUP_SIZE_M": 8,
-            },
-            num_stages=s,
-            num_warps=w,
-        )
-        for BM in [128]
-        for BN in [128]
-        for BK in [64]
-        for s in ([3])
-        for w in [4]
-    ]
-
-
 def _matmul_launch_metadata(grid, kernel, args):
     ret = {}
     M, N, K = args["M"], args["N"], args["K"]
@@ -45,10 +25,6 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     return pid_m, pid_n
 
 
-@triton.autotune(
-    configs=matmul_get_configs(),
-    key=["M", "N", "K"],
-)
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def gemm_kernel_persistent(
     a_ptr,
@@ -222,10 +198,6 @@ def gemm_kernel_descriptor_persistent(
 
 
 # only for testing
-@triton.autotune(
-    configs=matmul_get_configs(),
-    key=["M", "N", "K"],
-)
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def gemm_kernel(
     a_ptr,
