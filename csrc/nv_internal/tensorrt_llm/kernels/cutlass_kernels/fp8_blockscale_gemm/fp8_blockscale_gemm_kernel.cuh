@@ -1525,13 +1525,10 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     // Unlike the other scale kernels here, this one does not fit 8 blocks per SM (39 registers
     // per thread with nvcc 13.3 for sm_90a), so the grid is sized from its occupancy.
-    static int const kMaxBlocksPerSM = [&] {
-      int blocks = 0;
-      tensorrt_llm::common::check_cuda_error(
-          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, NumThreads, smem_size));
-      return std::max(blocks, 1);
-    }();
-    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs) * kMaxBlocksPerSM,
+    int max_blocks_per_sm = 0;
+    tensorrt_llm::common::check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, kernel, NumThreads, smem_size));
+    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs) * std::max(max_blocks_per_sm, 1),
                               div_up(max_shape_m * scales_dim_x, NumThreads / 32));
     kernel<<<num_blocks, NumThreads, smem_size, stream>>>(
         fp8_mat_a, scales_a, mat_a, problem_m_offsets, num_problems, shape_k, max_shape_m_padded,
