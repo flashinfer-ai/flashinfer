@@ -423,6 +423,7 @@ def run_ninja(
         raise RuntimeError(msg) from e
 
 
+@functools.lru_cache(maxsize=None)
 def is_nvcc_at_least(nvcc_path: str, version_str: str) -> bool:
     """Whether the nvcc that will actually run reports a CUDA version >= ``version_str``.
 

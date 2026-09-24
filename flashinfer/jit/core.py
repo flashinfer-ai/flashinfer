@@ -313,7 +313,7 @@ class JitSpec(abc.ABC):
         """Return the cached artifact, or None when absent or not known-valid.
 
         Exception contract: must NOT raise for artifact-level problems
-        (missing, stale, corrupt, unloadable) 閳?log and return None so
+        (missing, stale, corrupt, unloadable) — log and return None so
         build_and_load() falls through to build(). An exception escaping
         try_load() is a programming error and propagates.
         """
