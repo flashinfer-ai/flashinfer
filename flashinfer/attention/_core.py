@@ -36,9 +36,9 @@ from ..prefill import BatchPrefillWithPagedKVCacheWrapper
 from ..jit.attention.variants import attention_sink_decl
 from ..jit.attention.modules import (
     batch_prefill_bidirectional_ranges_jit_args,
+    get_batch_prefill_attention_sink_uri,
     get_batch_prefill_bidirectional_ranges_spec,
 )
-from ..jit.utils import filename_safe_dtype_map
 
 
 @functools.cache
@@ -377,7 +377,18 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             )
 
         jit_args = [
-            f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}_swa_{window_left >= 0}_{backend}",  # uri
+            get_batch_prefill_attention_sink_uri(
+                backend,
+                q_data_type,
+                kv_data_type,
+                q_data_type,
+                torch.int32,
+                head_dim_qk,
+                head_dim_vo,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,
+                use_fp16_qk_reduction,
+            ),  # uri
             q_data_type,  # dtype_q
             kv_data_type,  # dtype_kv
             q_data_type,  # dtype_o
