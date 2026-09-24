@@ -26,7 +26,10 @@ import torch
 
 from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .cudnn.prefill import _cudnn_supports_direct_seqlens
+from .cudnn.prefill import (
+    _cudnn_single_token_gqa_ragged_stats_broken,
+    _cudnn_supports_direct_seqlens,
+)
 from .jit import (
     MissingJITCacheError,
     gen_batch_prefill_module,
@@ -1848,7 +1851,7 @@ def _blackwell_ragged_auto_upgrade(
     cutlass_work_items: int,
     cuda_graph_enabled: bool,
     cutlass_indptr_is_int32: bool = False,
-    single_token_gqa: bool = False,
+    single_token_gqa_with_empty_rows: bool = False,
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
@@ -1902,11 +1905,14 @@ def _blackwell_ragged_auto_upgrade(
                 # graph, where it raises instead -- so in that case cuDNN
                 # cannot serve the call and must not be selected.
                 and cudnn_indptr_is_int32
-                # cuDNN's s_q == 1 kernel packs the q heads of a kv group and
-                # writes the LSE only for the first of them (cuDNN 9.26/9.27,
-                # NVBug 6783545); the output is right, the LSE is not, and run()
-                # does not know yet whether the caller wants it.
-                and not single_token_gqa
+                # cuDNN < 9.28 mis-stores a ragged Stats tensor for s_q == 1
+                # GQA (NVBug 6783545). The low level serves the packed LSE
+                # through the padded (b, 1, h) form instead, which only works
+                # when every request has exactly one token; a batch that mixes
+                # zero-length and single-token requests cannot get an LSE from
+                # cuDNN there, and run() does not know yet whether the caller
+                # wants one.
+                and not single_token_gqa_with_empty_rows
             ):
                 return backend
         elif backend == "cutlass":
@@ -4086,9 +4092,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._requested_backend = backend
         self._backend = backend
         self._cached_module = None
-        # cudnn: stats ragged offset so the LSE lands packed as
-        # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
-        self._cudnn_stats_offsets: Optional[torch.Tensor] = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -4685,8 +4688,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                             self._qo_indptr_buf.dtype == torch.int32
                             and self._kv_indptr_buf.dtype == torch.int32
                         ),
-                        single_token_gqa=(
-                            max_qo_len == 1 and num_qo_heads != num_kv_heads
+                        single_token_gqa_with_empty_rows=(
+                            max_qo_len == 1
+                            and num_qo_heads != num_kv_heads
+                            and total_num_rows != batch_size
+                            and _cudnn_single_token_gqa_ragged_stats_broken()
                         ),
                     )
                     if upgraded is not None:
@@ -4754,7 +4760,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._kv_indptr_buf = self._kv_indptr_buf.to(torch.int32)
                 self._o_indptr_buf = self._o_indptr_buf.to(torch.int32)
                 self._v_indptr_buf = self._v_indptr_buf.to(torch.int32)
-            self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
             if self.is_cuda_graph_enabled:
@@ -5280,12 +5285,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 return_lse
                 and self._max_token_per_sequence == 1
                 and q.shape[1] != k.shape[1]
+                and q.shape[0] != self._qo_indptr_buf.shape[0] - 1
+                and _cudnn_single_token_gqa_ragged_stats_broken()
             ):
                 raise NotImplementedError(
-                    "cuDNN's single-token (max q_len == 1) GQA kernel writes the "
-                    "LSE only for the first head of each kv group (cuDNN 9.26/9.27 "
-                    "bug, NVBug 6783545); use backend='auto', which routes these steps "
-                    "to another backend, or return_lse=False"
+                    "cuDNN < 9.28 mis-stores the ragged LSE for single-token "
+                    "(max q_len == 1) GQA (NVBug 6783545); the low level serves it "
+                    "only when every request has exactly one token, and this batch "
+                    "has zero-length requests. Use backend='auto', which routes "
+                    "these steps to another backend, or return_lse=False"
                 )
             # The caller's token-unit indptrs go straight to cuDNN (mask +
             # ragged offsets, scaled in-engine); no per-call conversion kernels.
@@ -5316,7 +5324,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 batch_offsets_k=self._kv_indptr_buf,
                 batch_offsets_v=self._v_indptr_buf,
                 batch_offsets_o=self._o_indptr_buf,
-                batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
                 batch_offsets_units="tokens",
                 is_cuda_graph_compatible=self._use_cuda_graph,
                 lse_base=lse_base,
