@@ -1386,6 +1386,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
 
+        # Same normalization as plan(): the native size query reads these host
+        # copies through raw data pointers.
+        indptr = indptr.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         indptr_host = indptr.to("cpu")
         last_page_len_host = last_page_len.to("cpu")
         if seq_lens is None:
@@ -1691,6 +1698,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
         )
+
+        # The planner and the kernels read these through raw data pointers, and
+        # ``.to(device)`` keeps a strided view strided, so normalize them (they
+        # are tiny) rather than silently misreading non-contiguous inputs.
+        indptr = indptr.contiguous()
+        indices = indices.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
@@ -4348,6 +4364,11 @@ def fast_decode_plan(
     - Remove unnecessary device-to-device copy for the cuda graph buffers.
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
+    # Kernels read these through raw data pointers; ``.contiguous()`` is a
+    # no-op for the usual contiguous inputs and fixes strided views.
+    indptr = indptr.contiguous()
+    indices = indices.contiguous()
+    last_page_len = last_page_len.contiguous()
     batch_size = len(last_page_len)
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
