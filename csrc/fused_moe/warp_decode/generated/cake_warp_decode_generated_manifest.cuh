@@ -4374,9 +4374,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   const bool situ = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiTU;
   const bool swiglu_oa = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSwiGLUParameterized;
   const bool q30_sm103_t10 = false
-      && inv.shape.num_tokens == 10 && inv.shape.hidden_size == 2048
+      && (inv.shape.num_tokens == 9 || inv.shape.num_tokens == 10) && inv.shape.hidden_size == 2048
       && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
       && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
+  const bool q35_sm103_t16 = false
+      && inv.shape.num_tokens == 16 && inv.shape.hidden_size == 2048
+      && inv.shape.intermediate_size == 512 && inv.shape.num_experts == 256
+      && inv.shape.local_num_experts == 256 && inv.shape.top_k == 8;
   const bool q30_t11_mma_u2 = false
       && inv.shape.num_tokens == 11 && inv.shape.hidden_size == 2048
       && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
@@ -4490,7 +4494,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.hidden_size == 3584 && inv.shape.intermediate_size == 3072
       && inv.shape.num_experts == 896 && inv.shape.local_num_experts == 896
       && inv.shape.top_k == 16;
-  const bool fixed_q8_top_k = fc1_kernel == 6
+  const bool fixed_q8_top_k = (fc1_kernel == 6 || q35_sm103_t16)
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
       && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
       && (inv.shape.num_tokens == 32
@@ -9451,9 +9455,13 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   const bool situ = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiTU;
   const bool swiglu_oa = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSwiGLUParameterized;
   const bool q30_sm103_t10 = true
-      && inv.shape.num_tokens == 10 && inv.shape.hidden_size == 2048
+      && (inv.shape.num_tokens == 9 || inv.shape.num_tokens == 10) && inv.shape.hidden_size == 2048
       && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
       && inv.shape.local_num_experts == 128 && inv.shape.top_k == 8;
+  const bool q35_sm103_t16 = true
+      && inv.shape.num_tokens == 16 && inv.shape.hidden_size == 2048
+      && inv.shape.intermediate_size == 512 && inv.shape.num_experts == 256
+      && inv.shape.local_num_experts == 256 && inv.shape.top_k == 8;
   const bool q30_t11_mma_u2 = true
       && inv.shape.num_tokens == 11 && inv.shape.hidden_size == 2048
       && inv.shape.intermediate_size == 768 && inv.shape.num_experts == 128
@@ -9479,7 +9487,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
           : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 6
           : 5)
       : schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 3
-      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed ? (q30_sm103_t10 ? 9 : 28)
+      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed ? ((q30_sm103_t10 || q35_sm103_t16) ? 9 : 28)
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? (q30_t11_mma_u2 ? 8 : 7)
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentPaddedScaleDeviceWorkfeed ? 11
       : q30_sm100_t2_t5_t8_merged_a ? 33
@@ -9567,7 +9575,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && inv.shape.hidden_size == 3584 && inv.shape.intermediate_size == 3072
       && inv.shape.num_experts == 896 && inv.shape.local_num_experts == 896
       && inv.shape.top_k == 16;
-  const bool fixed_q8_top_k = fc1_kernel == 7
+  const bool fixed_q8_top_k = (fc1_kernel == 7 || q35_sm103_t16)
       && schedule.route_layout == warp_decode::RouteLayout::kGpuPacked
       && schedule.finalize_threads == 128 && schedule.finalize_unroll == 4
       && (inv.shape.num_tokens == 32

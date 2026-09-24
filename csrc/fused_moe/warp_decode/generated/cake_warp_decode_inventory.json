@@ -1,8 +1,8 @@
 {
   "files": {
     "csrc/fused_moe/warp_decode/cake_warp_decode_binding.cu": "bb1c55d242b55a6d2fd347daee22942288d5a19b3afb0abda77fc8c889599e8a",
-    "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh": "733dc03bf948e7a3b316cdbcf9f47f4909e6e0ee1cdbb0ceceb8f7e22b67726b",
-    "csrc/fused_moe/warp_decode/generated/cake_warp_decode_generated_manifest.cuh": "46711826ddc63b08b0b4231a3e43226a330c80f04c77935faa20aa6cbb6dc6af",
+    "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh": "79552a2721c87387a107b2912ed5c890f2f2e007dde8f85d3f26a994c5a7bb30",
+    "csrc/fused_moe/warp_decode/generated/cake_warp_decode_generated_manifest.cuh": "1d70987cba9a7443519b478f1f7c1742798919a5a009a9dbfb9b7d8afa8f954a",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_01ad94fd0e5308715f89_binding.cu": "6ab45edf2e0753233a6d05fb65bbb3315bb5301ae8943f5005e8e23847301173",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_01ad94fd0e5308715f89_kernel.cu": "1bc77e809c1d0fd85e4eedf1c0144cb8ff18c157d0cc470f7646c00c2f79bde4",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_024bed5eb8061821a022_binding.cu": "3bc08da482f9c8c4c796f10593ae0088ad0e4322c65d4dbadda0ddcffc24b6ad",
@@ -174,6 +174,7 @@
     "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a01cad7552c630c3dc0b_binding.cu": "0a95e5c43c708a0d101f9017079918531799205eebb5d28e52c8b895b982768e",
     "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a3faef94a9154ab7d696_binding.cu": "ca6cb55d827c9c4e7de66fa8170a268f4a65bfd7b875c89eedf2cf764b4d88d4",
     "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a6a1d72ca69637d0a135_binding.cu": "7d97e243ad02f481c9e4119926d75ff6ab8a18ad64b9dcf00a27704fb3047aa5",
+    "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a7b03d74151902633012_binding.cu": "348166257a4bca2b80242d8af6af900cbb5326ed986050b0f9a452d4d3e1ad02",
     "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a7ddcbc19b97bb5d4f9e_binding.cu": "420aea4197bb3d6da3fad820ce64bc764038fd925dafcf775e6885e8a660ab43",
     "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a9a14c8153c3b075a341_binding.cu": "ee2006a142b8709db014725e681fe3deb930fdd1b25990fd16d5ae64fe9b205d",
     "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_af012e525c8e5c8dd993_binding.cu": "51c1154df7fe29b01b7e58f5ee2e5f9015e4c2679c7aa241b1dff0c3d0d3b4a4",
@@ -966,7 +967,7 @@
       "role": "kernel"
     }
   ],
-  "program_hash": "f369cc51611ba54fa9881f95146a9bfe7bede7be4fce2fe0f98766ada07adc0d",
+  "program_hash": "009f002d94652e95bb359fd46c0288f3c7ed358bcf3444c29b1c8a1a5bf17b21",
   "routes": [
     {
       "arch": "sm_100a",
@@ -17748,34 +17749,42 @@
         "top_k": 8
       },
       "sequence": {
-        "name": "cake_warp_decode_seq_fa18250844543ace3864",
+        "name": "cake_warp_decode_seq_8d632ab87e4e1d12c426",
         "role": "sequence"
       },
       "shape": "sm103a_swiglu_e128_h2048_i768_k8_t09",
       "stages": [
         {
           "module": {
-            "name": "cake_warp_decode_a86ccb7103a320e9db2f",
+            "name": "cake_warp_decode_ee7526ffca9f2aa5aa46",
+            "role": "kernel"
+          },
+          "name": "route_pack",
+          "template": "route_pack_generic"
+        },
+        {
+          "module": {
+            "name": "cake_warp_decode_b0f548cc0bc03def0160",
             "role": "kernel"
           },
           "name": "fc1",
-          "template": "fc1_swiglu_a_tma_merged_persistent"
+          "template": "fc1_swiglu_early_sfb_a_tma_merged_mma_u2_device_workfeed"
         },
         {
           "module": {
-            "name": "cake_warp_decode_70b170f94de40c8d7514",
+            "name": "cake_warp_decode_afb799d2d0dd264ba740",
             "role": "kernel"
           },
           "name": "fc2",
-          "template": "fc2_sm103_k512_stage5_u2_valid_k64_group256_early_accumulator_direct"
+          "template": "fc2_sm103_k512_stage5_valid_k64_prefetch_device_workfeed"
         },
         {
           "module": {
-            "name": "cake_warp_decode_c7113a73c61cc97c1593",
+            "name": "cake_warp_decode_f9fa9b6f9f326f89c9c6",
             "role": "kernel"
           },
           "name": "finalize",
-          "template": "finalize_direct_t128"
+          "template": "finalize_packed_t128_k8"
         }
       ]
     },
@@ -21169,7 +21178,7 @@
         "top_k": 8
       },
       "sequence": {
-        "name": "cake_warp_decode_seq_e47fdd499d6ed25a6729",
+        "name": "cake_warp_decode_seq_a7b03d74151902633012",
         "role": "sequence"
       },
       "shape": "sm103a_swiglu_e256_h2048_i512_k8_t16",
@@ -21184,11 +21193,11 @@
         },
         {
           "module": {
-            "name": "cake_warp_decode_34ef8576076046df901b",
+            "name": "cake_warp_decode_b0f548cc0bc03def0160",
             "role": "kernel"
           },
           "name": "fc1",
-          "template": "fc1_swiglu_device_workfeed"
+          "template": "fc1_swiglu_early_sfb_a_tma_merged_mma_u2_device_workfeed"
         },
         {
           "module": {
@@ -35164,6 +35173,37 @@
         }
       ],
       "name": "cake_warp_decode_seq_a6a1d72ca69637d0a135",
+      "role": "sequence"
+    },
+    {
+      "arch": "sm_103a",
+      "binding": "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_seq_a7b03d74151902633012_binding.cu",
+      "devices": [
+        "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_ee7526ffca9f2aa5aa46_kernel.cu",
+        "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_b0f548cc0bc03def0160_kernel.cu",
+        "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_f5274566e369dd01d4c9_kernel.cu",
+        "csrc/fused_moe/warp_decode/generated/sm_103a/cake_warp_decode_f9fa9b6f9f326f89c9c6_kernel.cu"
+      ],
+      "ffi_entry": "run",
+      "modules": [
+        {
+          "name": "cake_warp_decode_ee7526ffca9f2aa5aa46",
+          "role": "kernel"
+        },
+        {
+          "name": "cake_warp_decode_b0f548cc0bc03def0160",
+          "role": "kernel"
+        },
+        {
+          "name": "cake_warp_decode_f5274566e369dd01d4c9",
+          "role": "kernel"
+        },
+        {
+          "name": "cake_warp_decode_f9fa9b6f9f326f89c9c6",
+          "role": "kernel"
+        }
+      ],
+      "name": "cake_warp_decode_seq_a7b03d74151902633012",
       "role": "sequence"
     },
     {

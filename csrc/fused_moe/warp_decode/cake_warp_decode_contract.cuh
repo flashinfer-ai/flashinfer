@@ -249,14 +249,16 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
             Geometry::kH2048I512E256K8,
             RouteLayout::kGpuPacked,
             RoutePacker::kGeneral,
-            Fc1Schedule::kPersistentDeviceWorkfeed,
+            shape.num_tokens == 16 ? Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed
+                                   : Fc1Schedule::kPersistentDeviceWorkfeed,
             Fc2Schedule::kRouteParallelK512Stage5DeviceWorkfeed,
             128,
             4,
             144};
   }
 
-  if (IsGeometry(shape, 2048, 768, 128, 8) && shape.num_tokens == 10) {
+  if (IsGeometry(shape, 2048, 768, 128, 8) &&
+      (shape.num_tokens == 9 || shape.num_tokens == 10)) {
     return {true, Geometry::kH2048I768E128K8, RouteLayout::kGpuPacked,
             RoutePacker::kGeneral, Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed,
             Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed, 128, 4, 144};
@@ -665,15 +667,15 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
       if (tokens == 0 || tokens == 33) {
         if (schedule.supported) return false;
       } else if (geometry == Geometry::kH2048I768E128K8 &&
-                 (tokens == 10 || tokens == 11 || tokens == 12 || (target == 1 && tokens >= 13 && tokens <= 19) || (target == 0 && (tokens == 13 || tokens == 14 || tokens == 15 || tokens == 16 || tokens == 17 ||
+                 ((target == 1 && tokens == 9) || tokens == 10 || tokens == 11 || tokens == 12 || (target == 1 && tokens >= 13 && tokens <= 19) || (target == 0 && (tokens == 13 || tokens == 14 || tokens == 15 || tokens == 16 || tokens == 17 ||
                   ((tokens >= 20 && tokens <= 28) || tokens == 29 || tokens == 30 || tokens == 31))))) {
         if (!schedule.supported || schedule.geometry != geometry ||
             ActivationForGeometry(geometry) != activation ||
             schedule.route_layout != RouteLayout::kGpuPacked ||
             schedule.route_packer != RoutePacker::kGeneral ||
-            schedule.fc1 != (target == 0 || tokens == 10 ? Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed
+            schedule.fc1 != (target == 0 || tokens == 9 || tokens == 10 ? Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed
                                          : Fc1Schedule::kPersistentDeviceWorkfeed) ||
-            schedule.fc2 != ((target == 0 && tokens >= 10 && tokens <= 12) || (target == 1 && tokens == 10)
+            schedule.fc2 != ((target == 0 && tokens >= 10 && tokens <= 12) || (target == 1 && (tokens == 9 || tokens == 10))
                                  ? Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed
                                  : Fc2Schedule::kRouteParallelK256) ||
             schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
@@ -705,7 +707,8 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
             ActivationForGeometry(geometry) != activation ||
             schedule.route_layout != RouteLayout::kGpuPacked ||
             schedule.route_packer != RoutePacker::kGeneral ||
-            schedule.fc1 != Fc1Schedule::kPersistentDeviceWorkfeed ||
+            schedule.fc1 != (target == 1 && tokens == 16 ? Fc1Schedule::kPersistentEarlySfbDeviceWorkfeed
+                                                     : Fc1Schedule::kPersistentDeviceWorkfeed) ||
             schedule.fc2 != (target == 0 ? Fc2Schedule::kRouteParallelK512DeviceWorkfeed
                                          : Fc2Schedule::kRouteParallelK512Stage5DeviceWorkfeed) ||
             schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
