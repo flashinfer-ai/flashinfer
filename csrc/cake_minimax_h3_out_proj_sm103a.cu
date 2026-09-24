@@ -34,7 +34,11 @@
 // (kb / (112 / P)) * M + m, column block kb % (112 / P)).  The quantized variants first run a plain
 // 128-thread launch (one warp per row) that reads the same layout and writes the quantized dense
 // [M, 7168] activation plus its 128x4 swizzled block scales, then a persistent 2-CTA block-scaled
-// GEMM.  Every GEMM requires a cluster launch of (2, 1, 1) and does not compile for SM90 or SM120.
+// GEMM.  The quantization pass executes griddepcontrol.launch_dependents on entry and the
+// block-scaled GEMM is launched with programmatic stream serialization: its prologue (barrier /
+// TMEM setup, weight prefetch) overlaps the quantization pass and its load warp executes
+// griddepcontrol.wait before the first activation / scale fetch.  Every GEMM requires a cluster
+// launch of (2, 1, 1) and does not compile for SM90 or SM120.
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -1038,7 +1042,7 @@ __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2(
 #define MMA_K 16
 #define CTA_GROUP 2
 #define NUM_STAGES 7
-#define GROUP_M 32
+#define GROUP_M 16
 #define WORK_STAGES 4
 #define WORK_CONSUMERS 546
 #define NUM_K_ITERS 112
@@ -1656,6 +1660,7 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
 #define VECS_PER_LANE 28
 #define SF_K_TILES 56
 #define SF_TILE_BYTES 512
+#define LOAD_BATCH 7
 
 extern "C" {
 
@@ -1671,6 +1676,7 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int row = bid * ROWS_PER_CTA + warp;
     if (row < M) {
         unsigned long long row_base = (unsigned long long)row * (unsigned long long)ATTN_DIM;
@@ -1680,110 +1686,122 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
         int quad_lane = lane & 3;
         int block_in_vec = lane >> 2;
         #pragma unroll
-        for (int i = 0; i < VECS_PER_LANE; i++) {
-            int k = (lane + i * 32) * 8;
-            int seg = k / seg_cols;
-            int kk = k - seg * seg_cols;
-            int src_row = seg * M + row;
-            unsigned long long src = (unsigned long long)src_row * (unsigned long long)seg_cols + (unsigned long long)kk;
-            float _vec_load_0[8];
-            {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(attn_out + src + 0);
-                uint4 _vld_0[1];
-                #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_0[_blk] = _vptr_0[_blk];
-                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+        for (int batch = 0; batch < VECS_PER_LANE / LOAD_BATCH; batch++) {
+            float xs[LOAD_BATCH * 8];
+            #pragma unroll
+            for (int u = 0; u < LOAD_BATCH; u++) {
+                int k = (lane + (batch * LOAD_BATCH + u) * 32) * 8;
+                int seg = k / seg_cols;
+                int kk = k - seg * seg_cols;
+                int src_row = seg * M + row;
+                unsigned long long src = (unsigned long long)src_row * (unsigned long long)seg_cols + (unsigned long long)kk;
+                float _vec_load_0[8];
+                {
+                    const uint4* _vptr_0 = reinterpret_cast<const uint4*>(attn_out + src + 0);
+                    uint4 _vld_0[1];
                     #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_0[_pair]));
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_0[_blk] = _vptr_0[_blk];
+                        uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_0[_pair]));
+                        }
                     }
                 }
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    xs[u * 8 + j] = _vec_load_0[j];
+                }
             }
-            float vals[8];
-            float mags[8];
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                vals[j] = _vec_load_0[j];
-                mags[j] = _vec_load_0[j];
-            }
-            float _fabs_0 = fabsf(mags[0]);
-            mags[0] = _fabs_0;
-            float _fabs_1 = fabsf(mags[1]);
-            mags[1] = _fabs_1;
-            float _fabs_2 = fabsf(mags[2]);
-            mags[2] = _fabs_2;
-            float _fabs_3 = fabsf(mags[3]);
-            mags[3] = _fabs_3;
-            float _fabs_4 = fabsf(mags[4]);
-            mags[4] = _fabs_4;
-            float _fabs_5 = fabsf(mags[5]);
-            mags[5] = _fabs_5;
-            float _fabs_6 = fabsf(mags[6]);
-            mags[6] = _fabs_6;
-            float _fabs_7 = fabsf(mags[7]);
-            mags[7] = _fabs_7;
-            float mags_max = mags[0];
-            #pragma unroll
-            for (int _lr = 1; _lr < 8; _lr++) {
-                mags_max = max_noftz(mags_max, mags[_lr]);
-            }
-            float absmax = mags_max;
-            float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
-            float o1 = _shfl_xor_0;
-            float _max_0 = max_noftz(absmax, o1);
-            absmax = _max_0;
-            float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
-            float o2 = _shfl_xor_1;
-            float _max_1 = max_noftz(absmax, o2);
-            absmax = _max_1;
-            float scale = absmax / 448.0f;
-            unsigned int scale_bits = __as_u32(scale);
-            unsigned int exponent = scale_bits >> 23 & 255;
-            unsigned int mantissa = scale_bits & 8388607;
-            unsigned int has_mantissa = ((mantissa != 0) ? 1 : 0);
-            unsigned int normal = ((exponent != 0) ? 1 : 0);
-            unsigned int large_subnormal = ((mantissa > 4194304) ? 1 : 0);
-            unsigned int _min_0 = ((exponent + (has_mantissa & (normal | large_subnormal))) < (254) ? (exponent + (has_mantissa & (normal | large_subnormal))) : (254));
-            unsigned int scale_byte = _min_0;
-            unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
-            unsigned int zero_bits = 0;
-            unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
-            float inverse = 0.0f;
-            inverse = reinterpret_cast<float*>(&inverse_bits)[0];
-            const float2 _scale2_1 = {inverse, inverse};
-            #pragma unroll
-            for (int _ls = 0; _ls < 4; _ls++)
-                mul_f32x2_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_1);
-            {
-                unsigned int _fp8_pk[2];
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_fp8_pk[0]) : "f"(vals[0 + 0]), "f"(vals[0 + 1]), "f"(vals[0 + 2]), "f"(vals[0 + 3]));
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                    "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_fp8_pk[1]) : "f"(vals[0 + 4]), "f"(vals[0 + 5]), "f"(vals[0 + 6]), "f"(vals[0 + 7]));
-                *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(a_q + (row_base + (unsigned long long)k)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
-            }
-            if (quad_lane == 0) {
-                int block = i * 8 + block_in_vec;
-                int k_tile = block >> 2;
-                int sf_col = block & 3;
-                *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col)) + (0)) = (unsigned char)(scale_byte);
+            for (int u_1 = 0; u_1 < LOAD_BATCH; u_1++) {
+                int k_1 = (lane + (batch * LOAD_BATCH + u_1) * 32) * 8;
+                float vals[8];
+                float mags[8];
+                #pragma unroll
+                for (int j_1 = 0; j_1 < 8; j_1++) {
+                    vals[j_1] = xs[u_1 * 8 + j_1];
+                    mags[j_1] = xs[u_1 * 8 + j_1];
+                }
+                float _fabs_0 = fabsf(mags[0]);
+                mags[0] = _fabs_0;
+                float _fabs_1 = fabsf(mags[1]);
+                mags[1] = _fabs_1;
+                float _fabs_2 = fabsf(mags[2]);
+                mags[2] = _fabs_2;
+                float _fabs_3 = fabsf(mags[3]);
+                mags[3] = _fabs_3;
+                float _fabs_4 = fabsf(mags[4]);
+                mags[4] = _fabs_4;
+                float _fabs_5 = fabsf(mags[5]);
+                mags[5] = _fabs_5;
+                float _fabs_6 = fabsf(mags[6]);
+                mags[6] = _fabs_6;
+                float _fabs_7 = fabsf(mags[7]);
+                mags[7] = _fabs_7;
+                float mags_max = mags[0];
+                #pragma unroll
+                for (int _lr = 1; _lr < 8; _lr++) {
+                    mags_max = max_noftz(mags_max, mags[_lr]);
+                }
+                float absmax = mags_max;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
+                float o1 = _shfl_xor_0;
+                float _max_0 = max_noftz(absmax, o1);
+                absmax = _max_0;
+                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
+                float o2 = _shfl_xor_1;
+                float _max_1 = max_noftz(absmax, o2);
+                absmax = _max_1;
+                float scale = absmax / 448.0f;
+                unsigned int scale_bits = __as_u32(scale);
+                unsigned int exponent = scale_bits >> 23 & 255;
+                unsigned int mantissa = scale_bits & 8388607;
+                unsigned int has_mantissa = ((mantissa != 0) ? 1 : 0);
+                unsigned int normal = ((exponent != 0) ? 1 : 0);
+                unsigned int large_subnormal = ((mantissa > 4194304) ? 1 : 0);
+                unsigned int _min_0 = ((exponent + (has_mantissa & (normal | large_subnormal))) < (254) ? (exponent + (has_mantissa & (normal | large_subnormal))) : (254));
+                unsigned int scale_byte = _min_0;
+                unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
+                unsigned int zero_bits = 0;
+                unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
+                float inverse = 0.0f;
+                inverse = reinterpret_cast<float*>(&inverse_bits)[0];
+                const float2 _scale2_1 = {inverse, inverse};
+                #pragma unroll
+                for (int _ls = 0; _ls < 4; _ls++)
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_1);
+                {
+                    unsigned int _fp8_pk[2];
+                    asm("{\n\t"
+                        ".reg .b16 _lo, _hi;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                        "mov.b32 %0, {_lo, _hi};\n\t"
+                        "}\n"
+                        : "=r"(_fp8_pk[0]) : "f"(vals[0 + 0]), "f"(vals[0 + 1]), "f"(vals[0 + 2]), "f"(vals[0 + 3]));
+                    asm("{\n\t"
+                        ".reg .b16 _lo, _hi;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                        "mov.b32 %0, {_lo, _hi};\n\t"
+                        "}\n"
+                        : "=r"(_fp8_pk[1]) : "f"(vals[0 + 4]), "f"(vals[0 + 5]), "f"(vals[0 + 6]), "f"(vals[0 + 7]));
+                    *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(a_q + (row_base + (unsigned long long)k_1)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                }
+                if (quad_lane == 0) {
+                    int block = (batch * LOAD_BATCH + u_1) * 8 + block_in_vec;
+                    int k_tile = block >> 2;
+                    int sf_col = block & 3;
+                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col)) + (0)) = (unsigned char)(scale_byte);
+                }
             }
         }
     }
@@ -1792,6 +1810,7 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
 } // extern "C"
 
 #undef ATTN_DIM
+#undef LOAD_BATCH
 #undef MINIMAX_H3_OUT_PROJ_INF
 #undef NUM_MAIN_STAGES
 #undef ROWS_PER_CTA
@@ -1842,7 +1861,7 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
 #define BLOCK_K 256
 #define CTA_GROUP 2
 #define NUM_STAGES 3
-#define GROUP_M 64
+#define GROUP_M 32
 #define WORK_STAGES 4
 #define WORK_CONSUMERS 546
 #define NUM_K_ITERS 28
@@ -1969,6 +1988,7 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
         { // load_main
             unsigned int load_stage = 0;
             unsigned int work_stage = 0;
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_mma_done = 1;
             unsigned int _phase_work_full = 0;
@@ -2625,6 +2645,7 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
 #define VECS_PER_LANE 28
 #define SF_K_TILES 112
 #define SF_TILE_BYTES 512
+#define LOAD_BATCH 7
 
 extern "C" {
 
@@ -2640,6 +2661,7 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int row = bid * ROWS_PER_CTA + warp;
     if (row < M) {
         unsigned long long row_base = (unsigned long long)row * (unsigned long long)ATTN_DIM;
@@ -2656,92 +2678,104 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
         float sixth = _rcp_1;
         float zero_f32 = 0.0f;
         #pragma unroll
-        for (int i = 0; i < VECS_PER_LANE; i++) {
-            int k = (lane + i * 32) * 8;
-            int seg = k / seg_cols;
-            int kk = k - seg * seg_cols;
-            int src_row = seg * M + row;
-            unsigned long long src = (unsigned long long)src_row * (unsigned long long)seg_cols + (unsigned long long)kk;
-            float _vec_load_0[8];
-            {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(attn_out + src + 0);
-                uint4 _vld_0[1];
-                #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_0[_blk] = _vptr_0[_blk];
-                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+        for (int batch = 0; batch < VECS_PER_LANE / LOAD_BATCH; batch++) {
+            float xs[LOAD_BATCH * 8];
+            #pragma unroll
+            for (int u = 0; u < LOAD_BATCH; u++) {
+                int k = (lane + (batch * LOAD_BATCH + u) * 32) * 8;
+                int seg = k / seg_cols;
+                int kk = k - seg * seg_cols;
+                int src_row = seg * M + row;
+                unsigned long long src = (unsigned long long)src_row * (unsigned long long)seg_cols + (unsigned long long)kk;
+                float _vec_load_0[8];
+                {
+                    const uint4* _vptr_0 = reinterpret_cast<const uint4*>(attn_out + src + 0);
+                    uint4 _vld_0[1];
                     #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_0[_pair]));
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_0[_blk] = _vptr_0[_blk];
+                        uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_0[_pair]));
+                        }
                     }
                 }
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    xs[u * 8 + j] = _vec_load_0[j];
+                }
             }
-            float vals[8];
-            float mags[8];
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                vals[j] = _vec_load_0[j];
-                mags[j] = _vec_load_0[j];
-            }
-            float _fabs_0 = fabsf(mags[0]);
-            mags[0] = _fabs_0;
-            float _fabs_1 = fabsf(mags[1]);
-            mags[1] = _fabs_1;
-            float _fabs_2 = fabsf(mags[2]);
-            mags[2] = _fabs_2;
-            float _fabs_3 = fabsf(mags[3]);
-            mags[3] = _fabs_3;
-            float _fabs_4 = fabsf(mags[4]);
-            mags[4] = _fabs_4;
-            float _fabs_5 = fabsf(mags[5]);
-            mags[5] = _fabs_5;
-            float _fabs_6 = fabsf(mags[6]);
-            mags[6] = _fabs_6;
-            float _fabs_7 = fabsf(mags[7]);
-            mags[7] = _fabs_7;
-            float mags_max = mags[0];
-            #pragma unroll
-            for (int _lr = 1; _lr < 8; _lr++) {
-                mags_max = max_noftz(mags_max, mags[_lr]);
-            }
-            float absmax = mags_max;
-            float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
-            float o1 = _shfl_xor_0;
-            float _max_0 = max_noftz(absmax, o1);
-            absmax = _max_0;
-            float sf_value = g * (absmax * sixth);
-            uint16_t _e4m3x2_f32_0;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(zero_f32), "f"(sf_value));
-            uint16_t sf_pair = _e4m3x2_f32_0;
-            unsigned int sf_byte = (unsigned int)sf_pair & 255;
-            unsigned int sf_exp = sf_byte >> 3 & 15;
-            unsigned int sf_mant = sf_byte & 7;
-            unsigned int normal_bits = sf_exp + 120 << 23 | sf_mant << 20;
-            float sf_normal = 0.0f;
-            sf_normal = reinterpret_cast<float*>(&normal_bits)[0];
-            float sf_subnormal = (float)sf_mant * 0.001953125f;
-            float sf_f = ((sf_exp == 0) ? sf_subnormal : sf_normal);
-            float _rcp_2 = approx_rcp(sf_f * inv_g);
-            float out_scale_nonzero = _rcp_2;
-            float out_scale = ((absmax == 0.0f) ? 0.0f : out_scale_nonzero);
-            const float2 _scale2_1 = {out_scale, out_scale};
-            #pragma unroll
-            for (int _ls = 0; _ls < 4; _ls++)
-                mul_f32x2_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_1);
-            unsigned int packed[1];
-            asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(vals[0]), "f"(vals[1]), "f"(vals[2]), "f"(vals[3]), "f"(vals[4]), "f"(vals[5]), "f"(vals[6]), "f"(vals[7]));
-            *(reinterpret_cast<unsigned int*>(a_q + (word_base + (unsigned long long)(k >> 3))) + (0)) = packed[0];
-            if (pair_lane == 0) {
-                int block = i * 16 + block_in_vec;
-                int k_tile = block >> 2;
-                int sf_col = block & 3;
-                *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col)) + (0)) = (unsigned char)(sf_byte);
+            for (int u_1 = 0; u_1 < LOAD_BATCH; u_1++) {
+                int k_1 = (lane + (batch * LOAD_BATCH + u_1) * 32) * 8;
+                float vals[8];
+                float mags[8];
+                #pragma unroll
+                for (int j_1 = 0; j_1 < 8; j_1++) {
+                    vals[j_1] = xs[u_1 * 8 + j_1];
+                    mags[j_1] = xs[u_1 * 8 + j_1];
+                }
+                float _fabs_0 = fabsf(mags[0]);
+                mags[0] = _fabs_0;
+                float _fabs_1 = fabsf(mags[1]);
+                mags[1] = _fabs_1;
+                float _fabs_2 = fabsf(mags[2]);
+                mags[2] = _fabs_2;
+                float _fabs_3 = fabsf(mags[3]);
+                mags[3] = _fabs_3;
+                float _fabs_4 = fabsf(mags[4]);
+                mags[4] = _fabs_4;
+                float _fabs_5 = fabsf(mags[5]);
+                mags[5] = _fabs_5;
+                float _fabs_6 = fabsf(mags[6]);
+                mags[6] = _fabs_6;
+                float _fabs_7 = fabsf(mags[7]);
+                mags[7] = _fabs_7;
+                float mags_max = mags[0];
+                #pragma unroll
+                for (int _lr = 1; _lr < 8; _lr++) {
+                    mags_max = max_noftz(mags_max, mags[_lr]);
+                }
+                float absmax = mags_max;
+                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
+                float o1 = _shfl_xor_0;
+                float _max_0 = max_noftz(absmax, o1);
+                absmax = _max_0;
+                float sf_value = g * (absmax * sixth);
+                uint16_t _e4m3x2_f32_0;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(zero_f32), "f"(sf_value));
+                uint16_t sf_pair = _e4m3x2_f32_0;
+                unsigned int sf_byte = (unsigned int)sf_pair & 255;
+                unsigned int sf_exp = sf_byte >> 3 & 15;
+                unsigned int sf_mant = sf_byte & 7;
+                unsigned int normal_bits = sf_exp + 120 << 23 | sf_mant << 20;
+                float sf_normal = 0.0f;
+                sf_normal = reinterpret_cast<float*>(&normal_bits)[0];
+                float sf_subnormal = (float)sf_mant * 0.001953125f;
+                float sf_f = ((sf_exp == 0) ? sf_subnormal : sf_normal);
+                float _rcp_2 = approx_rcp(sf_f * inv_g);
+                float out_scale_nonzero = _rcp_2;
+                float out_scale = ((absmax == 0.0f) ? 0.0f : out_scale_nonzero);
+                const float2 _scale2_1 = {out_scale, out_scale};
+                #pragma unroll
+                for (int _ls = 0; _ls < 4; _ls++)
+                    mul_f32x2_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_1);
+                unsigned int packed[1];
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(vals[0]), "f"(vals[1]), "f"(vals[2]), "f"(vals[3]), "f"(vals[4]), "f"(vals[5]), "f"(vals[6]), "f"(vals[7]));
+                *(reinterpret_cast<unsigned int*>(a_q + (word_base + (unsigned long long)(k_1 >> 3))) + (0)) = packed[0];
+                if (pair_lane == 0) {
+                    int block = (batch * LOAD_BATCH + u_1) * 16 + block_in_vec;
+                    int k_tile = block >> 2;
+                    int sf_col = block & 3;
+                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col)) + (0)) = (unsigned char)(sf_byte);
+                }
             }
         }
     }
@@ -2750,6 +2784,7 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
 } // extern "C"
 
 #undef ATTN_DIM
+#undef LOAD_BATCH
 #undef MINIMAX_H3_OUT_PROJ_INF
 #undef NUM_MAIN_STAGES
 #undef ROWS_PER_CTA
@@ -2812,7 +2847,7 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
 #define BLOCK_K 256
 #define CTA_GROUP 2
 #define NUM_STAGES 5
-#define GROUP_M 64
+#define GROUP_M 16
 #define WORK_STAGES 4
 #define WORK_CONSUMERS 546
 #define NUM_K_ITERS 28
@@ -2951,6 +2986,7 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
         { // load_main
             unsigned int load_stage = 0;
             unsigned int work_stage = 0;
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_mma_done = 1;
             unsigned int _phase_work_full = 0;
@@ -3663,6 +3699,12 @@ constexpr int kGemmNvfp4Smem = 195712;
 constexpr unsigned int kClusterX = 2u;
 constexpr unsigned int kClusterY = 1u;
 constexpr unsigned int kClusterZ = 1u;
+// Programmatic dependent launch (cudaLaunchAttributeProgrammaticStreamSerialization): the GEMM may
+// start while the preceding launch on the stream is still running; the kernel itself waits
+// (griddepcontrol.wait) before touching that launch's outputs.  Resolved from the kernel module.
+constexpr bool kGemmBf16Pdl = false;
+constexpr bool kGemmMxfp8Pdl = true;
+constexpr bool kGemmNvfp4Pdl = true;
 
 // Quantized operand layouts (FlashInfer 128x4 swizzled scale tiles: 512-byte tiles of 128 rows x 4
 // K-blocks, byte (row % 32) * 16 + (row / 32) * 4 + kblock).
@@ -3876,20 +3918,30 @@ void CheckLaunch(const char* what) {
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError) << what << " launch failed: " << cudaGetErrorString(status);
 }
 
+// Cluster launch; with programmatic_dependent the programmatic-stream-serialization attribute is
+// added so the launch may overlap the tail of the preceding launch on the same stream.
 template <typename Kernel, typename... Args>
-void LaunchCluster(Kernel kernel, int64_t grid, int threads, int smem_bytes, cudaStream_t stream, const char* what, Args... args) {
-  cudaLaunchAttribute attrs[1]{};
-  attrs[0].id = cudaLaunchAttributeClusterDimension;
-  attrs[0].val.clusterDim.x = kClusterX;
-  attrs[0].val.clusterDim.y = kClusterY;
-  attrs[0].val.clusterDim.z = kClusterZ;
+void LaunchCluster(Kernel kernel, int64_t grid, int threads, int smem_bytes, cudaStream_t stream,
+                   bool programmatic_dependent, const char* what, Args... args) {
+  cudaLaunchAttribute attrs[2]{};
+  int n = 0;
+  attrs[n].id = cudaLaunchAttributeClusterDimension;
+  attrs[n].val.clusterDim.x = kClusterX;
+  attrs[n].val.clusterDim.y = kClusterY;
+  attrs[n].val.clusterDim.z = kClusterZ;
+  ++n;
+  if (programmatic_dependent) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned int>(grid), 1, 1);
   config.blockDim = dim3(static_cast<unsigned int>(threads), 1, 1);
   config.dynamicSmemBytes = static_cast<size_t>(smem_bytes);
   config.stream = stream;
   config.attrs = attrs;
-  config.numAttrs = 1;
+  config.numAttrs = static_cast<unsigned int>(n);
   const cudaError_t status = cudaLaunchKernelEx(&config, kernel, args...);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError) << what << " launch failed: " << cudaGetErrorString(status);
 }
@@ -3917,7 +3969,7 @@ void minimax_h3_out_proj(TensorView attn_out, TensorView o_weight, TensorView ga
                                              kBf16BoxRowsA, kBf16BoxGroups, "attn_out");
   const CUtensorMap b_map = EncodeKMajorRows(o_weight.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, kHidden,
                                              kAttnDim, kBf16BoxK, kBf16BoxRowsB, kBf16BoxGroups, "o_weight");
-  LaunchCluster(kernel_minimax_h3_out_proj_bf16, GemmGrid(m_tiles), kGemmBf16Threads, kGemmBf16Smem, stream,
+  LaunchCluster(kernel_minimax_h3_out_proj_bf16, GemmGrid(m_tiles), kGemmBf16Threads, kGemmBf16Smem, stream, kGemmBf16Pdl,
                 "MiniMax-H3 out-proj (bf16)", a_map, b_map, static_cast<__nv_bfloat16*>(gate.data_ptr()),
                 static_cast<int*>(gate_index.data_ptr()), static_cast<__nv_bfloat16*>(residual.data_ptr()),
                 static_cast<__nv_bfloat16*>(out.data_ptr()), static_cast<int>(layout.rows), static_cast<int>(m_tiles),
@@ -3928,7 +3980,8 @@ void minimax_h3_out_proj(TensorView attn_out, TensorView o_weight, TensorView ga
 // [21 * 56 * 1024] combined 256-row weight scale tiles ([n_tile][k_set][half][512]); workspace_q:
 // caller-owned float8_e4m3fn [M, 7168]; workspace_sf: caller-owned uint8 of at least
 // m_tiles(M) * 56 * 512 bytes (swizzled 128x4 activation scales).  Both workspaces receive the
-// FlashInfer-exact MXFP8 quantization of the logical activation A.
+// FlashInfer-exact MXFP8 quantization of the logical activation A.  The GEMM is launched
+// programmatically dependent on the quantization pass (see kGemmMxfp8Pdl).
 void minimax_h3_out_proj_mxfp8(TensorView attn_out, TensorView o_weight_q, TensorView o_scale_tiles, TensorView gate,
                                TensorView gate_index, TensorView residual, TensorView out, TensorView workspace_q,
                                TensorView workspace_sf) {
@@ -3964,7 +4017,7 @@ void minimax_h3_out_proj_mxfp8(TensorView attn_out, TensorView o_weight_q, Tenso
                                                kMxfp8SfaBoxTiles, "workspace_sf");
   const CUtensorMap sfb_map = EncodeScaleTiles(o_scale_tiles.data_ptr(), kSfbTileRows, kNTiles * kMxfp8SfKTiles,
                                                kMxfp8SfbBoxTiles, "o_scale_tiles");
-  LaunchCluster(kernel_minimax_h3_out_proj_e4m3, GemmGrid(m_tiles), kGemmQuantThreads, kGemmMxfp8Smem, stream,
+  LaunchCluster(kernel_minimax_h3_out_proj_e4m3, GemmGrid(m_tiles), kGemmQuantThreads, kGemmMxfp8Smem, stream, kGemmMxfp8Pdl,
                 "MiniMax-H3 out-proj (mxfp8)", a_map, b_map, sfa_map, sfb_map,
                 static_cast<__nv_bfloat16*>(gate.data_ptr()), static_cast<int*>(gate_index.data_ptr()),
                 static_cast<__nv_bfloat16*>(residual.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
@@ -3975,7 +4028,8 @@ void minimax_h3_out_proj_mxfp8(TensorView attn_out, TensorView o_weight_q, Tenso
 // nvfp4_quantize convention, 448 * 6 / absmax); o_weight_q: uint8 [5376, 3584] packed E2M1;
 // o_scale_tiles: uint8 [21 * 112 * 1024] combined 256-row weight scale tiles; alpha: float32 [1] =
 // 1 / (a_global_scale * w_global_scale); workspace_q: caller-owned uint8 [M, 3584]; workspace_sf:
-// caller-owned uint8 of at least m_tiles(M) * 112 * 512 bytes.
+// caller-owned uint8 of at least m_tiles(M) * 112 * 512 bytes.  The GEMM is launched programmatically
+// dependent on the quantization pass (see kGemmNvfp4Pdl).
 void minimax_h3_out_proj_nvfp4(TensorView attn_out, TensorView a_global_scale, TensorView o_weight_q,
                                TensorView o_scale_tiles, TensorView alpha, TensorView gate, TensorView gate_index,
                                TensorView residual, TensorView out, TensorView workspace_q, TensorView workspace_sf) {
@@ -4015,7 +4069,7 @@ void minimax_h3_out_proj_nvfp4(TensorView attn_out, TensorView a_global_scale, T
                                                kNvfp4SfaBoxTiles, "workspace_sf");
   const CUtensorMap sfb_map = EncodeScaleTiles(o_scale_tiles.data_ptr(), kSfbTileRows, kNTiles * kNvfp4SfKTiles,
                                                kNvfp4SfbBoxTiles, "o_scale_tiles");
-  LaunchCluster(kernel_minimax_h3_out_proj_e2m1, GemmGrid(m_tiles), kGemmQuantThreads, kGemmNvfp4Smem, stream,
+  LaunchCluster(kernel_minimax_h3_out_proj_e2m1, GemmGrid(m_tiles), kGemmQuantThreads, kGemmNvfp4Smem, stream, kGemmNvfp4Pdl,
                 "MiniMax-H3 out-proj (nvfp4)", a_map, b_map, sfa_map, sfb_map,
                 static_cast<float*>(alpha.data_ptr()), static_cast<__nv_bfloat16*>(gate.data_ptr()),
                 static_cast<int*>(gate_index.data_ptr()), static_cast<__nv_bfloat16*>(residual.data_ptr()),
