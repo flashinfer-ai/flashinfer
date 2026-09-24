@@ -7,8 +7,10 @@ import flashinfer
 
 
 def _requires_hpc_rope():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("hpc fused RoPE requires SM90+")
+    if not torch.cuda.is_available():
+        pytest.skip("hpc fused RoPE requires CUDA")
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("hpc fused RoPE supports SM90 and SM100 only")
 
 
 def _case(q_heads=8, kv_heads=1):
