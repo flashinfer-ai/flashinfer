@@ -231,6 +231,7 @@ class _ContextCompileSpec:
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
+    two_cta_umma: bool = False
 
 
 @dataclass(frozen=True)
@@ -273,6 +274,8 @@ def _make_context_kernel(
     causal_single_kv_tile: bool,
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
+    exp2_fma_pairs: int,
+    two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
 ):
@@ -296,7 +299,7 @@ def _make_context_kernel(
         if use_paged_kv
         else {}
     )
-    return FmhaTs(
+    fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
         in_qk_dtype=input_qk_dtype,
@@ -305,6 +308,7 @@ def _make_context_kernel(
         d=head_dim,
         d_v=head_dim_vo,
         is_persistent=is_persistent,
+        two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
         balance_causal_workload=(
@@ -324,6 +328,8 @@ def _make_context_kernel(
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         **paged_kwargs,
     )
+    fmha.cfg.exp2_fma_pairs = exp2_fma_pairs
+    return fmha
 
 
 def _validate_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -501,6 +507,20 @@ def _dsl_supports_ldtm_stat() -> bool:
         return pkg_version.Version(dsl_version).release >= (4, 7, 0)
     except pkg_version.InvalidVersion:
         return False
+
+
+def _default_exp2_fma_pairs(device_index: int, v_dtype) -> int:
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk: 4 for 16-bit V on SM100,
+    where MUFU bounds the softmax, 0 elsewhere."""
+    if torch.cuda.get_device_capability(device_index) != (10, 0):
+        return 0
+    return 4 if v_dtype.width == 16 else 0
+
+
+def _default_two_cta_umma(device_index: int) -> bool:
+    """Two-CTA UMMA for the dense paired D128 context kernel: on for SM103, where the
+    kernel is tensor-pipe bound and halving UMMA issues and K/V traffic per SM pays."""
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
 def _default_uses_ldtm_stat(device_index: int) -> bool:
@@ -1475,6 +1495,9 @@ def _make_context_scheduler_probe(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler="static_persistent",
         uses_ldtm_stat=_default_uses_ldtm_stat(geometry.device_index),
+        exp2_fma_pairs=_default_exp2_fma_pairs(
+            geometry.device_index, dtype_map[geometry.pv_dtype]
+        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1578,6 +1601,22 @@ def _resolve_paged_plan_geometry(
     )
 
 
+def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
+    """Dense contiguous MHA at D=128 with bf16 QK runs the two-CTA UMMA form, which
+    pairs Q tiles through the grid."""
+    return (
+        _default_two_cta_umma(geometry.device_index)
+        and geometry.head_dim == 128
+        and geometry.head_dim_vo in (None, 128)
+        and geometry.mask_type == "dense"
+        and not geometry.packed
+        and not geometry.head_paired
+        and geometry.num_qo_heads == geometry.num_kv_heads
+        and torch.finfo(geometry.qk_dtype).bits == 16
+        and torch.finfo(geometry.pv_dtype).bits in (8, 16)
+    )
+
+
 def _resolve_context_scheduler(geometry: _ContextPlanGeometry) -> _ContextScheduler:
     """Select a scheduler from plan-time work while keeping batch out of JIT."""
 
@@ -1585,6 +1624,9 @@ def _resolve_context_scheduler(geometry: _ContextPlanGeometry) -> _ContextSchedu
         geometry,
         causal_single_kv_tile=geometry.causal_single_kv_tile,
     )
+    if _two_cta_umma_geometry_eligible(geometry):
+        # Two-CTA pairs Q tiles through the grid, so no persistent scheduler.
+        return "nonpersistent"
     is_persistent = _contiguous_context_uses_persistent_scheduler(
         single_qkv_instance=probe.single_qkv_instance,
         head_paired=geometry.head_paired,
@@ -1664,6 +1706,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         causal_single_kv_tile=geometry.causal_single_kv_tile,
         packed_dense_k_mask=geometry.packed_dense_k_mask,
         scheduler=_resolve_context_scheduler(geometry),
+        two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
     )
 
 
@@ -1718,6 +1761,7 @@ def _get_compiled_context(
     causal_single_kv_tile = compile_spec.causal_single_kv_tile
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
     scheduler = compile_spec.scheduler
+    two_cta_umma = compile_spec.two_cta_umma
 
     import cutlass
     import cutlass.cute as cute
@@ -1749,7 +1793,9 @@ def _get_compiled_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
+        two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        exp2_fma_pairs=_default_exp2_fma_pairs(device_index, input_pv_dtype),
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1962,6 +2008,7 @@ def _get_compiled_paged_context(
         causal_single_kv_tile=False,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        exp2_fma_pairs=_default_exp2_fma_pairs(device_index, input_pv_dtype),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )

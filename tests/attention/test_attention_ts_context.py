@@ -3892,6 +3892,57 @@ def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
     )
 
 
+# Fixed dense K tails. The tail size S % 128 selects the partial-tile path in
+# the query-paired softmax schedule. Lengths with two or more K/V tiles run
+# unmasked loop iterations before the masked last tile.
+_FIXED_DENSE_K_TAIL_CASES = (
+    pytest.param((272,), id="two-tiles-tail16"),
+    pytest.param((336,), id="two-tiles-tail80"),
+    pytest.param((1040,), id="nine-tiles-tail16"),
+    pytest.param((4112,), id="thirty-three-tiles-tail16"),
+    pytest.param((4176,), id="thirty-three-tiles-tail80"),
+    pytest.param((4096,), id="aligned-control-no-tail"),
+)
+
+
+@pytest.mark.parametrize("k_lengths", _FIXED_DENSE_K_TAIL_CASES)
+@pytest.mark.parametrize(
+    "pv_dtype",
+    (torch.bfloat16, _FP8),
+    ids=("pv-bf16", "pv-fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_fixed_dense_k_tail_accuracy(
+    k_lengths: tuple[int, ...],
+    pv_dtype: torch.dtype,
+):
+    """Random data on the fixed dense tail path against the torch reference.
+
+    Unpacked BSHD with equal Q and K lengths is the contiguous no-KV-cache
+    layout that diffusion workloads use. The last K/V tile is masked to its
+    valid keys, so the output matches the reference for PV bf16 and PV fp8.
+    """
+    (k_length,) = k_lengths
+    case = _make_context_case(
+        q_lengths=(k_length, k_length),
+        k_lengths=(k_length, k_length),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=torch.bfloat16,
+        packed=False,
+        mask_type="dense",
+        output_dtype=torch.bfloat16,
+        device="cuda",
+        seed=2026091602 + k_length,
+    )
+    if pv_dtype is _FP8:
+        case = replace(case, v=case.v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
@@ -5339,3 +5390,59 @@ def test_attention_ts_context_mla_prefill(
         wrapper.run(q, k, v, qo, ko, out=torch.empty_like(q, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="v must have"):
         wrapper.run(q, k, torch.empty_like(k), qo, ko)
+
+
+# ---------------------------------------------------------------------------
+# Two-CTA UMMA (SM103 dense contiguous D128)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pv_dtype", (torch.bfloat16, _FP8), ids=("pv-bf16", "pv-fp8"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_two_cta_matches_single_cta(monkeypatch, pv_dtype):
+    """The paired kernel reproduces the single-CTA kernel and the reference.
+
+    8456 tokens give 33 query tiles per (batch, head): the odd count exercises the
+    even-grid padding of the cluster launch, and the 8-row remainder exercises the
+    partial last tile under two-CTA. Two batches and two heads make the pairing
+    cross batch and head boundaries. The device default is overridden both ways
+    so the kernel is exercised on SM100 as well as SM103, where it is the default.
+    """
+
+    case = _make_context_case(
+        q_lengths=(8456, 8456),
+        k_lengths=(8456, 8456),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        qkv_dtype=torch.bfloat16,
+        packed=False,
+        mask_type="dense",
+        output_dtype=torch.bfloat16,
+        output_scale=1.0,
+        seed=2026092201,
+    )
+    if pv_dtype is _FP8:
+        case = replace(case, v=case.v.to(_FP8))
+
+    monkeypatch.setattr(
+        context_module, "_default_two_cta_umma", lambda device_index: True
+    )
+    two_cta = BatchPrefillTSWrapper()
+    _plan_wrapper(two_cta, case)
+    assert two_cta._plan_state is not None
+    assert dict(two_cta._plan_state.policy)["scheduler"] == "nonpersistent"
+    out_two_cta = _run_wrapper(two_cta, case)
+    _assert_context_correct(out_two_cta, case)
+
+    monkeypatch.setattr(
+        context_module, "_default_two_cta_umma", lambda device_index: False
+    )
+    single_cta = BatchPrefillTSWrapper()
+    _plan_wrapper(single_cta, case)
+    out_single_cta = _run_wrapper(single_cta, case)
+    # Same per-row arithmetic in both forms; only the MMA M extent and the K/V
+    # staging differ, so the outputs agree to bf16 rounding.
+    torch.testing.assert_close(
+        out_two_cta.float(), out_single_cta.float(), atol=2e-3, rtol=1e-2
+    )

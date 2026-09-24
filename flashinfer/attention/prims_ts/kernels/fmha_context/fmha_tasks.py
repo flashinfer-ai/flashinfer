@@ -56,6 +56,7 @@ from .fmha_resources import (
     TmemSPResource,
     TmemStatsResource,
     TmemStatsDoneResource,
+    TmemPPrefixReadyResource,
 )
 
 
@@ -811,6 +812,8 @@ def create_mma_task(
     tmem_vec_done_1: TmemStatsDoneResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
+    tmem_p_prefix_ready_0: TmemPPrefixReadyResource | None = None,
+    tmem_p_prefix_ready_1: TmemPPrefixReadyResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp MMA compute task."""
@@ -822,7 +825,21 @@ def create_mma_task(
     if split_kv and smem_v is None:
         raise ValueError("split K/V staging requires a separate V buffer")
     kv_resources = (smem_k_or_kv, smem_v) if split_kv else (smem_k_or_kv,)
-    src = _src_resources(*qkv_resources, smem_q, *kv_resources, work_queue=work_queue)
+    pv_half_overlap = smem_q.cfg.pv_half_overlap
+    if pv_half_overlap and (
+        tmem_p_prefix_ready_0 is None or tmem_p_prefix_ready_1 is None
+    ):
+        raise ValueError("pv_half_overlap requires both P-prefix barriers")
+    p_prefix_resources = (
+        (tmem_p_prefix_ready_0, tmem_p_prefix_ready_1) if pv_half_overlap else ()
+    )
+    src = _src_resources(
+        *qkv_resources,
+        smem_q,
+        *kv_resources,
+        *p_prefix_resources,
+        work_queue=work_queue,
+    )
     num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
     num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
 
@@ -1256,8 +1273,24 @@ def create_mma_task(
         vd0: TmemStatsDoneResource,
         vd1: TmemStatsDoneResource,
         wq: WorkQueue | None = None,
+        pr0: TmemPPrefixReadyResource | None = None,
+        pr1: TmemPPrefixReadyResource | None = None,
     ) -> None:
         """Interleave paired QK/PV while retaining each K slice for both Qs."""
+
+        def pv(
+            sp: TmemSPResource, pr: TmemPPrefixReadyResource | None, **kw: Any
+        ) -> None:
+            """PV for one query group. With overlap, start on the leading half
+            of P as soon as softmax has stored it, then wait for the full P."""
+            if pv_half_overlap:
+                pr.wait()
+                to.pv_mma(k_half=0, **kw)
+                pr.release()
+            sp.acquire()
+            sp.p_read()
+            to.pv_mma(k_half=1 if pv_half_overlap else None, **kw)
+
         sq.init_descriptor_state()
         sk.init_descriptor_state()
         sv.init_descriptor_state()
@@ -1334,9 +1367,7 @@ def create_mma_task(
                 desc_v_base = sv.v_desc()
             # Acquire O first (off critical path), then acquire SP0 and run PV→O0.
             to.acquire()
-            sp0.acquire()
-            sp0.p_read()
-            to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Head)
+            pv(sp0, pr0, desc_v_base=desc_v_base, section=FmhaStage.Head)
             to.commit()
 
             # QK0 -> PV1 -> QK1 -> PV0: retain each K slice and the previous V
@@ -1345,9 +1376,7 @@ def create_mma_task(
                 k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
                 sp0.commit()
                 to.acquire()
-                sp1.acquire()
-                sp1.p_read()
-                to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Loop)
+                pv(sp1, pr1, desc_v_base=desc_v_base, section=FmhaStage.Loop)
                 to.commit()
                 # Release V_prev after PV1 UMMA consumed SMEM data.
                 sv.release()
@@ -1372,18 +1401,20 @@ def create_mma_task(
                     desc_v_base = sv.v_desc()
                 # PV0: P0 * Vi+1 → O0.
                 to.acquire()
-                sp0.acquire()
-                sp0.p_read()
-                to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Loop, inst_idx=1)
+                pv(
+                    sp0,
+                    pr0,
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Loop,
+                    inst_idx=1,
+                )
                 to.commit()
 
             sq.release()
             sq.release()
             sp0.commit()
             to.acquire()
-            sp1.acquire()
-            sp1.p_read()
-            to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Tail, is_tail=True)
+            pv(sp1, pr1, desc_v_base=desc_v_base, section=FmhaStage.Tail, is_tail=True)
             to.commit()
             sv.release()
             sp1.commit()
@@ -1419,8 +1450,48 @@ def create_mma_task(
         """Split K/V captured schedule."""
         mma_schedule_body(gqkv, sq, sk, sv, sp0, sp1, to, vd0, vd1, wq)
 
+    # Overlap variants carry the two P-prefix barriers.
+    @schedule
+    def mma_schedule_pr(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pr0: TmemPPrefixReadyResource,
+        pr1: TmemPPrefixReadyResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Shared-buffer captured schedule with P-prefix overlap."""
+        mma_schedule_body(gqkv, sq, skv, skv, sp0, sp1, to, vd0, vd1, wq, pr0, pr1)
+
+    @schedule
+    def mma_split_schedule_pr(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pr0: TmemPPrefixReadyResource,
+        pr1: TmemPPrefixReadyResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Split K/V captured schedule with P-prefix overlap."""
+        mma_schedule_body(gqkv, sq, sk, sv, sp0, sp1, to, vd0, vd1, wq, pr0, pr1)
+
+    if pv_half_overlap:
+        selected_mma_schedule = mma_split_schedule_pr if split_kv else mma_schedule_pr
+    else:
+        selected_mma_schedule = mma_split_schedule if split_kv else mma_schedule
     captured_schedule = _schedule_with_work_queue(
-        mma_split_schedule if split_kv else mma_schedule,
+        selected_mma_schedule,
         gmem_qkv,
         smem_q,
         *kv_resources,
@@ -1429,6 +1500,7 @@ def create_mma_task(
         tmem_o,
         tmem_vec_done_0,
         tmem_vec_done_1,
+        *p_prefix_resources,
         work_queue=work_queue,
     )
     return task_class(
@@ -1452,6 +1524,7 @@ def create_softmax_task(
     s0s1_seq: S0S1SequenceResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
+    tmem_p_prefix_ready: TmemPPrefixReadyResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create a four-warp Softmax task.
@@ -1535,6 +1608,12 @@ def create_softmax_task(
                             )
                         else:
                             old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                        if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
+                            row_max = sp.freeze_row_max(
+                                old_row_max=old_row_max,
+                                row_max=row_max,
+                                scale_softmax_log2=scale_softmax_log2,
+                            )
                         # Stats(i): S(i) -> row max/sum for correction.
                         vec.store_vec(
                             old_row_max=old_row_max,
@@ -1948,13 +2027,18 @@ def create_softmax_task(
     dst = [tmem_vec]
     if s0s1_seq is not None and index == 0:
         dst.append(s0s1_seq)
+    pv_half_overlap = tmem_sp.cfg.pv_half_overlap
+    if pv_half_overlap:
+        if tmem_p_prefix_ready is None:
+            raise ValueError("pv_half_overlap requires the P-prefix barrier")
+        dst.append(tmem_p_prefix_ready)
 
-    @schedule
-    def softmax_schedule(
+    def softmax_schedule_body(
         sp: TmemSPResource,
         vec: TmemStatsResource,
         seq: S0S1SequenceResource,
         wq: WorkQueue | None = None,
+        pr: TmemPPrefixReadyResource | None = None,
     ) -> None:
         """Captured schedule for one softmax warp group."""
         if tmem_sp.enable_early_tile_sum:
@@ -1964,6 +2048,19 @@ def create_softmax_task(
         else:
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
+
+        def exp2_p(sp: TmemSPResource, *, row_max: Any, scale_softmax_log2: Any) -> Any:
+            """Softmax and P store. With overlap, publish the leading half of
+            P behind ``pr`` before computing the rest."""
+            if not pv_half_overlap:
+                return sp.exp2_p(row_max=row_max, scale_softmax_log2=scale_softmax_log2)
+            pr.acquire()
+            p_lo = sp.exp2_p_lo(row_max=row_max, scale_softmax_log2=scale_softmax_log2)
+            pr.commit()
+            return sp.exp2_p_hi(
+                row_max=row_max, scale_softmax_log2=scale_softmax_log2, p_lo=p_lo
+            )
+
         vec.init_store_state()
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
             # Recompute per-tile SP/Vec TMEM state.
@@ -2004,10 +2101,6 @@ def create_softmax_task(
                         row_max=row_max,
                         q_offset=q_offset,
                     )
-                elif tmem_sp.uses_fixed_dense_k_tail_mask:
-                    old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                        row_max=row_max,
-                    )
                 elif tmem_sp.uses_packed_dense_k_mask:
                     old_row_max, row_max = sp.packed_dense_k_masked_row_max(
                         row_max=row_max,
@@ -2016,6 +2109,12 @@ def create_softmax_task(
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                if tmem_sp.cfg.corr_skip_threshold_log2 > 0:
+                    row_max = sp.freeze_row_max(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2038,7 +2137,8 @@ def create_softmax_task(
                     else:
                         seq.release()
                 # Apply softmax and write P.
-                p_chunk = sp.exp2_p(
+                p_chunk = exp2_p(
+                    sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
@@ -2170,7 +2270,7 @@ def create_softmax_task(
                 )
                 vec.commit()
             elif tmem_sp.cfg.is_causal:
-                # Causal softmax1 TAIL handles masked rows and cleanup.
+                # Causal tail: mask the last tile, then publish the final stats.
                 sp.wait()
                 old_row_max, row_max = sp.masked_row_max(
                     row_max=row_max,
@@ -2209,9 +2309,58 @@ def create_softmax_task(
                     final_stats=True,
                 )
                 vec.commit()
+            elif tmem_sp.uses_fixed_dense_k_tail_mask:
+                # Dense tail: one more loop step with the zero-filled lanes masked out.
+                sp.wait()
+                old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                    row_max=row_max,
+                    section=FmhaStage.Tail,
+                )
+                vec.store_vec(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                )
+                vec.commit()
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
+                    seq.acquire()
+                else:
+                    seq.wait()
+                p_chunk = exp2_p(
+                    sp,
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                )
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
+                    seq.commit()
+                else:
+                    seq.release()
+                sp.release()
+                row_sum = sp.softmax_aux_reduce(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    p_chunk=p_chunk,
+                    scale_softmax_log2=scale_softmax_log2,
+                )
+                vec.acquire()
+                # Cleanup: drain the final SP slot and publish identity stats.
+                sp.wait()
+                sp.release()
+                old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                vec.store_vec(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    final_stats=True,
+                )
+                vec.commit()
             else:
-                # Non-causal TAIL commits the reserved stats slot and lets MMA
-                # complete its cleanup path.
+                # Non-causal tail: no more tiles, just publish the final stats.
                 sp.wait()
                 sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
@@ -2223,9 +2372,38 @@ def create_softmax_task(
                 )
                 vec.commit()
 
-    captured_schedule = _schedule_with_work_queue(
-        softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
-    )
+    @schedule
+    def softmax_schedule(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq)
+
+    @schedule
+    def softmax_schedule_pr(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        pr: TmemPPrefixReadyResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq, pr)
+
+    if pv_half_overlap:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule_pr,
+            tmem_sp,
+            tmem_vec,
+            s0s1_seq,
+            tmem_p_prefix_ready,
+            work_queue=work_queue,
+        )
+    else:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
+        )
     return task_class(
         src_resources=src,
         dst_resources=dst,
@@ -2456,8 +2634,7 @@ def create_correction_task(
                     )
                     v0.release()
                     to.release()
-                # TAIL: consume remaining stats, release tmem-stats-done gates, and
-                # stage corrected O0/O1 into SMEM for the epilogue task.
+                # Tail: read the final stats, then write corrected O0/O1 to smem.
                 v1.release()
                 v0.wait()
                 _, _, vec_row_sum, vec_scale = v0.read_vec(
