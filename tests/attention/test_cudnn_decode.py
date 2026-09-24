@@ -1,4 +1,5 @@
 import math
+from functools import partial
 import subprocess
 import sys
 from pathlib import Path
@@ -1494,3 +1495,112 @@ def test_auto_backend_resolves_cudnn_with_frost_engines(
     out_ref, lse_ref = _run_wrapper("fa2", *args, q_len_per_req=q_len_per_req)
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 4])
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+@pytest.mark.parametrize("caller_block_table", [False, True])
+def test_auto_cudnn_fast_plan_capture_reuses_prepared(
+    monkeypatch, q_len_per_req, use_tensor_cores, caller_block_table
+):
+    """Fast planning must refresh cuDNN metadata, including for captured MTP.
+
+    Exercise the serving pattern that replaces the bound plan method, checks
+    changed sequence lengths, and replays the original capture with poisoned O/LSE.
+    """
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    torch.manual_seed(73)
+    b, h, hk, d, page = 8, 64, 4, 128, 16
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, 128, page, hk, h, d, torch.bfloat16, "HND", "cuda:0", q_len_per_req
+    )
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "HND",
+        backend="auto",
+        use_tensor_cores=use_tensor_cores,
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.empty_like(indptr),
+        paged_kv_indices_buffer=torch.empty_like(indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(last),
+    )
+    kwargs = dict(q_data_type=q.dtype, q_len_per_req=q_len_per_req)
+    table = None
+    if caller_block_table:
+        table = torch.zeros((b, 8), dtype=torch.int32, device=q.device)
+        offsets = indptr.cpu().tolist()
+        for i in range(b):
+            table[i, : offsets[i + 1] - offsets[i]] = indices[
+                offsets[i] : offsets[i + 1]
+            ]
+    wrapper.plan(indptr, indices, last, h, hk, d, page, block_tables=table, **kwargs)
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(q, cache, return_lse=True)
+    prepared = wrapper._cudnn_prepared
+    assert prepared is not None
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, cache, out=out, lse=lse, return_lse=True)
+
+    # Change lengths without changing the page counts or captured geometry.
+    new_last = torch.where(last == page, last - 1, last + 1)
+    wrapper.plan = partial(flashinfer.fast_decode_plan, wrapper)
+    wrapper.plan(
+        indptr,
+        indices,
+        new_last,
+        h,
+        hk,
+        d,
+        page,
+        global_override_indptr_cpu=indptr.cpu(),
+        **kwargs,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    wrapper.run(q, cache, out=out, lse=lse, return_lse=True)
+    assert wrapper._cudnn_prepared is prepared
+    if caller_block_table:
+        assert wrapper._block_tables is table
+    ref, ref_lse = _run_wrapper(
+        "fa2",
+        q,
+        cache,
+        indptr,
+        indices,
+        new_last,
+        page,
+        hk,
+        h,
+        d,
+        q.dtype,
+        "HND",
+        q_len_per_req=q_len_per_req,
+    )
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+def test_auto_cudnn_workspace_query_agrees_with_plan(monkeypatch):
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto()
+    assert wrapper.resolved_backend == "cudnn"
+    # A fresh query must not return an FA2 size for a cuDNN plan, either
+    # before or after the first plan on the wrapper.
+    fresh = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        wrapper._float_workspace_buffer, "HND", backend="auto", use_tensor_cores=True
+    )
+    _, _, indptr, indices, last, page, hk, h, d, dtype, _ = args
+    for w in (fresh, wrapper):
+        with pytest.raises(NotImplementedError, match="backend 'cudnn'"):
+            w.workspace_size(indptr, indices, last, h, hk, d, page, q_data_type=dtype)

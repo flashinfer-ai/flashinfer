@@ -87,14 +87,27 @@ def test_configure_warns_when_cudnn_was_imported_first(clean_env):
     clean_env.setenv(FI, "1")
     with pytest.warns(RuntimeWarning, match="already imported"):
         assert frost.configure_cudnn_frost_engines() is False
-    # the frontend already read its switch: FlashInfer must not pretend otherwise
+    # The late FI override was declined: availability must use FE's setting.
     assert FE not in os.environ
+    assert frost.frost_decode_engines_available((10, 0)) is False
 
     # same setting as what the frontend read: nothing to warn about
     clean_env.setenv(FE, "1")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert frost.configure_cudnn_frost_engines() is True
+    assert frost.frost_decode_engines_available((10, 0)) is True
+
+
+def test_availability_uses_forwarded_setting_not_a_late_fi_override(clean_env):
+    clean_env.setenv(FI, "1")
+    assert frost.configure_cudnn_frost_engines() is True
+    _fake_cudnn(clean_env, "1.30.0")
+    clean_env.setenv(FI, "0")
+    # Editing FI's alias after configuration does not change FE's setting.
+    assert frost.frost_decode_engines_available((10, 0)) is True
+    clean_env.setenv(FE, "0")
+    assert frost.frost_decode_engines_available((10, 0)) is False
 
 
 @pytest.mark.parametrize(
@@ -138,7 +151,7 @@ def test_frost_decode_engines_available(clean_env, requested, version, cc, expec
     else:
         _fake_cudnn(clean_env, version)
     if requested:
-        clean_env.setenv(FI, "1")
+        clean_env.setenv(FE, "1")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert frost.frost_decode_engines_available(cc) is expected
@@ -146,7 +159,7 @@ def test_frost_decode_engines_available(clean_env, requested, version, cc, expec
 
 def test_frost_decode_engines_warn_once_on_old_frontend(clean_env):
     _fake_cudnn(clean_env, "1.29.0")
-    clean_env.setenv(FI, "1")
+    clean_env.setenv(FE, "1")
     with pytest.warns(RuntimeWarning, match="1.29.0"):
         assert frost.frost_decode_engines_available((10, 0)) is False
     with warnings.catch_warnings():

@@ -24,9 +24,8 @@ from .cudnn_frost import (
     configure_cudnn_frost_engines as _configure_cudnn_frost_engines,
 )
 
-# cudnn-frontend reads its FROST-engine opt-in once, at `import cudnn`, and
-# FlashInfer imports cudnn lazily from several modules; apply
-# FLASHINFER_CUDNN_FROST_ENGINES before the first of them can run.
+# Apply FLASHINFER_CUDNN_FROST_ENGINES before any FlashInfer submodule can
+# import cudnn and select/cache an execution plan.
 _configure_cudnn_frost_engines()
 
 

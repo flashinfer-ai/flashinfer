@@ -1336,6 +1336,47 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def _uses_cudnn(self) -> bool:
         return self._backend == "cudnn" or self._cudnn_auto
 
+    def _auto_prefers_cudnn(
+        self,
+        q_data_type,
+        kv_data_type,
+        o_data_type,
+        head_dim,
+        num_qo_heads,
+        num_kv_heads,
+        batch_size,
+        page_size,
+        pos_encoding_mode,
+        window_left,
+        logits_soft_cap,
+        q_len_per_req,
+    ) -> bool:
+        # Both plan() and workspace_size() must select the same backend.
+        # A caller-provided JIT module must not be replaced by auto routing.
+        if self._requested_backend != "auto" or self._jit_module is not None:
+            return False
+        cc = get_compute_capability(self.device)
+        return _auto_decode_prefers_cudnn(
+            compute_capability=cc,
+            frost_available=frost_decode_engines_available(cc),
+            cudnn_available=_CUDNN_GRAPH_AVAILABLE,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            head_dim=head_dim,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            batch_size=batch_size,
+            page_size=page_size,
+            pos_encoding_mode=pos_encoding_mode,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_len_per_req=q_len_per_req,
+            sm_count=torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count,
+        )
+
     @property
     def resolved_backend(self) -> str:
         r"""What the last :meth:`plan` resolved ``backend="auto"`` to: ``"cudnn"``
@@ -1506,6 +1547,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
+        if self._auto_prefers_cudnn(
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+            head_dim,
+            num_qo_heads,
+            num_kv_heads,
+            batch_size,
+            page_size,
+            pos_encoding_mode,
+            window_left,
+            logits_soft_cap,
+            q_len_per_req,
+        ):
+            backend = "cudnn"
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
+            raise NotImplementedError(
+                f"workspace_size is not available for decode backend {backend!r}"
+            )
+
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
@@ -1541,11 +1602,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"request with kv_len={min_kv_len}: its earlier rows "
                     "would attend to an empty KV range."
                 )
-
-        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
-            raise NotImplementedError(
-                f"workspace_size is not available for decode backend {backend!r}"
-            )
 
         if self.use_tensor_cores:
             if self._jit_module is not None:
@@ -1851,29 +1907,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
-        self._cudnn_auto = False
-        if self._requested_backend == "auto":
-            cc = get_compute_capability(self.device)
-            self._cudnn_auto = _auto_decode_prefers_cudnn(
-                compute_capability=cc,
-                frost_available=frost_decode_engines_available(cc),
-                cudnn_available=_CUDNN_GRAPH_AVAILABLE,
-                q_data_type=q_data_type,
-                kv_data_type=kv_data_type,
-                o_data_type=o_data_type,
-                head_dim=head_dim,
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                batch_size=batch_size,
-                page_size=page_size,
-                pos_encoding_mode=pos_encoding_mode,
-                window_left=window_left,
-                logits_soft_cap=logits_soft_cap,
-                q_len_per_req=q_len_per_req,
-                sm_count=torch.cuda.get_device_properties(
-                    self.device
-                ).multi_processor_count,
-            )
+        self._cudnn_auto = self._auto_prefers_cudnn(
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+            head_dim,
+            num_qo_heads,
+            num_kv_heads,
+            batch_size,
+            page_size,
+            pos_encoding_mode,
+            window_left,
+            logits_soft_cap,
+            q_len_per_req,
+        )
         if window_right != 0 and self._backend != "cute-dsl":
             raise NotImplementedError(
                 "BatchDecodeWithPagedKVCacheWrapper only supports window_right != 0 "
@@ -1923,7 +1970,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf[: len(indices)].copy_(
                 indices, non_blocking=(indices.device == self.device) and non_blocking
             )
-            if q_len_per_req > 1 and self._backend in ("auto", "fa2"):
+            if (
+                self.use_tensor_cores
+                and q_len_per_req > 1
+                and self._backend in ("auto", "fa2")
+            ):
                 # "auto" is unresolved here; its fa3 resolution is rejected
                 # later in plan()
                 self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
@@ -4575,7 +4626,42 @@ def fast_decode_plan(
     Modifications:
     - Remove unnecessary device-to-device copy for the cuda graph buffers.
     - Remove unnecessary host-to-device copy for the metadata buffers.
+
+    cuDNN uses the regular planner to refresh its KV lengths and block table;
+    compatible prepared graphs are still reused. The copy-elision below is
+    specific to the FA2/FA3 module, not cuDNN's metadata contract.
     """
+    if self._uses_cudnn:
+        # Call the implementation directly: serving callers can replace
+        # self.plan with partial(fast_decode_plan, self).
+        return self._plan_impl(
+            indptr
+            if global_override_indptr_cpu is None
+            else global_override_indptr_cpu,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            pos_encoding_mode=pos_encoding_mode,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type
+            if q_data_type is not None
+            else data_type or "float16",
+            kv_data_type=kv_data_type,
+            data_type=data_type,
+            o_data_type=self._cached_o_data_type,
+            sm_scale=sm_scale,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            non_blocking=non_blocking,
+            block_tables=self._block_tables if self._user_block_tables else None,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+            q_len_per_req=q_len_per_req,
+        )
     batch_size = len(last_page_len)
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")

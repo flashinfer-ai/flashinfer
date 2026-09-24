@@ -24,6 +24,14 @@ wrapper's ``backend="auto"`` resolves to ``cudnn`` on SM100 for the d128 decode
 shapes where the decode tile measures at or ahead of fa2; ``FLASHINFER_DECODE_AUTO_CUDNN``
 overrides that choice.
 
+Compatible decode runs and replans retain the prepared cuDNN graph. Planning
+still stages changing KV lengths and, unless the caller supplies a dense GPU
+``block_tables``, constructs that table from CSR metadata. CUDA Graph replay
+does not include this host planning work. ``fast_decode_plan`` uses the regular
+cuDNN planner for these updates; its FA2/FA3 copy-elision does not apply to
+cuDNN. ``workspace_size`` currently raises for both explicit and auto-selected
+cuDNN, rather than returning another backend's workspace requirements.
+
 .. currentmodule:: flashinfer.cudnn
 
 .. autosummary::

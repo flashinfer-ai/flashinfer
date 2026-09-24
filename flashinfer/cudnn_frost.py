@@ -14,8 +14,8 @@
 
 """FlashInfer's switch for cudnn-frontend's opt-in FROST SDPA engines.
 
-cudnn-frontend ships its CuTe-DSL ("FROST") SDPA engines behind an opt-in that
-the frontend reads once, at ``import cudnn``: ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES``.
+cudnn-frontend offers its opt-in CuTe-DSL ("FROST") SDPA engines when
+``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` is enabled during engine selection.
 Those engines are what make cuDNN decode fast for the popular decode shapes on
 Blackwell (the d128 / d256 decode tiles, multi-token rows, attention sinks at
 ``q_len_per_req == 1``); the classic backend engine serves the same graphs
@@ -66,9 +66,9 @@ def configure_cudnn_frost_engines() -> bool:
 
     Idempotent; returns whether the engines are requested. When the variable is
     unset, the frontend's own variable is left untouched. When cudnn was already
-    imported before FlashInfer, the frontend has read its switch and this call
-    cannot change it: a ``RuntimeWarning`` says so and the effective setting is
-    returned.
+    imported before FlashInfer, leave its setting alone: changing the available
+    engines would not invalidate existing cached plans. A ``RuntimeWarning``
+    explains this restriction and the effective setting is returned.
     """
     fi = os.environ.get(FI_FROST_ENV)
     if fi is None:
@@ -78,7 +78,7 @@ def configure_cudnn_frost_engines() -> bool:
     if "cudnn" in sys.modules and (_is_true(current) != _is_true(want)):
         warnings.warn(
             f"{FI_FROST_ENV}={fi!r} was applied after cudnn was already imported; "
-            "cudnn-frontend read its FROST-engine switch at import, so this process "
+            "changing engine availability does not invalidate cached plans, so this process "
             f"keeps {FE_FROST_ENV}={current!r}. Import flashinfer before cudnn, or set "
             f"{FE_FROST_ENV} in the environment.",
             RuntimeWarning,
@@ -134,7 +134,9 @@ def frost_decode_engines_available(compute_capability: Tuple[int, int]) -> bool:
     :data:`FROST_DECODE_MIN_FRONTEND`, and the device is SM100 / SM103 (the
     Blackwell parts with a decode tile; Rubin has its own rows without one).
     """
-    if not frost_engines_requested():
+    # configure_cudnn_frost_engines may decline a late FI override. Read the
+    # actual FE setting, not the requested FI value, just as FE's manifest does.
+    if not _is_true(os.environ.get(FE_FROST_ENV)):
         return False
     version = cudnn_frontend_version()
     if version is None:
