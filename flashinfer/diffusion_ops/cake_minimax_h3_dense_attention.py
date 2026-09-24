@@ -36,6 +36,28 @@ def _get_module():
     return gen_minimax_h3_dense_attention_module().build_and_load()
 
 
+_WORKSPACES: dict = {}
+
+
+def _workspace(device: torch.device) -> torch.Tensor:
+    """Per-device zero-initialized workspace for the in-kernel tail split-KV merge.
+
+    The kernel rewinds its arrival counters after every launch, so one buffer per device
+    serves every call on that device (stream-ordered launches).
+    """
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    workspace = _WORKSPACES.get(index)
+    if workspace is None:
+        with torch.cuda.device(index):
+            nbytes = int(_get_module().minimax_h3_dense_attention_workspace_size())
+            workspace = torch.zeros(
+                nbytes, dtype=torch.uint8, device=torch.device("cuda", index)
+            )
+        _WORKSPACES[index] = workspace
+    return workspace
+
+
 def _check_rows(name: str, rows: torch.Tensor, tokens: int) -> None:
     if rows.dtype != torch.bfloat16:
         raise ValueError(f"{name} must be bfloat16, got {rows.dtype}")
@@ -47,14 +69,17 @@ def _check_rows(name: str, rows: torch.Tensor, tokens: int) -> None:
         raise ValueError(f"{name} must be a contiguous CUDA tensor")
 
 
-@register_custom_op("flashinfer::minimax_h3_dense_attention", mutates_args=("out",))
+@register_custom_op(
+    "flashinfer::minimax_h3_dense_attention", mutates_args=("out", "workspace")
+)
 def _minimax_h3_dense_attention_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
+    workspace: torch.Tensor,
 ) -> None:
-    _get_module().minimax_h3_dense_attention(q, k, v, out)
+    _get_module().minimax_h3_dense_attention(q, k, v, out, workspace)
 
 
 @register_fake_op("flashinfer::minimax_h3_dense_attention")
@@ -63,6 +88,7 @@ def _minimax_h3_dense_attention_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
+    workspace: torch.Tensor,
 ) -> None:
     pass
 
@@ -85,7 +111,8 @@ def minimax_h3_dense_attention(
     query scale and the attention run in one kernel.  One runtime-variable kernel serves any
     ``1 <= tokens <= 131072``: a persistent 256-thread CTA per SM walks the (head, 128-row
     query tile) work items with a two-stage K/V TMA ring and a ping-pong schedule between
-    its two warp groups.
+    its two warp groups; the items of the last wave are split across the otherwise idle CTAs
+    by K/V range and merged in-kernel through a small per-device workspace.
 
     Parameters
     ----------
@@ -111,7 +138,7 @@ def minimax_h3_dense_attention(
         out = torch.empty_like(q)
     else:
         _check_rows("out", out, tokens)
-    _minimax_h3_dense_attention_impl(q, k, v, out)
+    _minimax_h3_dense_attention_impl(q, k, v, out, _workspace(q.device))
     return out
 
 

@@ -123,6 +123,29 @@ def test_minimax_h3_dense_attention_preallocated_output() -> None:
     torch.testing.assert_close(out.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(
+    not _supported(),
+    reason="requires a CUDA GPU with compute capability 9.0, 10.x or 12.x",
+)
+def test_minimax_h3_dense_attention_repeated_launches_reuse_workspace() -> None:
+    """Back-to-back launches of different sizes share the per-device workspace.
+
+    The last-wave items are split across idle CTAs and merged in-kernel through the
+    workspace; the kernel rewinds its arrival counters, so the second launch of every
+    size must match the first.
+    """
+
+    device = torch.device("cuda:0")
+    for tokens in (1023, 257, 1023, 4097):
+        q, k, v = synthetic_inputs(tokens, seed=2, device=device)
+        first = minimax_h3_dense_attention(q, k, v)
+        second = minimax_h3_dense_attention(q, k, v)
+        torch.cuda.synchronize()
+        expected = fp32_oracle(q, k, v)
+        torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(first.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_dense_attention_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
