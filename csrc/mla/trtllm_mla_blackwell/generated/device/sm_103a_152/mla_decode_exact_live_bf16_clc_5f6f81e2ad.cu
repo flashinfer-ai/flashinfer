@@ -81,7 +81,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_TOTAL 230912
 #define THREADS 384
-#define Q4_B1024 1
 
 #include <math_constants.h>
 
@@ -1046,22 +1045,6 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 }
 
 
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-
-
-__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
-          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
-        : "r"(tmem_addr));
-}
-
-
 __device__ __forceinline__ unsigned int __as_u32(float v) {
     unsigned int u;
     asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
@@ -1217,7 +1200,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int load_kv_stage = 0;
             unsigned int load_kv_phase = 1;
             unsigned int load_kv_token = 0;
-            unsigned int load_work_idx = blockIdx.z * ((Q4_B1024) ? 4 : value_split_count) + blockIdx.x / 2;
+            unsigned int load_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int load_work_stage = 0;
             unsigned int load_throttle_stage = 0;
             unsigned int _phase_throttle_empty = 1;
@@ -1225,20 +1208,26 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_kv_empty = 1;
             unsigned int _phase_work_full = 0;
             #pragma unroll 1
-            for (unsigned int work_idx = 0; work_idx < ((Q4_B1024) ? 4096 : total_work_items); work_idx++) {
+            for (unsigned int work_idx = 0; work_idx < total_work_items; work_idx++) {
+                unsigned int load_ordered_work_idx = load_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        load_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)load_work_idx];
+                    }
+                }
                 if (cta_rank == 0) {
                     mbarrier_wait(throttle_empty_addr + (load_throttle_stage) * 8, _phase_throttle_empty);
                     mbarrier_arrive(throttle_full_addr + (load_throttle_stage) * 8);
                     load_throttle_stage += 1;
                     if (load_throttle_stage == 2) { load_throttle_stage = 0; _phase_throttle_empty ^= 1; }
                 }
-                int batch_idx = load_work_idx;
+                int batch_idx = load_ordered_work_idx;
                 int value_split = 0;
                 int seqlen_kv_b = seq_lens_kv[batch_idx];
                 int total_kv_tiles = (seqlen_kv_b + 128 - 1) / 128;
                 int start_tile = 0;
                 int num_kv_tiles = total_kv_tiles;
-                int pt_base = batch_idx * ((Q4_B1024) ? 32 : max_pages_per_seq);
+                int pt_base = batch_idx * max_pages_per_seq;
                 int q_row_global = batch_idx * 128 + cta_rank * 64;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
@@ -1468,7 +1457,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (load_work_valid == 0) {
                     break;
                 }
-                load_work_idx = _clc_ctaid_z_0 * (unsigned int)(((Q4_B1024) ? 4 : value_split_count)) + _clc_ctaid_x_0 / 2;
+                load_work_idx = _clc_ctaid_z_0 * (unsigned int)value_split_count + _clc_ctaid_x_0 / 2;
             }
             mbarrier_wait(q_empty_addr, _phase_q_empty_0);
             _phase_q_empty_0 ^= 1;
@@ -1477,11 +1466,11 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
     } else if (warp == 11) {
         { // empty1_main
             const int wg2_dummy_1 = 0;
-            unsigned int empty1_work_idx = blockIdx.z * ((Q4_B1024) ? 4 : value_split_count) + blockIdx.x / 2;
+            unsigned int empty1_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int empty1_work_stage = 0;
             unsigned int _phase_work_full_1 = 0;
             #pragma unroll 1
-            for (unsigned int _work_iter = 0; _work_iter < ((Q4_B1024) ? 4096 : total_work_items); _work_iter++) {
+            for (unsigned int _work_iter = 0; _work_iter < total_work_items; _work_iter++) {
                 mbarrier_wait(work_full_addr + (empty1_work_stage) * 8, _phase_work_full_1);
                 uint32_t _clc_valid_5 = 0;
                 uint32_t _clc_ctaid_x_5;
@@ -1513,12 +1502,12 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (empty1_work_valid == 0) {
                     break;
                 }
-                empty1_work_idx = _clc_ctaid_z_5 * (unsigned int)(((Q4_B1024) ? 4 : value_split_count)) + _clc_ctaid_x_5 / 2;
+                empty1_work_idx = _clc_ctaid_z_5 * (unsigned int)value_split_count + _clc_ctaid_x_5 / 2;
             }
         }
     // ---- Role: softmax_wg ----
     } else if (warp <= 3) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 176;");
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 192;");
         { // softmax_wg_main
             const int wg_dummy_inc = 0;
             const int tmem_row_base = warp % 2 * 32;
@@ -1527,7 +1516,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             const int exchange_idx = n_half * 64 + my_row;
             const int seed_row_base = warp % 4 * 32;
             int softmax_tile_cursor = 0;
-            unsigned int softmax_work_idx = blockIdx.z * ((Q4_B1024) ? 4 : value_split_count) + blockIdx.x / 2;
+            unsigned int softmax_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int softmax_work_stage = 0;
             float seed_zero[4];
             #pragma unroll
@@ -1552,8 +1541,14 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 :: "r"(tmem_scrubbed_addr), "r"(seed_peer_rank) : "memory");
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
-            for (unsigned int work_idx_1 = 0; work_idx_1 < ((Q4_B1024) ? 4096 : total_work_items); work_idx_1++) {
-                int batch_idx_1 = softmax_work_idx;
+            for (unsigned int work_idx_1 = 0; work_idx_1 < total_work_items; work_idx_1++) {
+                unsigned int softmax_ordered_work_idx = softmax_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        softmax_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)softmax_work_idx];
+                    }
+                }
+                int batch_idx_1 = softmax_ordered_work_idx;
                 int seqlen_kv_b_1 = seq_lens_kv[batch_idx_1];
                 int total_kv_tiles_1 = (seqlen_kv_b_1 + 128 - 1) / 128;
                 int start_tile_1 = 0;
@@ -1572,14 +1567,16 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     int s_base = taddr + (unsigned int)s_off + (unsigned int)(tmem_row_base << 16);
                     float sv[64];
                     float tile_max = -MLA_INF;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                    #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                    #endif
                     asm volatile(
-                        "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
-                        : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(tile_max)
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31])
                         : "r"(s_base));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
+                        : "r"(s_base + 32));
                     int abs_tile = start_tile_1 + tile_1;
                     bool score_tile_full = 0;
                     bool all_tiles_are_complete_k = seqlen_kv_b_1 % 128 == 0;
@@ -1680,13 +1677,11 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                         if (!(_slice_lo_mask_1 & (1u << 31))) sv[63] = -MLA_INF;
                     }
                     float new_max = tile_max;
-                    if (!score_tile_full) {
-                        float2 _reg_reduce_max2_2 = {-MLA_INF, -MLA_INF};
-                        row_max_x32_accum(&sv[0], _reg_reduce_max2_2);
-                        row_max_x32_accum(&sv[32], _reg_reduce_max2_2);
-                        float sv_max = row_max_reduce(_reg_reduce_max2_2);
-                        new_max = sv_max;
-                    }
+                    float2 _reg_reduce_max2_2 = {-MLA_INF, -MLA_INF};
+                    row_max_x32_accum(&sv[0], _reg_reduce_max2_2);
+                    row_max_x32_accum(&sv[32], _reg_reduce_max2_2);
+                    float sv_max = row_max_reduce(_reg_reduce_max2_2);
+                    new_max = sv_max;
                     float _max_0 = max_noftz(new_max, row_max_val);
                     new_max = _max_0;
                     smem_softmax_exchange[exchange_idx] = new_max;
@@ -1705,14 +1700,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                         :: "r"(exact_meta_addr), "f"(exact_meta[0]), "f"(exact_meta[1]));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(stats_addr + (phase) * 8);
-                    float _tmem_load_0[1];
-                    asm volatile(
-                        "tcgen05.ld.sync.aligned.32x32b.x1.b32"
-                        " {%0}, [%1];"
-                        : "=f"(_tmem_load_0[0])
-                        : "r"(exact_meta_addr + 1));
-                    asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    new_max = _tmem_load_0[0];
+                    new_max = new_max;
                     float no_correction = (((new_max - row_max_val) * softmax_scale_log2 <= 0.0f) ? 1.0f : 0.0f);
                     float delta = softmax_scale_log2 * (row_max_val - new_max);
                     float _exp2_0 = approx_exp2(delta);
@@ -1823,7 +1811,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (softmax_work_valid == 0) {
                     break;
                 }
-                softmax_work_idx = _clc_ctaid_z_2 * (unsigned int)(((Q4_B1024) ? 4 : value_split_count)) + _clc_ctaid_x_2 / 2;
+                softmax_work_idx = _clc_ctaid_z_2 * (unsigned int)value_split_count + _clc_ctaid_x_2 / 2;
             }
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1838,13 +1826,19 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             const int my_row_1 = (unsigned int)tmem_row_base_1 + lane;
             const int corr_row = tmem_row_base_1 << 16;
             int correction_tile_cursor = 0;
-            unsigned int correction_work_idx = blockIdx.z * ((Q4_B1024) ? 4 : value_split_count) + blockIdx.x / 2;
+            unsigned int correction_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int correction_work_stage = 0;
             unsigned int _phase_o_full_0 = 0;
             unsigned int _phase_work_full_3 = 0;
             #pragma unroll 1
-            for (unsigned int work_idx_2 = 0; work_idx_2 < ((Q4_B1024) ? 4096 : total_work_items); work_idx_2++) {
-                int batch_idx_2 = correction_work_idx;
+            for (unsigned int work_idx_2 = 0; work_idx_2 < total_work_items; work_idx_2++) {
+                unsigned int correction_ordered_work_idx = correction_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        correction_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)correction_work_idx];
+                    }
+                }
+                int batch_idx_2 = correction_ordered_work_idx;
                 int value_split_1 = 0;
                 int seqlen_kv_b_2 = seq_lens_kv[batch_idx_2];
                 int total_kv_tiles_2 = (seqlen_kv_b_2 + 128 - 1) / 128;
@@ -1863,15 +1857,15 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     mbarrier_wait(stats_addr + (phase_1) * 8, stats_wait_phase);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int meta_addr_1 = taddr + 384 + (unsigned int)(phase_1 * 8) + (unsigned int)(n_half_1 * 4) + (unsigned int)corr_row;
-                    float _tmem_load_1[2];
+                    float _tmem_load_0[2];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x2.b32"
                         " {%0, %1}, [%2];"
-                        : "=f"(_tmem_load_1[0]), "=f"(_tmem_load_1[1])
+                        : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1])
                         : "r"(meta_addr_1));
                     final_sum_val = final_sum_val;
                     final_max_val = final_max_val;
-                    float _exp2_3 = approx_exp2(softmax_scale_log2 * (_tmem_load_1[0] - _tmem_load_1[1]));
+                    float _exp2_3 = approx_exp2(softmax_scale_log2 * (_tmem_load_0[0] - _tmem_load_0[1]));
                     float acc_scale_1 = _exp2_3;
                     float no_correction_1 = 0.0f;
                     {
@@ -1880,7 +1874,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     {
-                        int _vote_0 = __all_sync(0xFFFFFFFF, _tmem_load_1[1] <= _tmem_load_1[0]);
+                        int _vote_0 = __all_sync(0xFFFFFFFF, _tmem_load_0[1] <= _tmem_load_0[0]);
                         int skip_correction = _vote_0;
                         if (skip_correction == 0) {
                             {
@@ -1892,13 +1886,13 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                                             int o_base = taddr + 128 + (unsigned int)(acc_stage_2 * 128) + (unsigned int)(vs_local * 64) + (unsigned int)corr_row;
                                             #pragma unroll
                                             for (int c = 0; c < 64; c += 16) {
-                                                float _tmem_load_3[16];
-                                                tmem_ld_x16(&_tmem_load_3[0], o_base + c);
+                                                float _tmem_load_2[16];
+                                                tmem_ld_x16(&_tmem_load_2[0], o_base + c);
                                                 const float2 _scale2_0 = {acc_scale_1, acc_scale_1};
                                                 #pragma unroll
                                                 for (int _ls = 0; _ls < 8; _ls++)
-                                                    reinterpret_cast<float2*>(_tmem_load_3)[_ls] = mul_f32x2_rn_ftz(reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_0);
-                                                tmem_st_x16_f32(o_base + c, _tmem_load_3);
+                                                    reinterpret_cast<float2*>(_tmem_load_2)[_ls] = mul_f32x2_rn_ftz(reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_0);
+                                                tmem_st_x16_f32(o_base + c, _tmem_load_2);
                                             }
                                         }
                                     }
@@ -1918,17 +1912,17 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 }
                 mbarrier_wait(stats_addr + (correction_tile_cursor + num_kv_tiles_2 & 1) * 8, (unsigned int)(correction_tile_cursor + num_kv_tiles_2 >> 1 & 1) ^ correction_work_stage & 1);
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                float _tmem_load_5[2];
+                float _tmem_load_4[2];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x2.b32"
                     " {%0, %1}, [%2];"
-                    : "=f"(_tmem_load_5[0]), "=f"(_tmem_load_5[1])
+                    : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1])
                     : "r"(taddr + 384 + (unsigned int)((correction_tile_cursor + num_kv_tiles_2 & 1) * 8) + (unsigned int)(n_half_1 * 4) + (unsigned int)corr_row));
                 mbarrier_arrive(stats_empty_addr + (correction_tile_cursor + num_kv_tiles_2 & 1) * 8);
                 mbarrier_wait(stats_addr + (correction_tile_cursor + num_kv_tiles_2 + 1 & 1) * 8, (unsigned int)(correction_tile_cursor + num_kv_tiles_2 + 1 >> 1 & 1) ^ correction_work_stage & 1);
                 mbarrier_arrive(stats_empty_addr + (correction_tile_cursor + num_kv_tiles_2 + 1 & 1) * 8);
-                final_sum_val = _tmem_load_5[0];
-                final_max_val = _tmem_load_5[1];
+                final_sum_val = _tmem_load_4[0];
+                final_max_val = _tmem_load_4[1];
                 mbarrier_wait(o_full_addr, _phase_o_full_0);
                 _phase_o_full_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1947,87 +1941,41 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 float output_scale = 1.0f;
                 {
                     {
-                        #pragma unroll 1
+                        #pragma unroll
                         for (int acc_stage_3 = 0; acc_stage_3 < 2; acc_stage_3++) {
-                            #pragma unroll 1
+                            #pragma unroll
                             for (int vs_local_1 = 0; vs_local_1 < 2; vs_local_1++) {
                                 int logical_vs = acc_stage_3 * 2 * 2 + n_half_1 * 2 + vs_local_1;
                                 int o_base_epi = taddr + 128 + (unsigned int)(acc_stage_3 * 128) + (unsigned int)(vs_local_1 * 64) + (unsigned int)corr_row;
                                 {
                                     #pragma unroll
-                                    for (int c_1 = 0; c_1 < 64; c_1 += 64) {
-                                        float _tmem_load_7[32];
-                                        tmem_ld_x8(&_tmem_load_7[0], o_base_epi + c_1);
-                                        tmem_ld_x8(&_tmem_load_7[8], o_base_epi + c_1 + 8);
-                                        tmem_ld_x8(&_tmem_load_7[16], o_base_epi + c_1 + 16);
-                                        tmem_ld_x8(&_tmem_load_7[24], o_base_epi + c_1 + 24);
+                                    for (int c_1 = 0; c_1 < 64; c_1 += 32) {
                                         float _tmem_load_8[32];
-                                        tmem_ld_x8(&_tmem_load_8[0], o_base_epi + c_1 + 32);
-                                        tmem_ld_x8(&_tmem_load_8[8], o_base_epi + c_1 + 32 + 8);
-                                        tmem_ld_x8(&_tmem_load_8[16], o_base_epi + c_1 + 32 + 16);
-                                        tmem_ld_x8(&_tmem_load_8[24], o_base_epi + c_1 + 32 + 24);
-                                        unsigned int epilogue_packed_first[16];
-                                        unsigned int epilogue_packed_next[16];
-                                        const float2 _scale2_1 = {inv_sum * output_scale, inv_sum * output_scale};
-                                        #pragma unroll
-                                        for (int _ls = 0; _ls < 16; _ls++)
-                                            reinterpret_cast<float2*>(_tmem_load_7)[_ls] = mul_f32x2_rn_ftz(reinterpret_cast<float2*>(_tmem_load_7)[_ls], _scale2_1);
-                                        #pragma unroll
-                                        for (int _lp = 0; _lp < 16; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_7[_lp*2 + 0], _tmem_load_7[_lp*2+1 + 0]));
-                                            epilogue_packed_first[_lp] = *(uint32_t*)&_bf2;
-                                        }
-                                        const float2 _scale2_2 = {inv_sum * output_scale, inv_sum * output_scale};
-                                        #pragma unroll
-                                        for (int _ls = 0; _ls < 16; _ls++)
-                                            reinterpret_cast<float2*>(_tmem_load_8)[_ls] = mul_f32x2_rn_ftz(reinterpret_cast<float2*>(_tmem_load_8)[_ls], _scale2_2);
-                                        #pragma unroll
-                                        for (int _lp = 0; _lp < 16; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_8[_lp*2 + 0], _tmem_load_8[_lp*2+1 + 0]));
-                                            epilogue_packed_next[_lp] = *(uint32_t*)&_bf2;
-                                        }
+                                        asm volatile(
+                                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                            : "=f"(_tmem_load_8[0]), "=f"(_tmem_load_8[1]), "=f"(_tmem_load_8[2]), "=f"(_tmem_load_8[3]), "=f"(_tmem_load_8[4]), "=f"(_tmem_load_8[5]), "=f"(_tmem_load_8[6]), "=f"(_tmem_load_8[7]), "=f"(_tmem_load_8[8]), "=f"(_tmem_load_8[9]), "=f"(_tmem_load_8[10]), "=f"(_tmem_load_8[11]), "=f"(_tmem_load_8[12]), "=f"(_tmem_load_8[13]), "=f"(_tmem_load_8[14]), "=f"(_tmem_load_8[15]), "=f"(_tmem_load_8[16]), "=f"(_tmem_load_8[17]), "=f"(_tmem_load_8[18]), "=f"(_tmem_load_8[19]), "=f"(_tmem_load_8[20]), "=f"(_tmem_load_8[21]), "=f"(_tmem_load_8[22]), "=f"(_tmem_load_8[23]), "=f"(_tmem_load_8[24]), "=f"(_tmem_load_8[25]), "=f"(_tmem_load_8[26]), "=f"(_tmem_load_8[27]), "=f"(_tmem_load_8[28]), "=f"(_tmem_load_8[29]), "=f"(_tmem_load_8[30]), "=f"(_tmem_load_8[31])
+                                            : "r"(o_base_epi + c_1));
                                         int gmem_base = o_offset + logical_vs * 64 + c_1;
-                                        if (((unsigned long long)O & 31) == 0) {
-                                            #pragma unroll
-                                            for (int j = 0; j < 32; j += 16) {
-                                                {
-                                                    unsigned _stv8_3_0 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 0]);
-                                                    unsigned _stv8_3_1 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 1]);
-                                                    unsigned _stv8_3_2 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 2]);
-                                                    unsigned _stv8_3_3 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 3]);
-                                                    unsigned _stv8_3_4 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 4]);
-                                                    unsigned _stv8_3_5 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 5]);
-                                                    unsigned _stv8_3_6 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 6]);
-                                                    unsigned _stv8_3_7 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_first)[j / 2 + 7]);
-                                                    asm volatile(
-                                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                        :: "l"((void*)(O + (gmem_base + j) + (0))), "r"(_stv8_3_0), "r"(_stv8_3_1), "r"(_stv8_3_2), "r"(_stv8_3_3), "r"(_stv8_3_4), "r"(_stv8_3_5), "r"(_stv8_3_6), "r"(_stv8_3_7) : "memory");
-                                                }
-                                            }
-                                            #pragma unroll
-                                            for (int j_1 = 0; j_1 < 32; j_1 += 16) {
-                                                {
-                                                    unsigned _stv8_4_0 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 0]);
-                                                    unsigned _stv8_4_1 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 1]);
-                                                    unsigned _stv8_4_2 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 2]);
-                                                    unsigned _stv8_4_3 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 3]);
-                                                    unsigned _stv8_4_4 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 4]);
-                                                    unsigned _stv8_4_5 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 5]);
-                                                    unsigned _stv8_4_6 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 6]);
-                                                    unsigned _stv8_4_7 = __float_as_uint(reinterpret_cast<float*>(epilogue_packed_next)[j_1 / 2 + 7]);
-                                                    asm volatile(
-                                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                        :: "l"((void*)(O + (gmem_base + 32 + j_1) + (0))), "r"(_stv8_4_0), "r"(_stv8_4_1), "r"(_stv8_4_2), "r"(_stv8_4_3), "r"(_stv8_4_4), "r"(_stv8_4_5), "r"(_stv8_4_6), "r"(_stv8_4_7) : "memory");
-                                                }
-                                            }
-                                        } else {
-                                            #pragma unroll
-                                            for (int j_2 = 0; j_2 < 32; j_2 += 8) {
-                                                reinterpret_cast<int4*>(O + (gmem_base + j_2))[0] = reinterpret_cast<int4*>(epilogue_packed_first + j_2 / 2)[0];
-                                            }
-                                            #pragma unroll
-                                            for (int j_3 = 0; j_3 < 32; j_3 += 8) {
-                                                reinterpret_cast<int4*>(O + (gmem_base + 32 + j_3))[0] = reinterpret_cast<int4*>(epilogue_packed_next + j_3 / 2)[0];
+                                        #pragma unroll
+                                        for (int j = 0; j < 32; j += 8) {
+                                            {
+                                                const float2 _prescale2_1 = {inv_sum * output_scale, inv_sum * output_scale};
+                                                #if __CUDA_ARCH__ >= 1000
+                                                #pragma unroll
+                                                for (int _ps = 0; _ps < 4; _ps++)
+                                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_8[j])[_ps], _prescale2_1);
+                                                #else
+                                                #pragma unroll
+                                                for (int _ps = 0; _ps < 8; _ps++)
+                                                    _tmem_load_8[j + _ps] *= inv_sum * output_scale;
+                                                #endif
+                                                __nv_bfloat162 _pk[4];
+                                                _pk[0] = __floats2bfloat162_rn(_tmem_load_8[j + 0], _tmem_load_8[j + 1]);
+                                                _pk[1] = __floats2bfloat162_rn(_tmem_load_8[j + 2], _tmem_load_8[j + 3]);
+                                                _pk[2] = __floats2bfloat162_rn(_tmem_load_8[j + 4], _tmem_load_8[j + 5]);
+                                                _pk[3] = __floats2bfloat162_rn(_tmem_load_8[j + 6], _tmem_load_8[j + 7]);
+                                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (gmem_base + j)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                             }
                                         }
                                     }
@@ -2076,7 +2024,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (correction_work_valid == 0) {
                     break;
                 }
-                correction_work_idx = _clc_ctaid_z_3 * (unsigned int)(((Q4_B1024) ? 4 : value_split_count)) + _clc_ctaid_x_3 / 2;
+                correction_work_idx = _clc_ctaid_z_3 * (unsigned int)value_split_count + _clc_ctaid_x_3 / 2;
             }
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -2093,7 +2041,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int mma_kv_phase = 0;
             unsigned int mma_kv_token = 0;
             int mma_tile_cursor = 0;
-            unsigned int mma_work_idx = blockIdx.z * ((Q4_B1024) ? 4 : value_split_count) + blockIdx.x / 2;
+            unsigned int mma_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int mma_work_stage = 0;
             unsigned int _phase_tmem_scrubbed_0 = 0;
             mbarrier_wait(tmem_scrubbed_addr, _phase_tmem_scrubbed_0);
@@ -2104,11 +2052,17 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_o_empty_0 = 1;
             unsigned int _phase_work_full_4 = 0;
             #pragma unroll 1
-            for (unsigned int work_idx_3 = 0; work_idx_3 < ((Q4_B1024) ? 4096 : total_work_items); work_idx_3++) {
+            for (unsigned int work_idx_3 = 0; work_idx_3 < total_work_items; work_idx_3++) {
+                unsigned int mma_ordered_work_idx = mma_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        mma_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)mma_work_idx];
+                    }
+                }
                 if (cta_rank != 0) {
                     break;
                 }
-                int batch_idx_3 = mma_work_idx;
+                int batch_idx_3 = mma_ordered_work_idx;
                 int seqlen_kv_b_3 = seq_lens_kv[batch_idx_3];
                 int total_kv_tiles_3 = (seqlen_kv_b_3 + 128 - 1) / 128;
                 int start_tile_3 = 0;
@@ -2363,7 +2317,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     if (mma_work_valid == 0) {
                         break;
                     }
-                    mma_work_idx = _clc_ctaid_z_1 * (unsigned int)(((Q4_B1024) ? 4 : value_split_count)) + _clc_ctaid_x_1 / 2;
+                    mma_work_idx = _clc_ctaid_z_1 * (unsigned int)value_split_count + _clc_ctaid_x_1 / 2;
                 }
             }
             if (cta_rank == 0) {
@@ -2398,12 +2352,12 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_work_full_5 = 0;
             if (cta_rank == 0) {
-                unsigned int scheduler_work_idx = blockIdx.z * ((Q4_B1024) ? 4 : value_split_count) + blockIdx.x / 2;
+                unsigned int scheduler_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
                 unsigned int scheduler_prod_stage = 0;
                 unsigned int scheduler_cons_stage = 0;
                 unsigned int scheduler_throttle_stage = 0;
                 #pragma unroll 1
-                for (unsigned int _work_iter_1 = 0; _work_iter_1 < ((Q4_B1024) ? 4096 : total_work_items); _work_iter_1++) {
+                for (unsigned int _work_iter_1 = 0; _work_iter_1 < total_work_items; _work_iter_1++) {
                     mbarrier_wait(throttle_full_addr + (scheduler_throttle_stage) * 8, _phase_throttle_full);
                     mbarrier_arrive(throttle_empty_addr + (scheduler_throttle_stage) * 8);
                     scheduler_throttle_stage += 1;
@@ -2460,7 +2414,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     if (scheduler_work_valid == 0) {
                         break;
                     }
-                    scheduler_work_idx = _clc_ctaid_z_4 * (unsigned int)(((Q4_B1024) ? 4 : value_split_count)) + _clc_ctaid_x_4 / 2;
+                    scheduler_work_idx = _clc_ctaid_z_4 * (unsigned int)value_split_count + _clc_ctaid_x_4 / 2;
                 }
                 #pragma unroll
                 for (int _tail = 0; _tail < 2; _tail++) {

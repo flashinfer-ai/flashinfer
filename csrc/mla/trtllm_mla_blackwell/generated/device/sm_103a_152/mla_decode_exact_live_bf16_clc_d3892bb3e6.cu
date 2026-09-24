@@ -81,7 +81,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_TOTAL 230912
 #define THREADS 384
-#define Q8_B768 1
 
 #include <math_constants.h>
 
@@ -284,6 +283,35 @@ __device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
     if (token == 0) {
         mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
     }
+}
+
+
+__device__ __forceinline__ uint32_t mbarrier_test_wait(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
+__device__ __forceinline__ uint32_t mbarrier_test_wait_cluster(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.test_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
 }
 
 
@@ -1201,7 +1229,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int load_kv_stage = 0;
             unsigned int load_kv_phase = 1;
             unsigned int load_kv_token = 0;
-            unsigned int load_work_idx = blockIdx.z * ((Q8_B768) ? 8 : value_split_count) + blockIdx.x / 2;
+            unsigned int load_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int load_work_stage = 0;
             unsigned int load_throttle_stage = 0;
             unsigned int _phase_throttle_empty = 1;
@@ -1209,20 +1237,26 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_kv_empty = 1;
             unsigned int _phase_work_full = 0;
             #pragma unroll 1
-            for (unsigned int work_idx = 0; work_idx < ((Q8_B768) ? 6144 : total_work_items); work_idx++) {
+            for (unsigned int work_idx = 0; work_idx < total_work_items; work_idx++) {
+                unsigned int load_ordered_work_idx = load_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        load_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)load_work_idx];
+                    }
+                }
                 if (cta_rank == 0) {
                     mbarrier_wait(throttle_empty_addr + (load_throttle_stage) * 8, _phase_throttle_empty);
                     mbarrier_arrive(throttle_full_addr + (load_throttle_stage) * 8);
                     load_throttle_stage += 1;
                     if (load_throttle_stage == 2) { load_throttle_stage = 0; _phase_throttle_empty ^= 1; }
                 }
-                int batch_idx = load_work_idx;
+                int batch_idx = load_ordered_work_idx;
                 int value_split = 0;
                 int seqlen_kv_b = seq_lens_kv[batch_idx];
                 int total_kv_tiles = (seqlen_kv_b + 128 - 1) / 128;
                 int start_tile = 0;
                 int num_kv_tiles = total_kv_tiles;
-                int pt_base = batch_idx * ((Q8_B768) ? 32 : max_pages_per_seq);
+                int pt_base = batch_idx * max_pages_per_seq;
                 int q_row_global = batch_idx * 128 + cta_rank * 64;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
@@ -1244,6 +1278,10 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 int k0_page_base = pt_base + 4 * start_tile + 2 * cta_rank;
                 int pg_k00 = 0;
                 int pg_k01 = 0;
+                {
+                    pg_k00 = page_table[k0_page_base];
+                    pg_k01 = page_table[k0_page_base + 1];
+                }
                 #pragma unroll
                 for (int n = 0; n < 8; n++) {
                     int dst = 0;
@@ -1251,10 +1289,6 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                         uint32_t _mbar_token_0 = mbarrier_try_wait(kv_empty_addr + (load_kv_stage) * 8, load_kv_phase);
                         load_kv_token = _mbar_token_0;
                         dst = smem_kv_addr + load_kv_stage * 8192;
-                        if (n == 0) {
-                            pg_k00 = page_table[k0_page_base];
-                            pg_k01 = page_table[k0_page_base + 1];
-                        }
                         mbarrier_wait_token(kv_empty_addr + (load_kv_stage) * 8, load_kv_phase, load_kv_token);
                     }
                     if (cta_rank == 0) {
@@ -1301,6 +1335,10 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     int k_page_base = pt_base + 4 * abs_tile_k + 2 * cta_rank;
                     int pg_k0 = 0;
                     int pg_k1 = 0;
+                    {
+                        pg_k0 = page_table[k_page_base];
+                        pg_k1 = page_table[k_page_base + 1];
+                    }
                     #pragma unroll
                     for (int n_1 = 0; n_1 < 8; n_1++) {
                         int dst_k = 0;
@@ -1308,10 +1346,6 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                             uint32_t _mbar_token_2 = mbarrier_try_wait(kv_empty_addr + (load_kv_stage) * 8, load_kv_phase);
                             load_kv_token = _mbar_token_2;
                             dst_k = smem_kv_addr + load_kv_stage * 8192;
-                            if (n_1 == 0) {
-                                pg_k0 = page_table[k_page_base];
-                                pg_k1 = page_table[k_page_base + 1];
-                            }
                             mbarrier_wait_token(kv_empty_addr + (load_kv_stage) * 8, load_kv_phase, load_kv_token);
                         }
                         if (cta_rank == 0) {
@@ -1452,7 +1486,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (load_work_valid == 0) {
                     break;
                 }
-                load_work_idx = _clc_ctaid_z_0 * (unsigned int)(((Q8_B768) ? 8 : value_split_count)) + _clc_ctaid_x_0 / 2;
+                load_work_idx = _clc_ctaid_z_0 * (unsigned int)value_split_count + _clc_ctaid_x_0 / 2;
             }
             mbarrier_wait(q_empty_addr, _phase_q_empty_0);
             _phase_q_empty_0 ^= 1;
@@ -1461,11 +1495,11 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
     } else if (warp == 11) {
         { // empty1_main
             const int wg2_dummy_1 = 0;
-            unsigned int empty1_work_idx = blockIdx.z * ((Q8_B768) ? 8 : value_split_count) + blockIdx.x / 2;
+            unsigned int empty1_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int empty1_work_stage = 0;
             unsigned int _phase_work_full_1 = 0;
             #pragma unroll 1
-            for (unsigned int _work_iter = 0; _work_iter < ((Q8_B768) ? 6144 : total_work_items); _work_iter++) {
+            for (unsigned int _work_iter = 0; _work_iter < total_work_items; _work_iter++) {
                 mbarrier_wait(work_full_addr + (empty1_work_stage) * 8, _phase_work_full_1);
                 uint32_t _clc_valid_5 = 0;
                 uint32_t _clc_ctaid_x_5;
@@ -1497,7 +1531,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (empty1_work_valid == 0) {
                     break;
                 }
-                empty1_work_idx = _clc_ctaid_z_5 * (unsigned int)(((Q8_B768) ? 8 : value_split_count)) + _clc_ctaid_x_5 / 2;
+                empty1_work_idx = _clc_ctaid_z_5 * (unsigned int)value_split_count + _clc_ctaid_x_5 / 2;
             }
         }
     // ---- Role: softmax_wg ----
@@ -1511,7 +1545,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             const int exchange_idx = n_half * 64 + my_row;
             const int seed_row_base = warp % 4 * 32;
             int softmax_tile_cursor = 0;
-            unsigned int softmax_work_idx = blockIdx.z * ((Q8_B768) ? 8 : value_split_count) + blockIdx.x / 2;
+            unsigned int softmax_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int softmax_work_stage = 0;
             float seed_zero[4];
             #pragma unroll
@@ -1536,14 +1570,21 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 :: "r"(tmem_scrubbed_addr), "r"(seed_peer_rank) : "memory");
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
-            for (unsigned int work_idx_1 = 0; work_idx_1 < ((Q8_B768) ? 6144 : total_work_items); work_idx_1++) {
-                int batch_idx_1 = softmax_work_idx;
+            for (unsigned int work_idx_1 = 0; work_idx_1 < total_work_items; work_idx_1++) {
+                unsigned int softmax_ordered_work_idx = softmax_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        softmax_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)softmax_work_idx];
+                    }
+                }
+                int batch_idx_1 = softmax_ordered_work_idx;
                 int seqlen_kv_b_1 = seq_lens_kv[batch_idx_1];
                 int total_kv_tiles_1 = (seqlen_kv_b_1 + 128 - 1) / 128;
                 int start_tile_1 = 0;
                 int num_kv_tiles_1 = total_kv_tiles_1;
                 float row_max_val = -MLA_INF;
                 float row_sum_val = 0.0f;
+                unsigned int next_score_ready_token = 0;
                 asm volatile("griddepcontrol.wait;" ::: "memory");
                 asm volatile("griddepcontrol.wait;" ::: "memory");
                 #pragma unroll 1
@@ -1551,19 +1592,31 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     int pipeline_tile = softmax_tile_cursor + tile_1;
                     int phase = pipeline_tile & 1;
                     int s_wait_phase = pipeline_tile >> 1 & 1;
-                    mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
+                    mbarrier_wait_token(s_full_addr + (phase) * 8, s_wait_phase, next_score_ready_token);
                     int s_off = ((phase != 0) ? 64 : 0);
                     int s_base = taddr + (unsigned int)s_off + (unsigned int)(tmem_row_base << 16);
                     float sv[64];
                     float tile_max = -MLA_INF;
+                    float tile_max_low = -MLA_INF;
+                    float tile_max_high = -MLA_INF;
                     #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                     #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
                     #endif
                     asm volatile(
-                        "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
-                        : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(tile_max)
+                        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                        : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(tile_max_low)
                         : "r"(s_base));
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                    #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                    #endif
+                    asm volatile(
+                        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                        : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(tile_max_high)
+                        : "r"(s_base + 32));
+                    float _max_0 = max_noftz(tile_max_low, tile_max_high);
+                    tile_max = _max_0;
                     int abs_tile = start_tile_1 + tile_1;
                     bool score_tile_full = 0;
                     bool all_tiles_are_complete_k = seqlen_kv_b_1 % 128 == 0;
@@ -1671,13 +1724,17 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                         float sv_max = row_max_reduce(_reg_reduce_max2_2);
                         new_max = sv_max;
                     }
-                    float _max_0 = max_noftz(new_max, row_max_val);
-                    new_max = _max_0;
+                    float _max_1 = max_noftz(new_max, row_max_val);
+                    new_max = _max_1;
+                    if (num_kv_tiles_1 > tile_1 + 1) {
+                        uint32_t _mbar_token_10 = mbarrier_test_wait(s_full_addr + (pipeline_tile + 1 & 1) * 8, pipeline_tile + 1 >> 1 & 1);
+                        next_score_ready_token = _mbar_token_10;
+                    }
                     smem_softmax_exchange[exchange_idx] = new_max;
                     asm volatile("barrier.sync 2, 128;" ::: "memory");
-                    float _max_1 = max_noftz(new_max, smem_softmax_exchange[exchange_idx ^ 64]);
+                    float _max_2 = max_noftz(new_max, smem_softmax_exchange[exchange_idx ^ 64]);
                     asm volatile("barrier.sync 2, 128;" ::: "memory");
-                    new_max = _max_1;
+                    new_max = _max_2;
                     float exact_meta[4];
                     int exact_meta_addr = taddr + 384 + (unsigned int)(phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(tmem_row_base << 16);
                     mbarrier_wait(stats_empty_addr + (phase) * 8, (unsigned int)(pipeline_tile >> 1 & 1) ^ softmax_work_stage & 1 ^ 1);
@@ -1800,7 +1857,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (softmax_work_valid == 0) {
                     break;
                 }
-                softmax_work_idx = _clc_ctaid_z_2 * (unsigned int)(((Q8_B768) ? 8 : value_split_count)) + _clc_ctaid_x_2 / 2;
+                softmax_work_idx = _clc_ctaid_z_2 * (unsigned int)value_split_count + _clc_ctaid_x_2 / 2;
             }
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1815,13 +1872,19 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             const int my_row_1 = (unsigned int)tmem_row_base_1 + lane;
             const int corr_row = tmem_row_base_1 << 16;
             int correction_tile_cursor = 0;
-            unsigned int correction_work_idx = blockIdx.z * ((Q8_B768) ? 8 : value_split_count) + blockIdx.x / 2;
+            unsigned int correction_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int correction_work_stage = 0;
             unsigned int _phase_o_full_0 = 0;
             unsigned int _phase_work_full_3 = 0;
             #pragma unroll 1
-            for (unsigned int work_idx_2 = 0; work_idx_2 < ((Q8_B768) ? 6144 : total_work_items); work_idx_2++) {
-                int batch_idx_2 = correction_work_idx;
+            for (unsigned int work_idx_2 = 0; work_idx_2 < total_work_items; work_idx_2++) {
+                unsigned int correction_ordered_work_idx = correction_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        correction_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)correction_work_idx];
+                    }
+                }
+                int batch_idx_2 = correction_ordered_work_idx;
                 int value_split_1 = 0;
                 int seqlen_kv_b_2 = seq_lens_kv[batch_idx_2];
                 int total_kv_tiles_2 = (seqlen_kv_b_2 + 128 - 1) / 128;
@@ -1924,7 +1987,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 float output_scale = 1.0f;
                 {
                     {
-                        #pragma unroll 1
+                        #pragma unroll
                         for (int acc_stage_3 = 0; acc_stage_3 < 2; acc_stage_3++) {
                             #pragma unroll
                             for (int vs_local_1 = 0; vs_local_1 < 2; vs_local_1++) {
@@ -2007,7 +2070,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                 if (correction_work_valid == 0) {
                     break;
                 }
-                correction_work_idx = _clc_ctaid_z_3 * (unsigned int)(((Q8_B768) ? 8 : value_split_count)) + _clc_ctaid_x_3 / 2;
+                correction_work_idx = _clc_ctaid_z_3 * (unsigned int)value_split_count + _clc_ctaid_x_3 / 2;
             }
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -2024,7 +2087,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int mma_kv_phase = 0;
             unsigned int mma_kv_token = 0;
             int mma_tile_cursor = 0;
-            unsigned int mma_work_idx = blockIdx.z * ((Q8_B768) ? 8 : value_split_count) + blockIdx.x / 2;
+            unsigned int mma_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
             unsigned int mma_work_stage = 0;
             unsigned int _phase_tmem_scrubbed_0 = 0;
             mbarrier_wait(tmem_scrubbed_addr, _phase_tmem_scrubbed_0);
@@ -2035,11 +2098,17 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_o_empty_0 = 1;
             unsigned int _phase_work_full_4 = 0;
             #pragma unroll 1
-            for (unsigned int work_idx_3 = 0; work_idx_3 < ((Q8_B768) ? 6144 : total_work_items); work_idx_3++) {
+            for (unsigned int work_idx_3 = 0; work_idx_3 < total_work_items; work_idx_3++) {
+                unsigned int mma_ordered_work_idx = mma_work_idx;
+                if (total_work_items > 76) {
+                    if (total_work_items <= 1024) {
+                        mma_ordered_work_idx = (unsigned int)page_table[total_work_items * max_pages_per_seq + (int)mma_work_idx];
+                    }
+                }
                 if (cta_rank != 0) {
                     break;
                 }
-                int batch_idx_3 = mma_work_idx;
+                int batch_idx_3 = mma_ordered_work_idx;
                 int seqlen_kv_b_3 = seq_lens_kv[batch_idx_3];
                 int total_kv_tiles_3 = (seqlen_kv_b_3 + 128 - 1) / 128;
                 int start_tile_3 = 0;
@@ -2294,7 +2363,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     if (mma_work_valid == 0) {
                         break;
                     }
-                    mma_work_idx = _clc_ctaid_z_1 * (unsigned int)(((Q8_B768) ? 8 : value_split_count)) + _clc_ctaid_x_1 / 2;
+                    mma_work_idx = _clc_ctaid_z_1 * (unsigned int)value_split_count + _clc_ctaid_x_1 / 2;
                 }
             }
             if (cta_rank == 0) {
@@ -2329,12 +2398,12 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_work_full_5 = 0;
             if (cta_rank == 0) {
-                unsigned int scheduler_work_idx = blockIdx.z * ((Q8_B768) ? 8 : value_split_count) + blockIdx.x / 2;
+                unsigned int scheduler_work_idx = blockIdx.z * value_split_count + blockIdx.x / 2;
                 unsigned int scheduler_prod_stage = 0;
                 unsigned int scheduler_cons_stage = 0;
                 unsigned int scheduler_throttle_stage = 0;
                 #pragma unroll 1
-                for (unsigned int _work_iter_1 = 0; _work_iter_1 < ((Q8_B768) ? 6144 : total_work_items); _work_iter_1++) {
+                for (unsigned int _work_iter_1 = 0; _work_iter_1 < total_work_items; _work_iter_1++) {
                     mbarrier_wait(throttle_full_addr + (scheduler_throttle_stage) * 8, _phase_throttle_full);
                     mbarrier_arrive(throttle_empty_addr + (scheduler_throttle_stage) * 8);
                     scheduler_throttle_stage += 1;
@@ -2391,7 +2460,7 @@ kernel_mla_decode_exact_live_bf16_clc(const __grid_constant__ CUtensorMap tmap_q
                     if (scheduler_work_valid == 0) {
                         break;
                     }
-                    scheduler_work_idx = _clc_ctaid_z_4 * (unsigned int)(((Q8_B768) ? 8 : value_split_count)) + _clc_ctaid_x_4 / 2;
+                    scheduler_work_idx = _clc_ctaid_z_4 * (unsigned int)value_split_count + _clc_ctaid_x_4 / 2;
                 }
                 #pragma unroll
                 for (int _tail = 0; _tail < 2; _tail++) {

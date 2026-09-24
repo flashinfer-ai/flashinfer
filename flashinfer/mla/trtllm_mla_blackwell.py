@@ -264,6 +264,35 @@ def _base_state(inputs: dict[str, Any], family: str) -> dict[str, Any]:
     return _workspace_get_or_create(key, build)
 
 
+def _longest_first_work_order(tile_counts: list[int]) -> list[int]:
+    """Work ids in descending KV-tile order; ties keep row order."""
+    return sorted(range(len(tile_counts)), key=lambda row: (-int(tile_counts[row]), row))
+
+
+def _append_work_order_rows(table: torch.Tensor, inputs: dict[str, Any]) -> torch.Tensor:
+    """Append the longest-first work permutation after the num_rows page-table rows.
+
+    The persistent CLC kernels consume raw work ids in launch order and read
+    ``page_table[num_rows * max_pages_per_seq + raw_id]`` to find the row each id
+    processes, so long rows start first and the dynamic scheduler balances the
+    tail.  Padding entries hold -1; rows below num_rows are unchanged, so every
+    other aligned domain sees the same page table as before.
+    """
+    tile_counts = [
+        (kv_len - q_len + query + 128) // 128
+        for q_len, kv_len in zip(inputs["q_lens"], inputs["kv_lens"], strict=True)
+        for query in range(int(q_len))
+    ]
+    num_rows, width = int(table.shape[0]), int(table.shape[1])
+    if num_rows != len(tile_counts):
+        raise ValueError("aligned page table rows do not match the query rows")
+    order = _longest_first_work_order(tile_counts)
+    tail_rows = (num_rows + width - 1) // width
+    tail = torch.full((tail_rows * width,), -1, dtype=torch.int32, device=table.device)
+    tail[:num_rows] = torch.tensor(order, dtype=torch.int32, device=table.device)
+    return torch.cat((table.to(dtype=torch.int32), tail.view(tail_rows, width)), dim=0).contiguous()
+
+
 def _aligned_state(inputs: dict[str, Any]) -> dict[str, Any]:
     state = _base_state(inputs, "aligned_bf16")
     if "kv_half_pages" not in state:
@@ -271,6 +300,7 @@ def _aligned_state(inputs: dict[str, Any]) -> dict[str, Any]:
         if int(inputs["page_size"]) == 64:
             table = torch.stack((table * 2, table * 2 + 1), dim=-1)
             table = table.reshape(state["num_rows"], -1).contiguous()
+        table = _append_work_order_rows(table, inputs)
         state.update(
             {
                 "row_page_table": table,

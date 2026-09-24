@@ -32,14 +32,14 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_0584ed27d1);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_2156c28515);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_23ac982d1b);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_4634ab4d25);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_46457f7f5b);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_7538e3766e);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_ab485aea76);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_f2b7cb67bf);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_5f26657c8f);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_5f6f81e2ad);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_823f60e1b7);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_a6a70d7004);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_d003c22422);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_d3892bb3e6);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_d56d2460cb);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_fb6e96f4d8);
 
 namespace mla_host_shim {
 
@@ -263,7 +263,7 @@ inline bool MlaConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id
 #endif
 }
 
-namespace variant_mla_decode_exact_live_bf16_clc_46457f7f5b_af65264fd83b {
+namespace variant_mla_decode_exact_live_bf16_clc_d56d2460cb_ceeecafef56b {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -502,7 +502,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_46457f7f5b::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_d56d2460cb::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -566,9 +566,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_46457f7f5b_af65264fd83b
+}  // namespace variant_mla_decode_exact_live_bf16_clc_d56d2460cb_ceeecafef56b
 
-namespace variant_mla_decode_exact_live_bf16_clc_7538e3766e_a0ee674993cb {
+namespace variant_mla_decode_exact_live_bf16_clc_d003c22422_d1a0fc38928b {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -807,7 +807,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_7538e3766e::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_d003c22422::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -871,9 +871,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_7538e3766e_a0ee674993cb
+}  // namespace variant_mla_decode_exact_live_bf16_clc_d003c22422_d1a0fc38928b
 
-namespace variant_mla_decode_exact_live_bf16_clc_ab485aea76_a3a904b7275c {
+namespace variant_mla_decode_exact_live_bf16_clc_a6a70d7004_92f6ccbf4561 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -1112,7 +1112,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_ab485aea76::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_a6a70d7004::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -1176,9 +1176,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_ab485aea76_a3a904b7275c
+}  // namespace variant_mla_decode_exact_live_bf16_clc_a6a70d7004_92f6ccbf4561
 
-namespace variant_mla_decode_exact_live_bf16_clc_f2b7cb67bf_3649d682c31d {
+namespace variant_mla_decode_exact_live_bf16_clc_fb6e96f4d8_e03a032a0a9a {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -1417,7 +1417,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_f2b7cb67bf::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_fb6e96f4d8::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -1481,9 +1481,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_f2b7cb67bf_3649d682c31d
+}  // namespace variant_mla_decode_exact_live_bf16_clc_fb6e96f4d8_e03a032a0a9a
 
-namespace variant_mla_decode_exact_live_bf16_clc_4634ab4d25_bd492d526b98 {
+namespace variant_mla_decode_exact_live_bf16_clc_d3892bb3e6_9ae1170423f2 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -1722,7 +1722,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_4634ab4d25::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_d3892bb3e6::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -1786,9 +1786,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_4634ab4d25_bd492d526b98
+}  // namespace variant_mla_decode_exact_live_bf16_clc_d3892bb3e6_9ae1170423f2
 
-namespace variant_mla_decode_exact_live_bf16_clc_2156c28515_241a337ac7f3 {
+namespace variant_mla_decode_exact_live_bf16_clc_5f26657c8f_13913bd93202 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -2027,7 +2027,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_2156c28515::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_5f26657c8f::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -2091,9 +2091,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_2156c28515_241a337ac7f3
+}  // namespace variant_mla_decode_exact_live_bf16_clc_5f26657c8f_13913bd93202
 
-namespace variant_mla_decode_exact_live_bf16_clc_23ac982d1b_6ebb18323d32 {
+namespace variant_mla_decode_exact_live_bf16_clc_5f6f81e2ad_f935d051e5c5 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -2332,7 +2332,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_23ac982d1b::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_5f6f81e2ad::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -2396,9 +2396,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_23ac982d1b_6ebb18323d32
+}  // namespace variant_mla_decode_exact_live_bf16_clc_5f6f81e2ad_f935d051e5c5
 
-namespace variant_mla_decode_exact_live_bf16_clc_0584ed27d1_652fa8cb9022 {
+namespace variant_mla_decode_exact_live_bf16_clc_823f60e1b7_30db214ceb9a {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -2637,7 +2637,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_0584ed27d1::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_823f60e1b7::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -2701,7 +2701,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_0584ed27d1_652fa8cb9022
+}  // namespace variant_mla_decode_exact_live_bf16_clc_823f60e1b7_30db214ceb9a
 
 int SelectVariant(float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z, int32_t max_kv_len, int32_t last_kv_len, int32_t source_selector_eligibility) {
   if (((((total_work_items == 512) && (value_split_count == 1)) && (grid_x == 2)) && (grid_z == 512))) return 0;
@@ -2730,7 +2730,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_46457f7f5b_af65264fd83b::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_d56d2460cb_ceeecafef56b::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2739,7 +2739,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_7538e3766e_a0ee674993cb::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_d003c22422_d1a0fc38928b::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2748,7 +2748,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_ab485aea76_a3a904b7275c::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_a6a70d7004_92f6ccbf4561::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2757,7 +2757,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_f2b7cb67bf_3649d682c31d::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_fb6e96f4d8_e03a032a0a9a::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2766,7 +2766,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_4634ab4d25_bd492d526b98::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_d3892bb3e6_9ae1170423f2::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2775,7 +2775,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_2156c28515_241a337ac7f3::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_5f26657c8f_13913bd93202::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2784,7 +2784,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_23ac982d1b_6ebb18323d32::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_5f6f81e2ad_f935d051e5c5::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2793,7 +2793,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_0584ed27d1_652fa8cb9022::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_823f60e1b7_30db214ceb9a::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
