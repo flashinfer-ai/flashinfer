@@ -65,8 +65,6 @@ def test_prepared_api_preserves_caller_owned_outputs(monkeypatch) -> None:
         **values,
         activation_q=object(),
         activation_sf=object(),
-        qkv_bf16=object(),
-        gemm_workspace=object(),
         P=8,
     )
     actual = operation.run(**values)
@@ -112,7 +110,6 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         pytest.skip("requires SM100a or SM103a")
 
     router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
-    from flashinfer.gemm import gemm_base
 
     hidden, qkv_width, head_dim, fp4_block = 5376, 21504, 128, 16
     device = torch.device("cuda")
@@ -152,7 +149,7 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         device,
     )
     post_backing, post_workspace = _aligned_workspace(
-        int(route["stages"]["qk_rope_destination_nvfp4_pack"]["tma_workspace_bytes"]),
+        int(route["stages"]["qkv_nvfp4_gemm_fused_pack"]["tma_workspace_bytes"]),
         device,
     )
     operation = MiniMaxH3Nvfp4PreAttention(
@@ -161,15 +158,9 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         activation_sf=torch.empty(
             (activation_sf_len,), dtype=torch.uint8, device=device
         ),
-        qkv_bf16=torch.empty((M, qkv_width), dtype=torch.bfloat16, device=device),
-        gemm_workspace=torch.empty(
-            (int(gemm_base.DEFAULT_WORKSPACE_SIZE),),
-            dtype=torch.uint8,
-            device=device,
-        ),
         P=P,
         norm_descriptor_workspace=norm_workspace,
-        post_descriptor_workspace=post_workspace,
+        gemm_descriptor_workspace=post_workspace,
     )
     return (
         operation,
@@ -276,36 +267,35 @@ def test_aot_inventory_covers_every_exact_route(monkeypatch) -> None:
         @staticmethod
         def gen_minimax_h3_nvfp4_stage_module(P, stage):
             calls.append((P, stage))
-            # The norm stage does not depend on P: one shared spec.
-            name = stage if stage == "norm_adaln_nvfp4_quantize" else f"{P}_{stage}"
-            return SimpleNamespace(name=name)
+            # Neither stage depends on P: one shared spec per stage.
+            return SimpleNamespace(name=stage)
 
     monkeypatch.setattr(jit.importlib, "import_module", lambda *_args: _PhysicalModule)
     specs = jit.gen_minimax_h3_nvfp4_aot_modules("sm103a")
 
     assert jit.MINIMAX_H3_NVFP4_PARTITIONS == (1, 2, 4, 8)
     assert len(calls) == 8
-    assert len(specs) == 5
+    assert len(specs) == 2
     assert {stage for _, stage in calls} == {
         "norm_adaln_nvfp4_quantize",
-        "qk_rope_destination_nvfp4_pack",
+        "qkv_nvfp4_gemm_fused_pack",
     }
 
 
 @pytest.mark.parametrize(
-    ("M", "P", "expected_norm", "expected_post"),
+    ("M", "P", "expected_norm", "expected_gemm", "expected_row_tiles"),
     [
-        (1, 8, (64, 1, 1), (3, 8, 1)),
-        (129, 8, (128, 1, 1), (87, 8, 1)),
-        (4824, 8, (2432, 1, 1), (3166, 8, 1)),
-        (9648, 4, (4864, 1, 1), (12663, 4, 1)),
-        (19296, 2, (9664, 1, 1), (50652, 2, 1)),
-        (38592, 1, (19328, 1, 1), (202608, 1, 1)),
-        (38591, 1, (19328, 1, 1), (202608, 1, 1)),
+        (1, 8, (64, 1, 1), (168, 1, 1), 2),
+        (129, 8, (128, 1, 1), (168, 1, 1), 2),
+        (4824, 8, (2432, 1, 1), (3192, 1, 1), 38),
+        (9648, 4, (4864, 1, 1), (6384, 1, 1), 76),
+        (19296, 2, (9664, 1, 1), (12768, 1, 1), 152),
+        (38592, 1, (19328, 1, 1), (25368, 1, 1), 302),
+        (38591, 1, (19328, 1, 1), (25368, 1, 1), 302),
     ],
 )
 def test_stage_launch_grids_follow_the_runtime_token_count(
-    M, P, expected_norm, expected_post
+    M, P, expected_norm, expected_gemm, expected_row_tiles
 ) -> None:
     from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
 
@@ -316,14 +306,42 @@ def test_stage_launch_grids_follow_the_runtime_token_count(
             "row_alignment": 128,
         }
     }
-    post_record = {
+    gemm_record = {
         "launch_grid_rule": {
-            "kind": "post_warps_2d",
-            "rows_per_warp": 4,
-            "warps_per_cta": 8,
+            "kind": "gemm_cluster_tiles",
+            "block_m": 128,
+            "cta_group": 2,
+            "n_tiles": 84,
         }
     }
     assert ops._stage_launch_grid(norm_record, M=M, P=P) == expected_norm
-    assert ops._stage_launch_grid(post_record, M=M, P=P) == expected_post
+    assert ops._stage_launch_grid(gemm_record, M=M, P=P) == expected_gemm
+    assert (
+        ops._gemm_row_tiles(gemm_record["launch_grid_rule"], M=M) == expected_row_tiles
+    )
     with pytest.raises(RuntimeError, match="launch grid rule"):
         ops._stage_launch_grid({"launch_grid_rule": {"kind": "other"}}, M=M, P=P)
+
+
+def test_fused_gemm_weight_scale_repack_orders_cta_pairs() -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+
+    n_blocks, k_sets, tile = 168, 84, 512
+    # Tile (row block n, K-set k) tagged by its position; the repack must map
+    # it to (pair n // 2, K-set k, half n % 2).
+    tags = torch.arange(n_blocks * k_sets, dtype=torch.int32).reshape(n_blocks, k_sets)
+    source = (
+        tags.unsqueeze(-1).expand(n_blocks, k_sets, tile).to(torch.int32).reshape(-1)
+    )
+    packed = ops.repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
+        (source % 251).to(torch.uint8)
+    )
+    assert packed.shape == (n_blocks * k_sets * tile,)
+    view = packed.reshape(n_blocks // 2, k_sets, 2, tile)
+    expected = (tags % 251).to(torch.uint8).reshape(n_blocks // 2, 2, k_sets)
+    assert torch.equal(view[..., 0], expected.permute(0, 2, 1))
+    assert torch.equal(view[..., tile - 1], expected.permute(0, 2, 1))
+    with pytest.raises(ValueError, match="swizzled scale bytes"):
+        ops.repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
+            torch.zeros((16,), dtype=torch.uint8)
+        )

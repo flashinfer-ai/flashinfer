@@ -212,15 +212,19 @@ class MiniMaxH3Nvfp4PreAttention:
     """Prepare and run the fixed MiniMax-H3 NVFP4 (W4A4) pre-attention pipeline.
 
     All outputs, intermediate tensors, and workspaces are supplied by the
-    caller. Preparation resolves the exact SM100a or SM103a route and selects
-    the FlashInfer ``mm_fp4`` GEMM backend and tactic. :meth:`run` performs no
-    tensor allocation and can be captured by a CUDA Graph after preparation.
+    caller. Preparation resolves the exact SM100a or SM103a route: a norm +
+    AdaLN + NVFP4 quantization stage followed by one fused tcgen05 NVFP4 QKV
+    GEMM whose epilogue applies the Q/K RMSNorm, RoPE and destination-major
+    NVFP4 packing; no BF16 QKV projection is materialized. :meth:`run`
+    performs no tensor allocation and can be captured by a CUDA Graph after
+    preparation.
 
     The tensors passed to :meth:`run` must be the same objects supplied here.
     Their contents may be updated between launches, including on independent
-    CUDA streams. The GEMM ``alpha`` operand is derived from
-    ``x_global_scale`` and ``w_global_scale`` once at preparation; changing
-    those values afterwards requires a new instance.
+    CUDA streams. The GEMM ``alpha`` operand (from ``x_global_scale`` and
+    ``w_global_scale``) and the CTA-pair ordering of ``qkv_weight_sf`` are
+    derived once at preparation; changing those values afterwards requires a
+    new instance.
     """
 
     def __init__(
@@ -243,12 +247,9 @@ class MiniMaxH3Nvfp4PreAttention:
         out_sf: torch.Tensor,
         activation_q: torch.Tensor,
         activation_sf: torch.Tensor,
-        qkv_bf16: torch.Tensor,
-        gemm_workspace: torch.Tensor,
         P: int,
-        gemm_backends: tuple[str, ...] = ("cutlass",),
         norm_descriptor_workspace: Optional[torch.Tensor] = None,
-        post_descriptor_workspace: Optional[torch.Tensor] = None,
+        gemm_descriptor_workspace: Optional[torch.Tensor] = None,
         debug_q_bf16: Optional[torch.Tensor] = None,
         debug_k_bf16: Optional[torch.Tensor] = None,
         debug_adaln_bf16: Optional[torch.Tensor] = None,
@@ -299,12 +300,9 @@ class MiniMaxH3Nvfp4PreAttention:
             out_sf=out_sf,
             activation_q=activation_q,
             activation_sf=activation_sf,
-            qkv_bf16=qkv_bf16,
-            gemm_workspace=gemm_workspace,
             P=P,
-            gemm_backends=gemm_backends,
             norm_descriptor_workspace=norm_descriptor_workspace,
-            post_descriptor_workspace=post_descriptor_workspace,
+            gemm_descriptor_workspace=gemm_descriptor_workspace,
             debug_q_bf16=debug_q_bf16,
             debug_k_bf16=debug_k_bf16,
             debug_adaln_bf16=debug_adaln_bf16,
