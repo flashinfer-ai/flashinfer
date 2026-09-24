@@ -48,7 +48,10 @@ def main():
     started = time.monotonic()
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl")
+    # Coordinate over gloo: the exchange itself runs on the MNNVL workspace, and
+    # the backend only needs object collectives and barriers. Keeping NCCL (and
+    # its watchdog thread) out of the process avoids racing the CUPTI session.
+    dist.init_process_group("gloo")
     rows = []
     try:
         world = dist.get_world_size()
@@ -85,7 +88,7 @@ def main():
                 cold_l2_cache=True,
             )
             local_median = torch.tensor(
-                [sorted(samples)[len(samples) // 2]], device="cuda", dtype=torch.float64
+                [sorted(samples)[len(samples) // 2]], dtype=torch.float64
             )
             dist.all_reduce(local_median, op=dist.ReduceOp.MAX)
             bytes_per_rank = (
