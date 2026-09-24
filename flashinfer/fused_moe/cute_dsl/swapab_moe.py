@@ -207,6 +207,9 @@ def swapab_dispatch(
     narrow_list: torch.Tensor,
     narrow_count: torch.Tensor,
     wide_min_rows: Optional[int] = None,
+    wide_min_permille: int = 0,
+    all_list: Optional[torch.Tensor] = None,
+    all_count: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -215,16 +218,24 @@ def swapab_dispatch(
     consumed through ``tile_idx_to_row_group``. Groups with more than
     ``wide_min_rows`` valid rows (default ``group_rows - narrow_tile``) go to
     the wide list; the others contribute one narrow item per occupied
-    sub-tile. Order-preserving, single CTA, graph-capturable."""
+    sub-tile. ``all_list`` / ``all_count`` (optional, given together) receive
+    every occupied ``narrow_tile``-row sub-tile of every group, the work list
+    of a narrow-tile GEMM2 behind a mixed GEMM1. ``wide_min_permille`` > 0
+    keeps every group narrow unless the wide candidates hold at least that
+    share (per mille) of all valid rows. Order-preserving, single CTA,
+    graph-capturable."""
     if group_rows % narrow_tile != 0:
         raise ValueError("group_rows must be a multiple of narrow_tile")
+    if (all_list is None) != (all_count is None):
+        raise ValueError("all_list and all_count must be given together")
     groups = tile_idx_to_mn_limit.shape[0]
     if wide_list.shape[0] < groups:
         raise ValueError(f"wide_list needs {groups} entries")
-    if narrow_list.shape[0] < groups * (group_rows // narrow_tile):
-        raise ValueError(
-            f"narrow_list needs {groups * (group_rows // narrow_tile)} entries"
-        )
+    sub_tiles = groups * (group_rows // narrow_tile)
+    if narrow_list.shape[0] < sub_tiles:
+        raise ValueError(f"narrow_list needs {sub_tiles} entries")
+    if all_list is not None and all_list.shape[0] < sub_tiles:
+        raise ValueError(f"all_list needs {sub_tiles} entries")
     for t in (
         tile_idx_to_mn_limit,
         num_non_exiting_tiles,
@@ -232,6 +243,7 @@ def swapab_dispatch(
         wide_count,
         narrow_list,
         narrow_count,
+        *(() if all_list is None else (all_list, all_count)),
     ):
         if t.dtype != torch.int32 or not t.is_contiguous():
             raise ValueError("dispatch buffers must be contiguous int32")
@@ -244,10 +256,13 @@ def swapab_dispatch(
         int(group_rows),
         int(narrow_tile),
         int(wide_min_rows),
+        int(wide_min_permille),
         wide_list.data_ptr(),
         wide_count.data_ptr(),
         narrow_list.data_ptr(),
         narrow_count.data_ptr(),
+        all_list.data_ptr() if all_list is not None else 0,
+        all_count.data_ptr() if all_count is not None else 0,
         bool(enable_pdl),
     )
     func(*args, torch.cuda.current_stream().cuda_stream)
@@ -350,6 +365,7 @@ def _get_compiled_swapab_kernel(
     group_rows: Optional[int] = None,
     sf_blocked: bool = False,
     wide_out: bool = False,
+    m_group: Optional[int] = None,
 ):
     import os
     import sys
@@ -358,7 +374,8 @@ def _get_compiled_swapab_kernel(
         row_tma = swap_row_tma(n_tile, epilogue_kind == "situ_mxfp8")
     if gather_warps is None:
         gather_warps = swap_gather_warps(n_tile)
-    m_group = swap_m_group(n_tile, gemm2=epilogue_kind != "situ_mxfp8")
+    if m_group is None:
+        m_group = swap_m_group(n_tile, gemm2=epilogue_kind != "situ_mxfp8")
     # ``compile_args[16]`` is the optional per-work-item row-group pointer
     # (wrapper position: after ``row_index_ptr``).
     row_group_list = compile_args[16] is not None
@@ -574,11 +591,16 @@ def swapab_gemm2(
     _prepared_launches: Optional[Dict[str, Any]] = None,
     tile_idx_to_row_group: Optional[torch.Tensor] = None,
     group_rows: Optional[int] = None,
+    sf_blocked: bool = False,
+    m_group: Optional[int] = None,
 ) -> None:
     """GEMM2 (down) on the swap path.
 
     ``act`` / ``act_sf`` are the permuted ``[R, I]`` E4M3 rows and plain
-    ``[R, I/32]`` scales written by GEMM1. ``finalize=True`` reduce-adds
+    ``[R, I/32]`` scales written by GEMM1 (``sf_blocked=True``: the same
+    bytes in the tcgen05 block-scaled atom layout ``(32, 4, R/128, 4, I/128)``
+    written by ``sf_blocked`` GEMM1 tiles; ``R`` must be a multiple of 128).
+    ``finalize=True`` reduce-adds
     ``alpha * route_weight * acc`` into the zero-filled ``out[T, H]``;
     ``finalize=False`` (deferred finalize) writes ``alpha * acc`` to
     ``out[R', H]`` (``R' >= R``) in permuted row order, i.e. row
@@ -590,8 +612,10 @@ def swapab_gemm2(
     if k_blocks_per_stage is None:
         k_blocks_per_stage = gemm2_k_blocks_per_stage(k, n_tile)
     rows = act.shape[0]
-    if act.shape[1] != k or act_sf.shape != (rows, k // 32):
-        raise ValueError("act must be [R, I] with act_sf [R, I/32]")
+    if act.shape[1] != k or act_sf.numel() != rows * (k // 32):
+        raise ValueError("act must be [R, I] with act_sf of R * I/32 bytes")
+    if sf_blocked and (rows % 128 or k % 128):
+        raise ValueError("blocked act_sf needs R and I multiples of 128")
     if permuted_idx_to_expanded_idx.shape[0] != rows:
         raise ValueError("permuted_idx_to_expanded_idx must have one entry per act row")
     if finalize:
@@ -664,7 +688,9 @@ def swapab_gemm2(
         tiled_a=bool(SWAP_TILED_WEIGHTS & 2),
         weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
         group_rows=group_rows,
+        sf_blocked=sf_blocked,
         wide_out=wide_out,
+        m_group=m_group,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)

@@ -176,8 +176,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # SiTU output scales in the tcgen05 block-scaled SFA atom layout
         # (``(32, 4, rows/128, 4, K/128)`` order (2,1,4,0,3)) so a dense
         # contiguous grouped GEMM2 can consume the rows directly, instead of
-        # the plain ``(rows, K/32)`` bytes read by the swap GEMM2.
+        # the plain ``(rows, K/32)`` bytes read by the swap GEMM2. For GEMM2
+        # the flag means the *input* row scales are in that layout (written
+        # by mixed dense / sf_blocked swap GEMM1 tiles).
         self.sf_blocked = bool(sf_blocked)
+        self.sf_blocked_read = self.sf_blocked and not self.gather_rows
         # Wide tiles keep the per-column finalize metadata in the scheduler's
         # smem ring (slot held until the tile's stores are done) instead of
         # n_tile register pairs per epilogue thread.
@@ -1452,6 +1455,16 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         tok = expanded // self.top_k
                         ok = ok & (expanded >= 0) & (tok < num_rows_b)
                         src_row = tok
+                    if cutlass.const_expr(self.sf_blocked_read):
+                        # Byte offset of the row inside its 128-row SF block
+                        # column ((32, 4, R/128, 4, K/128) order (2,1,4,0,3)):
+                        # (row % 32) * 16 + ((row // 32) % 4) * 4, plus
+                        # (row // 128) * 512 * (K/128) block rows.
+                        src_row = (
+                            (src_row % 32) * 16
+                            + ((src_row // 32) % 4) * 4
+                            + (src_row // 128) * (sf_cols * 128)
+                        )
                     sf_src[i] = src_row * cutlass.Int32(ok)
                     sf_ok[i] = ok
                     sf_dst[i] = lane_g * 16 + q * 4
@@ -1487,12 +1500,21 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 cute.copy_atom_call(b_atom_copy, g_b, s_b, pred=pred1)
                             # 4 UE8M0 bytes per row per 128-wide K atom -> SF atom row.
                             for i in cutlass.range_constexpr(n_sf_w):
-                                sf_src_off = cute.assume(
-                                    sf_src[i] * sf_cols
-                                    + b_producer_state.count * self.k_blocks_per_stage
-                                    + kt * 4,
-                                    divby=4,
-                                )
+                                if cutlass.const_expr(self.sf_blocked_read):
+                                    # 512-byte SF atom per 128-wide K atom.
+                                    sf_src_off = cute.assume(
+                                        sf_src[i]
+                                        + (b_producer_state.count * n_kt + kt) * 512,
+                                        divby=4,
+                                    )
+                                else:
+                                    sf_src_off = cute.assume(
+                                        sf_src[i] * sf_cols
+                                        + b_producer_state.count
+                                        * self.k_blocks_per_stage
+                                        + kt * 4,
+                                        divby=4,
+                                    )
                                 sf_g = cute.make_tensor(
                                     mSFB.iterator + sf_src_off,
                                     layout=cute.make_layout((4,)),
