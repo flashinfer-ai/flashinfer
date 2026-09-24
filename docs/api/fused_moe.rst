@@ -185,6 +185,8 @@ scale before route weighting.
     alphamoe_nvfp4_aligned_moe
     alphamoe_nvfp4_routed_moe
     prepare_nvfp4_w1_data
+    prepare_nvfp4_w1_gate_up_data
+    prepare_nvfp4_w1_gate_up_scales
     prepare_nvfp4_w1_scales
     prepare_nvfp4_w2_scales
 
@@ -230,50 +232,100 @@ Supply the buffers through optional keywords on either entry::
     # Existing aligned or routed call: retain every raw argument and append
     # **prepared_scales. Reuse these same tensors for subsequent requests.
 
-The matching 128-token and 512-token prepared-scale paths continue to use W1
-panels, and the matching 512-token path also uses W2 panels. The eight-token
-routed data path below additionally uses prepared W1 scales. Missing or
-incompatible optional scale panels retain their existing fallback; a valid W1
-scale panel with no valid W2 scale panel uses the W1-only path. No preparation
-is performed inside a request.
+Omitting optional prepared scale tensors retains the existing scale paths.
+The routed prepared-data paths below use W1 scales; the adjacent gate/up path
+has its own paired scale carrier. Supplied prepared tensors must satisfy the
+API's dtype, device, shape and alignment checks. No weight preparation occurs
+inside a routed request.
 
 AlphaMoE NVFP4 prepared gate/up data
 ----------------------------------
 
-``prepare_nvfp4_w1_data`` permutes the original contiguous uint8 packed W1
-weights ``[E,N,K/2]`` into ``[E*(N/128)*(K/256),128,128]`` panels. It preserves
-every packed byte without dequantization or requantization and requires
-``N % 128 == 0`` and ``K % 256 == 0``. The resulting tensor occupies the same
-number of bytes as the raw W1 weights: an additional 768 MiB per local weight
-pair at ``E=256, N=1024, K=6144``. Keep both tensors alive and immutable.
-Prepare the panels after the final device-local weight load, before warmup or
-CUDA graph capture, and replace them when the raw weights are replaced. They
-are derived data and need not be saved in the model checkpoint.
+``prepare_nvfp4_w1_data`` permutes contiguous uint8 packed W1 weights
+``[E,N,K/2]`` into ``[E*(N/128)*(K/256),128,128]`` panels. It preserves every
+packed byte without dequantization or requantization and requires
+``N % 128 == 0`` and ``K % 256 == 0``. The buffer occupies the same number of
+bytes as raw W1: an additional 768 MiB at ``E=256, N=1024, K=6144``.
 
-The routed entry selects the prepared-data path for exactly
-``M=8, N=1024, K=6144, E=256, top_k=8, block_m=8``, with compatible
-``w1_scale_prepared`` and ``w1_data_prepared`` tensors. Eight tokens alone do
-not select this path: calls with other dimensions keep their existing route.
-Omitting ``w1_data_prepared`` also keeps the existing route. The aligned entry
-does not accept this additional keyword.
+With compatible ``w1_scale_prepared`` and ``w1_data_prepared``, the routed
+entry selects prepared-data paths for ``M=8``, ``M=128`` and ``M=512`` at
+exactly ``N=1024, K=6144, E=256, top_k=8, block_m=8``. Other dimensions retain
+their existing selection. Omitting ``w1_data_prepared`` retains the scale-only
+or raw path. These data keywords belong to the routed entry, not the aligned
+entry. The paths preserve caller output and use BF16 expert-route storage.
+The eight-token path also keeps a separate FP32 initial-output seed; the
+128-token and 512-token prepared-data paths finalize directly into caller
+output in route order.
 
-This exact routed path stores expert contributions in BF16 route storage and
-uses a separate FP32 copy of the caller's initial output when accumulating
-weighted contributions in route order. It does not reset caller output or
-prepare weights inside the request.
-
-Prepare and pass the data buffer only to the routed entry::
+Prepare and pass ordinary data panels to the routed entry::
 
     from flashinfer.fused_moe import prepare_nvfp4_w1_data
 
-    # Once, alongside prepared_scales after device-local weight loading:
+    # Once, after the final device-local weight load:
     w1_data_prepared = prepare_nvfp4_w1_data(gemm1_weights)
     prepared_routed = dict(
         prepared_scales, w1_data_prepared=w1_data_prepared
     )
+    # Append **prepared_routed to the existing routed call, retaining raw inputs.
 
-    # Existing routed call: retain every raw argument and append
-    # **prepared_routed. Reuse the same tensors for subsequent requests.
+AlphaMoE NVFP4 adjacent gate/up panels
+------------------------------------
+
+For the exact 512-token shape above, the routed entry also accepts
+``w1_gate_up_data_prepared`` and ``w1_gate_up_scale_prepared``. These two
+carriers place each gate panel next to its matching up panel. Supply both or
+neither: supplying only one raises ``ValueError``. Both must be contiguous
+uint8 tensors on the raw W1 device, with 16-byte-aligned addresses and these
+shapes, where ``R = E*(N/256)*(K/256)``:
+
+* data: ``[R,256,128]`` from ``prepare_nvfp4_w1_gate_up_data(gemm1_weights)``;
+* scales: ``[R,32,128]`` from ``prepare_nvfp4_w1_gate_up_scales(
+  w1_scale_prepared, gemm1_weights.shape)``.
+
+Here ``N`` counts the combined gate/up rows in raw W1 ``[E,N,K/2]``. The
+preparation requires ``N % 256 == 0`` and ``K % 256 == 0``. The scale helper
+consumes the output of ``prepare_nvfp4_w1_scales``, not raw E4M3 scales. Both
+helpers only permute bytes. At the supported local dimensions, the adjacent
+data and scale buffers add 768 MiB and 96 MiB, respectively. Retaining ordinary
+prepared-data panels as well incurs their separate memory cost.
+
+A valid adjacent pair takes precedence at exactly
+``M=512, N=1024, K=6144, E=256, top_k=8, block_m=8`` with supported route
+metadata and 4-byte-aligned activation, W1 and W2 scale addresses. It does not
+require the separate
+``w1_scale_prepared``, ``w1_data_prepared`` or ``w2_scale_prepared`` arguments
+at call time. Raw weights and raw scales remain required arguments. For other
+shapes the adjacent pair does not select this specialization. Omitting both
+retains the existing prepared-data, scale-only or raw selection. Invalid
+supplied carriers are rejected rather than silently replaced.
+
+Prepare the pair once and reuse it across routed requests::
+
+    from flashinfer.fused_moe import (
+        prepare_nvfp4_w1_scales,
+        prepare_nvfp4_w1_gate_up_data,
+        prepare_nvfp4_w1_gate_up_scales,
+    )
+
+    w1_scales = prepare_nvfp4_w1_scales(gemm1_weights_scale)
+    adjacent_routed = {
+        "w1_gate_up_data_prepared": prepare_nvfp4_w1_gate_up_data(gemm1_weights),
+        "w1_gate_up_scale_prepared": prepare_nvfp4_w1_gate_up_scales(
+            w1_scales, gemm1_weights.shape
+        ),
+    }
+    # Append **adjacent_routed to the existing routed call; retain all raw inputs.
+
+Prepare after the final device-local load or shard layout is established and
+before warmup or CUDA graph capture. Keep the raw tensors and selected panels
+alive and immutable; rebuild the panels whenever those weights or scales are
+replaced. Shape checks cannot establish that a panel belongs to the current
+weight values. The helpers do not maintain an automatic cache or fetch model
+files. Reuse existing read-only model files as loading inputs, and keep any
+optional derived-panel cache separate from the original checkpoint. Reuse
+layer-owned device panels across requests instead of rebuilding them per call.
+Prepared panels are derived buffers and need not be saved in the model
+checkpoint. Preparation time and memory remain outside routed kernel timing.
 
 The aligned entry keeps its existing ``None`` return value. The routed entry
 returns the caller's output tensor. Neither entry resets caller output; provide

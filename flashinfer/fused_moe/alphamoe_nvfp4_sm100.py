@@ -988,7 +988,10 @@ def prepare_nvfp4_w2_scales(w2_scale):
         experts * output_tiles * intermediate_blocks, 8, 128
     )
 
-__all__ += ["prepare_nvfp4_w1_scales", "prepare_nvfp4_w2_scales", "prepare_nvfp4_w1_data"]
+__all__ += [
+    "prepare_nvfp4_w1_scales", "prepare_nvfp4_w2_scales", "prepare_nvfp4_w1_data",
+    "prepare_nvfp4_w1_gate_up_data", "prepare_nvfp4_w1_gate_up_scales",
+]
 
 
 def _uses_compact_owner_routed(
@@ -1170,6 +1173,13 @@ def _check_prepared_w1_gate_up(w1, data, scales):
 
 
 def prepare_nvfp4_w1_gate_up_data(w1):
+    """Return byte-preserving adjacent gate/up panels for the routed entry.
+
+    Contiguous uint8 W1 ``[E,N,K/2]`` requires ``N % 256 == 0`` and
+    ``K % 256 == 0``. The result is ``[E*(N/256)*(K/256),256,128]``
+    on the same device. Prepare after weight loading, before warmup or graph
+    capture; keep raw weights and derived panels alive and immutable.
+    """
     import torch
 
     assert w1.dtype == torch.uint8 and w1.ndim == 3 and w1.is_contiguous()
@@ -1193,6 +1203,13 @@ def restore_nvfp4_w1_gate_up_data(prepared, original_shape):
 
 
 def prepare_nvfp4_w1_gate_up_scales(prepared_scales, original_weight_shape):
+    """Pair existing prepared W1 scale bytes with adjacent gate/up data.
+
+    ``prepared_scales`` is the uint8 output of :func:`prepare_nvfp4_w1_scales`;
+    ``original_weight_shape`` is the raw W1 shape ``[E,N,K/2]``. The result
+    is ``[E*(N/256)*(K/256),32,128]`` and preserves every E4M3 byte.
+    Reuse it with data prepared from the same device-local weight load.
+    """
     import torch
 
     experts, rows, packed_k = map(int, original_weight_shape)

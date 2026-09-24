@@ -188,6 +188,8 @@ from .alphamoe_nvfp4_sm100 import (  # noqa: F401
     alphamoe_nvfp4_routed_moe as alphamoe_nvfp4_routed_moe,
     prepare_nvfp4_w1_scales as prepare_nvfp4_w1_scales,
     prepare_nvfp4_w1_data as prepare_nvfp4_w1_data,
+    prepare_nvfp4_w1_gate_up_data as prepare_nvfp4_w1_gate_up_data,
+    prepare_nvfp4_w1_gate_up_scales as prepare_nvfp4_w1_gate_up_scales,
     prepare_nvfp4_w2_scales as prepare_nvfp4_w2_scales,
 )
 
@@ -374,6 +376,8 @@ __all__ = [
     "alphamoe_nvfp4_routed_moe",
     "prepare_nvfp4_w1_scales",
     "prepare_nvfp4_w1_data",
+    "prepare_nvfp4_w1_gate_up_data",
+    "prepare_nvfp4_w1_gate_up_scales",
     "prepare_nvfp4_w2_scales",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
