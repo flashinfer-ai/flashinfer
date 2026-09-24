@@ -112,12 +112,12 @@ def test_minimax_h3_dense_attention_matches_fp32_oracle(tokens: int) -> None:
     not _supported(),
     reason="requires a CUDA GPU with compute capability 9.0, 10.x or 12.x",
 )
-def test_minimax_h3_dense_attention_preallocated_output_and_ctas_per_sm() -> None:
+def test_minimax_h3_dense_attention_preallocated_output() -> None:
     device = torch.device("cuda:0")
     q, k, v = synthetic_inputs(300, seed=1, device=device)
     expected = fp32_oracle(q, k, v)
     out = torch.empty_like(q)
-    returned = minimax_h3_dense_attention(q, k, v, out, ctas_per_sm=1)
+    returned = minimax_h3_dense_attention(q, k, v, out)
     torch.cuda.synchronize()
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.float(), expected.float(), atol=1e-2, rtol=1e-2)
@@ -131,7 +131,5 @@ def test_minimax_h3_dense_attention_rejects_bad_inputs() -> None:
         minimax_h3_dense_attention(q.float(), k, v)
     with pytest.raises(ValueError):
         minimax_h3_dense_attention(q[:, :64], k, v)
-    with pytest.raises(ValueError):
-        minimax_h3_dense_attention(q, k, v, ctas_per_sm=3)
     with pytest.raises(ValueError):
         minimax_h3_dense_attention(q.t().contiguous().t(), k, v)

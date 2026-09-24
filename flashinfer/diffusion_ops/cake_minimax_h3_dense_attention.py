@@ -53,9 +53,8 @@ def _minimax_h3_dense_attention_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
-    ctas_per_sm: int,
 ) -> None:
-    _get_module().minimax_h3_dense_attention(q, k, v, out, ctas_per_sm)
+    _get_module().minimax_h3_dense_attention(q, k, v, out)
 
 
 @register_fake_op("flashinfer::minimax_h3_dense_attention")
@@ -64,7 +63,6 @@ def _minimax_h3_dense_attention_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
-    ctas_per_sm: int,
 ) -> None:
     pass
 
@@ -74,8 +72,6 @@ def minimax_h3_dense_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    *,
-    ctas_per_sm: int = 2,
 ) -> torch.Tensor:
     r"""Dense non-causal BF16 self-attention for the MiniMax-H3 video DiT on SM120 (GB202).
 
@@ -87,7 +83,9 @@ def minimax_h3_dense_attention(
     ``q``, ``k``, ``v`` and ``y`` are contiguous BF16 ``[tokens, 7168]`` rows whose element
     ``[t, h * 128 + d]`` holds channel ``d`` of head ``h``; the row<->head re-layout, the
     query scale and the attention run in one kernel.  One runtime-variable kernel serves any
-    ``1 <= tokens <= 131072``.
+    ``1 <= tokens <= 131072``: a persistent 256-thread CTA per SM walks the (head, 128-row
+    query tile) work items with a two-stage K/V TMA ring and a ping-pong schedule between
+    its two warp groups.
 
     Parameters
     ----------
@@ -95,8 +93,6 @@ def minimax_h3_dense_attention(
         Contiguous ``bfloat16`` CUDA tensors of shape ``[tokens, 7168]``.
     out : Optional[torch.Tensor]
         Optional pre-allocated output of the same shape/dtype; allocated when omitted.
-    ctas_per_sm : int
-        Persistent CTAs per SM (1 or 2; default 2).
 
     Returns
     -------
@@ -115,9 +111,7 @@ def minimax_h3_dense_attention(
         out = torch.empty_like(q)
     else:
         _check_rows("out", out, tokens)
-    if ctas_per_sm not in (1, 2):
-        raise ValueError("ctas_per_sm must be 1 or 2")
-    _minimax_h3_dense_attention_impl(q, k, v, out, ctas_per_sm)
+    _minimax_h3_dense_attention_impl(q, k, v, out)
     return out
 
 
