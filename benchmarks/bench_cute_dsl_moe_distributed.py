@@ -6,28 +6,33 @@ Compares two activation contracts over the same routed-MoE workload:
 - W4A4 quantizes BF16 activations to NVFP4 before the MoE, using per-tensor
   scaling by default or per-token scaling with ``--use-per-token-activation``.
 - W4A16 keeps activations in BF16 and decodes NVFP4 weights online.
-- Optional W4A16 MegaMoE fuses EP communication with expert compute, using
-  the same packed weights, scales, routes, and BF16 inputs as split W4A16.
+- Optional W4A4/W4A16 MegaMoE variants fuse EP communication with expert
+  compute, using the same packed weights, scales, routes, and BF16 inputs.
+  W4A4 MegaMoE quantizes inputs during its timed forward; its activation
+  quantization contract differs from W4A16 and supports per-tensor scaling only.
 
 Use torchrun to benchmark both real expert- and tensor-parallel communication:
 
     torchrun --master-addr=127.0.0.1 --master-port=29500 --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py
 
-Compare split W4A16 with MegaMoE using CUPTI and CUDA graphs. Token counts
+Compare split W4A16 with both MegaMoE variants using CUPTI and CUDA graphs. Token counts
 are GLOBAL across the EP group, including empty ranks below eight tokens:
 
     torchrun --master-addr=127.0.0.1 --master-port=29500 --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py \\
-        --parallel-modes ep --variants w4a16,w4a16_megamoe \\
-        --timing cupti --cuda-graph --refcheck --no-fused-finalize \\
+        --parallel-modes ep --variants w4a16,w4a16_megamoe,w4a4_megamoe \\
+        --timing cupti --cuda-graph --no-fused-finalize --megamoe-knobs auto \\
         --precomputed-routing --warmup 3 --iters 100 \\
         --num-tokens 1,2,4,8,16,32,64,128,256,512,4096,8192,16384
 
 With ``--no-fused-finalize``, both W4A16 paths cast FC2 results to BF16 before
 applying FP32 routing weights. Split EP rounds each rank's weighted partial
 sum to BF16 before combine; MegaMoE reduces all per-route BF16 results at the
-source rank. The refcheck keeps a fixed tolerance for this reduction difference.
+source rank. Optional ``--refcheck`` checks only W4A16 MegaMoE against split
+W4A16, with a fixed tolerance for this reduction difference. Both MegaMoE
+variants use FC2 routing weights and disable in-kernel FC2 reduction by default.
+The MegaMoE precision speedup is W4A4 latency / W4A16 latency (>1 favors W4A16).
 
 Both timers measure the full forward, including routing, input staging,
 communication, expert compute, and output handling. MegaMoE also stages runtime
@@ -124,6 +129,7 @@ class BenchVariant:
 BENCH_VARIANTS = (
     BenchVariant("w4a4", use_nvfp4_activations=True),
     BenchVariant("w4a16", use_nvfp4_activations=False),
+    BenchVariant("w4a4_megamoe", use_nvfp4_activations=True, use_megamoe=True),
     BenchVariant("w4a16_megamoe", use_nvfp4_activations=False, use_megamoe=True),
 )
 
@@ -150,7 +156,7 @@ def _parse_profile_case(profile_case):
     if mode not in ("ep", "tp") or variant_name not in variants:
         raise ValueError(f"Invalid {_PROFILE_CASE_ENV}: {profile_case}")
     if mode == "tp" and variants[variant_name].use_megamoe:
-        raise ValueError("W4A16 MegaMoE supports expert parallelism only")
+        raise ValueError("MegaMoE supports expert parallelism only")
     return mode, variants[variant_name]
 
 
@@ -1203,7 +1209,7 @@ def _check_megamoe_output(output, reference, dist, device, rank, num_tokens):
 
 
 def _benchmark_distributed_megamoe(
-    args, num_tokens, rank, world_size, device, weights, reference_outputs
+    args, variant, num_tokens, rank, world_size, device, weights, reference_outputs
 ):
     import torch.distributed as dist
 
@@ -1214,11 +1220,17 @@ def _benchmark_distributed_megamoe(
         MoEEpLayer,
         MoEEpTensors,
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.testing.utils import get_l2_cache_size
 
     local_num_tokens, _ = _token_partition(num_tokens, rank, world_size)
     capacity = (num_tokens + world_size - 1) // world_size
+    config_type = (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if variant.use_nvfp4_activations
+        else Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    )
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(
             world_size=world_size,
@@ -1233,11 +1245,13 @@ def _benchmark_distributed_megamoe(
         ),
         weights=weights,
         backend=MegaConfig(
-            megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            megakernel=config_type(
                 intermediate_size=CFG.intermediate_size,
                 top_k=CFG.top_k,
                 knobs=args.megamoe_knobs,
-                **({"apply_topk_in_fc1": True} if args.apply_topk_in_fc1 else {}),
+                # W4A4's API defaults to FC1 weighting; align both variants.
+                apply_topk_in_fc1=args.apply_topk_in_fc1,
+                enable_in_kernel_fc2_reduce=False,
             )
         ),
     )
@@ -1280,24 +1294,34 @@ def _benchmark_distributed_megamoe(
         route()
         layer.warmup(tensors)
         if args.megamoe_knobs == "auto":
+            if variant.use_nvfp4_activations:
+                from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+                    nvfp4_candidates,
+                )
+
+                # W4A4 applies its winner directly to the frontend config.
+                config = layer._workspace._frontend.config
+                knobs = {name: getattr(config, name) for name in nvfp4_candidates()[0]}
+            else:
+                knobs = layer._kernel._autotune_winner
             print(
                 "MEGAMOE_TACTIC_JSON,"
                 + json.dumps(
                     {
-                        "variant": "w4a16_megamoe",
+                        "variant": variant.name,
                         "apply_topk_in_fc1": args.apply_topk_in_fc1,
                         "global_tokens": num_tokens,
                         "local_tokens": local_num_tokens,
                         "max_tokens_per_rank": capacity,
                         "rank": rank,
-                        "knobs": layer._kernel._autotune_winner,
+                        "knobs": knobs,
                     },
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
                 flush=True,
             )
-        if reference_outputs is not None:
+        if reference_outputs is not None and not variant.use_nvfp4_activations:
             _check_megamoe_output(
                 layer.forward(tensors),
                 reference_outputs["w4a16"],
@@ -1313,7 +1337,7 @@ def _benchmark_distributed_megamoe(
             l2_flush,
             dist,
             device,
-            "ep::w4a16_megamoe",
+            f"ep::{variant.name}",
             num_tokens,
         )
     finally:
@@ -1441,7 +1465,8 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
         device,
         prepared_weights=(
             _create_shared_ep_weights(0, args.num_gpus, device)[0]
-            if mode == "ep" and "w4a16_megamoe" in args.variants.split(",")
+            if mode == "ep"
+            and any(v.use_megamoe for v in _selected_variants(args, mode))
             else None
         ),
     )
@@ -1746,6 +1771,7 @@ def _run_parallel_mode(
             if variant.use_megamoe:
                 result = _benchmark_distributed_megamoe(
                     args,
+                    variant,
                     num_tokens,
                     rank,
                     world_size,
@@ -1803,6 +1829,11 @@ def _run_parallel_mode(
                 print(
                     f"W4A16_SPEEDUP_CSV,{num_tokens},{world_size},"
                     f"{row['w4a16'] / row['w4a16_megamoe']:.6f}"
+                )
+            if "w4a4_megamoe" in row and "w4a16_megamoe" in row:
+                print(
+                    f"MEGAMOE_W4A16_SPEEDUP_CSV,{num_tokens},{world_size},"
+                    f"{row['w4a4_megamoe'] / row['w4a16_megamoe']:.6f}"
                 )
         del shared_weights, reference_outputs
         gc.collect()
@@ -1929,15 +1960,16 @@ def main():
     parser.add_argument(
         "--variants",
         default="w4a4,w4a16",
-        help="Comma-separated variants: w4a4,w4a16,w4a16_megamoe (MegaMoE is EP only).",
+        help="Comma-separated variants: w4a4,w4a16,w4a16_megamoe,w4a4_megamoe (MegaMoE is EP only).",
     )
     parser.add_argument(
         "--megamoe-knobs",
         type=_parse_megamoe_knobs,
         default=None,
         help=(
-            "JSON object of W4A16 MegaMoE kernel knobs, or auto to collectively "
-            "tune during warmup. Recorded in benchmark output."
+            "JSON object of kernel knobs for the selected MegaMoE variants, or "
+            "auto to tune each backend's native candidates during warmup. "
+            "Recorded in benchmark output."
         ),
     )
     parser.add_argument(
@@ -1964,12 +1996,12 @@ def main():
     parser.add_argument(
         "--apply-topk-in-fc1",
         action="store_true",
-        help="Weight MegaMoE FP32 SwiGLU activations before the BF16 FC1 handoff.",
+        help="Weight MegaMoE FP32 SwiGLU activations before FC1 handoff quantization/casting.",
     )
     parser.add_argument(
         "--refcheck",
         action="store_true",
-        help="Check MegaMoE against split W4A16 at atol=rtol=1e-2 before timing.",
+        help="Check W4A16 MegaMoE against split W4A16 at atol=rtol=1e-2 before timing.",
     )
     parser.add_argument(
         "--num-gpus",
@@ -1989,7 +2021,7 @@ def main():
     parser.add_argument(
         "--use-per-token-activation",
         action="store_true",
-        help="Use per-token NVFP4 activation scaling for the W4A4 case.",
+        help="Use per-token NVFP4 activation scaling for split W4A4 (unsupported by W4A4 MegaMoE).",
     )
     parser.add_argument(
         "--no-fused-finalize",
@@ -2063,7 +2095,7 @@ def main():
         "--ncu-megamoe-kernel",
         default=None,
         help=(
-            "NCU demangled kernel-name filter for the W4A16 fused EP collective "
+            "NCU demangled kernel-name filter for the fused EP collective "
             "(exact name or regex:expression, required when profiling MegaMoE)."
         ),
     )
@@ -2078,21 +2110,25 @@ def main():
     if not set(variant_names) <= {variant.name for variant in BENCH_VARIANTS} or len(
         set(variant_names)
     ) != len(variant_names):
-        parser.error("--variants must contain unique w4a4,w4a16,w4a16_megamoe values")
+        parser.error(
+            "--variants must contain unique w4a4,w4a16,w4a16_megamoe,w4a4_megamoe values"
+        )
+    megamoe_variants = {v.name for v in BENCH_VARIANTS if v.use_megamoe}
+    has_megamoe = bool(set(variant_names) & megamoe_variants)
     parallel_modes = args.parallel_modes.split(",")
     if not set(parallel_modes) <= {"ep", "tp"} or len(set(parallel_modes)) != len(
         parallel_modes
     ):
         parser.error("--parallel-modes must contain unique ep,tp values")
-    if variant_names == ["w4a16_megamoe"] and parallel_modes == ["tp"]:
-        parser.error("W4A16 MegaMoE supports expert parallelism only")
-    if args.megamoe_knobs is not None and "w4a16_megamoe" not in variant_names:
-        parser.error("--megamoe-knobs requires the w4a16_megamoe variant")
+    if set(variant_names) <= megamoe_variants and parallel_modes == ["tp"]:
+        parser.error("MegaMoE supports expert parallelism only")
+    if args.megamoe_knobs is not None and not has_megamoe:
+        parser.error("--megamoe-knobs requires a MegaMoE variant")
+    if args.use_per_token_activation and "w4a4_megamoe" in variant_names:
+        parser.error("W4A4 MegaMoE supports per-tensor activation scaling only")
     if args.precomputed_routing and parallel_modes != ["ep"]:
         parser.error("--precomputed-routing requires --parallel-modes ep")
-    if args.apply_topk_in_fc1 and (
-        "w4a16_megamoe" not in variant_names or args.refcheck
-    ):
+    if args.apply_topk_in_fc1 and (not has_megamoe or args.refcheck):
         parser.error(
             "--apply-topk-in-fc1 requires MegaMoE without --refcheck; "
             "FC1 weighting has a distinct numerical contract"
@@ -2106,7 +2142,7 @@ def main():
     if (
         args.mode == "profile_ncu"
         and "ep" in parallel_modes
-        and "w4a16_megamoe" in variant_names
+        and has_megamoe
         and not args.ncu_megamoe_kernel
     ):
         parser.error("MegaMoE NCU capture requires --ncu-megamoe-kernel")
