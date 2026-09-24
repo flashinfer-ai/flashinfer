@@ -118,6 +118,14 @@ COMBINE_FIXED_BLOCKS = 3.0
 COMBINE_BLOCKS_PER_SLOT = 0.02
 KV_SPLIT_MIN_GAIN = 0.03
 KV_SPLIT_MAX_WAVES = 4
+# Per-unit cost of the split-capable NVFP4 attention program relative to the
+# dense program, per (pv_mode, arch), measured with both programs on the same
+# unsplit plan: the sm_103a fp8pv split program runs 1.21x slower per unit
+# (its block loop is rescheduled at the softmax register budget), the other
+# combinations are at parity. A split plan runs the split program on every
+# unit, so the planner scales the split candidates' makespan by this cost
+# (mirrors the production planner's ``SPLIT_PROGRAM_COST``).
+SPLIT_PROGRAM_COST: dict[tuple[str, str], float] = {("fp8", "sm_103a"): 1.21}
 # Combine kernel: 128 threads = one warp per output row, four rows per CTA.
 COMBINE_THREADS = 128
 COMBINE_ROWS_PER_CTA = COMBINE_THREADS // 32
@@ -361,7 +369,11 @@ def lpt_makespan(costs: Sequence[float], num_clusters: int) -> float:
 
 
 def choose_kv_splits(
-    unit_blocks: Sequence[int], num_clusters: int, *, force: Optional[int] = None
+    unit_blocks: Sequence[int],
+    num_clusters: int,
+    *,
+    force: Optional[int] = None,
+    program_cost: float = 1.0,
 ) -> list[int]:
     """Per-unit K/V split factors of one plan from the simulated makespan.
 
@@ -369,7 +381,9 @@ def choose_kv_splits(
     ``KV_SPLIT_MAX_WAVES`` waves, the ``U mod G`` most expensive units (and,
     as the fallback, every unit) are split ``k`` ways for ``k`` in
     ``2..MAX_KV_SPLITS``; each candidate's longest-processing-time-first slot
-    assignment is simulated and the combine cost added, and the best candidate
+    assignment is simulated, scaled by ``program_cost`` (the per-unit cost of
+    the split-capable attention program relative to the dense one, see
+    ``SPLIT_PROGRAM_COST``) and the combine cost added, and the best candidate
     is kept only when it beats the unsplit makespan by more than
     ``KV_SPLIT_MIN_GAIN``.  Mirrors the Cake production planner's
     ``choose_kv_splits``.
@@ -396,7 +410,10 @@ def choose_kv_splits(
         combine = (
             COMBINE_FIXED_BLOCKS + COMBINE_BLOCKS_PER_SLOT * slots if slots else 0.0
         )
-        return lpt_makespan(costs, G) + combine
+        span = lpt_makespan(costs, G)
+        if slots:
+            span *= program_cost
+        return span + combine
 
     base = total(ones)
     tail = U % G
@@ -698,6 +715,7 @@ def build_tile_tables(
     *,
     num_clusters: Optional[int] = None,
     kv_splits: Optional[int] = None,
+    program_cost: float = 1.0,
 ) -> TileTables:
     """Per-unit tables: segment-major enumeration, K/V splits, then LPT slot placement.
 
@@ -732,7 +750,9 @@ def build_tile_tables(
         for s in segments
         for _ in range(heads * (plan.cluster_off[s + 1] - plan.cluster_off[s]))
     ]
-    split_of = choose_kv_splits(unit_blocks, int(num_clusters), force=kv_splits)
+    split_of = choose_kv_splits(
+        unit_blocks, int(num_clusters), force=kv_splits, program_cost=program_cost
+    )
     units: list[
         tuple[int, int, int, int, int]
     ] = []  # (cluster tile, head, kv_begin, kv_blocks, slot)
@@ -1287,7 +1307,12 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
                     f"workspace[{name!r}] must be a contiguous {dtype} tensor of shape {shape} on {device}"
                 )
     PB = int(plan.PB)
-    tiles = build_tile_tables(plan, num_heads, device)
+    tiles = build_tile_tables(
+        plan,
+        num_heads,
+        device,
+        program_cost=SPLIT_PROGRAM_COST.get((pv_mode, arch), 1.0),
+    )
     quantize_kwargs = dict(
         q=query,
         k=key,

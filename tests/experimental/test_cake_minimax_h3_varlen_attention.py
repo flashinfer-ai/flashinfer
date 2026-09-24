@@ -22,6 +22,7 @@ import torch
 from flashinfer.experimental.minimax_h3_varlen_attention import cake_backend
 from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     BLOCK_M,
+    SPLIT_PROGRAM_COST,
     CLUSTER_Q_ROWS,
     BLOCK_N,
     COMBINE_WORDS,
@@ -264,6 +265,12 @@ def test_choose_kv_splits_policy():
     assert choose_kv_splits([2] * 80, 74) == [1] * 80
     # Forced factors are clamped to the unit's block count.
     assert choose_kv_splits([1, 5, 9], 74, force=4) == [1, 4, 4]
+    # A split-capable program that costs 1.21x per unit: the 1.14-wave row still
+    # splits (the wave-quantization gain exceeds the program cost), a 3.2-wave
+    # row no longer does.
+    assert choose_kv_splits([48] * 84, 74, program_cost=1.21) != [1] * 84
+    assert choose_kv_splits([66] * 238, 74, program_cost=1.0) != [1] * 238
+    assert choose_kv_splits([66] * 238, 74, program_cost=1.21) == [1] * 238
     assert split_chunks(10, 4) == [(0, 3), (3, 3), (6, 2), (8, 2)]
     assert split_chunks(2, 8) == [(0, 1), (1, 1)]
 
