@@ -427,11 +427,13 @@ DEFAULT_BLACKWELL_MOE_TACTIC = (
     128,
     ((128, 128), (1, 1), False, 1),
     ((128, 128), (1, 1), False, 1),
+    False,  # swap_ab
 )
 DEFAULT_RUBIN_MOE_TACTIC = (
     128,
     ((128, 128, 256), (128, 128, 128), (1, 1), False),
     ((128, 128, 256), (128, 128, 128), (1, 1), False),
+    False,  # swap_ab
 )
 
 
@@ -461,7 +463,9 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
         the standard keys.
     """
     tile_size, gemm1_tactic, gemm2_tactic = tactic[:3]
-    swap_ab = tactic[3] if len(tactic) > 3 else None
+    # 3-element tactics come from the non-swap-autotuning path (weight_interleave=64),
+    # where swap_ab must be off.
+    swap_ab = tactic[3] if len(tactic) > 3 else False
 
     if _is_rubin_tactic(tactic):
         (
@@ -930,7 +934,7 @@ class CuteDslFusedMoERunner(TunableRunner):
 
         def _tactic_ok(tactic):
             tile_size, gemm1_tactic, gemm2_tactic = tactic[:3]
-            tactic_swap_ab = tactic[3] if len(tactic) > 3 else self.swap_ab
+            tactic_swap_ab = tactic[3] if len(tactic) > 3 else False
             permuted_m = get_max_num_permuted_tokens(
                 num_tokens, self.top_k, self.num_local_experts, tile_size
             )
@@ -1199,9 +1203,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             w1_split_k=params["w1_split_k"],
             w2_raster_along_m=params["w2_raster_along_m"],
             w2_pdl_count=params["w2_pdl_count"],
-            swap_ab=(
-                params["swap_ab"] if params["swap_ab"] is not None else self.swap_ab
-            ),
+            swap_ab=params["swap_ab"],
             weight_interleave=self.weight_interleave,
         )
         if self._base_callback_contract:
