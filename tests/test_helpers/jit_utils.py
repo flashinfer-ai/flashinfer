@@ -15,11 +15,16 @@ limitations under the License.
 """
 
 import itertools
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
+from filelock import FileLock
 
 import flashinfer
 from flashinfer.jit import JitSpec
+from flashinfer.jit.core import JitSpecNvcc
+from flashinfer.jit.cpp_ext import run_ninja
 from flashinfer.utils import (
     is_fa3_backend_supported,
     is_fa3_prefill_head_dim_supported,
@@ -237,3 +242,65 @@ def gen_prefill_attention_modules(
     jit_specs.append(flashinfer.page.gen_page_module())
 
     return jit_specs
+
+
+def gen_fp4_quantization_module_for_device(device=None):
+    """JitSpec of the FP4 quantization module the runtime selects on ``device``.
+
+    Mirrors ``get_fp4_quantization_module``: the key is ``f"{major}{minor}"``, and
+    SM12x prefers the ``120f`` family variant on CUDA >= 12.9. Returns ``None``
+    when the architecture has no FP4 quantization module.
+    """
+    from flashinfer.quantization import fp4_quantization as fp4q
+    from flashinfer.utils import get_compute_capability, version_at_least
+
+    major, minor = get_compute_capability(device or torch.device("cuda:0"))
+    key = f"{major}{minor}"
+    if key in ("120", "121") and version_at_least(torch.version.cuda, "12.9"):
+        key = "120f"
+    gen = getattr(fp4q, f"gen_fp4_quantization_sm{key}_module", None)
+    return gen() if gen is not None else None
+
+
+def _prebuild_job_budget() -> int:
+    """Compiler jobs a prebuild may run at once: FLASHINFER_JIT_PREBUILD_MAX_JOBS,
+    else MAX_JOBS, else the CPU count.
+    """
+    for var in ("FLASHINFER_JIT_PREBUILD_MAX_JOBS", "MAX_JOBS"):
+        val = os.environ.get(var)
+        if val is not None and val.isdigit() and int(val) > 0:
+            return int(val)
+    return os.cpu_count() or 1
+
+
+def prebuild_jit_specs(specs, verbose: bool = False) -> None:
+    """Compile ``specs`` up front, one ninja per spec, within one job budget.
+
+    Each ninja runs from ``spec.build_dir`` like ``JitSpecNvcc.build()`` does
+    (per-module isolation, #2339), so the module's own ``.ninja_log`` and
+    ``.ninja_deps`` record the outputs and the later ``build_and_load()`` is a
+    no-op. ``flashinfer.jit.build_jit_specs`` runs one combined ninja from the
+    ``cached_ops`` root, whose log the per-module ninja never sees, so it
+    recompiles everything on first use.
+
+    At most ``budget`` compiler jobs run at once (see ``_prebuild_job_budget``):
+    ``workers`` ninjas, each with ``-j budget // workers``. AOT-cached specs are
+    skipped; duplicates are built once.
+    """
+    todo = {}
+    for spec in specs:
+        if isinstance(spec, JitSpecNvcc) and not spec.aot_path.exists():
+            todo.setdefault(spec.name, spec)
+    if not todo:
+        return
+    budget = _prebuild_job_budget()
+    workers = max(1, min(len(todo), budget))
+    jobs = max(1, budget // workers)
+
+    def build(spec):
+        with FileLock(spec.lock_path, thread_local=False):
+            spec.write_ninja()
+            run_ninja(spec.build_dir, spec.ninja_path, verbose, max_jobs=jobs)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(build, todo.values()))

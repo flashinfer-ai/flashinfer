@@ -16,13 +16,16 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.jit_utils import (
-    gen_decode_attention_modules,
-    gen_prefill_attention_modules,
-)
 
 import flashinfer
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from tests.test_helpers.jit_utils import prebuild_jit_specs
+from flashinfer.jit.attention.modules import _gen_batch_prefill_primary_module
+from flashinfer.quantization import gen_quantization_module
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 
 def head_dim_512_supported() -> bool:
@@ -40,27 +43,83 @@ def skip_if_head_dim_unsupported(head_dim: int):
     scope="module",
 )
 def warmup_jit():
+    """Prebuild the decode and prefill modules this file loads.
+
+    Per head_dim: single/batch decode with and without a sliding window, FA2
+    single prefill and the FA2 primary batch prefill module, and on SM90a the
+    FA3 modules that backend="auto" resolves to (FA3 has no head_dim 512).
+    """
+    f16, i32 = torch.float16, torch.int32
+    NONE = 0
     head_dims = [64, 128, 256] + ([512] if head_dim_512_supported() else [])
-    flashinfer.jit.build_jit_specs(
-        gen_decode_attention_modules(
-            [torch.float16],  # q_dtypes
-            [torch.float16],  # kv_dtypes
-            head_dims,
-            [0],  # pos_encoding_modes
-            [False, True],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
-        )
-        + gen_prefill_attention_modules(
-            [torch.float16],  # q_dtypes
-            [torch.float16],  # kv_dtypes
-            head_dims,
-            [0],  # pos_encoding_modes
-            [False, True],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
-            [False],  # use_fp16_qk_reductions
-        ),
-        verbose=False,
-    )
+    fa3 = is_sm90a_supported(torch.device("cuda:0"))
+    specs = []
+    for head_dim in head_dims:
+        for swa in (False, True):
+            specs.append(
+                flashinfer.decode.gen_single_decode_module(
+                    f16, f16, f16, head_dim, head_dim, NONE, swa, False
+                )
+            )
+            specs.append(
+                flashinfer.decode.gen_batch_decode_module(
+                    f16, f16, f16, i32, head_dim, head_dim, NONE, swa, False
+                )
+            )
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa2", f16, f16, f16, head_dim, head_dim, NONE, swa, False, False
+                )
+            )
+            specs.append(
+                _gen_batch_prefill_primary_module(
+                    "fa2",
+                    f16,
+                    f16,
+                    f16,
+                    i32,
+                    head_dim,
+                    head_dim,
+                    NONE,
+                    swa,
+                    False,
+                    False,
+                )
+            )
+            if fa3 and head_dim <= 256:
+                specs.append(
+                    flashinfer.prefill.gen_single_prefill_module(
+                        "fa3",
+                        f16,
+                        f16,
+                        f16,
+                        head_dim,
+                        head_dim,
+                        NONE,
+                        swa,
+                        False,
+                        False,
+                    )
+                )
+                specs.append(
+                    flashinfer.prefill.gen_batch_prefill_module(
+                        "fa3",
+                        f16,
+                        f16,
+                        f16,
+                        i32,
+                        head_dim,
+                        head_dim,
+                        NONE,
+                        swa,
+                        False,
+                        False,
+                    )
+                )
+
+    # packbits for the custom-mask reference in test_single_prefill_sliding_window.
+    specs.append(gen_quantization_module())
+    prebuild_jit_specs(specs)
     yield
 
 

@@ -19,16 +19,21 @@ import pytest
 import torch
 
 import flashinfer
-from tests.test_helpers.jit_utils import (
-    gen_persistent_batch_attention_modules,
-    gen_prefill_attention_modules,
-)
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from flashinfer.jit.attention.modules import _gen_batch_prefill_primary_module
+from tests.test_helpers.jit_utils import (
+    gen_fp4_quantization_module_for_device,
+    prebuild_jit_specs,
+)
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 
 @pytest.fixture(
@@ -36,24 +41,61 @@ from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
     scope="module",
 )
 def warmup_jit():
-    flashinfer.jit.build_jit_specs(
-        gen_persistent_batch_attention_modules(
-            [torch.float16, torch.bfloat16],  # q_dtypes
-            [torch.float16, torch.bfloat16],  # kv_dtypes
-            [64, 128, 256],  # head_dims
-            [False, True],  # use_logits_soft_cap
-        )
-        + gen_prefill_attention_modules(
-            [torch.float16, torch.bfloat16],  # q_dtypes
-            [torch.float16, torch.bfloat16],  # kv_dtypes
-            [64, 128, 256],  # head_dims
-            [0],  # pos_encoding_modes
-            [False],  # use_sliding_windows
-            [False, True],  # use_logits_soft_caps
-            [False],  # use_fp16_qk_reductions
-        ),
-        verbose=False,
-    )
+    """Prebuild the modules this file loads.
+
+    One holistic batch-attention module per (dtype, head_dim, soft-cap) and
+    the FA2 primary paged-prefill module used as its reference, plus the
+    NVFP4 tests' fp4-KV variants, fp4 quantization module and FA3
+    single-prefill references.
+    """
+    cc = get_compute_capability(torch.device("cuda:0"))
+    f16, bf16, i32 = torch.float16, torch.bfloat16, torch.int32
+    NONE = 0
+    specs = []
+    for dtype in (f16, bf16):
+        for head_dim in (64, 128, 256):
+            for cap in (False, True):
+                specs.append(
+                    flashinfer.jit.gen_batch_attention_module(
+                        dtype, dtype, dtype, i32, head_dim, head_dim, NONE, cap, False
+                    )
+                )
+                specs.append(
+                    _gen_batch_prefill_primary_module(
+                        "fa2",
+                        dtype,
+                        dtype,
+                        dtype,
+                        i32,
+                        head_dim,
+                        head_dim,
+                        NONE,
+                        False,
+                        cap,
+                        False,
+                    )
+                )
+    if cc[0] >= 9:
+        fp4 = torch.float4_e2m1fn_x2
+        for dtype in (f16, bf16):
+            specs.append(
+                flashinfer.jit.gen_batch_attention_module(
+                    dtype, fp4, dtype, i32, 128, 128, NONE, False, False
+                )
+            )
+        fp4_quant = gen_fp4_quantization_module_for_device()
+        if fp4_quant is not None:
+            specs.append(fp4_quant)
+    if is_sm90a_supported(torch.device("cuda:0")):
+        # The NVFP4 tests' per-item single_prefill reference resolves to FA3.
+        for dtype in (f16, bf16):
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa3", dtype, dtype, dtype, 128, 128, NONE, False, False, False
+                )
+            )
+
+    prebuild_jit_specs(specs)
 
 
 # -------------------------  Configuration generation function  ----------------------------- #

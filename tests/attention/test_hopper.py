@@ -18,7 +18,105 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import is_sm90a_supported
+from tests.test_helpers.jit_utils import prebuild_jit_specs
+from flashinfer.jit.attention.modules import _gen_batch_prefill_primary_module
+from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
+
+
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
+def warmup_jit():
+    """Prebuild the FA2/FA3 single and batch prefill modules this file loads.
+
+    The FA2 batch path loads the primary (equal K/V stride) module, the same
+    generator aot.py uses. See prebuild_jit_specs for how they are built.
+    """
+    if not is_sm90a_supported(torch.device("cuda")):
+        return
+    f16 = torch.float16
+    specs = []
+    for head_dim in [64, 128, 256]:
+        for use_logits_soft_cap in [False, True]:
+            for backend in ["fa2", "fa3"]:
+                specs.append(
+                    flashinfer.prefill.gen_single_prefill_module(
+                        backend,
+                        f16,
+                        f16,
+                        f16,
+                        head_dim,
+                        head_dim,
+                        0,
+                        False,
+                        use_logits_soft_cap,
+                        False,
+                    )
+                )
+            specs.append(
+                _gen_batch_prefill_primary_module(
+                    "fa2",
+                    f16,
+                    f16,
+                    f16,
+                    torch.int32,
+                    head_dim,
+                    head_dim,
+                    0,
+                    False,
+                    use_logits_soft_cap,
+                    False,
+                )
+            )
+            specs.append(
+                flashinfer.prefill.gen_batch_prefill_module(
+                    "fa3",
+                    f16,
+                    f16,
+                    f16,
+                    torch.int32,
+                    head_dim,
+                    head_dim,
+                    0,
+                    False,
+                    use_logits_soft_cap,
+                    False,
+                )
+            )
+    # test_deepseek_prefill: head_dim_qk=192, head_dim_vo=128, no soft cap.
+    for dtype in [torch.float16, torch.bfloat16]:
+        specs.append(
+            _gen_batch_prefill_primary_module(
+                "fa2",
+                dtype,
+                dtype,
+                dtype,
+                torch.int32,
+                192,
+                128,
+                0,
+                False,
+                False,
+                False,
+            )
+        )
+        specs.append(
+            flashinfer.prefill.gen_batch_prefill_module(
+                "fa3",
+                dtype,
+                dtype,
+                dtype,
+                torch.int32,
+                192,
+                128,
+                0,
+                False,
+                False,
+                False,
+            )
+        )
+    prebuild_jit_specs(specs)
 
 
 @pytest.mark.parametrize("seq_len", [11, 99, 1763, 9999, 32767])

@@ -17,15 +17,28 @@ limitations under the License.
 import math
 
 import numpy
+
 import pytest
 import torch
-from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from flashinfer.jit.attention.modules import (
+    _gen_batch_prefill_independent_paged_module,
+    _gen_batch_prefill_primary_module,
+)
+from flashinfer.quantization import gen_quantization_module
+from tests.test_helpers.jit_utils import (
+    gen_fp4_quantization_module_for_device,
+    prebuild_jit_specs,
+)
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 
 def _reset_workspace_for_plan(wrapper, *plan_args, **plan_kwargs):
@@ -95,22 +108,129 @@ def _assert_no_ref_mismatch(mismatch_counts):
     scope="module",
 )
 def warmup_jit():
-    flashinfer.jit.build_jit_specs(
-        gen_prefill_attention_modules(
-            [torch.float16],  # q_dtypes
-            [
-                torch.float16,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            ],  # kv_dtypes
-            [128, 256],  # head_dims
-            [0, 1],  # pos_encoding_modes
-            [False],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
-            [False],  # use_fp16_qk_reductions
-        ),
-        verbose=False,
+    """Prebuild the modules this file loads.
+
+    FA2 wrappers load the primary (equal K/V stride) module and the
+    unequal-stride tests the independent paged module; backend="auto"
+    resolves to FA3 on SM90a for NONE without a custom mask; references call
+    single_prefill_with_kv_cache. tests/attention/conftest.py also prebuilds
+    for this file; anything already built is skipped.
+    """
+    cc = get_compute_capability(torch.device("cuda:0"))
+    f16, bf16, i32 = torch.float16, torch.bfloat16, torch.int32
+    NONE, ROPE_LLAMA, ALIBI = 0, 1, 2
+
+    def primary(q, kv, qk, vo, pe, cap=False):
+        return _gen_batch_prefill_primary_module(
+            "fa2", q, kv, q, i32, qk, vo, pe, False, cap, False
+        )
+
+    def independent(q, kv, qk, vo, pe=NONE):
+        return _gen_batch_prefill_independent_paged_module(
+            "fa2", q, kv, q, i32, qk, vo, pe, False, False, False
+        )
+
+    specs = []
+    # fp16 paged/tuple/ragged/custom-mask grids.
+    for head_dim in (128, 256):
+        for pe in (NONE, ROPE_LLAMA, ALIBI):
+            for cap in (False, True):
+                specs.append(primary(f16, f16, head_dim, head_dim, pe, cap))
+    specs.append(primary(f16, f16, 64, 64, ROPE_LLAMA))
+    # bf16 grids (cuda-graph padding, stride-router plan reuse).
+    for head_dim in (64, 128):
+        specs.append(primary(bf16, bf16, head_dim, head_dim, NONE))
+        specs.append(independent(bf16, bf16, head_dim, head_dim))
+    if head_dim_512_supported():
+        # head_dim 512 and the qk448/vo256 smem probe.
+        specs.append(primary(f16, f16, 512, 512, NONE))
+        specs.append(primary(f16, f16, 512, 512, ROPE_LLAMA))
+        specs.append(independent(f16, f16, 512, 512))
+        specs.append(primary(f16, f16, 448, 256, NONE))
+        specs.append(independent(f16, f16, 448, 256))
+        # single_prefill references of the head_dim 512 and NVFP4 large-head tests.
+        for dtype in (f16, bf16):
+            for pe in (NONE, ROPE_LLAMA):
+                specs.append(
+                    flashinfer.prefill.gen_single_prefill_module(
+                        "fa2", dtype, dtype, dtype, 512, 512, pe, False, False, False
+                    )
+                )
+    fa3 = is_sm90a_supported(torch.device("cuda:0"))
+    for head_dim in (64, 128, 256):
+        # single_prefill references (FA2; FA3 for NONE on SM90a) and FA3 wrappers.
+        for pe in (NONE, ROPE_LLAMA):
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa2", f16, f16, f16, head_dim, head_dim, pe, False, False, False
+                )
+            )
+        if fa3:
+            specs.append(
+                flashinfer.prefill.gen_batch_prefill_module(
+                    "fa3",
+                    f16,
+                    f16,
+                    f16,
+                    i32,
+                    head_dim,
+                    head_dim,
+                    NONE,
+                    False,
+                    False,
+                    False,
+                )
+            )
+            specs.append(
+                flashinfer.prefill.gen_single_prefill_module(
+                    "fa3", f16, f16, f16, head_dim, head_dim, NONE, False, False, False
+                )
+            )
+    # multi-item scoring: FA2 single-prefill reference with logits soft cap.
+    specs.append(
+        flashinfer.prefill.gen_single_prefill_module(
+            "fa2", f16, f16, f16, 128, 128, ROPE_LLAMA, False, True, False
+        )
     )
+    # packbits for the custom-mask tests.
+    specs.append(gen_quantization_module())
+    if cc[0] >= 9:
+        # NVFP4 KV cache tests.
+        fp4 = torch.float4_e2m1fn_x2
+        for q in (f16, bf16):
+            specs.append(primary(q, fp4, 128, 128, NONE))
+            specs.append(primary(q, fp4, 256, 256, NONE))
+            specs.append(primary(q, fp4, 512, 512, NONE))
+            specs.append(primary(q, fp4, 512, 512, ROPE_LLAMA))
+        specs.append(independent(f16, fp4, 128, 128))
+        fp4_quant = gen_fp4_quantization_module_for_device()
+        if fp4_quant is not None:
+            specs.append(fp4_quant)
+        if fa3:
+            # bf16 references of the NVFP4 tests resolve to FA3.
+            for head_dim in (128, 256):
+                specs.append(
+                    flashinfer.prefill.gen_single_prefill_module(
+                        "fa3",
+                        bf16,
+                        bf16,
+                        bf16,
+                        head_dim,
+                        head_dim,
+                        NONE,
+                        False,
+                        False,
+                        False,
+                    )
+                )
+    if cc[0] >= 10:
+        # Asymmetric NVFP4 (SM100+) and the FP8-KV qk448/vo256 smem probe.
+        fp4 = torch.float4_e2m1fn_x2
+        for qk, vo in ((512, 256), (256, 128)):
+            specs.append(primary(bf16, fp4, qk, vo, NONE))
+            specs.append(independent(bf16, fp4, qk, vo))
+        specs.append(primary(f16, torch.float8_e4m3fn, 448, 256, NONE))
+    prebuild_jit_specs(specs)
     yield
 
 
