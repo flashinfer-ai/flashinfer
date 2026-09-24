@@ -48,7 +48,7 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from ...utils import get_compute_capability
-from ..api import QuantFormat
+from ..api import QuantConfig, QuantFormat
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
@@ -602,8 +602,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             or "auto" to tune it over AUTO_PDL_COUNTS.
         w1_split_k: None to tune GEMM1 split-K over 1, 2, and 4, or an
             integer to use one fixed factor.
-        activation_format: Activation quantization format.
-        weight_format: Weight quantization format.
+        quant: Weight/activation formats (NVFP4xNVFP4 or MXFP4xMXFP8). None
+            keeps the legacy forward_impl callback contract.
 
     Also supports Rubin (SM107): tactic format is architecture-dependent —
     see _extract_tactic_params.
@@ -634,8 +634,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         w2_pdl_count: Any = AUTO_PDL_COUNT,
         w1_split_k: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
-        activation_format: Optional[QuantFormat] = None,
-        weight_format: Optional[QuantFormat] = None,
+        quant: Optional[QuantConfig] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
@@ -668,26 +667,18 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.w2_pdl_count = w2_pdl_count
         self.enable_pdl = w1_pdl_count is not None or w2_pdl_count is not None
         self.w1_split_k = w1_split_k
-        if (activation_format is None) != (weight_format is None):
-            raise ValueError(
-                "activation_format and weight_format must be specified together"
-            )
-        if activation_format is not None:
-            if (activation_format, weight_format) not in (
+        if quant is not None:
+            if quant.pair not in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
-                (QuantFormat.MXFP8, QuantFormat.MXFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
             ):
-                raise ValueError(
-                    "unsupported CuTe-DSL runner format pair "
-                    f"({activation_format!r}, {weight_format!r})"
-                )
-            if activation_format is QuantFormat.MXFP8 and use_per_token_activation:
+                raise ValueError(f"unsupported CuTe-DSL runner quant {quant!r}")
+            if quant.activation is QuantFormat.MXFP8 and use_per_token_activation:
                 raise ValueError(
                     "per-token activation scaling is not supported for W4A8"
                 )
-        self.activation_format = activation_format
-        self.weight_format = weight_format
-        self._base_callback_contract = activation_format is not None
+        self.quant = quant
+        self._base_callback_contract = quant is not None
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -826,8 +817,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.w1_pdl_count,
                 self.w2_pdl_count,
                 self.w1_split_k,
-                self.activation_format,
-                self.weight_format,
+                self.quant,
             )
         )
 
@@ -840,8 +830,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         else:
             w1_alpha = w1_bias = w2_alpha = w2_bias = None
         return (
-            self.activation_format,
-            self.weight_format,
+            self.quant,
             str(inputs[0].dtype) if inputs else "unknown",
             int(self.activation_type),
             self.swiglu_alpha,

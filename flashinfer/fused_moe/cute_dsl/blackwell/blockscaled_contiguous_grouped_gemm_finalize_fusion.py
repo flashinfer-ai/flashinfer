@@ -1710,8 +1710,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         if warp_idx == self.sched_warp_id:
             #
-            # Persistent tile scheduling loop, starting after the pre-emitted
-            # first tile.
+            # Persistent tile scheduling loop
             #
             work_tile = tile_sched.initial_work_tile_info()
             tile_info_producer_state = make_pipeline_state(
@@ -1770,23 +1769,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                         tiled_mma.thr_id.shape
                     )
-                    tile_idx = (
-                        cur_tile_coord[1]
-                        if cutlass.const_expr(self.swap_ab)
-                        else mma_tile_coord_m
-                    )
+                    tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
-                        if cutlass.const_expr(not self.swap_ab):
-                            num_n_tiles = tile_sched_params.problem_shape_ntile_mnl[1]
-                            n_coord = cutlass.min(cur_tile_coord[1], num_n_tiles - 1)
-                            mn_limit = mn_limit * cutlass.Int32(
-                                cur_tile_coord[1] < num_n_tiles
-                            )
-                        else:
-                            n_coord = cur_tile_coord[1]
+                        num_n_tiles = tile_sched_params.problem_shape_ntile_mnl[1]
+                        n_coord = cutlass.min(cur_tile_coord[1], num_n_tiles - 1)
+                        mn_limit = mn_limit * cutlass.Int32(
+                            cur_tile_coord[1] < num_n_tiles
+                        )
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
                                 0

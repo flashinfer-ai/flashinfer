@@ -376,7 +376,7 @@ def bench_cute_dsl(
         profile_iters: Number of cold-L2 graph replays to capture.
     """
     from flashinfer import SfLayout, nvfp4_quantize
-    from flashinfer.fused_moe import QuantFormat
+    from flashinfer.fused_moe import QuantConfig, QuantFormat
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -498,8 +498,7 @@ def bench_cute_dsl(
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
@@ -560,8 +559,7 @@ def bench_cute_dsl(
                 top_k=CFG.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
-                activation_format=activation_format,
-                weight_format=weight_format,
+                quant=QuantConfig(weight=weight_format, activation=activation_format),
                 per_token_scale=per_token_scale,
                 use_fused_finalize=use_fused_finalize,
             )

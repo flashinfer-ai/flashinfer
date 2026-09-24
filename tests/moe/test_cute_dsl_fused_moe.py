@@ -36,7 +36,7 @@ import pytest
 import torch
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
-from flashinfer.fused_moe import QuantFormat
+from flashinfer.fused_moe import QuantConfig, QuantFormat
 
 _requires_dsl_arch = pytest.mark.skipif(
     torch.cuda.is_available()
@@ -408,13 +408,11 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
     )
     w4a4 = CuteDslFusedMoERunner(
         **kwargs,
-        activation_format=QuantFormat.NVFP4,
-        weight_format=QuantFormat.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
     w4a8 = CuteDslFusedMoERunner(
         **kwargs,
-        activation_format=QuantFormat.MXFP8,
-        weight_format=QuantFormat.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
     )
     assert hash(w4a4) != hash(w4a8)
     assert w4a4.get_cache_key_extras([]) != w4a8.get_cache_key_extras([])
@@ -432,21 +430,66 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
 def test_wrapper_quant_mode_alias(quant_mode, activation_format, weight_format):
     from flashinfer.fused_moe.cute_dsl.fused_moe import CuteDslMoEWrapper
 
-    with pytest.warns(
-        DeprecationWarning, match=f"activation_format={activation_format!r}"
-    ):
-        wrapper = CuteDslMoEWrapper(
+    wrapper = CuteDslMoEWrapper(
+        num_experts=1,
+        top_k=1,
+        hidden_size=128,
+        intermediate_size=128,
+        device="cpu",
+        quant_mode=quant_mode,
+    )
+    assert wrapper.quant.pair == (weight_format, activation_format)
+
+
+@pytest.mark.parametrize(
+    "kwargs,error,match",
+    [
+        (dict(quant="w4a4"), TypeError, "QuantConfig"),
+        (
+            dict(
+                quant=QuantConfig(
+                    weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8
+                )
+            ),
+            ValueError,
+            "unsupported",
+        ),
+        (
+            dict(
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4,
+                    activation=QuantFormat.NVFP4,
+                    output=QuantFormat.FP16,
+                )
+            ),
+            ValueError,
+            "output_dtype",
+        ),
+        (
+            dict(
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4,
+                    activation=QuantFormat.NVFP4,
+                    per_token_scale=True,
+                )
+            ),
+            ValueError,
+            "per_token_scale",
+        ),
+    ],
+)
+def test_wrapper_rejects_invalid_quant(kwargs, error, match):
+    from flashinfer.fused_moe.cute_dsl.fused_moe import CuteDslMoEWrapper
+
+    with pytest.raises(error, match=match):
+        CuteDslMoEWrapper(
             num_experts=1,
             top_k=1,
             hidden_size=128,
             intermediate_size=128,
             device="cpu",
-            quant_mode=quant_mode,
+            **kwargs,
         )
-    assert (wrapper.activation_format, wrapper.weight_format) == (
-        activation_format,
-        weight_format,
-    )
 
 
 @pytest.mark.parametrize(
@@ -907,8 +950,7 @@ class TestTacticEnumeration:
             num_experts=2,
             top_k=2,
             num_local_experts=2,
-            activation_format=QuantFormat.NVFP4,
-            weight_format=QuantFormat.NVFP4,
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             weight_interleave=16,
             w1_pdl_count=None,
             w2_pdl_count=1,
@@ -1240,12 +1282,6 @@ class TestAutotuneReplayMemsetContract:
                     dtype=torch.uint8,
                 )
         tensors["weight_interleave"] = weight_interleave
-        if activation_format is QuantFormat.BF16:
-            monkeypatch.setattr(
-                fused_moe,
-                "warn_deprecated_cute_dsl_moe_weight_interleave",
-                lambda *_args: pytest.fail("W4A16 interleave must not be deprecated"),
-            )
 
         if api == "functional":
             runner_name = (
@@ -1258,8 +1294,7 @@ class TestAutotuneReplayMemsetContract:
                 **tensors,
                 num_experts=1,
                 top_k=1,
-                activation_format=activation_format,
-                weight_format=weight_format,
+                quant=QuantConfig(weight=weight_format, activation=activation_format),
             )
         else:
             wrapper = fused_moe.CuteDslMoEWrapper(
@@ -1269,8 +1304,7 @@ class TestAutotuneReplayMemsetContract:
                 intermediate_size=128 if activation_format is QuantFormat.MXFP8 else 16,
                 use_cuda_graph=False,
                 device="cpu",
-                activation_format=activation_format,
-                weight_format=weight_format,
+                quant=QuantConfig(weight=weight_format, activation=activation_format),
             )
             if activation_format is not QuantFormat.BF16:
                 wrapper._runner = RecordingRunner()
@@ -1769,8 +1803,9 @@ class TestCuteDslMoeW4A16:
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 use_cuda_graph=False,
-                activation_format=QuantFormat.BF16,
-                weight_format=QuantFormat.NVFP4,
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
+                ),
             )
         else:
             moe = None
@@ -1782,8 +1817,9 @@ class TestCuteDslMoeW4A16:
                 **kwargs,
                 num_experts=num_experts,
                 top_k=top_k,
-                activation_format=QuantFormat.BF16,
-                weight_format=QuantFormat.NVFP4,
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
+                ),
             )
 
         # Weight scales are serving-owned tensors and may be updated in place.
@@ -2219,6 +2255,8 @@ class TestCuteDslMoeKernelAccuracy:
             init_normal=init_normal,
             normal_std=0.1,
             swap_ab=swap_ab,
+            # Swapped 2CTA (weight tile 256) requires M rasterization.
+            raster_along_m=swap_ab and mma_tiler_mn[1] == 256,
             expert_alpha_value=0.0625,
             generate_scaled_output=generate_scaled_output,
             weight_interleave=weight_interleave,
@@ -2794,8 +2832,7 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_local_experts,
             activation_type=activation_type,
             use_fused_finalize=use_fused_finalize,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
             **api_inputs,
         )
 
@@ -2864,8 +2901,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             activation_type=activation_type,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
             **api_inputs,
         )
 
@@ -2963,8 +2999,7 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=ActivationType.Swiglu,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
             **api_inputs,
         )
 
@@ -3051,8 +3086,7 @@ class TestCuteDslFusedMoeFunctional:
                 swiglu_alpha=1.702,
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,
-                activation_format=activation_format,
-                weight_format=weight_format,
+                quant=QuantConfig(weight=weight_format, activation=activation_format),
                 **api_inputs,
             )
 
@@ -3101,8 +3135,7 @@ class TestCuteDslFusedMoeFunctional:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
             **api_inputs,
         )
 
@@ -3185,8 +3218,7 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             use_fused_finalize=use_fused_finalize,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         result = moe.run(
@@ -3260,8 +3292,7 @@ class TestCuteDslMoEWrapper:
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         result = moe.run(
@@ -3351,8 +3382,7 @@ class TestCuteDslMoEWrapper:
             swiglu_beta=1.0,
             swiglu_limit=7.0,
             use_fused_finalize=use_fused_finalize,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         # Warmup
@@ -3488,8 +3518,7 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             activation_type=activation_type,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
         )
@@ -3750,8 +3779,7 @@ class TestApiConsistency:
         )
         result_functional = cute_dsl_fused_moe(
             **functional_inputs,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
         if activation_format is QuantFormat.NVFP4:
             deprecated_inputs = dict(functional_inputs)
@@ -3767,8 +3795,7 @@ class TestApiConsistency:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         result_wrapper = moe.run(
@@ -3855,8 +3882,7 @@ class TestExpertParallelism:
             intermediate_size=intermediate_size,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         result = moe.run(
@@ -3949,8 +3975,7 @@ class TestExpertParallelism:
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
             **api_inputs,
         )
 
@@ -4273,8 +4298,7 @@ class TestAllValidTactics:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=QuantConfig(weight=weight_format, activation=activation_format),
         )
 
         # Get the filtered list of valid tactics for this problem size
@@ -4761,8 +4785,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         **inputs,
         num_experts=num_experts,
         top_k=top_k,
-        activation_format=QuantFormat.MXFP8,
-        weight_format=QuantFormat.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         tactic=tactic,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -4775,8 +4798,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         top_k=top_k,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        activation_format=QuantFormat.MXFP8,
-        weight_format=QuantFormat.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
@@ -4925,8 +4947,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
             **unit_alpha_inputs,
             num_experts=num_experts,
             top_k=top_k,
-            activation_format=QuantFormat.MXFP8,
-            weight_format=QuantFormat.MXFP4,
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
             tactic=tactic,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,

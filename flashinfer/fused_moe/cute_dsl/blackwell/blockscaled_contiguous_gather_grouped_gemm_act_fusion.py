@@ -585,8 +585,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         mma_n = mma_tiler_mn[0] if swap_ab else mma_tiler_mn[1]
         self.use_2cta_instrs = mma_m == 256
         self.split_k = split_k
-        # Swapped 2CTA uses M rasterization for weight-cache locality.
-        self.raster_along_m = raster_along_m or (swap_ab and self.use_2cta_instrs)
+        # Swapped 2CTA requires M rasterization for weight-cache locality.
+        if swap_ab and self.use_2cta_instrs and not raster_along_m:
+            raise ValueError(
+                "swap_ab with a 2CTA (mma_m=256) tile requires raster_along_m=True"
+            )
+        self.raster_along_m = raster_along_m
         if split_k < 1 or split_k > 16 or not is_power_of_2(split_k):
             raise ValueError(
                 "split_k must be a positive power of two no greater than 16, "
@@ -1046,6 +1050,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.generate_sfc = sfc_tensor is not None
+        if cutlass.const_expr(
+            self.generate_sfc
+            and self.c_dtype == cutlass.Float4E2M1FN
+            and norm_const_tensor is None
+        ):
+            raise ValueError("norm_const_tensor is required for NVFP4 output")
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.fp4_swap = self.swap_ab and self.c_dtype == cutlass.Float4E2M1FN
@@ -1105,30 +1115,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 f"A=FP4 is only valid when B is FP4, but got A={self.a_dtype} and B={self.b_dtype}"
             )
         if cutlass.const_expr(
-            cutlass.const_expr(
-                self.swiglu_limit is not None
+            not self.gated
+            and (
+                self.swiglu_limit not in (None, DEFAULT_SWIGLU_LIMIT)
                 or self.swiglu_alpha != 1.0
                 or self.swiglu_beta != 0.0
             )
-            and not self.gated
         ):
-            print("Warning: SwiGLU is not supported when gated is False")
+            raise ValueError("SwiGLU controls require gated=True")
 
         # Setup attributes that dependent on gemm inputs
         self.setup_attributes()
 
-        if cutlass.const_expr(not self.swap_ab):
-            # Setup sfb tensor by filling B tensor to scale factor atom layout
-            # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-            sfb_layout = blockscaled_layout.tile_atom_to_shape_SF(
-                b.shape, self.sf_vec_size
-            )
-            weights_sf = cute.make_tensor(sfb.iterator, sfb_layout)
-        else:
-            sfa_layout = blockscaled_layout.tile_atom_to_shape_SF(
-                b.shape, self.sf_vec_size
-            )
-            weights_sf = cute.make_tensor(sfb.iterator, sfa_layout)
+        # Setup the weight scale-factor tensor by filling B to the scale factor
+        # atom layout ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL). B holds the
+        # weights in both operand orders, so swap_ab does not change this.
+        sfb_layout = blockscaled_layout.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
+        weights_sf = cute.make_tensor(sfb.iterator, sfb_layout)
 
         if cutlass.const_expr(self.generate_sfc):
             if cutlass.const_expr(self.use_compact_sfc):

@@ -4896,8 +4896,7 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                activation_format=self.config.quant.activation,
-                weight_format=self.config.quant.weight,
+                quant=self.config.quant,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -4975,33 +4974,33 @@ class CuteDslRunner(MoERunner):
         weight_interleave = normalize_cute_dsl_moe_weight_interleave(
             weight_interleave, swap_ab=False
         )
-        if (
-            self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
-            and weight_interleave != 64
-        ):
-            raise ValueError("CuTe-DSL W4A16 requires weight_interleave=64")
-        device = getattr(self, "device", torch.device("cpu"))
-        if (
-            weight_interleave == 16
-            and device.type == "cuda"
-            and torch.cuda.is_available()
-        ):
-            from ..utils import get_compute_capability
-
-            if get_compute_capability(device) == (10, 7):
-                raise ValueError("weight_interleave=16 is not supported on SM107")
-        if self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.BF16):
-            warn_deprecated_cute_dsl_moe_weight_interleave(weight_interleave, device)
+        is_w4a16 = self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
         bound_interleave = getattr(self, "_weight_interleave", None)
-        if bound_interleave is not None and bound_interleave != weight_interleave:
+        if bound_interleave is None:
+            if is_w4a16 and weight_interleave != 64:
+                raise ValueError("CuTe-DSL W4A16 requires weight_interleave=64")
+            device = getattr(self, "device", torch.device("cpu"))
+            if (
+                weight_interleave == 16
+                and device.type == "cuda"
+                and torch.cuda.is_available()
+            ):
+                from ..utils import get_compute_capability
+
+                if get_compute_capability(device) == (10, 7):
+                    raise ValueError("weight_interleave=16 is not supported on SM107")
+            if not is_w4a16:
+                warn_deprecated_cute_dsl_moe_weight_interleave(
+                    weight_interleave, device
+                )
+                self._inner.weight_interleave = weight_interleave
+            self._weight_interleave = weight_interleave
+        elif bound_interleave != weight_interleave:
             raise ValueError(
                 f"CuteDslRunner is already bound to weight_interleave="
                 f"{bound_interleave}; got a weight view tagged "
                 f"weight_interleave={weight_interleave}"
             )
-        self._weight_interleave = weight_interleave
-        if self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.BF16):
-            self._inner.weight_interleave = weight_interleave
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a

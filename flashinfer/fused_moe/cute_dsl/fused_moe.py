@@ -78,7 +78,7 @@ from ...quantization.kernels.nvfp4_quantize import (
     nvfp4_quantize_per_token_cute_dsl,
 )
 from ...utils import get_compute_capability, supported_compute_capability
-from ..api import QuantFormat
+from ..api import QuantConfig, QuantFormat
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -106,12 +106,54 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
-_QUANT_MODE_FORMATS = {
-    "w4a4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
-    "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
-    "w4a8": (QuantFormat.MXFP8, QuantFormat.MXFP4),
-    "w4a16": (QuantFormat.BF16, QuantFormat.NVFP4),
-}
+
+
+def _resolve_cute_dsl_quant(
+    quant: Optional[QuantConfig], quant_mode: Optional[str]
+) -> QuantConfig:
+    """Resolve ``quant`` (or the deprecated ``quant_mode`` string) and validate it."""
+    w4a4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+    w4a8 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    w4a16 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16)
+    quant_mode_configs = {"w4a4": w4a4, "nvfp4": w4a4, "w4a8": w4a8, "w4a16": w4a16}
+    if quant_mode is not None:
+        try:
+            mode_quant = quant_mode_configs[quant_mode.lower()]
+        except (AttributeError, KeyError):
+            raise ValueError(
+                f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
+            ) from None
+        if quant is not None:
+            warnings.warn(
+                f"both quant_mode={quant_mode!r} and quant={quant!r} are set; "
+                "using quant_mode.",
+                UserWarning,
+                stacklevel=3,
+            )
+        warnings.warn(
+            f"quant_mode is deprecated; use quant={mode_quant!r} instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return mode_quant
+    if quant is None:
+        return w4a4
+    if not isinstance(quant, QuantConfig):
+        raise TypeError(f"quant must be a QuantConfig, got {quant!r}")
+    if quant.pair not in (w4a4.pair, w4a8.pair, w4a16.pair):
+        raise ValueError(f"unsupported CuTe-DSL MoE quant {quant!r}")
+    # Output dtype and per-token scaling have their own knobs here; reject
+    # QuantConfig settings that would otherwise be silently ignored.
+    if (
+        quant.output is not QuantFormat.BF16
+        or quant.per_token_scale is not None
+        or quant.swizzled_scale_factors is not None
+    ):
+        raise ValueError(
+            "CuTe-DSL MoE uses only the weight/activation formats of quant; set "
+            "the output dtype with output_dtype and pass per_token_scale to run()"
+        )
+    return quant
 
 
 def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
@@ -633,8 +675,7 @@ class CuteDslMoEWrapper:
             resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
-        activation_format: Activation quantization format.
-        weight_format: Weight quantization format.
+        quant: Weight/activation quantization formats
         weight_interleave: Optional expected GEMM1 up/gate weight interleave.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
@@ -687,8 +728,7 @@ class CuteDslMoEWrapper:
         situ_linear_beta: Optional[float] = None,
         use_fused_finalize: bool = True,
         quant_mode: Optional[str] = None,
-        activation_format: QuantFormat = QuantFormat.NVFP4,
-        weight_format: QuantFormat = QuantFormat.NVFP4,
+        quant: Optional[QuantConfig] = None,
         weight_interleave: Optional[int] = None,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
@@ -742,55 +782,22 @@ class CuteDslMoEWrapper:
             Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
         quant_mode : Optional[str]
-            Deprecated alias for ``activation_format`` and ``weight_format``.
-        activation_format : QuantFormat
-            Activation quantization format. Defaults to ``QuantFormat.NVFP4``.
-        weight_format : QuantFormat
-            Weight quantization format. Defaults to ``QuantFormat.NVFP4``.
+            Deprecated alias for ``quant``: ``"w4a4"``, ``"w4a8"`` or ``"w4a16"``.
+        quant : Optional[QuantConfig]
+            Weight/activation formats: NVFP4×NVFP4 (W4A4, default),
+            MXFP4×MXFP8 (W4A8) or NVFP4×BF16 (W4A16).
         weight_interleave : Optional[int]
             Expected GEMM1 up/gate weight interleave. Set it in
             :func:`CuteDslConfig.prepare_weights`; this argument checks that
             the prepared view matches. Untagged weights default to ``64``.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
-        if quant_mode is not None:
-            try:
-                format_pair = _QUANT_MODE_FORMATS[quant_mode.lower()]
-            except (AttributeError, KeyError):
-                raise ValueError(
-                    "quant_mode must be 'w4a4', 'w4a8', or 'w4a16' "
-                    f"(got {quant_mode!r})."
-                ) from None
-            if (activation_format, weight_format) not in (
-                (QuantFormat.NVFP4, QuantFormat.NVFP4),
-                format_pair,
-            ):
-                raise ValueError(
-                    "quant_mode cannot be combined with conflicting "
-                    "activation_format or weight_format"
-                )
-            activation_format, weight_format = format_pair
-            warnings.warn(
-                "quant_mode is deprecated; use "
-                f"activation_format={activation_format!r} and "
-                f"weight_format={weight_format!r} instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        if (activation_format, weight_format) not in (
-            (QuantFormat.NVFP4, QuantFormat.NVFP4),
-            (QuantFormat.MXFP8, QuantFormat.MXFP4),
-            (QuantFormat.BF16, QuantFormat.NVFP4),
-        ):
-            raise ValueError(
-                "unsupported CuTe-DSL MoE format pair "
-                f"({activation_format!r}, {weight_format!r})"
-            )
+        quant = _resolve_cute_dsl_quant(quant, quant_mode)
         explicit_weight_interleave = weight_interleave
         weight_interleave = normalize_cute_dsl_moe_weight_interleave(
             weight_interleave, swap_ab=False
         )
-        if activation_format is QuantFormat.BF16 and weight_interleave != 64:
+        if quant.activation is QuantFormat.BF16 and weight_interleave != 64:
             raise ValueError("W4A16 requires weight_interleave=64")
         device_obj = torch.device(device)
         if (
@@ -821,12 +828,11 @@ class CuteDslMoEWrapper:
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.use_fused_finalize = use_fused_finalize
-        self.activation_format = activation_format
-        self.weight_format = weight_format
+        self.quant = quant
         self._explicit_weight_interleave = explicit_weight_interleave
         self._weight_interleave_bound = False
         self.weight_interleave = weight_interleave
-        if activation_format is QuantFormat.MXFP8:
+        if quant.activation is QuantFormat.MXFP8:
             if output_dtype is not torch.bfloat16:
                 raise ValueError("W4A8 supports only bfloat16 output")
             if not use_fused_finalize:
@@ -851,7 +857,7 @@ class CuteDslMoEWrapper:
         self._runner: Optional[CuteDslFusedMoERunner] = None
         self._per_token_runner: Optional[CuteDslFusedMoERunner] = None
         self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
-        if activation_format is not QuantFormat.BF16:
+        if quant.activation is not QuantFormat.BF16:
             wrapper_ref = weakref.ref(self)
 
             def _forward_with_tactic_weak(*args, **kwargs):
@@ -881,11 +887,10 @@ class CuteDslMoEWrapper:
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 use_per_token_activation=False,
-                activation_format=activation_format,
-                weight_format=weight_format,
+                quant=quant,
                 weight_interleave=weight_interleave,
             )
-            if activation_format is QuantFormat.NVFP4:
+            if quant.activation is QuantFormat.NVFP4:
                 self._per_token_runner = CuteDslFusedMoERunner(
                     forward_impl=_forward_with_tactic_weak,
                     num_experts=num_experts,
@@ -902,8 +907,7 @@ class CuteDslMoEWrapper:
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
                     use_per_token_activation=True,
-                    activation_format=activation_format,
-                    weight_format=weight_format,
+                    quant=quant,
                     weight_interleave=weight_interleave,
                 )
 
@@ -1048,7 +1052,7 @@ class CuteDslMoEWrapper:
                 f"CuteDslMoEWrapper is already bound to weight_interleave="
                 f"{self.weight_interleave}; got {weight_interleave}"
             )
-        if self.activation_format is QuantFormat.BF16 and weight_interleave != 64:
+        if self.quant.activation is QuantFormat.BF16 and weight_interleave != 64:
             raise ValueError("W4A16 requires weight_interleave=64")
         device = torch.device(self.device)
         if (
@@ -1058,7 +1062,7 @@ class CuteDslMoEWrapper:
             and get_compute_capability(device) == (10, 7)
         ):
             raise ValueError("weight_interleave=16 is not supported on SM107")
-        if self.activation_format is not QuantFormat.BF16:
+        if self.quant.activation is not QuantFormat.BF16:
             warn_deprecated_cute_dsl_moe_weight_interleave(weight_interleave, device)
         self.weight_interleave = weight_interleave
         for runner in (self._runner, self._per_token_runner):
@@ -1145,11 +1149,11 @@ class CuteDslMoEWrapper:
         num_tokens = token_selected_experts.size(0)
 
         if (
-            self.activation_format is QuantFormat.MXFP8
+            self.quant.activation is QuantFormat.MXFP8
             and x.dtype is not torch.float8_e4m3fn
         ):
             raise TypeError(f"x must have dtype torch.float8_e4m3fn, got {x.dtype}")
-        if self.activation_format is QuantFormat.MXFP8:
+        if self.quant.activation is QuantFormat.MXFP8:
             if per_token_scale is not None:
                 raise ValueError("per_token_scale is not supported when format is W4A8")
             if x_sf is None:
@@ -1169,21 +1173,21 @@ class CuteDslMoEWrapper:
                 w2_bias,
                 None,
             )
-        elif self.activation_format is QuantFormat.NVFP4 and x.dtype is not torch.uint8:
+        elif self.quant.activation is QuantFormat.NVFP4 and x.dtype is not torch.uint8:
             raise TypeError("W4A4 requires packed uint8 input")
         elif (
-            self.activation_format is QuantFormat.BF16 and x.dtype is not torch.bfloat16
+            self.quant.activation is QuantFormat.BF16 and x.dtype is not torch.bfloat16
         ):
             raise TypeError(f"W4A16 requires x.dtype=torch.bfloat16, got {x.dtype}")
         elif (
-            self.activation_format is QuantFormat.BF16
+            self.quant.activation is QuantFormat.BF16
             and token_final_scales.dtype is not torch.float32
         ):
             raise TypeError(
                 "W4A16 requires token_final_scales.dtype=torch.float32, "
                 f"got {token_final_scales.dtype}"
             )
-        if self.activation_format is QuantFormat.BF16 and (
+        if self.quant.activation is QuantFormat.BF16 and (
             w1_alpha is None or w2_alpha is None
         ):
             raise ValueError("w1_alpha and w2_alpha are required when format is W4A16")
@@ -1202,7 +1206,7 @@ class CuteDslMoEWrapper:
         )
         op_name = f"CuteDslMoEWrapper::run::{activation_name}"
 
-        if self.activation_format is not QuantFormat.BF16:
+        if self.quant.activation is not QuantFormat.BF16:
             use_per_token_activation = per_token_scale is not None
             runner = (
                 self._per_token_runner if use_per_token_activation else self._runner
@@ -1261,7 +1265,7 @@ class CuteDslMoEWrapper:
             runner.tuning_config,
             inputs,
         )
-        if self.activation_format is not QuantFormat.BF16:
+        if self.quant.activation is not QuantFormat.BF16:
             # Timed tactic runs retain the default async path; only this
             # selected-tactic execution is single-stream while tuning.
             runner_kwargs = {"use_async_memset": not tuner.is_tuning_mode}
@@ -1271,7 +1275,7 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
-        if self.activation_format is not QuantFormat.BF16:
+        if self.quant.activation is not QuantFormat.BF16:
             # _get_arch_tactics() replaces main's ALL_MOE_TACTICS: the tactic
             # list is now architecture-dependent (Blackwell vs Rubin).
             return _get_arch_tactics()
@@ -1416,8 +1420,7 @@ def cute_dsl_fused_moe(
     w2_bias: Optional[torch.Tensor] = None,
     *,
     quant_mode: Optional[str] = None,
-    activation_format: QuantFormat = QuantFormat.NVFP4,
-    weight_format: QuantFormat = QuantFormat.NVFP4,
+    quant: Optional[QuantConfig] = None,
     weight_interleave: Optional[int] = None,
     per_token_scale: Optional[torch.Tensor] = None,
     tactic: Optional[Tuple] = None,
@@ -1489,11 +1492,10 @@ def cute_dsl_fused_moe(
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : Optional[str]
-        Deprecated alias for ``activation_format`` and ``weight_format``.
-    activation_format : QuantFormat
-        Activation quantization format. Defaults to ``QuantFormat.NVFP4``.
-    weight_format : QuantFormat
-        Weight quantization format. Defaults to ``QuantFormat.NVFP4``.
+        Deprecated alias for ``quant``: ``"w4a4"``, ``"w4a8"`` or ``"w4a16"``.
+    quant : Optional[QuantConfig]
+        Weight/activation formats: NVFP4×NVFP4 (W4A4, default), MXFP4×MXFP8
+        (W4A8) or NVFP4×BF16 (W4A16).
     weight_interleave : Optional[int]
         Physical GEMM1 up/gate weight interleave recorded by
         :func:`CuteDslConfig.prepare_weights`. Untagged weights default to
@@ -1521,42 +1523,11 @@ def cute_dsl_fused_moe(
     """
     _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
-    if quant_mode is not None:
-        try:
-            format_pair = _QUANT_MODE_FORMATS[quant_mode.lower()]
-        except (AttributeError, KeyError):
-            raise ValueError(
-                f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
-            ) from None
-        if (activation_format, weight_format) not in (
-            (QuantFormat.NVFP4, QuantFormat.NVFP4),
-            format_pair,
-        ):
-            raise ValueError(
-                "quant_mode cannot be combined with conflicting "
-                "activation_format or weight_format"
-            )
-        activation_format, weight_format = format_pair
-        warnings.warn(
-            "quant_mode is deprecated; use "
-            f"activation_format={activation_format!r} and "
-            f"weight_format={weight_format!r} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if (activation_format, weight_format) not in (
-        (QuantFormat.NVFP4, QuantFormat.NVFP4),
-        (QuantFormat.MXFP8, QuantFormat.MXFP4),
-        (QuantFormat.BF16, QuantFormat.NVFP4),
-    ):
-        raise ValueError(
-            "unsupported CuTe-DSL MoE format pair "
-            f"({activation_format!r}, {weight_format!r})"
-        )
+    quant = _resolve_cute_dsl_quant(quant, quant_mode)
     weight_interleave = normalize_cute_dsl_moe_weight_interleave(
         weight_interleave, swap_ab=False
     )
-    if activation_format is QuantFormat.BF16 and weight_interleave != 64:
+    if quant.activation is QuantFormat.BF16 and weight_interleave != 64:
         raise ValueError("W4A16 requires weight_interleave=64")
     if (
         weight_interleave == 16
@@ -1564,11 +1535,11 @@ def cute_dsl_fused_moe(
         and get_compute_capability(x.device) == (10, 7)
     ):
         raise ValueError("weight_interleave=16 is not supported on SM107")
-    if activation_format is not QuantFormat.BF16:
+    if quant.activation is not QuantFormat.BF16:
         warn_deprecated_cute_dsl_moe_weight_interleave(weight_interleave, x.device)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
-    if activation_format is QuantFormat.MXFP8:
+    if quant.activation is QuantFormat.MXFP8:
         if x.dtype is not torch.float8_e4m3fn:
             raise TypeError(f"x must have dtype torch.float8_e4m3fn, got {x.dtype}")
         if get_compute_capability(x.device) == (10, 7):
@@ -1590,7 +1561,7 @@ def cute_dsl_fused_moe(
             w2_bias,
             moe_output,
         )
-    elif activation_format is QuantFormat.NVFP4:
+    elif quant.activation is QuantFormat.NVFP4:
         if x.dtype is not torch.uint8:
             raise TypeError("W4A4 requires packed uint8 input")
     elif x.dtype is not torch.bfloat16:
@@ -1600,7 +1571,7 @@ def cute_dsl_fused_moe(
             "W4A16 requires token_final_scales.dtype=torch.float32, "
             f"got {token_final_scales.dtype}"
         )
-    if activation_format is QuantFormat.BF16 and (w1_alpha is None or w2_alpha is None):
+    if quant.activation is QuantFormat.BF16 and (w1_alpha is None or w2_alpha is None):
         raise ValueError("w1_alpha and w2_alpha are required when format is W4A16")
 
     if num_local_experts is None:
@@ -1621,7 +1592,7 @@ def cute_dsl_fused_moe(
     activation_name = "Situ" if situ_beta is not None else activation.name
     op_name = f"CuteDslFusedMoE::run::{activation_name}"
 
-    if activation_format is not QuantFormat.BF16:
+    if quant.activation is not QuantFormat.BF16:
         use_per_token_activation = per_token_scale is not None
         runner = CuteDslFusedMoERunner(
             forward_impl=_cute_dsl_fused_moe_impl,
@@ -1639,8 +1610,7 @@ def cute_dsl_fused_moe(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             use_per_token_activation=use_per_token_activation,
-            activation_format=activation_format,
-            weight_format=weight_format,
+            quant=quant,
             weight_interleave=weight_interleave,
         )
 
@@ -1712,7 +1682,7 @@ def cute_dsl_fused_moe(
         inputs,
         aux_stream=aux_stream,
     )
-    if activation_format is not QuantFormat.BF16:
+    if quant.activation is not QuantFormat.BF16:
         runner_kwargs = {
             "aux_stream": aux_stream,
             "use_async_memset": not tuner.is_tuning_mode,
@@ -1769,8 +1739,8 @@ def cute_dsl_fused_moe_nvfp4(
         raise ValueError("cute_dsl_fused_moe_nvfp4 only supports quant_mode='w4a4'")
     warnings.warn(
         "cute_dsl_fused_moe_nvfp4 is deprecated; use cute_dsl_fused_moe with "
-        "activation_format=QuantFormat.NVFP4 and "
-        "weight_format=QuantFormat.NVFP4 instead.",
+        "quant=QuantConfig(weight=QuantFormat.NVFP4, "
+        "activation=QuantFormat.NVFP4) instead.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -1801,8 +1771,7 @@ def cute_dsl_fused_moe_nvfp4(
         swiglu_limit,
         situ_beta,
         situ_linear_beta,
-        activation_format=QuantFormat.NVFP4,
-        weight_format=QuantFormat.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         per_token_scale=per_token_scale,
     )
 
@@ -1846,8 +1815,8 @@ def cute_dsl_fused_moe_mxfp8_mxfp4(
     """
     warnings.warn(
         "cute_dsl_fused_moe_mxfp8_mxfp4 is deprecated; use cute_dsl_fused_moe "
-        "with activation_format=QuantFormat.MXFP8 and "
-        "weight_format=QuantFormat.MXFP4 instead.",
+        "with quant=QuantConfig(weight=QuantFormat.MXFP4, "
+        "activation=QuantFormat.MXFP8) instead.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -1876,8 +1845,7 @@ def cute_dsl_fused_moe_mxfp8_mxfp4(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
-        activation_format=QuantFormat.MXFP8,
-        weight_format=QuantFormat.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         tactic=tactic,
     )
 
@@ -1889,8 +1857,8 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
     -------
     This API will be deprecated in the future, please use
     :class:`CuteDslMoEWrapper` with
-    ``activation_format=QuantFormat.MXFP8`` and
-    ``weight_format=QuantFormat.MXFP4`` instead.
+    ``quant=QuantConfig(weight=QuantFormat.MXFP4,
+    activation=QuantFormat.MXFP8)`` instead.
 
     Because the stream and event resources are reused, one wrapper instance is
     not reentrant or safe for concurrent calls. The first ``run`` binds the
@@ -1922,8 +1890,8 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
         -------
         This API will be deprecated in the future, please use
         :class:`CuteDslMoEWrapper` with
-        ``activation_format=QuantFormat.MXFP8`` and
-        ``weight_format=QuantFormat.MXFP4`` instead.
+        ``quant=QuantConfig(weight=QuantFormat.MXFP4,
+        activation=QuantFormat.MXFP8)`` instead.
 
         ``max_num_tokens`` is accepted for backwards compatibility but
         ignored. See :class:`CuteDslMoEWrapper` for the full parameter
@@ -1931,8 +1899,8 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
         """
         warnings.warn(
             "CuteDslMxfp8Mxfp4MoEWrapper is deprecated; use CuteDslMoEWrapper "
-            "with activation_format=QuantFormat.MXFP8 and "
-            "weight_format=QuantFormat.MXFP4 instead.",
+            "with quant=QuantConfig(weight=QuantFormat.MXFP4, "
+            "activation=QuantFormat.MXFP8) instead.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -1951,8 +1919,7 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
-            activation_format=QuantFormat.MXFP8,
-            weight_format=QuantFormat.MXFP4,
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         )
 
     @flashinfer_api(trace=cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace)
@@ -1976,8 +1943,8 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
         -------
         This API will be deprecated in the future, please use
         :meth:`CuteDslMoEWrapper.run` on a wrapper configured with
-        ``activation_format=QuantFormat.MXFP8`` and
-        ``weight_format=QuantFormat.MXFP4`` instead.
+        ``quant=QuantConfig(weight=QuantFormat.MXFP4,
+        activation=QuantFormat.MXFP8)`` instead.
 
         This entry point has no ``fc2_input_scale``; it is forwarded as
         ``None``. See :meth:`CuteDslMoEWrapper.run` for the full parameter
