@@ -55,6 +55,35 @@ inline LoomTensorMap64 CopyTensorMap64(const CUtensorMap& descriptor) {
 
 // clang-format off
 
+#include <cstdlib>
+#include <string>
+#include <utility>
+
+// ---- S1: programmatic dependent launch for the routed decode chain ----
+static bool AlphamoeNvfp4PdlEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("ALPHAMOE_NVFP4_PDL");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  return enabled;
+}
+
+template <typename... Params, typename... Args>
+static cudaError_t AlphamoeNvfp4LaunchPdl(void (*kernel)(Params...), dim3 grid, dim3 block, size_t dynamic_smem,
+                                          cudaStream_t stream, Args&&... args) {
+  cudaLaunchConfig_t config = {};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = dynamic_smem;
+  config.stream = stream;
+  cudaLaunchAttribute attribute[1];
+  attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute[0].val.programmaticStreamSerializationAllowed = AlphamoeNvfp4PdlEnabled() ? 1 : 0;
+  config.attrs = attribute;
+  config.numAttrs = 1;
+  return cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
+}
+
 namespace nvfp4_first_w2_down_word {
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_nvfp4_first_w2_down_word
 #define LOOM_INF CUDART_INF_F
@@ -45708,6 +45737,8 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
     // ---- Role: load ----
     if (warp == 0) {
         { // load_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             int first_k_tile_load = blockIdx.z * (K / 256) / 4;
             int end_k_tile_load = (blockIdx.z + 1) * (K / 256) / 4;
             int route_work = blockIdx.x;
@@ -45765,6 +45796,8 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
     // ---- Role: mma ----
     if (warp == 1) {
         { // mma_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             int first_k_tile_mma = blockIdx.z * (K / 256) / 4;
             int end_k_tile_mma = (blockIdx.z + 1) * (K / 256) / 4;
             unsigned int up_stage_mma = 0;
@@ -45838,6 +45871,8 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
     // ---- Role: consumer ----
     if (warp >= 2 && warp <= 5) {
         { // consumer_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             int first_k_tile_scale = blockIdx.z * (K / 256) / 4;
             int end_k_tile_scale = (blockIdx.z + 1) * (K / 256) / 4;
             int route_work_c = blockIdx.x;
@@ -53467,6 +53502,8 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
     // ---- Role: load ----
     if (warp == 0) {
         { // load_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             int route_work = blockIdx.x;
             int intermediate_block = blockIdx.y;
             int intermediate_blocks = gridDim.y;
@@ -53745,6 +53782,8 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
     // ---- Role: mma ----
     if (warp == 1) {
         { // mma_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             asm volatile("barrier.sync 14, 192;" ::: "memory");
             unsigned int down_stage_mma = 0;
             unsigned int _phase_down_full = 0;
@@ -53783,6 +53822,8 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
     // ---- Role: consumer ----
     if (warp >= 2 && warp <= 5) {
         { // consumer_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             int route_work_c = blockIdx.x;
             int subtiles_per_route_block_c = route_block_m / 8;
             int route_block_c = route_work_c / subtiles_per_route_block_c;
@@ -54181,6 +54222,8 @@ kernel_alpha_moe_small_route_alignment_seed_init(int* __restrict__ topk_ids, int
     const int total_addr = smem + 12580;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (blockIdx.x == 0) {
         for (int bin_zero = tid; bin_zero < num_experts; bin_zero += 256) {
             counts[bin_zero] = 0;
@@ -60724,6 +60767,8 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma(float* __re
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int token = blockIdx.y;
     int feature = blockIdx.x * 32 + tid;
     int element = token * K + feature;
@@ -70752,7 +70797,7 @@ void RunCompleteRouted(
   if (route_id == 1) {
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c279_alignment::kernel_alpha_moe_small_route_alignment_seed_init_nvfp4_qualified_c279_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
       12672), "cudaFuncSetAttribute(complete alignment)");
-  nvfp4_qualified_c279_alignment::kernel_alpha_moe_small_route_alignment_seed_init_nvfp4_qualified_c279_alignment<<<dim3((std::max(out.numel(), route_accumulator.numel()) + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), 12672, stream>>>(
+  CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c279_alignment::kernel_alpha_moe_small_route_alignment_seed_init_nvfp4_qualified_c279_alignment, dim3((std::max(out.numel(), route_accumulator.numel()) + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), static_cast<size_t>(12672), stream,
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
       static_cast<int*>(expert_ids.data_ptr()),
@@ -70767,12 +70812,12 @@ void RunCompleteRouted(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()),
       static_cast<long long>(out.numel()),
-      static_cast<long long>(route_accumulator.numel()));
+      static_cast<long long>(route_accumulator.numel())), "complete alignment launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete alignment launch");
     if (packed_scales) {
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c208_up_word::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
       121088), "cudaFuncSetAttribute(complete up)");
-  nvfp4_qualified_c208_up_word::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word<<<dim3(capacity, blocks, 4), dim3(192, 1, 1), 121088, stream>>>(
+  CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c208_up_word::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word, dim3(capacity, blocks, 4), dim3(192, 1, 1), static_cast<size_t>(121088), stream,
       hidden_states_map,
       gemm1_map,
       static_cast<uint8_t*>(hidden_states_scale.data_ptr()),
@@ -70784,11 +70829,11 @@ void RunCompleteRouted(
       dims.m,
       dims.k,
       dims.top_k,
-      dims.block_m);
+      dims.block_m), "complete up launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete up launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c275_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
       34560), "cudaFuncSetAttribute(complete down)");
-  nvfp4_qualified_c275_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word<<<dim3(capacity, blocks, std::min(12, dims.k / 128)), dim3(192, 1, 1), 34560, stream>>>(
+  CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c275_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word, dim3(capacity, blocks, std::min(12, dims.k / 128)), dim3(192, 1, 1), static_cast<size_t>(34560), stream,
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
       static_cast<float*>(output2_scale_scalar.data_ptr()),
@@ -70805,7 +70850,7 @@ void RunCompleteRouted(
       dims.k,
       dims.top_k,
       dims.block_m,
-      static_cast<float>(routed_scaling_factor));
+      static_cast<float>(routed_scaling_factor)), "complete down launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete down launch");
     } else {
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c208_up_byte::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_byte, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -70846,7 +70891,7 @@ void RunCompleteRouted(
       static_cast<float>(routed_scaling_factor));
   CheckCuda(cudaGetLastError(), "complete down launch");
     }
-  nvfp4_qualified_c331_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_nvfp4_qualified_c331_finalize<<<dim3((dims.k + 31) / 32, dims.m, 1), dim3(32, 1, 1), 0, stream>>>(
+  CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c331_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_nvfp4_qualified_c331_finalize, dim3((dims.k + 31) / 32, dims.m, 1), dim3(32, 1, 1), static_cast<size_t>(0), stream,
       static_cast<float*>(route_accumulator.data_ptr()),
       static_cast<int*>(route_experts.data_ptr()),
       static_cast<float*>(output2_scale_scalar.data_ptr()),
@@ -70856,7 +70901,7 @@ void RunCompleteRouted(
       dims.m,
       dims.k,
       dims.top_k,
-      static_cast<float>(routed_scaling_factor));
+      static_cast<float>(routed_scaling_factor)), "complete finalize launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete finalize launch");
     return;
   }
