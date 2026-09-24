@@ -237,7 +237,10 @@ def chunk_pairs_for(
         and 8 * (p_max - p_min) <= p_max
     ):
         fill = uniform_fill_chunk_pairs(
-            pairs, items_per_chunk=items_per_chunk, num_ctas=num_ctas, pairs_min=pairs_min
+            pairs,
+            items_per_chunk=items_per_chunk,
+            num_ctas=num_ctas,
+            pairs_min=pairs_min,
         )
         return (fill, 0) if fill is not None else (p_max, k)
     if chunk_pairs < p_max and not split_is_worthwhile(
