@@ -178,6 +178,18 @@ def test_small_uniform_batch_splits_evenly():
     assert work_plan.num_items <= 160
 
 
+def test_multi_wave_uniform_batch_follows_launch_cost_model():
+    # 512 tiles of 128 pairs on 148 CTAs: 3 full waves plus a 68-CTA last
+    # wave, below SATURATING_CTAS -> two chunks per tile (6 full waves plus a
+    # saturated partial wave).  1024 tiles leave 136 CTAs streaming in the
+    # last wave and keep whole tiles.
+    split = plan_balanced_work([32768] * 64, num_kv_heads=8, num_ctas=148)
+    assert split.balance_factor == 0 and split.chunk_pairs == 64
+    assert all(item.n_chunks == 2 for item in split.items)
+    whole = plan_balanced_work([32768] * 128, num_kv_heads=8, num_ctas=148)
+    assert whole.num_split_items == 0 and whole.num_items == 1024
+
+
 def test_agentx_ragged_batch_splits_and_orders_by_length():
     work_plan = plan_balanced_work(AGENTX_LENGTHS, num_kv_heads=1, num_ctas=160)
     assert work_plan.num_split_items > 0
@@ -444,7 +456,8 @@ def _run_and_check(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True):
         ([130, 8000, 519, 4096, 1024, 2048, 3000], 8, 1),  # ragged, GQA 64/8
         ([512] * 4, 8, 1),  # short uniform, one item per tile
         ([65536] * 4, 8, 1),  # long uniform small batch: even split
-        ([4096] * 200, 1, 1),  # more tiles than CTAs, never splits
+        ([4096] * 200, 1, 1),  # 1.35 waves of 16-pair tiles: launch-cost model splits
+        ([8192] * 40, 8, 1),  # 2.2 waves, sparse last wave: launch-cost model splits
         (AGENTX_LENGTHS, 1, 1),  # #4832 AgentX pattern
         ([300, 257, 5000, 777], 2, 7),  # MTP verify rows, ragged (packed 64-row tile)
         ([8193, 8194, 8320], 1, 7),  # MTP rows straddling a 128-block edge

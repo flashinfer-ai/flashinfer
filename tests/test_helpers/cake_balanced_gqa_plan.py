@@ -55,6 +55,17 @@ from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
 )
 
 
+# Multi-wave uniform-batch launch-time model (mirror of the cake planner's
+# ``uniform_launch_cost``): quarter pairs of streaming at the per-CTA rate of a
+# full wave, times CTA slots.  A partial wave with fewer than SATURATING_CTAS
+# streaming CTAs runs at a proportionally lower aggregate rate; above it the
+# HBM roofline is reached and idle CTAs cost nothing.
+ITEM_OVERHEAD_QUARTER_PAIRS = 4
+MERGE_QUARTER_PAIRS = 3
+SATURATING_CTAS = 96
+UNIFORM_SPLIT_MARGIN_DIV = 50
+
+
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -109,6 +120,86 @@ def even_split_chunk_pairs(
     return l_even if l_even < p_max else None
 
 
+def uniform_launch_cost(
+    *, p_max: int, whole_items: int, num_ctas: int, chunk_pairs: int
+) -> int:
+    """Launch-time estimate for ``whole_items`` tiles of ``p_max`` pairs cut
+    into chunks of ``chunk_pairs`` (integer; the device planner evaluates the
+    same expression lane-parallel).  Full chunks run first in complete waves;
+    the partial wave that follows carries the remainder chunks on its idle
+    CTAs (each absorbs ``unit // rem_unit``); a wave with ``n`` streaming CTAs
+    costs ``max(SATURATING_CTAS, n)`` slots per unit of work; leftover
+    remainders run in rounds over all CTAs; a split tile adds one merge.
+    """
+    chunk = min(chunk_pairs, p_max)
+    full_per_tile, remainder = divmod(p_max, chunk)
+    unit = 4 * chunk + ITEM_OVERHEAD_QUARTER_PAIRS
+    full_items = full_per_tile * whole_items
+    full_waves, n_last = divmod(full_items, num_ctas)
+    cost = full_waves * unit * num_ctas
+    rem_items = whole_items if remainder else 0
+    rem_unit = 4 * remainder + ITEM_OVERHEAD_QUARTER_PAIRS
+    if n_last:
+        idle = num_ctas - n_last
+        absorbed = min(rem_items, idle * (unit // rem_unit))
+        active = n_last + min(idle, rem_items)
+        cost += unit * max(SATURATING_CTAS, active)
+        rem_items -= absorbed
+    if rem_items:
+        rounds = _ceil_div(rem_items, num_ctas)
+        cost += rounds * rem_unit * max(SATURATING_CTAS, min(rem_items, num_ctas))
+    if full_per_tile > 1 or remainder:
+        cost += MERGE_QUARTER_PAIRS * num_ctas
+    return cost
+
+
+def uniform_fill_chunk_pairs(
+    pairs: Sequence[int], *, items_per_chunk: int, num_ctas: int, pairs_min: int
+) -> Optional[int]:
+    """Multi-wave near-uniform batches (``tiles > num_ctas``,
+    ``8 * (p_max - p_min) <= p_max``): the chunk length whose launch-cost
+    estimate beats whole tiles by ``1 / UNIFORM_SPLIT_MARGIN_DIV``.
+
+    Candidates: ``ceil(total_work / (k * num_ctas))`` for ``k = 1..8`` and the
+    divisors ``ceil(p_max / n)`` for ``n = 2..8`` no shorter than the ``k = 8``
+    length (keeps the split-item count inside the workspace bound).  Ties keep
+    the longer chunk.  ``None`` when the rule does not apply or whole tiles win.
+    """
+    whole_items = len(pairs) * items_per_chunk
+    p_max, p_min = max(pairs), min(pairs)
+    if whole_items <= num_ctas or 8 * (p_max - p_min) > p_max:
+        return None
+    total_work = sum(pairs) * items_per_chunk
+    whole_cost = uniform_launch_cost(
+        p_max=p_max, whole_items=whole_items, num_ctas=num_ctas, chunk_pairs=p_max
+    )
+    l_min = max(_ceil_div(total_work, MAX_BALANCE_FACTOR * num_ctas), pairs_min)
+    candidates = [
+        max(_ceil_div(total_work, k * num_ctas), pairs_min)
+        for k in range(1, MAX_BALANCE_FACTOR + 1)
+    ]
+    candidates += [
+        chunk
+        for chunk in (
+            max(_ceil_div(p_max, n), pairs_min)
+            for n in range(2, MAX_BALANCE_FACTOR + 1)
+        )
+        if chunk >= l_min
+    ]
+    best: Optional[tuple[int, int]] = None
+    for chunk in candidates:
+        if chunk >= p_max:
+            continue
+        cost = uniform_launch_cost(
+            p_max=p_max, whole_items=whole_items, num_ctas=num_ctas, chunk_pairs=chunk
+        )
+        if best is None or cost < best[0] or (cost == best[0] and chunk > best[1]):
+            best = (cost, chunk)
+    if best is None or whole_cost - best[0] < whole_cost // UNIFORM_SPLIT_MARGIN_DIV:
+        return None
+    return best[1]
+
+
 def chunk_pairs_for(
     seq_lens: Sequence[int],
     *,
@@ -117,11 +208,14 @@ def chunk_pairs_for(
     num_ctas: int,
     balance_factor: Optional[int] = None,
     pairs_min: int = DEFAULT_PAIRS_MIN,
+    fill_uniform: bool = True,
 ) -> tuple[int, int]:
     """``(L, k)``: chunk length in pairs and the balance factor used.
 
-    ``k == 0`` marks the even-split rule for near-uniform batches whose whole
-    tiles all fit the grid.
+    ``k == 0`` marks a near-uniform batch decided outright: multi-wave batches
+    by the launch-cost model (``uniform_fill_chunk_pairs``; ``fill_uniform=False``
+    skips it, the packed-row MTP planner's base candidate), single-wave batches
+    by the even-split rule.
     """
     pairs = [_ceil_div(int(s) - (q_len - 1), PAIR_TOKENS) for s in seq_lens]
     items_per_chunk = q_len * num_kv_heads
@@ -136,6 +230,16 @@ def chunk_pairs_for(
         raise ValueError(f"balance_factor must be in [1, {MAX_BALANCE_FACTOR}]")
     chunk_pairs = max(_ceil_div(total_work, k * num_ctas), pairs_min)
     p_max, p_min = max(pairs), min(pairs)
+    if (
+        fill_uniform
+        and balance_factor is None
+        and len(pairs) * items_per_chunk > num_ctas
+        and 8 * (p_max - p_min) <= p_max
+    ):
+        fill = uniform_fill_chunk_pairs(
+            pairs, items_per_chunk=items_per_chunk, num_ctas=num_ctas, pairs_min=pairs_min
+        )
+        return (fill, 0) if fill is not None else (p_max, k)
     if chunk_pairs < p_max and not split_is_worthwhile(
         p_max=p_max, p_min=p_min, ideal_pairs=ideal_pairs, chunk_pairs=chunk_pairs
     ):
@@ -382,7 +486,11 @@ def mtp_chunk_pairs(
     pairs = [_ceil_div(int(s), PAIR_TOKENS) for s in seq_lens]
     total_work = sum(pairs) * num_kv_heads
     base, _ = chunk_pairs_for(
-        seq_lens, q_len=1, num_kv_heads=num_kv_heads, num_ctas=num_ctas
+        seq_lens,
+        q_len=1,
+        num_kv_heads=num_kv_heads,
+        num_ctas=num_ctas,
+        fill_uniform=False,
     )
     best_cost, best = None, base
     prev = 0
