@@ -5150,10 +5150,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
-
-    for (int32_t tile_N : selected_tile_nums) {
+    // Padded EP inputs can include tokens routed to remote experts. The input
+    // row count therefore need not reflect the work assigned to local experts.
+    // Let autotuning consider every supported tile, retaining the per-tactic
+    // validity checks below. The default dispatch heuristic is unchanged.
+    for (int32_t tile_N : tile_sizes) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
