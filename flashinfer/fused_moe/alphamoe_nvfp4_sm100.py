@@ -291,7 +291,9 @@ def get_alphamoe_nvfp4_sm100_module():
     return gen_alphamoe_nvfp4_sm100_module().build_and_load()
 
 
-@torch.library.custom_op("flashinfer::alphamoe_nvfp4_aligned_moe", mutates_args=("out",))
+@torch.library.custom_op(
+    "flashinfer::alphamoe_nvfp4_aligned_moe", mutates_args=("out",)
+)
 def _alphamoe_nvfp4_aligned_moe_impl(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -519,19 +521,34 @@ def is_alphamoe_nvfp4_small_alignment_seed_supported(
 ) -> bool:
     """Metadata-only dispatch predicate; callers retain their general fallback."""
     return (
-        topk_ids.is_cuda and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
-        and topk_ids.ndim == 2 and topk_ids.shape[0] in (1, 8) and topk_ids.shape[1] == 8
-        and num_experts in (257, 513) and block_size in (8, 16) and pad_sorted_token_ids
-        and initial_out.is_cuda and initial_out.dtype == torch.bfloat16
-        and initial_out.is_contiguous() and initial_out.ndim == 2
-        and initial_out.shape[0] == topk_ids.shape[0] and initial_out.shape[1] > 0
+        topk_ids.is_cuda
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_ids.ndim == 2
+        and topk_ids.shape[0] in (1, 8)
+        and topk_ids.shape[1] == 8
+        and num_experts in (257, 513)
+        and block_size in (8, 16)
+        and pad_sorted_token_ids
+        and initial_out.is_cuda
+        and initial_out.dtype == torch.bfloat16
+        and initial_out.is_contiguous()
+        and initial_out.ndim == 2
+        and initial_out.shape[0] == topk_ids.shape[0]
+        and initial_out.shape[1] > 0
         and initial_out.device == topk_ids.device
     )
 
 
 @torch.library.custom_op(
     "flashinfer::alphamoe_nvfp4_align_and_seed_output",
-    mutates_args=("sorted_token_ids", "expert_ids", "num_tokens_post_padded", "cumsum_buffer", "seeded_accumulator"),
+    mutates_args=(
+        "sorted_token_ids",
+        "expert_ids",
+        "num_tokens_post_padded",
+        "cumsum_buffer",
+        "seeded_accumulator",
+    ),
 )
 def _alphamoe_nvfp4_align_and_seed_output_impl(
     topk_ids: torch.Tensor,
@@ -546,8 +563,16 @@ def _alphamoe_nvfp4_align_and_seed_output_impl(
     pad_sorted_token_ids: bool,
 ) -> None:
     get_alphamoe_nvfp4_sm100_module().nvfp4_align_and_seed_output_op(
-        topk_ids, num_experts, block_size, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, cumsum_buffer, initial_out, seeded_accumulator, pad_sorted_token_ids,
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        cumsum_buffer,
+        initial_out,
+        seeded_accumulator,
+        pad_sorted_token_ids,
     )
 
 
@@ -616,12 +641,19 @@ def alphamoe_nvfp4_align_and_seed_output(
     if topk_ids.shape[0] not in (1, 8) or topk_ids.shape[1] != 8:
         raise ValueError("topk_ids must have shape (1, 8) or (8, 8)")
     if num_experts not in (257, 513) or block_size not in (8, 16):
-        raise ValueError("alignment requires 257/513 reserved-inclusive bins and block size 8/16")
+        raise ValueError(
+            "alignment requires 257/513 reserved-inclusive bins and block size 8/16"
+        )
     if not pad_sorted_token_ids:
         raise ValueError("alignment requires full-capacity sorted-token padding")
     pairs = topk_ids.numel()
-    if sorted_token_ids.numel() < pairs * block_size or sorted_token_ids.numel() > _INT32_MAX:
-        raise ValueError("sorted_token_ids capacity must cover every routed pair's padded block and fit int32")
+    if (
+        sorted_token_ids.numel() < pairs * block_size
+        or sorted_token_ids.numel() > _INT32_MAX
+    ):
+        raise ValueError(
+            "sorted_token_ids capacity must cover every routed pair's padded block and fit int32"
+        )
     if expert_ids.numel() < pairs:
         raise ValueError("expert_ids must have at least topk_ids.numel() entries")
     if num_tokens_post_padded.numel() != 1:
@@ -629,23 +661,43 @@ def alphamoe_nvfp4_align_and_seed_output(
     if cumsum_buffer.numel() < num_experts + 1:
         raise ValueError("cumsum_buffer must have at least num_experts + 1 entries")
     _require_cuda_tensor("initial_out", initial_out, dtype=torch.bfloat16, ndim=2)
-    _require_cuda_tensor("seeded_accumulator", seeded_accumulator, dtype=torch.float32, ndim=2)
+    _require_cuda_tensor(
+        "seeded_accumulator", seeded_accumulator, dtype=torch.float32, ndim=2
+    )
     if not is_alphamoe_nvfp4_small_alignment_seed_supported(
         topk_ids, num_experts, block_size, initial_out, pad_sorted_token_ids
     ):
-        raise ValueError("alignment and seed require supported route metadata and matching BF16 output")
-    if (seeded_accumulator.shape != initial_out.shape
-            or seeded_accumulator.device != initial_out.device):
+        raise ValueError(
+            "alignment and seed require supported route metadata and matching BF16 output"
+        )
+    if (
+        seeded_accumulator.shape != initial_out.shape
+        or seeded_accumulator.device != initial_out.device
+    ):
         raise ValueError("seeded_accumulator must match the output shape and device")
     _alphamoe_nvfp4_align_and_seed_output_impl(
-        topk_ids, num_experts, block_size, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, cumsum_buffer, initial_out, seeded_accumulator, pad_sorted_token_ids,
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        cumsum_buffer,
+        initial_out,
+        seeded_accumulator,
+        pad_sorted_token_ids,
     )
 
 
 @torch.library.custom_op(
     "flashinfer::alphamoe_nvfp4_routed_moe",
-    mutates_args=("sorted_token_ids", "expert_ids", "num_tokens_post_padded", "cumsum_buffer", "out"),
+    mutates_args=(
+        "sorted_token_ids",
+        "expert_ids",
+        "num_tokens_post_padded",
+        "cumsum_buffer",
+        "out",
+    ),
 )
 def _alphamoe_nvfp4_routed_moe_impl(
     hidden_states: torch.Tensor,
@@ -674,29 +726,60 @@ def _alphamoe_nvfp4_routed_moe_impl(
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
     if _alphamoe_try_complete_routed(
-        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
-        output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
-        top_k, block_m, routed_scaling_factor, w1_scale_prepared, w1_data_prepared,
-        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        topk_ids,
+        cumsum_buffer,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w1_data_prepared,
+        w1_gate_up_data_prepared,
+        w1_gate_up_scale_prepared,
     ):
         return
     # The private buffer is seeded by the alignment kernel on this stream.
     # During graph capture it belongs to PyTorch's graph memory pool.
     accumulator = torch.empty_like(out, dtype=torch.float32)
     module = get_alphamoe_nvfp4_sm100_module()
-    routed_op = (module.nvfp4_current_general_routed_seeded_moe_op
-                 if _uses_general_alignment_seed_portfolio(hidden_states, gemm1_weights, top_k, block_m)
-                 else module.nvfp4_current_routed_seeded_moe_op)
-    private_owners = ()
+    routed_op = (
+        module.nvfp4_current_general_routed_seeded_moe_op
+        if _uses_general_alignment_seed_portfolio(
+            hidden_states, gemm1_weights, top_k, block_m
+        )
+        else module.nvfp4_current_routed_seeded_moe_op
+    )
+    private_owners: tuple[torch.Tensor, ...] = ()
     if _uses_compact_owner_routed(
-        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-        gemm2_weights_scale, topk_ids, out, top_k, block_m,
-        w1_scale_prepared, w2_scale_prepared,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights_scale,
+        topk_ids,
+        out,
+        top_k,
+        block_m,
+        w1_scale_prepared,
+        w2_scale_prepared,
     ):
         owner_capacity = (topk_ids.numel() + 31) // 32 + gemm1_weights.shape[0]
-        owner_plan = torch.empty((owner_capacity, 3), dtype=torch.int32, device=out.device)
+        owner_plan = torch.empty(
+            (owner_capacity, 3), dtype=torch.int32, device=out.device
+        )
         owner_count = torch.empty((1,), dtype=torch.int32, device=out.device)
         private_owners = (owner_plan, owner_count)
         routed_op = module.nvfp4_compact_owner_routed_seeded_moe_op
@@ -828,15 +911,29 @@ def alphamoe_nvfp4_routed_moe(
         w2_scale_prepared,
     )
     _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
-    _check_prepared_w1_gate_up(gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared)
-    if not (is_alphamoe_nvfp4_routed_seed_supported(
-        hidden_states, gemm1_weights, topk_ids, out, top_k, block_m
-    ) or _alphamoe_complete_route_id(
-        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-        gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
-        w1_data_prepared,
-        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
-    )):
+    _check_prepared_w1_gate_up(
+        gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
+    )
+    if not (
+        is_alphamoe_nvfp4_routed_seed_supported(
+            hidden_states, gemm1_weights, topk_ids, out, top_k, block_m
+        )
+        or _alphamoe_complete_route_id(
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights_scale,
+            topk_ids,
+            out,
+            top_k,
+            block_m,
+            w1_scale_prepared,
+            w1_data_prepared,
+            w1_gate_up_data_prepared,
+            w1_gate_up_scale_prepared,
+        )
+    ):
         raise ValueError("routed companion requires supported route metadata")
     _alphamoe_nvfp4_routed_moe_impl(
         hidden_states,
@@ -861,7 +958,8 @@ def alphamoe_nvfp4_routed_moe(
         w1_scale_prepared,
         w2_scale_prepared,
         w1_data_prepared,
-        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
+        w1_gate_up_data_prepared,
+        w1_gate_up_scale_prepared,
     )
     return out
 
@@ -875,32 +973,56 @@ def is_alphamoe_nvfp4_alignment_seed_supported(
 ) -> bool:
     """Metadata-only dispatch predicate; callers retain their general fallback."""
     return (
-        topk_ids.is_cuda and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
-        and topk_ids.ndim == 2 and topk_ids.shape[0] > 0 and topk_ids.shape[1] > 0
+        topk_ids.is_cuda
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_ids.ndim == 2
+        and topk_ids.shape[0] > 0
+        and topk_ids.shape[1] > 0
         and topk_ids.numel() <= 2147483647
-        and 1 < num_experts <= 1024 and block_size in (8, 16) and pad_sorted_token_ids
-        and initial_out.is_cuda and initial_out.dtype == torch.bfloat16
-        and initial_out.is_contiguous() and initial_out.ndim == 2
-        and initial_out.shape[0] == topk_ids.shape[0] and initial_out.shape[1] > 0
+        and 1 < num_experts <= 1024
+        and block_size in (8, 16)
+        and pad_sorted_token_ids
+        and initial_out.is_cuda
+        and initial_out.dtype == torch.bfloat16
+        and initial_out.is_contiguous()
+        and initial_out.ndim == 2
+        and initial_out.shape[0] == topk_ids.shape[0]
+        and initial_out.shape[1] > 0
         and initial_out.device == topk_ids.device
     )
 
 
-def _uses_general_alignment_seed_portfolio(hidden_states, gemm1_weights, top_k, block_m):
-    return (hidden_states.shape[0] in (128, 512)
-            and (gemm1_weights.shape[1], hidden_states.shape[1] * 2, gemm1_weights.shape[0], top_k, block_m)
-            == (1024, 6144, 256, 8, 8))
+def _uses_general_alignment_seed_portfolio(
+    hidden_states, gemm1_weights, top_k, block_m
+):
+    return hidden_states.shape[0] in (128, 512) and (
+        gemm1_weights.shape[1],
+        hidden_states.shape[1] * 2,
+        gemm1_weights.shape[0],
+        top_k,
+        block_m,
+    ) == (1024, 6144, 256, 8, 8)
 
 
 def is_alphamoe_nvfp4_routed_seed_supported(
-    hidden_states, gemm1_weights, topk_ids, out, top_k, block_m,
+    hidden_states,
+    gemm1_weights,
+    topk_ids,
+    out,
+    top_k,
+    block_m,
 ):
     """Return whether this exact compute route has a fused alignment/seed companion."""
-    if _uses_general_alignment_seed_portfolio(hidden_states, gemm1_weights, top_k, block_m):
+    if _uses_general_alignment_seed_portfolio(
+        hidden_states, gemm1_weights, top_k, block_m
+    ):
         return is_alphamoe_nvfp4_alignment_seed_supported(
-            topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True)
+            topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True
+        )
     return is_alphamoe_nvfp4_small_alignment_seed_supported(
-        topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True)
+        topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True
+    )
 
 
 def prepare_nvfp4_w1_data(w1):
@@ -918,8 +1040,12 @@ def prepare_nvfp4_w1_data(w1):
     experts, rows, packed_k = map(int, w1.shape)
     if min(experts, rows, packed_k) <= 0 or rows % 128 or packed_k % 128:
         raise ValueError("Prepared W1 data requires N%128=0 and K%256=0")
-    return (w1.view(experts, rows // 128, 128, packed_k // 128, 128)
-            .permute(0, 1, 3, 2, 4).contiguous().view(-1, 128, 128))
+    return (
+        w1.view(experts, rows // 128, 128, packed_k // 128, 128)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(-1, 128, 128)
+    )
 
 
 def _check_prepared_w1_data(w1, prepared):
@@ -928,8 +1054,11 @@ def _check_prepared_w1_data(w1, prepared):
     _require_cuda_tensor("w1_data_prepared", prepared, dtype=torch.uint8, ndim=3)
     e, n, packed_k = w1.shape
     expected = (e * (n // 128) * (packed_k // 128), 128, 128)
-    if (prepared.device != w1.device or tuple(prepared.shape) != expected
-            or prepared.data_ptr() % 16 != 0):
+    if (
+        prepared.device != w1.device
+        or tuple(prepared.shape) != expected
+        or prepared.data_ptr() % 16 != 0
+    ):
         raise ValueError("Prepared W1 data must match the raw weights and panel layout")
 
 
@@ -953,12 +1082,12 @@ def prepare_nvfp4_w1_scales(w1_scale):
     panels = rows // 128
     k_tiles = scale_columns // 16
     # Raw axes: E, panel, g, c, d, K256 tile, word, byte.
-    raw = w1_scale.view(torch.uint8).reshape(
-        experts, panels, 4, 4, 8, k_tiles, 4, 4
-    )
+    raw = w1_scale.view(torch.uint8).reshape(experts, panels, 4, 4, 8, k_tiles, 4, 4)
     # Prepared axes: E, panel, K256 tile, c, word, d, g, byte.
-    return raw.permute(0, 1, 5, 3, 6, 4, 2, 7).contiguous().reshape(
-        experts * panels * k_tiles, 16, 128
+    return (
+        raw.permute(0, 1, 5, 3, 6, 4, 2, 7)
+        .contiguous()
+        .reshape(experts * panels * k_tiles, 16, 128)
     )
 
 
@@ -984,20 +1113,34 @@ def prepare_nvfp4_w2_scales(w2_scale):
         experts, output_tiles, 4, 4, 8, intermediate_blocks, 2, 4
     )
     # Native CP axes: E, output tile, intermediate block, c, word, d, g, byte.
-    return raw.permute(0, 1, 5, 3, 6, 4, 2, 7).contiguous().reshape(
-        experts * output_tiles * intermediate_blocks, 8, 128
+    return (
+        raw.permute(0, 1, 5, 3, 6, 4, 2, 7)
+        .contiguous()
+        .reshape(experts * output_tiles * intermediate_blocks, 8, 128)
     )
 
+
 __all__ += [
-    "prepare_nvfp4_w1_scales", "prepare_nvfp4_w2_scales", "prepare_nvfp4_w1_data",
-    "prepare_nvfp4_w1_gate_up_data", "prepare_nvfp4_w1_gate_up_scales",
+    "prepare_nvfp4_w1_scales",
+    "prepare_nvfp4_w2_scales",
+    "prepare_nvfp4_w1_data",
+    "prepare_nvfp4_w1_gate_up_data",
+    "prepare_nvfp4_w1_gate_up_scales",
 ]
 
 
 def _uses_compact_owner_routed(
-    hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-    gemm2_weights_scale, topk_ids, out, top_k, block_m,
-    w1_scale_prepared, w2_scale_prepared,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights_scale,
+    topk_ids,
+    out,
+    top_k,
+    block_m,
+    w1_scale_prepared,
+    w2_scale_prepared,
 ):
     # Only immutable metadata selects this private routed specialization.
     m, packed_k = hidden_states.shape
@@ -1014,8 +1157,10 @@ def _uses_compact_owner_routed(
     return (
         tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
         and tuple(gemm2_weights_scale.shape) == (e, k, n // 32)
-        and all(scale.data_ptr() % 4 == 0 for scale in (
-            hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale))
+        and all(
+            scale.data_ptr() % 4 == 0
+            for scale in (hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale)
+        )
         and gemm2_weights_scale.data_ptr() % 8 == 0
         and w1_scale_prepared.dtype == torch.uint8
         and w1_scale_prepared.is_contiguous()
@@ -1031,9 +1176,19 @@ def _uses_compact_owner_routed(
 
 
 def _alphamoe_complete_route_id(
-    hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-    gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared, w1_data_prepared=None,
-    w1_gate_up_data_prepared=None, w1_gate_up_scale_prepared=None,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights_scale,
+    topk_ids,
+    out,
+    top_k,
+    block_m,
+    w1_scale_prepared,
+    w1_data_prepared=None,
+    w1_gate_up_data_prepared=None,
+    w1_gate_up_scale_prepared=None,
 ):
     """Select complete routes from immutable host metadata and owned sidecars."""
     m, packed_k = hidden_states.shape
@@ -1045,12 +1200,28 @@ def _alphamoe_complete_route_id(
         topk_ids, e + 1, block_m, out, True
     ):
         return 1
-    if m == 512 and w1_gate_up_data_prepared is not None and w1_gate_up_scale_prepared is not None:
-        _check_prepared_w1_gate_up(gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared)
-        if (tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
-                and all(scale.data_ptr() % 4 == 0 for scale in
-                (hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale))
-                and is_alphamoe_nvfp4_alignment_seed_supported(topk_ids, e + 1, block_m, out, True)):
+    if (
+        m == 512
+        and w1_gate_up_data_prepared is not None
+        and w1_gate_up_scale_prepared is not None
+    ):
+        _check_prepared_w1_gate_up(
+            gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
+        )
+        if (
+            tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
+            and all(
+                scale.data_ptr() % 4 == 0
+                for scale in (
+                    hidden_states_scale,
+                    gemm1_weights_scale,
+                    gemm2_weights_scale,
+                )
+            )
+            and is_alphamoe_nvfp4_alignment_seed_supported(
+                topk_ids, e + 1, block_m, out, True
+            )
+        ):
             return 14 if out.data_ptr() % 16 == 0 else 15
     if w1_scale_prepared is None:
         return 0
@@ -1061,8 +1232,10 @@ def _alphamoe_complete_route_id(
         and tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
         and tuple(w1_scale_prepared.shape) == (e * (n // 128) * (k // 256), 16, 128)
         and w1_scale_prepared.data_ptr() % 16 == 0
-        and all(scale.data_ptr() % 4 == 0 for scale in
-                (hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale))
+        and all(
+            scale.data_ptr() % 4 == 0
+            for scale in (hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale)
+        )
     )
     if not prepared or not is_alphamoe_nvfp4_alignment_seed_supported(
         topk_ids, e + 1, block_m, out, True
@@ -1084,18 +1257,44 @@ def _alphamoe_complete_route_id(
 
 
 def _alphamoe_try_complete_routed(
-    hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-    gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
-    output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
-    num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
-    top_k, block_m, routed_scaling_factor, w1_scale_prepared,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    output1_scale_gate_scalar,
+    output1_scale_scalar,
+    output2_scale_scalar,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    topk_weights,
+    out,
+    topk_ids,
+    cumsum_buffer,
+    top_k,
+    block_m,
+    routed_scaling_factor,
+    w1_scale_prepared,
     w1_data_prepared=None,
-    w1_gate_up_data_prepared=None, w1_gate_up_scale_prepared=None,
+    w1_gate_up_data_prepared=None,
+    w1_gate_up_scale_prepared=None,
 ):
     route_id = _alphamoe_complete_route_id(
-        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-        gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared, w1_data_prepared,
-        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights_scale,
+        topk_ids,
+        out,
+        top_k,
+        block_m,
+        w1_scale_prepared,
+        w1_data_prepared,
+        w1_gate_up_data_prepared,
+        w1_gate_up_scale_prepared,
     )
     if route_id == 0:
         return False
@@ -1107,51 +1306,112 @@ def _alphamoe_try_complete_routed(
     partial_workspace = act_workspace = sf_workspace = None
     if route_id == 1:
         initial_out = torch.empty_like(out, dtype=torch.float32)
-        route_accumulator = torch.empty((m * top_k, k), dtype=torch.float32, device=out.device)
+        route_accumulator = torch.empty(
+            (m * top_k, k), dtype=torch.float32, device=out.device
+        )
         route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
-        partial_workspace = torch.empty((capacity * blocks, 8192),
-                                        dtype=torch.float32, device=hidden_states.device)
+        partial_workspace = torch.empty(
+            (capacity * blocks, 8192), dtype=torch.float32, device=hidden_states.device
+        )
     elif route_id == 8:
         get_alphamoe_nvfp4_sm100_module().nvfp4_complete_small_alignment_op(
-            hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-            gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
-            output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
-            num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
-            top_k, block_m, routed_scaling_factor,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            output1_scale_gate_scalar,
+            output1_scale_scalar,
+            output2_scale_scalar,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            out,
+            topk_ids,
+            cumsum_buffer,
+            top_k,
+            block_m,
+            routed_scaling_factor,
         )
         initial_out = out.to(torch.float32)
-        route_accumulator = torch.zeros((m * top_k, k), dtype=torch.float32, device=out.device)
-        route_experts = torch.full((m * top_k,), -1, dtype=torch.int32, device=out.device)
-        act_workspace = torch.empty((capacity * blocks, 512), dtype=torch.uint8,
-                                    device=hidden_states.device)
-        sf_workspace = torch.empty((capacity * blocks, 1024), dtype=torch.uint8,
-                                   device=hidden_states.device)
+        route_accumulator = torch.zeros(
+            (m * top_k, k), dtype=torch.float32, device=out.device
+        )
+        route_experts = torch.full(
+            (m * top_k,), -1, dtype=torch.int32, device=out.device
+        )
+        act_workspace = torch.empty(
+            (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
+        )
+        sf_workspace = torch.empty(
+            (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+        )
     else:
         owner_capacity = (topk_ids.numel() + 31) // 32 + e
-        owner_plan = torch.empty((owner_capacity, 3), dtype=torch.int32, device=hidden_states.device)
+        owner_plan = torch.empty(
+            (owner_capacity, 3), dtype=torch.int32, device=hidden_states.device
+        )
         owner_count = torch.empty((1,), dtype=torch.int32, device=hidden_states.device)
         if route_id in (2, 6, 7, 9):
             initial_out = torch.empty_like(out, dtype=torch.float32)
-        act_workspace = torch.empty((capacity * blocks, 512), dtype=torch.uint8,
-                                    device=hidden_states.device)
-        sf_workspace = torch.empty((capacity * blocks, 1024), dtype=torch.uint8,
-                                   device=hidden_states.device)
-        route_dtype = torch.bfloat16 if route_id in (4, 5, 6, 9, 10, 11, 12, 13, 14, 15) else torch.float32
+        act_workspace = torch.empty(
+            (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
+        )
+        sf_workspace = torch.empty(
+            (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+        )
+        route_dtype = (
+            torch.bfloat16
+            if route_id in (4, 5, 6, 9, 10, 11, 12, 13, 14, 15)
+            else torch.float32
+        )
         allocate_routes = torch.zeros if route_id == 7 else torch.empty
-        route_accumulator = allocate_routes((m * top_k, k), dtype=route_dtype, device=out.device)
+        route_accumulator = allocate_routes(
+            (m * top_k, k), dtype=route_dtype, device=out.device
+        )
         if route_id in (2, 3, 9, 10, 11, 12, 13, 14, 15):
-            route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
+            route_experts = torch.empty(
+                (m * top_k,), dtype=torch.int32, device=out.device
+            )
         else:
-            route_experts = torch.full((m * top_k,), -1, dtype=torch.int32, device=out.device)
+            route_experts = torch.full(
+                (m * top_k,), -1, dtype=torch.int32, device=out.device
+            )
     get_alphamoe_nvfp4_sm100_module().nvfp4_complete_routed_moe_op(
-        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
-        output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
-        route_accumulator, route_experts, owner_plan, owner_count, initial_out,
-        partial_workspace, act_workspace, sf_workspace, top_k, block_m,
-        routed_scaling_factor, w1_scale_prepared, route_id, w1_data_prepared,
-        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        topk_ids,
+        cumsum_buffer,
+        route_accumulator,
+        route_experts,
+        owner_plan,
+        owner_count,
+        initial_out,
+        partial_workspace,
+        act_workspace,
+        sf_workspace,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        route_id,
+        w1_data_prepared,
+        w1_gate_up_data_prepared,
+        w1_gate_up_scale_prepared,
     )
     return True
 
@@ -1160,15 +1420,22 @@ def _check_prepared_w1_gate_up(w1, data, scales):
     if data is None and scales is None:
         return
     if data is None or scales is None:
-        raise ValueError("Adjacent gate/up data and scale carriers must be supplied together")
+        raise ValueError(
+            "Adjacent gate/up data and scale carriers must be supplied together"
+        )
     e, n, packed_k = w1.shape
     records = e * (n // 256) * (packed_k // 128)
-    for name, value, rows in (("w1_gate_up_data_prepared", data, 256),
-                              ("w1_gate_up_scale_prepared", scales, 32)):
+    for name, value, rows in (
+        ("w1_gate_up_data_prepared", data, 256),
+        ("w1_gate_up_scale_prepared", scales, 32),
+    ):
         _require_cuda_tensor(name, value, dtype=torch.uint8, ndim=3)
-        if (value.device != w1.device or not value.is_contiguous()
-                or tuple(value.shape) != (records, rows, 128)
-                or value.data_ptr() % 16 != 0):
+        if (
+            value.device != w1.device
+            or not value.is_contiguous()
+            or tuple(value.shape) != (records, rows, 128)
+            or value.data_ptr() % 16 != 0
+        ):
             raise ValueError(name + " must match the adjacent gate/up panel layout")
 
 
@@ -1186,8 +1453,12 @@ def prepare_nvfp4_w1_gate_up_data(w1):
     experts, rows, packed_k = map(int, w1.shape)
     assert rows % 256 == 0 and packed_k % 128 == 0
     blocks, k_tiles = rows // 256, packed_k // 128
-    return (w1.view(experts, 2, blocks, 128, k_tiles, 128)
-            .permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, 256, 128))
+    return (
+        w1.view(experts, 2, blocks, 128, k_tiles, 128)
+        .permute(0, 2, 4, 1, 3, 5)
+        .contiguous()
+        .view(-1, 256, 128)
+    )
 
 
 def restore_nvfp4_w1_gate_up_data(prepared, original_shape):
@@ -1198,8 +1469,12 @@ def restore_nvfp4_w1_gate_up_data(prepared, original_shape):
     blocks, k_tiles = rows // 256, packed_k // 128
     assert prepared.dtype == torch.uint8 and prepared.is_contiguous()
     assert tuple(prepared.shape) == (experts * blocks * k_tiles, 256, 128)
-    return (prepared.view(experts, blocks, k_tiles, 2, 128, 128)
-            .permute(0, 3, 1, 4, 2, 5).contiguous().view(experts, rows, packed_k))
+    return (
+        prepared.view(experts, blocks, k_tiles, 2, 128, 128)
+        .permute(0, 3, 1, 4, 2, 5)
+        .contiguous()
+        .view(experts, rows, packed_k)
+    )
 
 
 def prepare_nvfp4_w1_gate_up_scales(prepared_scales, original_weight_shape):
@@ -1217,8 +1492,12 @@ def prepare_nvfp4_w1_gate_up_scales(prepared_scales, original_weight_shape):
     blocks, k_tiles = rows // 256, packed_k // 128
     assert prepared_scales.dtype == torch.uint8 and prepared_scales.is_contiguous()
     assert tuple(prepared_scales.shape) == (experts * 2 * blocks * k_tiles, 16, 128)
-    return (prepared_scales.view(experts, 2, blocks, k_tiles, 16, 128)
-            .permute(0, 2, 3, 1, 4, 5).contiguous().view(-1, 32, 128))
+    return (
+        prepared_scales.view(experts, 2, blocks, k_tiles, 16, 128)
+        .permute(0, 2, 3, 1, 4, 5)
+        .contiguous()
+        .view(-1, 32, 128)
+    )
 
 
 def restore_nvfp4_w1_gate_up_scales(prepared, original_weight_shape):
@@ -1229,6 +1508,9 @@ def restore_nvfp4_w1_gate_up_scales(prepared, original_weight_shape):
     blocks, k_tiles = rows // 256, packed_k // 128
     assert prepared.dtype == torch.uint8 and prepared.is_contiguous()
     assert tuple(prepared.shape) == (experts * blocks * k_tiles, 32, 128)
-    return (prepared.view(experts, blocks, k_tiles, 2, 16, 128)
-            .permute(0, 3, 1, 2, 4, 5).contiguous().view(-1, 16, 128))
-
+    return (
+        prepared.view(experts, blocks, k_tiles, 2, 16, 128)
+        .permute(0, 3, 1, 2, 4, 5)
+        .contiguous()
+        .view(-1, 16, 128)
+    )

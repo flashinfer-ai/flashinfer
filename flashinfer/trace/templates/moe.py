@@ -4194,7 +4194,9 @@ alphamoe_nvfp4_routed_moe_trace = TraceTemplate(
         w1_data_panels=Var(description="Physical panels of prepared W1 data."),
         w1_data_rows=Var(description="Physical rows of prepared W1 data."),
         w1_data_columns=Var(description="Physical columns of prepared W1 data."),
-        w1_gate_up_records=Var(description="Adjacent gate/up records of W1 data and scales."),
+        w1_gate_up_records=Var(
+            description="Adjacent gate/up records of W1 data and scales."
+        ),
         w1_gate_up_data_rows=Var(description="Rows per adjacent data record, 256."),
         w1_gate_up_scale_rows=Var(description="Rows per adjacent scale record, 32."),
         w1_gate_up_columns=Var(description="Bytes per adjacent record row, 128."),
@@ -4203,17 +4205,20 @@ alphamoe_nvfp4_routed_moe_trace = TraceTemplate(
         alphamoe_nvfp4_aligned_moe_trace.inputs,
         w1_data_prepared=Tensor(
             ["w1_data_panels", "w1_data_rows", "w1_data_columns"],
-            dtype="uint8", optional=True,
+            dtype="uint8",
+            optional=True,
             description="Immutable packed W1 panels prepared before requests; rows/columns are 128/128.",
         ),
         w1_gate_up_data_prepared=Tensor(
             ["w1_gate_up_records", "w1_gate_up_data_rows", "w1_gate_up_columns"],
-            dtype="uint8", optional=True,
+            dtype="uint8",
+            optional=True,
             description="Immutable adjacent gate/up data prepared before requests.",
         ),
         w1_gate_up_scale_prepared=Tensor(
             ["w1_gate_up_records", "w1_gate_up_scale_rows", "w1_gate_up_columns"],
-            dtype="uint8", optional=True,
+            dtype="uint8",
+            optional=True,
             description="Immutable adjacent gate/up scale panels prepared before requests.",
         ),
         topk_ids=Tensor(
@@ -4232,15 +4237,11 @@ alphamoe_nvfp4_routed_moe_trace = TraceTemplate(
         sorted_token_ids=Tensor(
             ["sorted_token_capacity"], param="sorted_token_ids", dtype="int32"
         ),
-        expert_ids=Tensor(
-            ["route_block_capacity"], param="expert_ids", dtype="int32"
-        ),
+        expert_ids=Tensor(["route_block_capacity"], param="expert_ids", dtype="int32"),
         num_tokens_post_padded=Tensor(
             ["one"], param="num_tokens_post_padded", dtype="int32"
         ),
-        cumsum_buffer=Tensor(
-            ["cumsum_capacity"], param="cumsum_buffer", dtype="int32"
-        ),
+        cumsum_buffer=Tensor(["cumsum_capacity"], param="cumsum_buffer", dtype="int32"),
     ),
     constraints=list(alphamoe_nvfp4_aligned_moe_trace.constraints),
     tags=[

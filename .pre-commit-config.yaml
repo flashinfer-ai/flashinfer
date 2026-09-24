@@ -60,7 +60,7 @@ repos:
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break their static source-registry identities.
         exclude: |
-          (?x)^(3rdparty/.*|csrc/cake_bf16_bmm/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/dcp/.*|csrc/generated/.*)$
+          (?x)^(3rdparty/.*|csrc/cake_bf16_bmm/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/dcp/.*|csrc/generated/.*|csrc/alphamoe_nvfp4_(?:sm100|c[0-9]+_[a-z_]+)\.cu)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at

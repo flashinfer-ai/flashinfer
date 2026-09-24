@@ -562,12 +562,14 @@ def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
 
     return gen_jit_spec(
         "alphamoe_nvfp4_sm100",
-        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_sm100.cu",
-         jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c346_finalize.cu",
-         jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c368_finalize.cu",
-         jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c376_alignment.cu",
-         jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c386_up.cu",
-         jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c388_up.cu"],
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c346_finalize.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c368_finalize.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c376_alignment.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c386_up.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c388_up.cu",
+        ],
         extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )
