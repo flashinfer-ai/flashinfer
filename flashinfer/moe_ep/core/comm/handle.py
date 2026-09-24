@@ -1,4 +1,4 @@
-"""Handle — per-iteration EP dispatch/combine state."""
+"""Handle — per-iteration dispatch/combine state of a :class:`Fleet` transport."""
 
 from __future__ import annotations
 

@@ -16,7 +16,7 @@ Expert-Parallel MoE with two execution modes:
 
 | Mode | Flow | When to use |
 |------|------|-------------|
-| **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NCCL-EP / NIXL-EP transport |
+| **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NVLink one-/two-sided, NCCL-EP, NIXL-EP |
 | **Mega** | fused comm + MoE kernel | Single symmetric-memory kernel; no separate Fleet/Handle |
 
 Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
@@ -24,8 +24,9 @@ Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backe
 ## Available backends
 
 Backends resolve by name from the config object's `kernel_name` /
-`backend_name` field (three registries: mega kernels, split kernels, split
-comm fleets; deprecated aliases still resolve but warn).
+`backend_name` field (four registries: mega kernels, split kernels,
+`MoEEpCommunication` backends, and Fleet transports; deprecated aliases still
+resolve but warn).
 
 ### Mega (fused comm + MoE kernel)
 
@@ -53,6 +54,34 @@ any kernel backend. The comm layer moves tokens (BF16 unless the kernel
 backend packs them); the kernel backend computes on this rank's expert shard.
 
 #### Comm backends (dispatch/combine transports)
+
+Communication has two levels:
+
+- **`MoEEpCommunication`** (`core/comm/communication.py`) is the MoE-level
+  interface every backend implements: `dispatch(hidden_states, topk_ids,
+  topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
+  their GLOBAL top-k routing (rows without a token carry
+  `MoEEpCommParams.invalid_expert_id`); the expert computation weights and
+  reduces over its local experts; `combine` sums each token's per-rank results
+  on its source rank. Create one with `create_communication(bootstrap,
+  MoEEpCommParams(...), backend=<config>)`, or let `MoEEpSplitLayer` create it
+  (requires `FleetParams(algorithm=LOW_LATENCY, layout=RANK_MAJOR)`).
+- **`Fleet` / `Handle`** (`core/comm/fleet.py`, `handle.py`) is the
+  transport-level API of the NCCL-EP and NIXL-EP backends. It mirrors those
+  libraries' group / per-step-handle model and exposes their full surface
+  (EXPERT_MAJOR and HT layouts, split send/receive staging, persistent handles
+  for CUDA graphs, fault-tolerance masks). `NcclEpCommunication` wraps it for
+  the rank-major contract; `MoEEpSplitLayer` drives `nccl_ep` / `nixl_ep`
+  through it directly.
+
+| Backend | Config | Level | Transport |
+|---|---|---|---|
+| `nvlink_one_sided` | `NVLinkOneSidedConfig(kernel="trtllm" \| "cake", ...)` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`). `kernel="cake"` selects the generated SM100/SM103 kernels |
+| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
+| `nccl_ep` | `NcclEpConfig` | `MoEEpCommunication` (LL `RANK_MAJOR`) and Fleet/Handle | see below |
+| `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
+
+Fleet transports:
 
 | Backend | Config | Transport | Modes | Constraints |
 |---|---|---|---|---|
@@ -232,7 +261,7 @@ Layout rule — taxonomy vs provenance:
   separate snapshot of a fork and keeps its current path for now; fold it into
   `cutedsl_megamoe/` if upstream merges the SM90 kernel.)
 
-Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `backends` is imported; comm fleets register when their `fleet.py` is imported from `__init__.py`.
+Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `backends` is imported; communication backends and comm fleets register when their `communication.py` / `fleet.py` is imported from `__init__.py`.
 
 ## Core types
 
@@ -247,7 +276,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
 
-**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune transport. Fleet is lazy-created on first `forward()`; a new Handle per forward. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
+**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune Fleet transports. The Fleet (or `MoEEpCommunication`) is lazy-created on first `forward()`; Fleet transports get a new Handle per forward. `MoEEpCommunication` backends run eagerly for now (no graph state / CUDA-graph capture through the layer). `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
 
 **Split compute:** the `fused_moe` kernel bridges the 3D EP dispatch buffer to `flashinfer.fused_moe` (a token-major `MoEActivationPack`) via `backends/split/kernel/fused_moe/bridge.py`:
 
@@ -305,9 +334,15 @@ classDiagram
     MoEEpLayer --> MoEEpSplitLayer : SplitConfig
     MoEEpLayer --> MoEEpMegaLayer : MegaConfig
 
-    MoEEpSplitLayer --> Fleet
+    MoEEpSplitLayer --> MoEEpCommunication : nvlink_*
+    MoEEpSplitLayer --> Fleet : nccl_ep / nixl_ep
     MoEEpSplitLayer --> SplitKernelBackend
     MoEEpSplitLayer --> Handle : per forward
+
+    MoEEpCommunication <|-- NVLinkOneSidedCommunication
+    MoEEpCommunication <|-- NVLinkTwoSidedCommunication
+    MoEEpCommunication <|-- NcclEpCommunication
+    NcclEpCommunication --> Fleet
 
     MoEEpMegaLayer --> MegaKernelBackend
 
@@ -327,6 +362,8 @@ classDiagram
 
 | Kind | Name | Config |
 |------|------|--------|
+| Comm | `nvlink_one_sided` | `NVLinkOneSidedConfig` |
+| Comm | `nvlink_two_sided` | `NVLinkTwoSidedConfig` |
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
@@ -404,7 +441,7 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
 2. **Mega kernel** — `backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
-3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py`, `fleet.py`, `handle.py`; import fleet from `moe_ep.__init__.py`.
+3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py` and `communication.py`: subclass `MoEEpCommunication`, `@register_communication`, import it from `moe_ep.__init__.py`, and add the backend's runtime needs to `split_comm_runtime_requirements`. A transport built on a group / per-step-handle library may instead implement `Fleet` / `Handle` (`fleet.py`, `handle.py`) and wrap them in a `MoEEpCommunication`.
 
 ## Tests
 

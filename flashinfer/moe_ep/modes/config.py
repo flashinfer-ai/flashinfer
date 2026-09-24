@@ -16,7 +16,12 @@ __all__ = [
 
 @dataclass
 class SplitConfig:
-    """Dispatch → inner kernel → combine over NCCL-EP / NIXL-EP."""
+    """Dispatch → inner kernel → combine.
+
+    ``comm`` selects a Fleet transport (``NcclEpConfig``, ``NvepConfig``) or a
+    :class:`~flashinfer.moe_ep.core.comm.communication.MoEEpCommunication`
+    backend (``NVLinkOneSidedConfig``, ``NVLinkTwoSidedConfig``).
+    """
 
     comm: object = field(default_factory=NcclEpConfig)
     kernel: object = field(default_factory=IdentityConfig)
