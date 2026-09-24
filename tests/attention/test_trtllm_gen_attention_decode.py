@@ -170,7 +170,7 @@ def create_kv_cache(
     num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
     num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
-    if kv_dtype not in ("fp8", "nvfp4"):
+    if kv_dtype not in ("fp8", "nvfp4", "fp8_k_nvfp4_v"):
         assert kv_dtype == ref_kv_dtype, (
             "kv_dtype and ref_kv_dtype must be the same for non-fp8/nvfp4 kv_cache"
         )
@@ -238,6 +238,18 @@ def create_kv_cache(
         kv_cache, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
             k_cache, v_cache, kv_layout=kv_layout
         )
+    elif kv_dtype == "fp8_k_nvfp4_v":
+        k_cache, k_scale = to_float8(k_cache)
+        v_ref = v_cache
+        (_, v_cache), (_, v_sf), _, v_scale = nvfp4_quantize_paged_kv_cache(
+            v_cache, v_cache, kv_layout=kv_layout
+        )
+        ref_kv_cache = torch.stack(
+            [k_cache.to(ref_kv_dtype_torch) * k_scale, v_ref],
+            dim=1,
+        )
+        kv_cache = (k_cache, v_cache)
+        kv_cache_sf = (None, v_sf)
     else:
         k_scale = v_scale = 1.0
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
@@ -1266,6 +1278,207 @@ def test_trtllm_batch_decode(
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_trtllm_decode_dcp_homogeneous_validation(kv_dtype: torch.dtype) -> None:
+    """Homogeneous DCP must reach its validation after mixed-KV dispatch."""
+    _skip_if_not_blackwell()
+    query = torch.empty(1, 4, 128, device=GPU_DEVICE, dtype=torch.bfloat16)
+    cache = torch.empty(1, 1, 64, 128, device=GPU_DEVICE, dtype=kv_dtype)
+    seq_lens = torch.ones(1, device=GPU_DEVICE, dtype=torch.int32)
+    with pytest.raises(ValueError, match="requires uniform q_len_per_req"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query,
+            (cache, cache),
+            torch.empty(1, device=GPU_DEVICE, dtype=torch.uint8),
+            torch.zeros(1, 1, device=GPU_DEVICE, dtype=torch.int32),
+            seq_lens,
+            1,
+            kv_layout="HND",
+            enable_pdl=False,
+            causal_seqlens_kv_global=seq_lens,
+            q_len_per_req=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "pages_per_seq",
+    [2, 8, 128],
+    ids=["one_cta_persistent", "cga", "multi_cta_gmem"],
+)
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize(
+    "head_group_size",
+    [4, 16, 64],
+    ids=["ungrouped_q8", "ungrouped_q16", "ungrouped_ratio64"],
+)
+def test_trtllm_batch_decode_fp8_k_nvfp4_v(
+    pages_per_seq: int, head_dim: int, head_group_size: int
+) -> None:
+    """Resolve and launch ungrouped mixed-KV FP8-query selector targets."""
+    _skip_if_not_blackwell()
+    torch.manual_seed(0)
+
+    batch_size = 2
+    page_size = 64
+    num_kv_heads = 4
+    num_qo_heads = num_kv_heads * head_group_size
+    num_pages = batch_size * pages_per_seq
+
+    query = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=GPU_DEVICE,
+    )
+    key = torch.randn(
+        num_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=GPU_DEVICE,
+    )
+    value = torch.randn_like(key)
+
+    query_fp8, fp8_query_scale = to_float8(query)
+    query_input = query_fp8
+    query_scale = float(fp8_query_scale.item())
+    query_ref = query_fp8.bfloat16() * query_scale
+    key_fp8, key_scale = to_float8(key)
+    (_, value_fp4), (_, value_block_scales), _, value_scale = (
+        nvfp4_quantize_paged_kv_cache(value, value, kv_layout="HND")
+    )
+    assert key_fp8.element_size() == 1
+    assert value_fp4.element_size() == 1
+    assert key_fp8.shape[-1] == head_dim
+    assert value_fp4.shape[-1] == head_dim // 2
+
+    block_tables = torch.arange(
+        num_pages, dtype=torch.int32, device=GPU_DEVICE
+    ).reshape(batch_size, pages_per_seq)
+    max_seq_len = pages_per_seq * page_size
+    seq_lens = torch.tensor(
+        [max_seq_len - page_size, max_seq_len],
+        dtype=torch.int32,
+        device=GPU_DEVICE,
+    )
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=GPU_DEVICE)
+
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query_input,
+        (key_fp8, value_fp4),
+        workspace,
+        block_tables,
+        seq_lens,
+        int(seq_lens.max().item()),
+        bmm1_scale=query_scale * float(key_scale.item()) / math.sqrt(head_dim),
+        bmm2_scale=value_scale,
+        out_dtype=torch.bfloat16,
+        backend="trtllm-gen",
+        kv_layout="HND",
+        kv_cache_sf=(None, value_block_scales),
+    )
+
+    key_ref = key_fp8.bfloat16() * key_scale
+    output_ref = []
+    for batch_idx, seq_len in enumerate(seq_lens.tolist()):
+        page_ids = block_tables[batch_idx, : math.ceil(seq_len / page_size)]
+        key_seq = (
+            key_ref[page_ids]
+            .permute(1, 0, 2, 3)
+            .reshape(num_kv_heads, -1, head_dim)[:, :seq_len]
+            .repeat_interleave(head_group_size, dim=0)
+            .float()
+        )
+        value_seq = (
+            value[page_ids]
+            .permute(1, 0, 2, 3)
+            .reshape(num_kv_heads, -1, head_dim)[:, :seq_len]
+            .repeat_interleave(head_group_size, dim=0)
+            .float()
+        )
+        logits = torch.einsum("hd,hnd->hn", query_ref[batch_idx].float(), key_seq)
+        probs = torch.softmax(logits / math.sqrt(head_dim), dim=-1)
+        output_ref.append(torch.einsum("hn,hnd->hd", probs, value_seq))
+    output_ref = torch.stack(output_ref)
+
+    cosine = torch.nn.functional.cosine_similarity(
+        output.float().reshape(-1), output_ref.reshape(-1), dim=0
+    )
+    assert cosine.item() > 0.97
+
+    graph_output = torch.empty_like(output)
+    bmm1_scale = query_scale * float(key_scale.item()) / math.sqrt(head_dim)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query_input,
+            (key_fp8, value_fp4),
+            workspace,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=value_scale,
+            out=graph_output,
+            backend="trtllm-gen",
+            kv_layout="HND",
+            kv_cache_sf=(None, value_block_scales),
+        )
+    for _ in range(2):
+        graph.replay()
+        torch.testing.assert_close(graph_output, output, atol=0, rtol=0)
+
+    with pytest.raises(ValueError, match="q_len_per_req=1"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query_input,
+            (key_fp8, value_fp4),
+            workspace,
+            block_tables,
+            seq_lens,
+            int(seq_lens.max().item()),
+            bmm1_scale=query_scale * float(key_scale.item()) / math.sqrt(head_dim),
+            bmm2_scale=value_scale,
+            out_dtype=torch.bfloat16,
+            backend="trtllm-gen",
+            kv_layout="HND",
+            kv_cache_sf=(None, value_block_scales),
+            q_len_per_req=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "kv_dtype,o_dtype",
+    [("fp8", "bf16"), ("nvfp4", "fp8")],
+)
+def test_trtllm_batch_decode_coherent_quantized_artifact(
+    kv_dtype: str, o_dtype: str
+) -> None:
+    """Keep homogeneous kernels compatible with the mixed-KV artifact ABI."""
+    _skip_if_not_blackwell()
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=2,
+        q_len_per_req=1,
+        page_size=64,
+        num_kv_heads=4,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype=o_dtype,
+        kv_dtype=kv_dtype,
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=512,
+        head_dim=128,
+        device_scale=True,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=True,
     )
 
 
