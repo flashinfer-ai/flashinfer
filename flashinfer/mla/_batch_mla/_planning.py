@@ -6,13 +6,15 @@ you may not use this file except in compliance with the License.
 """
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import wraps
+import math
 from typing import Any, Callable, Iterator, Literal, Optional, TypeVar, cast
 
 import torch
 
 from ._contracts import MLAPlanMetadata, MLAStructuralInputKind
+from ._backends._capabilities import _BackendPlanUnsupportedError
 
 
 _PlanResultT = TypeVar("_PlanResultT")
@@ -490,17 +492,48 @@ class _MLAPlanMetadataResolver:
             return csr
         return self._derive_csr(self._validate_dense(None))
 
+    def _csr_for_dense(self) -> _CSRPlanMetadata:
+        csr = self._validate_csr()
+        # Historical flat CSR accepts independent batch-array sizes for FA.
+        # Such metadata cannot describe one dense row per request.
+        if (
+            csr.qo_indptr.numel() != csr.kv_indptr.numel()
+            or csr.kv_len_arr.numel() + 1 != csr.qo_indptr.numel()
+        ):
+            raise _BackendPlanUnsupportedError(
+                "Dense MLA backends require matching query/KV batch dimensions."
+            )
+        return csr
+
     def resolve_dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
         self._check_forms()
         _check_table_width_alignment(table_width_alignment)
         if self._has_dense:
-            dense = self._validate_dense(table_width_alignment)
+            dense = self._validate_dense(None)
             self._ensure_dual_forms_equivalent(dense=dense)
-            return dense
+            width = dense.block_tables.shape[1]
+            if width > 0 and width % table_width_alignment == 0:
+                return dense
+            if table_width_alignment not in self._derived_dense_by_alignment:
+                padded_width = max(
+                    table_width_alignment,
+                    ((width + table_width_alignment - 1) // table_width_alignment)
+                    * table_width_alignment,
+                )
+                table = torch.zeros(
+                    (dense.block_tables.shape[0], padded_width),
+                    dtype=dense.block_tables.dtype,
+                    device=dense.block_tables.device,
+                )
+                table[:, :width].copy_(dense.block_tables)
+                self._derived_dense_by_alignment[table_width_alignment] = replace(
+                    dense, block_tables=table
+                )
+            return self._derived_dense_by_alignment[table_width_alignment]
         if table_width_alignment not in self._derived_dense_by_alignment:
             self._derived_dense_by_alignment[table_width_alignment] = (
                 _derive_dense_from_csr(
-                    self._validate_csr(),
+                    self._csr_for_dense(),
                     table_width_alignment=table_width_alignment,
                 )
             )
@@ -542,7 +575,7 @@ class _MLAPlanMetadataResolver:
             return dense
         if self._derived_native_dense is None:
             self._derived_native_dense = _derive_dense_from_csr(
-                self._validate_csr(),
+                self._csr_for_dense(),
                 table_width_alignment=None,
             )
         return self._derived_native_dense
@@ -593,6 +626,10 @@ class _MLAPlanArguments:
     _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
         default=None, repr=False, compare=False
     )
+    # Selector context; eager replans may choose a different concrete backend.
+    _previous_backend_name: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
     _metadata_resolver: _MLAPlanMetadataResolver = field(
         init=False, repr=False, compare=False
     )
@@ -620,6 +657,33 @@ class _MLAPlanArguments:
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, MLAPlanMetadata):
             raise TypeError("metadata must be an MLAPlanMetadata instance.")
+        if (
+            not isinstance(self.page_size, int)
+            or isinstance(self.page_size, bool)
+            or self.page_size <= 0
+        ):
+            raise ValueError(
+                f"page_size must be a positive int, got {self.page_size!r}."
+            )
+        for name in ("num_heads", "head_dim_ckv", "head_dim_kpe"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer, got {value!r}.")
+        if self.num_heads <= 0 or self.page_size <= 0:
+            raise ValueError("num_heads and page_size must be positive.")
+        if not isinstance(self.causal, bool) or not isinstance(self.use_profiler, bool):
+            raise TypeError("causal and use_profiler must be bools.")
+        if not isinstance(self.sm_scale, (int, float)) or isinstance(
+            self.sm_scale, bool
+        ):
+            raise TypeError("sm_scale must be a finite number.")
+        if not math.isfinite(self.sm_scale):
+            raise ValueError("sm_scale must be finite.")
+        object.__setattr__(self, "sm_scale", float(self.sm_scale))
+        if not isinstance(self.q_data_type, torch.dtype) or not isinstance(
+            self.kv_data_type, torch.dtype
+        ):
+            raise TypeError("q_data_type and kv_data_type must be torch.dtype values.")
         if self.head_dim_ckv <= 0:
             raise ValueError(f"head_dim_ckv must be > 0, got {self.head_dim_ckv}.")
         if self.head_dim_kpe < 0:
@@ -700,9 +764,20 @@ class _MLAPlanArguments:
 
     def dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
         self._record_metadata_argument_access()
+        self._check_dense_alignment_for_graph(table_width_alignment)
         return self._metadata_resolver.resolve_dense(
             table_width_alignment=table_width_alignment
         )
+
+    def _check_dense_alignment_for_graph(self, alignment: int) -> None:
+        if self._use_cuda_graph and self.metadata.block_tables is not None:
+            dense = self._metadata_resolver.resolve_native_dense()
+            width = dense.block_tables.shape[1]
+            if width == 0 or width % alignment:
+                raise _BackendPlanUnsupportedError(
+                    f"CUDA graph dense metadata requires table width aligned to {alignment}; "
+                    "padding would stop observing caller-owned table updates."
+                )
 
     def require_cuda_graph_dense_metadata(self, backend_name: str) -> None:
         """Keep graph launch metadata in caller-owned device storage."""
@@ -717,7 +792,7 @@ class _MLAPlanArguments:
                 self.metadata.seq_lens,
             )
         ):
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 f"{backend_name} CUDA graph plans require supplied dense metadata "
                 f"on the wrapper device {device}; CPU metadata and CSR-only "
                 "metadata would be copied rather than observe in-place updates."
@@ -725,6 +800,7 @@ class _MLAPlanArguments:
 
     def device_dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
         self._record_metadata_argument_access()
+        self._check_dense_alignment_for_graph(table_width_alignment)
         return self._metadata_resolver.resolve_device_dense(
             table_width_alignment=table_width_alignment
         )
