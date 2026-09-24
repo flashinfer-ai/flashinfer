@@ -1040,6 +1040,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         tile_info_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_tile_stage
         )
+        # Programmatic dependent launch: the prologue above (allocation, barrier
+        # init, descriptor prefetch) does not depend on the predecessor grid;
+        # wait here, before the first read of a routing output.
+        griddepcontrol_wait()
         num_valid_groups = num_non_exiting_tiles[0]
 
         # First tile before the CTA-wide sync so consumers can start immediately.
@@ -1111,7 +1115,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 work_tile = tile_sched.get_current_work()
 
         self.cta_sync_barrier.arrive_and_wait()
-        griddepcontrol_wait()
 
         # Zero-fill the finalize output for the following GEMM2 (grid-strided,
         # scheduler warp of every CTA) so no separate fill kernel is needed.

@@ -26,6 +26,7 @@ import cuda.bindings.driver as cuda
 import torch
 
 from ...cute_dsl.utils import make_ptr
+from .common.kernel_utils import griddepcontrol_launch_dependents
 from .moe_utils import get_max_num_tiles
 
 
@@ -389,6 +390,9 @@ class _FusedRoutePreprocess:
         block, _, _ = cute.arch.block_idx()
         lane = tid % 32
         warp = tid // 32
+        # Let a PDL-launched successor (swap-AB GEMM1) become resident now; it
+        # waits (griddepcontrol.wait) before reading any output of this kernel.
+        griddepcontrol_launch_dependents()
         smem = utils.SmemAllocator()
         counts = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
         bases = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))

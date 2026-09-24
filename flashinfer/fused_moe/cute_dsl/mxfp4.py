@@ -107,6 +107,12 @@ SWAP_HYBRID_DENSE_MIN_ROWS = int(os.environ.get("SWAPAB_HYBRID_DENSE_MIN_ROWS", 
 # shard at T=128..1024; SWAPAB_MIXED=1 enables it, SWAPAB_MIXED_EP=1 also on
 # expert-parallel ranks.
 SWAP_MIXED = os.environ.get("SWAPAB_MIXED", "0") == "1"
+# Programmatic dependent launch inside the swap-AB kernel chain (fused routing
+# -> GEMM1 -> GEMM2): the routing kernel triggers its dependents at entry and
+# the swap GEMMs wait before their first routing read, so the launch latency
+# and prologue of each GEMM overlap the previous kernel. The caller's
+# ``enable_pdl`` still governs the first launch of the op. 0 = plain launches.
+SWAP_PDL = os.environ.get("SWAPAB_PDL", "1") != "0"
 SWAP_MIXED_MIN_TOKENS = int(os.environ.get("SWAPAB_MIXED_MIN_TOKENS", "128"))
 # Mixed form by default on the fused-routing path (T * top_k <= 4096, i.e.
 # T <= 256 for top-16) up to this token count (0 disables): there the fused
@@ -770,6 +776,9 @@ class Mxfp4MoESwapAbPlan:
 
     def _prepare(self):
         w = self._wrapper
+        # Swap-chain kernels are PDL-launched (see SWAP_PDL); each waits before
+        # its first read of a predecessor's output.
+        self._pdl = pdl = w.enable_pdl or SWAP_PDL
         x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf = self._inputs
         b = self._buffers
         num_tokens = x.shape[0]
@@ -862,7 +871,7 @@ class Mxfp4MoESwapAbPlan:
                     local_expert_offset=w.local_expert_offset,
                     num_local_experts=w.num_local_experts,
                     tile_tokens_dim=self.group_rows,
-                    enable_pdl=w.enable_pdl,
+                    enable_pdl=pdl,
                     _prepared_launches=launches,
                     **sort_buffers,
                 )
@@ -885,7 +894,7 @@ class Mxfp4MoESwapAbPlan:
                     wide_min_permille=SWAP_MIXED_WIDE_PERMILLE if self.mixed else 0,
                     all_list=b["swap_all_groups"] if self.mixed else None,
                     all_count=b["swap_all_count"] if self.mixed else None,
-                    enable_pdl=w.enable_pdl,
+                    enable_pdl=pdl,
                     _prepared_launches=launches,
                 )
                 self._dispatch, self._dispatch_args = launches["swap_dispatch"]
@@ -924,7 +933,7 @@ class Mxfp4MoESwapAbPlan:
                 top_k=w.top_k,
                 zero_output=None,
                 n_tile=self.n_tile,
-                enable_pdl=w.enable_pdl,
+                enable_pdl=pdl,
                 weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
                 **{
@@ -967,7 +976,7 @@ class Mxfp4MoESwapAbPlan:
                     topk=w.top_k,
                     mma_tiler_mn=gemm1_tactic[0],
                     cluster_shape_mn=gemm1_tactic[1],
-                    enable_pdl=w.enable_pdl,
+                    enable_pdl=pdl,
                     activation_type=w.activation_type.value,
                     situ_beta=self._beta,
                     situ_linear_beta=self._linear_beta,
@@ -1004,7 +1013,7 @@ class Mxfp4MoESwapAbPlan:
                     out_dtype="bfloat16",
                     mma_tiler_mn=gemm2_tactic[0],
                     cluster_shape_mn=gemm2_tactic[1],
-                    enable_pdl=w.enable_pdl,
+                    enable_pdl=pdl,
                     use_fused_finalize=True,
                     weight_l2_hint=DENSE_WEIGHT_L2_HINT,
                     _prepared_launches=launches,
@@ -1081,7 +1090,7 @@ class Mxfp4MoESwapAbPlan:
                 finalize=fused_finalize,
                 n_tile=self.n_tile,
                 k_blocks_per_stage=gemm2_k_blocks,
-                enable_pdl=w.enable_pdl,
+                enable_pdl=self._pdl,
                 weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
                 m_group=gemm2_m_group,
@@ -1353,7 +1362,7 @@ class CuteDslMxfp4MoEWrapper:
         return (
             (1 <= num_tokens <= self.swapab_max_tokens or not do_finalize)
             and self.activation_type == ActivationType.Situ
-            and not self.enable_pdl
+            and (SWAP_PDL or not self.enable_pdl)
         )
 
     def _dense_two_stage(self, num_tokens):
@@ -1580,8 +1589,7 @@ class CuteDslMxfp4MoEWrapper:
             raise ValueError("num_tokens must be positive")
         if not self._use_swapab(num_tokens, do_finalize=False):
             raise ValueError(
-                "deferred output requires SiTU activation without PDL "
-                "(the swap-AB path)"
+                "deferred output requires SiTU activation (the swap-AB path)"
             )
         tile = self._swap_tile(num_tokens)
         return (
@@ -1649,7 +1657,7 @@ class CuteDslMxfp4MoEWrapper:
             if not do_finalize:
                 if not self._use_swapab(num_tokens, do_finalize=False):
                     raise ValueError(
-                        "deferred output requires SiTU activation without PDL"
+                        "deferred output requires SiTU activation (the swap-AB path)"
                     )
                 deferred_rows = self.get_deferred_output_rows(num_tokens)
                 if (

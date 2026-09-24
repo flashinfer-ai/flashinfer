@@ -105,11 +105,12 @@ directly; BF16/packed routing is converted into preallocated workspace on the
 caller stream.
 
 For T=1..16, one CuTe kernel combines routing unpack/conversion with output
-clearing and, when PDL is disabled, local expert histogram/prefix/scatter.
+clearing and the local expert histogram/prefix/scatter (on the dense path
+only when PDL is disabled).
 The default decode forward then launches GEMM1 and GEMM2 with finalize:
 three device-kernel launches in total. Expert IDs must be unique within each
 token and lie in ``[0, num_experts)``, as in standard top-k routing.
-PDL-enabled decode retains separate
+On the dense path, PDL-enabled decode retains separate
 native sorting. The fused sort covers every T with ``T * top_k <= 4096``
 (T <= 256 for Kimi K3, see "Kernel selection" below); above that the same
 conversion + output-clear kernel runs without the fused sort (it is
@@ -136,7 +137,8 @@ mirroring ``trtllm_fp4_block_scale_routed_moe(do_finalize=False)``.
   the converted router weights. Both are workspace-resident, fixed-address
   tensors valid after ``run``. The finalized output is
   ``sum_k route_weights[t, k] * output[map[t, k]]`` over the local slots.
-* The deferred form is provided by the swap-AB path (SiTU, PDL disabled) at
+* The deferred form is provided by the swap-AB path (SiTU, with or without
+  the caller's PDL) at
   every token count, in both parallel layouts: routing preprocessing (plus
   ``moe_sort`` above T=256), GEMM1 and GEMM2 with the plain-store epilogue.
   ``mxfp4_moe_capability(..., do_finalize=False)`` reports it through
@@ -428,6 +430,24 @@ expert-parallel rank at T=17..255 (``SWAPAB_EP_L2HINT_SKIP_MAX_TOKENS``),
 where a hot expert's 8-16 groups re-read its weights from L2 and the hint
 costs +10 us (balanced +4 us); from T=256 the 32-row groups make it a
 5-14 us win there too. All deltas are same-GPU paired medians.
+
+The swap-AB kernel chain is launched with programmatic dependent launch
+(``SWAPAB_PDL``, default 1) whatever the caller's ``enable_pdl``: the fused
+routing kernel triggers its dependents at entry, and every swap GEMM (and
+the hybrid form's dense GEMMs) executes ``griddepcontrol.wait`` after its
+prologue (TMEM allocation, barrier initialisation, descriptor prefetch) and
+before its first read of a routing output, so the launch latency and the
+prologue of each GEMM overlap the previous kernel. The first launch of the
+op stays a plain launch, so the caller-visible stream order is unchanged;
+with ``enable_pdl=True`` SiTU decode now also takes this path instead of
+the dense one. Measured per row on B300 (graph replay, CUPTI, same
+process): GPU span -2.1..-2.6 us on every decode row of both layouts
+(EP8 T=1 hot 25.1 -> 23.0 us, TP8 26.9 -> 24.6 us) with bitwise-identical
+output; the summed kernel durations rise by 0.4-1.3 us because a dependent
+kernel's clock runs while it waits, so overlapped rows are reported by GPU
+span. Triggering the dependents right after the wait instead of at the end
+of the epilogue gains nothing further (the dependent CTAs cannot become
+resident before the working CTAs leave their SMs).
 
 Routing preprocessing (expert histogram, permutation, per-row scale, output
 clear) runs as one fused CuTe kernel whenever ``T * top_k <= 4096``
@@ -1029,21 +1049,58 @@ MoE tensor-parallel rank 0 (896 experts, ``I_shard = 384``):
 **Where the gaps come from (measured on the same node).**
 
 *Decode, T <= 16.* The floor is the touched weight bytes at 6.92 TB/s
-(5 us for one expert on the wide shard, 10 us for 16 shard experts). A
-T=1 hot row costs 24 us: fused routing 2.4 us, GEMM1 13.4 us (22 MB of
-weights), GEMM2 8.5 us (13 MB), attributed per kernel on a second B300
-node of the same type (24.3 us there). The streaming ramp puts the same bytes at
-7.0 us and 5.2 us even at the swap GEMM's 48-CTA grid, so about 12 us of
-the 24 us is the small-transfer ramp plus the three launches, which no
-kernel organisation removes; that part is structural (5 us floor against
-~14 us reachable). The remaining ~10 us is the swap-AB kernels streaming at
-~37 GB/s per SM: with 48 CTAs they behave like a stream with 32 KB in flight
-(12.6 us for 22 MB, 8.7 us for 13 MB). Doubling or halving the K-blocks per
-stage and the stage count moved this by 1-3% (the smem budget fixes the
-bytes in flight per SM), and a split-K variant that puts more CTAs on each
-weight tile was slower in two implementations (its scheduler work exceeded
-the streaming gain). More CTAs per tile therefore remains the open lever for
-decode; the ramp part is not.
+(5 us for one expert on the wide shard, 10 us for 16 shard experts). At
+this revision a T=1 hot row costs 22.5 us of GPU span: fused
+routing 2.6 us, swap-AB GEMM1 (22 MB of weights) and GEMM2 (13 MB)
+launched as programmatic dependents of their predecessor. Per-CTA
+``%globaltimer`` stamps inside the two GEMMs (148 CTAs, one B300 node,
+graph replay) locate the time. All CTAs start within 0.2 us of each
+other, so the CTA launch ramp is not a term. A CTA without a tile leaves
+after 1.2-1.5 us (TMEM allocation, barrier initialisation, descriptor
+prefetch). A CTA with a tile spends 0.5 us in that prologue, 0.65 us
+issuing its first weight loads, 1.05 us waiting for the first K stage to
+land, then 7.1 us in the K loop (28 stages of K=256 at 0.25 us each) and
+1.0 us in the epilogue: 10.7 us in total for GEMM1 (6.3 us for GEMM2: 24
+stages at 0.14 us). The kernel durations were 13.4-13.9 and 8.3-8.8 us,
+so ~3 us of each kernel lay outside any CTA (launch latency and drain).
+The programmatic dependent launch removes 2.1-2.6 us of that per row
+(EP8 T=1 hot 25.1 -> 23.0 us GPU span, TP8 26.9 -> 24.6; every decode
+row of both layouts, same-process A/B, bitwise-identical output); an
+earlier trigger (right after the dependency wait instead of at the end of
+the epilogue) gains nothing further, because the dependent GEMM's CTAs
+cannot become resident before the working CTAs of the primary leave their
+SMs.
+
+The K loop itself runs at the MMA warp's issue rate, not at the memory
+system's: removing every token-row load, or the TMEM load and store of
+the epilogue, or raising the stages in flight from 5 to 10 (200 KB per SM)
+changes GEMM1 by less than 1 us, while cutting the stages to 3 costs 3 us.
+One 128 x 8 x 32 ``kind::f8f6f4`` MMA occupies the single MMA warp for
+about 64 issue cycles, and a K=256 stage issues 8 of them plus two
+``tcgen05.cp`` scale-factor copies and a commit: ~500 cycles = 0.25 us
+per stage at 2.0 GHz, which is what the stamps measure. The streaming
+microbenchmark moves the same 22 MB in 6.7-7.9 us with 48-288 CTAs, so
+the loop is within 10 % of the bytes' own ramp; the structural part of
+the decode row is therefore routing + two prologues + two first-stage
+latencies + the two MMA-issue-bound loops + two epilogues, ~20 us against
+the 5 us byte floor, and the row is at 1.1 x of that
+reachable figure. Two implementations of split-K (more CTAs per weight
+tile, partials reduced by the last CTA) were measured as slower or equal:
+with 48 working CTAs the loop is not bandwidth-bound, so spreading it
+over 144 CTAs shortens each CTA's loop but not the kernel (13.4 -> 13.4
+us at S=3; every configuration that needs a second wave is slower).
+
+*Balanced decode rows, T = 2..16.* Each token routes to 16 experts, so
+T=4 balanced touches 8 (16 on the shard) experts: GEMM1 has 4 x 48 = 192
+weight tiles for 148 CTAs and its per-CTA lifetimes are bimodal, 22-25 us
+for one tile and 30-33 us for two; the second wave streams 44 tiles while
+104 SMs idle. During the first wave the 148 CTAs stream at ~3.6 TB/s
+(0.7 us per K stage against 0.25 us with one expert), close to the
+streaming ramp's 4.6 TB/s for 94 MB. The wave quantisation (1.3 waves ->
+~9 us of the 36 us GEMM1, ~5 us of the 22 us GEMM2) is the open lever of
+this row class; a remainder-only split (split-K on the tiles past the
+first wave only) is the candidate, since the whole-kernel split above was
+measured negative.
 
 *Empty routing, T >= 128 (16 hot experts hold every route).* The
 swap-AB GEMMs stream each expert once per row group (8 rows on the shard,

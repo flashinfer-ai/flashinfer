@@ -172,11 +172,15 @@ def test_deferred_workspace_and_row_queries(tokens, mode):
             assert deferred == finalized
     with pytest.raises(ValueError):
         wrapper.get_deferred_output_rows(0)
+    # The swap-AB chain is PDL-launched internally, so the deferred form is
+    # available with the caller's PDL as well and sizes identically.
     pdl = m.CuteDslMxfp4MoEWrapper(
         896, 16, 7168, 3072, parallel_layout=layout, enable_pdl=True
     )
-    with pytest.raises(ValueError):
-        pdl.get_deferred_output_rows(tokens)
+    assert pdl.get_deferred_output_rows(tokens) == wrapper.get_deferred_output_rows(
+        tokens
+    )
+    assert pdl.get_workspace_size(tokens, do_finalize=False) == deferred
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +392,7 @@ def test_deferred_graph_replay(mode, tokens):
     assert _compiled_counts() == compiled_before
 
 
-def test_deferred_plan_rejects_bad_output_and_pdl():
+def test_deferred_plan_rejects_bad_output_with_and_without_pdl():
     _require_blackwell()
     case = make_case(tokens=4)
     from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
@@ -435,5 +439,17 @@ def test_deferred_plan_rejects_bad_output_and_pdl():
         local_expert_offset=case.local_expert_offset,
         enable_pdl=True,
     )
-    with pytest.raises(ValueError):
-        pdl.get_deferred_output_rows(4)
+    assert pdl.get_deferred_output_rows(4) == rows
+    with pytest.raises(ValueError, match="deferred output"):
+        pdl.plan(
+            case.x,
+            case.x_scale,
+            case.topk_ids,
+            case.topk_weights,
+            *weights,
+            beta=case.beta,
+            linear_beta=case.linear_beta,
+            workspace=workspace,
+            output=short,
+            do_finalize=False,
+        )
