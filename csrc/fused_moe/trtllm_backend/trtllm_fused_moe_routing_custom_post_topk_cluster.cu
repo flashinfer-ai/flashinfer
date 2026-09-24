@@ -14,6 +14,19 @@
  * limitations under the License.
  */
 
-#define FLASHINFER_ROUTING_CUSTOM_ENTRY
+#define FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL
 #include "trtllm_fused_moe_routing_custom.cuh"
-#include "trtllm_fused_moe_routing_custom_entry_launchers.cuh"
+
+namespace moe::dev::routing::routingCustom {
+
+bool launchClusterKernelBlockDim256(Data const& data, void* stream) {
+  return launchClusterKernelForPolicy<ClusterBlockDim256, NoOpPreprocess, SoftmaxPostprocess>(
+      data, stream);
+}
+
+bool launchClusterKernelBlockDim512(Data const& data, void* stream) {
+  return launchClusterKernelForPolicy<ClusterBlockDim512, NoOpPreprocess, SoftmaxPostprocess>(
+      data, stream);
+}
+
+}  // namespace moe::dev::routing::routingCustom

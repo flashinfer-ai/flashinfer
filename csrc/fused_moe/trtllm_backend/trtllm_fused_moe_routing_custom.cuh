@@ -322,18 +322,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 #endif
 }
 
-// Returns whether a compiled tier covered the runtime (numExperts, topK) and the
-// kernel was actually launched. A false return means no routing output was written;
-// the caller (run) must not proceed to the downstream pipeline in that case.
-bool launchBlockKernel(Data const& data, void* stream) {
-  uint32_t const numThreadsBlock =
-      std::min(1024u, static_cast<uint32_t>(queryDispatchedMaxExperts(data)));
-  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockKernel, 1, numThreadsBlock,
-                        /*smemSize=*/0,  // No dynamic smem
-                        stream);
-  return queryPolicyHasCompiledTier(data);
-}
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // Warp-level exclusive scan for the dynamic block kernel.
@@ -656,20 +644,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 #endif
 }
 
-// Returns whether a compiled tier covered the runtime (numExperts, topK) and the
-// kernel was actually launched (see launchBlockKernel).
-bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream) {
-  int32_t const maxExperts = queryDispatchedMaxExperts(data);
-  int const numSlots = data.mNumTokens * maxExperts;
-  int const smemSize = numSlots + numSlots * 2 + 128 +
-                       2 * (maxExperts / WarpSize) * static_cast<int>(sizeof(int32_t));
-  int const threads =
-      std::min(std::max(data.mNumTokens * static_cast<int>(WarpSize), maxExperts), 1024);
-
-  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesDynBlockKernel, 1, threads, smemSize, stream);
-  return queryPolicyHasCompiledTier(data);
-}
-
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -682,10 +656,6 @@ bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 static constexpr int ClusterBlockDim256 = NumExperts256Experts;
 static constexpr int ClusterBlockDim512 = NumExperts512Experts;
 static constexpr int ClusterBlockDim1024 = NumThreads;
-static constexpr int MaxNumTokensClusterScores256 =
-    NumBlocksPerCluster * (ClusterBlockDim256 / WarpSize);
-static constexpr int MaxNumTokensClusterScores512 =
-    NumBlocksPerCluster * (ClusterBlockDim512 / WarpSize);
 
 #if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL) || \
     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
@@ -873,62 +843,9 @@ bool launchClusterKernelForBlockDim(Data const& data, void* stream) {
   return dispatched;
 }
 
-// Returns whether the cluster tier dispatch found a covering tier and launched a kernel.
-#if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL)
-bool launchClusterKernelBlockDim256(Data const& data, void* stream) {
-  return launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
-}
-
-bool launchClusterKernelBlockDim512(Data const& data, void* stream) {
-  return launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
-}
-#endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL)
-
-#if defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
-bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
-  bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr &&
-                                    data.mPreprocessType == RoutingPreprocessType::None &&
-                                    data.mPostprocessType == RoutingPostprocessType::Softmax;
-  if (useNoOpSoftmaxScores) {
-    return launchClusterKernelForPolicy<ClusterBlockDim1024, NoOpPreprocess, SoftmaxPostprocess>(
-        data, stream);
-  }
-
-  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
-                        /*smemSize=*/0,  // No dynamic smem
-                        stream);
-  return queryPolicyHasCompiledTier(data);
-}
-#endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
-
 #endif  // FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL || FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE
 
 #if defined(FLASHINFER_ROUTING_CUSTOM_ENTRY)
-
-// Returns whether a compiled tier covered the runtime (numExperts, topK) and the
-// kernel was actually launched (see launchBlockKernel).
-bool launchClusterKernel(Data const& data, void* stream) {
-  // Use the wider cluster only for permutation-only launches in the bounded high-expert/high-TopK
-  // range. Score-to-TopK fused clusters retain the general capacity-based dispatch.
-  bool const useWidePermutationCluster =
-      data.mPtrScores == nullptr &&
-      topk::isInHighExpertLaneOwnedTopKRange(data.mNumExperts, data.mTopK) &&
-      data.mNumTokens >= 32 && data.mNumTokens <= 64;
-  if (useWidePermutationCluster) {
-    return launchClusterKernelBlockDim512(data, stream);
-  }
-
-  // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
-  // Use them only where the requested token count fits; otherwise keep the original 1024-thread
-  // launch.
-  if (data.mNumTokens <= MaxNumTokensClusterScores256) {
-    return launchClusterKernelBlockDim256(data, stream);
-  }
-  if (data.mNumTokens <= MaxNumTokensClusterScores512) {
-    return launchClusterKernelBlockDim512(data, stream);
-  }
-  return launchClusterKernelBlockDim1024(data, stream);
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1414,109 +1331,6 @@ bool launchBlockScoresKernel(Data const& data, void* stream) {
     }
   });
   return launched;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// 4. Coop kernel — cooperative histogram + offsets via grid-sync.
-//
-// The coop kernel only performs the post-topK permutation pipeline (histogram, prefix-scan,
-// index writes). It does not compute TopK; it reads pre-computed results from mPtrTopKPacked
-// or mPtrTopKIds. The expert tier sizes shared memory and determines the thread count. Most
-// tiers use NumTop8Experts and generic 64-entry per-thread state. Bounded high-expert/high-TopK
-// tiers can use NumTop16Experts with four entries per thread when that state covers
-// mNumTokens * mTopK.
-//
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int NumExpertsTier>
-void launchCoopKernelTier(Data const& data, int numBlocksCoop, uint32_t numThreadsHist,
-                          void* stream) {
-  bool useBoundedState = false;
-  if constexpr (topk::isInHighExpertLaneOwnedTopKRange(NumExpertsTier, NumTop16Experts)) {
-    int64_t const expandedIdxSize = int64_t{data.mNumTokens} * int64_t{data.mTopK};
-    int64_t const boundedCapacity = int64_t{4} * int64_t{numBlocksCoop} * int64_t{numThreadsHist};
-    useBoundedState = data.mTopK > NumTop8Experts && data.mTopK <= NumTop16Experts &&
-                      expandedIdxSize <= boundedCapacity;
-  }
-
-  if (useBoundedState) {
-    LAUNCH_ROUTING_WITH_POLICIES(
-        data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, numThreadsHist,
-        /*smemSize=*/0, stream, NoOpPreprocess, NoOpPostprocess, NumExpertsTier, NumTop16Experts);
-  } else {
-    LAUNCH_ROUTING_WITH_POLICIES(
-        data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, numThreadsHist,
-        /*smemSize=*/0, stream, NoOpPreprocess, NoOpPostprocess, NumExpertsTier, NumTop8Experts);
-  }
-}
-
-void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream) {
-  if (data.mNumExperts <= NumExperts128Experts) {
-    LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                 numThreadsHist, /*smemSize=*/0, stream, NoOpPreprocess,
-                                 NoOpPostprocess, NumExperts128Experts, NumTop8Experts);
-  } else if (data.mNumExperts <= NumExperts160Experts) {
-    LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                 numThreadsHist, /*smemSize=*/0, stream, NoOpPreprocess,
-                                 NoOpPostprocess, NumExperts160Experts, NumTop8Experts);
-  } else if (data.mNumExperts <= NumExperts256Experts) {
-    LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                 numThreadsHist, /*smemSize=*/0, stream, NoOpPreprocess,
-                                 NoOpPostprocess, NumExperts256Experts, NumTop8Experts);
-  } else if (data.mNumExperts <= NumExperts384Experts) {
-    LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                 numThreadsHist, /*smemSize=*/0, stream, NoOpPreprocess,
-                                 NoOpPostprocess, NumExperts384Experts, NumTop8Experts);
-  } else if (data.mNumExperts <= NumExperts512Experts) {
-    LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                 numThreadsHist, /*smemSize=*/0, stream, NoOpPreprocess,
-                                 NoOpPostprocess, NumExperts512Experts, NumTop8Experts);
-  } else if (data.mNumExperts <= NumExperts576Experts) {
-    LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                 numThreadsHist, /*smemSize=*/0, stream, NoOpPreprocess,
-                                 NoOpPostprocess, NumExperts576Experts, NumTop8Experts);
-  } else if (data.mNumExperts <= NumExperts896Experts) {
-    launchCoopKernelTier<NumExperts896Experts>(data, numBlocksCoop, numThreadsHist, stream);
-  } else if (data.mNumExperts <= NumExperts1024Experts) {
-    launchCoopKernelTier<NumExperts1024Experts>(data, numBlocksCoop, numThreadsHist, stream);
-  } else {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "Coop kernel does not support numExperts > " << NumExperts1024Experts << ", got "
-        << data.mNumExperts;
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// 5-7. Launch wrappers for shared kernels (defined in RoutingKernel.cuh):
-//      - InitExpertCounts (zero expert counts)
-//      - Histogram kernel (histogram from packed TopK)
-//      - Offsets kernel (prefix-scan + permutation)
-//
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void launchInitExpertCounts(Data const& data, uint32_t numThreadsHist, void* stream) {
-  LAUNCH_ROUTING_CUSTOM_NO_POLICY(data, false, routingInitExpertCounts,
-                                  (2 * data.mNumExperts - 1) / numThreadsHist + 1, numThreadsHist,
-                                  /*smemSize=*/0,  // No dynamic smem
-                                  stream);
-}
-
-void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t numThreadsHist,
-                           void* stream) {
-  LAUNCH_ROUTING_CUSTOM_NO_POLICY(data, false, routingIndicesHistogramKernel, numBlocksHistogram,
-                                  numThreadsHist,
-                                  /*smemSize=*/0,  // No dynamic smem
-                                  stream);
-}
-
-void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThreadsHist,
-                         void* stream) {
-  LAUNCH_ROUTING_CUSTOM_NO_POLICY(data, false, routingIndicesOffsetsKernel, numBlocksOffsets,
-                                  numThreadsHist,
-                                  /*smemSize=*/0,  // No dynamic smem
-                                  stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
