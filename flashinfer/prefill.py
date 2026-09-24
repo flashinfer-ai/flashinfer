@@ -20,7 +20,7 @@ import math
 import os
 import threading
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, overload
 
 import torch
 
@@ -7598,3 +7598,148 @@ def prepare_nvfp4_attention(q, k, v, out, *, causal=False, backend="cake"):
     )
 
     return prepare(q, k, v, out, causal=causal, backend="cake")
+
+
+@flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen BF16 attention")
+def minimax_h3_varlen_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""Noncausal packed-varlen BF16 attention over THD tensors (SM100/SM103).
+
+    The experimental Cake backend runs one persistent 2-CTA-cluster tcgen05
+    kernel (``kind::f16`` QK and PV, FP32 softmax and accumulation) over
+    packed ``[T, H, 128]`` tensors: for every segment ``[a, b)`` of
+    ``cu_seqlens`` and every head ``h``,
+    ``out[a:b, h] = softmax(query[a:b, h] @ key[a:b, h]^T * softmax_scale) @ value[a:b, h]``
+    (flashinfer-ai/flashinfer#4532, candidate 3A).
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        Contiguous BF16 ``[T, H, 128]`` packed THD tensors on one CUDA device.
+    cu_seqlens : torch.Tensor
+        int32 ``[B + 1]`` segment bounds on the same device with
+        ``cu_seqlens[0] == 0``, non-decreasing entries and ``cu_seqlens[B] == T``.
+        Segment lengths are arbitrary (including 0 and below one tile).
+    softmax_scale : Optional[float]
+        Defaults to ``1 / sqrt(128)``.
+    out : Optional[torch.Tensor]
+        Optional caller-owned BF16 ``[T, H, 128]`` output.
+    cu_seqlens_host : Optional[Sequence[int]]
+        Host copy of ``cu_seqlens``; when omitted the values are read back
+        from the device once to build the segment plan.
+    backend : str
+        Only ``"cake"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The BF16 ``[T, H, 128]`` output (``out`` when given).  For repeated
+        launches or CUDA Graph capture use
+        ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_attention``,
+        whose runner launches with no allocation or synchronization.  See
+        ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "MiniMax-H3 varlen attention currently supports backend='cake'"
+        )
+    from .experimental.minimax_h3_varlen_attention.cake_backend import (
+        minimax_h3_varlen_attention as run,
+    )
+
+    return run(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen NVFP4 attention")
+def minimax_h3_varlen_nvfp4_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    pv_mode: str = "fp8",
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""Noncausal packed-varlen attention with NVFP4 QK over THD tensors (SM100/SM103).
+
+    The experimental Cake backend quantizes ``query``/``key`` (and ``value``)
+    in-pipeline into a head-major, per-segment 128-token-padded packed layout
+    and runs one persistent 2-CTA-cluster tcgen05 kernel: QK is
+    ``kind::mxf4nvf4`` (E2M1 x E2M1 with UE4M3 block-16 scales); PV is either
+    ``kind::f8f6f4`` (``pv_mode="fp8"``: E4M3 P and dense E4M3 V with one
+    per-tensor scale) or ``kind::mxf4nvf4`` (``pv_mode="fp4"``: E2M1 P anchored
+    at the score-tile maximum and E2M1 V^T with per-16-token scales).  Softmax
+    and accumulation are FP32; the output is BF16 (flashinfer-ai/flashinfer#4532,
+    candidate 3C).  The complete call, including quantization, is the timed
+    boundary; the prepared runner exposes ``quantize()`` and ``attention()``
+    for separate timing.
+
+    Parameters
+    ----------
+    query, key, value : torch.Tensor
+        Contiguous BF16 ``[T, H, 128]`` packed THD tensors on one CUDA device.
+    cu_seqlens : torch.Tensor
+        int32 ``[B + 1]`` segment bounds on the same device with
+        ``cu_seqlens[0] == 0``, non-decreasing entries and ``cu_seqlens[B] == T``.
+    pv_mode : str
+        ``"fp8"`` (default, lower error) or ``"fp4"`` (fastest for long
+        segments).
+    softmax_scale : Optional[float]
+        Defaults to ``1 / sqrt(128)``.
+    out : Optional[torch.Tensor]
+        Optional caller-owned BF16 ``[T, H, 128]`` output.
+    cu_seqlens_host : Optional[Sequence[int]]
+        Host copy of ``cu_seqlens``; when omitted the values are read back
+        from the device once to build the segment plan.
+    backend : str
+        Only ``"cake"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The BF16 ``[T, H, 128]`` output (``out`` when given).  Validated
+        tolerance against an FP32 reference is ``atol=1.0, rtol=0.1``.  For
+        repeated launches or CUDA Graph capture use
+        ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_nvfp4_attention``.
+        See ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "MiniMax-H3 varlen NVFP4 attention currently supports backend='cake'"
+        )
+    from .experimental.minimax_h3_varlen_attention.cake_backend import (
+        minimax_h3_varlen_nvfp4_attention as run,
+    )
+
+    return run(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        pv_mode=pv_mode,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend="cake",
+    )
