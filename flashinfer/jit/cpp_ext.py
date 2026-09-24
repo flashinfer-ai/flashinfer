@@ -441,7 +441,7 @@ def is_nvcc_at_least(nvcc_path: str, version_str: str) -> bool:
         if matches:
             return Version(matches[0]) >= Version(version_str)
     except (
-        FileNotFoundError,
+        OSError,
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
     ):
