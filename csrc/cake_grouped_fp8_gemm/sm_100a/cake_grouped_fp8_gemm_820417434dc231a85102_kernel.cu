@@ -69,12 +69,12 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define SMEM_EPI_STAGING_3_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_3_STRIDE 8192
 #define SMEM_SMEM_ASCALE_OFF 197632
-#define SMEM_SMEM_ASCALE_STAGE_BYTES 1536
-#define SMEM_SMEM_ASCALE_STRIDE 1536
-#define SMEM_SMEM_BSCALE_OFF 199168
-#define SMEM_SMEM_BSCALE_STAGE_BYTES 12
-#define SMEM_SMEM_BSCALE_STRIDE 12
-#define SMEM_TOTAL 199296
+#define SMEM_SMEM_ASCALE_STAGE_BYTES 6144
+#define SMEM_SMEM_ASCALE_STRIDE 6144
+#define SMEM_SMEM_BSCALE_OFF 203776
+#define SMEM_SMEM_BSCALE_STAGE_BYTES 48
+#define SMEM_SMEM_BSCALE_STRIDE 48
+#define SMEM_TOTAL 203904
 #define THREADS 384
 
 #include <math_constants.h>
@@ -415,6 +415,15 @@ __device__ __forceinline__ void tma_4d_gmem2smem(
 }
 
 
+__device__ __forceinline__ void tma_store_2d(
+    const void *tmap, int x, int y, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2}], [%3];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
+}
+
+
 __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
     asm volatile(
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
@@ -452,7 +461,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_grouped_fp8_gemm_cf93e6fa926c6736f686(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
+kernel_cake_grouped_fp8_gemm_820417434dc231a85102(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -496,8 +505,8 @@ kernel_cake_grouped_fp8_gemm_cf93e6fa926c6736f686(CakeTensorMap const* A, CakeTe
     const int epi_staging_3_addr = smem + 189440;
     float* smem_ascale = reinterpret_cast<float*>(smem_raw + 197632);
     const int smem_ascale_addr = smem + 197632;
-    float* smem_bscale = reinterpret_cast<float*>(smem_raw + 199168);
-    const int smem_bscale_addr = smem + 199168;
+    float* smem_bscale = reinterpret_cast<float*>(smem_raw + 203776);
+    const int smem_bscale_addr = smem + 203776;
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
     int taddr;
     int tmem_partials;
@@ -687,17 +696,17 @@ kernel_cake_grouped_fp8_gemm_cf93e6fa926c6736f686(CakeTensorMap const* A, CakeTe
                     acc1[31] = 0.0f;
                     float partial_fragment[16];
                     int k_blocks = K / 128;
-                    int scale_groups = k_blocks;
+                    int scale_groups = k_blocks / 4;
                     #pragma unroll 1
                     for (int scale_group = 0; scale_group < scale_groups; scale_group++) {
                         mbarrier_wait(scale_full_addr + (scale_stage) * 8, _phase_scale_full);
-                        int scale_base = scale_stage * 128 + (unsigned int)row;
+                        int scale_base = scale_stage * 128 * 4 + (unsigned int)(row * 4);
                         #pragma unroll
-                        for (int k_inner = 0; k_inner < 1; k_inner++) {
+                        for (int k_inner = 0; k_inner < 4; k_inner++) {
                             mbarrier_wait(partial_full_addr + (partial_stage) * 8, _phase_partial_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             float a_s = smem_ascale[scale_base + k_inner];
-                            float b_s = smem_bscale[scale_stage + (unsigned int)k_inner];
+                            float b_s = smem_bscale[scale_stage * 4 + (unsigned int)k_inner];
                             float combined = a_s * b_s;
                             int _trl_addr_1 = tmem_partials + (partial_stage * 128 + (unsigned int)wg_col_base) + (row_base << 16);
                             tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_1);
@@ -765,13 +774,86 @@ kernel_cake_grouped_fp8_gemm_cf93e6fa926c6736f686(CakeTensorMap const* A, CakeTe
                         scale_stage += 1;
                         if (scale_stage == 3) { scale_stage = 0; _phase_scale_full ^= 1; }
                     }
-                    if (row >= run_begin) {
+                    int homogeneous = 0;
+                    if (run_begin == 0) {
+                        if (run_end == tile_rows) {
+                            homogeneous = 1;
+                        }
+                    }
+                    if (homogeneous != 0) {
+                        if (warp == 0) {
+                            if (elect_sync()) {
+                                asm volatile("cp.async.bulk.wait_group.read 0;");
+                            }
+                        }
+                        asm volatile("barrier.sync 8, 256;" ::: "memory");
+                        unsigned int epi_stage = 0;
+                        int c_stage_row = epi_stage * 128 + (unsigned int)row;
+                        uint32_t acc0_bf16[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc0[_lp*2 + 0], acc0[_lp*2+1 + 0]));
+                            acc0_bf16[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        uint32_t acc1_bf16[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc1[_lp*2 + 0], acc1[_lp*2+1 + 0]));
+                            acc1_bf16[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        if (acc_wg == 0) {
+                            #pragma unroll
+                            for (int chunk = 0; chunk < 4; chunk++) {
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_0_addr + (unsigned int)(c_stage_row * 64 + chunk * 16 ^ (c_stage_row * 64 + chunk * 16 >> 7 & 3) << 4))), "r"(acc0_bf16[chunk * 4]), "r"(acc0_bf16[chunk * 4 + 1]), "r"(acc0_bf16[chunk * 4 + 2]), "r"(acc0_bf16[chunk * 4 + 3]) : "memory");
+                            }
+                            #pragma unroll
+                            for (int chunk_1 = 0; chunk_1 < 4; chunk_1++) {
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_1_addr + (unsigned int)(c_stage_row * 64 + chunk_1 * 16 ^ (c_stage_row * 64 + chunk_1 * 16 >> 7 & 3) << 4))), "r"(acc1_bf16[chunk_1 * 4]), "r"(acc1_bf16[chunk_1 * 4 + 1]), "r"(acc1_bf16[chunk_1 * 4 + 2]), "r"(acc1_bf16[chunk_1 * 4 + 3]) : "memory");
+                            }
+                        }
+                        if (acc_wg == 1) {
+                            #pragma unroll
+                            for (int chunk_2 = 0; chunk_2 < 4; chunk_2++) {
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_2_addr + (unsigned int)(c_stage_row * 64 + chunk_2 * 16 ^ (c_stage_row * 64 + chunk_2 * 16 >> 7 & 3) << 4))), "r"(acc0_bf16[chunk_2 * 4]), "r"(acc0_bf16[chunk_2 * 4 + 1]), "r"(acc0_bf16[chunk_2 * 4 + 2]), "r"(acc0_bf16[chunk_2 * 4 + 3]) : "memory");
+                            }
+                            #pragma unroll
+                            for (int chunk_3 = 0; chunk_3 < 4; chunk_3++) {
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_3_addr + (unsigned int)(c_stage_row * 64 + chunk_3 * 16 ^ (c_stage_row * 64 + chunk_3 * 16 >> 7 & 3) << 4))), "r"(acc1_bf16[chunk_3 * 4]), "r"(acc1_bf16[chunk_3 * 4 + 1]), "r"(acc1_bf16[chunk_3 * 4 + 2]), "r"(acc1_bf16[chunk_3 * 4 + 3]) : "memory");
+                            }
+                        }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        asm volatile("barrier.sync 8, 256;" ::: "memory");
+                        if (warp == 0) {
+                            if (elect_sync()) {
+                                int staging_offset = epi_stage * 8192;
+                                tma_store_2d(C_tma, n_tile * 128, m_tile * 128, epi_staging_0_addr + (unsigned int)staging_offset);
+                                tma_store_2d(C_tma, n_tile * 128 + 32, m_tile * 128, epi_staging_1_addr + (unsigned int)staging_offset);
+                                tma_store_2d(C_tma, n_tile * 128 + 64, m_tile * 128, epi_staging_2_addr + (unsigned int)staging_offset);
+                                tma_store_2d(C_tma, n_tile * 128 + 96, m_tile * 128, epi_staging_3_addr + (unsigned int)staging_offset);
+                                asm volatile("cp.async.bulk.commit_group;");
+                            }
+                        }
+                    } else if (row >= run_begin) {
                         if (row < run_end) {
                             long long output_row = m_tile * 128 + row;
                             #pragma unroll
-                            for (int vec = 0; vec < 32; vec++) {
-                                *(reinterpret_cast<__nv_bfloat16*>(C + (output_row * (long long)N + (long long)(n_tile * 128) + (long long)wg_col_base + (long long)vec)) + (0)) = __float2bfloat16_rn(acc0[vec]);
-                                *(reinterpret_cast<__nv_bfloat16*>(C + (output_row * (long long)N + (long long)(n_tile * 128) + (long long)wg_col_base + 32 + vec)) + (0)) = __float2bfloat16_rn(acc1[vec]);
+                            for (int vec = 0; vec < 32; vec += 8) {
+                                {
+                                    __nv_bfloat162 _pk[4];
+                                    _pk[0] = __floats2bfloat162_rn(acc0[vec + 0], acc0[vec + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(acc0[vec + 2], acc0[vec + 3]);
+                                    _pk[2] = __floats2bfloat162_rn(acc0[vec + 4], acc0[vec + 5]);
+                                    _pk[3] = __floats2bfloat162_rn(acc0[vec + 6], acc0[vec + 7]);
+                                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(C + (output_row * (long long)N + (long long)(n_tile * 128) + (long long)wg_col_base + (long long)vec)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                }
+                                {
+                                    __nv_bfloat162 _pk[4];
+                                    _pk[0] = __floats2bfloat162_rn(acc1[vec + 0], acc1[vec + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(acc1[vec + 2], acc1[vec + 3]);
+                                    _pk[2] = __floats2bfloat162_rn(acc1[vec + 4], acc1[vec + 5]);
+                                    _pk[3] = __floats2bfloat162_rn(acc1[vec + 6], acc1[vec + 7]);
+                                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(C + (output_row * (long long)N + (long long)(n_tile * 128) + (long long)wg_col_base + 32 + vec)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                }
                             }
                         }
                     }
@@ -1009,26 +1091,26 @@ kernel_cake_grouped_fp8_gemm_cf93e6fa926c6736f686(CakeTensorMap const* A, CakeTe
                     int _shfl_3 = __shfl_sync(0xFFFFFFFF, group_3, 0);
                     group_3 = _shfl_3;
                     int k_blocks_3 = K / 128;
-                    int scale_groups_1 = k_blocks_3;
+                    int scale_groups_1 = k_blocks_3 / 4;
                     int n_blocks = N / 128;
                     #pragma unroll 1
                     for (int scale_group_1 = 0; scale_group_1 < scale_groups_1; scale_group_1++) {
                         mbarrier_wait(scale_free_addr + (scale_stage_1) * 8, _phase_scale_free);
-                        int stage_base = scale_stage_1 * 128;
+                        int stage_base = scale_stage_1 * 128 * 4;
                         #pragma unroll
-                        for (int chunk = 0; chunk < 4; chunk++) {
-                            int row_1 = chunk * 32 + lane;
+                        for (int chunk_4 = 0; chunk_4 < 4; chunk_4++) {
+                            int row_1 = chunk_4 * 32 + lane;
                             int g_row = m_tile_3 * 128 + row_1;
-                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                                :: "r"(smem_ascale_addr + (unsigned int)((stage_base + row_1) * 4)), "l"(a_scale + (g_row * k_blocks_3 + scale_group_1)), "r"((g_row < M) ? 4 : 0));
+                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
+                                :: "r"(smem_ascale_addr + (unsigned int)((stage_base + row_1 * 4) * 4)), "l"(a_scale + (g_row * k_blocks_3 + scale_group_1 * 4)), "r"((g_row < M) ? 16 : 0));
                         }
                         asm volatile(
                             "{\n\t"
                             ".reg .pred p;\n\t"
                             "setp.ne.b32 p, %0, 0;\n\t"
-                            "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
+                            "@p cp.async.ca.shared::cta.global [%1], [%2], 16;\n\t"
                             "}"
-                            :: "r"((lane == 0) ? 1 : 0), "r"(smem_bscale_addr + scale_stage_1 * 4), "l"(b_scale + ((group_3 * n_blocks + n_tile_2) * k_blocks_3 + scale_group_1)));
+                            :: "r"((lane == 0) ? 1 : 0), "r"(smem_bscale_addr + scale_stage_1 * 4 * 4), "l"(b_scale + ((group_3 * n_blocks + n_tile_2) * k_blocks_3 + scale_group_1 * 4)));
                         asm volatile(
                             "{\n\t"
                             "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"

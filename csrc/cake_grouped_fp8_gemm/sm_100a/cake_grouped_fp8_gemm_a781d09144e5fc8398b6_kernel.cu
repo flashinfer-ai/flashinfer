@@ -54,37 +54,34 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_PARTIALS_OFFSET 0
-#define NUM_AB_PIPE_STAGES 7
-#define NUM_PARTIAL_PIPE_STAGES 4
-#define NUM_SCALE_PIPE_STAGES 1
+#define NUM_AB_PIPE_STAGES 6
+#define NUM_PARTIAL_PIPE_STAGES 2
+#define NUM_SCALE_PIPE_STAGES 3
 #define SMEM_SMEM_A_OFF 1024
 #define SMEM_SMEM_A_STAGE_BYTES 16384
 #define SMEM_SMEM_A_STRIDE 16384
-#define SMEM_SMEM_B_OFF 115712
+#define SMEM_SMEM_B_OFF 99328
 #define SMEM_SMEM_B_STAGE_BYTES 16384
 #define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_SMEM_B_HALF0_OFF 115712
-#define SMEM_SMEM_B_HALF0_STAGE_BYTES 8192
-#define SMEM_SMEM_B_HALF0_STRIDE 16384
-#define SMEM_SMEM_B_HALF1_OFF 123904
-#define SMEM_SMEM_B_HALF1_STAGE_BYTES 8192
-#define SMEM_SMEM_B_HALF1_STRIDE 16384
 #define SMEM_EPI_STAGING_0_OFF 1024
 #define SMEM_EPI_STAGING_0_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_0_STRIDE 16384
-#define SMEM_EPI_STAGING_1_OFF 115712
+#define SMEM_EPI_STAGING_1_OFF 99328
 #define SMEM_EPI_STAGING_1_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_1_STRIDE 16384
 #define SMEM_EPI_STAGING_2_OFF 9216
 #define SMEM_EPI_STAGING_2_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_2_STRIDE 16384
-#define SMEM_EPI_STAGING_3_OFF 123904
+#define SMEM_EPI_STAGING_3_OFF 107520
 #define SMEM_EPI_STAGING_3_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_3_STRIDE 16384
-#define SMEM_SMEM_ASCALE_OFF 230400
-#define SMEM_SMEM_ASCALE_STAGE_BYTES 2048
-#define SMEM_SMEM_ASCALE_STRIDE 2048
-#define SMEM_TOTAL 232448
+#define SMEM_SMEM_ASCALE_OFF 197632
+#define SMEM_SMEM_ASCALE_STAGE_BYTES 6144
+#define SMEM_SMEM_ASCALE_STRIDE 6144
+#define SMEM_SMEM_BSCALE_OFF 203776
+#define SMEM_SMEM_BSCALE_STAGE_BYTES 96
+#define SMEM_SMEM_BSCALE_STRIDE 96
+#define SMEM_TOTAL 203904
 #define THREADS 384
 
 #include <math_constants.h>
@@ -489,7 +486,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
+kernel_cake_grouped_fp8_gemm_a781d09144e5fc8398b6(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -502,13 +499,13 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
 
     const int mbar_base = smem;
     #define ab_full_addr (mbar_base + 0)
-    #define ab_free_addr (mbar_base + 56)
-    #define partial_full_addr (mbar_base + 112)
-    #define partial_free_addr (mbar_base + 144)
-    #define scale_full_addr (mbar_base + 176)
-    #define scale_free_addr (mbar_base + 184)
-    #define producers_done_addr (mbar_base + 192)
-    #define pair_exit_addr (mbar_base + 200)
+    #define ab_free_addr (mbar_base + 48)
+    #define partial_full_addr (mbar_base + 96)
+    #define partial_free_addr (mbar_base + 112)
+    #define scale_full_addr (mbar_base + 128)
+    #define scale_free_addr (mbar_base + 152)
+    #define producers_done_addr (mbar_base + 176)
+    #define pair_exit_addr (mbar_base + 184)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -529,69 +526,65 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
     // Kernel setup ops
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 115712);
-    const int smem_b_addr = smem + 115712;
-    uint8_t* smem_b_half0 = reinterpret_cast<uint8_t*>(smem_raw + 115712);
-    const int smem_b_half0_addr = smem + 115712;
-    uint8_t* smem_b_half1 = reinterpret_cast<uint8_t*>(smem_raw + 123904);
-    const int smem_b_half1_addr = smem + 123904;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 99328);
+    const int smem_b_addr = smem + 99328;
     __nv_bfloat16* epi_staging_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int epi_staging_0_addr = smem + 1024;
-    __nv_bfloat16* epi_staging_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 115712);
-    const int epi_staging_1_addr = smem + 115712;
+    __nv_bfloat16* epi_staging_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
+    const int epi_staging_1_addr = smem + 99328;
     __nv_bfloat16* epi_staging_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 9216);
     const int epi_staging_2_addr = smem + 9216;
-    __nv_bfloat16* epi_staging_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 123904);
-    const int epi_staging_3_addr = smem + 123904;
-    float* smem_ascale = reinterpret_cast<float*>(smem_raw + 230400);
-    const int smem_ascale_addr = smem + 230400;
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 208);
+    __nv_bfloat16* epi_staging_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 107520);
+    const int epi_staging_3_addr = smem + 107520;
+    float* smem_ascale = reinterpret_cast<float*>(smem_raw + 197632);
+    const int smem_ascale_addr = smem + 197632;
+    float* smem_bscale = reinterpret_cast<float*>(smem_raw + 203776);
+    const int smem_bscale_addr = smem + 203776;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
     int taddr;
     int tmem_partials;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 26 barriers)
-    // Mbarriers at smem_raw[0..208)
+    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 24 barriers)
+    // Mbarriers at smem_raw[0..192)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'ab_pipe' ---
-            // ab_full: 7 barriers, init_count=2
+            // ab_full: 6 barriers, init_count=2
             mbarrier_init(smem + 0, 2);
             mbarrier_init(smem + 8, 2);
             mbarrier_init(smem + 16, 2);
             mbarrier_init(smem + 24, 2);
             mbarrier_init(smem + 32, 2);
             mbarrier_init(smem + 40, 2);
-            mbarrier_init(smem + 48, 2);
-            // ab_free: 7 barriers, init_count=1
+            // ab_free: 6 barriers, init_count=1
+            mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
+            // --- pipeline 'partial_pipe' ---
+            // partial_full: 2 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
             mbarrier_init(smem + 104, 1);
-            // --- pipeline 'partial_pipe' ---
-            // partial_full: 4 barriers, init_count=1
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
-            // partial_free: 4 barriers, init_count=16
-            mbarrier_init(smem + 144, 16);
-            mbarrier_init(smem + 152, 16);
-            mbarrier_init(smem + 160, 16);
-            mbarrier_init(smem + 168, 16);
+            // partial_free: 2 barriers, init_count=16
+            mbarrier_init(smem + 112, 16);
+            mbarrier_init(smem + 120, 16);
             // --- pipeline 'scale_pipe' ---
-            // scale_full: 1 barriers, init_count=32
-            mbarrier_init(smem + 176, 32);
-            // scale_free: 1 barriers, init_count=256
-            mbarrier_init(smem + 184, 256);
+            // scale_full: 3 barriers, init_count=32
+            mbarrier_init(smem + 128, 32);
+            mbarrier_init(smem + 136, 32);
+            mbarrier_init(smem + 144, 32);
+            // scale_free: 3 barriers, init_count=256
+            mbarrier_init(smem + 152, 256);
+            mbarrier_init(smem + 160, 256);
+            mbarrier_init(smem + 168, 256);
             // producers_done: 1 barriers, init_count=3
-            mbarrier_init(smem + 192, 3);
+            mbarrier_init(smem + 176, 3);
             // pair_exit: 1 barriers, init_count=1
-            mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 184, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -610,7 +603,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
         asm volatile("setmaxnreg.inc.sync.aligned.u32 216;");
         { // acc_epi_main
             if (warp == 0) {
-                int _tmem_hold_0 = smem + 208;
+                int _tmem_hold_0 = smem + 192;
                 asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold_0), "r"(512) : "memory");
             }
             asm volatile("barrier.sync 9, 288;" ::: "memory");
@@ -623,9 +616,6 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
             unsigned int partial_stage = 0;
             unsigned int consumer_ab_cursor = 0;
             unsigned int epi_panel_cursor = 0;
-            float b_scale_prefetch[4];
-            int b_scale_primed = 0;
-            int next_first_group = 0;
             unsigned int scale_stage = 0;
             const int acc_wg = warp / 4;
             const int acc_warp_in_wg = warp % 4;
@@ -652,21 +642,6 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                 int last_group = 0;
                 if (lane == 0) {
                     last_group = m_indices[cluster_m_base + tile_rows - 1];
-                }
-                int next_cluster_m_tile = cluster_m_tile + step_m;
-                int next_n_tile = n_tile + step_n;
-                if (next_n_tile >= n_tiles) {
-                    next_n_tile -= n_tiles;
-                    next_cluster_m_tile += 1;
-                }
-                int has_next = 0;
-                if ((unsigned int)total_tiles > (unsigned int)tile_id + num_clusters) {
-                    has_next = 1;
-                }
-                if (lane == 0) {
-                    if (has_next != 0) {
-                        next_first_group = m_indices[next_cluster_m_tile * 256];
-                    }
                 }
                 int run_begin = 0;
                 #pragma unroll 1
@@ -828,196 +803,153 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                     float partial_fragment[16];
                     int k_blocks = K / 128;
                     int scale_groups = k_blocks / 4;
-                    long long b_scale_base = group;
-                    b_scale_base = (b_scale_base * (long long)(N / 128) + (long long)(n_tile * 2) + (long long)acc_wg) * (long long)k_blocks;
-                    if (b_scale_primed == 0) {
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(b_scale + b_scale_base);
-                            b_scale_prefetch[0 + 0] = _v4.x;
-                            b_scale_prefetch[0 + 1] = _v4.y;
-                            b_scale_prefetch[0 + 2] = _v4.z;
-                            b_scale_prefetch[0 + 3] = _v4.w;
-                        }
-                    }
-                    b_scale_primed = 0;
                     #pragma unroll 1
                     for (int scale_group = 0; scale_group < scale_groups; scale_group++) {
-                        float scale_products[4];
                         mbarrier_wait(scale_full_addr + (scale_stage) * 8, _phase_scale_full);
                         int scale_base = scale_stage * 128 * 4 + (unsigned int)(row * 4);
+                        float scale_products[4];
                         #pragma unroll
                         for (int preload_k = 0; preload_k < 4; preload_k++) {
                             float a_s = smem_ascale[scale_base + preload_k];
-                            scale_products[preload_k] = a_s * b_scale_prefetch[preload_k];
+                            float b_s = smem_bscale[(scale_stage * 2 + (unsigned int)acc_wg) * 4 + (unsigned int)preload_k];
+                            scale_products[preload_k] = a_s * b_s;
                         }
                         mbarrier_arrive(scale_free_addr + (scale_stage) * 8);
-                        _phase_scale_full ^= 1;
-                        if (scale_groups > scale_group + 1) {
-                            {
-                                float4 _v4 = *reinterpret_cast<const float4*>(b_scale + b_scale_base + (long long)((scale_group + 1) * 4));
-                                b_scale_prefetch[0 + 0] = _v4.x;
-                                b_scale_prefetch[0 + 1] = _v4.y;
-                                b_scale_prefetch[0 + 2] = _v4.z;
-                                b_scale_prefetch[0 + 3] = _v4.w;
-                            }
-                        }
-                        if (scale_groups <= scale_group + 1) {
-                            if (run_end == tile_rows) {
-                                if (has_next != 0) {
-                                    int _shfl_10 = __shfl_sync(0xFFFFFFFF, next_first_group, 0);
-                                    int next_group_1 = _shfl_10;
-                                    long long next_b_scale_base = next_group_1;
-                                    next_b_scale_base = (next_b_scale_base * (long long)(N / 128) + (long long)(next_n_tile * 2) + (long long)acc_wg) * (long long)k_blocks;
-                                    {
-                                        float4 _v4 = *reinterpret_cast<const float4*>(b_scale + next_b_scale_base);
-                                        b_scale_prefetch[0 + 0] = _v4.x;
-                                        b_scale_prefetch[0 + 1] = _v4.y;
-                                        b_scale_prefetch[0 + 2] = _v4.z;
-                                        b_scale_prefetch[0 + 3] = _v4.w;
-                                    }
-                                    b_scale_primed = 1;
-                                }
-                            }
+                        scale_stage += 1;
+                        if (scale_stage == 3) { scale_stage = 0; _phase_scale_full ^= 1; }
+                        int partial_release_issuer = 0;
+                        if (elect_sync()) {
+                            partial_release_issuer = 1;
                         }
                         #pragma unroll
                         for (int k_inner = 0; k_inner < 4; k_inner++) {
                             mbarrier_wait(partial_full_addr + (partial_stage) * 8, _phase_partial_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             float combined = scale_products[k_inner];
-                            int _trl_addr_4 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64)) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_4);
+                            int _trl_addr_1 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_1);
                             {
-                                unsigned long long _fma_acc_scale2_5;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_5) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[0]), "+f"(acc0[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[2]), "+f"(acc0[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[4]), "+f"(acc0[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[6]), "+f"(acc0[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[8]), "+f"(acc0[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[10]), "+f"(acc0[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[12]), "+f"(acc0[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_5));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[14]), "+f"(acc0[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_5));
+                                unsigned long long _fma_acc_scale2_2;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_2) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[0]), "+f"(acc0[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[2]), "+f"(acc0[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[4]), "+f"(acc0[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[6]), "+f"(acc0[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[8]), "+f"(acc0[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[10]), "+f"(acc0[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[12]), "+f"(acc0[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_2));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[14]), "+f"(acc0[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_2));
                             }
-                            int _trl_addr_6 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64) + 16) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_6);
+                            int _trl_addr_3 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 16) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_3);
                             {
-                                unsigned long long _fma_acc_scale2_7;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_7) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[16]), "+f"(acc0[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[18]), "+f"(acc0[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[20]), "+f"(acc0[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[22]), "+f"(acc0[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[24]), "+f"(acc0[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[26]), "+f"(acc0[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[28]), "+f"(acc0[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_7));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[30]), "+f"(acc0[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_7));
+                                unsigned long long _fma_acc_scale2_4;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_4) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[16]), "+f"(acc0[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[18]), "+f"(acc0[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[20]), "+f"(acc0[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[22]), "+f"(acc0[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[24]), "+f"(acc0[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[26]), "+f"(acc0[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[28]), "+f"(acc0[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_4));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc0[30]), "+f"(acc0[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_4));
                             }
-                            int _trl_addr_8 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64) + 32) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_8);
+                            int _trl_addr_5 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 32) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_5);
                             {
-                                unsigned long long _fma_acc_scale2_9;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_9) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[0]), "+f"(acc1[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[2]), "+f"(acc1[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[4]), "+f"(acc1[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[6]), "+f"(acc1[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[8]), "+f"(acc1[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[10]), "+f"(acc1[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[12]), "+f"(acc1[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_9));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[14]), "+f"(acc1[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_9));
+                                unsigned long long _fma_acc_scale2_6;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_6) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[0]), "+f"(acc1[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[2]), "+f"(acc1[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[4]), "+f"(acc1[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[6]), "+f"(acc1[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[8]), "+f"(acc1[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[10]), "+f"(acc1[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[12]), "+f"(acc1[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_6));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[14]), "+f"(acc1[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_6));
                             }
-                            int _trl_addr_10 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64) + 32 + 16) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_10);
+                            int _trl_addr_7 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 32 + 16) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_7);
                             {
-                                unsigned long long _fma_acc_scale2_11;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_11) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[16]), "+f"(acc1[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[18]), "+f"(acc1[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[20]), "+f"(acc1[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[22]), "+f"(acc1[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[24]), "+f"(acc1[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[26]), "+f"(acc1[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[28]), "+f"(acc1[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_11));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[30]), "+f"(acc1[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_11));
+                                unsigned long long _fma_acc_scale2_8;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_8) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[16]), "+f"(acc1[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[18]), "+f"(acc1[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[20]), "+f"(acc1[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[22]), "+f"(acc1[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[24]), "+f"(acc1[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[26]), "+f"(acc1[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[28]), "+f"(acc1[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_8));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc1[30]), "+f"(acc1[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_8));
+                            }
+                            int _trl_addr_9 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 64) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_9);
+                            {
+                                unsigned long long _fma_acc_scale2_10;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_10) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[0]), "+f"(acc2[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[2]), "+f"(acc2[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[4]), "+f"(acc2[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[6]), "+f"(acc2[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[8]), "+f"(acc2[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[10]), "+f"(acc2[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[12]), "+f"(acc2[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_10));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[14]), "+f"(acc2[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_10));
+                            }
+                            int _trl_addr_11 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 64 + 16) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_11);
+                            {
+                                unsigned long long _fma_acc_scale2_12;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_12) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[16]), "+f"(acc2[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[18]), "+f"(acc2[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[20]), "+f"(acc2[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[22]), "+f"(acc2[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[24]), "+f"(acc2[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[26]), "+f"(acc2[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[28]), "+f"(acc2[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_12));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[30]), "+f"(acc2[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_12));
+                            }
+                            int _trl_addr_13 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 96) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_13);
+                            {
+                                unsigned long long _fma_acc_scale2_14;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_14) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[0]), "+f"(acc3[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[2]), "+f"(acc3[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[4]), "+f"(acc3[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[6]), "+f"(acc3[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[8]), "+f"(acc3[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[10]), "+f"(acc3[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[12]), "+f"(acc3[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_14));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[14]), "+f"(acc3[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_14));
+                            }
+                            int _trl_addr_15 = tmem_partials + (partial_stage * 256 + (unsigned int)wg_col_base + 96 + 16) + (row_base << 16);
+                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_15);
+                            {
+                                unsigned long long _fma_acc_scale2_16;
+                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_16) : "f"(combined));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[16]), "+f"(acc3[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[18]), "+f"(acc3[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[20]), "+f"(acc3[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[22]), "+f"(acc3[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[24]), "+f"(acc3[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[26]), "+f"(acc3[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[28]), "+f"(acc3[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_16));
+                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[30]), "+f"(acc3[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_16));
                             }
                             asm volatile("tcgen05.fence::before_thread_sync;");
-                            if (elect_sync()) {
+                            if (partial_release_issuer != 0) {
                                 asm volatile(
                                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                     :: "r"((partial_free_addr + (partial_stage) * 8) & 0xFEFFFFFF) : "memory");
                             }
                             partial_stage += 1;
-                            if (partial_stage == 4) { partial_stage = 0; _phase_partial_full ^= 1; }
-                            mbarrier_wait(partial_full_addr + (partial_stage) * 8, _phase_partial_full);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _trl_addr_12 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64)) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_12);
-                            {
-                                unsigned long long _fma_acc_scale2_13;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_13) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[0]), "+f"(acc2[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[2]), "+f"(acc2[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[4]), "+f"(acc2[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[6]), "+f"(acc2[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[8]), "+f"(acc2[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[10]), "+f"(acc2[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[12]), "+f"(acc2[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_13));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[14]), "+f"(acc2[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_13));
-                            }
-                            int _trl_addr_14 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64) + 16) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_14);
-                            {
-                                unsigned long long _fma_acc_scale2_15;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_15) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[16]), "+f"(acc2[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[18]), "+f"(acc2[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[20]), "+f"(acc2[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[22]), "+f"(acc2[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[24]), "+f"(acc2[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[26]), "+f"(acc2[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[28]), "+f"(acc2[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_15));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc2[30]), "+f"(acc2[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_15));
-                            }
-                            int _trl_addr_16 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64) + 32) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_16);
-                            {
-                                unsigned long long _fma_acc_scale2_17;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_17) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[0]), "+f"(acc3[1]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[2]), "+f"(acc3[3]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[4]), "+f"(acc3[5]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[6]), "+f"(acc3[7]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[8]), "+f"(acc3[9]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[10]), "+f"(acc3[11]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[12]), "+f"(acc3[13]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_17));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[14]), "+f"(acc3[15]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_17));
-                            }
-                            int _trl_addr_18 = tmem_partials + (partial_stage * 128 + (unsigned int)(acc_wg * 64) + 32 + 16) + (row_base << 16);
-                            tmem_ld_x16_wait(&partial_fragment[0], _trl_addr_18);
-                            {
-                                unsigned long long _fma_acc_scale2_19;
-                                asm volatile("mov.b64 %0, {%1, %1};" : "=l"(_fma_acc_scale2_19) : "f"(combined));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[16]), "+f"(acc3[17]) : "f"(partial_fragment[0]), "f"(partial_fragment[1]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[18]), "+f"(acc3[19]) : "f"(partial_fragment[2]), "f"(partial_fragment[3]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[20]), "+f"(acc3[21]) : "f"(partial_fragment[4]), "f"(partial_fragment[5]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[22]), "+f"(acc3[23]) : "f"(partial_fragment[6]), "f"(partial_fragment[7]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[24]), "+f"(acc3[25]) : "f"(partial_fragment[8]), "f"(partial_fragment[9]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[26]), "+f"(acc3[27]) : "f"(partial_fragment[10]), "f"(partial_fragment[11]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[28]), "+f"(acc3[29]) : "f"(partial_fragment[12]), "f"(partial_fragment[13]), "l"(_fma_acc_scale2_19));
-                                asm volatile("{\n\t" ".reg .b64 _src2, _acc2, _out2;\n\t" "mov.b64 _src2, {%2, %3};\n\t" "mov.b64 _acc2, {%0, %1};\n\t" "fma.rn.f32x2 _out2, _src2, %4, _acc2;\n\t" "mov.b64 {%0, %1}, _out2;\n\t" "}" : "+f"(acc3[30]), "+f"(acc3[31]) : "f"(partial_fragment[14]), "f"(partial_fragment[15]), "l"(_fma_acc_scale2_19));
-                            }
-                            asm volatile("tcgen05.fence::before_thread_sync;");
-                            if (elect_sync()) {
-                                asm volatile(
-                                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                                    :: "r"((partial_free_addr + (partial_stage) * 8) & 0xFEFFFFFF) : "memory");
-                            }
-                            partial_stage += 1;
-                            if (partial_stage == 4) { partial_stage = 0; _phase_partial_full ^= 1; }
+                            if (partial_stage == 2) { partial_stage = 0; _phase_partial_full ^= 1; }
                         }
                     }
-                    unsigned int output_ab_stage = (consumer_ab_cursor + (unsigned int)k_blocks - 1) % 7;
-                    consumer_ab_cursor = (consumer_ab_cursor + (unsigned int)k_blocks) % 7;
+                    unsigned int output_ab_stage = (consumer_ab_cursor + (unsigned int)k_blocks - 1) % 6;
+                    consumer_ab_cursor = (consumer_ab_cursor + (unsigned int)k_blocks) % 6;
                     int homogeneous = 0;
                     if (run_begin == 0) {
                         if (run_end == tile_rows) {
@@ -1329,8 +1261,8 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                             if (group_1 != last_group_1) {
                                 #pragma unroll 1
                                 for (int probe_1 = run_begin_1 + 1; probe_1 < tile_rows_1; probe_1++) {
-                                    int next_group_2 = m_indices[cluster_m_base_1 + probe_1];
-                                    if (next_group_2 != group_1) {
+                                    int next_group_1 = m_indices[cluster_m_base_1 + probe_1];
+                                    if (next_group_1 != group_1) {
                                         run_end_1 = probe_1;
                                         break;
                                     }
@@ -1348,7 +1280,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                             mbarrier_wait(ab_full_addr + (ab_stage) * 8, _phase_ab_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024;
-                            int _mma_b_lo_0 = (((smem_b_half0_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024;
+                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1360,7 +1292,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 270532624;\n\t"
+                    "mov.b32 id, 272629776;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1382,48 +1314,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_partials + (partial_stage_1 * 128))), "r"(0));
-                            elect_commit_cg2_multicast(partial_full_addr + (partial_stage_1) * 8, (uint16_t)(3));
-                            partial_stage_1 += 1;
-                            if (partial_stage_1 == 4) { partial_stage_1 = 0; _phase_partial_free ^= 1; }
-                            mbarrier_wait(partial_free_addr + (partial_stage_1) * 8, _phase_partial_free);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
-                            int _mma_a_lo_1 = (((smem_a_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024;
-                            int _mma_b_lo_1 = (((smem_b_half1_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024;
-                            asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 270532624;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_partials + (partial_stage_1 * 128))), "r"(0));
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_partials + (partial_stage_1 * 256))), "r"(0));
                             int release_ab = 1;
                             if (run_begin_1 == 0) {
                                 if (run_end_1 == tile_rows_1) {
@@ -1437,9 +1328,9 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                             }
                             elect_commit_cg2_multicast(partial_full_addr + (partial_stage_1) * 8, (uint16_t)(3));
                             ab_stage += 1;
-                            if (ab_stage == 7) { ab_stage = 0; _phase_ab_full ^= 1; }
+                            if (ab_stage == 6) { ab_stage = 0; _phase_ab_full ^= 1; }
                             partial_stage_1 += 1;
-                            if (partial_stage_1 == 4) { partial_stage_1 = 0; _phase_partial_free ^= 1; }
+                            if (partial_stage_1 == 2) { partial_stage_1 = 0; _phase_partial_free ^= 1; }
                         }
                         run_begin_1 = run_end_1;
                     }
@@ -1491,8 +1382,8 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                         if (group_2 != last_group_2) {
                             #pragma unroll 1
                             for (int probe_2 = run_begin_2 + 1; probe_2 < tile_rows_2; probe_2++) {
-                                int next_group_3 = m_indices[cluster_m_base_2 + probe_2];
-                                if (next_group_3 != group_2) {
+                                int next_group_2 = m_indices[cluster_m_base_2 + probe_2];
+                                if (next_group_2 != group_2) {
                                     run_end_2 = probe_2;
                                     break;
                                 }
@@ -1513,7 +1404,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                                 :: "r"((ab_full_addr + (ab_stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                             ab_stage_1 += 1;
-                            if (ab_stage_1 == 7) { ab_stage_1 = 0; _phase_ab_free ^= 1; }
+                            if (ab_stage_1 == 6) { ab_stage_1 = 0; _phase_ab_free ^= 1; }
                         }
                     }
                     run_begin_2 = run_end_2;
@@ -1527,10 +1418,10 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
             }
             if (elect_sync()) {
                 #pragma unroll
-                for (int _ab_drain = 0; _ab_drain < 7; _ab_drain++) {
+                for (int _ab_drain = 0; _ab_drain < 6; _ab_drain++) {
                     mbarrier_wait(ab_free_addr + (ab_stage_1) * 8, _phase_ab_free);
                     ab_stage_1 += 1;
-                    if (ab_stage_1 == 7) { ab_stage_1 = 0; _phase_ab_free ^= 1; }
+                    if (ab_stage_1 == 6) { ab_stage_1 = 0; _phase_ab_free ^= 1; }
                 }
                 mbarrier_arrive(producers_done_addr);
             }
@@ -1573,8 +1464,8 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                         if (group_3 != last_group_3) {
                             #pragma unroll 1
                             for (int probe_3 = run_begin_3 + 1; probe_3 < tile_rows_3; probe_3++) {
-                                int next_group_4 = m_indices[cluster_m_base_3 + probe_3];
-                                if (next_group_4 != group_3) {
+                                int next_group_3 = m_indices[cluster_m_base_3 + probe_3];
+                                if (next_group_3 != group_3) {
                                     run_end_3 = probe_3;
                                     break;
                                 }
@@ -1587,6 +1478,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                     group_3 = _shfl_5;
                     int k_blocks_3 = K / 128;
                     int scale_groups_1 = k_blocks_3 / 4;
+                    int n_blocks = N / 128;
                     #pragma unroll 1
                     for (int scale_group_1 = 0; scale_group_1 < scale_groups_1; scale_group_1++) {
                         mbarrier_wait(scale_free_addr + (scale_stage_1) * 8, _phase_scale_free);
@@ -1598,12 +1490,23 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                             asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
                                 :: "r"(smem_ascale_addr + (unsigned int)((stage_base + row_1 * 4) * 4)), "l"(a_scale + (g_row * k_blocks_3 + scale_group_1 * 4)), "r"((g_row < M) ? 16 : 0));
                         }
+                        #pragma unroll
+                        for (int n_half = 0; n_half < 2; n_half++) {
+                            asm volatile(
+                                "{\n\t"
+                                ".reg .pred p;\n\t"
+                                "setp.ne.b32 p, %0, 0;\n\t"
+                                "@p cp.async.ca.shared::cta.global [%1], [%2], 16;\n\t"
+                                "}"
+                                :: "r"((lane == 0) ? 1 : 0), "r"(smem_bscale_addr + (scale_stage_1 * 2 + (unsigned int)n_half) * 4 * 4), "l"(b_scale + ((group_3 * n_blocks + n_tile_3 * 2 + n_half) * k_blocks_3 + scale_group_1 * 4)));
+                        }
                         asm volatile(
                             "{\n\t"
                             "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
                             "}"
                             :: "r"(scale_full_addr + (scale_stage_1) * 8) : "memory");
-                        _phase_scale_free ^= 1;
+                        scale_stage_1 += 1;
+                        if (scale_stage_1 == 3) { scale_stage_1 = 0; _phase_scale_free ^= 1; }
                     }
                     run_begin_3 = run_end_3;
                 }
@@ -1615,9 +1518,10 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                 }
             }
             #pragma unroll
-            for (int _drain = 0; _drain < 1; _drain++) {
+            for (int _drain = 0; _drain < 3; _drain++) {
                 mbarrier_wait(scale_free_addr + (scale_stage_1) * 8, _phase_scale_free);
-                _phase_scale_free ^= 1;
+                scale_stage_1 += 1;
+                if (scale_stage_1 == 3) { scale_stage_1 = 0; _phase_scale_free ^= 1; }
             }
             if (elect_sync()) {
                 mbarrier_arrive(producers_done_addr);
@@ -1661,8 +1565,8 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                         if (group_b != last_group_4) {
                             #pragma unroll 1
                             for (int probe_4 = run_begin_4 + 1; probe_4 < tile_rows_4; probe_4++) {
-                                int next_group_5 = m_indices[cluster_m_base_4 + probe_4];
-                                if (next_group_5 != group_b) {
+                                int next_group_4 = m_indices[cluster_m_base_4 + probe_4];
+                                if (next_group_4 != group_b) {
                                     run_end_4 = probe_4;
                                     break;
                                 }
@@ -1680,7 +1584,7 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
                             mbarrier_wait(ab_free_addr + (ab_stage_b) * 8, _phase_ab_free_1);
                             tma_4d_gmem2smem_cta2(smem_b_addr + ab_stage_b * 16384, B, 0, n_tile_b * 256 + cta_rank * 128, iter_k_b, group_b, ((ab_full_addr + (ab_stage_b) * 8) & 0xFEFFFFFF));
                             ab_stage_b += 1;
-                            if (ab_stage_b == 7) { ab_stage_b = 0; _phase_ab_free_1 ^= 1; }
+                            if (ab_stage_b == 6) { ab_stage_b = 0; _phase_ab_free_1 ^= 1; }
                         }
                     }
                     run_begin_4 = run_end_4;
@@ -1694,10 +1598,10 @@ kernel_cake_grouped_fp8_gemm_6bf8b4f8ce900bd50808(CakeTensorMap const* A, CakeTe
             }
             if (elect_sync()) {
                 #pragma unroll
-                for (int _ab_drain_b = 0; _ab_drain_b < 7; _ab_drain_b++) {
+                for (int _ab_drain_b = 0; _ab_drain_b < 6; _ab_drain_b++) {
                     mbarrier_wait(ab_free_addr + (ab_stage_b) * 8, _phase_ab_free_1);
                     ab_stage_b += 1;
-                    if (ab_stage_b == 7) { ab_stage_b = 0; _phase_ab_free_1 ^= 1; }
+                    if (ab_stage_b == 6) { ab_stage_b = 0; _phase_ab_free_1 ^= 1; }
                 }
                 mbarrier_arrive(producers_done_addr);
             }

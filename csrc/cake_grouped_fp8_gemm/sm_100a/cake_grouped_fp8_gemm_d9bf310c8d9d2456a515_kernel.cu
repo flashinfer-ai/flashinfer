@@ -967,7 +967,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384) void
-kernel_cake_grouped_fp8_gemm_d7f8d5132ca62707fae1(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
+kernel_cake_grouped_fp8_gemm_d9bf310c8d9d2456a515(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1079,6 +1079,9 @@ kernel_cake_grouped_fp8_gemm_d7f8d5132ca62707fae1(CakeTensorMap const* A, CakeTe
         }
     }
 
+    // Phase-seed words at smem_raw[368..496): 32 lanes x 4 B, zeroed before the post-init sync
+    if (tid < 32) { reinterpret_cast<volatile int*>(smem_raw + 368)[tid] = 0; }
+
     __syncthreads();
 
     // ---- Ordered hardware-WG register redistribution ----
@@ -1090,6 +1093,9 @@ kernel_cake_grouped_fp8_gemm_d7f8d5132ca62707fae1(CakeTensorMap const* A, CakeTe
     // ---- Role: acc_epi ----
     if (warp <= 7) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 216;");
+        // PhaseInit.LANE_SEEDED: per-lane zero from smem_raw[368 + lane * 4]
+        unsigned int _phase_seed;
+        asm volatile("ld.shared.u32 %0, [%1];" : "=r"(_phase_seed) : "r"(smem + 368 + lane * 4) : "memory");
         { // acc_epi_main
             int max_nonempty_groups = G;
             if (max_nonempty_groups > M) {
@@ -1110,12 +1116,12 @@ kernel_cake_grouped_fp8_gemm_d7f8d5132ca62707fae1(CakeTensorMap const* A, CakeTe
             unsigned int ring_stage = 0;
             unsigned int s_stage = 0;
             unsigned int acc_stage = 0;
-            unsigned int acc_done_phase = 0;
+            unsigned int acc_done_phase = _phase_seed;
             unsigned int epi_publish_stage = 0;
             const int epi_wg = warp / 4;
             const int epi_warp = warp % 4;
-            unsigned int _phase_tile_full = 0;
-            unsigned int _phase_scale_full = 0;
+            unsigned int _phase_tile_full = _phase_seed;
+            unsigned int _phase_scale_full = _phase_seed;
             #pragma unroll 1
             for (int ring_iter = 0; ring_iter < max_segments + 1; ring_iter++) {
                 mbarrier_wait(tile_full_addr + (ring_stage) * 8, _phase_tile_full);
