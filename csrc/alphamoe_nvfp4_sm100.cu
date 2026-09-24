@@ -84,6 +84,15 @@ static cudaError_t AlphamoeNvfp4LaunchPdl(void (*kernel)(Params...), dim3 grid, 
   return cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
 }
 
+// ---- S2: deferred finalize with the caller's BF16 seed ----
+static bool DeferrableCompleteRoute(int64_t route_id) {
+  return route_id == 1 || route_id == 2 || route_id == 7 || route_id == 8 || route_id == 9;
+}
+
+static float* SeedWorkspacePtr(const tvm::ffi::Optional<TensorView>& initial_out) {
+  return initial_out.has_value() ? static_cast<float*>(initial_out.value().data_ptr()) : nullptr;
+}
+
 namespace nvfp4_first_w2_down_word {
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_nvfp4_first_w2_down_word
 #define LOOM_INF CUDART_INF_F
@@ -60808,6 +60817,270 @@ constexpr int kGeneratedSmemTotal = 0;
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma
 }  // namespace nvfp4_qualified_c331_finalize
 
+namespace nvfp4_qualified_c402_finalize_r1 {
+#define kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed_nvfp4_qualified_c402_finalize_r1
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 32
+
+#include <math_constants.h>
+
+extern "C" {
+
+__global__ __launch_bounds__(32) void
+kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed(float* __restrict__ route_accumulator, int* __restrict__ route_experts, float* __restrict__ output2_scale_scalar, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ initial_out, __nv_bfloat16* __restrict__ out, int M, int K, int top_k, float scaling_factor)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    int token = blockIdx.y;
+    int feature = blockIdx.x * 32 + tid;
+    int element = token * K + feature;
+    if (token < M && feature < K) {
+        float total = (float)initial_out[element];
+        #pragma unroll
+        for (int route_slot = 0; route_slot < 8; route_slot++) {
+            int pair = token * 8 + route_slot;
+            int expert = route_experts[pair];
+            if (expert >= 0) {
+                float complete_down = route_accumulator[pair * K + feature];
+                float scaled_down = complete_down * output2_scale_scalar[expert];
+                __nv_bfloat16 rounded_down = (__nv_bfloat16)scaled_down;
+                float rounded_float = (float)rounded_down;
+                if (scaling_factor == 1.0f) {
+                    float route_weight = topk_weights[pair];
+                    float _fma_0 = __fmaf_rn(rounded_float, route_weight, total);
+                    total = _fma_0;
+                } else {
+                    float weighted = rounded_float * topk_weights[pair] * scaling_factor;
+                    total = total + weighted;
+                }
+            }
+        }
+        out[element] = (__nv_bfloat16)total;
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kGeneratedThreads = 32;
+constexpr int kGeneratedSmemTotal = 0;
+#undef LOOM_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed
+}  // namespace nvfp4_qualified_c402_finalize_r1
+
+namespace nvfp4_qualified_c402_finalize_r2 {
+#define kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed_nvfp4_qualified_c402_finalize_r2
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+#include <math_constants.h>
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed(float* __restrict__ route_accumulator, int* __restrict__ route_experts, float* __restrict__ output2_scale_scalar, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ initial_out, __nv_bfloat16* __restrict__ out, int M, int K, int top_k, float scaling_factor)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    int element = blockIdx.x * 256 + tid;
+    if (element < M * K) {
+        int token = element / K;
+        int feature = element % K;
+        float total = (float)initial_out[element];
+        #pragma unroll
+        for (int route_slot = 0; route_slot < 8; route_slot++) {
+            int pair = token * top_k + route_slot;
+            int expert = route_experts[pair];
+            if (expert >= 0) {
+                float complete_down = route_accumulator[pair * K + feature];
+                float scaled_down = complete_down * output2_scale_scalar[expert];
+                __nv_bfloat16 rounded_down = (__nv_bfloat16)scaled_down;
+                float rounded_float = (float)rounded_down;
+                float weighted = rounded_float * topk_weights[pair] * scaling_factor;
+                total = total + weighted;
+            }
+        }
+        out[element] = (__nv_bfloat16)total;
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kGeneratedThreads = 256;
+constexpr int kGeneratedSmemTotal = 0;
+#undef LOOM_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed
+}  // namespace nvfp4_qualified_c402_finalize_r2
+
+namespace nvfp4_qualified_c402_finalize_r7 {
+#define kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed_nvfp4_qualified_c402_finalize_r7
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+#include <math_constants.h>
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed(float* __restrict__ route_accumulator, int* __restrict__ route_experts, float* __restrict__ output2_scale_scalar, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ initial_out, __nv_bfloat16* __restrict__ out, int M, int K, int top_k, float scaling_factor)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    int element = blockIdx.x * 256 + tid;
+    if (element < M * K) {
+        int token = element / K;
+        int feature = element % K;
+        float total = (float)initial_out[element];
+        #pragma unroll 1
+        for (int route_slot = 0; route_slot < top_k; route_slot++) {
+            int pair = token * top_k + route_slot;
+            int expert = route_experts[pair];
+            if (expert >= 0) {
+                float complete_down = route_accumulator[pair * K + feature];
+                float scaled_down = complete_down * output2_scale_scalar[expert];
+                __nv_bfloat16 rounded_down = (__nv_bfloat16)scaled_down;
+                float rounded_float = (float)rounded_down;
+                float weighted = rounded_float * topk_weights[pair] * scaling_factor;
+                total = total + weighted;
+            }
+        }
+        out[element] = (__nv_bfloat16)total;
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kGeneratedThreads = 256;
+constexpr int kGeneratedSmemTotal = 0;
+#undef LOOM_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed
+}  // namespace nvfp4_qualified_c402_finalize_r7
+
+namespace nvfp4_qualified_c402_finalize_r9 {
+#define kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed_nvfp4_qualified_c402_finalize_r9
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+#include <math_constants.h>
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed(__nv_bfloat16* __restrict__ route_accumulator, int* __restrict__ route_experts, float* __restrict__ output2_scale_scalar, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ initial_out, __nv_bfloat16* __restrict__ out, int M, int K, int top_k, float scaling_factor)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    int element = blockIdx.x * 256 + tid;
+    if (element < M * K) {
+        int token = element / K;
+        int feature = element % K;
+        float total = (float)initial_out[element];
+        #pragma unroll
+        for (int route_slot = 0; route_slot < 8; route_slot++) {
+            int pair = token * top_k + route_slot;
+            int expert = route_experts[pair];
+            if (expert >= 0) {
+                __nv_bfloat16 rounded_down = route_accumulator[pair * K + feature];
+                float rounded_float = (float)rounded_down;
+                float weighted = rounded_float * topk_weights[pair] * scaling_factor;
+                total = total + weighted;
+            }
+        }
+        out[element] = (__nv_bfloat16)total;
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kGeneratedThreads = 256;
+constexpr int kGeneratedSmemTotal = 0;
+#undef LOOM_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+#undef kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed
+}  // namespace nvfp4_qualified_c402_finalize_r9
+
 namespace nvfp4_qualified_c332_up {
 #define kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128 kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128_nvfp4_qualified_c332_up
 #define LOOM_INF CUDART_INF_F
@@ -70683,7 +70956,7 @@ inline CUtensorMap EncodeAdjacentW1DataTma(const TensorView& tensor) {
   return map;
 }
 
-void RunCompleteRouted(
+void RunCompleteRoutedImpl(
     TensorView hidden_states, TensorView hidden_states_scale, TensorView gemm1_weights,
     TensorView gemm1_weights_scale, TensorView gemm2_weights, TensorView gemm2_weights_scale,
     TensorView output1_scale_gate_scalar, TensorView output1_scale_scalar,
@@ -70697,7 +70970,8 @@ void RunCompleteRouted(
     tvm::ffi::Optional<TensorView> w1_scale_prepared, int64_t route_id,
     tvm::ffi::Optional<TensorView> w1_data_prepared,
     tvm::ffi::Optional<TensorView> w1_gate_up_data_prepared,
-    tvm::ffi::Optional<TensorView> w1_gate_up_scale_prepared) {
+    tvm::ffi::Optional<TensorView> w1_gate_up_scale_prepared,
+    bool defer_finalize) {
   TVM_FFI_ICHECK(hidden_states.device().device_type == kDLCUDA)
       << "hidden_states must be a CUDA tensor";
   ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
@@ -70708,6 +70982,8 @@ void RunCompleteRouted(
       topk_weights, out, top_k, block_m, routed_scaling_factor);
 
   TVM_FFI_ICHECK(route_id >= 1 && route_id <= 15) << "invalid complete route id";
+  const bool deferred = defer_finalize && DeferrableCompleteRoute(route_id);
+  TVM_FFI_ICHECK(!defer_finalize || deferred) << "deferred finalize requires a deferrable complete route";
   TVM_FFI_ICHECK(dims.n == 1024 && dims.k == 6144 && gemm1_weights.size(0) == 256 &&
                  dims.top_k == 8 && dims.block_m == 8)
       << "complete route requires its selected geometry";
@@ -70735,7 +71011,7 @@ void RunCompleteRouted(
   const int64_t capacity = expert_ids.numel();
   const int64_t blocks = dims.n / 256;
   const int64_t owner_capacity = (topk_ids.numel() + 31) / 32 + gemm1_weights.size(0);
-  if (route_id == 1 || route_id == 2 || route_id == 6 || route_id == 7 || route_id == 8 || route_id == 9) {
+  if (!deferred && (route_id == 1 || route_id == 2 || route_id == 6 || route_id == 7 || route_id == 8 || route_id == 9)) {
     TVM_FFI_ICHECK(initial_out.has_value()) << "complete route requires seed workspace";
     CheckTensor(initial_out.value(), dl_float32, 2, true, "initial_out", "float32");
     CheckSameDevice(initial_out.value(), device_id, "initial_out");
@@ -70804,14 +71080,14 @@ void RunCompleteRouted(
       static_cast<int*>(num_tokens_post_padded.data_ptr()),
       static_cast<int*>(cumsum_buffer.data_ptr()),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
+      SeedWorkspacePtr(initial_out),
       static_cast<float*>(route_accumulator.data_ptr()),
       static_cast<int*>(route_experts.data_ptr()),
       static_cast<int>(gemm1_weights.size(0) + 1),
       dims.block_m,
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()),
-      static_cast<long long>(out.numel()),
+      static_cast<long long>(deferred ? 0 : out.numel()),
       static_cast<long long>(route_accumulator.numel())), "complete alignment launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete alignment launch");
     if (packed_scales) {
@@ -70891,18 +71167,20 @@ void RunCompleteRouted(
       static_cast<float>(routed_scaling_factor));
   CheckCuda(cudaGetLastError(), "complete down launch");
     }
-  CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c331_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_nvfp4_qualified_c331_finalize, dim3((dims.k + 31) / 32, dims.m, 1), dim3(32, 1, 1), static_cast<size_t>(0), stream,
-      static_cast<float*>(route_accumulator.data_ptr()),
-      static_cast<int*>(route_experts.data_ptr()),
-      static_cast<float*>(output2_scale_scalar.data_ptr()),
-      static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
-      static_cast<__nv_bfloat16*>(out.data_ptr()),
-      dims.m,
-      dims.k,
-      dims.top_k,
-      static_cast<float>(routed_scaling_factor)), "complete finalize launch (pdl)");
-  CheckCuda(cudaGetLastError(), "complete finalize launch");
+  if (!deferred) {
+    CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c331_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_nvfp4_qualified_c331_finalize, dim3((dims.k + 31) / 32, dims.m, 1), dim3(32, 1, 1), static_cast<size_t>(0), stream,
+        static_cast<float*>(route_accumulator.data_ptr()),
+        static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()),
+        static_cast<float*>(topk_weights.data_ptr()),
+        SeedWorkspacePtr(initial_out),
+        static_cast<__nv_bfloat16*>(out.data_ptr()),
+        dims.m,
+        dims.k,
+        dims.top_k,
+        static_cast<float>(routed_scaling_factor)), "complete finalize launch (pdl)");
+    CheckCuda(cudaGetLastError(), "complete finalize launch");
+  }
     return;
   }
   if (route_id == 8) {
@@ -70945,18 +71223,20 @@ void RunCompleteRouted(
       dims.block_m,
       static_cast<float>(routed_scaling_factor));
   CheckCuda(cudaGetLastError(), "complete down launch");
-  nvfp4_qualified_c248_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_nvfp4_qualified_c248_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
-      static_cast<float*>(route_accumulator.data_ptr()),
-      static_cast<int*>(route_experts.data_ptr()),
-      static_cast<float*>(output2_scale_scalar.data_ptr()),
-      static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
-      static_cast<__nv_bfloat16*>(out.data_ptr()),
-      dims.m,
-      dims.k,
-      dims.top_k,
-      static_cast<float>(routed_scaling_factor));
-  CheckCuda(cudaGetLastError(), "complete finalize launch");
+  if (!deferred) {
+    nvfp4_qualified_c248_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_nvfp4_qualified_c248_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
+        static_cast<float*>(route_accumulator.data_ptr()),
+        static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()),
+        static_cast<float*>(topk_weights.data_ptr()),
+        SeedWorkspacePtr(initial_out),
+        static_cast<__nv_bfloat16*>(out.data_ptr()),
+        dims.m,
+        dims.k,
+        dims.top_k,
+        static_cast<float>(routed_scaling_factor));
+    CheckCuda(cudaGetLastError(), "complete finalize launch");
+  }
     return;
   }
   const CUtensorMap w1_scale_map = (route_id == 14 || route_id == 15)
@@ -70980,12 +71260,12 @@ void RunCompleteRouted(
       static_cast<int*>(owner_plan.value().data_ptr()),
       static_cast<int*>(owner_count.value().data_ptr()),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
+      SeedWorkspacePtr(initial_out),
       static_cast<int>(gemm1_weights.size(0) + 1),
       dims.block_m,
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()),
-      static_cast<long long>(out.numel()));
+      static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
       87040), "cudaFuncSetAttribute(complete up)");
@@ -71029,18 +71309,20 @@ void RunCompleteRouted(
       static_cast<float>(routed_scaling_factor),
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete down launch");
-  nvfp4_qualified_c346_finalize::kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_nvfp4_qualified_c346_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
-      static_cast<__nv_bfloat16*>(route_accumulator.data_ptr()),
-      static_cast<int*>(route_experts.data_ptr()),
-      static_cast<float*>(output2_scale_scalar.data_ptr()),
-      static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
-      static_cast<__nv_bfloat16*>(out.data_ptr()),
-      dims.m,
-      dims.k,
-      dims.top_k,
-      static_cast<float>(routed_scaling_factor));
-  CheckCuda(cudaGetLastError(), "complete finalize launch");
+  if (!deferred) {
+    nvfp4_qualified_c346_finalize::kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_nvfp4_qualified_c346_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
+        static_cast<__nv_bfloat16*>(route_accumulator.data_ptr()),
+        static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()),
+        static_cast<float*>(topk_weights.data_ptr()),
+        SeedWorkspacePtr(initial_out),
+        static_cast<__nv_bfloat16*>(out.data_ptr()),
+        dims.m,
+        dims.k,
+        dims.top_k,
+        static_cast<float>(routed_scaling_factor));
+    CheckCuda(cudaGetLastError(), "complete finalize launch");
+  }
     return;
   }
   if (route_id == 2) {
@@ -71056,12 +71338,12 @@ void RunCompleteRouted(
       static_cast<int*>(owner_plan.value().data_ptr()),
       static_cast<int*>(owner_count.value().data_ptr()),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
+      SeedWorkspacePtr(initial_out),
       static_cast<int>(gemm1_weights.size(0) + 1),
       dims.block_m,
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()),
-      static_cast<long long>(out.numel()));
+      static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
       87040), "cudaFuncSetAttribute(complete up)");
@@ -71105,18 +71387,20 @@ void RunCompleteRouted(
       static_cast<float>(routed_scaling_factor),
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete down launch");
-  nvfp4_qualified_c318_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_nvfp4_qualified_c318_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
-      static_cast<float*>(route_accumulator.data_ptr()),
-      static_cast<int*>(route_experts.data_ptr()),
-      static_cast<float*>(output2_scale_scalar.data_ptr()),
-      static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
-      static_cast<__nv_bfloat16*>(out.data_ptr()),
-      dims.m,
-      dims.k,
-      dims.top_k,
-      static_cast<float>(routed_scaling_factor));
-  CheckCuda(cudaGetLastError(), "complete finalize launch");
+  if (!deferred) {
+    nvfp4_qualified_c318_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_nvfp4_qualified_c318_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
+        static_cast<float*>(route_accumulator.data_ptr()),
+        static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()),
+        static_cast<float*>(topk_weights.data_ptr()),
+        SeedWorkspacePtr(initial_out),
+        static_cast<__nv_bfloat16*>(out.data_ptr()),
+        dims.m,
+        dims.k,
+        dims.top_k,
+        static_cast<float>(routed_scaling_factor));
+    CheckCuda(cudaGetLastError(), "complete finalize launch");
+  }
     return;
   }
   if (route_id == 10) {
@@ -71828,12 +72112,12 @@ void RunCompleteRouted(
       static_cast<int*>(owner_plan.value().data_ptr()),
       static_cast<int*>(owner_count.value().data_ptr()),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
+      SeedWorkspacePtr(initial_out),
       static_cast<int>(gemm1_weights.size(0) + 1),
       dims.block_m,
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()),
-      static_cast<long long>(out.numel()));
+      static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c284_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c284_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
       87552), "cudaFuncSetAttribute(complete up)");
@@ -71885,7 +72169,7 @@ void RunCompleteRouted(
       static_cast<int*>(route_experts.data_ptr()),
       static_cast<float*>(output2_scale_scalar.data_ptr()),
       static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
+      SeedWorkspacePtr(initial_out),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
       dims.m,
       dims.k,
@@ -71906,12 +72190,12 @@ void RunCompleteRouted(
       static_cast<int*>(owner_plan.value().data_ptr()),
       static_cast<int*>(owner_count.value().data_ptr()),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
+      SeedWorkspacePtr(initial_out),
       static_cast<int>(gemm1_weights.size(0) + 1),
       dims.block_m,
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()),
-      static_cast<long long>(out.numel()));
+      static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
       87040), "cudaFuncSetAttribute(complete up)");
@@ -71955,24 +72239,135 @@ void RunCompleteRouted(
       static_cast<float>(routed_scaling_factor),
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete down launch");
-  nvfp4_qualified_c248_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_nvfp4_qualified_c248_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
-      static_cast<float*>(route_accumulator.data_ptr()),
-      static_cast<int*>(route_experts.data_ptr()),
-      static_cast<float*>(output2_scale_scalar.data_ptr()),
-      static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(initial_out.value().data_ptr()),
-      static_cast<__nv_bfloat16*>(out.data_ptr()),
-      dims.m,
-      dims.k,
-      dims.top_k,
-      static_cast<float>(routed_scaling_factor));
-  CheckCuda(cudaGetLastError(), "complete finalize launch");
+  if (!deferred) {
+    nvfp4_qualified_c248_finalize::kernel_alpha_moe_nvfp4_finalize_route_bf16_nvfp4_qualified_c248_finalize<<<dim3((out.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 0, stream>>>(
+        static_cast<float*>(route_accumulator.data_ptr()),
+        static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()),
+        static_cast<float*>(topk_weights.data_ptr()),
+        SeedWorkspacePtr(initial_out),
+        static_cast<__nv_bfloat16*>(out.data_ptr()),
+        dims.m,
+        dims.k,
+        dims.top_k,
+        static_cast<float>(routed_scaling_factor));
+    CheckCuda(cudaGetLastError(), "complete finalize launch");
+  }
     return;
   }
 }
+void RunCompleteRouted(
+    TensorView hidden_states, TensorView hidden_states_scale, TensorView gemm1_weights,
+    TensorView gemm1_weights_scale, TensorView gemm2_weights, TensorView gemm2_weights_scale,
+    TensorView output1_scale_gate_scalar, TensorView output1_scale_scalar,
+    TensorView output2_scale_scalar, TensorView sorted_token_ids, TensorView expert_ids,
+    TensorView num_tokens_post_padded, TensorView topk_weights, TensorView out, TensorView topk_ids, TensorView cumsum_buffer,
+    TensorView route_accumulator, TensorView route_experts,
+    tvm::ffi::Optional<TensorView> owner_plan, tvm::ffi::Optional<TensorView> owner_count,
+    tvm::ffi::Optional<TensorView> initial_out, tvm::ffi::Optional<TensorView> partial_workspace,
+    tvm::ffi::Optional<TensorView> act_workspace, tvm::ffi::Optional<TensorView> sf_workspace,
+    int64_t top_k, int64_t block_m, double routed_scaling_factor,
+    tvm::ffi::Optional<TensorView> w1_scale_prepared, int64_t route_id,
+    tvm::ffi::Optional<TensorView> w1_data_prepared,
+    tvm::ffi::Optional<TensorView> w1_gate_up_data_prepared,
+    tvm::ffi::Optional<TensorView> w1_gate_up_scale_prepared) {
+  RunCompleteRoutedImpl(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar, output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer, route_accumulator, route_experts, owner_plan, owner_count, initial_out, partial_workspace, act_workspace, sf_workspace, top_k, block_m, routed_scaling_factor, w1_scale_prepared, route_id, w1_data_prepared, w1_gate_up_data_prepared, w1_gate_up_scale_prepared, false);
+}
+
+void RunCompleteRoutedDeferred(
+    TensorView hidden_states, TensorView hidden_states_scale, TensorView gemm1_weights,
+    TensorView gemm1_weights_scale, TensorView gemm2_weights, TensorView gemm2_weights_scale,
+    TensorView output1_scale_gate_scalar, TensorView output1_scale_scalar,
+    TensorView output2_scale_scalar, TensorView sorted_token_ids, TensorView expert_ids,
+    TensorView num_tokens_post_padded, TensorView topk_weights, TensorView out, TensorView topk_ids, TensorView cumsum_buffer,
+    TensorView route_accumulator, TensorView route_experts,
+    tvm::ffi::Optional<TensorView> owner_plan, tvm::ffi::Optional<TensorView> owner_count,
+    tvm::ffi::Optional<TensorView> initial_out, tvm::ffi::Optional<TensorView> partial_workspace,
+    tvm::ffi::Optional<TensorView> act_workspace, tvm::ffi::Optional<TensorView> sf_workspace,
+    int64_t top_k, int64_t block_m, double routed_scaling_factor,
+    tvm::ffi::Optional<TensorView> w1_scale_prepared, int64_t route_id,
+    tvm::ffi::Optional<TensorView> w1_data_prepared,
+    tvm::ffi::Optional<TensorView> w1_gate_up_data_prepared,
+    tvm::ffi::Optional<TensorView> w1_gate_up_scale_prepared) {
+  RunCompleteRoutedImpl(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar, output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer, route_accumulator, route_experts, owner_plan, owner_count, initial_out, partial_workspace, act_workspace, sf_workspace, top_k, block_m, routed_scaling_factor, w1_scale_prepared, route_id, w1_data_prepared, w1_gate_up_data_prepared, w1_gate_up_scale_prepared, true);
+}
+
+void RunCompleteRoutedFinalize(TensorView route_accumulator, TensorView route_experts,
+                               TensorView output2_scale_scalar, TensorView topk_weights,
+                               TensorView seed, TensorView out, int64_t top_k,
+                               double routed_scaling_factor, int64_t route_id) {
+  TVM_FFI_ICHECK(out.device().device_type == kDLCUDA) << "out must be a CUDA tensor";
+  ffi::CUDADeviceGuard device_guard(out.device().device_id);
+  const int device_id = out.device().device_id;
+  TVM_FFI_ICHECK(DeferrableCompleteRoute(route_id)) << "deferred finalize requires a deferrable complete route";
+  CheckTensor(out, dl_bfloat16, 2, true, "out", "bfloat16");
+  CheckTensor(seed, dl_bfloat16, 2, true, "seed", "bfloat16");
+  CheckSameDevice(seed, device_id, "seed");
+  const int64_t m = out.size(0);
+  const int64_t k = out.size(1);
+  TVM_FFI_ICHECK(top_k == 8 && k == 6144 && m >= 1) << "deferred finalize requires the complete route geometry";
+  TVM_FFI_ICHECK((route_id == 1 && m == 1) || ((route_id == 2 || route_id == 9) && m == 8) ||
+                 (route_id == 8 && m >= 2 && m < 8) || (route_id == 7 && m >= 8 && m < 128))
+      << "deferred finalize route id does not match token count";
+  CheckShape2(seed, m, k, "seed");
+  if (seed.data_ptr() != out.data_ptr()) {
+    CheckNoOverlap(out, seed, "seed");
+  }
+  const bool bf16_routes = route_id == 9;
+  CheckTensor(route_accumulator, bf16_routes ? dl_bfloat16 : dl_float32, 2, true, "route_accumulator",
+              bf16_routes ? "bfloat16" : "float32");
+  CheckSameDevice(route_accumulator, device_id, "route_accumulator");
+  CheckShape2(route_accumulator, m * top_k, k, "route_accumulator");
+  CheckNoOverlap(out, route_accumulator, "route_accumulator");
+  CheckTensor(route_experts, dl_int32, 1, true, "route_experts", "int32");
+  CheckSameDevice(route_experts, device_id, "route_experts");
+  CheckShape1(route_experts, m * top_k, "route_experts");
+  CheckTensor(topk_weights, dl_float32, 2, true, "topk_weights", "float32");
+  CheckSameDevice(topk_weights, device_id, "topk_weights");
+  CheckShape2(topk_weights, m, top_k, "topk_weights");
+  CheckTensor(output2_scale_scalar, dl_float32, 1, true, "output2_scale_scalar", "float32");
+  CheckSameDevice(output2_scale_scalar, device_id, "output2_scale_scalar");
+  TVM_FFI_ICHECK(output2_scale_scalar.numel() >= 256) << "output2_scale_scalar must cover every expert";
+  const cudaStream_t stream = get_stream(out.device());
+  const int m_i = static_cast<int>(m);
+  const int k_i = static_cast<int>(k);
+  const int top_k_i = static_cast<int>(top_k);
+  const float scaling = static_cast<float>(routed_scaling_factor);
+  if (route_id == 1) {
+    CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c402_finalize_r1::kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed_nvfp4_qualified_c402_finalize_r1, dim3((k_i + 31) / 32, m_i, 1), dim3(32, 1, 1), static_cast<size_t>(0), stream,
+        static_cast<float*>(route_accumulator.data_ptr()), static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()), static_cast<float*>(topk_weights.data_ptr()),
+        static_cast<__nv_bfloat16*>(seed.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
+        m_i, k_i, top_k_i, scaling), "deferred finalize launch (route 1, pdl)");
+  } else if (route_id == 2) {
+    CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c402_finalize_r2::kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed_nvfp4_qualified_c402_finalize_r2, dim3((m_i * k_i + 255) / 256, 1, 1), dim3(256, 1, 1), static_cast<size_t>(0), stream,
+        static_cast<float*>(route_accumulator.data_ptr()), static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()), static_cast<float*>(topk_weights.data_ptr()),
+        static_cast<__nv_bfloat16*>(seed.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
+        m_i, k_i, top_k_i, scaling), "deferred finalize launch (route 2, pdl)");
+  } else if (route_id == 9) {
+    CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c402_finalize_r9::kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed_nvfp4_qualified_c402_finalize_r9, dim3((m_i * k_i + 255) / 256, 1, 1), dim3(256, 1, 1), static_cast<size_t>(0), stream,
+        static_cast<__nv_bfloat16*>(route_accumulator.data_ptr()), static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()), static_cast<float*>(topk_weights.data_ptr()),
+        static_cast<__nv_bfloat16*>(seed.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
+        m_i, k_i, top_k_i, scaling), "deferred finalize launch (route 9, pdl)");
+  } else {
+    CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c402_finalize_r7::kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed_nvfp4_qualified_c402_finalize_r7, dim3((m_i * k_i + 255) / 256, 1, 1), dim3(256, 1, 1), static_cast<size_t>(0), stream,
+        static_cast<float*>(route_accumulator.data_ptr()), static_cast<int*>(route_experts.data_ptr()),
+        static_cast<float*>(output2_scale_scalar.data_ptr()), static_cast<float*>(topk_weights.data_ptr()),
+        static_cast<__nv_bfloat16*>(seed.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
+        m_i, k_i, top_k_i, scaling), "deferred finalize launch (routes 7/8, pdl)");
+  }
+  CheckCuda(cudaGetLastError(), "deferred finalize launch");
+}
+
 }  // namespace alphamoe_nvfp4_sm100
 }  // namespace flashinfer
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_complete_small_alignment_op,
     flashinfer::alphamoe_nvfp4_sm100::RunCompleteSmallAlignment);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_complete_routed_moe_op,
     flashinfer::alphamoe_nvfp4_sm100::RunCompleteRouted);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_complete_routed_deferred_moe_op,
+                              flashinfer::alphamoe_nvfp4_sm100::RunCompleteRoutedDeferred);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_complete_routed_finalize_op,
+                              flashinfer::alphamoe_nvfp4_sm100::RunCompleteRoutedFinalize);

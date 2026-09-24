@@ -1514,3 +1514,331 @@ def restore_nvfp4_w1_gate_up_scales(prepared, original_weight_shape):
         .contiguous()
         .view(-1, 16, 128)
     )
+
+
+# Deferred finalize: the routed decode chain runs without the caller's seed and
+# the caller finalizes later with a BF16 seed (for example a shared-expert output).
+__all__ += [
+    "AlphaMoeNvfp4DeferredOutput",
+    "alphamoe_nvfp4_routed_moe_deferred",
+    "alphamoe_nvfp4_finalize_deferred",
+]
+
+_DEFERRABLE_COMPLETE_ROUTES = (1, 2, 7, 8, 9)
+
+
+class AlphaMoeNvfp4DeferredOutput:
+    """Routed expert contributions awaiting :func:`alphamoe_nvfp4_finalize_deferred`.
+
+    For the deferrable complete routes the per-route accumulators, route experts
+    and top-k weights are held until the caller supplies its BF16 seed. For every
+    other route the weighted expert sum has already been written into ``out``
+    from a zero seed and the finalize step adds it to the caller's seed.
+    """
+
+    __slots__ = (
+        "route_id",
+        "route_accumulator",
+        "route_experts",
+        "topk_weights",
+        "output2_scale_scalar",
+        "routed_scaling_factor",
+        "top_k",
+        "out",
+    )
+
+    def __init__(
+        self,
+        route_id: int,
+        route_accumulator: Optional[torch.Tensor],
+        route_experts: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        routed_scaling_factor: float,
+        top_k: int,
+        out: Optional[torch.Tensor],
+    ) -> None:
+        self.route_id = int(route_id)
+        self.route_accumulator = route_accumulator
+        self.route_experts = route_experts
+        self.topk_weights = topk_weights
+        self.output2_scale_scalar = output2_scale_scalar
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        self.top_k = int(top_k)
+        self.out = out
+
+    @property
+    def deferred(self) -> bool:
+        return self.out is None
+
+
+def alphamoe_nvfp4_routed_moe_deferred(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    topk_ids: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    top_k: int,
+    block_m: int = 8,
+    routed_scaling_factor: float = 1.0,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+    w1_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
+) -> AlphaMoeNvfp4DeferredOutput:
+    """Run alignment and the expert GEMMs now; finalize later with a BF16 seed.
+
+    Same inputs and route selection as :func:`alphamoe_nvfp4_routed_moe`. ``out``
+    is the caller's BF16 ``[M, K]`` output workspace: its contents are ignored.
+    For the deferrable complete routes (decode shapes M=1, 2..7, 8 and 9..127)
+    nothing is written to ``out`` here; the seed conversion and the finalize
+    launch are skipped and the private route accumulators are returned. For
+    every other route ``out`` is zero-filled and receives the finished weighted
+    expert sum exactly as the existing routed entry produces it from a zero seed.
+    Call :func:`alphamoe_nvfp4_finalize_deferred` with the caller's BF16 seed to
+    obtain ``seed + routed contributions`` in either case. All launches use the
+    current stream, including during CUDA graph capture.
+    """
+    _check_alphamoe_nvfp4_supported(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w2_scale_prepared,
+    )
+    _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
+    _check_prepared_w1_gate_up(
+        gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
+    )
+    route_id = _alphamoe_complete_route_id(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights_scale,
+        topk_ids,
+        out,
+        top_k,
+        block_m,
+        w1_scale_prepared,
+        w1_data_prepared,
+        w1_gate_up_data_prepared,
+        w1_gate_up_scale_prepared,
+    )
+    topk_weights = topk_weights.contiguous()
+    if route_id not in _DEFERRABLE_COMPLETE_ROUTES:
+        out.zero_()
+        alphamoe_nvfp4_routed_moe(
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            output1_scale_gate_scalar,
+            output1_scale_scalar,
+            output2_scale_scalar,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            out,
+            topk_ids,
+            cumsum_buffer,
+            top_k,
+            block_m,
+            routed_scaling_factor,
+            w1_scale_prepared,
+            w2_scale_prepared,
+            w1_data_prepared,
+            w1_gate_up_data_prepared,
+            w1_gate_up_scale_prepared,
+        )
+        return AlphaMoeNvfp4DeferredOutput(
+            route_id, None, None, topk_weights, output2_scale_scalar,
+            routed_scaling_factor, top_k, out,
+        )
+    m, k = out.shape
+    e, n, _ = gemm1_weights.shape
+    capacity = expert_ids.numel()
+    blocks = n // 256
+    module = get_alphamoe_nvfp4_sm100_module()
+    owner_plan = owner_count = None
+    partial_workspace = act_workspace = sf_workspace = None
+    if route_id == 1:
+        route_accumulator = torch.empty(
+            (m * top_k, k), dtype=torch.float32, device=out.device
+        )
+        route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
+        partial_workspace = torch.empty(
+            (capacity * blocks, 8192), dtype=torch.float32, device=hidden_states.device
+        )
+    elif route_id == 8:
+        module.nvfp4_complete_small_alignment_op(
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            output1_scale_gate_scalar,
+            output1_scale_scalar,
+            output2_scale_scalar,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            out,
+            topk_ids,
+            cumsum_buffer,
+            top_k,
+            block_m,
+            routed_scaling_factor,
+        )
+        route_accumulator = torch.zeros(
+            (m * top_k, k), dtype=torch.float32, device=out.device
+        )
+        route_experts = torch.full(
+            (m * top_k,), -1, dtype=torch.int32, device=out.device
+        )
+        act_workspace = torch.empty(
+            (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
+        )
+        sf_workspace = torch.empty(
+            (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+        )
+    else:
+        owner_capacity = (topk_ids.numel() + 31) // 32 + e
+        owner_plan = torch.empty(
+            (owner_capacity, 3), dtype=torch.int32, device=hidden_states.device
+        )
+        owner_count = torch.empty((1,), dtype=torch.int32, device=hidden_states.device)
+        act_workspace = torch.empty(
+            (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
+        )
+        sf_workspace = torch.empty(
+            (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+        )
+        route_dtype = torch.bfloat16 if route_id == 9 else torch.float32
+        allocate_routes = torch.zeros if route_id == 7 else torch.empty
+        route_accumulator = allocate_routes(
+            (m * top_k, k), dtype=route_dtype, device=out.device
+        )
+        if route_id in (2, 9):
+            route_experts = torch.empty(
+                (m * top_k,), dtype=torch.int32, device=out.device
+            )
+        else:
+            route_experts = torch.full(
+                (m * top_k,), -1, dtype=torch.int32, device=out.device
+            )
+    module.nvfp4_complete_routed_deferred_moe_op(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        topk_ids,
+        cumsum_buffer,
+        route_accumulator,
+        route_experts,
+        owner_plan,
+        owner_count,
+        None,
+        partial_workspace,
+        act_workspace,
+        sf_workspace,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        route_id,
+        w1_data_prepared,
+        w1_gate_up_data_prepared,
+        w1_gate_up_scale_prepared,
+    )
+    return AlphaMoeNvfp4DeferredOutput(
+        route_id, route_accumulator, route_experts, topk_weights,
+        output2_scale_scalar, routed_scaling_factor, top_k, None,
+    )
+
+
+def alphamoe_nvfp4_finalize_deferred(
+    deferred: AlphaMoeNvfp4DeferredOutput,
+    seed: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Write ``seed + routed contributions`` for a deferred routed-MoE call.
+
+    ``seed`` is the caller's contiguous BF16 ``[M, K]`` tensor (for example the
+    shared-expert output). ``out`` defaults to ``seed`` (in place); a distinct
+    ``out`` must not overlap ``seed``. For deferrable routes this launches the
+    route's finalize kernel with the BF16 seed under programmatic dependent
+    launch; the arithmetic equals the existing routed entry given the same
+    seed. For other routes the finished expert sum is added into ``out``.
+    Returns ``out``.
+    """
+    _require_cuda_tensor("seed", seed, dtype=torch.bfloat16, ndim=2)
+    if out is None:
+        out = seed
+    else:
+        _require_cuda_tensor("out", out, dtype=torch.bfloat16, ndim=2)
+        if out.shape != seed.shape or out.device != seed.device:
+            raise ValueError("out must match the seed shape and device")
+    if not (seed.is_contiguous() and out.is_contiguous()):
+        raise ValueError("seed and out must be contiguous")
+    if not deferred.deferred:
+        if deferred.out.shape != seed.shape:
+            raise ValueError("deferred output does not match the seed shape")
+        if out.data_ptr() == seed.data_ptr():
+            out.add_(deferred.out)
+        else:
+            torch.add(seed, deferred.out, out=out)
+        return out
+    get_alphamoe_nvfp4_sm100_module().nvfp4_complete_routed_finalize_op(
+        deferred.route_accumulator,
+        deferred.route_experts,
+        deferred.output2_scale_scalar,
+        deferred.topk_weights,
+        seed,
+        out,
+        deferred.top_k,
+        deferred.routed_scaling_factor,
+        deferred.route_id,
+    )
+    return out
