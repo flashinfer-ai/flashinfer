@@ -25,6 +25,10 @@ from ..jit.minimax_h3_fc1_swiglu import (
     minimax_h3_fc1_swiglu_target,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
+from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
+    _minimax_h3_fc1_swiglu_nvfp4_sm120,
+    prepare_minimax_h3_fc1_weight_nvfp4_sm120,
+)
 
 # MiniMax-H3 video DiT block dimensions served by the generated kernels.
 MINIMAX_H3_HIDDEN = 5376
@@ -78,6 +82,16 @@ def _get_module(target: MiniMaxH3Fc1SwigluTarget):
 
 def _module_for(device: torch.device):
     return _get_module(minimax_h3_fc1_swiglu_target(get_compute_capability(device)))
+
+
+def _is_sm120(tensor) -> bool:
+    """True when ``tensor`` lives on a compute capability 12.x device (RTX 5090 / RTX PRO 6000
+    Blackwell), which is served by the ``mma.sync`` SM120 route instead of the tcgen05 route."""
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.is_cuda
+        and get_compute_capability(tensor.device)[0] == 12
+    )
 
 
 def _m_tiles(rows: int) -> int:
@@ -373,10 +387,19 @@ def prepare_minimax_h3_fc1_weight_nvfp4(
     tile (see :func:`_combined_weight_scale_tiles`).  Relies on
     ``nvfp4_quantize(..., sfLayout=SfLayout.layout_128x4, do_shuffle=False)`` returning the scales
     in the 128x4 swizzled layout with rows padded to 128 and columns to a multiple of 4.
+
+    The prepared layout is **device-architecture specific**: on a compute capability 12.x device
+    (RTX 5090 / RTX PRO 6000 Blackwell) this returns the SM120 layout of
+    :func:`~flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu.prepare_minimax_h3_fc1_weight_nvfp4_sm120`
+    (row-permuted weights, ``28672 * 336`` swizzled scale bytes) instead.  Prepare the weight on the
+    device that will run :func:`minimax_h3_fc1_swiglu_nvfp4`; the outputs are not interchangeable
+    between the two routes.
     """
     from ..quantization.fp4_quantization import nvfp4_quantize
     from ..tllm_enums import SfLayout
 
+    if _is_sm120(fc1_weight):
+        return prepare_minimax_h3_fc1_weight_nvfp4_sm120(fc1_weight, w_global_scale)
     if (
         tuple(fc1_weight.shape) != (MINIMAX_H3_FC1_ROWS, MINIMAX_H3_HIDDEN)
         or fc1_weight.dtype != torch.bfloat16
@@ -756,6 +779,16 @@ def minimax_h3_fc1_swiglu_nvfp4(
     r"""NVFP4 (W4A4, E2M1 + UE4M3 per-16 block scales + FP32 global scales) variant of
     :func:`minimax_h3_fc1_swiglu`.
 
+    Dispatches on the compute capability of ``x``: 10.0 / 10.3 (B200 / B300) run the tcgen05 route
+    described below; 12.x (RTX 5090 / RTX PRO 6000 Blackwell) runs the ``mma.sync`` SM120 route
+    (:func:`~flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu._minimax_h3_fc1_swiglu_nvfp4_sm120`,
+    same signature and rounding points).  The prepared weight layout differs between the routes,
+    so ``fc1_weight_q`` / ``fc1_scale_tiles`` must come from :func:`prepare_minimax_h3_fc1_weight_nvfp4`
+    run on the same device architecture.  On SM120 ``workspace_sf`` receives dense row-major
+    ``[M, 336]`` scales in its first ``M * 336`` bytes (a buffer sized by
+    :func:`nvfp4_activation_scale_workspace_bytes` is always large enough) and ``eps`` may be any
+    positive value.
+
     The norm kernel computes the BF16 modulated activation ``a`` and quantizes it with FlashInfer's
     :func:`~flashinfer.nvfp4_quantize` recipe (``cvt_warp_fp16_to_fp4``): per 16 consecutive K
     elements ``sf = E4M3_RN(g * absmax * rcp(6))`` saturating at 448 with ``g = a_global_scale``,
@@ -796,6 +829,22 @@ def minimax_h3_fc1_swiglu_nvfp4(
     torch.Tensor
         ``bfloat16`` ``[M, 14336]``.
     """
+    if _is_sm120(x):
+        return _minimax_h3_fc1_swiglu_nvfp4_sm120(
+            x,
+            x_norm_weight,
+            adaln_scale,
+            adaln_shift,
+            adaln_index,
+            a_global_scale,
+            fc1_weight_q,
+            fc1_scale_tiles,
+            alpha,
+            out=out,
+            workspace_q=workspace_q,
+            workspace_sf=workspace_sf,
+            eps=eps,
+        )
     rows, device = _check_norm_inputs(
         x, x_norm_weight, adaln_scale, adaln_shift, adaln_index, eps
     )
