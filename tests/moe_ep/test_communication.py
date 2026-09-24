@@ -140,6 +140,12 @@ class TestRegistry:
         assert not is_communication_backend("nixl_ep")
         assert not is_communication_backend(object())
 
+    def test_cuda_graph_capability(self) -> None:
+        assert NVLinkOneSidedCommunication.supports_cuda_graph
+        assert NVLinkTwoSidedCommunication.supports_cuda_graph
+        # Each NCCL-EP dispatch creates a handle on the host.
+        assert not NcclEpCommunication.supports_cuda_graph
+
     def test_create_by_name_and_by_config(self, loopback_backend) -> None:
         bootstrap = BootstrapConfig(world_size=1, rank=0)
         comm = create_communication(bootstrap, _params(), "test_loopback", tag=7)

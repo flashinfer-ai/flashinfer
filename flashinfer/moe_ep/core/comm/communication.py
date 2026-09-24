@@ -108,6 +108,9 @@ class MoEEpCommunication(ABC):
     """
 
     backend_name: ClassVar[str]
+    # Whether a dispatch/combine pair may be recorded into a CUDA graph (after
+    # an eager warmup with the same shapes).
+    supports_cuda_graph: ClassVar[bool] = True
 
     def __init__(
         self,

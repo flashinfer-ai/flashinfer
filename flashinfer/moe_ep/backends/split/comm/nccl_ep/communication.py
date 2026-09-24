@@ -47,8 +47,12 @@ class NcclEpCommunication(MoEEpCommunication):
     The fleet is created on the first :meth:`dispatch` (a collective over the
     EP group); ``fleet_knobs`` configure it (fault tolerance, allocator, ...).
     ``topk_weights`` are required. Received ids of picks owned by other ranks
-    are reported as ``invalid_expert_id``.
+    are reported as ``invalid_expert_id``. Each dispatch creates its own
+    handle, a host-side allocation, so dispatch cannot be captured into a CUDA
+    graph; capture through ``Fleet``/``Handle`` persistent handles instead.
     """
+
+    supports_cuda_graph = False
 
     def __init__(
         self,
