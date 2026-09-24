@@ -1436,6 +1436,34 @@ def test_auto_backend_replan_outside_the_envelope_returns_to_fa2(monkeypatch):
     assert wrapper.resolved_backend == "cudnn"
     torch.testing.assert_close(wrapper.run(args[0], args[1]), out_first)
 
+    # Auto initially allocates only the first batch's KV-length storage.
+    # Growing must rebind its view, and shrinking must trim the retained buffer.
+    for batch_size in (16, 8):
+        q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+            batch_size, 2048, 16, 8, 64, 128, torch.bfloat16, "HND", "cuda:0"
+        )
+        wrapper.plan(
+            indptr, indices, last_page_len, 64, 8, 128, 16, q_data_type=q.dtype
+        )
+        assert wrapper.resolved_backend == "cudnn"
+        actual, lse = wrapper.run(q, kv_cache, return_lse=True)
+        ref, ref_lse = _run_wrapper(
+            "fa2",
+            q,
+            kv_cache,
+            indptr,
+            indices,
+            last_page_len,
+            16,
+            8,
+            64,
+            128,
+            q.dtype,
+            "HND",
+        )
+        torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
 
 @requires_cudnn_graph
 @pytest.mark.parametrize(
@@ -1541,6 +1569,7 @@ def test_auto_cudnn_fast_plan_capture_reuses_prepared(
     assert wrapper.resolved_backend == "cudnn"
     out, lse = wrapper.run(q, cache, return_lse=True)
     prepared = wrapper._cudnn_prepared
+    lengths_view = wrapper._cudnn_kv_lens_view
     assert prepared is not None
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1561,6 +1590,7 @@ def test_auto_cudnn_fast_plan_capture_reuses_prepared(
         **kwargs,
     )
     assert wrapper.resolved_backend == "cudnn"
+    assert wrapper._cudnn_kv_lens_view is lengths_view
     wrapper.run(q, cache, out=out, lse=lse, return_lse=True)
     assert wrapper._cudnn_prepared is prepared
     if caller_block_table:

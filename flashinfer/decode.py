@@ -2378,6 +2378,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._kv_lens_buffer = torch.empty(
                 (batch_size,), dtype=torch.int32, device=self.device
             )
+            self._cudnn_kv_lens_view = None
+        # Reuse the descriptor view while updating its backing storage. A
+        # compatible replan does not need another slice/view allocation.
+        if (
+            self._cudnn_kv_lens_view is None
+            or self._cudnn_kv_lens_view.shape[0] != batch_size
+        ):
+            self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
+                batch_size, 1, 1, 1
+            )
         self._kv_lens_buffer[:batch_size].copy_(
             kv_lens_arr_host.to(torch.int32), non_blocking=non_blocking
         )
@@ -2402,9 +2412,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"max kv_len={max_kv_len}, page_size={page_size})."
                 )
             self._max_kv_len = self._block_tables.shape[1] * page_size
-            self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
-                batch_size, 1, 1, 1
-            )
             return
 
         # cuDNN bakes max_seq_len_kv and the block-table width into the built graph,
@@ -2441,9 +2448,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         table.copy_(host_table, non_blocking=non_blocking)
         self._block_tables = table
         self._max_kv_len = max_kv_len
-        self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
-            batch_size, 1, 1, 1
-        )
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
