@@ -472,3 +472,34 @@ def test_affine_fp32_rows_in_place_match_the_window_merge_bitwise(monkeypatch, l
     assert "rows_in_place" in str(in_place.schedule)
     _assert_same(_snapshot(d), want)
     assert torch.isfinite(d["state_checkpoints"]).all()
+
+
+def test_plan_cache_accounting_never_queries_the_allocator(monkeypatch):
+    # ``torch.cuda.memory_allocated`` flattens the allocator's stats tree in
+    # Python; with hundreds of captured CUDA graphs in a serving process that
+    # took ~150 ms per call, i.e. two GPU-idle stalls per prefill step.  The
+    # retained-bytes accounting must come from the launch's own tensors.
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("plan cache accounting queried the CUDA allocator")
+
+    monkeypatch.setattr(torch.cuda, "memory_allocated", _forbidden)
+    monkeypatch.setattr(torch.cuda, "memory_stats", _forbidden)
+    monkeypatch.setattr(torch.cuda, "memory_stats_as_nested_dict", _forbidden)
+    cache = KDAPrefillPlanCache(8)
+    for lengths, seed in (([64] * 4, 41), ([16384], 42)):
+        d = _inputs(lengths, 12 if len(lengths) > 1 else 16, seed=seed)
+        monkeypatch.undo()
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        monkeypatch.setattr(torch.cuda, "memory_allocated", _forbidden)
+        monkeypatch.setattr(torch.cuda, "memory_stats", _forbidden)
+        monkeypatch.setattr(torch.cuda, "memory_stats_as_nested_dict", _forbidden)
+        entries = len(cache)
+        _run(d, cache)
+        assert len(cache) == entries + 1
+        monkeypatch.undo()
+        retained = torch.cuda.memory_allocated() - before
+        # every owned storage is counted once and nothing the caller owns is
+        # counted; the allocator delta also includes rounding and the run's
+        # transient scratch, so it bounds the accounting from above
+        assert 0 < cache._bytes[next(reversed(cache._entries))] <= retained

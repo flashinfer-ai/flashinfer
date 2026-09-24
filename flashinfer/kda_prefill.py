@@ -7658,7 +7658,6 @@ def _prepare_kda_prefill(
         lower_bound,
     )
     with torch.cuda.device(q.device):
-        allocated_before = torch.cuda.memory_allocated(q.device)
         if beta_is_logit:
             prepared = FlashKDABlackwellLaunch(*args, **kwargs)
         elif compute_dtype == "bf16":
@@ -7671,8 +7670,61 @@ def _prepare_kda_prefill(
             prepared = prepare_active_beta_fwd(*args, **kwargs)
         prepare_descriptors(getattr(prepared, "prepared", prepared))
         if cache_inputs is not None:
-            retained = torch.cuda.memory_allocated(q.device) - allocated_before
             plan_cache.put(
-                prepared, cache_inputs, retained_bytes=max(0, retained), **cache_scalars
+                prepared,
+                cache_inputs,
+                retained_bytes=_retained_device_bytes(prepared, cache_inputs),
+                **cache_scalars,
             )
     return prepared
+
+
+def _retained_device_bytes(prepared, inputs) -> int:
+    """Device bytes a prepared launch keeps alive beyond the caller's tensors.
+
+    Walks the launch's own attributes (workspaces, staging buffers, packed
+    metadata, sub-launches of a composite) and sums each distinct CUDA storage
+    once, skipping storages that back the caller-owned ``inputs``.  This must
+    not consult ``torch.cuda.memory_allocated``/``memory_stats``: in a serving
+    process with hundreds of captured CUDA graphs that call flattens a stats
+    tree of ~10^5 entries in Python and costs ~150 ms, which was two GPU-idle
+    stalls per prefill step on Kimi-K3 (one plan miss per step).
+    """
+    import torch
+
+    caller = {
+        t.untyped_storage().data_ptr()
+        for t in inputs.values()
+        if isinstance(t, torch.Tensor) and t.is_cuda
+    }
+    seen_storage: set[int] = set()
+    seen_obj: set[int] = set()
+    total = 0
+
+    def visit(obj, depth):
+        nonlocal total
+        if depth > 6 or id(obj) in seen_obj:
+            return
+        seen_obj.add(id(obj))
+        if isinstance(obj, torch.Tensor):
+            if not obj.is_cuda:
+                return
+            storage = obj.untyped_storage()
+            ptr = storage.data_ptr()
+            if ptr in caller or ptr in seen_storage:
+                return
+            seen_storage.add(ptr)
+            total += int(storage.nbytes())
+            return
+        if isinstance(obj, dict):
+            for value in obj.values():
+                visit(value, depth + 1)
+        elif isinstance(obj, (tuple, list, set, frozenset)):
+            for value in obj:
+                visit(value, depth + 1)
+        elif type(obj).__module__.startswith("flashinfer") and hasattr(obj, "__dict__"):
+            for value in vars(obj).values():
+                visit(value, depth + 1)
+
+    visit(prepared, 0)
+    return total
