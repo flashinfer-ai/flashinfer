@@ -141,7 +141,11 @@ def _check_split_units(units, combine, blocks_of, num_partial_slots, num_combine
         by_key.setdefault(key, []).append((begin, count, slot))
     assert len(combine) == COMBINE_WORDS * num_combine_units
     combine_rows = {
-        (combine[COMBINE_WORDS * i], combine[COMBINE_WORDS * i + 1] >> 16, combine[COMBINE_WORDS * i + 1] & 0xFFFF): (
+        (
+            combine[COMBINE_WORDS * i],
+            combine[COMBINE_WORDS * i + 1] >> 16,
+            combine[COMBINE_WORDS * i + 1] & 0xFFFF,
+        ): (
             combine[COMBINE_WORDS * i + 2],
             combine[COMBINE_WORDS * i + 3],
         )
@@ -189,8 +193,13 @@ def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
         == plan.combine_table.dtype
         == torch.int32
     )
-    assert plan.partial_O.dtype == torch.float16 and plan.partial_ML.dtype == torch.float32
-    assert plan.partial_O.numel() == max(plan.num_partial_slots, 1) * PARTIAL_ROWS * HEAD_DIM
+    assert (
+        plan.partial_O.dtype == torch.float16 and plan.partial_ML.dtype == torch.float32
+    )
+    assert (
+        plan.partial_O.numel()
+        == max(plan.num_partial_slots, 1) * PARTIAL_ROWS * HEAD_DIM
+    )
     assert plan.partial_ML.numel() == max(plan.num_partial_slots, 1) * PARTIAL_ROWS * 2
     assert plan.seg_len.tolist() == lengths
     assert plan.seg_begin.tolist() == [
@@ -218,7 +227,9 @@ def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
         [blocks[s] for s, _h, _c in expected], plan.num_clusters, force=kv_splits
     )
     assert plan.max_kv_splits == max(split_of, default=1)
-    assert plan.total_tiles == sum(min(k, blocks[s]) for k, (s, _h, _c) in zip(split_of, expected, strict=True))
+    assert plan.total_tiles == sum(
+        min(k, blocks[s]) for k, (s, _h, _c) in zip(split_of, expected, strict=True)
+    )
     if kv_splits == 1:
         assert plan.total_tiles == heads * plan.total_clusters
         assert plan.num_combine_units == 0 and plan.num_partial_slots == 0
@@ -231,7 +242,9 @@ def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
     ]
     cost = [n + BF16_UNIT_OVERHEAD_BLOCKS for _key, _b, n in ranges]
     slots = assign_unit_slots(cost, plan.num_clusters)
-    assert [((s, h, c), b, n) for s, h, c, b, n, _ in decoded] == [ranges[u] for u in slots]
+    assert [((s, h, c), b, n) for s, h, c, b, n, _ in decoded] == [
+        ranges[u] for u in slots
+    ]
     G = plan.num_clusters
     for k in range(plan.total_tiles // G):
         round_costs = [decoded[k * G + i][4] for i in range(G)]
@@ -245,7 +258,7 @@ def test_choose_kv_splits_policy():
     # split so the makespan drops below the unsplit wave.
     blocks = [200] * 80
     split_of = choose_kv_splits(blocks, 74)
-    assert len(split_of) == 80 and max(split_of) >= 2 and 1 <= min(split_of)
+    assert len(split_of) == 80 and max(split_of) >= 2 and min(split_of) >= 1
     assert all(1 <= k <= MAX_KV_SPLITS for k in split_of)
     # Cheap units gain nothing from splitting (combine cost dominates).
     assert choose_kv_splits([2] * 80, 74) == [1] * 80
@@ -298,7 +311,11 @@ def test_packed_segment_plan(label, cu, heads):
 def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_splits):
     plan = build_packed_segment_plan(cu, torch.device("cpu"))
     tiles = build_tile_tables(
-        plan, heads, torch.device("cpu"), num_clusters=grid_clusters, kv_splits=kv_splits
+        plan,
+        heads,
+        torch.device("cpu"),
+        num_clusters=grid_clusters,
+        kv_splits=kv_splits,
     )
     assert tiles.heads == heads
     tables = {name: getattr(tiles, name) for name in TileTables.NAMES}
@@ -307,8 +324,14 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_spl
         assert table.shape == (max(tiles.total_tiles, 1),), name
     assert tiles.seg_begin.tolist() == list(plan.seg_begin)
     assert tiles.seg_len.tolist() == list(plan.seg_len)
-    assert tiles.partial_O.dtype == torch.float16 and tiles.partial_ML.dtype == torch.float32
-    assert tiles.partial_O.numel() == max(tiles.num_partial_slots, 1) * PARTIAL_ROWS * HEAD_DIM
+    assert (
+        tiles.partial_O.dtype == torch.float16
+        and tiles.partial_ML.dtype == torch.float32
+    )
+    assert (
+        tiles.partial_O.numel()
+        == max(tiles.num_partial_slots, 1) * PARTIAL_ROWS * HEAD_DIM
+    )
     if tiles.total_tiles == 0:
         assert tiles.num_combine_units == 0
         return
@@ -323,7 +346,9 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_spl
         )
     )
     segment_of_cluster = [
-        s for s in range(plan.num_segments) for _ in range(plan.cluster_off[s], plan.cluster_off[s + 1])
+        s
+        for s in range(plan.num_segments)
+        for _ in range(plan.cluster_off[s], plan.cluster_off[s + 1])
     ]
     # Every (head, cluster tile) pair is covered exactly once by its K/V ranges
     # (the cluster's own per-cluster entries); split units park in
@@ -622,7 +647,21 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     assert runner.plan.PB == 2 + 2 + 5 and runner.plan.total_clusters == 1 + 1 + 2
     assert runner.tile_tables.total_tiles >= heads * 4
     assert runner.route_metadata["pv_mode"] == pv_mode
-    assert tuple(runner.stage_kwargs) == ("quantize", "attention", "combine")
+    assert tuple(runner.stage_kwargs) == (
+        "quantize",
+        "attention",
+        "attention_split",
+        "combine",
+    )
+    # A 3-segment plan far below one wave has no split units: the dense
+    # attention program is bound, the split program and combine are not.
+    assert runner.tile_tables.num_partial_slots == 0
+    assert runner.attention_stage == "attention"
+    assert runner.route_metadata["attention_variant"] == "attention"
+    assert [name for name, entry, _ in runner._stages if entry is not None] == [
+        "quantize",
+        "attention",
+    ]
     assert runner.stage_kwargs["quantize"]["grid"] == (
         heads * 9 * QUANTIZE_SUBS_PER_BLOCK,
         1,
@@ -653,6 +692,36 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     v.copy_(torch.randn_like(v) * 3.0)
     out.fill_(float("nan"))
     graph.replay()
+    torch.cuda.synchronize()
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL
+    )
+
+
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_split_plan_binds_split_program(pv_mode):
+    """A partial-wave plan binds ``attention_split`` + ``combine`` and stays exact."""
+    _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    device = torch.device("cuda")
+    # 12 clusters x 7 heads = 84 units: 1.14 waves on the 74-cluster grid of
+    # B200/B300, which the planner splits; smaller grids split it as well.
+    cu, heads = [0, 6096], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=11)
+    runner = prepare_minimax_h3_varlen_nvfp4_attention(
+        q, k, v, cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
+    )
+    tiles = runner.tile_tables
+    if cake_backend.bf16_grid_clusters(device) >= 84:
+        pytest.skip("grid holds the 84 units in one wave; no split expected")
+    assert tiles.num_partial_slots > 0 and tiles.num_combine_units > 0
+    assert runner.attention_stage == "attention_split"
+    assert runner.route_metadata["attention_variant"] == "attention_split"
+    assert [name for name, entry, _ in runner._stages if entry is not None] == [
+        "quantize",
+        "attention_split",
+        "combine",
+    ]
+    out = runner()
     torch.cuda.synchronize()
     _check(
         out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL

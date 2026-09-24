@@ -68,7 +68,10 @@ Two program families share this package:
   K/V-split planner applies: the per-tile tables gain ``cl_kv_begin``,
   ``cl_kv_blocks`` and ``cl_ws_slot``, split units park FP16 partials in the
   tile tables' workspace and the ``combine`` stage finishes them after the
-  attention launch (an ordinary serial launch on the same stream).
+  attention launch (an ordinary serial launch on the same stream).  Two
+  attention programs are registered per architecture -- the dense
+  ``attention`` (no K/V-split code) and ``attention_split`` -- and the runner
+  binds the one the plan needs (:func:`nvfp4_attention_stage`).
 
 See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 """
@@ -309,9 +312,12 @@ def assign_unit_slots(unit_costs: Sequence[int], num_clusters: int) -> list[int]
     Slot ``k * num_clusters + i`` is the ``k``-th unit of cluster ``i``.  The
     partial tail round receives the cheapest units, and within every full
     round the clusters that also own a tail unit receive that round's cheapest
-    units.  Returns ``slot -> unit`` (a permutation); equal costs keep the
-    enumeration order so a single segment's units stay head-major.  Mirrors
-    the Cake production planner's ``assign_unit_slots``.
+    units.  Returns ``slot -> unit`` (a permutation).  Equal costs are placed
+    in reverse enumeration order within a round (the stable sort keeps the
+    enumeration order, each round is filled from its most expensive unit down);
+    measured equal to the plain enumeration order on uniform plans, i.e. the
+    round's unit set, not the order inside the round, is what matters for L2
+    locality.  Mirrors the production planner's ``assign_unit_slots``.
     """
     total = len(unit_costs)
     if total == 0:
@@ -387,7 +393,9 @@ def choose_kv_splits(
             if len(chunks) > 1:
                 slots += len(chunks)
             costs.extend(count + BF16_UNIT_OVERHEAD_BLOCKS for _, count in chunks)
-        combine = COMBINE_FIXED_BLOCKS + COMBINE_BLOCKS_PER_SLOT * slots if slots else 0.0
+        combine = (
+            COMBINE_FIXED_BLOCKS + COMBINE_BLOCKS_PER_SLOT * slots if slots else 0.0
+        )
         return lpt_makespan(costs, G) + combine
 
     base = total(ones)
@@ -414,7 +422,9 @@ def _partial_workspace(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     slots = max(int(partial_slots), 1)
     return (
-        torch.empty(slots * PARTIAL_ROWS * HEAD_DIM, dtype=torch.float16, device=device),
+        torch.empty(
+            slots * PARTIAL_ROWS * HEAD_DIM, dtype=torch.float16, device=device
+        ),
         torch.empty(slots * PARTIAL_ROWS * 2, dtype=torch.float32, device=device),
     )
 
@@ -456,7 +466,9 @@ def build_bf16_segment_plan(
     if any(b >= MAX_KV_BLOCKS for b in blocks):
         raise ValueError(f"a segment needs fewer than {MAX_KV_BLOCKS} K/V blocks")
     unit_blocks = [
-        blocks[seg] for seg in range(len(lens)) for _ in range(num_heads * clusters[seg])
+        blocks[seg]
+        for seg in range(len(lens))
+        for _ in range(num_heads * clusters[seg])
     ]
     split_of = choose_kv_splits(unit_blocks, int(num_clusters), force=kv_splits)
     units: list[tuple[int, int, int, int, int, int]] = []
@@ -494,8 +506,12 @@ def build_bf16_segment_plan(
         num_clusters=num_clusters,
         seg_begin=_table(begins, device),
         seg_len=_table(lens, device),
-        unit_table=torch.tensor(table or [0] * UNIT_WORDS, dtype=torch.int32, device=device),
-        combine_table=torch.tensor(combine or [0] * COMBINE_WORDS, dtype=torch.int32, device=device),
+        unit_table=torch.tensor(
+            table or [0] * UNIT_WORDS, dtype=torch.int32, device=device
+        ),
+        combine_table=torch.tensor(
+            combine or [0] * COMBINE_WORDS, dtype=torch.int32, device=device
+        ),
         partial_O=partial_O,
         partial_ML=partial_ML,
         num_partial_slots=partial_slots,
@@ -692,7 +708,8 @@ def build_tile_tables(
     near-equal K/V block ranges (:func:`choose_kv_splits`; ``kv_splits``
     forces one factor).  The units are then placed into the persistent grid's
     statically strided slots longest-processing-time first
-    (:func:`assign_unit_slots`; equal costs keep the enumeration order).
+    (:func:`assign_unit_slots`; equal costs are placed in reverse enumeration
+    order within a round).
     ``num_clusters`` is the grid capacity in 2-CTA clusters (default
     ``bf16_grid_clusters(device)``, a CUDA device).  Mirrors the Cake
     production planner's ``build_tile_tables``.
@@ -716,7 +733,9 @@ def build_tile_tables(
         for _ in range(heads * (plan.cluster_off[s + 1] - plan.cluster_off[s]))
     ]
     split_of = choose_kv_splits(unit_blocks, int(num_clusters), force=kv_splits)
-    units: list[tuple[int, int, int, int, int]] = []  # (cluster tile, head, kv_begin, kv_blocks, slot)
+    units: list[
+        tuple[int, int, int, int, int]
+    ] = []  # (cluster tile, head, kv_begin, kv_blocks, slot)
     costs: list[int] = []
     combine: list[int] = []
     partial_slots = 0
@@ -731,14 +750,22 @@ def build_tile_tables(
                     costs.append(seg_blocks[s] + BF16_UNIT_OVERHEAD_BLOCKS)
                     continue
                 combine.extend(
-                    (s, (head << 16) | (c - plan.cluster_off[s]), partial_slots, len(chunks))
+                    (
+                        s,
+                        (head << 16) | (c - plan.cluster_off[s]),
+                        partial_slots,
+                        len(chunks),
+                    )
                 )
                 for begin, count in chunks:
                     units.append((c, head, begin, count, partial_slots))
                     costs.append(count + BF16_UNIT_OVERHEAD_BLOCKS)
                     partial_slots += 1
     num_tiles = len(units)
-    slots = [units[u] for u in assign_unit_slots(costs, min(int(num_clusters), max(num_tiles, 1)))]
+    slots = [
+        units[u]
+        for u in assign_unit_slots(costs, min(int(num_clusters), max(num_tiles, 1)))
+    ]
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
     return TileTables(
         heads=heads,
@@ -1016,11 +1043,14 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
     """Launch the prepared NVFP4 pipeline: quantize Q/K/V, then attend.
 
     ``launch()`` runs the complete pipeline (for ``pv_mode="fp8"`` one device
-    ``amax(V)`` reduction into the workspace, then one fused quantizer launch
-    and one attention launch) into the caller-owned ``out`` with no CUDA
-    allocation and no host synchronization.  ``quantize()`` and
-    ``attention()`` run the two stages separately so callers can time them
-    on their own.  Packed operands live in ``workspace`` (allocated at
+    ``amax(V)`` reduction into the workspace, then one fused quantizer launch,
+    one attention launch and, for plans with K/V-split units, the ``combine``
+    launch) into the caller-owned ``out`` with no CUDA allocation and no host
+    synchronization.  ``quantize()`` and ``attention()`` run the stages
+    separately so callers can time them on their own.  The attention launch
+    uses one of two generated programs, chosen at preparation from the plan:
+    the dense ``attention`` module for plans without split units and
+    ``attention_split`` otherwise (``attention_stage``).  Packed operands live in ``workspace`` (allocated at
     preparation).  Prepare a new runner when ``cu_seqlens``, shapes or tensor
     bindings change; values may change freely since quantization is part of
     every launch.  CUDA Graph capture belongs to the caller.
@@ -1056,9 +1086,14 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
         self._run(("quantize",))
 
     def attention(self) -> torch.Tensor:
-        # The attention launch and, for K/V-split plans, the combine launch.
+        # The bound attention program and, for K/V-split plans, the combine launch.
         self._run(tuple(s for s in STAGES[self.variant] if s != "quantize"))
         return self.out
+
+    @property
+    def attention_stage(self) -> str:
+        """``"attention_split"`` for plans with K/V-split units, else ``"attention"``."""
+        return nvfp4_attention_stage(self.tile_tables)
 
     def launch(self) -> torch.Tensor:
         self._run(STAGES[self.variant])
@@ -1084,7 +1119,19 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
             tile_count=self.tile_tables.total_tiles,
             kv_split_units=self.tile_tables.num_combine_units,
             max_kv_splits=self.tile_tables.max_kv_splits,
+            attention_variant=self.attention_stage,
         )
+
+
+def nvfp4_attention_stage(tiles: TileTables) -> str:
+    """The attention program a plan binds: ``attention_split`` when the tile
+    tables hold any K/V-split unit (partial slots), else the dense ``attention``.
+
+    Both are the same generated program specialised at build time; the dense
+    variant carries no K/V-range or partial-slot code, which keeps the softmax
+    block loop of unsplit units at the schedule of the single-program kernel.
+    """
+    return "attention_split" if int(tiles.num_partial_slots) > 0 else "attention"
 
 
 # ---------------------------------------------------------------------------
@@ -1157,12 +1204,26 @@ def prepare_minimax_h3_varlen_attention(
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
                 combine_kwargs(
-                    plan.partial_O, plan.partial_ML, plan.combine_table,
-                    plan.seg_begin, plan.seg_len, out, num_heads, plan.num_combine_units,
+                    plan.partial_O,
+                    plan.partial_ML,
+                    plan.combine_table,
+                    plan.seg_begin,
+                    plan.seg_len,
+                    out,
+                    num_heads,
+                    plan.num_combine_units,
                 ),
             )
     return MiniMaxH3VarlenAttentionRunner(
-        "bf16", arch, plan, main_kwargs, out, entry, arguments, combine_entry, combine_arguments
+        "bf16",
+        arch,
+        plan,
+        main_kwargs,
+        out,
+        entry,
+        arguments,
+        combine_entry,
+        combine_arguments,
     )
 
 
@@ -1289,15 +1350,29 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
     else:
         attention_kwargs.update(V=workspace["v_fp8"], v_amax=workspace["v_amax"])
         assert tuple(attention_kwargs) == NVFP4_ATTENTION_FP8PV_KWARGS
+    # Both attention programs take the same bindings; exactly one is bound.
     stage_kwargs["attention"] = attention_kwargs
+    stage_kwargs["attention_split"] = attention_kwargs
     stage_kwargs["combine"] = combine_kwargs(
-        tiles.partial_O, tiles.partial_ML, tiles.combine_table,
-        tiles.seg_begin, tiles.seg_len, out, num_heads, tiles.num_combine_units,
+        tiles.partial_O,
+        tiles.partial_ML,
+        tiles.combine_table,
+        tiles.seg_begin,
+        tiles.seg_len,
+        out,
+        num_heads,
+        tiles.num_combine_units,
     )
     assert tuple(stage_kwargs) == STAGES[variant]
+    attention_stage = nvfp4_attention_stage(tiles)
     stages: list[tuple[str, Optional[Callable[..., Any]], tuple]] = []
     for stage in STAGES[variant]:
-        if total_tiles == 0 or (stage == "combine" and tiles.num_combine_units == 0):
+        skipped = (
+            total_tiles == 0
+            or (stage == "combine" and tiles.num_combine_units == 0)
+            or (stage in ("attention", "attention_split") and stage != attention_stage)
+        )
+        if skipped:
             stages.append((stage, None, ()))
             continue
         entry, arguments = _bind_stage(route["modules"][stage], stage_kwargs[stage])

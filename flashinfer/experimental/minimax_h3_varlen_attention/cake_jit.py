@@ -31,13 +31,17 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # ordered stage -> module assignment of that program family:
 #
 # * ``bf16``          stages ``("attention", "combine")``
-# * ``nvfp4_fp4pv``   stages ``("quantize", "attention", "combine")``
-# * ``nvfp4_fp8pv``   stages ``("quantize", "attention", "combine")``
+# * ``nvfp4_fp4pv``   stages ``("quantize", "attention", "attention_split", "combine")``
+# * ``nvfp4_fp8pv``   stages ``("quantize", "attention", "attention_split", "combine")``
 #
 # ``quantize`` is one fused single-launch quantizer per PV mode
 # (``minimax_h3_varlen_nvfp4_quantize_qkv`` / ``..._quantize_qk_fp8v``); the
-# ``attention`` binding of the NVFP4 routes carries the programmatic
-# dependent launch attribute; ``combine`` is the shared K/V-split merge kernel
+# NVFP4 routes carry two attention programs, the dense ``attention`` (no
+# K/V-split code; bound for plans without split units) and
+# ``attention_split`` (reads the unit's K/V block range and writes partial
+# rows; bound when the plan has split units) -- the runner binds exactly one
+# of them per plan -- and both bindings carry the programmatic dependent
+# launch attribute; ``combine`` is the shared K/V-split merge kernel
 # (``minimax_h3_varlen_split_combine``) that finishes the units the host
 # planner split over their K/V range (skipped by the runner when a plan has no
 # split units).  Every module is an exact-arch program (the
@@ -50,8 +54,8 @@ ROUTES: dict[str, dict[str, Any]] = {}
 VARIANTS = ("bf16", "nvfp4_fp4pv", "nvfp4_fp8pv")
 STAGES = {
     "bf16": ("attention", "combine"),
-    "nvfp4_fp4pv": ("quantize", "attention", "combine"),
-    "nvfp4_fp8pv": ("quantize", "attention", "combine"),
+    "nvfp4_fp4pv": ("quantize", "attention", "attention_split", "combine"),
+    "nvfp4_fp8pv": ("quantize", "attention", "attention_split", "combine"),
 }
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,

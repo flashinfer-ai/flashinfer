@@ -131,7 +131,14 @@ inside its segment.
 Quantization is part of the pipeline: one fused quantizer launch (`quantize`;
 `minimax_h3_varlen_nvfp4_quantize_qkv` for `pv_mode="fp4"`,
 `minimax_h3_varlen_nvfp4_quantize_qk_fp8v` for `pv_mode="fp8"`), then one
-attention launch (`attention`). The quantizer writes a
+attention launch. The attention launch uses one of two generated programs,
+chosen at preparation from the plan: the dense `attention` program (no
+K/V-split code at all) for plans without split units, `attention_split` for
+plans with them (`runner.attention_stage`, `route_metadata["attention_variant"]`).
+Both are the same kernel specialised at build time; keeping the dense program
+free of the split-unit epilogue keeps the softmax block loop of unsplit units
+at the schedule of the single-program kernel (a split path in the epilogue
+costs 1-2 % on every long row). The quantizer writes a
 **head-major, per-segment 128-token-padded packed layout**: segment `s`
 (non-empty segments only) owns `ceil(len / 128)` packed 128-token blocks
 starting at packed block `seg_tile_base[s]`, `PB = sum(ceil(len / 128))`, and
@@ -170,11 +177,11 @@ The attention launch is a **programmatic dependent launch**: the quantizer
 signals `griddepcontrol.launch_dependents` at its end, the attention prologue
 runs its barrier/TMEM setup and then waits with `griddepcontrol.wait` before
 reading the packed operands. The launch attribute
-(`cudaLaunchAttributeProgrammaticStreamSerialization`) is baked into the
-generated attention host binding by the export, so the runner only enqueues
-the launches in order on the current stream (quantizer, attention and, for
-plans with K/V-split units, the `combine` stage); the `fp8` `amax(V)`
-reduction runs before the quantizer launch.
+(`cudaLaunchAttributeProgrammaticStreamSerialization`) is baked into both
+generated attention host bindings by the export, so the runner only enqueues
+the launches in order on the current stream (quantizer, the bound attention
+program and, for plans with K/V-split units, the `combine` stage); the `fp8`
+`amax(V)` reduction runs before the quantizer launch.
 
 Packed operands (`q_fp4`, `k_fp4`, `q_scale`, `k_scale`, plus `v_fp4_t`,
 `v_scale_lo`, `v_scale_hi` for `fp4` or `v_fp8`, `v_amax` for `fp8`) cost
