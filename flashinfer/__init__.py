@@ -227,6 +227,7 @@ from .kda_decode import packed_kda_decode as packed_kda_decode
 from .kda_decode import packed_fused_kda_decode
 from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
 from .cake_minimax_h3 import MiniMaxH3Nvfp4PreAttention as MiniMaxH3Nvfp4PreAttention
+from .cake_minimax_h3 import MiniMaxH3QkvQuantizePack as MiniMaxH3QkvQuantizePack
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops

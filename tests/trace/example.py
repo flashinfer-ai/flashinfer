@@ -60,6 +60,7 @@ merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 minimax_h3_mxfp8_pre_attention_p8_hdst7_d128.json
 minimax_h3_nvfp4_pre_attention_p8_hdst7_d128.json
+minimax_h3_qkv_quantize_pack_p8_hdst7_d128_pk64.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
@@ -163,6 +164,7 @@ from flashinfer.utils import is_sm100a_supported
 from flashinfer.cake_minimax_h3 import (
     MiniMaxH3Mxfp8PreAttention,
     MiniMaxH3Nvfp4PreAttention,
+    MiniMaxH3QkvQuantizePack,
 )
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
@@ -225,6 +227,22 @@ MiniMaxH3Nvfp4PreAttention.run.fi_trace(
     q_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
     k_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
     rope_cos_sin=torch.empty((_mh_M, 96), dtype=torch.bfloat16, device="meta"),
+    out_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
+    out_q=torch.empty(
+        (_mh_P, _mh_M, 56 // _mh_P, 3, 128 // 2),
+        dtype=torch.uint8,
+        device="meta",
+    ),
+    out_sf=torch.empty((_mh_P, 1024), dtype=torch.uint8, device="meta"),
+)
+
+# One-pass QKV quantize-and-pack helper (issue #4532 candidate 7): the NVFP4
+# send-buffer layout of the sibling above, produced directly from BF16 Q/K/V.
+MiniMaxH3QkvQuantizePack.run.fi_trace(
+    save_dir=SAVE_DIR,
+    q=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    k=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    v=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
     out_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
     out_q=torch.empty(
         (_mh_P, _mh_M, 56 // _mh_P, 3, 128 // 2),
