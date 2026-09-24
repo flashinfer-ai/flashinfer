@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 import pytest
 import torch
@@ -201,6 +202,15 @@ def test_gen_attention_aot_matrix_contains_equal_primaries_only(generated_source
         spec.name.endswith("_kv_stride_equal") for spec in standard_prefill_specs
     )
     assert all(len(spec.sources) == 10 for spec in standard_prefill_specs)
+    persistent_specs = [
+        spec for spec in specs if spec.name.startswith("batch_attention_with_kv_cache_")
+    ]
+    # The sliding-window cross product duplicates URIs; the shipped portfolio
+    # contains only one equal-stride primary per actual configuration.
+    assert len(persistent_specs) == 4
+    assert len({spec.name for spec in persistent_specs}) == 2
+    assert all(spec.name.endswith("_kv_stride_equal") for spec in persistent_specs)
+    assert all(len(spec.sources) == 6 for spec in persistent_specs)
     assert not any(
         "_paged_kv_stride_independent" in spec.name
         or spec.name.endswith("_kv_stride_independent")
@@ -261,3 +271,128 @@ def test_batch_prefill_nvfp4_requires_sf_tensors():
         assert "maybe_v_cache_sf" in str(exc)
     else:
         raise AssertionError("expected NVFP4 KV prefill without SF tensors to fail")
+
+
+def _persistent_instantiation_arguments(source):
+    # Ignore comments and whitespace; inspect the actual explicit template args.
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.DOTALL)
+    return [
+        tuple(re.sub(r"\s+", "", argument) for argument in arguments.split(","))
+        for arguments in re.findall(
+            r"template\s+cudaError_t\s+BatchPagedAttentionPersistent\s*<(.*?)>\s*\(",
+            source,
+            flags=re.DOTALL,
+        )
+    ]
+
+
+def _assert_persistent_module_surface(directory, variants):
+    for mask in range(4):
+        source = (
+            directory / f"batch_attention_paged_kernel_mask_{mask}.cu"
+        ).read_text()
+        assert sorted(_persistent_instantiation_arguments(source)) == sorted(
+            (
+                "128",
+                "16",
+                "64",
+                "64",
+                (
+                    "MaskMode::kNone",
+                    "MaskMode::kCausal",
+                    "MaskMode::kCustom",
+                    "MaskMode::kMultiItemScoring",
+                )[mask],
+                variant,
+                "StandardAttention<false>",
+                "PersistentParams",
+            )
+            for variant in variants
+        )
+    binding = (directory / "batch_attention_jit_binding.cu").read_text()
+    for entrypoint in ("plan", "run"):
+        assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({entrypoint}," in binding
+
+
+@pytest.mark.parametrize(
+    "factory,suffix,mode,variants",
+    [
+        ("gen_batch_attention_module", "", "RUNTIME", {"true", "false"}),
+        ("_gen_batch_attention_primary_module", "_kv_stride_equal", "EQUAL", {"true"}),
+        (
+            "_gen_batch_attention_independent_module",
+            "_kv_stride_independent",
+            "INDEPENDENT",
+            {"false"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("profiler", [False, True])
+def test_batch_attention_stride_module_surface(
+    generated_sources, factory, suffix, mode, variants, profiler
+):
+    args = (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.int32,
+        64,
+        64,
+        0,
+        False,
+        profiler,
+    )
+    spec = getattr(attention_modules, factory)(*args)
+    assert spec.name == attention_modules.get_batch_attention_uri(*args) + suffix
+    assert len(spec.sources) == 6
+    directory = generated_sources / spec.name
+    config = (directory / "batch_attention_config.inc").read_text()
+    assert (
+        f"#define BATCH_ATTENTION_KV_STRIDE_MODE BATCH_ATTENTION_KV_STRIDE_MODE_{mode}"
+        in config
+    )
+    assert ("-DFLASHINFER_ENABLE_PROFILER" in spec.extra_cuda_cflags) == profiler
+    _assert_persistent_module_surface(directory, variants)
+
+
+def test_custom_batch_attention_preserves_caller_uri_and_dual_surface(
+    generated_sources,
+):
+    uri = "test_custom_batch_attention_runtime_compatibility"
+    spec = attention_modules.gen_customize_batch_attention_module(
+        uri,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.int32,
+        64,
+        64,
+        ["maybe_k_cache_sf", "maybe_v_cache_sf"],
+        ["uint8_t", "uint8_t"],
+        [],
+        [],
+        "StandardAttention<false>",
+        "#include <flashinfer/attention/variants.cuh>",
+    )
+    assert spec.name == uri and len(spec.sources) == 6
+    directory = generated_sources / uri
+    config = (directory / "batch_attention_config.inc").read_text()
+    assert (
+        "#define BATCH_ATTENTION_KV_STRIDE_MODE BATCH_ATTENTION_KV_STRIDE_MODE_RUNTIME"
+        in config
+    )
+    _assert_persistent_module_surface(directory, ("true", "false"))
+
+
+def test_persistent_warmup_contains_equal_primaries_only(generated_sources):
+    from tests.test_helpers.jit_utils import gen_persistent_batch_attention_modules
+
+    specs = gen_persistent_batch_attention_modules(
+        [torch.float16, torch.bfloat16],
+        [torch.float16, torch.bfloat16],
+        [64, 128, 256],
+        [False, True],
+    )
+    assert len(specs) == 12
+    assert len({spec.name for spec in specs}) == 12
+    assert all(spec.name.endswith("_kv_stride_equal") for spec in specs)

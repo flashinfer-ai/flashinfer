@@ -2244,7 +2244,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "Paged-KV-stride prewarm requires a standard FA2 plan, "
                 f"got backend={self._backend!r}."
             )
-        self._cached_module.prewarm_paged_kv_stride_variant(variant)
+        with torch.cuda.device(self.device):
+            self._cached_module.prewarm_paged_kv_stride_variant(variant)
 
     begin_forward = plan
 
