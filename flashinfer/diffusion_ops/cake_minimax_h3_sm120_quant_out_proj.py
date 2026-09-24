@@ -188,30 +188,51 @@ def _nvfp4_fake(
     pass
 
 
+# Smallest amax admitted by the scale helpers: an all-zero tensor gets a finite scale (the kernel's
+# per-row FP8 scale applies the same ``fmax(amax, 1e-12)``), never ``0`` / ``inf`` / ``NaN`` codes.
+AMAX_FLOOR = 1e-12
+
+
 def fp8_scale_from_amax(amax: torch.Tensor) -> torch.Tensor:
-    r"""``RN(amax / 448)`` with a true IEEE division (``tensor / 448.0`` multiplies by a reciprocal
-    and differs in the last FP32 bit, which flips E4M3 rounding ties)."""
+    r"""``RN(max(amax, 1e-12) / 448)`` with a true IEEE division (``tensor / 448.0`` multiplies by a
+    reciprocal and differs in the last FP32 bit, which flips E4M3 rounding ties)."""
 
-    return amax / torch.full((), E4M3_MAX, dtype=torch.float32, device=amax.device)
-
-
-def nvfp4_global_scale_from_amax(amax: Union[float, torch.Tensor]) -> torch.Tensor:
-    r"""FlashInfer NVFP4 global scale ``448 * 6 / amax`` as an FP32 ``[1]`` CUDA tensor."""
-
-    if isinstance(amax, torch.Tensor):
-        return (E4M3_MAX * E2M1_MAX / amax.float()).reshape(1).contiguous()
-    return torch.tensor(
-        [E4M3_MAX * E2M1_MAX / float(amax)], dtype=torch.float32, device="cuda"
+    return amax.float().clamp_min(AMAX_FLOOR) / torch.full(
+        (), E4M3_MAX, dtype=torch.float32, device=amax.device
     )
 
 
+def nvfp4_global_scale_from_amax(amax: Union[float, torch.Tensor]) -> torch.Tensor:
+    r"""FlashInfer NVFP4 global scale ``448 * 6 / max(amax, 1e-12)`` as an FP32 ``[1]`` CUDA tensor."""
+
+    if isinstance(amax, torch.Tensor):
+        safe_amax = amax.float().clamp_min(AMAX_FLOOR)
+        return (E4M3_MAX * E2M1_MAX / safe_amax).reshape(1).contiguous()
+    safe_amax = max(float(amax), AMAX_FLOOR)
+    return torch.tensor(
+        [E4M3_MAX * E2M1_MAX / safe_amax], dtype=torch.float32, device="cuda"
+    )
+
+
+@flashinfer_api
 def quantize_minimax_h3_o_weight_fp8(
     o_weight: torch.Tensor, chunk_rows: int = 1792
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-output-channel E4M3 quantization of the BF16 ``[5376, 7168]`` attention output weight.
 
-    Returns ``(o_weight_q float8_e4m3fn [5376, 7168], o_weight_scale float32 [5376])`` with
-    ``o_weight_scale[n] = RN(amax(row n) / 448)`` and ``o_weight_q = RN(row / scale)``.
+    Parameters
+    ----------
+    o_weight : torch.Tensor
+        BF16 (or any float) ``[5376, 7168]`` attention output projection weight on a CUDA device.
+    chunk_rows : int
+        Rows quantized per chunk (bounds the FP32 temporary; the result does not depend on it).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(o_weight_q, o_weight_scale)``: float8_e4m3fn ``[5376, 7168]`` codes and FP32 ``[5376]``
+        dequant multipliers with ``o_weight_scale[n] = RN(amax(row n) / 448)`` and
+        ``o_weight_q = RN(row / scale)``.
     """
 
     if tuple(o_weight.shape) != (MINIMAX_H3_HIDDEN, MINIMAX_H3_ATTN_DIM):
@@ -237,14 +258,24 @@ def quantize_minimax_h3_o_weight_fp8(
     return weight_q, scale
 
 
+@flashinfer_api
 def quantize_minimax_h3_o_weight_nvfp4(
     o_weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""FlashInfer NVFP4 quantization of the BF16 ``[5376, 7168]`` attention output weight.
 
-    Returns ``(o_weight_q uint8 [5376, 3584], o_weight_sf uint8 (128x4 swizzled layout),
-    o_weight_global_scale float32 [1])`` exactly as :func:`flashinfer.fp4_quantize` with
-    ``sf_vec_size=16`` and ``is_sf_swizzled_layout=True`` produces them.
+    Parameters
+    ----------
+    o_weight : torch.Tensor
+        BF16 (or any float) ``[5376, 7168]`` attention output projection weight on a CUDA device.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(o_weight_q, o_weight_sf, o_weight_global_scale)``: uint8 ``[5376, 3584]`` E2M1x2 codes,
+        uint8 UE4M3 block-16 scales in the 128x4 swizzled layout and the FP32 ``[1]`` global scale
+        ``448 * 6 / amax(W)``, exactly as :func:`flashinfer.fp4_quantize` with ``sf_vec_size=16``
+        and ``is_sf_swizzled_layout=True`` produces them.
     """
 
     from ..quantization import fp4_quantize
@@ -306,8 +337,10 @@ def minimax_h3_fp8_out_proj(
         BF16 ``[M, 5376]`` residual stream.
     out : Optional[torch.Tensor]
         BF16 ``[M, 5376]`` output (allocated when ``None``).
-    act_q, act_scale : Optional[torch.Tensor]
-        Optional caller-owned quantization workspaces (E4M3 ``[M, 7168]``, FP32 ``[M]``).
+    act_q : Optional[torch.Tensor]
+        Optional caller-owned E4M3 activation workspace (``[M, 7168]``).
+    act_scale : Optional[torch.Tensor]
+        Optional caller-owned FP32 per-row activation scale workspace (``[M]``).
 
     Returns
     -------
@@ -386,10 +419,18 @@ def minimax_h3_nvfp4_out_proj(
         FP32 per-tensor weight global scale ``448 * 6 / amax(W)``.
     act_global_scale : torch.Tensor
         FP32 ``[1]`` CUDA tensor, the calibrated activation global scale ``448 * 6 / amax``.
-    gate, gate_index, residual, out :
-        As in :func:`minimax_h3_fp8_out_proj`.
-    act_q, act_sf : Optional[torch.Tensor]
-        Optional caller-owned quantization workspaces (uint8 ``[M, 3584]``, uint8 ``[M, 448]``).
+    gate : torch.Tensor
+        BF16 ``[9, 5376]`` per-index ``gate_msa`` rows of the AdaLN plan.
+    gate_index : torch.Tensor
+        int32 ``[M]`` per-row table index.
+    residual : torch.Tensor
+        BF16 ``[M, 5376]`` residual stream.
+    out : Optional[torch.Tensor]
+        BF16 ``[M, 5376]`` output (allocated when ``None``).
+    act_q : Optional[torch.Tensor]
+        Optional caller-owned E2M1x2 activation workspace (uint8 ``[M, 3584]``).
+    act_sf : Optional[torch.Tensor]
+        Optional caller-owned activation block-scale workspace (uint8 ``[M, 448]``).
 
     Returns
     -------

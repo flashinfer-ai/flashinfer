@@ -123,6 +123,19 @@ def baseline_nvfp4(inputs, model, weights, act_global_scale, alpha):
     return torch_gate_residual(inputs, model, o)
 
 
+def _peak_memory_gib(fn) -> tuple:
+    """Peak memory of one standalone call of ``fn`` (no timing helper, no L2 flush buffer):
+    ``(absolute peak GiB, GiB allocated by the call above its starting allocation)``."""
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    start = torch.cuda.memory_allocated()
+    fn()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    return peak / 2**30, (peak - start) / 2**30
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -168,10 +181,9 @@ def main() -> None:
             )
         fn()
         torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
+        peak_gib, op_gib = _peak_memory_gib(fn)
         times = bench_gpu_time(fn, cold_l2_cache=True)
         kernel_ms = float(sorted(times)[len(times) // 2])
-        peak_gib = torch.cuda.max_memory_allocated() / 2**30
         row = {
             "variant": args.variant,
             "M": rows,
@@ -183,6 +195,7 @@ def main() -> None:
             / kernel_ms
             / 1e9,
             "fused_peak_gib": peak_gib,
+            "fused_op_gib": op_gib,
         }
         if not args.no_baseline:
             try:
@@ -195,10 +208,11 @@ def main() -> None:
                     )
                 base()
                 torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
+                row["baseline_peak_gib"], row["baseline_op_gib"] = _peak_memory_gib(
+                    base
+                )
                 base_times = bench_gpu_time(base, cold_l2_cache=True)
                 row["baseline_ms"] = float(sorted(base_times)[len(base_times) // 2])
-                row["baseline_peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
                 row["speedup"] = row["baseline_ms"] / kernel_ms
             except torch.OutOfMemoryError:
                 row["baseline_ms"] = None

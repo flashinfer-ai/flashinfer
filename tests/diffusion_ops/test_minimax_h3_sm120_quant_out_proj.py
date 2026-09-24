@@ -51,12 +51,12 @@ ROWS = [1, 127, 128, 129, 257, 4097]
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    # The public functions are gated to compute capability 12.0 (GB202); 12.1 would raise, not run.
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires a CUDA GPU with compute capability 12.x (GB202)"
+    not _supported(), reason="requires a CUDA GPU with compute capability 12.0 (GB202)"
 )
 
 
