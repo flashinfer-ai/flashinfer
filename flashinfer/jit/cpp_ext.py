@@ -270,7 +270,7 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
-    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
+    # Compiler launchers (e.g., sccache, ccache) 閳?empty string when unset
     cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
     nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
@@ -421,3 +421,22 @@ def run_ninja(
         if e.output:
             msg += " Ninja output:\n" + e.output
         raise RuntimeError(msg) from e
+
+
+def is_nvcc_at_least(nvcc_path: str, version_str: str) -> bool:
+    """Whether the nvcc that will actually run reports a CUDA version >= ``version_str``.
+
+    ``is_cuda_version_at_least`` inspects the default toolkit, but the JIT build uses
+    ``FLASHINFER_NVCC`` when set. Gate version-dependent flags (e.g.
+    ``--compress-mode``) on the selected compiler so an explicit override to an older
+    nvcc does not receive a flag its nvcc rejects. Falls back to default-toolkit
+    detection when the override cannot be queried.
+    """
+    try:
+        txt = subprocess.check_output([nvcc_path, "--version"], text=True)
+        matches = re.findall(r"release (\d+\.\d+),", txt)
+        if matches:
+            return Version(matches[0]) >= Version(version_str)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    return is_cuda_version_at_least(version_str)

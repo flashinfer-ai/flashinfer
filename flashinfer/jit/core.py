@@ -1,4 +1,4 @@
-import abc
+﻿import abc
 import dataclasses
 import functools
 import logging
@@ -26,8 +26,9 @@ from ..compilation_context import CompilationContext
 from . import env as jit_env
 from .cpp_ext import (
     generate_ninja_build_for_op,
+    get_cuda_path,
     get_nvcc_parallelism_flags,
-    is_cuda_version_at_least,
+    is_nvcc_at_least,
     run_ninja,
 )
 from .utils import write_if_different
@@ -312,7 +313,7 @@ class JitSpec(abc.ABC):
         """Return the cached artifact, or None when absent or not known-valid.
 
         Exception contract: must NOT raise for artifact-level problems
-        (missing, stale, corrupt, unloadable) — log and return None so
+        (missing, stale, corrupt, unloadable) 閳?log and return None so
         build_and_load() falls through to build(). An exception escaping
         try_load() is a programming error and propagates.
         """
@@ -721,7 +722,13 @@ def gen_jit_spec(
         # to older toolchains makes every JIT build fail with
         # "nvcc fatal : Unknown option '--compress-mode=size'".
         # https://github.com/flashinfer-ai/flashinfer/issues/5479
-        *(["--compress-mode=size"] if is_cuda_version_at_least("13.0") else []),
+        *(
+            ["--compress-mode=size"]
+            if is_nvcc_at_least(
+                os.environ.get("FLASHINFER_NVCC", f"{get_cuda_path()}/bin/nvcc"), "13.0"
+            )
+            else []
+        ),
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
