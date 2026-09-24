@@ -2125,10 +2125,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     tile_info_pipeline.consumer_release(tile_info_consumer_state)
                     tile_info_consumer_state.advance()
 
-                #
-                # Wait A sync transform buffer empty
-                #
-                a_sync_transform_pipeline.producer_tail(a_sync_transform_producer_state)
+                # No producer_tail: the relay pipeline's empty barriers are
+                # never arrived on (see the MMA warp's consumer_release).
 
         #
         # Specialized TMA B/SFB load warp (warp 9)
@@ -2538,10 +2536,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                         # Async arrive AB buffer empty
                         a_pipeline.consumer_release(a_consumer_state)
-                        if cutlass.const_expr(self.use_2cta_instrs):
-                            a_sync_transform_pipeline.consumer_release(
-                                a_sync_transform_consumer_state
-                            )
+                        # The 2-CTA A-sync relay pipeline has no empty side: its
+                        # producer (warp 11 of both CTAs) is throttled by the A
+                        # pipeline, whose empty barrier this same commit releases
+                        # in both CTAs, so a stage of the relay can only be
+                        # re-filled after this MMA consumed it. Arriving on its
+                        # empty barriers would signal a barrier nobody waits on
+                        # (compute-sanitizer synccheck "Missing wait").
                         b_pipeline.consumer_release(b_consumer_state)
 
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
