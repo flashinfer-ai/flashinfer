@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include "tvm_ffi_utils.h"
 
@@ -28,35 +29,42 @@ __device__ __forceinline__ int WarpSum(int value) {
 }
 
 __device__ __forceinline__ uint16_t Bf16ToOrdered(uint16_t bits) {
+  if ((bits & 0x7fff) == 0) {
+    return 0x8000;
+  }
   return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits ^ 0x8000);
 }
 
 __device__ __forceinline__ bool Bf16IsFinite(uint16_t bits) { return (bits & 0x7f80) != 0x7f80; }
 
-__device__ __forceinline__ int ComputeBudget(int q_row, int key_offset, int prompt_blocks,
+__device__ __forceinline__ int ComputeBudget(int q_row, int64_t key_offset, int64_t prompt_blocks,
                                              float alpha, float medium_rate, int medium_bias,
                                              float large_rate, int large_bias) {
-  constexpr int kSmallPromptBlocks = 56;
-  constexpr int kMediumPromptBlocks = 160;
-  int budget;
+  constexpr int64_t kSmallPromptBlocks = 56;
+  constexpr int64_t kMediumPromptBlocks = 160;
+  int64_t budget;
   if (prompt_blocks < kSmallPromptBlocks) {
     budget = prompt_blocks;
   } else if (prompt_blocks < kMediumPromptBlocks) {
-    budget = static_cast<int>(prompt_blocks * medium_rate) + medium_bias;
+    const double scaled = static_cast<double>(prompt_blocks) * medium_rate + medium_bias;
+    budget = static_cast<int64_t>(min(scaled, static_cast<double>(prompt_blocks)));
   } else {
-    budget = static_cast<int>(prompt_blocks * large_rate) + large_bias;
+    const double scaled = static_cast<double>(prompt_blocks) * large_rate + large_bias;
+    budget = static_cast<int64_t>(min(scaled, static_cast<double>(prompt_blocks)));
   }
-  budget = max(1, min(budget, prompt_blocks));
+  budget = budget < 1 ? 1 : (budget > prompt_blocks ? prompt_blocks : budget);
 
-  const int query_position = q_row + key_offset;
-  const int decay_length = prompt_blocks - budget;
+  const int64_t query_position = static_cast<int64_t>(q_row) + key_offset;
+  const int64_t decay_length = prompt_blocks - budget;
   if (query_position < budget || decay_length <= 1) {
-    return budget;
+    return static_cast<int>(budget);
   }
-  const float t =
-      static_cast<float>(query_position - budget) / static_cast<float>(decay_length - 1);
-  const int decayed = static_cast<int>(floorf(budget + t * (budget * alpha - budget)));
-  return max(1, min(decayed, budget));
+  const double t =
+      static_cast<double>(query_position - budget) / static_cast<double>(decay_length - 1);
+  const int64_t decayed = static_cast<int64_t>(
+      floor(static_cast<double>(budget) + t * (static_cast<double>(budget) * alpha - budget)));
+  const int64_t clamped = decayed < 1 ? 1 : (decayed > budget ? budget : decayed);
+  return static_cast<int>(clamped);
 }
 
 template <int kItemsPerThread, int kWarpsPerRow>
@@ -119,13 +127,19 @@ __global__ void AdaptiveSparseBlockMaskKernel(const __nv_bfloat16* block_logits,
   const int head = blockIdx.y;
   const int request = blockIdx.z;
 
-  const int q_length = max(q_seq_lens[request], 0);
-  const int kv_length = max(kv_seq_lens[request], 0);
-  const int prompt_length = max(num_prompt_tokens[request], 0);
-  const int q_blocks = min((q_length + block_size - 1) / block_size, max_q_blocks);
-  const int k_blocks = min((kv_length + block_size - 1) / block_size, max_k_blocks);
-  const int prompt_blocks = max(1, (prompt_length + block_size - 1) / block_size);
-  const int key_offset = (max(kv_length - q_length, 0) + block_size - 1) / block_size;
+  const int64_t q_length = q_seq_lens[request] > 0 ? q_seq_lens[request] : 0;
+  const int64_t kv_length = kv_seq_lens[request] > 0 ? kv_seq_lens[request] : 0;
+  const int64_t prompt_length = num_prompt_tokens[request] > 0 ? num_prompt_tokens[request] : 0;
+  const int64_t q_blocks_unclamped = (q_length + block_size - 1) / block_size;
+  const int64_t k_blocks_unclamped = (kv_length + block_size - 1) / block_size;
+  const int q_blocks =
+      static_cast<int>(q_blocks_unclamped < max_q_blocks ? q_blocks_unclamped : max_q_blocks);
+  const int k_blocks =
+      static_cast<int>(k_blocks_unclamped < max_k_blocks ? k_blocks_unclamped : max_k_blocks);
+  const int64_t prompt_blocks_unclamped = (prompt_length + block_size - 1) / block_size;
+  const int64_t prompt_blocks = prompt_blocks_unclamped > 1 ? prompt_blocks_unclamped : 1;
+  const int64_t token_offset = kv_length > q_length ? kv_length - q_length : 0;
+  const int64_t key_offset = (token_offset + block_size - 1) / block_size;
   if (q_blocks == 0 || k_blocks == 0 || q_row >= q_blocks) {
     return;
   }
@@ -175,7 +189,9 @@ __global__ void AdaptiveSparseBlockMaskKernel(const __nv_bfloat16* block_logits,
                                                              warp_in_row);
   }
 
-  const int diagonal = min(q_row + key_offset, k_blocks - 1);
+  const int64_t diagonal_unclamped = static_cast<int64_t>(q_row) + key_offset;
+  const int diagonal =
+      static_cast<int>(diagonal_unclamped < k_blocks - 1 ? diagonal_unclamped : k_blocks - 1);
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
     const int column = linear_thread + item * kThreadsPerRow;
@@ -258,6 +274,7 @@ void adaptive_sparse_block_mask(TensorView block_logits, TensorView q_seq_lens,
   CHECK_DEVICE(mask, block_logits);
   TVM_FFI_ICHECK_EQ(block_logits.size(0), q_seq_lens.size(0));
   TVM_FFI_ICHECK_GT(block_size, 0);
+  TVM_FFI_ICHECK_LE(block_size, std::numeric_limits<int>::max());
   TVM_FFI_ICHECK_LE(block_logits.size(3), 32768);
 
   ffi::CUDADeviceGuard guard(block_logits.device().device_id);

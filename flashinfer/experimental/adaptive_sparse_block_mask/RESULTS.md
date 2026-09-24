@@ -8,17 +8,20 @@ Correctness:
 
 ```text
 pytest -q tests/experimental/test_adaptive_sparse_block_mask.py -x -vv
-6 passed
+13 passed
 ```
 
-CUPTI cold-L2 medians, 10 warm-up and 30 measured iterations:
+CUPTI cold-L2 medians, 10 warm-up and 30 measured iterations per
+implementation. Measurements are split into two equal batches with reversed
+execution order (`adaptive -> PyTorch`, then `PyTorch -> adaptive`) to reduce
+clock and thermal-state bias:
 
 | Shape | Adaptive CUDA | PyTorch topk pipeline | Speedup |
 | --- | ---: | ---: | ---: |
-| B1 H8 Qb64 Kb192, k=49 | 0.015328 ms | 0.022303 ms | 1.455x |
-| B1 H8 Qb64 Kb1024, k=132 | 0.016240 ms | 0.058672 ms | 3.613x |
-| B1 H8 Qb64 Kb4096, k=439 | 0.022704 ms | 0.182157 ms | 8.023x |
-| B4 H8 Qb64 Kb1024, k=132 | 0.020480 ms | 0.123566 ms | 6.033x |
+| B1 H8 Qb64 Kb192, k=49 | 0.020928 ms | 0.032575 ms | 1.557x |
+| B1 H8 Qb64 Kb1024, k=132 | 0.018256 ms | 0.058671 ms | 3.214x |
+| B1 H8 Qb64 Kb4096, k=439 | 0.021855 ms | 0.098575 ms | 4.510x |
+| B4 H8 Qb64 Kb1024, k=132 | 0.021488 ms | 0.118878 ms | 5.532x |
 
 Reproducer:
 

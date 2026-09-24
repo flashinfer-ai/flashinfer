@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -20,6 +21,59 @@ def _check_vector(
         raise ValueError(f"{name} must be on {device}, got {value.device}")
     if not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def _check_length_values(
+    q_seq_lens: torch.Tensor,
+    kv_seq_lens: torch.Tensor,
+    num_prompt_tokens: torch.Tensor,
+    *,
+    max_q_blocks: int,
+    max_k_blocks: int,
+    block_size: int,
+) -> None:
+    """Validate CUDA-resident lengths with one device-to-host transfer."""
+
+    q_values, kv_values, prompt_values = torch.stack(
+        (q_seq_lens, kv_seq_lens, num_prompt_tokens)
+    ).tolist()
+    max_q_tokens = int(max_q_blocks) * int(block_size)
+    max_k_tokens = int(max_k_blocks) * int(block_size)
+
+    for name, values in (
+        ("q_seq_lens", q_values),
+        ("kv_seq_lens", kv_values),
+        ("num_prompt_tokens", prompt_values),
+    ):
+        if any(value < 0 for value in values):
+            raise ValueError(f"{name} must contain nonnegative lengths")
+
+    if any(value > max_q_tokens for value in q_values):
+        raise ValueError(
+            f"q_seq_lens must not exceed max_q_blocks * block_size ({max_q_tokens})"
+        )
+    if any(value > max_k_tokens for value in kv_values):
+        raise ValueError(
+            f"kv_seq_lens must not exceed max_k_blocks * block_size ({max_k_tokens})"
+        )
+
+    # Python integers are unbounded, so this calculation also verifies the
+    # largest prompt value without reproducing the kernel's former int32 add.
+    max_prompt_blocks = max(
+        (
+            (int(value) + int(block_size) - 1) // int(block_size)
+            for value in prompt_values
+        ),
+        default=0,
+    )
+    if max_prompt_blocks > torch.iinfo(torch.int32).max:
+        raise ValueError("num_prompt_tokens produces too many prompt blocks")
+
+
+def _sync_input_validation_enabled() -> bool:
+    """Return whether CUDA-resident value checks should synchronize to host."""
+
+    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
 
 
 def run(
@@ -61,6 +115,8 @@ def run(
 
     if block_size <= 0:
         raise ValueError("block_size must be positive")
+    if block_size > torch.iinfo(torch.int32).max:
+        raise ValueError("block_size must fit in int32")
     if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must be finite and in [0, 1]")
     if initial_blocks < 0 or window_size < 0:
@@ -70,6 +126,16 @@ def run(
             raise ValueError(f"{name} must be finite and nonnegative")
     if medium_bias < 0 or large_bias < 0:
         raise ValueError("medium_bias and large_bias must be nonnegative")
+
+    if _sync_input_validation_enabled():
+        _check_length_values(
+            q_seq_lens,
+            kv_seq_lens,
+            num_prompt_tokens,
+            max_q_blocks=max_q_blocks,
+            max_k_blocks=max_k_blocks,
+            block_size=block_size,
+        )
 
     if out is None:
         out = torch.zeros_like(block_logits, dtype=torch.bool)
