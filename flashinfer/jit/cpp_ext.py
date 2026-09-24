@@ -270,7 +270,7 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
-    # Compiler launchers (e.g., sccache, ccache) 閳?empty string when unset
+    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
     cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
     nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
