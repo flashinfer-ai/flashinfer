@@ -351,8 +351,12 @@ __all__ = [
 # Packed-row MTP program (q_len_per_req 3..8)
 # ---------------------------------------------------------------------------
 
+# Planner cost model of the packed-row kernel, in quarter pairs (mirrors the kernel).
 MTP_ITEM_OVERHEAD_PAIRS = 1
 MTP_MERGE_WAVE_PAIRS = 1
+MTP_MERGE_ROWCHUNKS_PER_QUARTER_PAIR = 6
+MTP_INLINE_MERGE_ROWCHUNKS = 18  # in-place fold of a two-chunk tile ~ 3/4 pair
+MTP_COARSE_CANDIDATES = 3  # the planner also evaluates 2, 3, 4 x ceil(total / CTAs)
 
 
 def mtp_chunk_pairs(
@@ -363,11 +367,16 @@ def mtp_chunk_pairs(
     The packed kernel plans ``items_per_chunk = num_kv_heads`` from the longest
     query row.  It starts from ``chunk_pairs_for`` (``q_len = 1``) and then
     evaluates ``ceil(total / (k * CTAs))`` for ``k = 1..MAX_BALANCE_FACTOR``,
-    that length and whole tiles, keeping the smallest
-    ``waves * (L + 1) + merge_waves * 1`` (ties go to the coarser candidate).
+    that length, whole tiles and ``2, 3, 4 x ceil(total / CTAs)`` (below whole
+    tiles), keeping the smallest cost in quarter pairs
+    ``4 * waves * (L + 1) + 4 * merge_waves + ceil(max_rowchunks / 6)`` (ties go
+    to the earlier candidate), where ``max_rowchunks`` is the longest fold: a
+    merge ticket's rows per warp x chunks, or 18 for a two-chunk tile folded
+    in place by its last chunk item.
     """
     from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
-        mtp_merge_slices_per_tile,
+        MTP_INLINE_MERGE_CHUNKS,
+        mtp_merge_slices_for,
     )
 
     pairs = [_ceil_div(int(s), PAIR_TOKENS) for s in seq_lens]
@@ -375,27 +384,45 @@ def mtp_chunk_pairs(
     base, _ = chunk_pairs_for(
         seq_lens, q_len=1, num_kv_heads=num_kv_heads, num_ctas=num_ctas
     )
-    merges = mtp_merge_slices_per_tile(q_len)
     best_cost, best = None, base
     prev = 0
-    for kc in range(MAX_BALANCE_FACTOR + 2):
+    l_one = max(_ceil_div(total_work, num_ctas), DEFAULT_PAIRS_MIN)
+    for kc in range(MAX_BALANCE_FACTOR + 2 + MTP_COARSE_CANDIDATES):
         if kc < MAX_BALANCE_FACTOR:
             cand = max(_ceil_div(total_work, (kc + 1) * num_ctas), DEFAULT_PAIRS_MIN)
         elif kc == MAX_BALANCE_FACTOR:
             cand = base
-        else:
+        elif kc == MAX_BALANCE_FACTOR + 1:
             cand = max(pairs)
+        else:
+            cand = l_one * (kc - MAX_BALANCE_FACTOR)
+            if cand >= max(pairs):
+                continue  # whole tiles already evaluated
         if cand == prev:
             continue
         prev = cand
         n_chunks = [_ceil_div(p, cand) for p in pairs]
         tickets = sum(n_chunks) * num_kv_heads
-        split = sum(1 for n in n_chunks if n > 1)
+        merge_tickets = (
+            sum(mtp_merge_slices_for(n, q_len) for n in n_chunks if n > 1)
+            * num_kv_heads
+        )
         waves = _ceil_div(tickets, num_ctas)
-        merge_waves = _ceil_div(split * num_kv_heads * merges, num_ctas)
+        merge_waves = _ceil_div(merge_tickets, num_ctas)
+        max_rowchunks = max(
+            (
+                (2 * q_len // mtp_merge_slices_for(n, q_len)) * n
+                if n > MTP_INLINE_MERGE_CHUNKS
+                else MTP_INLINE_MERGE_ROWCHUNKS
+                for n in n_chunks
+                if n >= MTP_INLINE_MERGE_CHUNKS
+            ),
+            default=0,
+        )
         cost = (
-            waves * (cand + MTP_ITEM_OVERHEAD_PAIRS)
-            + merge_waves * MTP_MERGE_WAVE_PAIRS
+            4 * waves * (cand + MTP_ITEM_OVERHEAD_PAIRS)
+            + 4 * merge_waves * MTP_MERGE_WAVE_PAIRS
+            + _ceil_div(max_rowchunks, MTP_MERGE_ROWCHUNKS_PER_QUARTER_PAIR)
         )
         if best_cost is None or cost < best_cost:
             best_cost, best = cost, cand
@@ -407,7 +434,7 @@ def mtp_device_plan(
 ) -> tuple[int, int]:
     """``(chunk_pairs, tickets)`` the packed-row kernel publishes in its queue counters."""
     from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
-        mtp_merge_slices_per_tile,
+        mtp_merge_items,
     )
 
     chunk = mtp_chunk_pairs(
@@ -420,6 +447,6 @@ def mtp_device_plan(
         num_ctas=num_ctas,
         chunk_pairs=chunk,
     )
-    return chunk, plan.num_items + plan.num_split_tiles * mtp_merge_slices_per_tile(
-        q_len
+    return chunk, plan.num_items + mtp_merge_items(
+        seq_lens, q_len_per_req=q_len, num_kv_heads=num_kv_heads, chunk_pairs=chunk
     )

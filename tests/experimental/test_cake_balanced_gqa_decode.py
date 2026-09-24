@@ -574,12 +574,17 @@ def test_packed_mtp_bounds_and_chunk_length():
     assert mtp_chunk_pairs(agentx, q_len=7, num_kv_heads=1, num_ctas=148) == 20
     assert mtp_chunk_pairs([4096] * 8, q_len=7, num_kv_heads=8, num_ctas=148) == 8
     assert (
-        mtp_chunk_pairs([1024] * 64, q_len=7, num_kv_heads=1, num_ctas=148) == 4
-    )  # whole tiles, no merges
+        mtp_chunk_pairs([1024] * 64, q_len=7, num_kv_heads=1, num_ctas=148) == 2
+    )  # two-chunk tiles fold in place: one wave of 2-pair chunks, no tickets
+    assert (
+        mtp_chunk_pairs([60007], q_len=7, num_kv_heads=1, num_ctas=148) == 4
+    )  # coarser chunks halve the fourteen merge tickets' fold
     chunk, tickets = mtp_device_plan(
         [300, 257, 5000, 777], q_len=7, num_kv_heads=2, num_ctas=148
     )
-    assert (chunk, tickets) == (2, 28 + 4 * 14)
+    # 28 chunk items; the 5000-token tile (10 chunks) takes 14 tickets per kv
+    # head, the 777-token tile (2 chunks) is folded in place.
+    assert (chunk, tickets) == (2, 28 + 2 * 14)
 
 
 def test_launch_makes_no_allocation():

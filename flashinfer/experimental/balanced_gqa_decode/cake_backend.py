@@ -28,8 +28,9 @@ KV-length distribution written into ``seq_lens`` later.  See
 ``q_len_per_req`` 3..8 (speculative / MTP verify) is served by the packed-row
 program: one ``8 * q_len``-row tile per ``(request, kv head)`` item so each KV
 chunk is streamed once per request, with the same on-device scheduler and a
-distributed merge (``2 * q_len`` merge tickets per split tile).  Other
-``q_len_per_req`` values use the row-tile program.
+distributed merge (one to ``2 * q_len`` merge tickets per split tile, fewer
+and fatter for tiles with few chunks).  Other ``q_len_per_req`` values use
+the row-tile program.
 """
 
 from __future__ import annotations
