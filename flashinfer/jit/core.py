@@ -313,7 +313,7 @@ class JitSpec(abc.ABC):
         """Return the cached artifact, or None when absent or not known-valid.
 
         Exception contract: must NOT raise for artifact-level problems
-        (missing, stale, corrupt, unloadable) — log and return None so
+        (missing, stale, corrupt, unloadable) 閳?log and return None so
         build_and_load() falls through to build(). An exception escaping
         try_load() is a programming error and propagates.
         """
@@ -715,6 +715,13 @@ def gen_jit_spec(
     if not cflags_has_std:
         cflags.insert(0, "-std=c++17")
 
+    # Resolve the nvcc that will actually run. Honor an explicit FLASHINFER_NVCC
+    # override without touching the default toolkit, so a user who only sets the
+    # override (and has no default CUDA_HOME) still gets a usable spec.
+    selected_nvcc = os.environ.get("FLASHINFER_NVCC")
+    if selected_nvcc is None:
+        selected_nvcc = f"{get_cuda_path()}/bin/nvcc"
+
     cuda_cflags = [
         *get_nvcc_parallelism_flags(),
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
@@ -722,13 +729,7 @@ def gen_jit_spec(
         # to older toolchains makes every JIT build fail with
         # "nvcc fatal : Unknown option '--compress-mode=size'".
         # https://github.com/flashinfer-ai/flashinfer/issues/5479
-        *(
-            ["--compress-mode=size"]
-            if is_nvcc_at_least(
-                os.environ.get("FLASHINFER_NVCC", f"{get_cuda_path()}/bin/nvcc"), "13.0"
-            )
-            else []
-        ),
+        *(["--compress-mode=size"] if is_nvcc_at_least(selected_nvcc, "13.0") else []),
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
