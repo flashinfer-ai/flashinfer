@@ -35,6 +35,9 @@ from .fused_moe import _moe_core_impl, validate_w4a8_inputs
 from .moe_utils import get_max_num_tiles, moe_sort
 from .mxfp4_finalize import plan_finalize_rows
 from .mxfp4_routing import FUSED_ROUTE_MAX_ROUTES, _plan_route_preprocess
+from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    blockscaled_contiguous_gather_grouped_gemm_act_fusion,
+)
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     blockscaled_contiguous_grouped_gemm_finalize_fusion,
 )
@@ -87,6 +90,14 @@ DENSE_WEIGHT_L2_HINT = _DENSE_L2_HINTS[os.environ.get("MXFP4_DENSE_L2HINT", "fir
 SWAP_HYBRID = os.environ.get("SWAPAB_HYBRID", "1") != "0"
 SWAP_HYBRID_GROUP_ROWS = 128
 SWAP_HYBRID_MIN_TILE = 64
+# Hybrid form, mixed GEMM1 tiles: a 128-row sort group with more valid rows
+# than this runs as one dense gather-GEMM1 tile (its expert's weights stream
+# once for the group); the other groups run as swap sub-tiles, which stream
+# the weights once per sub-tile. Measured on B300 for the MoE-TP shard: 16
+# hot experts holding every route at T=128..2048 re-stream each expert 16x
+# in the swap form (148 us at T=128 against 53 us for the dense form). 128
+# disables the dense tiles.
+SWAP_HYBRID_DENSE_MIN_ROWS = int(os.environ.get("SWAPAB_HYBRID_DENSE_MIN_ROWS", "64"))
 # Swap-AB path: EVICT_FIRST on the weight loads helps every shape whose
 # experts stream their weights once (decode -3..-15 us, single-group prefill
 # -5..-14 us on B300, same-GPU pairs) and hurts a hot expert whose groups
@@ -634,6 +645,7 @@ class Mxfp4MoESwapAbPlan:
         self._sort = None
         self._dispatch = None
         self._dispatch_args = None
+        self._gemm1_dense = None
         self._token_index = None
         self._token_index_args = None
         self._packed_weight_view = (
@@ -712,7 +724,7 @@ class Mxfp4MoESwapAbPlan:
                     wide_count=b["swap_wide_count"],
                     narrow_list=b["swap_row_groups"],
                     narrow_count=b["swap_row_group_count"],
-                    wide_min_rows=self.group_rows,
+                    wide_min_rows=min(SWAP_HYBRID_DENSE_MIN_ROWS, self.group_rows),
                     enable_pdl=w.enable_pdl,
                     _prepared_launches=launches,
                 )
@@ -759,6 +771,47 @@ class Mxfp4MoESwapAbPlan:
                     **gemm1_lists,
                 },
             )
+            if self.hybrid and SWAP_HYBRID_DENSE_MIN_ROWS < self.group_rows:
+                # Dense gather GEMM1 over the wide list (sort groups with more
+                # than SWAP_HYBRID_DENSE_MIN_ROWS valid rows); it writes the
+                # same E4M3 rows and blocked scales the swap sub-tiles write
+                # for the narrow groups, so GEMM2 sees one contiguous layout.
+                gemm1_tactic = w._tactic(num_tokens)[1]
+                if gemm1_tactic[0][0] != self.group_rows:
+                    raise ValueError(
+                        "hybrid GEMM1 tactic tile must match the "
+                        f"{self.group_rows}-row sort groups, got {gemm1_tactic!r}"
+                    )
+                blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+                    a=x,
+                    b=w1,
+                    a_scale=x_sf,
+                    b_scale=w1_sf,
+                    alpha=b["w1_alpha"],
+                    tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"],
+                    tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
+                    token_id_mapping=b["out_permuted_idx_to_expanded_idx"],
+                    num_non_exiting_tiles=b["swap_wide_count"],
+                    tile_idx_to_row_group=b["swap_wide_list"],
+                    out=b["gemm1_out"],
+                    out_scale=b["gemm1_out_scale"],
+                    c_dtype="float8_e4m3fn",
+                    a_dtype="float8_e4m3fn",
+                    b_dtype="float4_e2m1fn",
+                    sf_dtype="float8_e8m0fnu",
+                    sf_vec_size=32,
+                    quantize_output=True,
+                    topk=w.top_k,
+                    mma_tiler_mn=gemm1_tactic[0],
+                    cluster_shape_mn=gemm1_tactic[1],
+                    enable_pdl=w.enable_pdl,
+                    activation_type=w.activation_type.value,
+                    situ_beta=self._beta,
+                    situ_linear_beta=self._linear_beta,
+                    weight_l2_hint=DENSE_WEIGHT_L2_HINT,
+                    _prepared_launches=launches,
+                )
+                self._gemm1_dense = launches["gather"]
             fused_finalize = self.finalize and not self.two_stage
             if self.hybrid:
                 # Dense contiguous grouped GEMM2 over the 128-row sort groups
@@ -845,8 +898,9 @@ class Mxfp4MoESwapAbPlan:
             )
 
     def run(self) -> torch.Tensor:
-        """Enqueue three (T <= 16), four (deferred) or five (two-stage
-        finalize) launches on the caller's stream."""
+        """Enqueue three (T <= 16), four (deferred), five (two-stage
+        finalize) or six (hybrid: sort, dispatch, swap and dense GEMM1
+        tiles, GEMM2) launches on the caller's stream."""
         with torch.cuda.device(self.device):
             stream_ptr = torch.cuda.current_stream().cuda_stream
             stream = cuda.CUstream(stream_ptr)
@@ -858,6 +912,9 @@ class Mxfp4MoESwapAbPlan:
             if self._token_index is not None:
                 self._token_index(*self._token_index_args, stream=stream)
             self._gemm1(*self._gemm1_args, stream=stream)
+            if self._gemm1_dense is not None:
+                compiled, args, kwargs = self._gemm1_dense
+                compiled(*args, stream=stream, **kwargs)
             self._gemm2(*self._gemm2_args, stream=stream)
             if self._finalize_rows is not None:
                 self._finalize_rows.run(stream)

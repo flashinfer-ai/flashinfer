@@ -837,6 +837,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         situ_beta_tensor: Optional[cute.Tensor] = None,
         situ_linear_beta_tensor: Optional[cute.Tensor] = None,
+        tile_idx_to_row_group: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -1195,6 +1196,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_idx_to_mn_limit,
             token_id_mapping_tensor,
             num_non_exiting_tiles,
+            tile_idx_to_row_group,
             alpha,
             a_per_token_scale,
             situ_beta_tensor,
@@ -1284,6 +1286,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tile_idx_to_mn_limit: cute.Tensor,
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
+        tile_idx_to_row_group: Optional[cute.Tensor],
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
         situ_beta_tensor: Optional[cute.Tensor],
@@ -1634,12 +1637,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if mma_tile_coord_m < num_non_exiting_tiles_value:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         cur_tile_coord = work_tile.tile_idx
-                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        sched_group = mma_tile_coord_m
+                        sched_coord_m = cur_tile_coord[0]
+                        if cutlass.const_expr(tile_idx_to_row_group is not None):
+                            # Compacted work list: the scheduler slot names the
+                            # sort group whose rows, expert and limit follow.
+                            sched_group = tile_idx_to_row_group[mma_tile_coord_m]
+                            sched_coord_m = sched_group * cute.size(
+                                tiled_mma.thr_id.shape
+                            ) + (
+                                cur_tile_coord[0]
+                                - mma_tile_coord_m * cute.size(tiled_mma.thr_id.shape)
+                            )
+                        expert_idx = tile_idx_to_expert_idx[sched_group]
+                        mn_limit = tile_idx_to_mn_limit[sched_group]
                         with cute.arch.elect_one():
-                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
-                                0
-                            ]
+                            sInfo[(0, tile_info_producer_state.index)] = sched_coord_m
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
                                 1
                             ]
@@ -1670,12 +1683,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if mma_tile_coord_m < num_non_exiting_tiles_value:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         cur_tile_coord = work_tile.tile_idx
-                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        sched_group = mma_tile_coord_m
+                        sched_coord_m = cur_tile_coord[0]
+                        if cutlass.const_expr(tile_idx_to_row_group is not None):
+                            # Compacted work list: the scheduler slot names the
+                            # sort group whose rows, expert and limit follow.
+                            sched_group = tile_idx_to_row_group[mma_tile_coord_m]
+                            sched_coord_m = sched_group * cute.size(
+                                tiled_mma.thr_id.shape
+                            ) + (
+                                cur_tile_coord[0]
+                                - mma_tile_coord_m * cute.size(tiled_mma.thr_id.shape)
+                            )
+                        expert_idx = tile_idx_to_expert_idx[sched_group]
+                        mn_limit = tile_idx_to_mn_limit[sched_group]
                         with cute.arch.elect_one():
-                            sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
-                                0
-                            ]
+                            sInfo[(0, tile_info_producer_state.index)] = sched_coord_m
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
                                 1
                             ]
@@ -4157,6 +4180,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta_ptr: Optional[cute.Pointer] = None,
         situ_beta_stride: cutlass.Int32 = 0,
         situ_linear_beta_stride: cutlass.Int32 = 0,
+        tile_idx_to_row_group_ptr: Optional[cute.Pointer] = None,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
@@ -4233,6 +4257,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
+        # Optional compacted work list: scheduler slot -> sort group (row
+        # block of ``tile_size`` rows); ``num_non_exiting_tiles`` then counts
+        # the list entries.
+        tile_idx_to_row_group = (
+            cute.make_tensor(
+                tile_idx_to_row_group_ptr, layout=cute.make_layout((num_tiles,))
+            )
+            if cutlass.const_expr(tile_idx_to_row_group_ptr is not None)
+            else None
+        )
         global_sf = (
             cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
             if cutlass.const_expr(global_sf_ptr is not None)
@@ -4258,6 +4292,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             epilogue_op=epilogue_op,
             situ_beta_tensor=situ_beta_tensor,
             situ_linear_beta_tensor=situ_linear_beta_tensor,
+            tile_idx_to_row_group=tile_idx_to_row_group,
         )
 
 

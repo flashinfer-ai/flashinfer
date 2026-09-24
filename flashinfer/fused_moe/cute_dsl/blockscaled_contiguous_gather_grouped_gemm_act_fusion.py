@@ -272,6 +272,7 @@ def _get_compiled_gather_kernel(
     use_a_per_token_scale: bool = False,
     runtime_situ_beta_ptr=None,
     runtime_situ_linear_beta_ptr=None,
+    row_group_ptr=None,
     situ_beta_stride: int = 0,
     situ_linear_beta_stride: int = 0,
     weight_l2_hint: Optional[int] = None,
@@ -331,6 +332,7 @@ def _get_compiled_gather_kernel(
         gated,
         use_a_per_token_scale,
         weight_l2_hint,
+        row_group_ptr is not None,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -435,6 +437,7 @@ def _get_compiled_gather_kernel(
                     "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
                     "situ_beta_stride": situ_beta_stride,
                     "situ_linear_beta_stride": situ_linear_beta_stride,
+                    "tile_idx_to_row_group_ptr": row_group_ptr,
                 }
                 if not is_rubin
                 else {}
@@ -485,6 +488,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_beta: Optional[Union[float, torch.Tensor]] = None,
     situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
+    tile_idx_to_row_group: Optional[torch.Tensor] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
@@ -514,6 +518,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             token_id = token_idx * topk + k_idx. Invalid rows have -1.
             Used by cp.async to gather from A tensor.
         num_non_exiting_tiles: Number of valid tiles, shape (1,), int32
+        tile_idx_to_row_group: Optional int32 work list, shape (num_tiles,):
+            scheduler slot ``i`` processes the ``tile_size``-row block
+            ``tile_idx_to_row_group[i]`` of the permuted rows (its expert and
+            row limit come from that block's entries) and
+            ``num_non_exiting_tiles`` counts the list entries. Lets a caller
+            run only a subset of the sort groups through this kernel.
         out: Optional output tensor, shape (permuted_m, intermediate_size). Created if None.
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for block-scaled
@@ -871,6 +881,26 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     num_tiles_ptr = make_ptr(
         cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem
     )
+    row_group_ptr = None
+    if tile_idx_to_row_group is not None:
+        if is_rubin:
+            raise NotImplementedError(
+                "tile_idx_to_row_group is not supported by the Rubin (SM107) "
+                "gather grouped GEMM kernel"
+            )
+        if (
+            tile_idx_to_row_group.dtype != torch.int32
+            or tile_idx_to_row_group.device != a.device
+            or not tile_idx_to_row_group.is_contiguous()
+            or tile_idx_to_row_group.shape[0] < permuted_m // tile_size
+        ):
+            raise ValueError(
+                "tile_idx_to_row_group must be contiguous int32 on the input "
+                f"device with at least {permuted_m // tile_size} entries"
+            )
+        row_group_ptr = make_ptr(
+            cutlass.Int32, tile_idx_to_row_group.data_ptr(), cute.AddressSpace.gmem
+        )
 
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
@@ -927,6 +957,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         runtime_situ_linear_beta_ptr=runtime_situ_linear_beta_ptr,
         situ_beta_stride=situ_beta_stride,
         situ_linear_beta_stride=situ_linear_beta_stride,
+        row_group_ptr=row_group_ptr,
     )
 
     # Execute kernel with runtime parameters.
@@ -963,6 +994,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
             "situ_beta_stride": situ_beta_stride,
             "situ_linear_beta_stride": situ_linear_beta_stride,
+            "tile_idx_to_row_group_ptr": row_group_ptr,
         }
         if not is_rubin
         else {}
