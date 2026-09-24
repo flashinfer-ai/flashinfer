@@ -3721,12 +3721,12 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "activation_format": Scalar(
             "int32",
             optional=True,
-            description="Activation QuantVariant.",
+            description="Activation QuantFormat.",
         ),
         "weight_format": Scalar(
             "int32",
             optional=True,
-            description="Weight QuantVariant.",
+            description="Weight QuantFormat.",
         ),
         "weight_interleave": Scalar(
             "int32",
@@ -3823,12 +3823,12 @@ _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
 _cute_dsl_wrapper_inputs["activation_format"] = Scalar(
     "int32",
     optional=True,
-    description="Activation QuantVariant set at wrapper __init__, not passed to run().",
+    description="Activation QuantFormat set at wrapper __init__, not passed to run().",
 )
 _cute_dsl_wrapper_inputs["weight_format"] = Scalar(
     "int32",
     optional=True,
-    description="Weight QuantVariant set at wrapper __init__, not passed to run().",
+    description="Weight QuantFormat set at wrapper __init__, not passed to run().",
 )
 _cute_dsl_wrapper_inputs["weight_interleave"] = Scalar(
     "int32",
@@ -4238,33 +4238,33 @@ def _cute_dsl_fused_moe_reference(
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
-    from ...fused_moe.api import QuantVariant
+    from ...fused_moe.api import QuantFormat
 
-    activation_format = QuantVariant(
-        QuantVariant.NVFP4 if activation_format is None else activation_format
+    activation_format = QuantFormat(
+        QuantFormat.NVFP4 if activation_format is None else activation_format
     )
-    weight_format = QuantVariant(
-        QuantVariant.NVFP4 if weight_format is None else weight_format
+    weight_format = QuantFormat(
+        QuantFormat.NVFP4 if weight_format is None else weight_format
     )
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     if (activation_format, weight_format) == (
-        QuantVariant.NVFP4,
-        QuantVariant.NVFP4,
+        QuantFormat.NVFP4,
+        QuantFormat.NVFP4,
     ):
         if x_sf is None:
             raise ValueError("x_sf is required for W4A4")
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
     elif (activation_format, weight_format) == (
-        QuantVariant.MXFP8,
-        QuantVariant.MXFP4,
+        QuantFormat.MXFP8,
+        QuantFormat.MXFP4,
     ):
         if x_sf is None:
             raise ValueError("x_sf is required for W4A8")
         hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
     elif (activation_format, weight_format) == (
-        QuantVariant.BF16,
-        QuantVariant.MXFP4,
+        QuantFormat.BF16,
+        QuantFormat.NVFP4,
     ):
         if x_sf is not None:
             raise ValueError("x_sf must be None when format is w4a16")
@@ -4273,7 +4273,7 @@ def _cute_dsl_fused_moe_reference(
         raise ValueError(
             f"unsupported format pair ({activation_format!r}, {weight_format!r})"
         )
-    if weight_format is QuantVariant.MXFP4:
+    if weight_format is QuantFormat.MXFP4:
 
         def mma_scales_to_logical(scales, rows, columns):
             groups = scales.shape[5]
@@ -4290,10 +4290,10 @@ def _cute_dsl_fused_moe_reference(
             w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
         )
     W1 = _dequantize_fp4_tensor(
-        w1_weight, w1_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4
+        w1_weight, w1_weight_sf, is_ue8m0_scales=weight_format is QuantFormat.MXFP4
     )
     W2 = _dequantize_fp4_tensor(
-        w2_weight, w2_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4
+        w2_weight, w2_weight_sf, is_ue8m0_scales=weight_format is QuantFormat.MXFP4
     )
     if normalize_activation_type(activation_type).is_gated:
         experts, rows, hidden = W1.shape

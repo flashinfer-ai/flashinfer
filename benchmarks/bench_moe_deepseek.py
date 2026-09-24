@@ -375,7 +375,8 @@ def bench_cute_dsl(
             cudaProfilerStart/Stop instead of benchmarking.
         profile_iters: Number of cold-L2 graph replays to capture.
     """
-    from flashinfer import QuantVariant, SfLayout, nvfp4_quantize
+    from flashinfer import SfLayout, nvfp4_quantize
+    from flashinfer.fused_moe import QuantFormat
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -387,8 +388,8 @@ def bench_cute_dsl(
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
     if (activation_format, weight_format) not in (
-        (QuantVariant.NVFP4, QuantVariant.NVFP4),
-        (QuantVariant.BF16, QuantVariant.MXFP4),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.BF16, QuantFormat.NVFP4),
     ):
         raise ValueError(
             "Unsupported CuTe DSL format pair: "
@@ -402,7 +403,7 @@ def bench_cute_dsl(
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
     activation_global_scale = None
-    if activation_format is QuantVariant.NVFP4:
+    if activation_format is QuantFormat.NVFP4:
         activation_global_scale = (
             make_nvfp4_global_scale(
                 inputs["hidden_bf16"],
@@ -413,7 +414,7 @@ def bench_cute_dsl(
             else gs1
         )
 
-    if activation_format is QuantVariant.BF16 or include_activation_quant:
+    if activation_format is QuantFormat.BF16 or include_activation_quant:
         xf = inputs["hidden_bf16"]
         xs = None
         hidden_per_token_scale = None
@@ -433,7 +434,7 @@ def bench_cute_dsl(
 
     def prepare_activation(x, x_sf):
         per_token_scale = hidden_per_token_scale
-        if activation_format is QuantVariant.BF16:
+        if activation_format is QuantFormat.BF16:
             return x, None, None
         if include_activation_quant:
             if use_per_token_activation:
@@ -476,7 +477,7 @@ def bench_cute_dsl(
     alpha = torch.ones(num_local_experts, device=dev)
     fc2sc = (
         None
-        if activation_format is QuantVariant.BF16
+        if activation_format is QuantFormat.BF16
         else torch.tensor([1.0], device=dev)
     )
 
@@ -1183,7 +1184,7 @@ def _benchmark_single(
         use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
         do_autotune: Forwarded to each bench_* function — wraps pre-warm only.
     """
-    from flashinfer import QuantVariant
+    from flashinfer.fused_moe import QuantFormat
 
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
@@ -1220,8 +1221,8 @@ def _benchmark_single(
             use_cupti,
             use_wrapper=use_wrapper,
             do_autotune=do_autotune,
-            activation_format=QuantVariant.NVFP4,
-            weight_format=QuantVariant.NVFP4,
+            activation_format=QuantFormat.NVFP4,
+            weight_format=QuantFormat.NVFP4,
             use_per_token_activation=use_per_token_activation,
             include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
@@ -1240,8 +1241,8 @@ def _benchmark_single(
             use_cupti,
             use_wrapper=use_wrapper,
             do_autotune=do_autotune,
-            activation_format=QuantVariant.BF16,
-            weight_format=QuantVariant.MXFP4,
+            activation_format=QuantFormat.BF16,
+            weight_format=QuantFormat.NVFP4,
             use_per_token_activation=use_per_token_activation,
             include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
