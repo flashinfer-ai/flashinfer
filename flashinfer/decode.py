@@ -2388,7 +2388,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1
             )
-        self._kv_lens_buffer[:batch_size].copy_(
+        kv_lens_buffer = self._kv_lens_buffer
+        if kv_lens_buffer.shape[0] != batch_size:
+            kv_lens_buffer = kv_lens_buffer[:batch_size]
+        kv_lens_buffer.copy_(
             kv_lens_arr_host.to(torch.int32), non_blocking=non_blocking
         )
 
