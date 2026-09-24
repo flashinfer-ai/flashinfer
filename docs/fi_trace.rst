@@ -218,7 +218,16 @@ AlphaMoE aligned and routed traces include the optional uint8
 physical dimensions. They retain every raw scale input. When generating or
 replaying inputs, prepare these derived panels from the matching raw scales
 before repeated requests; unrelated panel bytes do not represent those weights.
-Omitting either optional tensor preserves the API's corresponding raw fallback.
+The routed trace also records optional uint8 ``w1_data_prepared`` as
+``[E*(N/128)*(K/256),128,128]``. Generate this buffer with
+``prepare_nvfp4_w1_data`` from the matching raw packed W1 weights, retain the
+raw weights, and reuse the immutable panels across requests. The selected
+prepared-data route uses BF16 expert-route storage and a separate FP32
+initial-output seed; trace inputs preserve the caller's initial BF16 output.
+Scale tensors remain optional and retain their existing fallback behavior.
+Omitting ``w1_data_prepared`` preserves the existing routed path; the
+prepared-data route requires both ``w1_data_prepared`` and
+``w1_scale_prepared``. ``w2_scale_prepared`` remains optional for that route.
 Routed traces also record the expert IDs and mutated alignment workspaces.
 
 MoE Routing Types

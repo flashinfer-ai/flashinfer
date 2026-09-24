@@ -669,13 +669,17 @@ def _alphamoe_nvfp4_routed_moe_impl(
     routed_scaling_factor: float,
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
+    w1_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
     if _alphamoe_try_complete_routed(
         hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
         gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
         output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
         num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
-        top_k, block_m, routed_scaling_factor, w1_scale_prepared,
+        top_k, block_m, routed_scaling_factor, w1_scale_prepared, w1_data_prepared,
+        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
     ):
         return
     # The private buffer is seeded by the alignment kernel on this stream.
@@ -747,6 +751,9 @@ def _alphamoe_nvfp4_routed_moe_fake(
     routed_scaling_factor: float,
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
+    w1_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
     pass
 
@@ -774,13 +781,16 @@ def alphamoe_nvfp4_routed_moe(
     routed_scaling_factor: float = 1.0,
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
+    w1_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
+    w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run route alignment, complete expert computation and weighted accumulation.
 
     Selected complete routes use private per-route accumulators and finalize
     contributions in route order, preserving the caller's existing output.
     The exact route controls seed initialization, FP32 or BF16 route storage,
-    optional compact-owner metadata and immutable prepared W1 scales. Buffer
+    optional compact-owner metadata and immutable prepared W1 scales/data. Buffer
     initialization, expert computation and finalization all stay inside this
     call and use the current stream, including during CUDA graph capture.
 
@@ -788,6 +798,12 @@ def alphamoe_nvfp4_routed_moe(
     accumulator and compute path. The aligned API is unchanged. Prepared scale
     tensors remain optional immutable model-load inputs; this function performs
     no weight preparation, host device-count read or automatic model fetching.
+    For the selected 8-, 128- and 512-token routes, pass ``w1_data_prepared`` from
+    :func:`prepare_nvfp4_w1_data`; omitting it retains the existing path.
+    For the adjacent gate/up M512 route, pass both
+    ``w1_gate_up_data_prepared`` and ``w1_gate_up_scale_prepared`` from the
+    matching model-load preparation helpers. They use a distinct layout
+    from the optional old prepared inputs. No packing occurs in this call.
     The caller-owned output is updated and returned.
     """
     _check_alphamoe_nvfp4_supported(
@@ -811,11 +827,15 @@ def alphamoe_nvfp4_routed_moe(
         w1_scale_prepared,
         w2_scale_prepared,
     )
+    _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
+    _check_prepared_w1_gate_up(gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared)
     if not (is_alphamoe_nvfp4_routed_seed_supported(
         hidden_states, gemm1_weights, topk_ids, out, top_k, block_m
     ) or _alphamoe_complete_route_id(
         hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
         gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
+        w1_data_prepared,
+        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
     )):
         raise ValueError("routed companion requires supported route metadata")
     _alphamoe_nvfp4_routed_moe_impl(
@@ -840,6 +860,8 @@ def alphamoe_nvfp4_routed_moe(
         routed_scaling_factor,
         w1_scale_prepared,
         w2_scale_prepared,
+        w1_data_prepared,
+        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
     )
     return out
 
@@ -879,6 +901,36 @@ def is_alphamoe_nvfp4_routed_seed_supported(
             topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True)
     return is_alphamoe_nvfp4_small_alignment_seed_supported(
         topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True)
+
+
+def prepare_nvfp4_w1_data(w1):
+    """Prepare immutable packed W1 panels once during model loading.
+
+    The contiguous uint8 input is [E,N,K/2] in the original gate/up row order.
+    The result is [E*(N/128)*(K/256),128,128], an exact byte permutation with
+    no dequantization. Keep the raw weights and this tensor alive and immutable
+    while using the routed operator. Preparation is outside routed execution.
+    """
+    if w1.dtype != torch.uint8:
+        raise TypeError("W1 data must contain original packed uint8 bytes")
+    if w1.ndim != 3 or not w1.is_contiguous():
+        raise ValueError("W1 data must be contiguous [E,N,K/2]")
+    experts, rows, packed_k = map(int, w1.shape)
+    if min(experts, rows, packed_k) <= 0 or rows % 128 or packed_k % 128:
+        raise ValueError("Prepared W1 data requires N%128=0 and K%256=0")
+    return (w1.view(experts, rows // 128, 128, packed_k // 128, 128)
+            .permute(0, 1, 3, 2, 4).contiguous().view(-1, 128, 128))
+
+
+def _check_prepared_w1_data(w1, prepared):
+    if prepared is None:
+        return
+    _require_cuda_tensor("w1_data_prepared", prepared, dtype=torch.uint8, ndim=3)
+    e, n, packed_k = w1.shape
+    expected = (e * (n // 128) * (packed_k // 128), 128, 128)
+    if (prepared.device != w1.device or tuple(prepared.shape) != expected
+            or prepared.data_ptr() % 16 != 0):
+        raise ValueError("Prepared W1 data must match the raw weights and panel layout")
 
 
 def prepare_nvfp4_w1_scales(w1_scale):
@@ -936,7 +988,7 @@ def prepare_nvfp4_w2_scales(w2_scale):
         experts * output_tiles * intermediate_blocks, 8, 128
     )
 
-__all__ += ["prepare_nvfp4_w1_scales", "prepare_nvfp4_w2_scales"]
+__all__ += ["prepare_nvfp4_w1_scales", "prepare_nvfp4_w2_scales", "prepare_nvfp4_w1_data"]
 
 
 def _uses_compact_owner_routed(
@@ -977,7 +1029,8 @@ def _uses_compact_owner_routed(
 
 def _alphamoe_complete_route_id(
     hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-    gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
+    gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared, w1_data_prepared=None,
+    w1_gate_up_data_prepared=None, w1_gate_up_scale_prepared=None,
 ):
     """Select complete routes from immutable host metadata and owned sidecars."""
     m, packed_k = hidden_states.shape
@@ -989,6 +1042,13 @@ def _alphamoe_complete_route_id(
         topk_ids, e + 1, block_m, out, True
     ):
         return 1
+    if m == 512 and w1_gate_up_data_prepared is not None and w1_gate_up_scale_prepared is not None:
+        _check_prepared_w1_gate_up(gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared)
+        if (tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
+                and all(scale.data_ptr() % 4 == 0 for scale in
+                (hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale))
+                and is_alphamoe_nvfp4_alignment_seed_supported(topk_ids, e + 1, block_m, out, True)):
+            return 14 if out.data_ptr() % 16 == 0 else 15
     if w1_scale_prepared is None:
         return 0
     prepared = (
@@ -1006,10 +1066,14 @@ def _alphamoe_complete_route_id(
     ):
         return 0
     if m == 8:
-        return 2
+        return 9 if w1_data_prepared is not None else 2
     if m == 128:
+        if w1_data_prepared is not None:
+            return 10 if out.data_ptr() % 16 == 0 else 11
         return 3
     if m == 512:
+        if w1_data_prepared is not None:
+            return 12 if out.data_ptr() % 16 == 0 else 13
         return 4 if out.data_ptr() % 16 == 0 else 5
     if m >= 128:
         return 6
@@ -1022,10 +1086,13 @@ def _alphamoe_try_complete_routed(
     output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
     num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
     top_k, block_m, routed_scaling_factor, w1_scale_prepared,
+    w1_data_prepared=None,
+    w1_gate_up_data_prepared=None, w1_gate_up_scale_prepared=None,
 ):
     route_id = _alphamoe_complete_route_id(
         hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-        gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
+        gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared, w1_data_prepared,
+        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
     )
     if route_id == 0:
         return False
@@ -1060,16 +1127,16 @@ def _alphamoe_try_complete_routed(
         owner_capacity = (topk_ids.numel() + 31) // 32 + e
         owner_plan = torch.empty((owner_capacity, 3), dtype=torch.int32, device=hidden_states.device)
         owner_count = torch.empty((1,), dtype=torch.int32, device=hidden_states.device)
-        if route_id in (2, 6, 7):
+        if route_id in (2, 6, 7, 9):
             initial_out = torch.empty_like(out, dtype=torch.float32)
         act_workspace = torch.empty((capacity * blocks, 512), dtype=torch.uint8,
                                     device=hidden_states.device)
         sf_workspace = torch.empty((capacity * blocks, 1024), dtype=torch.uint8,
                                    device=hidden_states.device)
-        route_dtype = torch.bfloat16 if route_id in (4, 5, 6) else torch.float32
+        route_dtype = torch.bfloat16 if route_id in (4, 5, 6, 9, 10, 11, 12, 13, 14, 15) else torch.float32
         allocate_routes = torch.zeros if route_id == 7 else torch.empty
         route_accumulator = allocate_routes((m * top_k, k), dtype=route_dtype, device=out.device)
-        if route_id in (2, 3):
+        if route_id in (2, 3, 9, 10, 11, 12, 13, 14, 15):
             route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
         else:
             route_experts = torch.full((m * top_k,), -1, dtype=torch.int32, device=out.device)
@@ -1080,6 +1147,71 @@ def _alphamoe_try_complete_routed(
         num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
         route_accumulator, route_experts, owner_plan, owner_count, initial_out,
         partial_workspace, act_workspace, sf_workspace, top_k, block_m,
-        routed_scaling_factor, w1_scale_prepared, route_id,
+        routed_scaling_factor, w1_scale_prepared, route_id, w1_data_prepared,
+        w1_gate_up_data_prepared, w1_gate_up_scale_prepared,
     )
     return True
+
+
+def _check_prepared_w1_gate_up(w1, data, scales):
+    if data is None and scales is None:
+        return
+    if data is None or scales is None:
+        raise ValueError("Adjacent gate/up data and scale carriers must be supplied together")
+    e, n, packed_k = w1.shape
+    records = e * (n // 256) * (packed_k // 128)
+    for name, value, rows in (("w1_gate_up_data_prepared", data, 256),
+                              ("w1_gate_up_scale_prepared", scales, 32)):
+        _require_cuda_tensor(name, value, dtype=torch.uint8, ndim=3)
+        if (value.device != w1.device or not value.is_contiguous()
+                or tuple(value.shape) != (records, rows, 128)
+                or value.data_ptr() % 16 != 0):
+            raise ValueError(name + " must match the adjacent gate/up panel layout")
+
+
+def prepare_nvfp4_w1_gate_up_data(w1):
+    import torch
+
+    assert w1.dtype == torch.uint8 and w1.ndim == 3 and w1.is_contiguous()
+    experts, rows, packed_k = map(int, w1.shape)
+    assert rows % 256 == 0 and packed_k % 128 == 0
+    blocks, k_tiles = rows // 256, packed_k // 128
+    return (w1.view(experts, 2, blocks, 128, k_tiles, 128)
+            .permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, 256, 128))
+
+
+def restore_nvfp4_w1_gate_up_data(prepared, original_shape):
+    import torch
+
+    experts, rows, packed_k = map(int, original_shape)
+    assert rows % 256 == 0 and packed_k % 128 == 0
+    blocks, k_tiles = rows // 256, packed_k // 128
+    assert prepared.dtype == torch.uint8 and prepared.is_contiguous()
+    assert tuple(prepared.shape) == (experts * blocks * k_tiles, 256, 128)
+    return (prepared.view(experts, blocks, k_tiles, 2, 128, 128)
+            .permute(0, 3, 1, 4, 2, 5).contiguous().view(experts, rows, packed_k))
+
+
+def prepare_nvfp4_w1_gate_up_scales(prepared_scales, original_weight_shape):
+    import torch
+
+    experts, rows, packed_k = map(int, original_weight_shape)
+    assert rows % 256 == 0 and packed_k % 128 == 0
+    blocks, k_tiles = rows // 256, packed_k // 128
+    assert prepared_scales.dtype == torch.uint8 and prepared_scales.is_contiguous()
+    assert tuple(prepared_scales.shape) == (experts * 2 * blocks * k_tiles, 16, 128)
+    return (prepared_scales.view(experts, 2, blocks, k_tiles, 16, 128)
+            .permute(0, 2, 3, 1, 4, 5).contiguous().view(-1, 32, 128))
+
+
+def restore_nvfp4_w1_gate_up_scales(prepared, original_weight_shape):
+    import torch
+
+    experts, rows, packed_k = map(int, original_weight_shape)
+    assert rows % 256 == 0 and packed_k % 128 == 0
+    blocks, k_tiles = rows // 256, packed_k // 128
+    assert prepared.dtype == torch.uint8 and prepared.is_contiguous()
+    assert tuple(prepared.shape) == (experts * blocks * k_tiles, 32, 128)
+    return (prepared.view(experts, blocks, k_tiles, 2, 16, 128)
+            .permute(0, 3, 1, 2, 4, 5).contiguous().view(-1, 16, 128))
+

@@ -172,7 +172,8 @@ The AlphaMoE path consumes packed E2M1 activations and weights with linear
 per-16 E4M3 scales. The aligned entry consumes an existing routing plan; the
 routed entry aligns the supplied expert IDs before compute. Shape-selected
 stages perform gate/up projection, SwiGLU, NVFP4 requantization and down
-projection, accumulating through FP32 scratch into caller-owned BF16 output.
+projection. The aligned path uses FP32 scratch; selected routed paths use
+FP32 or BF16 route storage before finalizing into caller-owned BF16 output.
 Neither entry resets the caller's initial output. Three contiguous FP32
 ``[E]`` tensors provide the per-expert static ModelOpt scales: the gate scale
 is applied before SiLU, the up scale before SwiGLU multiplication, and the down
@@ -183,6 +184,7 @@ scale before route weighting.
 
     alphamoe_nvfp4_aligned_moe
     alphamoe_nvfp4_routed_moe
+    prepare_nvfp4_w1_data
     prepare_nvfp4_w1_scales
     prepare_nvfp4_w2_scales
 
@@ -228,11 +230,50 @@ Supply the buffers through optional keywords on either entry::
     # Existing aligned or routed call: retain every raw argument and append
     # **prepared_scales. Reuse these same tensors for subsequent requests.
 
-The current prepared routes use W1 panels for the matching 128-token and
-512-token shapes, and W2 panels for the matching 512-token shape. Other
-shapes retain their existing raw-scale paths. Missing or incompatible optional
-panels also retain raw fallback; a valid W1 panel with no valid W2 panel uses
-the W1-only path. No preparation is performed inside a request.
+The matching 128-token and 512-token prepared-scale paths continue to use W1
+panels, and the matching 512-token path also uses W2 panels. The eight-token
+routed data path below additionally uses prepared W1 scales. Missing or
+incompatible optional scale panels retain their existing fallback; a valid W1
+scale panel with no valid W2 scale panel uses the W1-only path. No preparation
+is performed inside a request.
+
+AlphaMoE NVFP4 prepared gate/up data
+----------------------------------
+
+``prepare_nvfp4_w1_data`` permutes the original contiguous uint8 packed W1
+weights ``[E,N,K/2]`` into ``[E*(N/128)*(K/256),128,128]`` panels. It preserves
+every packed byte without dequantization or requantization and requires
+``N % 128 == 0`` and ``K % 256 == 0``. The resulting tensor occupies the same
+number of bytes as the raw W1 weights: an additional 768 MiB per local weight
+pair at ``E=256, N=1024, K=6144``. Keep both tensors alive and immutable.
+Prepare the panels after the final device-local weight load, before warmup or
+CUDA graph capture, and replace them when the raw weights are replaced. They
+are derived data and need not be saved in the model checkpoint.
+
+The routed entry selects the prepared-data path for exactly
+``M=8, N=1024, K=6144, E=256, top_k=8, block_m=8``, with compatible
+``w1_scale_prepared`` and ``w1_data_prepared`` tensors. Eight tokens alone do
+not select this path: calls with other dimensions keep their existing route.
+Omitting ``w1_data_prepared`` also keeps the existing route. The aligned entry
+does not accept this additional keyword.
+
+This exact routed path stores expert contributions in BF16 route storage and
+uses a separate FP32 copy of the caller's initial output when accumulating
+weighted contributions in route order. It does not reset caller output or
+prepare weights inside the request.
+
+Prepare and pass the data buffer only to the routed entry::
+
+    from flashinfer.fused_moe import prepare_nvfp4_w1_data
+
+    # Once, alongside prepared_scales after device-local weight loading:
+    w1_data_prepared = prepare_nvfp4_w1_data(gemm1_weights)
+    prepared_routed = dict(
+        prepared_scales, w1_data_prepared=w1_data_prepared
+    )
+
+    # Existing routed call: retain every raw argument and append
+    # **prepared_routed. Reuse the same tensors for subsequent requests.
 
 The aligned entry keeps its existing ``None`` return value. The routed entry
 returns the caller's output tensor. Neither entry resets caller output; provide
