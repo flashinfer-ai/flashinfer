@@ -65,7 +65,6 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.co
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
-    prims_ts_batch_mla_decode_with_kv_cache,
 )
 import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
@@ -815,15 +814,15 @@ def _run_standalone(
         if out is None
         else out
     )
-    result = prims_ts_batch_mla_decode_with_kv_cache(
+    result = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
-        workspace,
-        _LATENT_DIM,
-        _ROPE_DIM,
         case.block_tables,
         case.seq_lens,
-        case.max_seq_len,
+        workspace_buffer=workspace,
+        max_kv_len=case.max_seq_len,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
         qo_indptr=qo_indptr,
         max_seq_len_q=resolved_max_seq_len_q,
         out=output,
@@ -1141,7 +1140,6 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
         BatchMLADecodePagedTSWrapper.run,
         batch_mla_decode_with_paged_kv_cache,
         get_prims_ts_batch_mla_decode_workspace_size,
-        prims_ts_batch_mla_decode_with_kv_cache,
     )
     violations = []
     for surface in surfaces:
@@ -1195,6 +1193,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "o_data_type",
         "mask_type",
         "workspace_buffer",
+        "validate",
     )
     for name in (
         "device",
@@ -1238,12 +1237,18 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["validate"].default is True
 
 
+@pytest.mark.parametrize("validate", (True, False))
 def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     monkeypatch,
+    validate,
 ):
     """Keep plan publication atomic and compilation after workspace checks."""
 
     events = []
+    device_calls = []
+    expected_events = (
+        ["spec"] + (["validate_workspace"] if validate else []) + ["bind_workspace"]
+    )
     policy = (("source", "auto"), ("split_kv", 1))
     spec = mla_decode_module._MLADecodeLaunchSpec(
         kernel=object(),
@@ -1255,6 +1260,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
 
     def resolve_device(device):
         assert device == "cuda:0"
+        device_calls.append("resolve")
         return torch.device("cpu"), 0
 
     def resolve_spec(*args):
@@ -1271,11 +1277,16 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         return original_bind(workspace_buffer, layout)
 
     def compile_plan(*args):
-        assert events == ["spec", "validate_workspace", "bind_workspace"]
+        assert events == expected_events
         events.append("compile")
         return lambda *launch_args: None
 
     monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", resolve_device)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_validate_runtime_device",
+        lambda _device: device_calls.append("validate"),
+    )
     monkeypatch.setattr(
         mla_decode_module, "_resolve_mla_decode_launch_spec", resolve_spec
     )
@@ -1306,9 +1317,11 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
         workspace_buffer=workspace,
+        validate=validate,
     )
 
-    assert events == ["spec", "validate_workspace", "bind_workspace", "compile"]
+    assert events == [*expected_events, "compile"]
+    assert device_calls == (["resolve", "validate"] if validate else ["resolve"])
     assert tuple(vars(wrapper)) == ("_plan_state",)
     state = wrapper._plan_state
     assert state is not None
@@ -1335,6 +1348,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
             o_data_type=torch.bfloat16,
+            validate=validate,
             workspace_buffer=workspace,
         )
     assert wrapper._plan_state is state
@@ -1860,8 +1874,8 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
-    """The standalone ABI cannot derive a packed-Q JIT bound on its hot path."""
+def test_attention_ts_mla_packed_query_requires_trusted_static_bound():
+    """The trusted caller-workspace path requires an explicit packed-Q bound."""
 
     case = _make_mla_case(
         batch_size=2,
@@ -1874,17 +1888,18 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
     )
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="max_seq_len_q is required"):
-        prims_ts_batch_mla_decode_with_kv_cache(
+    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+        batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
-            workspace,
-            _LATENT_DIM,
-            _ROPE_DIM,
             case.block_tables,
             case.seq_lens,
-            case.max_seq_len,
+            workspace_buffer=workspace,
+            max_kv_len=case.max_seq_len,
+            kv_lora_rank=_LATENT_DIM,
+            qk_rope_head_dim=_ROPE_DIM,
             qo_indptr=qo_indptr,
+            validate=False,
         )
 
 

@@ -115,6 +115,10 @@ class MoEEpMegaLayer(nn.Module):
         self._kernel = create_mega_kernel(self._megakernel_config)
         self._kernel.bind_ep_bootstrap(bootstrap)
         self._runtime = None
+        self._workspace: Any = None
+        # Check backend geometry and compiler capabilities before collective
+        # runtime initialization.
+        self._kernel.validate_init(bootstrap, fleet_params)
         if bootstrap.auto_bootstrap:
             self._runtime = bootstrap_moe_ep_runtime(
                 bootstrap,
@@ -122,7 +126,6 @@ class MoEEpMegaLayer(nn.Module):
             )
 
         validate_bootstrap_world_size(bootstrap)
-        self._kernel.validate_init(bootstrap, fleet_params)
 
         if backend.transformed_weights is None:
             validate_fleet_weights(weights, fleet_params, bootstrap.world_size)
@@ -131,7 +134,6 @@ class MoEEpMegaLayer(nn.Module):
             weights if backend.transformed_weights is None else None
         )
         self._transformed: Optional[Any] = None
-        self._workspace: Any = None
         self._default_workspace_handle: MoEEpMegaWorkspace | None = None
         # Strong tracking is intentional: workspace create/destroy is an EP
         # collective and therefore must never be triggered by rank-local GC.

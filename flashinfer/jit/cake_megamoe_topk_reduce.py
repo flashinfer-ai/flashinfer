@@ -30,7 +30,7 @@ _SOURCE_FILE = "cake_megamoe_topk_reduce_kernels.cu"
 _MANIFEST_FILE = "manifest.json"
 _BINDING_HEADER = "cake_megamoe_topk_reduce_binding.cuh"
 _KERNEL_SYMBOL = "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
-_SOURCE_SHA256 = "721e39685cc4f217b6e15a32dc0359cbcd0d2cee671da8fab3b6dd5aa536ee89"
+_SOURCE_SHA256 = "3b83507e0d50dd5089389650c692fd4c17283ebe1f371a62ccb2a7d07b854dda"
 _MANIFEST_KEYS = {
     "arch",
     "compile_flags",
