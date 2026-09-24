@@ -3815,18 +3815,29 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
   void prepare_moe(int64_t& moe_tactic) override {
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
-    int32_t max_num_padded_tokens_gemm1 =
+    // The batched-GEMM TMA loads can touch the first 128 KiB of an operand regardless of how many
+    // of its rows are valid, so each buffer spans maybeGetMinTokenCount() rows of its own element
+    // width. The FP8 FC2 operand thus needs twice the rows of the BF16 FC1 output it is quantized
+    // from.
+    int32_t const max_num_padded_tokens_gemm1 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
             workspace.total_max_padded_tokens, args->intermediate_size,
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
-    int32_t max_num_padded_tokens_gemm2 = workspace.total_max_padded_tokens;
+    int32_t const max_num_padded_tokens_activation =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+            workspace.total_max_padded_tokens, args->intermediate_size,
+            btg::dtypeGetNumBits(btg::Dtype::E4m3));
+    int32_t const max_num_padded_tokens_gemm2 =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+            workspace.total_max_padded_tokens, args->hidden_size,
+            btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
 
     gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size}, dl_bfloat16,
                                 hidden_states.device());
-    activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+    activation_output = alloc_tensor({max_num_padded_tokens_activation, args->intermediate_size},
                                      dl_uint8, hidden_states.device());
     activation_output_scale =
-        alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
+        alloc_tensor({max_num_padded_tokens_activation}, dl_float32, hidden_states.device());
 
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
                                 hidden_states.device());
