@@ -965,7 +965,9 @@ def test_full_kimi_paired_decode_weights_require_exact_pair(
     # canonical representation is bound.
     ineligible = _full_kimi_case(full_kimi_case, 3, "hot")
     plan, _, _ = prepare_candidate(
-        ineligible, prepared_weights=weights, paired_decode_weights=full_kimi_decode_pair
+        ineligible,
+        prepared_weights=weights,
+        paired_decode_weights=full_kimi_decode_pair,
     )
     assert _selected_w1(plan) is canonical_w1
     plan.run()

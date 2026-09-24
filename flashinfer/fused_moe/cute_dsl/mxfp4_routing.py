@@ -19,6 +19,8 @@ and binds caller-owned buffers outside capture; execution uses the supplied
 CUDA stream.
 """
 
+from typing import Any, Dict, Tuple
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -31,7 +33,7 @@ from ...cute_dsl.utils import make_ptr
 from .moe_utils import get_max_num_tiles
 
 
-_route_preprocess_kernel_cache = {}
+_route_preprocess_kernel_cache: Dict[Tuple, Any] = {}
 
 _SORT_BUFFER_NAMES = (
     "out_tile_idx_to_expert_idx",
@@ -89,7 +91,11 @@ class _RoutePreprocess:
         # loop remains correct even when its domain is larger than this one.
         tasks = tokens * (hidden_size // 2)
         self.kernel(ids_src, weights_src, ids_dst, weights_dst, output_words).launch(
-            grid=(cute.ceil_div(tasks, self.threads * self.clear_words_per_thread), 1, 1),
+            grid=(
+                cute.ceil_div(tasks, self.threads * self.clear_words_per_thread),
+                1,
+                1,
+            ),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -187,7 +193,14 @@ def _routing_warp_inclusive(value: cutlass.Int32, lane: cutlass.Int32):
 
 
 class _FusedRoutePreprocess:
-    def __init__(self, mode, threads, single_tile_per_expert=False, fused_prefill_sort=False, _clear_output=True):
+    def __init__(
+        self,
+        mode,
+        threads,
+        single_tile_per_expert=False,
+        fused_prefill_sort=False,
+        _clear_output=True,
+    ):
         # The fused sorting mode is selected only for full-shape B300 T512.
         self.fused_prefill_sort = fused_prefill_sort
         self.clear_output = _clear_output
@@ -271,7 +284,16 @@ class _FusedRoutePreprocess:
             local_offset,
             tile_size,
         ).launch(
-            grid=(cute.ceil_div(cute.size(output), self.threads * (4 if self.fused_prefill_sort else 1)) if self.clear_output else 1, 1, 1),
+            grid=(
+                cute.ceil_div(
+                    cute.size(output),
+                    self.threads * (4 if self.fused_prefill_sort else 1),
+                )
+                if self.clear_output
+                else 1,
+                1,
+                1,
+            ),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -318,7 +340,9 @@ class _FusedRoutePreprocess:
                         expert = expert >> 16
                         ids_dst[route] = expert
                     if cutlass.const_expr(self.convert_weights):
-                        weights_dst[route] = weights_src[(token, slot)].to(cutlass.Float32)
+                        weights_dst[route] = weights_src[(token, slot)].to(
+                            cutlass.Float32
+                        )
                     local = expert - local_offset
                     expanded[route] = cutlass.Int32(-1)
                     if (
@@ -341,7 +365,9 @@ class _FusedRoutePreprocess:
                         expert = expert >> 16
                         ids_dst[tid] = expert
                     if cutlass.const_expr(self.convert_weights):
-                        weights_dst[tid] = weights_src[(token, slot)].to(cutlass.Float32)
+                        weights_dst[tid] = weights_src[(token, slot)].to(
+                            cutlass.Float32
+                        )
                     local = expert - local_offset
                     expanded[tid] = cutlass.Int32(-1)
                     if (
@@ -418,7 +444,9 @@ class _FusedRoutePreprocess:
             # Each word is covered once, independently of the assignment count.
             if cutlass.const_expr(self.fused_prefill_sort):
                 grid_x, _, _ = cute.arch.grid_dim()
-                for word in cutlass.range(block * self.threads + tid, cute.size(output), grid_x * self.threads):
+                for word in cutlass.range(
+                    block * self.threads + tid, cute.size(output), grid_x * self.threads
+                ):
                     output[word] = cutlass.Uint32(0)
             else:
                 word = block * self.threads + tid
@@ -534,13 +562,10 @@ def _plan_route_preprocess(
     if not isinstance(topk_ids, torch.Tensor) or topk_ids.ndim != 2:
         raise ValueError("topk_ids must be a 2-D tensor")
     top_k = topk_ids.shape[1]
-    if (
-        tokens <= 0
-        or not 1 <= top_k <= 32
-        or hidden_size <= 0
-        or hidden_size % 2
-    ):
-        raise ValueError("require positive T, top_k=1..32 and positive even hidden_size")
+    if tokens <= 0 or not 1 <= top_k <= 32 or hidden_size <= 0 or hidden_size % 2:
+        raise ValueError(
+            "require positive T, top_k=1..32 and positive even hidden_size"
+        )
     if threads not in (128, 256):
         raise ValueError("route preprocessing supports 128 or 256 threads per block")
     device = output.device
@@ -558,10 +583,16 @@ def _plan_route_preprocess(
     sorts_tokens = moe_sort_buffers is not None
     if sorts_tokens:
         if _fused_prefill_sort:
-            if not (tokens == 512 and hidden_size == 7168 and top_k == 16
-                    and num_experts == 896 and num_local_experts == 112
-                    and tile_size == 128 and not _single_tile_per_expert
-                    and (topk_weights is None or topk_weights.dtype == torch.bfloat16)):
+            if not (
+                tokens == 512
+                and hidden_size == 7168
+                and top_k == 16
+                and num_experts == 896
+                and num_local_experts == 112
+                and tile_size == 128
+                and not _single_tile_per_expert
+                and (topk_weights is None or topk_weights.dtype == torch.bfloat16)
+            ):
                 raise ValueError("invalid private T512 fused sorting geometry")
         else:
             if tokens > 16:
@@ -763,9 +794,17 @@ def _plan_route_preprocess(
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         if compiled is None:
             kernel = (
-                _FusedRoutePreprocess(mode, threads, single_tile_per_expert, _fused_prefill_sort, _clear_output)
+                _FusedRoutePreprocess(
+                    mode,
+                    threads,
+                    single_tile_per_expert,
+                    _fused_prefill_sort,
+                    _clear_output,
+                )
                 if sorts_tokens
-                else _RoutePreprocess(mode, threads, clear_words_per_thread, _vector_clear=vector_clear)
+                else _RoutePreprocess(
+                    mode, threads, clear_words_per_thread, _vector_clear=vector_clear
+                )
             )
             compiled = cute.compile(kernel, *arguments, stream=stream)
             _route_preprocess_kernel_cache[cache_key] = compiled

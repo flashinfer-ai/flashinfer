@@ -116,7 +116,14 @@ class Mxfp4MoEPlan:
     """
 
     def __init__(
-        self, *, kwargs, workspace, topk_ids, topk_weights, route_ids, route_weights,
+        self,
+        *,
+        kwargs,
+        workspace,
+        topk_ids,
+        topk_weights,
+        route_ids,
+        route_weights,
         _fused_prefill_sort=False,
     ):
         # Keep every bound tensor alive alongside the raw launch pointers.
@@ -161,7 +168,9 @@ class Mxfp4MoEPlan:
                 self.output,
             )
             with torch.cuda.device(self.device):
-                self._expanded_combine.run(cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+                self._expanded_combine.run(
+                    cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+                )
         decode = self.output.shape[0] <= 16
         # Prefill keeps native sorting; fuse only routing conversion and the
         # output clear. FP32 routes have no conversion to combine with clear.
@@ -169,8 +178,7 @@ class Mxfp4MoEPlan:
             not decode
             and not self._kwargs["enable_pdl"]
             and (
-                self._topk_weights is None
-                or self._topk_weights.dtype == torch.bfloat16
+                self._topk_weights is None or self._topk_weights.dtype == torch.bfloat16
             )
         )
         if decode or prefill_route_conversion:
@@ -182,7 +190,8 @@ class Mxfp4MoEPlan:
                 output=self.output,
                 moe_sort_buffers=(
                     None
-                    if self._kwargs["enable_pdl"] or not (decode or self._fused_prefill_sort)
+                    if self._kwargs["enable_pdl"]
+                    or not (decode or self._fused_prefill_sort)
                     else self._kwargs["moe_sort_buffers"]
                 ),
                 num_experts=self._kwargs["num_experts"],
@@ -323,11 +332,22 @@ class CuteDslMxfp4MoEWrapper:
             ("w1_alpha", (self.num_local_experts,), torch.float32, 4),
             ("w2_alpha", (self.num_local_experts,), torch.float32, 4),
         ]
-        if (num_tokens == 512 and self.hidden_size == 7168
-                and self.intermediate_size == 3072 and self.num_experts == 896
-                and self.num_local_experts == 112 and self.top_k == 16):
-            specs.append(("expanded_contributions_bf16",
-                          (num_tokens * self.top_k, self.hidden_size), torch.bfloat16, 2))
+        if (
+            num_tokens == 512
+            and self.hidden_size == 7168
+            and self.intermediate_size == 3072
+            and self.num_experts == 896
+            and self.num_local_experts == 112
+            and self.top_k == 16
+        ):
+            specs.append(
+                (
+                    "expanded_contributions_bf16",
+                    (num_tokens * self.top_k, self.hidden_size),
+                    torch.bfloat16,
+                    2,
+                )
+            )
         if num_tokens > 1024:
             specs.append(("out_expert_counts", (2 * self.num_experts,), torch.int32, 4))
         fields, offset = [], 0
@@ -625,7 +645,9 @@ class CuteDslMxfp4MoEWrapper:
                 _enable_sparse_prefill_epilogue=sparse_prefill_epilogue,
                 _enable_sparse_prefill_narrow_a=sparse_prefill_narrow_a,
                 _expanded_weighted_output=(
-                    buffers["expanded_contributions_bf16"] if write_expanded_weighted else None
+                    buffers["expanded_contributions_bf16"]
+                    if write_expanded_weighted
+                    else None
                 ),
             )
             plan = Mxfp4MoEPlan(

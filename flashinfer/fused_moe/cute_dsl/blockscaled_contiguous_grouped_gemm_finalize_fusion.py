@@ -258,17 +258,25 @@ def _get_compiled_finalize_kernel(
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
 
     enable_t16_const_scheduler = bool(
-        enable_skinny_finalize and seq_len == 16 and n == 7168 and k == 3072
-        and num_experts == 112 and topk == 16
+        enable_skinny_finalize
+        and seq_len == 16
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
     )
     enable_t16_slot_planes = enable_t16_const_scheduler
     enable_t4_const_scheduler = bool(
-        enable_skinny_finalize and seq_len == 4 and n == 7168 and k == 3072
-        and num_experts == 112 and topk == 16
+        enable_skinny_finalize
+        and seq_len == 4
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
     )
 
     # Cache key includes tactic and pointer dtype parameters, NOT problem dimensions.
-    cache_key = (
+    cache_key: Tuple[Any, ...] = (
         "sm107" if is_rubin else "sm100",
         sf_vec_size,
         tile_size,
@@ -348,7 +356,7 @@ def _get_compiled_finalize_kernel(
             if enable_skinny_finalize:
                 from .blackwell.skinny_decode_finalize import SkinnyDecodeFinalizeKernel
 
-                gemm_bw = SkinnyDecodeFinalizeKernel(
+                gemm_bw: Any = SkinnyDecodeFinalizeKernel(
                     enable_t16_const_scheduler=enable_t16_const_scheduler,
                     enable_t16_slot_planes=enable_t16_slot_planes,
                     enable_t4_const_scheduler=enable_t4_const_scheduler,
@@ -409,9 +417,13 @@ def _get_compiled_finalize_kernel(
         )
 
         if enable_route_split:
-            from .blackwell.single_n16_prefill_finalize import SingleN16PrefillFinalizeKernel
+            from .blackwell.single_n16_prefill_finalize import (
+                SingleN16PrefillFinalizeKernel,
+            )
+
             sparse_kernel = SingleN16PrefillFinalizeKernel(
-                write_expanded_weighted=write_expanded_weighted)
+                write_expanded_weighted=write_expanded_weighted
+            )
             compiled_sparse = cute.compile(
                 sparse_kernel.wrapper,
                 a_ptr,
@@ -669,8 +681,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    output_rows = (seq_len if use_fused_finalize and not _write_expanded_weighted
-                   else seq_len * topk)
+    output_rows = (
+        seq_len
+        if use_fused_finalize and not _write_expanded_weighted
+        else seq_len * topk
+    )
 
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
@@ -777,7 +792,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     )
 
     if _write_expanded_weighted and not enable_route_split:
-        raise ValueError("weighted expanded output requires the private T512 route-split path")
+        raise ValueError(
+            "weighted expanded output requires the private T512 route-split path"
+        )
 
     # Preparation-only SM103 T4 selection with unique-ID decode provenance.
     enable_t4_compact_output = bool(

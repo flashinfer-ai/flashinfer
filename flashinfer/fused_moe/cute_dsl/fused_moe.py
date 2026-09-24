@@ -480,8 +480,11 @@ def _moe_core_impl(
             memset_event.wait()
         else:
             moe_output_memset_inplace(moe_output, _prepared_launches=_prepared_launches)
-        gemm2_output = (moe_output if _expanded_weighted_output is None
-                        else _expanded_weighted_output)
+        gemm2_output = (
+            moe_output
+            if _expanded_weighted_output is None
+            else _expanded_weighted_output
+        )
     else:
         gemm2_output = torch.empty(
             (num_tokens * top_k, hidden_size),

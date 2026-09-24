@@ -16,6 +16,7 @@ concurrent-stream safe). Single-round launches are not split. Each CTA emits
 its first walk position (block_id, never at or beyond the cut) before the
 valid-tile scan, so the scan overlaps the consumers' first item.
 """
+
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -29,16 +30,18 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.helpers import smem_descriptor_to_int
-from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
-    UnalignedNamedBarrier, blk_reduce_bf16,
-    tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync,
+    UnalignedNamedBarrier,
+    blk_reduce_bf16,
+    tcgen05_fence_after_thread_sync,
+    tcgen05_fence_before_thread_sync,
 )
 
 
 @dsl_user_op
-def finalize_instruction_selector(mma, ta0, tb0, sk: cutlass.Constexpr,
-                                *, loc=None, ip=None):
+def finalize_instruction_selector(
+    mma, ta0, tb0, sk: cutlass.Constexpr, *, loc=None, ip=None
+):
     """Encode actual typed slot-zero origins; no SF data load or TMEM access."""
     op = mma.op
     # Named fields of UtcmmaDescriptorBlock: dense, K32, K-major and the
@@ -48,26 +51,36 @@ def finalize_instruction_selector(mma, ta0, tb0, sk: cutlass.Constexpr,
     negate_a_shift, negate_b_shift = 13, 14
     n_dim_shift, scale_format_shift, m_dim_shift = 17, 23, 27
     base = cutlass.Uint32(
-        (a_format_e2m1 << a_format_shift) | (b_format_e4m3 << b_format_shift)
+        (a_format_e2m1 << a_format_shift)
+        | (b_format_e4m3 << b_format_shift)
         | ((op.shape_mnk[1] >> 3) << n_dim_shift)
         | (scale_format_ue8m0 << scale_format_shift)
-        | ((op.shape_mnk[0] >> 7) << m_dim_shift))
-    base = base | (cutlass.Uint32(cutlass.Boolean(
-        mma.get(tcgen05.Field.NEGATE_A, loc=loc, ip=ip))) << negate_a_shift)
-    base = base | (cutlass.Uint32(cutlass.Boolean(
-        mma.get(tcgen05.Field.NEGATE_B, loc=loc, ip=ip))) << negate_b_shift)
+        | ((op.shape_mnk[0] >> 7) << m_dim_shift)
+    )
+    base = base | (
+        cutlass.Uint32(cutlass.Boolean(mma.get(tcgen05.Field.NEGATE_A, loc=loc, ip=ip)))
+        << negate_a_shift
+    )
+    base = base | (
+        cutlass.Uint32(cutlass.Boolean(mma.get(tcgen05.Field.NEGATE_B, loc=loc, ip=ip)))
+        << negate_b_shift
+    )
     assert sk in (0, 1, 2, 3)
     a = cutlass.Uint32(ta0[(None, None, 0)].iterator.toint(loc=loc, ip=ip))
     b = cutlass.Uint32(tb0[(None, None, 0)].iterator.toint(loc=loc, ip=ip))
     a = a + cutlass.Uint32(sk << 30)
     b = b + cutlass.Uint32(sk << 30)
-    return base | ((a >> 1) & cutlass.Uint32(0x60000000)) | ((b >> 26) & cutlass.Uint32(0x30))
+    return (
+        base
+        | ((a >> 1) & cutlass.Uint32(0x60000000))
+        | ((b >> 26) & cutlass.Uint32(0x30))
+    )
 
 
 @dsl_user_op
-def issue_finalize_epoch(mma, acc, fa, fb, ta0, tb0,
-                       a_stage, b_stage, d0, d1, d2, d3,
-                            *, loc=None, ip=None):
+def issue_finalize_epoch(
+    mma, acc, fa, fb, ta0, tb0, a_stage, b_stage, d0, d1, d2, d3, *, loc=None, ip=None
+):
     """Sixteen ordered K32 MMAs for the exact existing M128/N8/K512 epoch.
 
     SmemDesc iterators come from the original CuTe fragments, not a new
@@ -84,54 +97,78 @@ def issue_finalize_epoch(mma, acc, fa, fb, ta0, tb0,
     assert op.b_dtype is cutlass.Float8E4M3FN
     assert op.acc_dtype is cutlass.Float32
     assert op.sf_dtype is cutlass.Float8E8M0FNU and op.sf_vec_size == 32
-    assert op.a_major_mode.name == op.b_major_mode.name == 'K'
+    assert op.a_major_mode.name == op.b_major_mode.name == "K"
 
-    accumulate = cutlass.Uint32(cutlass.Boolean(
-        mma.get(tcgen05.Field.ACCUMULATE, loc=loc, ip=ip)))
+    accumulate = cutlass.Uint32(
+        cutlass.Boolean(mma.get(tcgen05.Field.ACCUMULATE, loc=loc, ip=ip))
+    )
     # Actual CuTe-derived epoch origins include each independent ring slot.
     a = fa[(None, None, 0, a_stage)]
     b = fb[(None, None, 0, b_stage)]
     assert cute.size(a) == cute.size(b) == 1
-    arguments = [cutlass.Uint32(acc.iterator.toint(loc=loc, ip=ip)), accumulate, d0,
+    arguments = [
+        cutlass.Uint32(acc.iterator.toint(loc=loc, ip=ip)),
+        accumulate,
+        d0,
         smem_descriptor_to_int(a.iterator, loc=loc, ip=ip),
         smem_descriptor_to_int(b.iterator, loc=loc, ip=ip),
         cutlass.Uint32(ta0[(None, None, 0)].iterator.toint(loc=loc, ip=ip)),
         cutlass.Uint32(tb0[(None, None, 0)].iterator.toint(loc=loc, ip=ip)),
-        d1, d2, d3]
-    constraints = ['r', 'r', 'r', 'l', 'l', 'r', 'r', 'r', 'r', 'r']
+        d1,
+        d2,
+        d3,
+    ]
+    constraints = ["r", "r", "r", "l", "l", "r", "r", "r", "r", "r"]
 
     # Fixed-layout offsets are proved against all sixteen original operands.
     # Low-word addition preserves the original high word: the largest start
     # field is 0x6bc6, below bit15 and the leading field starting at bit16.
     # Reuse temporaries only after their preceding MMA has sampled operands.
-    asm = ['{ .reg .pred elected, accum_first, accum_next; ',
-        '.reg .b32 sf_a, sf_b; ',
-        '.reg .b64 a_desc, b_desc; ',
-        '.reg .b32 a_lo0, a_hi, b_lo0, b_hi, a_lo, b_lo; ',
-        'elect.sync _|elected, -1; @!elected bra EPOCH_DONE; ',
-        'mov.b64 {a_lo0, a_hi}, $3; mov.b64 {b_lo0, b_hi}, $4; ',
-        'setp.ne.u32 accum_first, $1, 0; setp.eq.u32 accum_next, 0, 0; ']
+    asm = [
+        "{ .reg .pred elected, accum_first, accum_next; ",
+        ".reg .b32 sf_a, sf_b; ",
+        ".reg .b64 a_desc, b_desc; ",
+        ".reg .b32 a_lo0, a_hi, b_lo0, b_hi, a_lo, b_lo; ",
+        "elect.sync _|elected, -1; @!elected bra EPOCH_DONE; ",
+        "mov.b64 {a_lo0, a_hi}, $3; mov.b64 {b_lo0, b_hi}, $4; ",
+        "setp.ne.u32 accum_first, $1, 0; setp.eq.u32 accum_next, 0, 0; ",
+    ]
     for issue in range(16):
         kc, sk = issue // 4, issue % 4
         a_delta, b_delta = 1024 * kc + 2 * sk, 64 * kc + 2 * sk
         sfa_delta, sfb_delta = 4 * kc + (sk << 30), 2 * kc + (sk << 30)
-        predicate = 'accum_first' if issue == 0 else 'accum_next'
-        asm.append(f'add.u32 a_lo, a_lo0, {a_delta}; mov.b64 a_desc, {{a_lo, a_hi}}; '
-                   f'add.u32 b_lo, b_lo0, {b_delta}; mov.b64 b_desc, {{b_lo, b_hi}}; '
-                   f'add.u32 sf_a, $5, {sfa_delta}; add.u32 sf_b, $6, {sfb_delta}; '
-                   'tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.block32.'
-                   f'collector::a::discard [$0], a_desc, b_desc, ${2 if sk == 0 else 6 + sk}, '
-                   f'[sf_a], [sf_b], {predicate}; ')
-    asm.append('EPOCH_DONE: }')
-    llvm.inline_asm(None, [value.ir_value(loc=loc, ip=ip) for value in arguments],
-        ''.join(asm), ','.join(constraints + ['~{memory}']),
-        has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+        predicate = "accum_first" if issue == 0 else "accum_next"
+        asm.append(
+            f"add.u32 a_lo, a_lo0, {a_delta}; mov.b64 a_desc, {{a_lo, a_hi}}; "
+            f"add.u32 b_lo, b_lo0, {b_delta}; mov.b64 b_desc, {{b_lo, b_hi}}; "
+            f"add.u32 sf_a, $5, {sfa_delta}; add.u32 sf_b, $6, {sfb_delta}; "
+            "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.block32."
+            f"collector::a::discard [$0], a_desc, b_desc, ${2 if sk == 0 else 6 + sk}, "
+            f"[sf_a], [sf_b], {predicate}; "
+        )
+    asm.append("EPOCH_DONE: }")
+    llvm.inline_asm(
+        None,
+        [value.ir_value(loc=loc, ip=ip) for value in arguments],
+        "".join(asm),
+        ",".join(constraints + ["~{memory}"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class SkinnyDecodeFinalizeKernel:
-    def __init__(self, *, enable_t16_const_scheduler=False, enable_t16_slot_planes=False, enable_t4_const_scheduler=False,
-                 enable_tail_stream_k=None):
+    def __init__(
+        self,
+        *,
+        enable_t16_const_scheduler=False,
+        enable_t16_slot_planes=False,
+        enable_t4_const_scheduler=False,
+        enable_tail_stream_k=None,
+    ):
         self.enable_skinny_finalize = True
         self.enable_contiguous_b_tma = True
         self.b_tma_bytes = 4096
@@ -149,12 +186,20 @@ class SkinnyDecodeFinalizeKernel:
         # Tail stream-K follows the existing selected T4/T16 walks unless the
         # caller pins it; the generic (T8) walk keeps the five-word records.
         if enable_tail_stream_k is None:
-            enable_tail_stream_k = bool(enable_t4_const_scheduler or enable_t16_slot_planes)
+            enable_tail_stream_k = bool(
+                enable_t4_const_scheduler or enable_t16_slot_planes
+            )
         self.enable_tail_stream_k = bool(enable_tail_stream_k)
-        assert not self.enable_tail_stream_k or enable_t4_const_scheduler or enable_t16_slot_planes
+        assert (
+            not self.enable_tail_stream_k
+            or enable_t4_const_scheduler
+            or enable_t16_slot_planes
+        )
         self.record_words = 7 if self.enable_tail_stream_k else 5
         self.work_words = 2 * self.record_words
-        self.cache_key_marker = 't4_t16_g2_tail_stream_k' if self.enable_tail_stream_k else None
+        self.cache_key_marker = (
+            "t4_t16_g2_tail_stream_k" if self.enable_tail_stream_k else None
+        )
         self.num_ab_stage, self.num_acc_stage, self.num_c_stage = 3, 2, 1
         self.num_tmem_alloc_cols, self.threads_wo_sched = 128, 480
         self.threads_per_cta = 512
@@ -167,12 +212,17 @@ class SkinnyDecodeFinalizeKernel:
     def scale_layout(self, rows, k, groups):
         # Exact selected finalize six-dimensional physical UE8M0 layout.
         return cute.make_ordered_layout(
-            (32, 4, rows // 128, 4, k // 128, groups), order=(2, 1, 4, 0, 3, 5))
+            (32, 4, rows // 128, 4, k // 128, groups), order=(2, 1, 4, 0, 3, 5)
+        )
 
     @cute.jit
     def epilogue_partition(self, acc_mn, tid):
-        tc = tcgen05.make_tmem_copy(cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x8), cutlass.Float32), acc_mn)
+        tc = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(
+                tcgen05.Ld32x32bOp(tcgen05.Repetition.x8), cutlass.Float32
+            ),
+            acc_mn,
+        )
         thr = tc.get_slice(tid)
         coords = thr.partition_D(cute.make_identity_tensor((128, 8)))
         return tc, thr.partition_S(acc_mn), coords
@@ -188,93 +238,137 @@ class SkinnyDecodeFinalizeKernel:
         atom = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(self.cta_group), self.sf_dtype)
         copy = tcgen05.make_s2t_copy(atom, tensor_compact)
         part = copy.get_slice(0)
-        source = tcgen05.get_s2t_smem_desc_tensor(copy, part.partition_S(shared_compact))
+        source = tcgen05.get_s2t_smem_desc_tensor(
+            copy, part.partition_S(shared_compact)
+        )
         return copy, source, part.partition_D(tensor_compact)
 
     @cute.jit
     def weight_scale_tma(self, pointer, features, k, experts):
         # Raw UE8M0 bytes, paired as Int16 without conversion. Four K128
         # slices form exactly the old contiguous 2048-byte warp12 transfer.
-        source = cute.make_tensor(cute.recast_ptr(pointer, dtype=cutlass.Int16),
-            cute.make_layout((256, k // 128, features // 128, experts),
-                stride=(1, 256, 256 * (k // 128),
-                        256 * (k // 128) * (features // 128))))
+        source = cute.make_tensor(
+            cute.recast_ptr(pointer, dtype=cutlass.Int16),
+            cute.make_layout(
+                (256, k // 128, features // 128, experts),
+                stride=(1, 256, 256 * (k // 128), 256 * (k // 128) * (features // 128)),
+            ),
+        )
         destination = cute.make_layout((256, 4, 1, 1), stride=(1, 256, 1024, 1024))
         return cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(self.cta_group), source,
-            destination, (256, 4, 1, 1))
+            cpasync.CopyBulkTensorTileG2SOp(self.cta_group),
+            source,
+            destination,
+            (256, 4, 1, 1),
+        )
 
     @cute.jit
     def weight_scale_partition(self, atom, source, shared):
-        destination = cute.make_tensor(cute.recast_ptr(shared.iterator, dtype=cutlass.Int16),
-            cute.make_layout((256, 4, 1, 1, 3), stride=(1, 256, 1024, 1024, 1024)))
+        destination = cute.make_tensor(
+            cute.recast_ptr(shared.iterator, dtype=cutlass.Int16),
+            cute.make_layout((256, 4, 1, 1, 3), stride=(1, 256, 1024, 1024, 1024)),
+        )
         tiles = cute.local_tile(source, (256, 4, 1, 1), (None, None, None, None))
-        return cpasync.tma_partition(atom, 0, cute.make_layout(1),
-            cute.group_modes(destination, 0, 4), cute.group_modes(tiles, 0, 4))
+        return cpasync.tma_partition(
+            atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(destination, 0, 4),
+            cute.group_modes(tiles, 0, 4),
+        )
 
     @cute.jit
     def clamped_b_tma(self, pointer, k, swizzle):
         # Existing native intermediate bytes; 4D coordinates clamp only the
         # selected N8 sub-tile without reading another expert's padded rows.
-        source = cute.make_tensor(pointer, cute.make_layout(
-            (k, 8, 1 << 31, 1 << 31), stride=(1, k, (1 << 35) - k, k)))
-        shared = cute.make_composed_layout(swizzle, 0,
-            cute.make_layout((128, 8, 1, 1)))
+        source = cute.make_tensor(
+            pointer,
+            cute.make_layout((k, 8, 1 << 31, 1 << 31), stride=(1, k, (1 << 35) - k, k)),
+        )
+        shared = cute.make_composed_layout(swizzle, 0, cute.make_layout((128, 8, 1, 1)))
         return cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(self.cta_group), source,
-            shared, (128, 8, 1, 1))
+            cpasync.CopyBulkTensorTileG2SOp(self.cta_group),
+            source,
+            shared,
+            (128, 8, 1, 1),
+        )
 
     @cute.jit
     def clamped_b_partition(self, atom, mapped, tma_shared, row_base, limit):
-        valid = cutlass.min(cutlass.Int32(8),
-                            cutlass.max(cutlass.Int32(0), limit - row_base))
+        valid = cutlass.min(
+            cutlass.Int32(8), cutlass.max(cutlass.Int32(0), limit - row_base)
+        )
         pad = 8 - valid
         source = cute.domain_offset(
-            (0, pad, 1 << 30, row_base - pad + (1 << 30)), mapped)
+            (0, pad, 1 << 30, row_base - pad + (1 << 30)), mapped
+        )
         tiles = cute.local_tile(source, (128, 8, 1, 1), (None, 0, 0, 0))
-        return cpasync.tma_partition(atom, 0, cute.make_layout(1),
-            cute.group_modes(tma_shared, 0, 4), cute.group_modes(tiles, 0, 4))
+        return cpasync.tma_partition(
+            atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(tma_shared, 0, 4),
+            cute.group_modes(tiles, 0, 4),
+        )
 
     @cute.jit
     def copy_clamped_b(self, atom, shared_copy, global_copy, stage, kt, barrier):
         for quarter in cutlass.range_constexpr(4):
-            cute.copy(atom, global_copy[(None, kt * 4 + quarter)],
-                      shared_copy[(None, stage * 4 + quarter)],
-                      tma_bar_ptr=barrier)
+            cute.copy(
+                atom,
+                global_copy[(None, kt * 4 + quarter)],
+                shared_copy[(None, stage * 4 + quarter)],
+                tma_bar_ptr=barrier,
+            )
 
     @cute.jit
     def intermediate_scale_tma(self, pointer, rows, k):
         # Native R128c4 bytes: (r%32)*16 + ((r%128)//32)*4 +
         # (r//128)*512*Q + g + q*512. Overfetch all four row groups.
-        source = cute.make_tensor(cute.recast_ptr(pointer, dtype=cutlass.Uint8),
-            cute.make_layout((16, 32, k // 128, rows // 128),
-                stride=(1, 16, 512, 512 * (k // 128))))
+        source = cute.make_tensor(
+            cute.recast_ptr(pointer, dtype=cutlass.Uint8),
+            cute.make_layout(
+                (16, 32, k // 128, rows // 128), stride=(1, 16, 512, 512 * (k // 128))
+            ),
+        )
         destination = cute.make_layout((16, 8, 4, 1))
         return cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(self.cta_group), source,
-            destination, (16, 8, 4, 1))
+            cpasync.CopyBulkTensorTileG2SOp(self.cta_group),
+            source,
+            destination,
+            (16, 8, 4, 1),
+        )
 
     @cute.jit
     def intermediate_scale_partition(self, atom, mapped, shared):
-        destination = cute.make_tensor(shared.iterator,
-            cute.make_layout((16, 8, 4, 1, 3)))
-        tiles = cute.local_tile(mapped, (16, 8, 4, 1),
-            (None, None, None, None))
-        return cpasync.tma_partition(atom, 0, cute.make_layout(1),
-            cute.group_modes(destination, 0, 4), cute.group_modes(tiles, 0, 4))
+        destination = cute.make_tensor(
+            shared.iterator, cute.make_layout((16, 8, 4, 1, 3))
+        )
+        tiles = cute.local_tile(mapped, (16, 8, 4, 1), (None, None, None, None))
+        return cpasync.tma_partition(
+            atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(destination, 0, 4),
+            cute.group_modes(tiles, 0, 4),
+        )
 
     @cute.jit
-    def copy_intermediate_scale(self, atom, shared_copy, global_copy,
-                               stage, row_base, kt, barrier):
-        cute.copy(atom,
+    def copy_intermediate_scale(
+        self, atom, shared_copy, global_copy, stage, row_base, kt, barrier
+    ):
+        cute.copy(
+            atom,
             global_copy[(None, 0, (row_base % 32) // 8, kt, row_base // 128)],
-            shared_copy[(None, stage)], tma_bar_ptr=barrier)
+            shared_copy[(None, stage)],
+            tma_bar_ptr=barrier,
+        )
 
     @cute.jit
     def intermediate_scale_word(self, words, stage, row_base, limit, kc, lane):
         word = cutlass.Uint32(0)
         if lane < 8:
-            word = cutlass.Uint32(0x7f7f7f7f)
+            word = cutlass.Uint32(0x7F7F7F7F)
             if row_base + lane < limit:
                 h = (row_base % 128) // 32
                 word = words[stage * 128 + kc * 32 + lane * 4 + h].to(cutlass.Uint32)
@@ -319,7 +413,9 @@ class SkinnyDecodeFinalizeKernel:
         return count, found
 
     @cute.jit
-    def locate_valid_tile(self, route_limit, active, planes: cutlass.Constexpr, count0, ordinal, lane):
+    def locate_valid_tile(
+        self, route_limit, active, planes: cutlass.Constexpr, count0, ordinal, lane
+    ):
         """(slot, tile) of valid pair ordinal `ordinal` in walk order: slot-0
         tiles first, then slot-1 tiles when two planes are walked."""
         slot = cutlass.Int32(0)
@@ -332,16 +428,29 @@ class SkinnyDecodeFinalizeKernel:
         return slot, tile
 
     @cute.jit
-    def tail_split(self, route_limit, active, planes: cutlass.Constexpr, grid_x, block_id, epochs, lane):
+    def tail_split(
+        self,
+        route_limit,
+        active,
+        planes: cutlass.Constexpr,
+        grid_x,
+        block_id,
+        epochs,
+        lane,
+    ):
         """Tail cut of one launch. Returns the first walk position that is not a
         full item (positions are feature-fastest, plane-major), the number of
         full items, the slot-0 valid tile count and this CTA's unit range
         [begin, end) over the tail's K512 epochs (end == begin: nothing split).
         Splitting requires at least one full round and a shorter tail round."""
-        count0, _ = self.scan_valid_tiles(route_limit, active, 0, cutlass.Int32(-1), lane)
+        count0, _ = self.scan_valid_tiles(
+            route_limit, active, 0, cutlass.Int32(-1), lane
+        )
         count1 = cutlass.Int32(0)
         if cutlass.const_expr(planes == 2):
-            count1, _ = self.scan_valid_tiles(route_limit, active, 1, cutlass.Int32(-1), lane)
+            count1, _ = self.scan_valid_tiles(
+                route_limit, active, 1, cutlass.Int32(-1), lane
+            )
         items = (count0 + count1) * 56
         span = active * 56
         cut = planes * span
@@ -357,7 +466,9 @@ class SkinnyDecodeFinalizeKernel:
                 full_items = full
                 pair = full // 56
                 feature = full - pair * 56
-                slot, tile = self.locate_valid_tile(route_limit, active, planes, count0, pair, lane)
+                slot, tile = self.locate_valid_tile(
+                    route_limit, active, planes, count0, pair, lane
+                )
                 cut = slot * span + tile * 56 + feature
                 begin = cutlass.min(block_id * per_cta, units)
                 end = cutlass.min(begin + per_cta, units)
@@ -365,37 +476,61 @@ class SkinnyDecodeFinalizeKernel:
 
     @cute.jit
     def wrapper(
-        self, a_ptr: cute.Pointer, b_ptr: cute.Pointer,
-        a_sf_ptr: cute.Pointer, b_sf_ptr: cute.Pointer,
-        c_ptr: cute.Pointer, alpha_ptr: cute.Pointer,
+        self,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
         a_per_token_scale_ptr: Optional[cute.Pointer],
-        m: cutlass.Int64, n: cutlass.Int64, k: cutlass.Int64, l: cutlass.Int64,
-        num_tokens: cutlass.Int64, top_k: cutlass.Int64,
-        tile_size: cutlass.Constexpr, scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr, stream: cuda.CUstream,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        l: cutlass.Int64,
+        num_tokens: cutlass.Int64,
+        top_k: cutlass.Int64,
+        tile_size: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        weights = cute.make_tensor(b_ptr, cute.make_layout((n, k, l), stride=(k, 1, n*k)))
+        weights = cute.make_tensor(
+            b_ptr, cute.make_layout((n, k, l), stride=(k, 1, n * k))
+        )
         sfa_tma, sfa_ma = self.weight_scale_tma(b_sf_ptr, n, k, l)
         x = cute.make_tensor(a_ptr, cute.make_layout((m, k), stride=(k, 1)))
         sfb_tma, sfb_ma = self.intermediate_scale_tma(a_sf_ptr, m, k)
-        route_expert = cute.make_tensor(tile_idx_to_group_idx_ptr, cute.make_layout(m//128))
-        route_limit = cute.make_tensor(tile_idx_to_mn_limit_ptr, cute.make_layout(m//128))
+        route_expert = cute.make_tensor(
+            tile_idx_to_group_idx_ptr, cute.make_layout(m // 128)
+        )
+        route_limit = cute.make_tensor(
+            tile_idx_to_mn_limit_ptr, cute.make_layout(m // 128)
+        )
         routes = cute.make_tensor(permuted_idx_to_expanded_idx_ptr, cute.make_layout(m))
         active_tiles = cute.make_tensor(num_non_exiting_tiles_ptr, cute.make_layout(1))
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout(l))
-        route_weights = cute.make_tensor(token_final_scales_ptr,
-            cute.make_layout((num_tokens, top_k), stride=(top_k, 1)))
+        route_weights = cute.make_tensor(
+            token_final_scales_ptr,
+            cute.make_layout((num_tokens, top_k), stride=(top_k, 1)),
+        )
         out = cute.make_tensor(c_ptr, cute.make_layout((num_tokens, n), stride=(n, 1)))
         mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            cutlass.Float4E2M1FN, cutlass.Float8E4M3FN,
-            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K,
-            self.sf_dtype, 32, self.cta_group, self.tile[:2])
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+            self.sf_dtype,
+            32,
+            self.cta_group,
+            self.tile[:2],
+        )
         al = sm100_utils.make_smem_layout_a(mma, self.tile, cutlass.Int8, 3)
         bl = sm100_utils.make_smem_layout_b(mma, self.tile, cutlass.Float8E4M3FN, 3)
         b_tma, b_mapped = self.clamped_b_tma(a_ptr, k, bl.inner)
@@ -403,31 +538,87 @@ class SkinnyDecodeFinalizeKernel:
         sbl = blockscaled_utils.make_smem_layout_sfb(mma, self.scale_tile, 32, 4)
         cluster = cute.tiled_divide(cute.make_layout((1, 1, 1, 1)), (mma.thr_id.shape,))
         tma, ma = cute.nvgpu.make_tiled_tma_atom_A(
-            cpasync.CopyBulkTensorTileG2SOp(self.cta_group), weights,
-            cute.slice_(al, (None, None, None, 0)), self.tile, mma,
-            cluster.shape, internal_type=cutlass.Int8)
+            cpasync.CopyBulkTensorTileG2SOp(self.cta_group),
+            weights,
+            cute.slice_(al, (None, None, None, 0)),
+            self.tile,
+            mma,
+            cluster.shape,
+            internal_type=cutlass.Int8,
+        )
 
         @cute.struct
         class Storage:
             barriers: cute.struct.MemRange[cutlass.Int64, 44]
             tmem_address: cutlass.Int32
-            a: cute.struct.Align[cute.struct.MemRange[cutlass.Int8, cute.cosize(al.outer)], 1024]
-            b: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(bl.outer)], 1024]
+            a: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, cute.cosize(al.outer)], 1024
+            ]
+            b: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(bl.outer)], 1024
+            ]
             sa: cute.struct.Align[cute.struct.MemRange[self.sf_dtype, 6144], 128]
             sb: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, 1536], 128]
             work: cute.struct.MemRange[cutlass.Int32, self.work_words]
-            output_rows: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, 1024], 128]
+            output_rows: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, 1024], 128
+            ]
+
         self.shared_storage = Storage
-        self.kernel(mma, tma, ma, sfa_tma, sfa_ma, b_tma, b_mapped, x, sfb_tma, sfb_ma, routes, route_expert,
-            route_limit, active_tiles, alpha, route_weights, out,
-            al, bl, sal, sbl).launch(
-                grid=(max_active_clusters, 1, 1), block=(512, 1, 1),
-                smem=Storage.size_in_bytes(), stream=stream)
+        self.kernel(
+            mma,
+            tma,
+            ma,
+            sfa_tma,
+            sfa_ma,
+            b_tma,
+            b_mapped,
+            x,
+            sfb_tma,
+            sfb_ma,
+            routes,
+            route_expert,
+            route_limit,
+            active_tiles,
+            alpha,
+            route_weights,
+            out,
+            al,
+            bl,
+            sal,
+            sbl,
+        ).launch(
+            grid=(max_active_clusters, 1, 1),
+            block=(512, 1, 1),
+            smem=Storage.size_in_bytes(),  # type: ignore[attr-defined]
+            stream=stream,
+        )
 
     @cute.kernel
-    def kernel(self, mma, tma, ma, sfa_tma, sfa_ma, b_tma, b_mapped, x, sfb_tma, sfb_ma, routes, route_expert,
-               route_limit, active_tiles, alpha, route_weights, out,
-               al, bl, sal, sbl):
+    def kernel(
+        self,
+        mma,
+        tma,
+        ma,
+        sfa_tma,
+        sfa_ma,
+        b_tma,
+        b_mapped,
+        x,
+        sfb_tma,
+        sfb_ma,
+        routes,
+        route_expert,
+        route_limit,
+        active_tiles,
+        alpha,
+        route_weights,
+        out,
+        al,
+        bl,
+        sal,
+        sbl,
+    ):
         tid, _, _ = cute.arch.thread_idx()
         block_id, _, _ = cute.arch.block_idx()
         grid_x, _, _ = cute.arch.grid_dim()
@@ -441,77 +632,121 @@ class SkinnyDecodeFinalizeKernel:
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         bars = storage.barriers.data_ptr()
         ap = pipeline.PipelineTmaUmma.create(
-            num_stages=3, barrier_storage=bars,
+            num_stages=3,
+            barrier_storage=bars,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.tma_bytes, cta_layout_vmnk=None, defer_sync=True)
+            tx_count=self.tma_bytes,
+            cta_layout_vmnk=None,
+            defer_sync=True,
+        )
         bp = pipeline.PipelineTmaUmma.create(
-            num_stages=3, barrier_storage=bars + 6,
+            num_stages=3,
+            barrier_storage=bars + 6,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.b_tma_bytes, cta_layout_vmnk=None, defer_sync=True)
+            tx_count=self.b_tma_bytes,
+            cta_layout_vmnk=None,
+            defer_sync=True,
+        )
         sap = pipeline.PipelineTmaUmma.create(
-            num_stages=3, barrier_storage=bars + 12,
+            num_stages=3,
+            barrier_storage=bars + 12,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=2048, cta_layout_vmnk=None, defer_sync=True)
+            tx_count=2048,
+            cta_layout_vmnk=None,
+            defer_sync=True,
+        )
         sbp = pipeline.PipelineTmaAsync.create(
-            num_stages=3, barrier_storage=bars + 18,
+            num_stages=3,
+            barrier_storage=bars + 18,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
-            tx_count=self.sfb_tma_bytes, cta_layout_vmnk=None,
+            tx_count=self.sfb_tma_bytes,
+            cta_layout_vmnk=None,
             # Single CTA: logical signaling index zero makes every reader
             # signal; preserve all 128 thread arrivals, not four warp arrivals.
-            tidx=cutlass.Int32(0), enable_multicast_signaling=False,
-            defer_sync=True)
+            tidx=cutlass.Int32(0),
+            enable_multicast_signaling=False,
+            defer_sync=True,
+        )
         tap = pipeline.PipelineAsyncUmma.create(
-            num_stages=3, barrier_storage=bars + 24,
+            num_stages=3,
+            barrier_storage=bars + 24,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            cta_layout_vmnk=None, defer_sync=True)
+            cta_layout_vmnk=None,
+            defer_sync=True,
+        )
         tbp = pipeline.PipelineAsyncUmma.create(
-            num_stages=3, barrier_storage=bars + 30,
+            num_stages=3,
+            barrier_storage=bars + 30,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            cta_layout_vmnk=None, defer_sync=True)
+            cta_layout_vmnk=None,
+            defer_sync=True,
+        )
         cp = pipeline.PipelineUmmaAsync.create(
-            num_stages=2, barrier_storage=bars+36,
+            num_stages=2,
+            barrier_storage=bars + 36,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
-            cta_layout_vmnk=None, defer_sync=True)
+            cta_layout_vmnk=None,
+            defer_sync=True,
+        )
         mp = pipeline.PipelineAsync.create(
-            num_stages=2, barrier_storage=bars+40,
+            num_stages=2,
+            barrier_storage=bars + 40,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 480),
-            defer_sync=True)
+            defer_sync=True,
+        )
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         sa = storage.a.get_tensor(al.outer, swizzle=al.inner)
         sb = storage.b.get_tensor(bl.outer, swizzle=bl.inner)
         b_tma_shared = storage.b.get_tensor(
-            cute.make_layout((128, 8, 1, 1, 12)), swizzle=bl.inner)
+            cute.make_layout((128, 8, 1, 1, 12)), swizzle=bl.inner
+        )
         sfa = storage.sa.get_tensor(sal)
         sfa_copy, gfa_copy = self.weight_scale_partition(sfa_tma, sfa_ma, sfa)
         raw_sfb = storage.sb.get_tensor(cute.make_layout(1536))
-        sfb_words = cute.make_tensor(cute.recast_ptr(raw_sfb.iterator, dtype=cutlass.Uint32),
-                                     cute.make_layout(384))
+        sfb_words = cute.make_tensor(
+            cute.recast_ptr(raw_sfb.iterator, dtype=cutlass.Uint32),
+            cute.make_layout(384),
+        )
         sfb_copy, gfb_copy = self.intermediate_scale_partition(sfb_tma, sfb_ma, raw_sfb)
-        tmem = utils.TmemAllocator(storage.tmem_address.ptr,
-            barrier_for_retrieve=self.tmem_alloc_barrier, allocator_warp_id=0, is_two_cta=False)
+        tmem = utils.TmemAllocator(
+            storage.tmem_address.ptr,
+            barrier_for_retrieve=self.tmem_alloc_barrier,
+            allocator_warp_id=0,
+            is_two_cta=False,
+        )
         tmem.allocate(128)
         tmem.wait_for_alloc()
         acc_ptr = tmem.retrieve_ptr(cutlass.Float32)
         acc_layout = mma.make_fragment_C(mma.partition_shape_C(self.tile[:2])).layout
         sat = blockscaled_utils.make_tmem_layout_sfa(
-            mma, self.scale_tile, 32, cute.slice_(sal, (None, None, None, 0)))
+            mma, self.scale_tile, 32, cute.slice_(sal, (None, None, None, 0))
+        )
         sbt = blockscaled_utils.make_tmem_layout_sfb(
-            mma, self.scale_tile, 32, cute.slice_(sbl, (None, None, None, 0)))
+            mma, self.scale_tile, 32, cute.slice_(sbl, (None, None, None, 0))
+        )
         ga = mma.get_slice(0).partition_A(
-            cute.local_tile(ma, (128, 512), (None, None, None)))
-        sa_copy, ga_copy = cpasync.tma_partition(tma, 0, cute.make_layout(1),
-            cute.group_modes(sa, 0, 3), cute.group_modes(ga, 0, 3))
+            cute.local_tile(ma, (128, 512), (None, None, None))
+        )
+        sa_copy, ga_copy = cpasync.tma_partition(
+            tma,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sa, 0, 3),
+            cute.group_modes(ga, 0, 3),
+        )
         fa, fb = mma.make_fragment_A(sa), mma.make_fragment_B(sb)
-        records = storage.work.get_tensor(cute.make_layout((self.record_words, 2), stride=(1, self.record_words)))
+        records = storage.work.get_tensor(
+            cute.make_layout((self.record_words, 2), stride=(1, self.record_words))
+        )
         work = cute.make_rmem_tensor((self.record_words,), cutlass.Int32)
         output_rows = storage.output_rows.get_tensor(self.output_shared_layout())
 
@@ -554,7 +789,14 @@ class SkinnyDecodeFinalizeKernel:
                         linear_work += grid_x
                     # Positions at or beyond the cut are tail pieces, not full items.
                     cut, full_items, count0, unit_begin, unit_end = self.tail_split(
-                        route_limit, active_tiles[0], planes, grid_x, block_id, epochs, lane)
+                        route_limit,
+                        active_tiles[0],
+                        planes,
+                        grid_x,
+                        block_id,
+                        epochs,
+                        lane,
+                    )
                     total = cut
                 while linear_work < total:
                     feature = linear_work % 56
@@ -610,7 +852,14 @@ class SkinnyDecodeFinalizeKernel:
                             ms.advance()
                         linear_work += grid_x
                     cut, full_items, count0, unit_begin, unit_end = self.tail_split(
-                        route_limit, active_tiles[0], planes, grid_x, block_id, epochs, lane)
+                        route_limit,
+                        active_tiles[0],
+                        planes,
+                        grid_x,
+                        block_id,
+                        epochs,
+                        lane,
+                    )
                 # Carry each CTA's global ordinal across the two slot planes.
                 # Resetting here would put both plane remainders on the same CTAs.
                 for slot in cutlass.range_constexpr(2):
@@ -686,7 +935,8 @@ class SkinnyDecodeFinalizeKernel:
                     pair = ordinal // 56
                     feature = ordinal - pair * 56
                     slot, route_tile = self.locate_valid_tile(
-                        route_limit, active_tiles[0], planes, count0, pair, lane)
+                        route_limit, active_tiles[0], planes, count0, pair, lane
+                    )
                     mp.producer_acquire(ms)
                     expert = route_expert[route_tile]
                     limit = route_limit[route_tile]
@@ -713,7 +963,9 @@ class SkinnyDecodeFinalizeKernel:
 
         # Warp 11: only native packed-weight TMA, one K512 transaction/stage.
         if warp == 11:
-            a_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 3)
+            a_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 3
+            )
             meta_a = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
             self.read_work(mp, meta_a, records, work)
             meta_a.advance()
@@ -723,8 +975,12 @@ class SkinnyDecodeFinalizeKernel:
                 kb, ke = self.k_range(work, k)
                 for kt in cutlass.range(kb, ke, unroll=1):
                     ap.producer_acquire(a_state)
-                    cute.copy(tma, ga_copy[(None, bm, kt, expert)], sa_copy[(None, a_state.index)],
-                              tma_bar_ptr=ap.producer_get_barrier(a_state))
+                    cute.copy(
+                        tma,
+                        ga_copy[(None, bm, kt, expert)],
+                        sa_copy[(None, a_state.index)],
+                        tma_bar_ptr=ap.producer_get_barrier(a_state),
+                    )
                     a_state.advance()
                 self.read_work(mp, meta_a, records, work)
                 meta_a.advance()
@@ -732,19 +988,28 @@ class SkinnyDecodeFinalizeKernel:
 
         # Warp8: four ordinary N8/K128 TMA copies into each native K512 slot.
         if warp == 8:
-            b_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 3)
+            b_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 3
+            )
             meta_b = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
             self.read_work(mp, meta_b, records, work)
             meta_b.advance()
             while work[0] >= 0:
                 row_base, limit = work[1] * 128 + work[2] * 8, work[4]
                 b_shared_copy, b_global_copy = self.clamped_b_partition(
-                    b_tma, b_mapped, b_tma_shared, row_base, limit)
+                    b_tma, b_mapped, b_tma_shared, row_base, limit
+                )
                 kb, ke = self.k_range(work, k)
                 for kt in cutlass.range(kb, ke, unroll=1):
                     bp.producer_acquire(b_state)
-                    self.copy_clamped_b(b_tma, b_shared_copy, b_global_copy,
-                        b_state.index, kt, bp.producer_get_barrier(b_state))
+                    self.copy_clamped_b(
+                        b_tma,
+                        b_shared_copy,
+                        b_global_copy,
+                        b_state.index,
+                        kt,
+                        bp.producer_get_barrier(b_state),
+                    )
                     b_state.advance()
                 self.read_work(mp, meta_b, records, work)
                 meta_b.advance()
@@ -763,8 +1028,12 @@ class SkinnyDecodeFinalizeKernel:
         # Warp 12: one 2048-byte TMA into the unchanged expanded SFA ring.
         # Warp13 releases its shared lifetime only after CP reads complete.
         if warp == 12:
-            sa_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 3)
-            meta_sa = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
+            sa_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 3
+            )
+            meta_sa = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
             self.read_work(mp, meta_sa, records, work)
             meta_sa.advance()
             while work[0] >= 0:
@@ -775,9 +1044,12 @@ class SkinnyDecodeFinalizeKernel:
                     sap.producer_acquire(sa_prod)
                     # kt is a K512 tile coordinate; local_tile maps it to
                     # the raw source K128 coordinate 4*kt.
-                    cute.copy(sfa_tma, gfa_copy[(None, 0, kt, bm, expert)],
-                              sfa_copy[(None, sa_prod.index)],
-                              tma_bar_ptr=sap.producer_get_barrier(sa_prod))
+                    cute.copy(
+                        sfa_tma,
+                        gfa_copy[(None, 0, kt, bm, expert)],
+                        sfa_copy[(None, sa_prod.index)],
+                        tma_bar_ptr=sap.producer_get_barrier(sa_prod),
+                    )
                     sa_prod.advance()
                 self.read_work(mp, meta_sa, records, work)
                 meta_sa.advance()
@@ -785,8 +1057,12 @@ class SkinnyDecodeFinalizeKernel:
 
         # Warp 10: one 512-byte SFB TMA; publishers select 128 useful bytes.
         if warp == 10:
-            sb_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 3)
-            meta_sb = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
+            sb_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 3
+            )
+            meta_sb = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
             self.read_work(mp, meta_sb, records, work)
             meta_sb.advance()
             while work[0] >= 0:
@@ -795,8 +1071,15 @@ class SkinnyDecodeFinalizeKernel:
                 kb, ke = self.k_range(work, k)
                 for kt in cutlass.range(kb, ke, unroll=1):
                     sbp.producer_acquire(sb_prod)
-                    self.copy_intermediate_scale(sfb_tma, sfb_copy, gfb_copy,
-                        sb_prod.index, row_base, kt, sbp.producer_get_barrier(sb_prod))
+                    self.copy_intermediate_scale(
+                        sfb_tma,
+                        sfb_copy,
+                        gfb_copy,
+                        sb_prod.index,
+                        row_base,
+                        kt,
+                        sbp.producer_get_barrier(sb_prod),
+                    )
                     sb_prod.advance()
                 self.read_work(mp, meta_sb, records, work)
                 meta_sb.advance()
@@ -805,24 +1088,39 @@ class SkinnyDecodeFinalizeKernel:
         # Warp 13: four K128 CPs into this stage's independent 16-column
         # TMEM SFA slot. CP-to-MMA is the PTX pipelined cross-thread pattern.
         if warp == 13:
-            sa_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 3)
-            ta_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 3)
-            meta_ta = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
+            sa_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 3
+            )
+            ta_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 3
+            )
+            meta_ta = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
             self.read_work(mp, meta_ta, records, work)
             meta_ta.advance()
             while work[0] >= 0:
                 bm, expert = work[0], work[3]
                 row_base, limit = work[1] * 128 + work[2] * 8, work[4]
                 kb, ke = self.k_range(work, k)
-                for kt in cutlass.range(kb, ke, unroll=1):
+                for kt in cutlass.range(kb, ke, unroll=1):  # noqa: B007
                     sap.consumer_wait(sa_cons)
                     tap.producer_acquire(ta_prod)
                     tcgen05_fence_after_thread_sync()
                     for kc in cutlass.range_constexpr(4):
-                        ta_stage = cute.make_tensor(cute.recast_ptr(
-                            acc_ptr + 16 + ta_prod.index * 16 + kc * 4, dtype=self.sf_dtype), sat)
+                        ta_stage = cute.make_tensor(
+                            cute.recast_ptr(
+                                acc_ptr + 16 + ta_prod.index * 16 + kc * 4,
+                                dtype=self.sf_dtype,
+                            ),
+                            sat,
+                        )
                         cpa, cpa_src, cpa_dst = self.scale_copy(sfa, ta_stage)
-                        cute.copy(cpa, cpa_src[(None, None, None, None, sa_cons.index * 4 + kc)], cpa_dst)
+                        cute.copy(
+                            cpa,
+                            cpa_src[(None, None, None, None, sa_cons.index * 4 + kc)],
+                            cpa_dst,
+                        )
                     tcgen05_fence_before_thread_sync()
                     tap.producer_commit(ta_prod)
                     # This method emits an elected tcgen05.commit: shared SFA
@@ -836,32 +1134,50 @@ class SkinnyDecodeFinalizeKernel:
 
         # Warps 4..7: four-warp compact scale-factor publication.
         if warp >= 4 and warp < 8:
-            sb_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 3)
-            tb_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 3)
+            sb_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 3
+            )
+            tb_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 3
+            )
             copy_tid = (warp - 4) * 32 + lane
-            meta_tb = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
+            meta_tb = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
             self.read_work(mp, meta_tb, records, work)
             meta_tb.advance()
             while work[0] >= 0:
                 bm, expert = work[0], work[3]
                 row_base, limit = work[1] * 128 + work[2] * 8, work[4]
                 kb, ke = self.k_range(work, k)
-                for kt in cutlass.range(kb, ke, unroll=1):
+                for kt in cutlass.range(kb, ke, unroll=1):  # noqa: B007
                     sbp.consumer_wait(sb_cons)
                     tbp.producer_acquire(tb_prod)
                     tcgen05_fence_after_thread_sync()
                     for kc in cutlass.range_constexpr(4):
-                        word_tensor = cute.make_tensor(cute.recast_ptr(
-                            acc_ptr + 64 + tb_prod.index * 8 + kc * 2, dtype=cutlass.Uint32),
-                            cute.make_layout((128, 1), stride=(65536, 1)))
-                        st = tcgen05.make_tmem_copy(cute.make_copy_atom(
-                            tcgen05.St32x32bOp(tcgen05.Repetition.x1), cutlass.Uint32), word_tensor)
+                        word_tensor = cute.make_tensor(
+                            cute.recast_ptr(
+                                acc_ptr + 64 + tb_prod.index * 8 + kc * 2,
+                                dtype=cutlass.Uint32,
+                            ),
+                            cute.make_layout((128, 1), stride=(65536, 1)),
+                        )
+                        st = tcgen05.make_tmem_copy(
+                            cute.make_copy_atom(
+                                tcgen05.St32x32bOp(tcgen05.Repetition.x1),
+                                cutlass.Uint32,
+                            ),
+                            word_tensor,
+                        )
                         thread_st = st.get_slice(copy_tid)
-                        coords = thread_st.partition_S(cute.make_identity_tensor((128, 1)))
+                        coords = thread_st.partition_S(
+                            cute.make_identity_tensor((128, 1))
+                        )
                         registers = cute.make_rmem_tensor(coords.shape, cutlass.Uint32)
                         assert cute.size(registers) == 1
-                        word = self.intermediate_scale_word(sfb_words,
-                            sb_cons.index, row_base, limit, kc, lane)
+                        word = self.intermediate_scale_word(
+                            sfb_words, sb_cons.index, row_base, limit, kc, lane
+                        )
                         registers.fill(word)
                         cute.copy(st, registers, thread_st.partition_D(word_tensor))
                     cute.arch.fence_view_async_tmem_store()
@@ -883,14 +1199,20 @@ class SkinnyDecodeFinalizeKernel:
             bc = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 3)
             tac = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 3)
             tbc = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 3)
-            meta_mma = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
-            acc_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
+            meta_mma = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
+            acc_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 2
+            )
             # Address encodings are invariant across all independent ring slots.
             # Use the actual allocated TMEM base and original typed SF layouts.
-            selector_a0 = cute.make_tensor(cute.recast_ptr(
-                acc_ptr + 16, dtype=self.sf_dtype), sat)
-            selector_b0 = cute.make_tensor(cute.recast_ptr(
-                acc_ptr + 64, dtype=self.sf_dtype), sbt)
+            selector_a0 = cute.make_tensor(
+                cute.recast_ptr(acc_ptr + 16, dtype=self.sf_dtype), sat
+            )
+            selector_b0 = cute.make_tensor(
+                cute.recast_ptr(acc_ptr + 64, dtype=self.sf_dtype), sbt
+            )
             d0 = finalize_instruction_selector(mma, selector_a0, selector_b0, 0)
             d1 = finalize_instruction_selector(mma, selector_a0, selector_b0, 1)
             d2 = finalize_instruction_selector(mma, selector_a0, selector_b0, 2)
@@ -914,18 +1236,27 @@ class SkinnyDecodeFinalizeKernel:
                     tap.consumer_wait(tac)
                     tbp.consumer_wait(tbc)
                     tcgen05_fence_after_thread_sync()
-                    ta0 = cute.make_tensor(cute.recast_ptr(
-                        acc_ptr + 16 + tac.index * 16, dtype=self.sf_dtype), sat)
-                    tb0 = cute.make_tensor(cute.recast_ptr(
-                        acc_ptr + 64 + tbc.index * 8, dtype=self.sf_dtype), sbt)
+                    ta0 = cute.make_tensor(
+                        cute.recast_ptr(
+                            acc_ptr + 16 + tac.index * 16, dtype=self.sf_dtype
+                        ),
+                        sat,
+                    )
+                    tb0 = cute.make_tensor(
+                        cute.recast_ptr(
+                            acc_ptr + 64 + tbc.index * 8, dtype=self.sf_dtype
+                        ),
+                        sbt,
+                    )
                     if cutlass.const_expr(self.enable_t4_const_scheduler):
                         next_a_ready = a_ready
                         if kt + 1 < ke:
                             next_ac = ac.clone()
                             next_ac.advance()
                             next_a_ready = ap.consumer_try_wait(next_ac)
-                    issue_finalize_epoch(mma, acc, fa, fb, ta0, tb0,
-                                         ac.index, bc.index, d0, d1, d2, d3)
+                    issue_finalize_epoch(
+                        mma, acc, fa, fb, ta0, tb0, ac.index, bc.index, d0, d1, d2, d3
+                    )
                     mma.set(tcgen05.Field.ACCUMULATE, True)
                     ap.consumer_release(ac)
                     bp.consumer_release(bc)
@@ -945,8 +1276,12 @@ class SkinnyDecodeFinalizeKernel:
 
         # Four-warp TMEM load, token-major BF16 bridge, then existing bulk add.
         if warp < 4:
-            meta_epi = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
-            acc_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
+            meta_epi = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
+            acc_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
             self.read_work(mp, meta_epi, records, work)
             meta_epi.advance()
             while work[0] >= 0:
@@ -960,7 +1295,8 @@ class SkinnyDecodeFinalizeKernel:
                         token = (expanded // top_k).to(cutlass.Int32)
                         choice = expanded % top_k
                         combined_scale = cutlass.Float32(
-                            alpha[work[3]] * route_weights[(token, choice)])
+                            alpha[work[3]] * route_weights[(token, choice)]
+                        )
                 cp.consumer_wait(acc_cons)
                 tcgen05_fence_after_thread_sync()
                 acc_out = cute.make_tensor(acc_ptr + acc_cons.index * 8, acc_layout)
@@ -974,7 +1310,9 @@ class SkinnyDecodeFinalizeKernel:
                     channel, slot = coords[vi]
                     scale = cute.arch.shuffle_sync(combined_scale, cutlass.Int32(slot))
                     if row_base + slot < limit:
-                        output_rows[(slot, channel)] = (scale * values[vi]).to(cutlass.BFloat16)
+                        output_rows[(slot, channel)] = (scale * values[vi]).to(
+                            cutlass.BFloat16
+                        )
                 cute.arch.fence_proxy("async.shared", space="cta")
                 self.epilog_sync_barrier.arrive_and_wait()
                 cp.consumer_release(acc_cons)
@@ -983,7 +1321,9 @@ class SkinnyDecodeFinalizeKernel:
                 if tid < 8:
                     if row_base + tid < limit:
                         destination = cute.domain_offset((token, work[0] * 128), out)
-                        blk_reduce_bf16(destination, output_rows[tid, None], cutlass.Int32(256))
+                        blk_reduce_bf16(
+                            destination, output_rows[tid, None], cutlass.Int32(256)
+                        )
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()

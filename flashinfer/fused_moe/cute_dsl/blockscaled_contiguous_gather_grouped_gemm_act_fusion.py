@@ -75,7 +75,9 @@ from .moe_utils import (
 
 # Import the Blackwell (SM100) kernel implementation
 from .blackwell.skinny_decode_gather import SkinnyDecodeGatherKernel
-from .blackwell.skinny_decode_paired_t2 import SkinnyDecodeGatherKernel as PairedT2GatherKernel
+from .blackwell.skinny_decode_paired_t2 import (
+    SkinnyDecodeGatherKernel as PairedT2GatherKernel,
+)
 from .blackwell.narrow_prefill_n16_k512_gather import NarrowPrefillN16K512GatherKernel
 from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
@@ -370,7 +372,10 @@ def _get_compiled_gather_kernel(
     # Reuse the existing private T512 eligibility; routing stays device-resident.
     enable_route_split = bool(
         enable_sparse_prefill_epilogue
-        and k == 7168 and n == 6144 and num_experts == 112 and topk == 16
+        and k == 7168
+        and n == 6144
+        and num_experts == 112
+        and topk == 16
         and not raster_along_m
     )
     if enable_route_split and _route_split_mode == "":
@@ -441,25 +446,43 @@ def _get_compiled_gather_kernel(
     ) or enable_route_split_sparse
     enable_b_vector_load = bool(enable_skinny_decode and _input_aligned_16)
     enable_t16_const_scheduler = bool(
-        enable_skinny_decode and enable_b_vector_load
-        and orig_m == 16 and n == 6144 and k == 7168
-        and num_experts == 112 and topk == 16 and not raster_along_m
+        enable_skinny_decode
+        and enable_b_vector_load
+        and orig_m == 16
+        and n == 6144
+        and k == 7168
+        and num_experts == 112
+        and topk == 16
+        and not raster_along_m
     )
     enable_t16_slot_planes = enable_t16_const_scheduler
     if _private_paired_t2 and not (
-        enable_skinny_decode and enable_b_vector_load
-        and orig_m in (2, 4, 16) and n == 6144 and k == 7168
-        and num_experts == 112 and topk == 16 and not raster_along_m
+        enable_skinny_decode
+        and enable_b_vector_load
+        and orig_m in (2, 4, 16)
+        and n == 6144
+        and k == 7168
+        and num_experts == 112
+        and topk == 16
+        and not raster_along_m
     ):
-        raise ValueError("private paired W1/SFA requires the eligible T2/T4/T16 skinny plan")
+        raise ValueError(
+            "private paired W1/SFA requires the eligible T2/T4/T16 skinny plan"
+        )
 
     enable_t4_scale_address = bool(
-        _private_paired_t2 and enable_skinny_decode and enable_b_vector_load
-        and orig_m == 4 and n == 6144 and k == 7168
-        and num_experts == 112 and topk == 16 and not raster_along_m
+        _private_paired_t2
+        and enable_skinny_decode
+        and enable_b_vector_load
+        and orig_m == 4
+        and n == 6144
+        and k == 7168
+        and num_experts == 112
+        and topk == 16
+        and not raster_along_m
     )
 
-    cache_key = (
+    cache_key: Tuple[Any, ...] = (
         "sm107" if is_rubin else "sm100",
         a_dtype,
         b_dtype,
@@ -1039,7 +1062,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             ("situ_linear_beta", situ_linear_beta),
         ):
             if value is not None and (
-                value.device != a.device or value.numel() not in (1, num_experts)
+                value.device != a.device or value.numel() not in (1, num_experts)  # type: ignore[union-attr]
             ):
                 raise ValueError(
                     f"{name} must be on the input device and contain one or "
@@ -1051,9 +1074,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_beta_stride = int(situ_beta.numel() != 1)
         if situ_linear_beta is not None:
             runtime_situ_linear_beta_ptr = make_ptr(
-                cutlass.Float32, situ_linear_beta.data_ptr(), cute.AddressSpace.gmem
+                cutlass.Float32,
+                situ_linear_beta.data_ptr(),  # type: ignore[union-attr]
+                cute.AddressSpace.gmem,
             )
-            situ_linear_beta_stride = int(situ_linear_beta.numel() != 1)
+            situ_linear_beta_stride = int(situ_linear_beta.numel() != 1)  # type: ignore[union-attr]
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -1081,7 +1106,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     private_scale_layout = getattr(b_scale, "_private_paired_t2_layout", None)
     private_paired_t2 = private_layout is not None or private_scale_layout is not None
     if private_paired_t2:
-        if private_layout != "paired_t2_w1_sf32" or private_scale_layout != private_layout:
+        if (
+            private_layout != "paired_t2_w1_sf32"
+            or private_scale_layout != private_layout
+        ):
             raise ValueError("private T2 requires paired W1 and scale layout tags")
         if (major, minor) != (10, 3):
             raise ValueError("private paired T2 W1/SFA requires SM103")
