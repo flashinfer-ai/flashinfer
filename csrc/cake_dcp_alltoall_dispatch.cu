@@ -1,0 +1,126 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// Native launch bridge; the generated device and TVM-FFI sources remain unchanged.
+// clang-format off
+#include <algorithm>
+#include <cstdint>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include "tvm_ffi_utils.h"
+#include "cake_dcp_alltoall_dispatch.cuh"
+// clang-format on
+
+namespace {
+struct GeneratedDcpKernel {
+  int cp_size;
+  unsigned smem_bytes;
+  const void* kernel;
+};
+}  // namespace
+
+// CAKE_DCP_GENERATED_KERNELS_BEGIN
+// Filled by the Cake source exporter per exact target: one extern "C"
+// declaration per generated kernel and the (cp_size, dynamic smem bytes,
+// kernel) table, selected by the CAKE_DCP_GENERATED_TARGET_* define of the
+// compiling module.
+namespace {
+const GeneratedDcpKernel kGeneratedDcpKernels[] = {
+    {0, 0u, nullptr},
+};
+constexpr int kGeneratedDcpKernelCount = 0;
+}  // namespace
+// CAKE_DCP_GENERATED_KERNELS_END
+
+namespace flashinfer::comm::dcp {
+
+namespace {
+// The generated schedule is the exact BF16/FP16 D128 + two-FP32-statistics
+// route: 256-byte partial rows and 8-byte statistics rows, contiguous per entry.
+constexpr int kPartialElementCount = 128;
+constexpr int kPartialElementSize = 2;
+constexpr int kStatsElementCount = 2;
+constexpr int kStatsElementSize = 4;
+constexpr unsigned kWarpSize = 32;
+
+bool FieldMatches(tensorrt_llm::kernels::HelixFieldInfo const& field, int element_count,
+                  int element_size) {
+  return field.elementCount == element_count && field.elementSize == element_size &&
+         field.stride == element_count * element_size;
+}
+
+int ActiveChannelCount(tensorrt_llm::kernels::HelixAllToAllParams const& params) {
+  // Mirrors the source launch geometry: one channel per entry up to the
+  // workspace-backed maximum.
+  return std::min(params.maxChannelCount, std::max(1, params.entryCount));
+}
+}  // namespace
+
+bool LaunchGeneratedDcpAllToAll(tensorrt_llm::kernels::HelixAllToAllParams const& params,
+                                bool allowVariableField1, bool enablePdl, cudaStream_t stream) {
+  if (kGeneratedDcpKernelCount == 0 || allowVariableField1 || params.channelCount != 0) {
+    return false;
+  }
+  if (!FieldMatches(params.sendFields[0], kPartialElementCount, kPartialElementSize) ||
+      !FieldMatches(params.recvFields[0], kPartialElementCount, kPartialElementSize) ||
+      !FieldMatches(params.sendFields[1], kStatsElementCount, kStatsElementSize) ||
+      !FieldMatches(params.recvFields[1], kStatsElementCount, kStatsElementSize)) {
+    return false;
+  }
+  if (params.entryCount <= 0 || params.maxChannelCount <= 0 || params.cpRank < 0 ||
+      params.cpRank >= params.cpSize) {
+    return false;
+  }
+  const GeneratedDcpKernel* selected = nullptr;
+  for (int index = 0; index < kGeneratedDcpKernelCount; ++index) {
+    if (kGeneratedDcpKernels[index].cp_size == params.cpSize) {
+      selected = &kGeneratedDcpKernels[index];
+      break;
+    }
+  }
+  if (selected == nullptr) {
+    return false;
+  }
+
+  void* partial_o = params.sendFields[0].dataPtr;
+  void* softmax_stats = params.sendFields[1].dataPtr;
+  void* partial_o_out = params.recvFields[0].dataPtr;
+  void* softmax_stats_out = params.recvFields[1].dataPtr;
+  void* workspace = params.workspace;
+  unsigned long long workspace_stride_in_u64 =
+      static_cast<unsigned long long>(params.workspaceStrideInU64);
+  int cp_rank = params.cpRank;
+  int entry_count = params.entryCount;
+  int max_channel_count = params.maxChannelCount;
+  void* args[] = {&partial_o,     &softmax_stats,           &partial_o_out, &softmax_stats_out,
+                  &workspace,     &workspace_stride_in_u64, &cp_rank,       &entry_count,
+                  &max_channel_count};
+
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(1, static_cast<unsigned>(ActiveChannelCount(params)), 2);
+  config.blockDim = dim3(kWarpSize, static_cast<unsigned>(params.cpSize), 1);
+  config.dynamicSmemBytes = selected->smem_bytes;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enablePdl ? 1 : 0;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  cudaError_t status = cudaLaunchKernelExC(&config, selected->kernel, args);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "generated DCP all-to-all launch failed: " << cudaGetErrorString(status);
+  return true;
+}
+
+}  // namespace flashinfer::comm::dcp
