@@ -151,6 +151,10 @@ from .jit.cake_minimax_h3_mxfp8 import (
     MiniMaxH3Mxfp8Target,
     gen_minimax_h3_mxfp8_aot_modules,
 )
+from .jit.cake_minimax_h3_nvfp4 import (
+    MiniMaxH3Nvfp4Target,
+    gen_minimax_h3_nvfp4_aot_modules,
+)
 from .jit.mla import (
     gen_mla_module,
     gen_sparse_mla_sm120_module,
@@ -625,6 +629,14 @@ def gen_all_modules(
     for minimax_h3_target, enabled in minimax_h3_targets:
         if enabled:
             jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
+
+    minimax_h3_nvfp4_targets: tuple[tuple[MiniMaxH3Nvfp4Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.

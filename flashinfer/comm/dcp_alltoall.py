@@ -95,10 +95,36 @@ def get_dcp_alltoall_module():
             partial_o, softmax_stats, workspace, cp_rank, cp_size, enable_pdl
         )
 
+    @register_custom_op(
+        "flashinfer::decode_cp_a2a_alltoall_into",
+        mutates_args=("partial_o_out", "softmax_stats_out", "workspace"),
+    )
+    def decode_cp_a2a_alltoall_into(
+        partial_o: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        partial_o_out: torch.Tensor,
+        softmax_stats_out: torch.Tensor,
+        workspace: torch.Tensor,
+        cp_rank: int,
+        cp_size: int,
+        enable_pdl: bool = True,
+    ) -> None:
+        module.alltoall_dcp_native_into(
+            partial_o,
+            softmax_stats,
+            partial_o_out,
+            softmax_stats_out,
+            workspace,
+            cp_rank,
+            cp_size,
+            enable_pdl,
+        )
+
     return SimpleNamespace(
         get_workspace_size_per_rank=module.get_dcp_workspace_size_per_rank,
         initialize_workspace=decode_cp_a2a_init_workspace,
         alltoall=decode_cp_a2a_alltoall,
+        alltoall_into=decode_cp_a2a_alltoall_into,
     )
 
 
@@ -161,7 +187,9 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
     mnnvl_config : MnnvlConfig, optional
         Configuration for the MNNVL communication backend.  Required when
         using MNNVL with ``torch.distributed`` (pass
-        ``MnnvlConfig(comm_backend=TorchDistBackend(group))``).
+        ``MnnvlConfig(comm_backend=TorchDistBackend(group))``); the backend is
+        split into context-parallel groups (same ``pp_rank`` / ``tp_rank``,
+        ordered by ``cp_rank``) so the workspace holds one segment per CP rank.
 
     Returns
     -------
@@ -172,7 +200,14 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
 
     MnnvlMemory.initialize()
     if mnnvl_config:
-        MnnvlMemory.set_comm_from_config(mapping, mnnvl_config)
+        # The DCP workspace spans the context-parallel group: one segment per
+        # CP rank, ordered by ``cp_rank``. ``MnnvlMemory.set_comm_from_config``
+        # builds tensor-parallel groups instead (ranks sharing a ``cp_rank``),
+        # which would leave every CP rank alone with a single-segment workspace.
+        MnnvlMemory.config = mnnvl_config
+        MnnvlMemory.comm = mnnvl_config.comm_backend.Split(
+            mapping.pp_rank * mapping.tp_size + mapping.tp_rank, mapping.cp_rank
+        )
 
     mnnvl_mem = MnnvlMemory(mapping, ws_bytes)
     workspace = mnnvl_mem.as_torch_strided_tensor(torch.int64)
@@ -231,6 +266,7 @@ def decode_cp_a2a_alltoall(
     cp_rank: int,
     cp_size: int,
     enable_pdl: Optional[bool] = None,
+    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Perform the DCP all-to-all exchange.
 
@@ -257,6 +293,11 @@ def decode_cp_a2a_alltoall(
     enable_pdl : bool, optional
         Enable Programmatic Dependent Launch (SM90+).  Defaults to ``True``
         on SM90+ GPUs and ``False`` otherwise.
+    out : Tuple[torch.Tensor, torch.Tensor], optional
+        Preallocated ``(partial_o_out, softmax_stats_out)`` with the same
+        shapes, dtypes and device as the inputs. When given, the exchange
+        writes into these tensors and returns them, so CUDA-graph captures
+        and steady-state decode loops do not allocate per call.
 
     Returns
     -------
@@ -264,12 +305,34 @@ def decode_cp_a2a_alltoall(
         ``(partial_o_out, softmax_stats_out)`` with the same shapes and
         dtypes as the inputs.  Each output contains the gathered data from
         all peers for this rank.
+
+    Note
+    ----
+    On SM100 / SM103 targets built with an exact ``FLASHINFER_CUDA_ARCH_LIST``
+    (``10.0a`` or ``10.3a``), the BF16/FP16 ``D=128``, ``S=2`` CP2/CP4 routes
+    run a generated kernel that shares this workspace layout; every other
+    shape or target runs the portable helix kernel. Both paths produce the
+    same outputs.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(partial_o.device)
-    return get_dcp_alltoall_module().alltoall(
-        partial_o, softmax_stats, workspace, cp_rank, cp_size, enable_pdl
+    module = get_dcp_alltoall_module()
+    if out is None:
+        return module.alltoall(
+            partial_o, softmax_stats, workspace, cp_rank, cp_size, enable_pdl
+        )
+    partial_o_out, softmax_stats_out = out
+    module.alltoall_into(
+        partial_o,
+        softmax_stats,
+        partial_o_out,
+        softmax_stats_out,
+        workspace,
+        cp_rank,
+        cp_size,
+        enable_pdl,
     )
+    return partial_o_out, softmax_stats_out
 
 
 __all__ = [
