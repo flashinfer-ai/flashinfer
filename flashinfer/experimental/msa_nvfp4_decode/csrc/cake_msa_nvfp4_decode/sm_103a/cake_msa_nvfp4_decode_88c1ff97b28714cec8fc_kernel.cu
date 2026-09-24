@@ -961,7 +961,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_msa_nvfp4_decode_327f6606c686359b3132(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+kernel_cake_msa_nvfp4_decode_88c1ff97b28714cec8fc(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1172,35 +1172,27 @@ kernel_cake_msa_nvfp4_decode_327f6606c686359b3132(const __grid_constant__ CUtens
                             asm volatile("redux.sync.max.NaN.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_f32_0) : "f"(_max_0));
                             wmax[c_3] = _warp_redux_f32_0;
                         }
-                        #pragma unroll
-                        for (int c_4 = 0; c_4 < 16; c_4++) {
-                            if (origin[c_4] == -CAKE_INF) {
-                                if (wmax[c_4] > -CAKE_INF) {
-                                    origin[c_4] = wmax[c_4];
-                                    neg_ms[c_4] = (-wmax[c_4]) * softmax_scale_log2;
-                                }
+                        if (wmax[0] > -CAKE_INF) {
+                            #pragma unroll
+                            for (int c_4 = 0; c_4 < 16; c_4++) {
+                                origin[c_4] = wmax[c_4];
+                                neg_ms[c_4] = (-wmax[c_4]) * softmax_scale_log2;
                             }
-                        }
-                        origins_set = 1;
-                        #pragma unroll
-                        for (int c_5 = 0; c_5 < 16; c_5++) {
-                            if (origin[c_5] == -CAKE_INF) {
-                                origins_set = 0;
-                            }
+                            origins_set = 1;
                         }
                     }
                     if (p >= 2) {
                         mbarrier_wait(pv_done_addr + (p - 2) * 8, item_par);
                     }
                     #pragma unroll
-                    for (int c_6 = 0; c_6 < 16; c_6++) {
-                        float _fma_0 = __fmaf_rn(sv0[c_6], softmax_scale_log2, neg_ms[c_6]);
+                    for (int c_5 = 0; c_5 < 16; c_5++) {
+                        float _fma_0 = __fmaf_rn(sv0[c_5], softmax_scale_log2, neg_ms[c_5]);
                         float _exp2_0 = approx_exp2(_fma_0);
-                        sv0[c_6] = _exp2_0;
-                        float _fma_1 = __fmaf_rn(sv1[c_6], softmax_scale_log2, neg_ms[c_6]);
+                        sv0[c_5] = _exp2_0;
+                        float _fma_1 = __fmaf_rn(sv1[c_5], softmax_scale_log2, neg_ms[c_5]);
                         float _exp2_1 = approx_exp2(_fma_1);
-                        sv1[c_6] = _exp2_1;
-                        lane_sum[c_6] = lane_sum[c_6] + sv0[c_6] + sv1[c_6];
+                        sv1[c_5] = _exp2_1;
+                        lane_sum[c_5] = lane_sum[c_5] + sv0[c_5] + sv1[c_5];
                     }
                     int p0_base = smem_p_addr + (unsigned int)(p_stage * 2 * 4096);
                     int p1_base = smem_p_addr + (unsigned int)((p_stage * 2 + 1) * 4096);
@@ -1235,9 +1227,9 @@ kernel_cake_msa_nvfp4_decode_327f6606c686359b3132(const __grid_constant__ CUtens
                         tmem_ld_x16(&nv1[0], s_addr_n + 16);
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         #pragma unroll
-                        for (int c_7 = 0; c_7 < 16; c_7++) {
-                            sv0[c_7] = nv0[c_7];
-                            sv1[c_7] = nv1[c_7];
+                        for (int c_6 = 0; c_6 < 16; c_6++) {
+                            sv0[c_6] = nv0[c_6];
+                            sv1[c_6] = nv1[c_6];
                         }
                     }
                 }
@@ -1245,22 +1237,52 @@ kernel_cake_msa_nvfp4_decode_327f6606c686359b3132(const __grid_constant__ CUtens
                 if (elect_sync()) {
                     mbarrier_arrive(meta_empty_addr + (item_par) * 8);
                 }
-                float sum_hold = 0.0f;
+                int b4 = lane / 16 % 2;
+                int b3 = lane / 8 % 2;
+                int b2 = lane / 4 % 2;
+                int b1 = lane / 2 % 2;
+                float r8[8];
+                #pragma unroll
+                for (int c_7 = 0; c_7 < 8; c_7++) {
+                    float snd8 = ((b4 == 0) ? lane_sum[c_7 + 8] : lane_sum[c_7]);
+                    float kp8 = ((b4 == 0) ? lane_sum[c_7] : lane_sum[c_7 + 8]);
+                    float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, snd8, 16);
+                    r8[c_7] = kp8 + _shfl_xor_0;
+                }
+                float r4[4];
+                #pragma unroll
+                for (int c_8 = 0; c_8 < 4; c_8++) {
+                    float snd4 = ((b3 == 0) ? r8[c_8 + 4] : r8[c_8]);
+                    float kp4 = ((b3 == 0) ? r8[c_8] : r8[c_8 + 4]);
+                    float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, snd4, 8);
+                    r4[c_8] = kp4 + _shfl_xor_1;
+                }
+                float r2[2];
+                #pragma unroll
+                for (int c_9 = 0; c_9 < 2; c_9++) {
+                    float snd2 = ((b2 == 0) ? r4[c_9 + 2] : r4[c_9]);
+                    float kp2 = ((b2 == 0) ? r4[c_9] : r4[c_9 + 2]);
+                    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, snd2, 4);
+                    r2[c_9] = kp2 + _shfl_xor_2;
+                }
+                float snd1 = ((b1 == 0) ? r2[1] : r2[0]);
+                float kp1 = ((b1 == 0) ? r2[0] : r2[1]);
+                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, snd1, 2);
+                float r1 = kp1 + _shfl_xor_3;
+                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, r1, 1);
+                r1 = r1 + _shfl_xor_4;
+                float head_sum_w = r1;
                 float orig_hold = -CAKE_INF;
                 #pragma unroll
-                for (int c_8 = 0; c_8 < 16; c_8++) {
-                    float _warp_reduce_0 = lane_sum[c_8];
-                    #pragma unroll
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-                    float warp_sum_c = _warp_reduce_0;
-                    if (lane == c_8) {
-                        sum_hold = warp_sum_c;
-                        orig_hold = origin[c_8];
+                for (int c_10 = 0; c_10 < 16; c_10++) {
+                    if (lane == c_10) {
+                        orig_hold = origin[c_10];
                     }
                 }
+                if (lane % 2 == 0) {
+                    smem_f32[warp_in_role * 32 + lane / 2] = head_sum_w;
+                }
                 if (lane < 16) {
-                    smem_f32[warp_in_role * 32 + lane] = sum_hold;
                     smem_f32[warp_in_role * 32 + 16 + lane] = orig_hold;
                 }
                 asm volatile("barrier.sync 8, 128;" ::: "memory");
@@ -2108,6 +2130,8 @@ kernel_cake_msa_nvfp4_decode_327f6606c686359b3132(const __grid_constant__ CUtens
                         elect_commit(q_empty_addr + (q_buf_s) * 8);
                     }
                     elect_commit(s_full_addr + (s_stage_m) * 8);
+                    if (sp_1 == npairs_s - 1) {
+                    }
                     s_stage_m += 1;
                     if (s_stage_m == 2) { s_stage_m = 0; s_phase_m ^= 1; }
                 }
