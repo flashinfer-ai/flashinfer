@@ -44,7 +44,9 @@ def test_cudnn_prefill_token_indptr(
     if not direct:
         # Force the conversion path even where the direct path is supported.
         monkeypatch.setattr(
-            cudnn_prefill, "_cudnn_supports_direct_seqlens", lambda dtype: False
+            cudnn_prefill,
+            "_cudnn_supports_direct_seqlens",
+            lambda dtype, **kwargs: False,
         )
 
     torch.manual_seed(0)
@@ -145,7 +147,9 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
 
     if not direct:
         monkeypatch.setattr(
-            cudnn_prefill, "_cudnn_supports_direct_seqlens", lambda dtype: False
+            cudnn_prefill,
+            "_cudnn_supports_direct_seqlens",
+            lambda dtype, **kwargs: False,
         )
 
     torch.manual_seed(0)

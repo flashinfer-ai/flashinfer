@@ -39,6 +39,8 @@ _patch_cutlass_dsl_operand_major_mode()
 import flashinfer
 from flashinfer.jit import MissingJITCacheError
 
+pytest_plugins = ["tests.test_helpers.parametrize"]
+
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
 _MISSING_JIT_CACHE_MODULES: Set[tuple] = set()
@@ -179,6 +181,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
     config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
+    config.addinivalue_line("markers", "arch_rubin: requires sm_107 (Rubin)")
     config.addinivalue_line(
         "markers", "arch_sm120: requires sm_120/sm_121 (Blackwell-consumer)"
     )
@@ -240,12 +243,12 @@ def pytest_collection_modifyitems(config, items):
                 # (the sm120 kernel drop's bootstrap maps
                 # local_rank % device_count and supports MEGA_SINGLE_GPU_GLOO).
                 item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
-        # Exactly the sm_10x family: the sm_100 tree's kernels do not target
-        # Hopper (below) or the consumer sm_11x/sm_12x families (which use
-        # their own kernel trees), so >= would let them collect on hosts
-        # where the kernel cannot compile.
-        if "arch_blackwell" in item.keywords and cc[0] != 10:
-            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103"))
+        # SM100 kernels cannot compile for Rubin (10.7).
+        if "arch_blackwell" in item.keywords and (cc < (10, 0) or cc >= (10, 7)):
+            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)"))
+        # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
+        if "arch_rubin" in item.keywords and cc != (10, 7):
+            item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):
@@ -293,6 +296,8 @@ def pytest_runtest_call(item):
     try:
         yield
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if os.environ.get("FLASHINFER_STRICT_MOE_EP_TESTS") == "1":
+            raise
         if _release_cuda_oom(e):
             pytest.skip("Skipping due to OOM")
         elif isinstance(e, MissingJITCacheError):

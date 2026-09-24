@@ -297,6 +297,67 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
   }
 }
 
+// Named tensor-argument checks. Each check names the offending argument in its
+// error so a caller can act on the message without reading the binding.
+inline void check_cuda_tensor(const TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
+      << name
+      << " must be a CUDA tensor, got device_type=" << static_cast<int>(t.device().device_type);
+}
+
+inline void check_dtype(const TensorView& t, DLDataType expected, const char* name) {
+  DLDataType d = t.dtype();
+  TVM_FFI_CHECK(d.code == expected.code && d.bits == expected.bits && d.lanes == expected.lanes,
+                TypeError)
+      << name << " dtype mismatch: expected DLDataType(code=" << static_cast<int>(expected.code)
+      << ", bits=" << static_cast<int>(expected.bits)
+      << ", lanes=" << static_cast<int>(expected.lanes)
+      << "), got (code=" << static_cast<int>(d.code) << ", bits=" << static_cast<int>(d.bits)
+      << ", lanes=" << static_cast<int>(d.lanes) << ")";
+}
+
+inline void check_contiguous(const TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
+}
+
+inline void check_same_device(const TensorView& t, const TensorView& reference, const char* name,
+                              const char* reference_name) {
+  TVM_FFI_CHECK(t.device().device_type == reference.device().device_type &&
+                    t.device().device_id == reference.device().device_id,
+                ValueError)
+      << name << " must be on the same device as " << reference_name
+      << ": got device_type=" << static_cast<int>(t.device().device_type)
+      << " id=" << t.device().device_id
+      << " versus device_type=" << static_cast<int>(reference.device().device_type)
+      << " id=" << reference.device().device_id;
+}
+
+// Require the dimensions above the last `trailing` dimensions to form one dense
+// row-major chain, so they can be folded into a single logical dimension whose
+// step is stride(-(trailing + 1)). Shape products are stride-independent, so
+// this verifies the physical layout instead of inventing a folded stride.
+inline void check_dense_leading_dims(const TensorView& t, int trailing, const char* name) {
+  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
+      << name << " cannot fold leading dimensions above " << trailing
+      << " trailing dims from ndim=" << t.ndim();
+  int outer_last = t.ndim() - trailing - 1;
+  if (outer_last <= 0) {
+    return;
+  }
+  int64_t step = t.stride(outer_last);
+  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
+  int64_t expected = step;
+  for (int axis = outer_last - 1; axis >= 0; --axis) {
+    expected *= t.size(axis + 1);
+    if (t.size(axis) > 1) {
+      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
+          << name << " leading dims are not physically foldable above " << trailing
+          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected "
+          << expected;
+    }
+  }
+}
+
 #define CHECK_CUDA(x) \
   TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CPU(x) \
