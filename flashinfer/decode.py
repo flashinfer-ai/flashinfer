@@ -158,7 +158,6 @@ _PRIMS_TS_LAZY_EXPORTS = (
             "get_prims_ts_batch_decode_workspace_size",
             "make_q_token_kv_block_sparse_qo_indptr",
             "prepare_prims_ts_batch_decode_with_kv_cache",
-            "prims_ts_batch_decode_with_kv_cache",
             "suggest_q_token_kv_block_sparse_group_size",
             "validate_q_token_kv_block_sparse_group_size",
         }
@@ -276,6 +275,92 @@ def prepare_sm110_gqa_decode(
     from .experimental.sm110_gqa_decode import prepare_for_launch
 
     return prepare_for_launch(inputs, num_splits=num_splits)
+
+
+@flashinfer_experimental_api(feature="Balanced paged GQA decode")
+def prepare_balanced_batch_decode_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    sm_scale: Optional[float] = None,
+    q_len_per_req: int = 1,
+    out: Optional[torch.Tensor] = None,
+    kv_layout: str = "HND",
+    backend: str = "cake",
+):
+    r"""Prepare on-device load-balanced BF16 paged GQA decode (SM100/SM103).
+
+    The experimental Cake backend serves ragged paged decode batches with one
+    persistent launch whose work plan is derived on the GPU from ``seq_lens``:
+    long requests are split across CTAs and short ones packed, with no host
+    planning, no request permutation and no per-length CUDA Graph variants
+    (the kernel-owned scheduler requested in flashinfer-ai/flashinfer#4832).
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        BF16 ``[batch * q_len_per_req, num_q_heads, 128]``; request ``b`` owns
+        rows ``[b * q_len_per_req, (b + 1) * q_len_per_req)`` and query head
+        ``h`` attends to KV head ``h // 8`` (exactly eight query heads per KV
+        head).
+    kv_cache : Tuple[torch.Tensor, torch.Tensor]
+        ``(k_cache, v_cache)``, each BF16 ``[num_pages, num_kv_heads, 16, 128]``
+        (``HND`` pages of 16 tokens).
+    block_tables : torch.Tensor
+        int32 ``[batch, max_pages]`` page ids per request.  A width that is a
+        multiple of eight pages is read in place; other widths are copied
+        into a padded table inside ``workspace_buffer`` at preparation.
+    seq_lens : torch.Tensor
+        int32 ``[batch]`` KV lengths including the ``q_len_per_req`` new
+        tokens.  Read on device at every launch.
+    workspace_buffer : torch.Tensor
+        Caller-owned CUDA bytes of at least
+        :func:`flashinfer.experimental.balanced_gqa_decode.cake_backend.balanced_gqa_decode_workspace_size`;
+        the split partials and the kernel's self-resetting counters live here,
+        so the region must not be shared with other work between launches.
+    sm_scale : Optional[float]
+        Softmax scale; defaults to ``1 / sqrt(128)``.
+    q_len_per_req : int
+        Query tokens per request (speculative / MTP verify).  Row ``j`` of a
+        request attends causally to its first ``seq_len - (q_len_per_req - 1 - j)``
+        KV positions.
+    out : Optional[torch.Tensor]
+        Optional caller-owned BF16 ``[batch * q_len_per_req, num_q_heads, 128]``.
+    kv_layout : str
+        Only ``"HND"`` is supported.
+    backend : str
+        Only ``"cake"`` is supported.
+
+    Returns
+    -------
+    BalancedGQADecodeRunner
+        Calling it launches the decode on the current stream with no CUDA
+        allocation or host synchronization and returns ``out``.  CUDA Graph
+        capture belongs to the caller; a captured runner replays correctly
+        for any lengths later written into ``seq_lens``.  See
+        ``flashinfer/experimental/balanced_gqa_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("balanced GQA decode currently supports backend='cake'")
+    from .experimental.balanced_gqa_decode.cake_backend import (
+        prepare_balanced_batch_decode_with_kv_cache as prepare,
+    )
+
+    return prepare(
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        sm_scale=sm_scale,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        kv_layout=kv_layout,
+        backend="cake",
+    )
 
 
 @flashinfer_experimental_api(feature="Prepared SM110 GQA decode launch")

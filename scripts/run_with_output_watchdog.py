@@ -213,22 +213,88 @@ def _collect_diagnostics(root_pid: int, idle_seconds: float) -> str:
 def _terminate_process_group(
     process: subprocess.Popen[bytes], grace_seconds: float
 ) -> None:
-    if process.poll() is not None:
-        return
+    def process_group_has_live_members() -> bool:
+        proc_root = Path("/proc")
+        if proc_root.is_dir():
+            try:
+                entries = list(proc_root.iterdir())
+            except OSError:
+                entries = []
+            else:
+                for entry in entries:
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        stat_fields = (
+                            (entry / "stat").read_text().rpartition(")")[2].split()
+                        )
+                        state = stat_fields[0]
+                        process_group = int(stat_fields[2])
+                    except (IndexError, OSError, ValueError):
+                        continue
+                    if process_group == process.pid and state != "Z":
+                        return True
+                return False
+
+        try:
+            result = subprocess.run(
+                ["ps", "-axo", "pgid=,stat="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        else:
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    fields = line.split(None, 1)
+                    if len(fields) == 2 and fields[0] == str(process.pid):
+                        if not fields[1].startswith("Z"):
+                            return True
+                return False
+
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def wait_for_process_group(timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while process_group_has_live_members():
+            process.poll()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.1, remaining))
+        process.poll()
+        return True
+
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=grace_seconds)
     except ProcessLookupError:
+        process.poll()
         return
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
+
+    if not wait_for_process_group(grace_seconds):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        wait_for_process_group(5)
+
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=5)
 
 
 def run(args: argparse.Namespace) -> int:
+    child_environment = os.environ.copy()
+    child_environment["PYTHONUNBUFFERED"] = "1"
     process = subprocess.Popen(
         args.command,
+        env=child_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -253,11 +319,18 @@ def run(args: argparse.Namespace) -> int:
             diagnostics = _collect_diagnostics(process.pid, idle_seconds)
             sys.stderr.write(f"\n{diagnostics}")
             sys.stderr.flush()
-            if args.diagnostics_file:
-                path = Path(args.diagnostics_file)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(diagnostics)
-            _terminate_process_group(process, args.term_grace_seconds)
+            try:
+                if args.diagnostics_file:
+                    path = Path(args.diagnostics_file)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(diagnostics)
+            except OSError as error:
+                sys.stderr.write(
+                    f"watchdog could not write {args.diagnostics_file}: {error}\n"
+                )
+                sys.stderr.flush()
+            finally:
+                _terminate_process_group(process, args.term_grace_seconds)
             return 124
 
         events = selector.select(timeout=min(remaining, 1.0))

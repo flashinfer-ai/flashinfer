@@ -1087,6 +1087,9 @@ def test_contiguous_one_shot_forwards_route_mode_and_capacity(
     calls: list[tuple[str, dict[str, object]]] = []
     sentinel = object()
     monkeypatch.setattr(
+        block_sparse_module, "_validate_runtime_device", lambda _device: None
+    )
+    monkeypatch.setattr(
         block_sparse_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
@@ -1366,6 +1369,9 @@ def test_block_sparse_plan_rejects_cuda_graph_capture_before_allocation(
 ) -> None:
     device = torch.device("cuda:0")
     plan_stream = object()
+    monkeypatch.setattr(
+        block_sparse_module, "_validate_runtime_device", lambda _device: None
+    )
     monkeypatch.setattr(
         block_sparse_module,
         "_resolve_cuda_device",

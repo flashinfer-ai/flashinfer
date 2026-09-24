@@ -21,8 +21,13 @@ import copy
 import inspect
 import json
 import os
+import runpy
+import subprocess
+import sys
 import textwrap
 from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
 
 import flashinfer.experimental.cake_mxfp8_megamoe_ep16.jit as _jit
 import pytest
@@ -33,6 +38,7 @@ from flashinfer.experimental.cake_mxfp8_megamoe_ep16.backend import (
     _interleave_gate_up_16,
     _pack_scale_n128_k128,
     _quantize_mxfp8_block32,
+    _validate_backend,
     _validate_gathered_routing_capacity,
     _validate_launch_epoch,
 )
@@ -46,9 +52,248 @@ from flashinfer.moe_ep import (
 )
 
 
+@pytest.fixture(scope="module")
+def example_device_index():
+    example = (
+        Path(__file__).resolve().parents[2]
+        / "examples/experimental/cake_mxfp8_megamoe_ep16.py"
+    )
+    return runpy.run_path(str(example))["_select_device_index"]
+
+
+@pytest.mark.parametrize(
+    "local_rank,local_world_size,visible_devices,expected",
+    (
+        (0, 16, 16, 0),
+        (15, 16, 16, 15),
+        (3, 4, 4, 3),
+        (3, 4, 8, 3),
+        (0, 1, 1, 0),
+        (3, 4, 1, 0),
+        (15, 16, 1, 0),
+    ),
+)
+def test_example_device_selection(
+    example_device_index, local_rank, local_world_size, visible_devices, expected
+) -> None:
+    environ = {
+        "WORLD_SIZE": "16",
+        "LOCAL_WORLD_SIZE": str(local_world_size),
+        "LOCAL_RANK": str(local_rank),
+    }
+    assert example_device_index(environ, visible_devices) == expected
+
+
+@pytest.mark.parametrize(
+    "world_size,local_world_size,local_rank,visible_devices",
+    (
+        (8, 4, 0, 4),
+        (32, 4, 0, 4),
+        (16, 0, 0, 1),
+        (16, -1, 0, 1),
+        (16, 17, 0, 1),
+        (16, 4, -1, 4),
+        (16, 4, 4, 4),
+        (16, 4, -1, 1),
+        (16, 4, 4, 1),
+        (16, 4, 0, 0),
+        (16, 4, 0, 2),
+    ),
+)
+def test_example_device_selection_rejects_invalid_layout(
+    example_device_index, world_size, local_world_size, local_rank, visible_devices
+) -> None:
+    environ = {
+        "WORLD_SIZE": str(world_size),
+        "LOCAL_WORLD_SIZE": str(local_world_size),
+        "LOCAL_RANK": str(local_rank),
+    }
+    with pytest.raises(ValueError):
+        example_device_index(environ, visible_devices)
+
+
+@pytest.mark.parametrize("key", ("WORLD_SIZE", "LOCAL_WORLD_SIZE", "LOCAL_RANK"))
+@pytest.mark.parametrize("value", (None, "invalid"))
+def test_example_device_selection_requires_torchrun_metadata(
+    example_device_index, key, value
+) -> None:
+    environ = {"WORLD_SIZE": "16", "LOCAL_WORLD_SIZE": "4", "LOCAL_RANK": "0"}
+    if value is None:
+        del environ[key]
+    else:
+        environ[key] = value
+    with pytest.raises(ValueError, match="Launch with torchrun"):
+        example_device_index(environ, 4)
+
+
 def test_public_entry_points_are_experimental() -> None:
     assert CakeMxfp8MegaMoeEp16.is_experimental
     assert preprocess_cake_mxfp8_megamoe_ep16_weights.is_experimental
+
+
+def test_backend_keyword_defaults_to_cuda() -> None:
+    parameter = inspect.signature(CakeMxfp8MegaMoeEp16).parameters["backend"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default == "cuda"
+    _validate_backend("cuda")
+    _validate_backend("cute_dsl")
+
+
+@pytest.mark.parametrize("backend", (None, True, 0, "auto", "CUDA", "cutedsl", []))
+def test_invalid_backend_is_rejected_before_session_setup(backend) -> None:
+    # Invalid selection fails before accessing the deliberately absent inputs.
+    with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
+        CakeMxfp8MegaMoeEp16(None, None, backend=backend)
+
+
+@pytest.mark.parametrize("backend", ("cuda", "cute_dsl"))
+@pytest.mark.parametrize(
+    "invalid_backend", (None, True, 0, "auto", "CUDA", "cutedsl", [])
+)
+@pytest.mark.parametrize("rank", (0, 1))
+def test_invalid_backend_is_rejected_collectively(
+    monkeypatch, backend, invalid_backend, rank
+) -> None:
+    process_group = object()
+    choices = [backend] * 16
+    choices[0] = invalid_backend
+    gathered = []
+
+    def all_gather_object(output, selected, *, group):
+        assert group is process_group
+        assert selected == choices[rank]
+        output[:] = choices
+        gathered.append(rank)
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+
+    with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
+        _CakeMxfp8MegaMoeEp16Session(
+            None, None, process_group=process_group, backend=choices[rank]
+        )
+    # Even the rank with the invalid value must join its peers before raising.
+    assert gathered == [rank]
+
+
+def test_public_import_and_default_selection_do_not_import_cute_kernels() -> None:
+    code = """
+import sys
+from flashinfer.moe_ep import CakeMxfp8MegaMoeEp16
+
+prefix = "flashinfer.experimental.cake_mxfp8_megamoe_ep16"
+assert prefix not in sys.modules
+for kwargs in ({}, {"backend": "cuda"}):
+    try:
+        CakeMxfp8MegaMoeEp16(None, None, **kwargs)
+    except RuntimeError as error:
+        assert "torch.distributed must be initialized" in str(error)
+    else:
+        raise AssertionError("uninitialized session was accepted")
+    assert prefix + ".cute_dsl" not in sys.modules
+    assert not any(name.startswith(prefix + ".kernels") for name in sys.modules)
+"""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(Path(__file__).resolve().parents[2]), env.get("PYTHONPATH")))
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=120)
+
+
+def test_cute_peer_arguments_preserve_all_address_bits() -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16.cute_dsl import (
+        _peer_arguments,
+    )
+
+    active = (1, 2**63 - 1, 2**63, 2**64 - 1, *range(5, 17))
+    pointers = active + (0,) * 16
+    packed = _peer_arguments(SimpleNamespace(peer_pointers=pointers))
+    assert packed == (1, 2**63 - 1, -(2**63), -1, *range(5, 17), *((0,) * 16))
+    assert pointers == active + (0,) * 16
+
+
+@pytest.mark.parametrize(
+    "pointers",
+    (
+        None,
+        [1] * 16 + [0] * 16,
+        (1,) * 16 + (0,) * 15,
+        (1,) * 16 + (0,) * 17,
+        (0,) + (1,) * 15 + (0,) * 16,
+        (-1,) + (1,) * 15 + (0,) * 16,
+        (2**64,) + (1,) * 15 + (0,) * 16,
+        (True,) + (1,) * 15 + (0,) * 16,
+        ("1",) + (1,) * 15 + (0,) * 16,
+        (1,) * 17 + (0,) * 15,
+        (1,) * 16 + (False,) + (0,) * 15,
+    ),
+)
+def test_cute_peer_arguments_reject_invalid_tables(pointers) -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16.cute_dsl import (
+        _peer_arguments,
+    )
+
+    with pytest.raises(ValueError):
+        _peer_arguments(SimpleNamespace(peer_pointers=pointers))
+
+
+def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
+    from flashinfer.jit import cute_dsl_core
+
+    package = Path(cute_dsl.__file__).resolve().parent
+    flashinfer_root = package.parent.parent
+    expected = {
+        package / "kernels" / "fused_cta0.py",
+        package / "kernels" / "fused_all_ctas.py",
+        package / "kernels" / "topk_reduce.py",
+        package / "cute_dsl.py",
+        package / "backend.py",
+        package / "__init__.py",
+        flashinfer_root / "moe_ep" / "cake_mxfp8_megamoe_ep16.py",
+        Path(cute_dsl_core.__file__).resolve(),
+    }
+    kernels_init = package / "kernels" / "__init__.py"
+    if kernels_init.is_file():
+        expected.add(kernels_init)
+    actual = tuple(Path(path) for path in cute_dsl._source_files())
+    assert len(actual) == len(set(actual))
+    assert set(actual) == expected
+    assert all(path.is_file() for path in actual)
+
+
+def test_cute_source_key_changes_for_each_dependency(tmp_path) -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
+    from flashinfer.jit.cute_dsl_core import _hash_source_files
+
+    flashinfer_root = Path(cute_dsl.__file__).resolve().parents[2]
+    sources = cute_dsl._source_files()
+    original_key = _hash_source_files(sources)
+    copies = []
+    for name in sources:
+        source = Path(name)
+        copied = tmp_path / source.relative_to(flashinfer_root)
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        copied.write_bytes(source.read_bytes())
+        copies.append(copied)
+    copied_paths = tuple(str(path) for path in copies)
+    baseline_key = _hash_source_files(copied_paths)
+    # Paths themselves participate in this hash. Keep the temporary path set
+    # fixed and change only one file's bytes for each invalidation check.
+    for copied in copies:
+        original = copied.read_bytes()
+        try:
+            copied.write_bytes(original + b"\n# source-key invalidation test\n")
+            assert _hash_source_files(copied_paths) != baseline_key
+        finally:
+            copied.write_bytes(original)
+        assert _hash_source_files(copied_paths) == baseline_key
+    assert _hash_source_files(sources) == original_key
 
 
 def test_generated_source_closure() -> None:
@@ -305,8 +550,11 @@ def test_sparse_reference_routing_exercises_mixed_width_tail() -> None:
 
 
 @pytest.mark.solo
-def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
-    """Run with ``torchrun --nproc-per-node=16 -m pytest <this-file> -k sparse_reference``."""
+@pytest.mark.parametrize(
+    "backend", (None, "cute_dsl"), ids=("default_cuda", "cute_dsl")
+)
+def test_ep16_sm103_sparse_reference_and_repeated_result(backend) -> None:
+    """Run under 16-rank torchrun with ``-m pytest <this-file> -k sparse_reference``."""
 
     if int(os.environ.get("WORLD_SIZE", "0")) != 16:
         pytest.skip("requires torchrun with exactly 16 ranks")
@@ -314,9 +562,18 @@ def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
         pytest.skip("requires CUDA")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
-    if local_world_size > torch.cuda.device_count():
-        pytest.skip("requires one visible CUDA device per local rank")
-    torch.cuda.set_device(local_rank)
+    visible_devices = torch.cuda.device_count()
+    if visible_devices == 1:
+        # A per-rank CUDA_VISIBLE_DEVICES binding keeps the physical local rank
+        # in the environment but exposes its assigned GPU as logical device 0.
+        device_index = 0
+    else:
+        if local_world_size > visible_devices:
+            pytest.skip("requires one visible CUDA device per local rank")
+        if not 0 <= local_rank < visible_devices:
+            pytest.skip("requires a valid local rank among visible CUDA devices")
+        device_index = local_rank
+    torch.cuda.set_device(device_index)
     device = torch.device("cuda", torch.cuda.current_device())
     if torch.cuda.get_device_capability(device) != (10, 3):
         pytest.skip("requires exact SM103")
@@ -329,6 +586,16 @@ def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
     rank = dist.get_rank()
 
     try:
+        # Use the actual collective, not a mocked agreement result. Mismatched
+        # choices must fail before inspecting weights or allocating a workspace.
+        with pytest.raises(
+            ValueError, match="all EP16 ranks must select the same backend"
+        ):
+            CakeMxfp8MegaMoeEp16(None, None, backend="cuda" if rank % 2 else "cute_dsl")
+        dist.barrier()
+        with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
+            CakeMxfp8MegaMoeEp16(None, None, backend="invalid" if rank == 0 else "cuda")
+        dist.barrier()
         w13, w2 = _make_sparse_expert_weights(rank, device)
         weights = preprocess_cake_mxfp8_megamoe_ep16_weights(w13, w2)
         del w13, w2
@@ -348,34 +615,55 @@ def test_ep16_sm103_sparse_reference_and_repeated_result() -> None:
             hidden_states = torch.zeros(
                 (tokens, 3072), dtype=torch.bfloat16, device=device
             )
-            hidden_states[:, 0] = torch.exp2((global_tokens % 7).float() - 3.0).to(
+            base_hidden = torch.exp2((global_tokens % 7).float() - 3.0).to(
                 torch.bfloat16
             )
-            expected = _analytical_sparse_reference(
-                hidden_states, topk_ids, topk_weights
-            )
+            if backend is None:
+                session = CakeMxfp8MegaMoeEp16(weights, topk_ids)
+            else:
+                session = CakeMxfp8MegaMoeEp16(weights, topk_ids, backend=backend)
+            workspace = session._workspace
+            assert workspace.flags.tensor.numel() == (66 if backend else 2)
+            for symm in (
+                workspace.flags,
+                workspace.published_hidden,
+                workspace.published_topk_ids,
+                workspace.published_topk_weights,
+                workspace.route_terms,
+            ):
+                if backend == "cute_dsl":
+                    assert symm.peers is None
+                    assert len(symm.peer_pointers) == 32
+                    assert all(pointer > 0 for pointer in symm.peer_pointers[:16])
+                    assert symm.peer_pointers[16:] == (0,) * 16
+                else:
+                    assert symm.peer_pointers is None
+                    assert symm.peers.dtype == torch.int64
+                    assert symm.peers.numel() == 16
 
-            session = CakeMxfp8MegaMoeEp16(weights, topk_ids)
-            first_output = session.run(
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                out=session.workspace_output,
-            )
-            torch.cuda.synchronize(device)
-            first_copy = first_output.clone()
-            second_output = session.run(
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                out=session.workspace_output,
-            )
-            torch.cuda.synchronize(device)
-
-            assert bool(torch.isfinite(second_output).all().item())
-            assert torch.equal(first_copy, second_output)
-            torch.testing.assert_close(second_output, expected, atol=1e-2, rtol=1e-2)
-            del session, first_copy, expected
+            first_copy = None
+            for repeat in range(32):
+                # Identical pairs retain the repeated-result check, while
+                # alternating pairs expose stale payloads when banks are reused.
+                factor = 1.0 if (repeat // 2) % 2 == 0 else 0.5
+                hidden_states[:, 0].copy_(base_hidden * factor)
+                expected = _analytical_sparse_reference(
+                    hidden_states, topk_ids, topk_weights
+                )
+                output = session.run(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    out=session.workspace_output,
+                )
+                torch.cuda.synchronize(device)
+                assert bool(torch.isfinite(output).all().item())
+                torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
+                if repeat % 2 == 0:
+                    first_copy = output.clone()
+                else:
+                    assert torch.equal(first_copy, output)
+            del session, workspace, symm, first_copy, expected, output
             torch.cuda.empty_cache()
             dist.barrier()
     finally:
