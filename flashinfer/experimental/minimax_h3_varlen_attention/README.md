@@ -138,7 +138,11 @@ plans with them (`runner.attention_stage`, `route_metadata["attention_variant"]`
 Both are the same kernel specialised at build time; keeping the dense program
 free of the split-unit epilogue keeps the softmax block loop of unsplit units
 at the schedule of the single-program kernel (a split path in the epilogue
-costs 1-2 % on every long row). The quantizer writes a
+costs 1-2 % on every long row). The split program itself runs at a per-unit
+cost relative to the dense program that depends on `(pv_mode, arch)`
+(`SPLIT_PROGRAM_COST`: sm_103a fp8pv 1.21x, sm_100a fp4pv 1.03x, parity
+otherwise); the planner scales a split plan's makespan by it, so a row splits
+only when the wave-quantization gain exceeds the program cost. The quantizer writes a
 **head-major, per-segment 128-token-padded packed layout**: segment `s`
 (non-empty segments only) owns `ceil(len / 128)` packed 128-token blocks
 starting at packed block `seg_tile_base[s]`, `PB = sum(ceil(len / 128))`, and
