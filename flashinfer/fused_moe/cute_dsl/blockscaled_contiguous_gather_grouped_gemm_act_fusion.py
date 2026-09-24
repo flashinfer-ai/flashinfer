@@ -74,6 +74,9 @@ from .moe_utils import (
 )
 
 # Import the Blackwell (SM100) kernel implementation
+from .blackwell.skinny_decode_gather import SkinnyDecodeGatherKernel
+from .blackwell.skinny_decode_paired_t2 import SkinnyDecodeGatherKernel as PairedT2GatherKernel
+from .blackwell.narrow_prefill_n16_k512_gather import NarrowPrefillN16K512GatherKernel
 from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
 )
@@ -218,6 +221,18 @@ def create_gather_gemm_tensors(
 _gather_kernel_cache: Dict[Tuple, Any] = {}
 
 
+class _RouteSplitGather:
+    """Two preparation-bound G1 calls with disjoint valid intermediate writes."""
+
+    def __init__(self, dense, sparse):
+        self.route_split_dense = dense
+        self.route_split_sparse = sparse
+
+    def __call__(self, *args, stream, **kwargs):
+        self.route_split_dense(*args, stream=stream, **kwargs)
+        self.route_split_sparse(*args, stream=stream, **kwargs)
+
+
 def _get_compiled_gather_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
     orig_m: int,
@@ -266,10 +281,20 @@ def _get_compiled_gather_kernel(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    runtime_situ_beta_ptr=None,
+    runtime_situ_linear_beta_ptr=None,
+    situ_beta_stride: int = 0,
+    situ_linear_beta_stride: int = 0,
+    _enable_compact_epilogue: bool = False,
+    _enable_sparse_prefill_epilogue: bool = False,
+    _input_aligned_16: bool = False,
+    enable_prefill_weight_prefetch: bool = False,
+    _route_split_mode: str = "",
+    _private_paired_t2: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -293,6 +318,146 @@ def _get_compiled_gather_kernel(
     )
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    runtime_situ = isinstance(situ_beta, torch.Tensor)
+    if is_rubin and runtime_situ:
+        raise NotImplementedError(
+            "Runtime SiTU parameters require the Blackwell kernel"
+        )
+
+    # The caller's existing decode specialization proves distinct routes and
+    # at most 16 rows per expert. Bind eligibility before symbolic dimensions
+    # erase orig_m; ordinary/generic gather calls retain the original path.
+    enable_decode_compact_epilogue = bool(
+        _enable_compact_epilogue
+        and not is_rubin
+        and 1 <= orig_m <= 16
+        and runtime_situ
+        and normalized_activation_type == ActivationType.Situ
+        and a_dtype == "float8_e4m3fn"
+        and b_dtype == "float4_e2m1fn"
+        and c_dtype == "float8_e4m3fn"
+        and sf_dtype == "float8_e8m0fnu"
+        and quantize_output
+        and sf_vec_size == 32
+        and tile_size == 128
+        and mma_tiler_mn == (128, 128)
+        and cluster_shape_mn == (1, 1)
+        and vectorized_f32
+        and not enable_pdl
+        and not use_a_per_token_scale
+    )
+
+    enable_sparse_prefill_epilogue = bool(
+        _enable_sparse_prefill_epilogue
+        and not is_rubin
+        and orig_m == 512
+        and runtime_situ
+        and normalized_activation_type == ActivationType.Situ
+        and a_dtype == "float8_e4m3fn"
+        and b_dtype == "float4_e2m1fn"
+        and c_dtype == "float8_e4m3fn"
+        and sf_dtype == "float8_e8m0fnu"
+        and quantize_output
+        and sf_vec_size == 32
+        and tile_size == 128
+        and mma_tiler_mn == (128, 128)
+        and cluster_shape_mn == (1, 1)
+        and vectorized_f32
+        and not enable_pdl
+        and not use_a_per_token_scale
+    )
+
+    # Reuse the existing private T512 eligibility; routing stays device-resident.
+    enable_route_split = bool(
+        enable_sparse_prefill_epilogue
+        and k == 7168 and n == 6144 and num_experts == 112 and topk == 16
+        and not raster_along_m
+    )
+    if enable_route_split and _route_split_mode == "":
+        options = {
+            "orig_m": orig_m,
+            "permuted_m": permuted_m,
+            "n": n,
+            "k": k,
+            "num_experts": num_experts,
+            "a_ptr": a_ptr,
+            "b_ptr": b_ptr,
+            "a_sf_ptr": a_sf_ptr,
+            "b_sf_ptr": b_sf_ptr,
+            "c_ptr": c_ptr,
+            "c_sf_ptr": c_sf_ptr,
+            "alpha_ptr": alpha_ptr,
+            "tile_idx_ptr": tile_idx_ptr,
+            "mn_limit_ptr": mn_limit_ptr,
+            "token_id_ptr": token_id_ptr,
+            "num_tiles_ptr": num_tiles_ptr,
+            "norm_const_ptr": norm_const_ptr,
+            "a_per_token_scale_ptr": a_per_token_scale_ptr,
+            "max_active_clusters": max_active_clusters,
+            "stream": stream,
+            "a_dtype": a_dtype,
+            "b_dtype": b_dtype,
+            "sf_dtype": sf_dtype,
+            "c_dtype": c_dtype,
+            "quantize_output": quantize_output,
+            "sf_vec_size": sf_vec_size,
+            "tile_size": tile_size,
+            "topk": topk,
+            "cluster_shape_mn": cluster_shape_mn,
+            "vectorized_f32": vectorized_f32,
+            "raster_along_m": raster_along_m,
+            "mma_tiler_mn": mma_tiler_mn,
+            "mma_tiler": mma_tiler,
+            "mma_inst_shape": mma_inst_shape,
+            "enable_pdl": enable_pdl,
+            "activation_type": activation_type,
+            "swiglu_alpha": swiglu_alpha,
+            "swiglu_beta": swiglu_beta,
+            "swiglu_limit": swiglu_limit,
+            "situ_beta": situ_beta,
+            "situ_linear_beta": situ_linear_beta,
+            "gated": gated,
+            "use_a_per_token_scale": use_a_per_token_scale,
+            "runtime_situ_beta_ptr": runtime_situ_beta_ptr,
+            "runtime_situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+            "situ_beta_stride": situ_beta_stride,
+            "situ_linear_beta_stride": situ_linear_beta_stride,
+            "_enable_compact_epilogue": _enable_compact_epilogue,
+            "_enable_sparse_prefill_epilogue": _enable_sparse_prefill_epilogue,
+            "_input_aligned_16": _input_aligned_16,
+            "enable_prefill_weight_prefetch": enable_prefill_weight_prefetch,
+            "_private_paired_t2": _private_paired_t2,
+        }
+        dense = _get_compiled_gather_kernel(**options, _route_split_mode="dense")
+        sparse = _get_compiled_gather_kernel(**options, _route_split_mode="sparse")
+        return _RouteSplitGather(dense, sparse)
+    enable_route_split_dense = enable_route_split and _route_split_mode == "dense"
+    enable_route_split_sparse = enable_route_split and _route_split_mode == "sparse"
+
+    # Resolve K eligibility while dimensions are concrete. N8 token subtiles
+    # remain runtime-dependent, allowing one compiled kernel for every T1..16.
+    enable_skinny_decode = (
+        enable_decode_compact_epilogue and k % 512 == 0
+    ) or enable_route_split_sparse
+    enable_b_vector_load = bool(enable_skinny_decode and _input_aligned_16)
+    enable_t16_const_scheduler = bool(
+        enable_skinny_decode and enable_b_vector_load
+        and orig_m == 16 and n == 6144 and k == 7168
+        and num_experts == 112 and topk == 16 and not raster_along_m
+    )
+    enable_t16_slot_planes = enable_t16_const_scheduler
+    if _private_paired_t2 and not (
+        enable_skinny_decode and enable_b_vector_load
+        and orig_m in (2, 4, 16) and n == 6144 and k == 7168
+        and num_experts == 112 and topk == 16 and not raster_along_m
+    ):
+        raise ValueError("private paired W1/SFA requires the eligible T2/T4/T16 skinny plan")
+
+    enable_t4_scale_address = bool(
+        _private_paired_t2 and enable_skinny_decode and enable_b_vector_load
+        and orig_m == 4 and n == 6144 and k == 7168
+        and num_experts == 112 and topk == 16 and not raster_along_m
+    )
 
     cache_key = (
         "sm107" if is_rubin else "sm100",
@@ -314,11 +479,33 @@ def _get_compiled_gather_kernel(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
-        situ_beta,
-        situ_linear_beta,
+        "runtime" if runtime_situ else situ_beta,
+        ("runtime" if situ_linear_beta is not None else None)
+        if runtime_situ
+        else situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        enable_decode_compact_epilogue,
+        enable_skinny_decode,
+        enable_b_vector_load,
+        enable_prefill_weight_prefetch,
     )
+
+    if _private_paired_t2:
+        cache_key += ("paired_t2_w1_sf32",)
+        if orig_m == 2:
+            cache_key += ("paired_sfb_cp",)
+    if enable_t16_const_scheduler:
+        cache_key += ("t16_const_scheduler",)
+    if enable_t16_slot_planes:
+        cache_key += ("t16_slot_planes",)
+    if enable_sparse_prefill_epilogue:
+        cache_key += ("sparse_prefill_epilogue",)
+    if enable_route_split:
+        cache_key += ("route_split_g1", _route_split_mode)
+
+    if enable_t4_scale_address:
+        cache_key += ("paired_t4_scale_address", "paired_t4_sfb_cohort")
 
     if cache_key not in _gather_kernel_cache:
         if is_rubin:
@@ -357,6 +544,31 @@ def _get_compiled_gather_kernel(
                 raster_along_m=raster_along_m,
                 enable_pdl=enable_pdl,
             )
+        elif enable_route_split_sparse:
+            gemm = NarrowPrefillN16K512GatherKernel(
+                topk=topk,
+                runtime_situ_linear_beta=situ_linear_beta is not None,
+                enable_b_vector_load=enable_b_vector_load,
+                enable_route_split_sparse=True,
+            )
+        elif enable_skinny_decode and _private_paired_t2:
+            gemm = PairedT2GatherKernel(
+                topk=topk,
+                runtime_situ_linear_beta=situ_linear_beta is not None,
+                enable_b_vector_load=enable_b_vector_load,
+                enable_t4_scale_address=enable_t4_scale_address,
+                enable_sfb_cp=(orig_m == 2),
+                enable_t16_const_scheduler=enable_t16_const_scheduler,
+                enable_t16_slot_planes=enable_t16_slot_planes,
+            )
+        elif enable_skinny_decode:
+            gemm = SkinnyDecodeGatherKernel(
+                topk=topk,
+                runtime_situ_linear_beta=situ_linear_beta is not None,
+                enable_b_vector_load=enable_b_vector_load,
+                enable_t16_const_scheduler=enable_t16_const_scheduler,
+                enable_t16_slot_planes=enable_t16_slot_planes,
+            )
         else:
             # Create kernel instance
             gemm = BlockScaledContiguousGatherGroupedGemmKernel(
@@ -371,10 +583,16 @@ def _get_compiled_gather_kernel(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
+                situ_beta=None if runtime_situ else situ_beta,
+                situ_linear_beta=None if runtime_situ else situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                runtime_situ=runtime_situ,
+                runtime_situ_linear_beta=runtime_situ and situ_linear_beta is not None,
+                enable_decode_compact_epilogue=enable_decode_compact_epilogue,
+                enable_sparse_prefill_epilogue=enable_sparse_prefill_epilogue,
+                enable_route_split_dense=enable_route_split_dense,
+                enable_prefill_weight_prefetch=enable_prefill_weight_prefetch,
             )
         wrapper_fn = gemm.wrapper
 
@@ -413,6 +631,16 @@ def _get_compiled_gather_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            **(
+                {
+                    "situ_beta_ptr": runtime_situ_beta_ptr,
+                    "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+                    "situ_beta_stride": situ_beta_stride,
+                    "situ_linear_beta_stride": situ_linear_beta_stride,
+                }
+                if not is_rubin
+                else {}
+            ),
         )
 
         _gather_kernel_cache[cache_key] = compiled_gemm
@@ -455,9 +683,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+    _enable_compact_epilogue: bool = False,
+    _enable_sparse_prefill_epilogue: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -520,9 +751,16 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
-        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate
-            ``beta * tanh(gate / beta) * sigmoid(gate)``.
-        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        situ_beta: SiTU gate parameter for ``ActivationType.Situ`` (or the
+            legacy SwiGLU variant): ``beta * tanh(gate / beta) * sigmoid(gate)``.
+            A contiguous CUDA float32 tensor containing one value or one per
+            local expert supplies runtime parameters without specialization on
+            their values. Values must be positive and finite. Python floats
+            retain the existing scalar specialization behavior.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch. When
+            situ_beta is a tensor this must also be a CUDA float32 tensor
+            containing one value or one per local expert, or None to leave
+            the up branch unchanged.
         gated: Whether to run the gated SwiGLU path. If False, run non-gated
             ReLU2.
 
@@ -791,6 +1029,31 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    runtime_situ_beta_ptr = None
+    runtime_situ_linear_beta_ptr = None
+    situ_beta_stride = 0
+    situ_linear_beta_stride = 0
+    if isinstance(situ_beta, torch.Tensor):
+        for name, value in (
+            ("situ_beta", situ_beta),
+            ("situ_linear_beta", situ_linear_beta),
+        ):
+            if value is not None and (
+                value.device != a.device or value.numel() not in (1, num_experts)
+            ):
+                raise ValueError(
+                    f"{name} must be on the input device and contain one or "
+                    "num_local_experts values"
+                )
+        runtime_situ_beta_ptr = make_ptr(
+            cutlass.Float32, situ_beta.data_ptr(), cute.AddressSpace.gmem
+        )
+        situ_beta_stride = int(situ_beta.numel() != 1)
+        if situ_linear_beta is not None:
+            runtime_situ_linear_beta_ptr = make_ptr(
+                cutlass.Float32, situ_linear_beta.data_ptr(), cute.AddressSpace.gmem
+            )
+            situ_linear_beta_stride = int(situ_linear_beta.numel() != 1)
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -811,6 +1074,17 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     num_tiles_ptr = make_ptr(
         cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem
     )
+
+    # Explicit private preparation tags belong to these exact W1/SFA objects.
+    # Public group64 tensors are untagged; no repacking occurs while binding/run.
+    private_layout = getattr(b, "_private_paired_t2_layout", None)
+    private_scale_layout = getattr(b_scale, "_private_paired_t2_layout", None)
+    private_paired_t2 = private_layout is not None or private_scale_layout is not None
+    if private_paired_t2:
+        if private_layout != "paired_t2_w1_sf32" or private_scale_layout != private_layout:
+            raise ValueError("private T2 requires paired W1 and scale layout tags")
+        if (major, minor) != (10, 3):
+            raise ValueError("private paired T2 W1/SFA requires SM103")
 
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
@@ -862,6 +1136,34 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        _enable_compact_epilogue=_enable_compact_epilogue,
+        _enable_sparse_prefill_epilogue=_enable_sparse_prefill_epilogue,
+        _input_aligned_16=a.data_ptr() % 16 == 0,
+        _private_paired_t2=private_paired_t2,
+        runtime_situ_beta_ptr=runtime_situ_beta_ptr,
+        runtime_situ_linear_beta_ptr=runtime_situ_linear_beta_ptr,
+        situ_beta_stride=situ_beta_stride,
+        situ_linear_beta_stride=situ_linear_beta_stride,
+        enable_prefill_weight_prefetch=(
+            (major, minor) == (10, 3)
+            and not is_rubin
+            and seq_len > 16
+            and not enable_pdl
+            and not use_a_per_token_scale
+            and normalized_activation_type == ActivationType.Situ
+            and isinstance(situ_beta, torch.Tensor)
+            and gated
+            and a_dtype == "float8_e4m3fn"
+            and b_dtype == "float4_e2m1fn"
+            and sf_dtype == "float8_e8m0fnu"
+            and c_dtype == "float8_e4m3fn"
+            and quantize_output
+            and sf_vec_size == 32
+            and tile_size == 128
+            and mma_tiler_mn == (128, 128)
+            and cluster_shape_mn == (1, 1)
+            and not raster_along_m
+        ),
     )
 
     # Execute kernel with runtime parameters.
@@ -872,7 +1174,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
     #  [a_per_token_scale_ptr], orig_m, m, n, k, l, stream)
-    compiled_gemm(
+    launch_args = (
         a_ptr,
         b_ptr,
         a_sf_ptr,
@@ -891,8 +1193,20 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         n,
         k,
         num_experts,
-        stream=stream,
     )
+    launch_kwargs = (
+        {
+            "situ_beta_ptr": runtime_situ_beta_ptr,
+            "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+            "situ_beta_stride": situ_beta_stride,
+            "situ_linear_beta_stride": situ_linear_beta_stride,
+        }
+        if not is_rubin
+        else {}
+    )
+    if _prepared_launches is not None:
+        _prepared_launches["gather"] = (compiled_gemm, launch_args, launch_kwargs)
+    compiled_gemm(*launch_args, stream=stream, **launch_kwargs)
 
     return out, out_scale if generate_sfc else None
 
