@@ -13,6 +13,12 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   `scores + bias` are selected (exact ties resolve toward the lower expert
   id); `topk_ids` are returned in ascending order and `topk_weights` are the
   selected sigmoid scores divided by their sum (a zero sum divides by one).
+  The sigmoid and the division reproduce the SGLang router's `__expf` /
+  `__fdividef` arithmetic, so `scores` can differ from `torch.sigmoid` in the
+  last FP32 bit (and the rounding of that bit can differ between SM100 and
+  SM103). Two candidates whose biased scores agree to within `2**-22` may
+  therefore be ordered either way at the top-16 boundary; the tests accept
+  exactly that tolerance and nothing else.
 - The route plan follows the `moe_align_block_size` layout: pair indices
   `token * 16 + route` grouped by expert in ascending pair order, every expert
   segment padded to a multiple of `block_m` (8 or 16) with the sentinel

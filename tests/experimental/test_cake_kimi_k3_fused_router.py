@@ -69,13 +69,29 @@ def make_inputs(num_tokens, device, seed=0):
     return logits.contiguous(), bias.contiguous()
 
 
-def reference_route(logits, bias, block_m):
-    """FP32 torch reference of the fused router and its aligned route plan."""
+# Two ulps of a unit-scale FP32 score.  The kernel reproduces the SGLang
+# router's ``__expf`` / ``__fdividef`` sigmoid, whose last bit can differ from
+# ``torch.sigmoid`` (and between GPU generations).  Two candidates whose
+# biased scores agree to within this tolerance may be ordered either way at
+# the top-16 boundary; everything else must match exactly.
+TIE_TOLERANCE = 2.0**-22
+
+
+def reference_route(logits, bias, block_m, topk_ids=None):
+    """FP32 torch reference of the fused router and its aligned route plan.
+
+    ``topk_ids`` (ascending, validated by :func:`assert_selection_matches`)
+    replaces the reference selection so that weights and the plan are derived
+    from a tie-resolved selection.
+    """
     logits = logits.float()
     scores = torch.sigmoid(logits)
     ranking = scores + bias.float().reshape(1, NUM_EXPERTS)
-    ranked = torch.argsort(ranking, dim=-1, descending=True, stable=True)[:, :TOP_K]
-    topk_ids = torch.sort(ranked, dim=-1).values.to(torch.int32)
+    if topk_ids is None:
+        ranked = torch.argsort(ranking, dim=-1, descending=True, stable=True)[:, :TOP_K]
+        topk_ids = torch.sort(ranked, dim=-1).values.to(torch.int32)
+    else:
+        topk_ids = topk_ids.to(torch.int32).clone()
     selected = torch.gather(scores, 1, topk_ids.to(torch.int64))
     total = torch.zeros(selected.shape[0], dtype=torch.float32, device=logits.device)
     for route in range(TOP_K):  # sequential FP32 sum in ascending-id order
@@ -122,6 +138,41 @@ def reference_route(logits, bias, block_m):
         expert_offsets=offsets,
         expert_scatter_offsets=counts.clone(),
     )
+
+
+def assert_selection_matches(actual_ids, logits, bias):
+    """Every row selects the 16 largest biased scores up to ``TIE_TOLERANCE``.
+
+    Rows with a clear gap between the 16th and 17th candidate must equal the
+    torch reference exactly (the tolerance cannot admit a lower-ranked expert);
+    only candidates tied to within two ulps may swap.  Returns the number of
+    rows resolved through the tie tolerance.
+    """
+    ids = actual_ids.to(torch.int64)
+    assert ids.shape == (logits.shape[0], TOP_K)
+    assert bool(((ids >= 0) & (ids < NUM_EXPERTS)).all())
+    assert bool((ids[:, 1:] > ids[:, :-1]).all()), "ids must be ascending and distinct"
+    ranking = torch.sigmoid(logits.float()) + bias.float().reshape(1, NUM_EXPERTS)
+    selected = torch.zeros_like(ranking, dtype=torch.bool).scatter_(1, ids, True)
+    selected_min = torch.where(
+        selected, ranking, torch.full_like(ranking, float("inf"))
+    )
+    unselected_max = torch.where(
+        selected, torch.full_like(ranking, float("-inf")), ranking
+    )
+    slack = unselected_max.amax(dim=1) - selected_min.amin(dim=1)
+    assert bool((slack <= TIE_TOLERANCE).all()), (
+        f"rows {torch.nonzero(slack > TIE_TOLERANCE).flatten().tolist()[:8]} select an "
+        f"expert ranked below the top-16 by more than {TIE_TOLERANCE:.3g}"
+    )
+    reference_ids = reference_route(logits, bias, 8).topk_ids.to(torch.int64)
+    return int((ids != reference_ids).any(dim=1).sum().item())
+
+
+def expected_plan(actual, logits, bias, block_m):
+    """Reference plan for the kernel's (tie-validated) selection."""
+    assert_selection_matches(actual.topk_ids, logits, bias)
+    return reference_route(logits, bias, block_m, topk_ids=actual.topk_ids)
 
 
 def poison_plan(plan):
@@ -325,6 +376,51 @@ def test_validate_inputs():
         validate_kimi_k3_fused_router_inputs(logits, bias, 8.0)
 
 
+def test_selection_tie_tolerance():
+    logits, bias = make_inputs(5, torch.device("cpu"), seed=9)
+    plan = reference_route(logits, bias, 8)
+    assert assert_selection_matches(plan.topk_ids, logits, bias) == 0
+    ranking = torch.sigmoid(logits) + bias.reshape(1, NUM_EXPERTS)
+    order = torch.argsort(ranking[0], descending=True)
+    sixteenth, seventeenth = int(order[15]), int(order[16])
+    # Move the 17th candidate onto the 16th's biased score: either order is valid.
+    tied = logits.clone()
+    target = (
+        torch.sigmoid(logits[0, sixteenth]) + bias[sixteenth] - bias[seventeenth]
+    ).double()
+    tied[0, seventeenth] = torch.logit(target).float()
+    tied_ranking = torch.sigmoid(tied) + bias.reshape(1, NUM_EXPERTS)
+    assert (
+        abs(float(tied_ranking[0, sixteenth] - tied_ranking[0, seventeenth]))
+        <= TIE_TOLERANCE
+    )
+    reference_ids = reference_route(tied, bias, 8).topk_ids
+    kept, dropped = (
+        (sixteenth, seventeenth)
+        if sixteenth in reference_ids[0].tolist()
+        else (seventeenth, sixteenth)
+    )
+    swapped = reference_ids.clone()
+    row = [
+        dropped if expert == kept else expert for expert in reference_ids[0].tolist()
+    ]
+    swapped[0] = torch.tensor(sorted(row), dtype=torch.int32)
+    assert assert_selection_matches(swapped, tied, bias) == 1
+    assert torch.equal(
+        reference_route(tied, bias, 8, topk_ids=swapped).topk_ids, swapped
+    )
+    # A clearly lower-ranked expert is never admitted.
+    wrong = plan.topk_ids.clone()
+    lower = int(torch.argsort(ranking[1], descending=True)[40])
+    row = [
+        lower if expert == int(plan.topk_ids[1, 0]) else expert
+        for expert in plan.topk_ids[1].tolist()
+    ]
+    wrong[1] = torch.tensor(sorted(row), dtype=torch.int32)
+    with pytest.raises(AssertionError):
+        assert_selection_matches(wrong, logits, bias)
+
+
 def test_reference_plan_is_self_consistent():
     logits, bias = make_inputs(37, torch.device("cpu"), seed=3)
     plan = reference_route(logits, bias, 8)
@@ -379,7 +475,7 @@ def _run_and_check(num_tokens, block_m, seed):
     out = runner()
     torch.cuda.synchronize()
     assert out is plan
-    expected = reference_route(logits, bias, block_m)
+    expected = expected_plan(plan, logits, bias, block_m)
     check_route_plan(plan, expected, num_tokens=num_tokens, block_m=block_m)
     return runner, logits, bias, plan
 
@@ -394,7 +490,7 @@ def test_allocating_api_matches_reference():
     logits, bias = make_inputs(64, device, seed=11)
     plan = kimi_k3_fused_router(logits, bias, block_m=8)
     torch.cuda.synchronize()
-    expected = reference_route(logits, bias, 8)
+    expected = expected_plan(plan, logits, bias, 8)
     assert torch.equal(plan.topk_ids, expected.topk_ids)
     torch.testing.assert_close(
         plan.topk_weights, expected.topk_weights, atol=WEIGHT_ATOL, rtol=WEIGHT_RTOL
@@ -431,7 +527,7 @@ def test_graph_replay_follows_device_inputs(num_tokens, block_m):
         torch.cuda.synchronize()
         graph.replay()
         torch.cuda.synchronize()
-        expected = reference_route(logits, bias, block_m)
+        expected = expected_plan(plan, logits, bias, block_m)
         check_route_plan(plan, expected, num_tokens=num_tokens, block_m=block_m)
 
 
