@@ -62,10 +62,16 @@ def make_inputs(num_tokens, device, seed=0):
 
 
 def _sglang_route(logits, bias, block_m, device):
-    """SGLang ``route_radix`` + ``moe_align_block_size`` closure, or None."""
+    """SGLang ``route_radix`` + ``moe_align_block_size`` closure, or None.
+
+    Mirrors the two-launch baseline of the source benchmark: the route kernel
+    is driven through the JIT module's ``run`` entry with caller-owned
+    ``topk_weights`` / ``topk_ids`` (no per-call allocation) when that entry is
+    available, otherwise through the allocating public ``route_radix`` wrapper;
+    the align kernel always goes through ``moe_align_block_size``.
+    """
     try:
-        from sglang.kernels.ops.moe.moe_align import moe_align_block_size
-        from sglang.kernels.ops.moe.moe_route_radix import route_radix
+        from sglang.kernels.ops.moe import moe_align, moe_route_radix
     except Exception:  # noqa: BLE001 - any import failure disables the baseline
         return None
     num_tokens = int(logits.shape[0])
@@ -79,20 +85,36 @@ def _sglang_route(logits, bias, block_m, device):
     # align kernel receives E + 1 experts and E + 2 prefix entries.
     cumsum_buffer = torch.empty(NUM_EXPERTS + 2, dtype=torch.int32, device=device)
 
+    route_raw = None
+    builder = getattr(moe_route_radix, "_jit_route_radix_module", None)
+    if callable(builder):
+        try:
+            route_raw = getattr(builder(), "run", None)
+        except Exception:  # noqa: BLE001 - fall back to the public wrapper
+            route_raw = None
+
+    if callable(route_raw):
+
+        def route():
+            # (scores, bias, weights, ids, topk, routed_scaling_factor,
+            #  renormalize, apply_scale, sorted)
+            route_raw(
+                logits, bias, topk_weights, topk_ids, TOP_K, 1.0, True, False, False
+            )
+            return topk_ids
+
+    else:
+
+        def route():
+            _, ids = moe_route_radix.route_radix(
+                logits, bias, TOP_K, True, 1.0, False, False
+            )
+            return ids
+
     def run():
-        route_radix(
-            scores=logits,
-            bias=bias,
-            topk=TOP_K,
-            renormalize=True,
-            routed_scaling_factor=1.0,
-            apply_scale=False,
-            sorted=False,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-        )
-        moe_align_block_size(
-            topk_ids=topk_ids,
+        ids = route()
+        moe_align.moe_align_block_size(
+            topk_ids=ids,
             num_experts=NUM_EXPERTS + 1,
             block_size=block_m,
             sorted_token_ids=sorted_token_ids,
@@ -102,28 +124,8 @@ def _sglang_route(logits, bias, block_m, device):
             pad_sorted_token_ids=True,
         )
 
-    try:
-        run()
-        torch.cuda.synchronize()
-    except TypeError:
-        # Positional-only wrappers of an older/newer SGLang revision.
-        def run():  # noqa: F811
-            route_radix(
-                logits, bias, TOP_K, True, 1.0, False, False, topk_weights, topk_ids
-            )
-            moe_align_block_size(
-                topk_ids,
-                NUM_EXPERTS + 1,
-                block_m,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_pad,
-                cumsum_buffer,
-                True,
-            )
-
-        run()
-        torch.cuda.synchronize()
+    run()
+    torch.cuda.synchronize()
     return run
 
 
