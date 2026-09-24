@@ -2788,53 +2788,35 @@ def _checked_cudnn_grouped_gemm_weights(
     device: Optional[torch.device] = None,
     alignment: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Validate the canonical BF16 expert weights and return contiguous copies
-    in the layout the cuDNN grouped GEMM runners consume.
-
-    ``w1_bf16`` is ``[E_local, 2*I, H]`` in canonical ``[up, gate]`` row order
-    for gated activations (``[E_local, I, H]`` otherwise) and ``w2_bf16`` is
-    ``[E_local, H, I]``; ``E_local`` is the number of experts held by this
-    rank. Block-scaled views pass ``alignment=128`` so that ``H`` and ``I``
-    fill whole 128-row scale tiles. Gated fc1 rows come back reordered to
-    ``[gate, up]``, the order of the fused ``activation(gate) * up`` kernels.
+    """Validate canonical BF16 expert weights (``w1 [E, 2*I | I, H]`` in
+    ``[up, gate]`` order, ``w2 [E, H, I]``) and return them on ``device``,
+    gated fc1 rows reordered to ``[gate, up]``. ``w2`` aliases the input when it
+    is already contiguous there.
     """
-    if hidden_size % alignment or intermediate_size % alignment:
-        raise ValueError(
-            f"{name} requires hidden_size and intermediate_size divisible by "
-            f"{alignment}, got {hidden_size} and {intermediate_size}."
-        )
-    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
-        raise TypeError(
-            f"{name} expects BF16 weights, got w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
-        )
     if w1_bf16.ndim != 3 or w2_bf16.ndim != 3:
         raise ValueError(
             f"{name} expects 3D (num_experts, n, k) weights, got "
             f"w1.ndim={w1_bf16.ndim}, w2.ndim={w2_bf16.ndim}."
         )
-    activation = _normalize_activation(activation)
-    expected_w1 = (
-        num_local_experts,
-        _gemm1_rows(intermediate_size, activation),
-        hidden_size,
+    w1, w2, device = _require_canonical_cutlass_bf16_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        name=name,
+        activation=activation,
+        alignment=alignment if alignment > 1 else None,
+        device=device,
     )
-    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
-    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
-        raise ValueError(
-            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
-            f"expected {expected_w1}/{expected_w2}."
-        )
-    device = torch.device(device if device is not None else w1_bf16.device)
-    w1 = w1_bf16.to(device)
-    if activation.is_gated:
+    if _normalize_activation(activation).is_gated:
         # [up, gate] -> [gate, up] as two strided copies; a torch.cat of the
         # halves runs several times slower.
         reordered = torch.empty(w1.shape, dtype=w1.dtype, device=device)
         reordered[:, :intermediate_size].copy_(w1[:, intermediate_size:])
         reordered[:, intermediate_size:].copy_(w1[:, :intermediate_size])
         w1 = reordered
-    w2 = w2_bf16.to(device)
-    return w1.contiguous(), w2.contiguous()
+    return w1, w2
 
 
 def prepare_cudnn_grouped_gemm_bf16_weights(
@@ -2872,6 +2854,8 @@ def prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+    intermediate_scale_global: Union[float, torch.Tensor],
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -2880,11 +2864,12 @@ def prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the weight view consumed by ``CudnnGroupedGemmFp8PerTensorRunner``.
 
-    Each expert is quantized with one E4M3 multiplier. Returns the two
-    ``grouped_mm_fp8`` operands ``fc1_expert_weights`` / ``fc2_expert_weights``
-    (E4M3, same shapes as the BF16 view) plus ``float32 [E_local]``
-    ``fc1_dequant`` / ``fc2_dequant`` (``amax / fp8_max`` per expert), which the
-    runner applies as a per-row scale after each GEMM.
+    Each expert is quantized with one E4M3 multiplier; the static calibration
+    multipliers are folded into
+    ``fc1_dequant_scale = fc1_dequant / hidden_states_scale_global``,
+    ``fc2_act_quant_scale = intermediate_scale_global`` and
+    ``fc2_dequant_scale = fc2_dequant / intermediate_scale_global``. The
+    unfolded values stay in the view as calibration metadata.
     For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
@@ -2897,36 +2882,28 @@ def prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
         activation=activation,
         device=device,
     )
-    w1_q, w1_scale = _quantize_fp8_per_expert(w1)
-    w2_q, w2_scale = _quantize_fp8_per_expert(w2)
+    w1_q, w1_mult = _quantize_fp8_per_expert(w1)
+    w2_q, w2_mult = _quantize_fp8_per_expert(w2)
+    act_scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global, name="hidden_states_scale_global", device=w1.device
+    )
+    inter_scale = _fp8_per_tensor_scale(
+        intermediate_scale_global, name="intermediate_scale_global", device=w1.device
+    )
+    fc1_dequant = (1.0 / w1_mult).contiguous()
+    fc2_dequant = (1.0 / w2_mult).contiguous()
     return {
         "fc1_expert_weights": w1_q,
         "fc2_expert_weights": w2_q,
-        "fc1_dequant": (1.0 / w1_scale).contiguous(),
-        "fc2_dequant": (1.0 / w2_scale).contiguous(),
+        "fc1_dequant_scale": (fc1_dequant / act_scale).contiguous(),
+        "fc2_act_quant_scale": inter_scale.clone(),
+        "fc2_dequant_scale": (fc2_dequant / inter_scale).contiguous(),
+        # Calibration metadata; the runner ignores these keys.
+        "fc1_dequant": fc1_dequant,
+        "fc2_dequant": fc2_dequant,
+        "hidden_states_scale_global": act_scale.clone(),
+        "intermediate_scale_global": inter_scale.clone(),
     }
-
-
-def prepare_cudnn_grouped_gemm_fp8_per_tensor_activations(
-    hidden_states_bf16: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``[M, H]`` BF16 activations to E4M3 plus a 0-dim dequant scale.
-
-    The scale is ``amax / fp8_max`` as ``float32`` (1 for an all-zero tensor);
-    the ``cudnn_grouped_gemm_fp8_per_tensor`` runner applies it as the GEMM1
-    ``alpha``.
-    """
-    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
-        raise ValueError(
-            "prepare_cudnn_grouped_gemm_fp8_per_tensor_activations expects a 2D "
-            f"BF16 tensor, got shape={tuple(hidden_states_bf16.shape)}, "
-            f"dtype={hidden_states_bf16.dtype}."
-        )
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = hidden_states_bf16.float().abs().amax()
-    dequant = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
-    quantized = (hidden_states_bf16.float() / dequant).clamp(-fp8_max, fp8_max)
-    return quantized.to(torch.float8_e4m3fn), dequant
 
 
 def _quantize_mxfp8_rows(
@@ -2967,7 +2944,12 @@ def prepare_cudnn_grouped_gemm_mxfp8_activations(
             "cuDNN MXFP8 activations require hidden_size divisible by 128, got "
             f"{hidden_states_bf16.shape[1]}."
         )
-    return _quantize_mxfp8_rows(hidden_states_bf16.contiguous(), token_major=True)
+    from .api import QuantConfig, QuantFormat
+
+    return prepare_trtllm_fp8_block_activations(
+        hidden_states_bf16,
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    )
 
 
 def _quantize_mxfp8_per_expert(
@@ -3046,25 +3028,22 @@ def _quantize_nvfp4_rows(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """NVFP4-quantize ``[rows, k]`` BF16 rows for the cuDNN block-scaled grouped GEMMs.
 
-    The global scale is ``(448 * 6) / amax`` (1 where ``amax`` is 0), where
-    ``amax`` is a float32 magnitude bound of ``values``: 0-dim for one scale
-    over all rows (reduced from ``values`` when not given) or ``[rows]`` for
-    one scale per row. Returns packed E2M1 ``uint8 [rows, k // 2]``, the E4M3
-    block scales ``[rows, k // 16]`` in cuDNN's swizzled 128x4 layout
-    (``rows`` and ``k`` must be multiples of 128) and the float32 global
-    dequant (the inverse global scale), ``[1]`` or ``[rows]`` like ``amax``.
+    The global scale is one, or ``(448 * 6) / amax`` for a 0-dim or ``[rows]``
+    float32 ``amax``. Returns packed E2M1 ``uint8 [rows, k // 2]``, E4M3 block
+    scales ``[rows, k // 16]`` in cuDNN's swizzled 128x4 layout (``rows`` and
+    ``k`` multiples of 128) and the float32 global dequant, ``[1]`` or ``[rows]``.
     """
     from ..quantization.fp4_quantization import fp4_quantize
 
     _require_swizzled_scale_tiles(values, "_quantize_nvfp4_rows")
     if amax is None:
-        amax = torch.linalg.vector_norm(values, float("inf")).float()
-
-    nvfp4_max = 6.0  # largest E2M1 magnitude
-    nvfp4_scale_max = 448.0  # largest E4M3 block scale
-    global_scale = torch.where(
-        amax > 0, (nvfp4_scale_max * nvfp4_max) / amax, torch.ones_like(amax)
-    ).reshape(-1)
+        global_scale = torch.ones(1, dtype=torch.float32, device=values.device)
+    else:
+        nvfp4_max = 6.0  # largest E2M1 magnitude
+        nvfp4_scale_max = 448.0  # largest E4M3 block scale
+        global_scale = torch.where(
+            amax > 0, (nvfp4_scale_max * nvfp4_max) / amax, torch.ones_like(amax)
+        ).reshape(-1)
     quantized, scale = fp4_quantize(
         values, global_scale=global_scale, sf_vec_size=16, is_sf_swizzled_layout=True
     )
@@ -3088,31 +3067,26 @@ def prepare_cudnn_grouped_gemm_nvfp4_activations(
     0.09 in magnitude get subnormal scales with reduced precision and blocks
     below about 0.006 quantize to zero.
     """
-    from ..quantization.fp4_quantization import fp4_quantize
-
     if hidden_states_bf16.dtype is not torch.bfloat16 or hidden_states_bf16.ndim != 2:
         raise ValueError(
             "prepare_cudnn_grouped_gemm_nvfp4_activations expects a 2D BF16 tensor, "
             f"got shape={tuple(hidden_states_bf16.shape)}, "
             f"dtype={hidden_states_bf16.dtype}."
         )
-    num_tokens, hidden_size = hidden_states_bf16.shape
+    hidden_size = hidden_states_bf16.shape[1]
     if hidden_size % 128:
         raise ValueError(
             "cuDNN NVFP4 activations require hidden_size divisible by 128, got "
             f"{hidden_size}."
         )
-    quantized, scale = fp4_quantize(
+    from .api import QuantConfig, QuantFormat
+
+    quantized, scale = prepare_trtllm_fp4_activations(
         hidden_states_bf16.contiguous(),
-        torch.ones(1, dtype=torch.float32, device=hidden_states_bf16.device),
-        sf_vec_size=16,
-        sf_use_ue8m0=False,
-        is_sf_swizzled_layout=False,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
-    return (
-        quantized.view(torch.uint8),
-        scale.view(torch.float8_e4m3fn).reshape(num_tokens, hidden_size // 16),
-    )
+    assert scale is not None
+    return quantized, scale
 
 
 def _quantize_nvfp4_per_expert(

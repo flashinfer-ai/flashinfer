@@ -30,7 +30,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Literal, Mapping, Optional, Sequence
+from typing import Any, Callable, ClassVar, List, Literal, Mapping, Optional, Sequence
 
 import torch
 
@@ -7743,19 +7743,17 @@ def _combine_rows(
 ) -> torch.Tensor:
     """``out[t] = sum_j topk_weights[t, j] * rows[token_to_row[t, j]]`` over local slots.
 
-    One ``embedding_bag`` with float32 accumulation; -1 slots get weight 0.
+    Float32 accumulation one slot at a time; -1 slots contribute nothing.
     """
+    local = token_to_row >= 0
     indices = token_to_row.clamp(min=0).to(torch.int64)
-    if topk_weights.dtype is rows.dtype:
-        values, weights = rows, topk_weights
-    else:
-        values, weights = rows.float(), topk_weights.float()
-    weights = torch.where(token_to_row >= 0, weights, 0.0)
-    return out.copy_(
-        torch.nn.functional.embedding_bag(
-            indices, values, per_sample_weights=weights, mode="sum"
-        )
-    )
+    weights = topk_weights.float()
+    acc = torch.zeros(out.shape, dtype=torch.float32, device=out.device)
+    for slot in range(indices.shape[1]):
+        gathered = rows.index_select(0, indices[:, slot]).float()
+        gathered = torch.where(local[:, slot, None], gathered, 0.0)
+        acc.addcmul_(gathered, weights[:, slot, None])
+    return out.copy_(acc)
 
 
 _CUDNN_GROUPED_GEMM_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
@@ -7786,12 +7784,6 @@ def _apply_moe_activation(
             f"got {activation!r}."
         )
     return kernel(gemm1_out, out=out, enable_pdl=False)
-
-
-def _valid_rows_amax(values: torch.Tensor, row_valid: torch.Tensor) -> torch.Tensor:
-    """Largest magnitude over the rows flagged in ``row_valid`` (0-dim float32)."""
-    row_amax = torch.linalg.vector_norm(values, float("inf"), dim=1).float()
-    return torch.where(row_valid, row_amax, torch.zeros_like(row_amax)).amax()
 
 
 def _dequant_rows_by_expert(
@@ -7876,6 +7868,16 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 f"{type(self).__name__} does not support SM{self._device_arch}; "
                 f"supported architectures are {self._supported_archs}."
             )
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per_token_scale=True; the "
+                "cuDNN grouped GEMMs take no per-token activation scale."
+            )
+        if self.config.quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} reads token-major activation block scales "
+                "only; swizzled_scale_factors=True is not supported."
+            )
         from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
 
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
@@ -7893,11 +7895,20 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             )
 
     def _build(self) -> None:
-        """Load the ``moe_utils`` kernels where they run."""
-        if self._use_moe_utils:
-            from .cute_dsl.moe_utils import _get_moe_utils_module
+        """Load the ``moe_utils`` kernels; without them the torch permute and finalize run."""
+        if not self._use_moe_utils:
+            return
+        from .cute_dsl.moe_utils import _get_moe_utils_module
 
+        try:
             _get_moe_utils_module()
+        except (RuntimeError, OSError) as exc:
+            warnings.warn(
+                f"{type(self).__name__}: the moe_utils kernels are unavailable "
+                f"({exc}); using the torch permute and finalize path.",
+                stacklevel=2,
+            )
+            self._use_moe_utils = False
 
     # --- geometry and workspace -------------------------------------------
 
@@ -8110,6 +8121,11 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             allowed_weights_dtypes=(torch.float32, torch.bfloat16),
             require_contiguous=True,
         )
+        if act.per_token_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
+                "GEMMs have no per-token activation scale input."
+            )
         view = weights.get_view(self.backend_key)
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
         extra_inputs = self._pack_extra_inputs(act, view)
@@ -8128,28 +8144,33 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             *weight_inputs,
             *extra_inputs,
         ]
-        token_sized = [0, 1, 2, *self._token_sized_extra_inputs()]
         if self.config.finalize.do_finalize:
-            token_sized.append(len(inputs))
             inputs.append(
                 torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=self.device
                 )
             )
+        return inputs
+
+    def tuning_config_for(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        token_sized = [0, 1, 2, *self._token_sized_extra_inputs()]
+        if self.config.finalize.do_finalize:
+            token_sized.append(len(inputs) - 1)
         ceiling = self.config.execution.tune_max_num_tokens
-        self.tuning_config = TuningConfig(
+        return TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
                     input_idx=tuple(token_sized),
                     dim_idx=(0,) * len(token_sized),
-                    gen_tuning_buckets=(map_to_hybrid_bucket(num_tokens, ceiling),),
+                    gen_tuning_buckets=(
+                        map_to_hybrid_bucket(inputs[0].shape[0], ceiling),
+                    ),
                     map_to_tuning_buckets=make_hybrid_bucket_mapper(ceiling),
                 ),
             ),
             use_cuda_graph=True,
             inputs_pre_hook=self._prepare_tuning_inputs,
         )
-        return inputs
 
     # --- execution --------------------------------------------------------
 
@@ -8251,14 +8272,26 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         )
         return layout, workspace
 
-    def _checked_plan(
-        self, stage: int, tactic: int, result: Optional[torch.Tensor]
+    def _run_plan(
+        self,
+        stage: int,
+        tactic: int,
+        run: Callable[[int], Optional[torch.Tensor]],
     ) -> torch.Tensor:
-        """The flat functions return ``None`` for a tactic beyond cuDNN's plan count."""
+        """``run(tactic)``; a plan index beyond cuDNN's count for this shape runs the heuristic plan."""
+        result = run(tactic)
         if result is None:
-            raise ValueError(
-                f"{self.backend_key} GEMM{stage} tactic {tactic} is not a valid cuDNN "
-                "execution-plan index for this shape."
+            warnings.warn(
+                f"{self.backend_key} GEMM{stage} tactic {tactic} is not a cuDNN "
+                "execution-plan index for this shape on this device; running the "
+                "heuristic plan instead.",
+                stacklevel=2,
+            )
+            result = run(-1)
+        if result is None:
+            raise RuntimeError(
+                f"{self.backend_key} GEMM{stage} has no cuDNN execution plan for "
+                "this shape."
             )
         return result
 
@@ -8457,15 +8490,15 @@ class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
     ) -> torch.Tensor:
         from ..grouped_mm import grouped_mm_bf16
 
-        return self._checked_plan(
+        return self._run_plan(
             1,
             tactic,
-            grouped_mm_bf16(
+            lambda plan: grouped_mm_bf16(
                 workspace.permuted_hidden_states,
                 inputs[3],
                 layout.m_indptr,
                 out=workspace.gemm1_out,
-                tactic=tactic,
+                tactic=plan,
             ),
         )
 
@@ -8479,10 +8512,12 @@ class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
     ) -> torch.Tensor:
         from ..grouped_mm import grouped_mm_bf16
 
-        return self._checked_plan(
+        return self._run_plan(
             2,
             tactic,
-            grouped_mm_bf16(intermediate, inputs[4], layout.m_indptr, tactic=tactic),
+            lambda plan: grouped_mm_bf16(
+                intermediate, inputs[4], layout.m_indptr, tactic=plan
+            ),
         )
 
     def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
@@ -8494,11 +8529,12 @@ class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
 class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
     """FP8 per-tensor MoE over ``grouped_mm_fp8``.
 
-    E4M3 activations with a 0-dim float32 ``hidden_states_scale``; E4M3 weights
-    with one float32 dequant per expert. GEMM2 reads the intermediate
-    requantized per tensor by the fused Triton SwiGLU kernel, so SwiGLU with
-    default scalars is the only activation.
-    Extra packed inputs: ``[fc1_dequant, fc2_dequant, hidden_states_scale]``.
+    The canonical per-tensor FP8 pack (no activation scale); the view carries
+    the folded static scales. GEMM1 rows are scaled by ``fc1_dequant_scale``,
+    the fused Triton SwiGLU requantizes with ``fc2_act_quant_scale`` (so SwiGLU
+    with default scalars is the only activation) and the finalize applies
+    ``fc2_dequant_scale``.
+    Extra packed inputs: ``[fc1_dequant_scale, fc2_act_quant_scale, fc2_dequant_scale]``.
     """
 
     backend_key = "cudnn_grouped_gemm_fp8_per_tensor"
@@ -8510,11 +8546,12 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
-        "fc1_dequant",
-        "fc2_dequant",
+        "fc1_dequant_scale",
+        "fc2_act_quant_scale",
+        "fc2_dequant_scale",
     )
     _expected_num_inputs = 8
-    _fc2_dequant_input = 6
+    _fc2_dequant_input = 7
 
     def _build(self) -> None:
         super()._build()
@@ -8523,21 +8560,22 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
     def _pack_extra_inputs(
         self, act: MoEActivationPack, view: dict[str, torch.Tensor]
     ) -> List[torch.Tensor]:
-        scale = act.hidden_states_scale
-        if scale is None or scale.dim() != 0 or scale.dtype is not torch.float32:
+        if act.hidden_states_scale is not None:
             raise ValueError(
-                f"{type(self).__name__} requires a 0-dim float32 "
-                "hidden_states_scale dequant factor."
+                f"{type(self).__name__} activations do not use hidden_states_scale; "
+                "the static multipliers live in the weight view."
             )
         expected = (self._num_local_experts,)
         return [
             self._require_view_tensor(
-                view, "fc1_dequant", dtype=torch.float32, shape=expected
+                view, "fc1_dequant_scale", dtype=torch.float32, shape=expected
             ),
             self._require_view_tensor(
-                view, "fc2_dequant", dtype=torch.float32, shape=expected
+                view, "fc2_act_quant_scale", dtype=torch.float32, shape=()
             ),
-            scale,
+            self._require_view_tensor(
+                view, "fc2_dequant_scale", dtype=torch.float32, shape=expected
+            ),
         ]
 
     def _gemm1(
@@ -8549,16 +8587,15 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
     ) -> torch.Tensor:
         from ..grouped_mm import grouped_mm_fp8
 
-        out = self._checked_plan(
+        out = self._run_plan(
             1,
             tactic,
-            grouped_mm_fp8(
+            lambda plan: grouped_mm_fp8(
                 workspace.permuted_hidden_states,
                 inputs[3],
                 layout.m_indptr,
-                alpha=inputs[7].reshape(1),
                 out=workspace.gemm1_out,
-                tactic=tactic,
+                tactic=plan,
             ),
         )
         return _dequant_rows_by_expert(out, inputs[5], layout)
@@ -8571,30 +8608,19 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
         intermediate: torch.Tensor,
         tactic: int,
     ) -> torch.Tensor:
-        """Requantize the intermediate per tensor with the fused Triton SwiGLU kernel.
-
-        The scale is ``amax / fp8_max`` over the valid rows (1 when all zero) and
-        becomes ``alpha``; the kernel's clamp saturates values up to one BF16 ulp
-        above ``amax``.
-        """
+        """Requantize GEMM1's output with the static ``fc2_act_quant_scale``
+        multiplier inside the fused Triton SwiGLU kernel, then run GEMM2."""
         from ..grouped_mm import grouped_mm_fp8
         from ..triton.activation import silu_and_mul
 
-        amax = _valid_rows_amax(intermediate, layout.row_valid)
-        fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
         quantized = silu_and_mul(
-            workspace.gemm1_out, o_scale=1.0 / scale, dtype=torch.float8_e4m3fn
+            workspace.gemm1_out, o_scale=inputs[6], dtype=torch.float8_e4m3fn
         )
-        return self._checked_plan(
+        return self._run_plan(
             2,
             tactic,
-            grouped_mm_fp8(
-                quantized,
-                inputs[4],
-                layout.m_indptr,
-                alpha=scale.reshape(1),
-                tactic=tactic,
+            lambda plan: grouped_mm_fp8(
+                quantized, inputs[4], layout.m_indptr, tactic=plan
             ),
         )
 
@@ -8610,8 +8636,7 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
                 device=self.device,
             )
         )
-        alpha = torch.ones(1, dtype=torch.float32, device=self.device)
-        return self._plan_indices(a, inputs[2 + stage], alpha=alpha)
+        return self._plan_indices(a, inputs[2 + stage])
 
 
 class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
@@ -8800,17 +8825,17 @@ class CudnnGroupedGemmMxfp8Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
         from ..grouped_mm import grouped_mm_mxfp8
 
         assert workspace.permuted_hidden_states_scale is not None
-        return self._checked_plan(
+        return self._run_plan(
             1,
             tactic,
-            grouped_mm_mxfp8(
+            lambda plan: grouped_mm_mxfp8(
                 workspace.permuted_hidden_states,
                 inputs[3],
                 workspace.permuted_hidden_states_scale,
                 inputs[5],
                 layout.m_indptr,
                 out=workspace.gemm1_out,
-                tactic=tactic,
+                tactic=plan,
             ),
         )
 
@@ -8826,16 +8851,16 @@ class CudnnGroupedGemmMxfp8Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
         from .prepare import _quantize_mxfp8_rows
 
         quantized, scale = _quantize_mxfp8_rows(intermediate)
-        return self._checked_plan(
+        return self._run_plan(
             2,
             tactic,
-            grouped_mm_mxfp8(
+            lambda plan: grouped_mm_mxfp8(
                 quantized,
                 inputs[4],
                 scale,
                 inputs[6],
                 layout.m_indptr,
-                tactic=tactic,
+                tactic=plan,
             ),
         )
 
@@ -8846,8 +8871,7 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
     Packed E2M1 ``uint8 [M, H // 2]`` rows with ``float8_e4m3fn [M, H // 16]``
     token-major scales and a global scale of one; packed E2M1 weights with E4M3
     block scales and one global dequant per expert. The intermediate is
-    requantized with a dynamic global scale (amax of the valid rows) whose
-    dequant is GEMM2's ``alpha``.
+    requantized with a global scale of one.
     Extra packed inputs: ``[fc1_weight_scale, fc2_weight_scale, fc1_dequant,
     fc2_dequant, hidden_states_scale]``.
     """
@@ -8870,7 +8894,7 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
     _fc2_dequant_input = 8
     _block_size = 16
     _block_scale_dtype = torch.float8_e4m3fn
-    _gemm2_takes_alpha = True
+    _gemm2_takes_alpha = False
 
     def _pack_extra_inputs(
         self, act: MoEActivationPack, view: dict[str, torch.Tensor]
@@ -8910,10 +8934,10 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
         from ..grouped_mm import grouped_mm_fp4
 
         assert workspace.permuted_hidden_states_scale is not None
-        out = self._checked_plan(
+        out = self._run_plan(
             1,
             tactic,
-            grouped_mm_fp4(
+            lambda plan: grouped_mm_fp4(
                 workspace.permuted_hidden_states,
                 inputs[3],
                 workspace.permuted_hidden_states_scale,
@@ -8921,7 +8945,7 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
                 layout.m_indptr,
                 out=workspace.gemm1_out,
                 block_size=self._block_size,
-                tactic=tactic,
+                tactic=plan,
             ),
         )
         return _dequant_rows_by_expert(out, inputs[7], layout)
@@ -8937,21 +8961,18 @@ class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
         from ..grouped_mm import grouped_mm_fp4
         from .prepare import _quantize_nvfp4_rows
 
-        quantized, scale, dequant = _quantize_nvfp4_rows(
-            intermediate, amax=_valid_rows_amax(intermediate, layout.row_valid)
-        )
-        return self._checked_plan(
+        quantized, scale, _ = _quantize_nvfp4_rows(intermediate)
+        return self._run_plan(
             2,
             tactic,
-            grouped_mm_fp4(
+            lambda plan: grouped_mm_fp4(
                 quantized,
                 inputs[4],
                 scale,
                 inputs[6],
                 layout.m_indptr,
-                alpha=dequant.reshape(1),
                 block_size=self._block_size,
-                tactic=tactic,
+                tactic=plan,
             ),
         )
 

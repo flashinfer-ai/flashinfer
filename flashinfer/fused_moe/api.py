@@ -1306,14 +1306,10 @@ class CudnnGroupedGemmFp8PerTensorConfig:
     The runner builds a full MoE layer on the cuDNN grouped GEMM behind
     :func:`flashinfer.grouped_mm.grouped_mm_fp8`: permutation into
     expert-sorted rows, GEMM1, the typed activation and GEMM2. Activations are
-    prequantized E4M3 ``[M, H]`` (``M`` tokens of hidden size ``H``) with a
-    0-dim ``float32`` dequant scale on ``MoEActivationPack.hidden_states_scale``
-    (see :meth:`prepare_activations`). Weights are E4M3 with one ``float32``
-    dequant scale per expert (see :meth:`prepare_weights`); the activation
-    scale is each GEMM's scalar ``alpha``, GEMM1's output rows are multiplied
-    by their expert's scale and GEMM2's expert scale is applied by the
-    finalize (or to the unfinalized rows). The intermediate is requantized per
-    tensor with a dynamic scale before GEMM2 by the fused Triton SwiGLU kernel,
+    the canonical per-tensor FP8 pack: E4M3 quantized with the static
+    ``hidden_states_scale_global`` multiplier, ``hidden_states_scale=None``.
+    ``prepare_weights`` takes both static multipliers and folds them into the
+    view. The intermediate is requantized by the fused Triton SwiGLU kernel,
     so SwiGLU with default scalars is the only supported activation.
 
     Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
@@ -1333,15 +1329,16 @@ class CudnnGroupedGemmFp8PerTensorConfig:
         w1_bf16,
         w2_bf16,
         *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
     ):
-        """Quantize canonical BF16 weights to per-expert E4M3 plus dequant scales.
-
-        Register the result with
+        """Quantize canonical BF16 weights to per-expert E4M3 with the static
+        multipliers folded in. Register the result with
         ``MoEWeightPack.prepare_for("cudnn_grouped_gemm_fp8_per_tensor", ...)``. See
         :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_fp8_per_tensor_weights`.
         """
@@ -1350,6 +1347,8 @@ class CudnnGroupedGemmFp8PerTensorConfig:
         return prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
             w1_bf16,
             w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -1357,16 +1356,7 @@ class CudnnGroupedGemmFp8PerTensorConfig:
             device=device,
         )
 
-    @staticmethod
-    def prepare_activations(hidden_states_bf16):
-        """Quantize BF16 activations to E4M3 plus a 0-dim float32 dequant scale.
-
-        The scale is ``amax / fp8_max`` (1 for an all-zero tensor). See
-        :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_fp8_per_tensor_activations`.
-        """
-        from .prepare import prepare_cudnn_grouped_gemm_fp8_per_tensor_activations
-
-        return prepare_cudnn_grouped_gemm_fp8_per_tensor_activations(hidden_states_bf16)
+    prepare_activations = staticmethod(TrtllmFp8PerTensorConfig.prepare_activations)
 
     def __repr__(self) -> str:
         return "CudnnGroupedGemmFp8PerTensorConfig()"
@@ -1458,12 +1448,12 @@ class CudnnGroupedGemmNvfp4Config:
     resolves); rows and scale rows are permuted into expert order, each expert
     segment padded to a multiple of 128 rows, and the permuted scale rows are
     swizzled into the GEMM's block-scale layout. The BF16 intermediate is
-    quantized to NVFP4 with a dynamic global scale, straight into that layout,
-    before GEMM2. Weights are packed E2M1 with E4M3 block scales and one
-    global scale per expert (see :meth:`prepare_weights`); GEMM1's output rows
-    are multiplied by their expert's global dequant, GEMM2 takes the
-    intermediate's global dequant as its scalar ``alpha`` and its expert
-    dequant is applied by the finalize (or to the unfinalized rows).
+    quantized to NVFP4 with a global scale of one, straight into that layout,
+    before GEMM2. Weights are packed E2M1 with E4M3
+    block scales and one global scale per expert (see :meth:`prepare_weights`);
+    GEMM1's output rows are multiplied by their expert's global dequant and
+    GEMM2's expert dequant is applied by the finalize (or to the unfinalized
+    rows).
     ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
 
     Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
@@ -2454,12 +2444,10 @@ class MoEActivationPack:
       token-major ``uint8 [M, H/32]`` UE8M0 scales. CUTLASS MXFP8 runners
       accept the flat swizzled 1-D ``input_sf`` instead when
       ``QuantConfig(swizzled_scale_factors=True)``.
-    * FP8 per-tensor (``TrtllmFp8PerTensorConfig``, ``CutlassFp8PerTensorConfig``):
-      ``float8_e4m3fn [M, H]`` values with no activation scale; the static
-      calibration multipliers live in each backend's weight view.
-    * FP8 per-tensor (``CudnnGroupedGemmFp8PerTensorConfig``): ``float8_e4m3fn
-      [M, H]`` values with the 0-dim ``float32`` dequant scale returned by
-      ``prepare_activations``.
+    * FP8 per-tensor (``TrtllmFp8PerTensorConfig``, ``CutlassFp8PerTensorConfig``,
+      ``CudnnGroupedGemmFp8PerTensorConfig``): ``float8_e4m3fn [M, H]`` values
+      with no activation scale; the static calibration multipliers live in
+      each backend's weight view.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -2468,9 +2456,9 @@ class MoEActivationPack:
       The TRTLLM runners normally combine both fields into one packed ``int32``
       tensor before launch.
     * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: supported
-      by the TRTLLM runners. The caller supplies ``int32`` ids and BF16 or FP32
-      weights directly, avoiding packed-id construction. The launcher consumes
-      the weights in their native dtype.
+      by the TRTLLM and cuDNN grouped-GEMM runners. The caller supplies ``int32``
+      ids and BF16 or FP32 weights directly, avoiding packed-id construction.
+      The launcher consumes the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the

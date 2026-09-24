@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 from collections import defaultdict
 from typing import Any
 
@@ -115,6 +116,23 @@ _PREQUANTIZED_ACTIVATIONS = (
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
 )
+# Per-tensor FP8 backends taking the static multipliers as ``prepare_weights`` inputs.
+_STATIC_FP8_PER_TENSOR = (CutlassFp8PerTensorConfig, CudnnGroupedGemmFp8PerTensorConfig)
+
+
+def _fp8_per_tensor_static_scales(
+    hidden_states: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Static multipliers: ``fp8_max / amax`` of the activations and a fixed 32."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = hidden_states.float().abs().amax()
+    return {
+        "hidden_states_scale_global": torch.where(
+            amax > 0, fp8_max / amax, torch.ones_like(amax)
+        ),
+        "intermediate_scale_global": torch.tensor(32.0, device=hidden_states.device),
+    }
+
 
 _ACTIVATIONS = {
     ActivationType.Swiglu: SwiGLU,
@@ -310,6 +328,7 @@ def _prepare_weight_view(
     activation,
     args,
     device: torch.device,
+    fp8_static_scales: dict[str, torch.Tensor],
 ):
     common = {
         "num_local_experts": args.num_experts,
@@ -318,6 +337,8 @@ def _prepare_weight_view(
         "activation": activation,
         "device": device,
     }
+    if config_type in _STATIC_FP8_PER_TENSOR:
+        common.update(fp8_static_scales)
     if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
         return config_type.prepare_weights(w1, w2, **common)
 
@@ -496,7 +517,7 @@ def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
         _, tactic = AutoTuner.get().choose_one(
             custom_op=f"moe_{runner.backend_key}",
             runners=[runner],
-            tuning_config=runner.tuning_config,
+            tuning_config=runner.tuning_config_for(inputs),
             inputs=inputs,
         )
     return tactic
@@ -521,7 +542,10 @@ def _measure_runner(
             # CUTLASS FP8 takes prequantized input. Include its public BF16
             # conversion in the timed graph to match cuTile's API boundary.
             packed = list(profile_inputs[1:])
-            packed[1], packed[-1] = input_quantizer(profile_inputs[0])
+            quantized, scale = input_quantizer(profile_inputs[0])
+            packed[1] = quantized
+            if scale is not None:  # per-tensor FP8 keeps its scale in the view
+                packed[-1] = scale
         return runner.forward(packed, tactic=tactic)
 
     profile_inputs = tuple(inputs) if input_quantizer is None else (bf16_input, *inputs)
@@ -572,6 +596,7 @@ def run_unified_moe_test(args):
     arch = major * 10 + minor
     assert activations.topk_ids is not None
     active_experts = int(activations.topk_ids.unique().numel())
+    fp8_static_scales = _fp8_per_tensor_static_scales(activations.hidden_states_q)
     results = []
 
     for backend in args.backends:
@@ -593,10 +618,18 @@ def run_unified_moe_test(args):
         config = _config_for_backend(args, activation, backend_config)
         try:
             backend_activations = activations
+            prepare_activations = getattr(config_type, "prepare_activations", None)
+            if config_type in _STATIC_FP8_PER_TENSOR:
+                prepare_activations = functools.partial(
+                    prepare_activations,
+                    hidden_states_scale_global=fp8_static_scales[
+                        "hidden_states_scale_global"
+                    ],
+                )
             if config_type in _PREQUANTIZED_ACTIVATIONS:
                 # Inside the guard so an unaligned hidden_size skips this
                 # backend like any other unsupported configuration.
-                x_q, x_sf = config_type.prepare_activations(activations.hidden_states_q)
+                x_q, x_sf = prepare_activations(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
                     hidden_states_q=x_q,
                     hidden_states_scale=x_sf,
@@ -614,12 +647,13 @@ def run_unified_moe_test(args):
                 activation,
                 args,
                 device,
+                fp8_static_scales,
             )
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
             input_quantizer = None
             if backend == "cutlass" and args.quant_variant in ("fp8", "mxfp4_w4a8"):
-                input_quantizer = config_type.prepare_activations
+                input_quantizer = prepare_activations
                 quantized, scale = input_quantizer(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
                     hidden_states_q=quantized,

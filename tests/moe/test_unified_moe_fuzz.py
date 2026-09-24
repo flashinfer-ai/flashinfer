@@ -1057,9 +1057,14 @@ def _cutlass_post_reference(backend_key):
                 view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
             )
         elif backend_key == "cudnn_grouped_gemm_fp8_per_tensor":
-            # Dynamic per-tensor pack: the activation scale is the dequant
-            # multiplier of the quantized rows.
-            x_ref = view["_activation_q"].float() * view["_activation_scale"]
+            # Canonical TRTLLM pack: static multipliers live in the view and the
+            # pack carries no scale; GEMM1 output is requantized with the
+            # static intermediate multiplier before GEMM2.
+            assert view["_activation_scale"] is None
+            x_ref = view["_activation_q"].float() / view["hidden_states_scale_global"]
+            intermediate_hook = fp8_per_tensor_requant_hook(
+                view["intermediate_scale_global"]
+            )
             w1_ref = (
                 view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
             )
@@ -1391,7 +1396,8 @@ _CONTRACT_HANDLERS = {
     "cudnn_grouped_gemm_fp8_per_tensor": _contract_handler(
         CudnnGroupedGemmFp8PerTensorConfig,
         "fp8pertensor",
-        activation_pack=_contract_fp8_act_pack(CudnnGroupedGemmFp8PerTensorConfig),
+        # Same static-scale pack as the TRTLLM per-tensor handler.
+        activation_pack=_fp8_per_tensor_act_pack,
         reference=_cutlass_post_reference("cudnn_grouped_gemm_fp8_per_tensor"),
         atol_frac=0.1,
         rtol=0.1,
@@ -3102,7 +3108,11 @@ def test_unified_moe_fuzz(cfg):
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["quant"] = _quant_config_for_handler(handler)
-        elif BackendCfg in (TrtllmFp8PerTensorConfig, CutlassFp8PerTensorConfig):
+        elif BackendCfg in (
+            TrtllmFp8PerTensorConfig,
+            CutlassFp8PerTensorConfig,
+            CudnnGroupedGemmFp8PerTensorConfig,
+        ):
             prepare_kwargs.update(
                 hidden_states_scale_global=fp8_per_tensor_global_scale(x),
                 intermediate_scale_global=torch.tensor(64.0, device=dev),

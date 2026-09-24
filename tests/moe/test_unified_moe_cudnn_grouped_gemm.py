@@ -62,7 +62,7 @@ from flashinfer.quantization.fp4_quantization import e2m1_and_ufp8sf_scale_to_fl
 from flashinfer.quantization.fp8_quantization import mxfp8_dequantize_host
 from flashinfer.utils import get_compute_capability
 
-from .utils import compute_reference_moe
+from .utils import compute_reference_moe, fp8_per_tensor_global_scale
 
 # The gated activations backed by fused flashinfer.activation kernels.
 _ACTIVATIONS = (SwiGLU(), GeGLU(), GeGLUTanh())
@@ -88,7 +88,7 @@ _BF16_TOL = dict(rtol=2e-2, atol=2e-2)
 def _fp8_tol(expected):
     """FP8 tolerance: 10% relative plus 10% of the reference's largest magnitude.
 
-    Two E4M3 quantizations (activations and the dynamically scaled intermediate)
+    Two E4M3 quantizations (activations and the statically scaled intermediate)
     leave single-element outliers that a fixed absolute tolerance cannot bound.
     """
     return dict(rtol=1e-1, atol=1e-1 * expected.abs().max().item())
@@ -243,7 +243,6 @@ _REQUIRED = {
 _FAMILY_PARAMS = tuple(pytest.param(key, marks=_REQUIRED[key]) for key in _FAMILY_KEYS)
 _PLAIN_FAMILY_PARAMS = _FAMILY_PARAMS[:2]  # BF16, FP8: 16-row tiles
 _BLOCK_SCALE_FAMILY_PARAMS = _FAMILY_PARAMS[2:]  # MXFP8, NVFP4: 128-row tiles
-_DYNAMIC_SCALE_FAMILY_PARAMS = (_FAMILY_PARAMS[1], _FAMILY_PARAMS[3])  # FP8, NVFP4
 # (family, activation) for every activation the family runs.
 _FAMILY_ACTIVATION_PARAMS = tuple(
     pytest.param(key, activation, marks=_REQUIRED[key])
@@ -398,10 +397,28 @@ def test_cudnn_check_support_rejects_unsupported_options():
                 execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=8),
             ),
         )._check_support()
-    for key in _BLOCK_SCALE_KEYS:
-        with pytest.raises(NotImplementedError, match="intermediate_size divisible"):
+    if _cudnn_moe_available():
+        # The block-scale size check follows the cuDNN version check.
+        for key in _BLOCK_SCALE_KEYS:
+            with pytest.raises(
+                NotImplementedError, match="intermediate_size divisible"
+            ):
+                _detached_runner(
+                    key, _config(key, experts=ExpertConfig(intermediate_size=96))
+                )._check_support()
+    for key in _FAMILY_KEYS:
+        quant = _FAMILIES[key].quant
+        with pytest.raises(NotImplementedError, match="per_token_scale"):
             _detached_runner(
-                key, _config(key, experts=ExpertConfig(intermediate_size=96))
+                key,
+                _config(key, quant=dataclasses.replace(quant, per_token_scale=True)),
+            )._check_support()
+        with pytest.raises(NotImplementedError, match="swizzled_scale_factors"):
+            _detached_runner(
+                key,
+                _config(
+                    key, quant=dataclasses.replace(quant, swizzled_scale_factors=True)
+                ),
             )._check_support()
     for activation in _UNSUPPORTED_ACTIVATIONS:
         with pytest.raises(NotImplementedError, match="SwiGLU|does not support"):
@@ -444,6 +461,8 @@ def test_cudnn_prepare_weights_rejects_invalid_inputs(key):
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
+    if key == _FP8_KEY:
+        kwargs.update(hidden_states_scale_global=1.0, intermediate_scale_global=1.0)
     w1 = torch.randn(2, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16)
     w2 = torch.randn(2, hidden_size, intermediate_size, dtype=torch.bfloat16)
     with pytest.raises(TypeError, match="expects BF16 weights"):
@@ -508,12 +527,41 @@ def _dequant_experts(family: _Family, view, prefix: str) -> torch.Tensor:
     return torch.stack(experts).to(device=weights.device, dtype=torch.bfloat16)
 
 
-def _dequant_activations(family: _Family, q, scale) -> torch.Tensor:
+def _fp8_static_scales(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Static multipliers of the per-tensor FP8 view: amax-derived and a fixed 32."""
+    return dict(
+        hidden_states_scale_global=fp8_per_tensor_global_scale(hidden_states),
+        intermediate_scale_global=torch.tensor(32.0, device=hidden_states.device),
+    )
+
+
+def _prepare_kwargs(family: _Family, view=None, hidden_states=None) -> dict:
+    """``prepare_weights`` extras: the FP8 multipliers from ``view`` or ``hidden_states``."""
+    if family.key != _FP8_KEY:
+        return {}
+    if view is not None:
+        return {
+            key: view[key]
+            for key in ("hidden_states_scale_global", "intermediate_scale_global")
+        }
+    return _fp8_static_scales(hidden_states)
+
+
+def _prepare_activations(family: _Family, hidden_states: torch.Tensor, view):
+    if family.key == _FP8_KEY:
+        return family.config_cls.prepare_activations(
+            hidden_states, hidden_states_scale_global=view["hidden_states_scale_global"]
+        )
+    return family.config_cls.prepare_activations(hidden_states)
+
+
+def _dequant_activations(family: _Family, q, scale, view=None) -> torch.Tensor:
     """Dequantize an activation pack back to BF16 ``[M, H]``."""
     if family.key == _BF16_KEY:
         return q
     if family.key == _FP8_KEY:
-        return (q.float() * scale).to(torch.bfloat16)
+        assert scale is None
+        return (q.float() / view["hidden_states_scale_global"]).to(torch.bfloat16)
     if family.key == _MXFP8_KEY:
         values = mxfp8_dequantize_host(
             q.cpu().view(torch.uint8), scale.cpu().view(torch.uint8).reshape(-1), False
@@ -597,6 +645,7 @@ def _make_case(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=activation,
+            **_prepare_kwargs(family, hidden_states=hidden_states),
         )
         weights = MoEWeightPack()
         weights.prepare_for(family.key, view)
@@ -610,16 +659,19 @@ def _make_case(
         w2_ref[offset : offset + count] = _dequant_experts(family, view, "fc2")
     else:
         weights, w1_ref, w2_ref = shared.weights, shared.w1_ref, shared.w2_ref
+    view = weights.get_view(family.key)
     if family.key == _BF16_KEY:
         act = MoEActivationPack(hidden_states, None, topk_ids, topk_weights)
     else:
-        q, scale = family.config_cls.prepare_activations(hidden_states)
+        q, scale = _prepare_activations(family, hidden_states, view)
         act = MoEActivationPack(q, scale, topk_ids, topk_weights)
     is_local = ((topk_ids >= offset) & (topk_ids < offset + count)).to(
         topk_weights.dtype
     )
     expected = compute_reference_moe(
-        _dequant_activations(family, act.hidden_states_q, act.hidden_states_scale),
+        _dequant_activations(
+            family, act.hidden_states_q, act.hidden_states_scale, view
+        ),
         topk_ids,
         topk_weights * is_local,
         w1_ref,
@@ -922,50 +974,6 @@ def test_cudnn_layer_reuse_across_token_counts(key):
         )
 
 
-@pytest.mark.parametrize("key", _DYNAMIC_SCALE_FAMILY_PARAMS)
-def test_cudnn_padding_rows_do_not_skew_dynamic_scales(key):
-    """Padding rows never enter the intermediate's dynamic scale.
-
-    Padding rows are computed with an expert that never sees their token. With
-    that expert's weights blown up, a padding row entering the per-tensor
-    (FP8) or global (NVFP4) scale of the intermediate would quantize every
-    real row to zero. A preceding call that routes tokens to that expert
-    leaves its outputs in exactly the rows the real routing pads.
-    """
-    family = _FAMILIES[key]
-    torch.manual_seed(23)
-    device = torch.device("cuda")
-    num_tokens, num_experts, hidden_size, intermediate_size = 20, 3, 128, 128
-    w1, w2 = _experts(num_experts, hidden_size, intermediate_size, SwiGLU(), device)
-    w1[2] *= 1000.0
-    w2[2] *= 1000.0
-    case = _make_case(
-        family,
-        num_tokens,
-        num_experts,
-        1,
-        hidden_size,
-        intermediate_size,
-        topk_ids=torch.zeros(num_tokens, 1, dtype=torch.int32, device=device),
-        topk_weights=torch.ones(num_tokens, 1, device=device),
-        experts=(w1, w2),
-    )
-    layer = _layer(case)
-    _assert_matches_reference(
-        _check_unfinalized(layer(case.act, case.weights), case), case
-    )
-    stale = MoEActivationPack(
-        case.act.hidden_states_q,
-        case.act.hidden_states_scale,
-        _topk_ids_with_counts((7, 7, 6), device),
-        case.act.topk_weights,
-    )
-    layer(stale, case.weights)  # fills the blown-up expert's rows
-    _assert_matches_reference(
-        _check_unfinalized(layer(case.act, case.weights), case), case
-    )
-
-
 def _autotune_and_graph(runner, case: _Case, *, cache_name: str):
     """Tune the compound tactic, check every advertised pair, then replay a CUDA graph."""
     inputs = runner.pack_inputs(case.act, case.weights)
@@ -986,6 +994,10 @@ def _autotune_and_graph(runner, case: _Case, *, cache_name: str):
         _assert_matches_reference(
             _combine(runner.forward(inputs, tactic=candidate), num_tokens, top_k), case
         )
+    # A plan index beyond this device's plan count runs the heuristic plan.
+    with pytest.warns(UserWarning, match="execution-plan index"):
+        beyond = runner.forward(inputs, tactic=(1 << 20, 1 << 20))
+    _assert_matches_reference(_combine(beyond, num_tokens, top_k), case)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1039,16 +1051,36 @@ def test_cudnn_prepare_weights_and_activations_contract(key):
     device = torch.device("cuda")
     num_experts, hidden_size, intermediate_size = 3, 256, 128
     w1, w2 = _experts(num_experts, hidden_size, intermediate_size, SwiGLU(), device)
+    x = torch.randn(6, hidden_size, dtype=torch.bfloat16, device=device)
     view = family.config_cls.prepare_weights(
         w1,
         w2,
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        **_prepare_kwargs(family, hidden_states=x),
     )
     keys = {"fc1_expert_weights", "fc2_expert_weights"}
     if key == _FP8_KEY:
-        keys |= {"fc1_dequant", "fc2_dequant"}
+        keys |= {
+            "fc1_dequant_scale",
+            "fc2_act_quant_scale",
+            "fc2_dequant_scale",
+            "fc1_dequant",
+            "fc2_dequant",
+            "hidden_states_scale_global",
+            "intermediate_scale_global",
+        }
+        scales = _fp8_static_scales(x)
+        a1, a2 = (
+            scales["hidden_states_scale_global"],
+            scales["intermediate_scale_global"],
+        )
+        torch.testing.assert_close(view["hidden_states_scale_global"], a1)
+        torch.testing.assert_close(view["intermediate_scale_global"], a2)
+        torch.testing.assert_close(view["fc1_dequant_scale"], view["fc1_dequant"] / a1)
+        torch.testing.assert_close(view["fc2_act_quant_scale"], a2)
+        torch.testing.assert_close(view["fc2_dequant_scale"], view["fc2_dequant"] / a2)
     elif key == _MXFP8_KEY:
         keys |= {"fc1_weight_scale", "fc2_weight_scale"}
     elif key == _NVFP4_KEY:
@@ -1091,15 +1123,16 @@ def test_cudnn_prepare_weights_and_activations_contract(key):
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         activation=ReLU2(),
+        **_prepare_kwargs(family, view=view),
     )
     assert relu2["fc1_expert_weights"].shape[1] == intermediate_size
     if key == _BF16_KEY:
         return
-    x = torch.randn(6, hidden_size, dtype=torch.bfloat16, device=device)
-    q, scale = family.config_cls.prepare_activations(x)
+    q, scale = _prepare_activations(family, x, view)
     if key == _FP8_KEY:
+        # The canonical per-tensor FP8 pack: the static multiplier lives in the view.
         assert q.dtype is torch.float8_e4m3fn and q.shape == x.shape
-        assert scale.dtype is torch.float32 and scale.ndim == 0
+        assert scale is None
     elif key == _MXFP8_KEY:
         assert q.dtype is torch.float8_e4m3fn and q.shape == x.shape
         assert scale.dtype is torch.uint8 and scale.shape == (6, hidden_size // 32)
@@ -1110,13 +1143,13 @@ def test_cudnn_prepare_weights_and_activations_contract(key):
             hidden_size // 16,
         )
     torch.testing.assert_close(
-        _dequant_activations(family, q, scale),
+        _dequant_activations(family, q, scale, view),
         x,
         rtol=frac,
         atol=frac * x.abs().max().item(),
     )
     with pytest.raises(ValueError, match="2D BF16"):
-        family.config_cls.prepare_activations(x.float())
+        _prepare_activations(family, x.float(), view)
     if key in _BLOCK_SCALE_KEYS:
         for width in (40, 160):
             with pytest.raises(ValueError, match="hidden_size divisible by 128"):
@@ -1147,6 +1180,17 @@ def test_cudnn_bf16_pack_inputs_fail_fast():
                 None,
                 act.topk_ids,
                 act.topk_weights,
+            ),
+            weights,
+        )
+    with pytest.raises(ValueError, match="takes no per_token_scale"):
+        runner.pack_inputs(
+            MoEActivationPack(
+                act.hidden_states_q,
+                None,
+                act.topk_ids,
+                act.topk_weights,
+                per_token_scale=torch.ones(4, dtype=torch.float32, device=device),
             ),
             weights,
         )
@@ -1215,11 +1259,11 @@ def test_cudnn_fp8_pack_inputs_fail_fast():
     case = _make_case(family, 16, 4, 2, 128, 256)
     act, weights = case.act, case.weights
     runner = _layer(case).runners[0]
-    with pytest.raises(ValueError, match="0-dim float32"):
+    with pytest.raises(ValueError, match="do not use hidden_states_scale"):
         runner.pack_inputs(
             MoEActivationPack(
                 act.hidden_states_q,
-                act.hidden_states_scale.reshape(1),
+                torch.ones((), device=act.hidden_states_q.device),
                 act.topk_ids,
                 act.topk_weights,
             ),
@@ -1229,7 +1273,7 @@ def test_cudnn_fp8_pack_inputs_fail_fast():
         runner.pack_inputs(
             MoEActivationPack(
                 act.hidden_states_q.view(torch.float8_e5m2),
-                act.hidden_states_scale,
+                None,
                 act.topk_ids,
                 act.topk_weights,
             ),
@@ -1248,14 +1292,19 @@ def test_cudnn_fp8_pack_inputs_fail_fast():
             "must be torch.float8_e4m3fn",
         ),
         (
-            {**view, "fc1_dequant": view["fc1_dequant"].half()},
+            {**view, "fc1_dequant_scale": view["fc1_dequant_scale"].half()},
             ValueError,
-            "fc1_dequant must be",
+            "fc1_dequant_scale must be",
         ),
         (
-            {**view, "fc2_dequant": view["fc2_dequant"][:-1]},
+            {**view, "fc2_act_quant_scale": view["fc2_act_quant_scale"].reshape(1)},
             ValueError,
-            "fc2_dequant must be",
+            "fc2_act_quant_scale must be",
+        ),
+        (
+            {**view, "fc2_dequant_scale": view["fc2_dequant_scale"][:-1]},
+            ValueError,
+            "fc2_dequant_scale must be",
         ),
     ):
         bad = MoEWeightPack()
