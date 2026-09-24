@@ -1382,6 +1382,28 @@ def dequantize_block(
     return x_dequant.view(original_shape)
 
 
+def quantize_block_fp8_experts(w: torch.Tensor):
+    """128x128 block FP8 quantization of per-expert weights [num_experts, out_dim, in_dim].
+
+    Returns the FP8 weights, their block scales, and the dequantized weights.
+    """
+    num_experts, out_dim, in_dim = w.shape
+    w_quant = torch.empty_like(w).to(torch.float8_e4m3fn)
+    w_scales = torch.zeros(
+        num_experts,
+        ceil_div(out_dim, 128),
+        ceil_div(in_dim, 128),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    for expert_id in range(num_experts):
+        q, s = per_block_cast_to_fp8(w[expert_id, :])
+        w_quant.data[expert_id].copy_(q)
+        w_scales.data[expert_id].copy_(s)
+    w_dequant = dequantize_block(w_quant, w_scales, w.dtype, w.shape)
+    return w_quant, w_scales, w_dequant
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
@@ -1428,37 +1450,10 @@ def test_moe_fp8_block_scaling(
 
     # Quantize input and weights
     x_quant, x_scales = per_token_group_quant_fp8(x, group_size=128)
-
-    w31_dequant = torch.empty_like(w31_weight)
-    w2_dequant = torch.empty_like(w2_weight)
-    w31_quant = torch.empty_like(w31_weight).to(torch.float8_e4m3fn)
-    w2_quant = torch.empty_like(w2_weight).to(torch.float8_e4m3fn)
-    w31_scales = torch.zeros(
-        num_experts,
-        ceil_div(2 * intermediate_size, 128),
-        ceil_div(hidden_size, 128),
-        dtype=torch.float32,
-    ).cuda()
-    w2_scales = torch.zeros(
-        num_experts,
-        ceil_div(hidden_size, 128),
-        ceil_div(intermediate_size, 128),
-        dtype=torch.float32,
-    ).cuda()
-
-    for expert_id in range(num_experts):
-        w31, w31_s = per_block_cast_to_fp8(w31_weight[expert_id, :])
-        w2, w2_s = per_block_cast_to_fp8(w2_weight[expert_id, :])
-        w31_quant.data[expert_id].copy_(w31)
-        w31_scales.data[expert_id].copy_(w31_s)
-        w2_quant.data[expert_id].copy_(w2)
-        w2_scales.data[expert_id].copy_(w2_s)
+    w31_quant, w31_scales, w31_dequant = quantize_block_fp8_experts(w31_weight)
+    w2_quant, w2_scales, w2_dequant = quantize_block_fp8_experts(w2_weight)
     # Dequantize for verification
     x_dequant = dequantize_block(x_quant, x_scales, x.dtype, x.shape)
-    w31_dequant = dequantize_block(
-        w31_quant, w31_scales, w31_weight.dtype, w31_weight.shape
-    )
-    w2_dequant = dequantize_block(w2_quant, w2_scales, w2_weight.dtype, w2_weight.shape)
 
     # Run reference implementation with dequantized tensors
     ref_output = compute_with_experts(
@@ -1492,6 +1487,75 @@ def test_moe_fp8_block_scaling(
         )
 
         torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("num_experts, top_k", [(8, 2), (64, 8), (256, 8)])
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda"))[0] != 9,
+    reason="FP8 block scaling is only supported on SM90",
+)
+def test_moe_fp8_block_scaling_after_larger_batch(num_experts, top_k):
+    """
+    The FP8 block-scale GEMM runner is cached across calls and plans its activation
+    quantization launch from the largest row count it has seen, so small (decode-sized)
+    batches that follow a large one run with a launch planned for the large batch.
+    """
+    torch.manual_seed(42)
+    otype = torch.bfloat16
+    hidden_size, intermediate_size = 512, 256
+
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda()
+        / 10
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=otype).cuda()
+        / 10
+    )
+    w31_quant, w31_scales, w31_dequant = quantize_block_fp8_experts(w31_weight)
+    w2_quant, w2_scales, w2_dequant = quantize_block_fp8_experts(w2_weight)
+
+    for batch_size in (2048, 1, 5, 64):
+        x = torch.randn(batch_size, hidden_size, dtype=otype).cuda()
+        selected_experts = torch.stack(
+            [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
+        ).cuda()
+        routing_weights = F.softmax(torch.randn((batch_size, top_k)).cuda(), dim=1)
+
+        x_quant, x_scales = per_token_group_quant_fp8(x, group_size=128)
+        # dequantize_block only handles activations with hidden_size == 128
+        x_dequant = (
+            x_quant.to(otype).view(batch_size, -1, 128)
+            * x_scales.to(otype).unsqueeze(-1)
+        ).view_as(x)
+        ref_output = compute_with_experts(
+            num_experts,
+            x_dequant,
+            w31_dequant,
+            w2_dequant,
+            selected_experts,
+            routing_weights,
+        )
+
+        flash_output = torch.zeros_like(x)
+        fused_moe.cutlass_fused_moe(
+            x.contiguous(),
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_quant.contiguous(),
+            w2_quant.contiguous(),
+            otype,
+            use_deepseek_fp8_block_scale=True,
+            quant_scales=[w31_scales.contiguous(), w2_scales.contiguous()],
+            output=flash_output,
+        )
+        # The kernel also quantizes the FC2 input to FP8, which the bf16 reference does not;
+        # at these sizes that alone gives ~4-5% relative error, too much for a per-element
+        # tolerance. A misplaced activation scale breaks whole rows and fails this check.
+        rel_err = (
+            flash_output.float() - ref_output.float()
+        ).norm() / ref_output.float().norm()
+        assert rel_err < 0.08, f"batch_size={batch_size}: relative error {rel_err:.4f}"
 
 
 def quant_mxfp4_batches(a, num_experts):
