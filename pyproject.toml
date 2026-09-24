@@ -28,8 +28,10 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
 cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
+# Native Rubin MegaMoE uses APIs absent from the general CUDA-extra floor.
+sm107 = ["nvidia-cutlass-dsl[cu13]>=4.8.0.dev0", "nvshmem4py-cu13>=0.3.1", "torch>=2.8"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
-# working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
+# working. The moe_ep runtime deps (cuda-python, nccl-extensions) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
 # default (best-effort) on `pip install .` — see the moe_ep section at the top
 # of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
@@ -42,7 +44,7 @@ nvep = []
 flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"]
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.11,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 
@@ -70,13 +72,24 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
+"flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
+"flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+# Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
+# importlib.resources.
+"flashinfer.msa_ops" = ["*.json"]
 # Workload registry of the experimental fused GDN decode backends, loaded at
 # runtime via importlib.resources.
 "flashinfer.gdn_kernels.experimental" = ["*.json"]
 # Their in-package JIT kernel source, compiled on demand by
 # flashinfer/jit/gdn_fused_decode.py.
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
+# Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
+"flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated sources for the experimental exact-SM110 GQA decode backend.
+"flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
@@ -85,6 +98,13 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "src/a2a/*.cuh",
   "src/fp8_gemm/*.cu",
   "src/fp8_gemm/*.cuh",
+]
+# Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates
+# the manifest checksum before compiling the source on demand.
+"flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = [
+  "*.md",
+  "src/*.cu",
+  "src/*.json",
 ]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
@@ -117,7 +137,9 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
-  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
+  "flashinfer/prims_ts/",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
@@ -132,6 +154,12 @@ exclude = [
   # and they differ in length).
   "flashinfer/topk_varlen/kernels/filtered_topk_util.py",
   "flashinfer/topk_varlen/kernels/filtered_topk_decode.py",
+  # Self-sampling GVR V2: verbatim TRT-LLM drops (see the ruff exclude note).
+  "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
+  # Same class: a CuTe DSL kernel body, kept byte-faithful to the artifact its
+  # kernel-level numbers were measured on.
+  "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
   "build/",
 ]
 
@@ -151,9 +179,12 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
-  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
   "flashinfer/topk_varlen/kernels/block_scan.py",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src",

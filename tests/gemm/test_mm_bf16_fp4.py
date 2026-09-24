@@ -46,7 +46,7 @@ def _dequantize_bf16_fp4_torch(b, b_descale, alpha, n, k, block_size):
 
 # Backends covered by the cross-backend contract tests.  New backends get
 # appended here as they land.
-ALL_BACKENDS = ["cudnn", "cute-dsl"]
+ALL_BACKENDS = ["cudnn", "cute-dsl", "cute-dsl-native"]
 
 
 def _skip_if_backend_unavailable(backend: str) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import FrozenSet
+from typing import Any, FrozenSet
 
 from ...config import BootstrapConfig
 
@@ -21,6 +21,7 @@ class MoEEpRuntimeHandle:
     """Opaque token returned by :func:`bootstrap_moe_ep_runtime`."""
 
     requirements: FrozenSet[str]
+    closed: bool = False
 
 
 @dataclass
@@ -29,6 +30,7 @@ class _RuntimeState:
     owned_torch_dist: bool = False
     owned_nvshmem: bool = False
     active_requirements: FrozenSet[str] = frozenset()
+    nvshmem_identity: Any = None
 
 
 _STATE = _RuntimeState()
@@ -177,15 +179,16 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
 
     uid = nvshmem.core.get_unique_id(empty=(rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
+    source_rank = dist.get_global_rank(pg, 0)
     if _single_gpu_gloo():
         # gloo has no CUDA broadcast; the UID travels on the host.
         uid_tensor = torch.from_numpy(uid_bytes)
-        dist.broadcast(uid_tensor, src=0, group=pg)
+        dist.broadcast(uid_tensor, src=source_rank, group=pg)
         dist.barrier(group=pg)
         uid._data[:] = uid_tensor.numpy().view(uid._data.dtype)
     else:
         uid_tensor = torch.from_numpy(uid_bytes).cuda()
-        dist.broadcast(uid_tensor, src=0, group=pg)
+        dist.broadcast(uid_tensor, src=source_rank, group=pg)
         dist.barrier(group=pg)
         uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
 
@@ -206,15 +209,31 @@ def _ensure_nvshmem(bootstrap: BootstrapConfig) -> tuple[bool, bool]:
     """
     if _mega_no_dist():
         return False, False
-    if _nvshmem_initialized():
-        _ensure_torch_dist(bootstrap)
-        return False, False
-
     owned_torch_dist = _ensure_torch_dist(bootstrap)
+    from ..bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
+
+    pg = bootstrap_comm_group(bootstrap)
+    rank, world_size = bootstrap_ep_rank_world(bootstrap)
+    identity = (pg, rank, world_size, _resolve_local_device(bootstrap))
+    if _nvshmem_initialized():
+        import nvshmem.core
+
+        if (int(nvshmem.core.my_pe()), int(nvshmem.core.n_pes())) != (rank, world_size):
+            raise RuntimeError(
+                "existing NVSHMEM PE rank/count does not match the requested EP group"
+            )
+        if _STATE.nvshmem_identity is not None and _STATE.nvshmem_identity != identity:
+            raise RuntimeError(
+                "existing NVSHMEM runtime belongs to another EP group or CUDA device"
+            )
+        _STATE.nvshmem_identity = identity
+        return False, owned_torch_dist
+
     owned_nvshmem = _init_nvshmem_after_dist(bootstrap)
     from ...core.validation.common import validate_bootstrap_world_size
 
     validate_bootstrap_world_size(bootstrap)
+    _STATE.nvshmem_identity = identity
     return owned_nvshmem, owned_torch_dist
 
 
@@ -226,28 +245,33 @@ def bootstrap_moe_ep_runtime(
     if not requirements:
         return MoEEpRuntimeHandle(requirements=frozenset())
 
-    _STATE.ref_count += 1
-    _STATE.active_requirements |= requirements
-
     if NVSHMEM in requirements:
         owned_nvshmem, owned_torch_dist = _ensure_nvshmem(bootstrap)
         _STATE.owned_nvshmem = _STATE.owned_nvshmem or owned_nvshmem
         _STATE.owned_torch_dist = _STATE.owned_torch_dist or owned_torch_dist
     elif TORCH_DIST in requirements:
-        _STATE.owned_torch_dist = _STATE.owned_torch_dist or _ensure_torch_dist(
-            bootstrap
-        )
+        owned_torch_dist = _ensure_torch_dist(bootstrap)
+        _STATE.owned_torch_dist = _STATE.owned_torch_dist or owned_torch_dist
 
+    _STATE.ref_count += 1
+    _STATE.active_requirements |= requirements
     return MoEEpRuntimeHandle(requirements=frozenset(requirements))
 
 
 def finalize_moe_ep_runtime(handle: MoEEpRuntimeHandle | None) -> None:
     """Release runtime resources acquired via :func:`bootstrap_moe_ep_runtime`."""
-    if handle is None or not handle.requirements:
+    if handle is None or handle.closed or not handle.requirements:
         return
     if _STATE.ref_count <= 0:
         return
 
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "moe_ep runtime finalization cannot run during CUDA graph capture"
+        )
+    handle.closed = True
     _STATE.ref_count -= 1
     if _STATE.ref_count > 0:
         return
@@ -260,6 +284,7 @@ def finalize_moe_ep_runtime(handle: MoEEpRuntimeHandle | None) -> None:
         except Exception as exc:  # noqa: BLE001
             _logger.warning("moe_ep NVSHMEM finalize failed: %s", exc, exc_info=True)
         _STATE.owned_nvshmem = False
+        _STATE.nvshmem_identity = None
 
     if _STATE.owned_torch_dist and not _launched_via_torchrun():
         try:
@@ -303,6 +328,13 @@ def mxfp8_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
     return cutedsl_runtime_requirements(bootstrap)
 
 
+def bf16_mxfp8_cutedsl_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL mixed MXFP8/BF16 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
 def bf16_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
     """Runtime needs for the CuTeDSL BF16 mega kernel."""
     return cutedsl_runtime_requirements(bootstrap)
@@ -313,6 +345,18 @@ def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
 
     Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
     """
+    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+
+def sm107_block_scaled_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the SM107 (Rubin) block-scaled inference mega kernel.
+
+    Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
+    """
+    if _mega_no_dist() and bootstrap.world_size != 1:
+        raise ValueError("MEGA_NO_DIST=1 supports only world_size=1 for SM107")
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
@@ -334,6 +378,7 @@ __all__ = [
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
     "bf16_cutedsl_runtime_requirements",
+    "bf16_mxfp8_cutedsl_runtime_requirements",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",

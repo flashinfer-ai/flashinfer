@@ -22,11 +22,12 @@ from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
-
 _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
 _SUPPORTED_OUTPUTS_PER_BLOCK = (1, 2, 4)
 _MAX_M = 32
+# Base budget for unrolled B prefetch: 128 16-byte vectors/thread, not registers.
+_B_PREFETCH_VECTOR_BUDGET = 128
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
 
 
@@ -87,12 +88,7 @@ def default_tactic(m: int, n: int, k: int) -> DirectTactic:
 
 
 def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
-    """Enumerate the compact tactic space used by FlashInfer autotuning.
-
-    Block sizes cover every configuration exercised in the H100/B200 sweep;
-    output grouping spans the measured 1/2/4-column choices.  Row tiling stays
-    at the occupancy-oriented default to keep JIT cost bounded.
-    """
+    """Bound whole-K prefetch expansion while retaining the default tactic."""
     try:
         default = default_tactic(m, n, k)
     except ValueError:
@@ -108,6 +104,11 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
             try:
                 validate_tactic(tactic, m, n, k)
             except ValueError:
+                continue
+            if k // (block_size * _VECTOR_WIDTH) * outputs_per_block > max(
+                _B_PREFETCH_VECTOR_BUDGET,
+                k // (default.block_size * _VECTOR_WIDTH) * default.outputs_per_block,
+            ):
                 continue
             tactics.append(tactic)
     return list(dict.fromkeys(tactics))
@@ -133,16 +134,15 @@ class DirectDenseGemmKernel:
         self,
         *,
         element_type,
-        num_rows: int,
         k_extent: int,
         tactic: DirectTactic,
         use_pdl: bool,
     ) -> None:
-        validate_tactic(tactic, num_rows, tactic.outputs_per_block, k_extent)
+        validate_tactic(
+            tactic, tactic.rows_per_block, tactic.outputs_per_block, k_extent
+        )
         self.element_type = element_type
-        self.num_rows = num_rows
         self.rows_per_block = tactic.rows_per_block
-        self.k_extent = k_extent
         self.block_size = tactic.block_size
         self.outputs_per_block = tactic.outputs_per_block
         self.vector_width = _VECTOR_WIDTH
@@ -158,7 +158,6 @@ class DirectDenseGemmKernel:
         gC: cute.Tensor,
         stream: _cuda.CUstream,
     ) -> None:
-        n = cute.size(gB, mode=[0])
         copy_a = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
             self.element_type,
@@ -173,8 +172,8 @@ class DirectDenseGemmKernel:
         )
         self.kernel(gA, gB, gC, copy_a, copy_b).launch(
             grid=[
-                cute.ceil_div(n, self.outputs_per_block),
-                self.num_rows // self.rows_per_block,
+                cute.ceil_div(cute.size(gB, mode=[0]), self.outputs_per_block),
+                cute.size(gA, mode=[0]) // self.rows_per_block,
                 1,
             ],
             block=[self.block_size, 1, 1],
@@ -282,27 +281,33 @@ class DirectDenseGemmKernel:
             cute.arch.griddepcontrol_launch_dependents()
 
 
-def _from_dlpack_static(tensor: _torch.Tensor):
-    # K is specialized and the row stride must retain its 16-byte divisibility
-    # for the verifier to accept vectorized G2R copies.
-    return from_dlpack(tensor, assumed_align=32)
+def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
+    tensor = from_dlpack(tensor.detach(), assumed_align=32)
+    if dynamic_m:
+        # Keep K and the row stride static for vectorized G2R copies.
+        tensor = tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
+    return tensor
 
 
-def _make_compile_repr_tensors(dtype, m: int, n: int, k: int):
+def _make_compile_repr_tensors(dtype, rows_per_block: int, n: int, k: int):
     return tuple(
-        _from_dlpack_static(tensor)
-        for tensor in (
-            _torch.empty((m, k), dtype=dtype, device="cuda"),
-            _torch.empty((n, k), dtype=dtype, device="cuda"),
-            _torch.empty((m, n), dtype=dtype, device="cuda"),
+        _from_dlpack(
+            _torch.empty(shape, dtype=dtype, device="cuda"), dynamic_m=dynamic_m
+        )
+        for shape, dynamic_m in (
+            ((rows_per_block, k), True),
+            ((n, k), False),
+            ((rows_per_block, n), True),
         )
     )
 
 
 @functools.cache
 def _get_compiled_direct_kernel(
+    device_index: int,
     dtype,
-    m: int,
     n: int,
     k: int,
     tactic: DirectTactic,
@@ -310,16 +315,19 @@ def _get_compiled_direct_kernel(
 ):
     if dtype != _torch.bfloat16:
         raise ValueError(f"direct GEMM supports BF16; got {dtype}")
-    kernel = DirectDenseGemmKernel(
-        element_type=cutlass.BFloat16,
-        num_rows=m,
-        k_extent=k,
-        tactic=tactic,
-        use_pdl=use_pdl,
-    )
-    tensors = _make_compile_repr_tensors(dtype, m, n, k)
-    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(kernel, *tensors, stream, options=_COMPILE_OPTIONS)
+
+    with _torch.cuda.device(device_index):
+        return cute_ext.compile(
+            DirectDenseGemmKernel(
+                element_type=cutlass.BFloat16,
+                k_extent=k,
+                tactic=tactic,
+                use_pdl=use_pdl,
+            ),
+            *_make_compile_repr_tensors(dtype, tactic.rows_per_block, n, k),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+            options=_COMPILE_OPTIONS,
+        )
 
 
 def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
@@ -350,11 +358,17 @@ def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
 
 def run_direct_dense(a, b, out, pdl: bool, tactic: DirectTactic):
     """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
-    m, n, k = _validate_runtime_tensors(a, b, out, tactic)
-    compiled = _get_compiled_direct_kernel(a.dtype, m, n, k, tactic, pdl)
-    tensors = tuple(_from_dlpack_static(tensor) for tensor in (a, b.T, out))
-    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-    compiled(*tensors, stream)
+    _, n, k = _validate_runtime_tensors(a, b, out, tactic)
+    with _torch.cuda.device(a.device):
+        compiled = _get_compiled_direct_kernel(
+            a.get_device(), a.dtype, n, k, tactic, pdl
+        )
+        compiled(
+            _from_dlpack(a, dynamic_m=True),
+            _from_dlpack(b.T),
+            _from_dlpack(out, dynamic_m=True),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
     return out
 
 

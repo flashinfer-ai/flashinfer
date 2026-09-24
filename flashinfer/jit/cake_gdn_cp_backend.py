@@ -1,0 +1,202 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""JIT loader for the source-only GDN CP-prefill backend."""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any, Literal
+
+from filelock import FileLock
+from tvm_ffi import cpp
+
+from . import env as jit_env
+from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
+
+from .cake_gdn_cp_generated import (
+    load_generated_gdn_cp_kernel,
+    prepare_generated_gdn_cp_kernel,
+)
+
+
+GDNCPArch = Literal["sm_100a", "sm_103a"]
+
+_EXPORT_SCHEMA = "flashinfer.gdn_cp.runtime_manifest.v1"
+_MANIFEST_SHA256 = "ff97f4e62fbd50c157486c79e92f92fb0ff7fc2b248586e2140ee732db1e1851"
+
+
+def _source_dir() -> Path:
+    installed = jit_env.FLASHINFER_CSRC_DIR / "gdn" / "gdn_cp"
+    if installed.exists():
+        return installed
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "gdn" / "gdn_cp"
+    if checkout.exists():
+        return checkout
+    raise FileNotFoundError(
+        "frozen GDN CP-prefill sources were not found; checked "
+        f"{installed} and {checkout}"
+    )
+
+
+@functools.cache
+def _manifest() -> dict[str, Any]:
+    path = _source_dir() / "manifest.json"
+    observed_digest = _sha256(path)
+    if observed_digest != _MANIFEST_SHA256:
+        raise RuntimeError(
+            f"GDN CP-prefill manifest drift at {path}: "
+            f"expected {_MANIFEST_SHA256}, got {observed_digest}"
+        )
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema") != _EXPORT_SCHEMA:
+        raise RuntimeError(
+            "unsupported GDN CP-prefill runtime manifest schema: "
+            f"{manifest.get('schema')!r}"
+        )
+    return manifest
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _kernel_record(name: str) -> dict[str, Any]:
+    records = [record for record in _manifest()["kernels"] if record["name"] == name]
+    if len(records) != 1:
+        raise ValueError(f"unknown GDN CP-prefill kernel: {name!r}")
+    return records[0]
+
+
+def _cuda_record(record: dict[str, Any], arch: GDNCPArch) -> dict[str, Any]:
+    outputs = [
+        output for output in record["outputs"] if arch in output["architectures"]
+    ]
+    if len(outputs) != 1:
+        raise ValueError(f"kernel {record['name']!r} does not support {arch}")
+    return outputs[0]
+
+
+def _compile_cubin(source: Path, *, arch: GDNCPArch, digest: str) -> bytes:
+    cache_dir = jit_env.FLASHINFER_JIT_DIR / "gdn_cp_backend" / arch
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cubin = cache_dir / f"{source.stem}-{digest[:16]}.cubin"
+    lock = FileLock(f"{cubin}.lock", thread_local=False)
+    with lock:
+        if not cubin.exists():
+            nvcc = Path(get_cuda_path()) / "bin" / "nvcc"
+            if not nvcc.is_file():
+                raise RuntimeError(f"nvcc was not found at {nvcc}")
+            with tempfile.NamedTemporaryFile(
+                dir=cache_dir,
+                prefix=f".{cubin.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+            try:
+                command = [
+                    str(nvcc),
+                    "--cubin",
+                    "--std=c++17",
+                    "-O3",
+                    f"--gpu-architecture={arch}",
+                    *get_nvcc_parallelism_flags(),
+                    str(source),
+                    "-o",
+                    str(temporary),
+                ]
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"failed to compile {source.name} for {arch}:\n{result.stdout}"
+                    )
+                os.replace(temporary, cubin)
+            finally:
+                temporary.unlink(missing_ok=True)
+    return cubin.read_bytes()
+
+
+@functools.cache
+def load_gdn_cp_kernel(name: str, arch: GDNCPArch):
+    """Compile and load one checksum-verified GDN CP kernel binding."""
+
+    if arch not in ("sm_100a", "sm_103a"):
+        raise ValueError(f"unsupported GDN CP-prefill architecture: {arch!r}")
+    generated = load_generated_gdn_cp_kernel(name, arch)
+    if generated is not None:
+        return generated
+    record = _kernel_record(name)
+    cuda = _cuda_record(record, arch)
+    host = record["host_binding"]
+    root = _source_dir()
+    cuda_path = root / cuda["path"]
+    host_path = root / host["path"]
+    headers = _manifest().get("cuda_headers", [])
+    sources = [
+        (cuda_path, cuda["sha256"]),
+        (host_path, host["sha256"]),
+        *((root / header["path"], header["sha256"]) for header in headers),
+    ]
+    for path, expected in sources:
+        observed = _sha256(path)
+        if observed != expected:
+            raise RuntimeError(
+                f"GDN CP-prefill source drift at {path}: "
+                f"expected {expected}, got {observed}"
+            )
+    compile_digest = hashlib.sha256(
+        "\0".join([cuda["sha256"], *(header["sha256"] for header in headers)]).encode()
+    ).hexdigest()
+    cubin = _compile_cubin(cuda_path, arch=arch, digest=compile_digest)
+    module = cpp.load_inline(
+        f"flashinfer_gdn_cp_{name}_{arch}_{compile_digest[:12]}",
+        cpp_sources=host_path.read_text(encoding="utf-8"),
+        embed_cubin={host["module_ident"]: cubin},
+        extra_include_paths=[
+            str(Path(get_cuda_path()) / "include"),
+            str(root.parents[1]),
+            str(root.parents[2] / "include"),
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+    return module[host["entry"]]
+
+
+def prepare_gdn_cp_kernel(name: str, arch: GDNCPArch, *, device):
+    """Prepare per-owner launch storage while sharing only compiled code."""
+
+    generated = prepare_generated_gdn_cp_kernel(name, arch, device=device)
+    if generated is not None:
+        return generated
+    return load_gdn_cp_kernel(name, arch), ()
+
+
+__all__ = ["GDNCPArch", "load_gdn_cp_kernel", "prepare_gdn_cp_kernel"]

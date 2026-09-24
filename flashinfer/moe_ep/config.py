@@ -235,6 +235,13 @@ class CombineInputParams:
 
     x: Sequence["torch.Tensor"]
     out: Optional["torch.Tensor"] = None
+    # Whether ``out`` keeps its address across calls. Only the caller knows: a
+    # graph state reuses one buffer, while the default forward allocates a
+    # fresh one per call. Backends that cache per-address FFI state must not
+    # cache a churning buffer -- doing so pins it, prevents the allocator
+    # reusing that address, and leaks one output per call. Defaults to False so
+    # a caller that says nothing is never cached.
+    out_is_stable: bool = False
 
 
 @dataclass(frozen=True)

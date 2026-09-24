@@ -4,7 +4,7 @@
 
 Public API for the ``moe_ep`` backends over the SM90 FP8 mega kernel
 (``Sm90MegaMoEFp8Kernel`` / ``Sm90MegaMoESwapABFp8Kernel``).  This tree is a
-FORK of the SM100 package (``kernel_src/cutedsl_megamoe``): the kernel
+FORK of the SM100 package (``kernel_src/sm100/cutedsl_megamoe``): the kernel
 team's SM90 work branched from the same repo, so ``src/`` duplicates the
 shared runtime (``common``, ``src``, ``moe_nvfp4_swapab``) at the SM90 drop's
 revision.  The two trees are separate backends and are mutually exclusive per
@@ -35,6 +35,17 @@ from __future__ import annotations
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
     MegaMoEHopperFp8Config,
+    autotune_hopper_fp8_mega_moe,
+    autotune_knobs,
+    default_knobs,
+    hopper_fp8_candidates,
+    is_valid,
+    iter_candidates,
+    knob_cache_path,
+    lookup_knobs,
+    record_knobs,
+    resolve_knobs,
+    with_knobs,
     MegaMoEHopperFp8Frontend,
     MegaMoEHopperFp8Inputs,
     MegaMoEHopperFp8SymmBuffer,
@@ -90,6 +101,17 @@ def __getattr__(name):  # PEP 562
 __all__ = [
     *_LAZY_HELPERS,
     "MegaMoEHopperFp8Config",
+    "autotune_hopper_fp8_mega_moe",
+    "autotune_knobs",
+    "default_knobs",
+    "hopper_fp8_candidates",
+    "is_valid",
+    "iter_candidates",
+    "knob_cache_path",
+    "lookup_knobs",
+    "record_knobs",
+    "resolve_knobs",
+    "with_knobs",
     "MegaMoEHopperFp8Frontend",
     "MegaMoEHopperFp8Inputs",
     "MegaMoEHopperFp8SymmBuffer",

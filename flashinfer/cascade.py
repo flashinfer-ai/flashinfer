@@ -516,6 +516,21 @@ class MultiLevelCascadeAttentionWrapper:
                 kv_data_type=kv_data_type,
             )
 
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Prewarm every level's lazy paged-KV-stride variant after :meth:`plan`.
+
+        Call this method before CUDA graph capture.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        for wrapper in self._batch_prefill_wrappers:
+            wrapper.prewarm_paged_kv_stride_variant(variant)
+
     begin_forward = plan
 
     @flashinfer_api(trace=multi_level_cascade_run_trace)
@@ -810,11 +825,6 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
 
-    @flashinfer_api
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect"""
-        pass
-
 
 class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with shared-prefix paged kv-cache for
@@ -895,7 +905,6 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     ...     outputs.append(o)
     ...
     s[0].shape>>> # clear auxiliary data structures
-    >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([100, 64, 128])
 
@@ -1003,6 +1012,20 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         )
 
     @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Prewarm the underlying prefill wrapper's paged-KV-stride variant.
+
+        Call this method after :meth:`begin_forward` and before CUDA graph capture.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        self._batch_prefill_wrapper.prewarm_paged_kv_stride_variant(variant)
+
+    @flashinfer_api
     def forward(
         self,
         q: torch.Tensor,
@@ -1093,8 +1116,3 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         )
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
-
-    @flashinfer_api
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect"""
-        pass

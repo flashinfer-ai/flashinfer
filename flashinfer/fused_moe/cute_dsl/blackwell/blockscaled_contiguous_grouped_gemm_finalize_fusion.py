@@ -1729,9 +1729,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if cutlass.const_expr(self.swap_ab)
                         else mma_tile_coord_m
                     )
-                    expert_idx = tile_idx_to_expert_idx[tile_idx]
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         if cutlass.const_expr(not self.swap_ab):
                             num_n_tiles = tile_sched_params.problem_shape_ntile_mnl[1]
@@ -1775,9 +1775,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if cutlass.const_expr(self.swap_ab)
                         else mma_tile_coord_m
                     )
-                    expert_idx = tile_idx_to_expert_idx[tile_idx]
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         if cutlass.const_expr(not self.swap_ab):
                             num_n_tiles = tile_sched_params.problem_shape_ntile_mnl[1]

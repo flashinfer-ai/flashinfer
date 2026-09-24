@@ -48,7 +48,7 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from ...utils import get_compute_capability
-from ..api import QuantVariant
+from ..api import QuantFormat
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
@@ -630,8 +630,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         w2_pdl_count: Any = AUTO_PDL_COUNT,
         w1_split_k: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
-        activation_format: Optional[QuantVariant] = None,
-        weight_format: Optional[QuantVariant] = None,
+        activation_format: Optional[QuantFormat] = None,
+        weight_format: Optional[QuantFormat] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
@@ -670,14 +670,14 @@ class CuteDslFusedMoERunner(TunableRunner):
             )
         if activation_format is not None:
             if (activation_format, weight_format) not in (
-                (QuantVariant.NVFP4, QuantVariant.NVFP4),
-                (QuantVariant.MXFP8, QuantVariant.MXFP4),
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP8, QuantFormat.MXFP4),
             ):
                 raise ValueError(
                     "unsupported CuTe-DSL runner format pair "
                     f"({activation_format!r}, {weight_format!r})"
                 )
-            if activation_format is QuantVariant.MXFP8 and use_per_token_activation:
+            if activation_format is QuantFormat.MXFP8 and use_per_token_activation:
                 raise ValueError(
                     "per-token activation scaling is not supported for W4A8"
                 )
@@ -845,6 +845,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.num_experts,
+            self.local_expert_offset,
             self.use_fused_finalize,
             str(self.output_dtype),
             self.use_per_token_activation,
@@ -966,6 +968,10 @@ class CuteDslFusedMoERunner(TunableRunner):
                 gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn, _ = (
                     gemm2_tactic
                 )
+
+                if gemm1_cluster_shape_mn[0] > 1 or gemm2_cluster_shape_mn[0] > 1:
+                    return False
+
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
                     a_dtype=a_dtype,
                     b_dtype=b_dtype,

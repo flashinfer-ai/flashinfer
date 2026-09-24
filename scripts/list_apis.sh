@@ -3,8 +3,12 @@
 # grouped by class (or "[Global Functions]" per file), with full multi-line
 # signatures preserved.
 #
+# The experimental track is excluded by default (see -x): experimental APIs and
+# backends carry no compatibility guarantees, so they must not appear in the
+# release API diff alongside the versioned public surface.
+#
 # Usage:
-#   scripts/list_apis.sh [-n] [-p] [-M] [-d] [--ref REF] [path...]
+#   scripts/list_apis.sh [-n] [-p] [-M] [-d] [-x] [--ref REF] [path...]
 #
 # Options:
 #   -n, --no-lines       Omit line numbers
@@ -12,6 +16,12 @@
 #   -M, --methods-only   Skip module-level functions; only show class methods
 #   -d, --deterministic  Sort files for stable, diff-friendly output
 #                        (disables rg's parallel walk; slightly slower)
+#   -x, --include-experimental
+#                        Also list the experimental track: files under
+#                        flashinfer/experimental/ and functions decorated with
+#                        @flashinfer_experimental_api. Off by default; note that
+#                        an explicit path under flashinfer/experimental/ still
+#                        yields nothing without this flag.
 #   -r, --ref REF        Run against a git revision (tag/branch/sha) via temp worktree
 #   -h, --help           Show this help
 #
@@ -34,6 +44,7 @@ show_lines=1
 show_paths=1
 include_global=1
 deterministic=0
+include_experimental=0
 ref=""
 paths=()
 
@@ -43,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     -p|--no-paths) show_paths=0; show_lines=0; shift ;;
     -M|--methods-only) include_global=0; shift ;;
     -d|--deterministic) deterministic=1; shift ;;
+    -x|--include-experimental) include_experimental=1; shift ;;
     # Guard against `--ref` as the last arg — bare `shift 2` would trip `set -e`
     # with an opaque "shift count out of range" instead of a useful message.
     -r|--ref)
@@ -84,11 +96,32 @@ fi
 rg_sort=()
 [[ "$deterministic" -eq 1 ]] && rg_sort=(--sort path)
 
-rg -HUn -U "${rg_sort[@]}" \
-   "^class \w+[^\n]*:|^\s*@flashinfer_api(?:\([^)]*\))?|^\s*def \w+\([\s\S]*?\) *(?:-> *[^:]+)?:" \
+# Experimental track exclusion. Two independent dimensions, both off by default:
+#   - path: everything under flashinfer/experimental/ is an experimental backend
+#     by construction (flashinfer/experimental/README.md).
+#   - decorator: experimental APIs live in core but are marked
+#     @flashinfer_experimental_api. The alternation below is literal on purpose —
+#     without -x the pattern only ever matches @flashinfer_api, and
+#     @flashinfer_experimental_api does not contain it as a prefix.
+# The leading **/ keeps the glob correct for --ref, where paths are prefixed
+# with the temporary worktree directory.
+rg_globs=()
+deco_alt='flashinfer_api'
+if [[ "$include_experimental" -eq 1 ]]; then
+  deco_alt='flashinfer_api|flashinfer_experimental_api'
+else
+  rg_globs=(--glob '!**/flashinfer/experimental/**')
+fi
+
+# ${arr[@]+"${arr[@]}"} rather than "${arr[@]}": bash 3.2 (macOS' /bin/bash)
+# treats an empty array as unset under `set -u` and aborts.
+rg -HUn -U ${rg_sort[@]+"${rg_sort[@]}"} ${rg_globs[@]+"${rg_globs[@]}"} \
+   "^class \w+[^\n]*:|^\s*@(?:${deco_alt})(?:\([^)]*\))?|^\s*def \w+\([\s\S]*?\) *(?:-> *[^:]+)?:" \
    "${paths[@]}" \
 | awk -v show_lines="$show_lines" -v show_paths="$show_paths" \
-      -v include_global="$include_global" -v strip="${wt:-}/" '
+      -v include_global="$include_global" -v strip="${wt:-}/" \
+      -v deco_alt="$deco_alt" '
+    BEGIN { deco_method = "^[ \t]+@(" deco_alt ")"; deco_global = "^@(" deco_alt ")" }
     function emit(line,    out) {
       out = line
       if (strip != "/" && index(out, strip) == 1) out = substr(out, length(strip) + 1)
@@ -119,9 +152,9 @@ rg -HUn -U "${rg_sort[@]}" \
 
       if (path != lastpath) { flush(); cls=""; deco=""; printed=0; global_printed=0; lastpath=path }
       if (content ~ /^class /)                { flush(); cls=$0; printed=0; deco=""; next }
-      if (content ~ /^[ \t]+@flashinfer_api/) { flush(); deco=$0; next }
+      if (content ~ deco_method) { flush(); deco=$0; next }
       # Top-level (column 0) decorator — only meaningful with --global
-      if (content ~ /^@flashinfer_api/ && include_global) { flush(); deco=$0; cls=""; next }
+      if (content ~ deco_global && include_global) { flush(); deco=$0; cls=""; next }
 
       if (content ~ /^[ \t]+def /) {
         flush()

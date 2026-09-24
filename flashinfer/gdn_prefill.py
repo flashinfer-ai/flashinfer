@@ -16,13 +16,24 @@ limitations under the License.
 
 import math
 import warnings
+import weakref
 from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
+from .cute_dsl.availability import is_cute_dsl_arch_supported
 from .trace.templates.gdn import gdn_prefill_trace
+
+try:
+    from .jit import cake_gdn as _cake_gdn
+
+    _CAKE_GDN_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _cake_gdn = None
+    _CAKE_GDN_AVAILABLE = False
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
+    _chunk_gated_delta_rule_gdn_cp_sm100,
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
@@ -44,15 +55,469 @@ _STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float8_e5m2,
 )
 
+_GDN_CP_STATE_DTYPES: tuple[torch.dtype, ...] = (
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+)
+
+
+_CAKE_GDN_HOST_INTS: dict[
+    tuple[int, int, Optional[int], int],
+    tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]],
+] = {}
+
+
+def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
+    """Resolve immutable CUDA integer metadata once, outside Graph capture."""
+
+    # Inference tensors intentionally have no version counter.  Their metadata
+    # is immutable by this adapter's contract, so object identity and storage
+    # identity are the available cache key during inference and Graph replay.
+    version = None if values.is_inference() else int(values._version)
+    key = (
+        int(values.device.index or 0),
+        int(values.data_ptr()),
+        version,
+        int(values.numel()),
+    )
+    cached = _CAKE_GDN_HOST_INTS.get(key)
+    if cached is not None and cached[0]() is values:
+        return cached[1]
+    if torch.cuda.is_current_stream_capturing():
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            f"GDN non-CP prefill requires one eager {purpose} resolution before CUDA Graph capture"
+        )
+    resolved = tuple(int(value) for value in values.detach().cpu().tolist())
+    _CAKE_GDN_HOST_INTS[key] = (weakref.ref(values), resolved)
+    return resolved
+
+
+def _cake_gdn_prefill_seq_lens(
+    cu_seqlens: torch.Tensor, total_seq_len: int
+) -> tuple[int, ...]:
+    """Resolve immutable launch metadata once, outside CUDA Graph capture."""
+
+    offsets = _cake_gdn_host_ints(cu_seqlens, purpose="cu_seqlens metadata")
+    if (
+        len(offsets) < 2
+        or offsets[0] != 0
+        or offsets[-1] != total_seq_len
+        or any(end < start for start, end in zip(offsets, offsets[1:], strict=False))
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires monotonic cu_seqlens spanning all input tokens"
+        )
+    seq_lens = tuple(
+        end - start for start, end in zip(offsets, offsets[1:], strict=False)
+    )
+    return seq_lens
+
+
+def _cake_gdn_assert_state_slots(
+    indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
+) -> None:
+    """Validate CUDA-resident state slots without a host synchronization."""
+
+    in_pool = (indices >= 0) & (indices < pool_size)
+    valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
+    torch._assert_async(
+        valid.all(),
+        f"{name} must contain "
+        + ("-1 or " if allow_minus_one else "")
+        + f"slots in [0, {pool_size})",
+    )
+
+
+def _cake_gdn_prefill_dtype_name(dtype: torch.dtype) -> str:
+    names = {
+        torch.float32: "float32",
+        torch.bfloat16: "bfloat16",
+        torch.float16: "float16",
+        torch.float8_e4m3fn: "float8_e4m3fn",
+        torch.float8_e5m2: "float8_e5m2",
+    }
+    try:
+        return names[dtype]
+    except KeyError as exc:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            f"unsupported GDN non-CP prefill dtype {dtype}"
+        ) from exc
+
+
+def _run_cake_gdn_prefill(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    scale: float,
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+    output: torch.Tensor,
+    output_state: Optional[torch.Tensor],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_indices: Optional[torch.Tensor],
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Launch one exact manifest-backed GDN non-CP non-CP prefill row."""
+
+    if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+        raise RuntimeError("the source-only Cake GDN backend is not installed")
+    if use_qk_l2norm_in_kernel:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP non-CP prefill requires caller-normalized Q/K"
+        )
+    tensors = tuple(
+        tensor
+        for tensor in (
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            cu_seqlens,
+            output,
+            output_state,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            state_indices,
+        )
+        if tensor is not None
+    )
+    if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires all tensors on one CUDA device"
+        )
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _cake_gdn.arch_for_compute_capability(major, minor)
+    if q.dtype not in (torch.float16, torch.bfloat16) or any(
+        tensor.dtype != q.dtype for tensor in (k, v, output)
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires matching FP16 or BF16 Q/K/V/output"
+        )
+    if any(not tensor.is_contiguous() for tensor in (q, k, v, output)):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires contiguous Q/K/V/output"
+        )
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or output.ndim != 3:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill tensors must be rank 3"
+        )
+    total_seq_len, num_q_heads, head_size = map(int, q.shape)
+    num_k_heads, num_v_heads = int(k.shape[1]), int(v.shape[1])
+    num_o_heads = max(num_q_heads, num_v_heads)
+    if (
+        total_seq_len <= 0
+        or head_size != 128
+        or tuple(k.shape) != (total_seq_len, num_k_heads, 128)
+        or tuple(v.shape) != (total_seq_len, num_v_heads, 128)
+        or tuple(output.shape) != (total_seq_len, num_o_heads, 128)
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires exact [tokens,heads,128] tensors"
+        )
+    if (
+        cu_seqlens.ndim != 1
+        or cu_seqlens.dtype not in (torch.int32, torch.int64)
+        or not cu_seqlens.is_contiguous()
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires contiguous int32/int64 cu_seqlens"
+        )
+    seq_lens = _cake_gdn_prefill_seq_lens(cu_seqlens, total_seq_len)
+    num_seqs = len(seq_lens)
+    gates_present = g is not None and beta is not None
+
+    gate = g
+    if gate is None:
+        gate = torch.ones(
+            (total_seq_len, num_o_heads), dtype=torch.float32, device=q.device
+        )
+    update_gate = beta
+    if update_gate is None:
+        update_gate = torch.ones_like(gate)
+    for name, tensor in (("g", gate), ("beta", update_gate)):
+        if (
+            tensor.dtype != torch.float32
+            or tuple(tensor.shape) != (total_seq_len, num_o_heads)
+            or not tensor.is_contiguous()
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                f"GDN non-CP prefill requires contiguous FP32 {name} [tokens,heads]"
+            )
+
+    if output_final_state and output_state is None:
+        output_state = torch.empty(
+            (num_seqs, num_o_heads, 128, 128),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    active_states = [
+        tensor
+        for tensor in (
+            initial_state,
+            output_state if output_final_state else None,
+            state_checkpoints if checkpoint_every_n_tokens else None,
+        )
+        if tensor is not None
+    ]
+    state_dtype = active_states[0].dtype if active_states else torch.float32
+    if any(tensor.dtype != state_dtype for tensor in active_states):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires one state dtype across initial/final/checkpoints"
+        )
+    state_dtype_name = _cake_gdn_prefill_dtype_name(state_dtype)
+    for name, tensor in (
+        ("initial_state", initial_state),
+        ("output_state", output_state if output_final_state else None),
+    ):
+        if tensor is None:
+            continue
+        if (
+            tensor.ndim != 4
+            or tuple(tensor.shape[1:]) != (num_o_heads, 128, 128)
+            or tuple(tensor.stride()[1:]) != (16384, 128, 1)
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                f"GDN non-CP prefill requires {name} with contiguous [H,V,K] rows"
+            )
+    if state_indices is not None and (
+        state_indices.ndim != 1
+        or int(state_indices.numel()) != num_seqs
+        or state_indices.dtype not in (torch.int32, torch.int64)
+        or not state_indices.is_contiguous()
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP prefill requires one contiguous integer state index per sequence"
+        )
+    if state_indices is not None:
+        indexed_pools = tuple(
+            tensor
+            for tensor in (
+                initial_state,
+                output_state if output_final_state else None,
+            )
+            if tensor is not None
+        )
+        if indexed_pools:
+            _cake_gdn_assert_state_slots(
+                state_indices,
+                min(int(tensor.shape[0]) for tensor in indexed_pools),
+                name="GDN non-CP prefill state_indices",
+                allow_minus_one=False,
+            )
+    if checkpoint_every_n_tokens:
+        if (
+            state_checkpoints is None
+            or checkpoint_cu_starts is None
+            or not state_checkpoints.is_contiguous()
+            or checkpoint_cu_starts.ndim != 1
+            or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
+            or not checkpoint_cu_starts.is_contiguous()
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "GDN non-CP checkpoint prefill requires contiguous state/cumulative buffers"
+            )
+        checkpoint_counts = tuple(
+            length // checkpoint_every_n_tokens for length in seq_lens
+        )
+        expected_checkpoint_cu_list = [0]
+        for count in checkpoint_counts:
+            expected_checkpoint_cu_list.append(expected_checkpoint_cu_list[-1] + count)
+        expected_checkpoint_cu = tuple(expected_checkpoint_cu_list)
+        if tuple(state_checkpoints.shape) != (
+            expected_checkpoint_cu[-1],
+            num_o_heads,
+            128,
+            128,
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "GDN non-CP state_checkpoints must have shape "
+                "[sum(floor(seq_len/interval)),H,128,128]"
+            )
+        observed_checkpoint_cu = _cake_gdn_host_ints(
+            checkpoint_cu_starts,
+            purpose="checkpoint cumulative metadata",
+        )
+        if observed_checkpoint_cu != expected_checkpoint_cu:
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "GDN non-CP checkpoint_cu_starts does not match cu_seqlens and checkpoint interval"
+            )
+
+    route = _cake_gdn.select_cake_gdn_prefill_variant(
+        arch=arch,
+        io_dtype=_cake_gdn_prefill_dtype_name(q.dtype),
+        state_dtype=state_dtype_name,
+        num_seqs=num_seqs,
+        total_seq_len=total_seq_len,
+        max_seq_len=max(seq_lens),
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        use_initial_state=initial_state is not None,
+        store_final_state=output_final_state,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        use_state_indices=state_indices is not None,
+        gates_present=gates_present,
+        seq_lens=seq_lens,
+    )
+    entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    active_clusters = int(
+        torch.cuda.get_device_properties(q.device).multi_processor_count
+    )
+    dvsplit = route.route_id.endswith(".dvsplit")
+    total_tiles = num_seqs * num_o_heads * (2 if dvsplit else 1)
+    if dvsplit or total_tiles <= 128:
+        grid_x = min(active_clusters, total_tiles)
+    else:
+        max_chunks = max((length + 63) // 64 for length in seq_lens)
+        if max_chunks <= 8:
+            grid_x = min(128, total_tiles)
+        elif active_clusters in (148, 160) and total_tiles == 256:
+            grid_x = 128
+        else:
+            grid_x = min(active_clusters, total_tiles)
+
+    empty_i32 = torch.empty(1, dtype=torch.int32, device=q.device)
+    cu_seqlens_i32 = (
+        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
+    )
+    state_indices_i32 = (
+        empty_i32
+        if state_indices is None
+        else state_indices
+        if state_indices.dtype == torch.int32
+        else state_indices.to(torch.int32)
+    )
+    empty_state = torch.empty(1, dtype=state_dtype, device=q.device)
+    launch_initial_state = initial_state if initial_state is not None else empty_state
+    launch_output_state = (
+        output_state if output_final_state and output_state is not None else empty_state
+    )
+    launch_checkpoints = (
+        state_checkpoints
+        if checkpoint_every_n_tokens and state_checkpoints is not None
+        else empty_state
+    )
+    cu_checkpoints_i32 = (
+        empty_i32
+        if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
+        else checkpoint_cu_starts
+        if checkpoint_cu_starts.dtype == torch.int32
+        else checkpoint_cu_starts.to(torch.int32)
+    )
+    tensormap_workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=q.device)
+    entry(
+        q,
+        k,
+        v,
+        output,
+        gate,
+        update_gate,
+        cu_seqlens_i32,
+        state_indices_i32,
+        launch_initial_state,
+        launch_output_state,
+        launch_checkpoints,
+        cu_checkpoints_i32,
+        tensormap_workspace,
+        int(initial_state.stride(0))
+        if initial_state is not None
+        else num_o_heads * 16384,
+        int(output_state.stride(0))
+        if output_final_state and output_state is not None
+        else num_o_heads * 16384,
+        checkpoint_every_n_tokens,
+        scale,
+        num_seqs,
+        num_q_heads,
+        num_v_heads,
+        total_tiles,
+        grid_x,
+        1,
+        1,
+    )
+    if output_final_state:
+        assert output_state is not None
+        return output, output_state
+    return output
+
 
 def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
 
 
+def _use_gdn_cp_sm100(
+    *,
+    initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    cp_chunk_len: Optional[int],
+) -> bool:
+    """Select GDN CP for the ratified PR4078 domain and FP32 checkpoints."""
+
+    checkpoint_enabled = checkpoint_every_n_tokens > 0
+    if checkpoint_enabled:
+        if (
+            state_checkpoints is None
+            or state_checkpoints.dtype != torch.float32
+            or checkpoint_cu_starts is None
+            or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
+            or not checkpoint_cu_starts.is_cuda
+            or cp_chunk_len not in (None, checkpoint_every_n_tokens)
+        ):
+            return False
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        return False
+    if cp_chunk_len is not None and (cp_chunk_len <= 0 or cp_chunk_len % 64 != 0):
+        return False
+    return all(
+        tensor is None or tensor.dtype in _GDN_CP_STATE_DTYPES
+        for tensor in (initial_state, output_state)
+    )
+
+
+def _is_gdn_cp_sm100_supported_shape(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    """Return whether tensor shapes satisfy the generated backend contract."""
+
+    if (
+        q.ndim != 3
+        or k.ndim != 3
+        or v.ndim != 3
+        or q.shape[0] != k.shape[0]
+        or q.shape[0] != v.shape[0]
+        or q.shape[2] != 128
+        or k.shape[2] != 128
+        or v.shape[2] != 128
+    ):
+        return False
+    hq, hk, hv = int(q.shape[1]), int(k.shape[1]), int(v.shape[1])
+    return bool(
+        hq > 0
+        and hk > 0
+        and hv > 0
+        and ((hq == hk and hv % hq == 0) or (hk == hv and hq % hk == 0))
+    )
+
+
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
-    cuda_major: int,
+    use_gdn_cp_backend: bool,
+    cuda_version: tuple[int, int],
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -60,30 +525,30 @@ def _cp_delta_rule_rejection_reason(
     beta: Optional[torch.Tensor],
     output: torch.Tensor,
     initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
+    cp_chunk_len: Optional[int],
 ) -> Optional[str]:
     if arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
     elif arch_major == 10:
-        if cuda_major < 13:
-            return "CP delta rule SM100 requires CUDA 13 or newer"
-        if cp_delta_rule_dsl_sm100 is None:
+        if use_gdn_cp_backend and cuda_version < (12, 8):
+            return "GDN CP SM100 kernel requires CUDA 12.8 or newer"
+        if not use_gdn_cp_backend and cuda_version < (13, 0):
+            return "CP delta rule SM100 DSL kernel requires CUDA 13 or newer"
+        if use_gdn_cp_backend and _chunk_gated_delta_rule_gdn_cp_sm100 is None:
+            return "GDN CP SM100 kernel is unavailable"
+        if not use_gdn_cp_backend and cp_delta_rule_dsl_sm100 is None:
             return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
-    if (
-        checkpoint_every_n_tokens > 0
-        or state_checkpoints is not None
-        or checkpoint_cu_starts is not None
-    ) and arch_major not in (9, 10, 12):
-        return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -106,8 +571,8 @@ def _cp_delta_rule_rejection_reason(
             continue
         if not tensor.is_contiguous():
             return f"CP delta rule requires {name} to be contiguous"
-    if initial_state is not None:
-        if state_indices is None and not initial_state.is_contiguous():
+    if initial_state is not None and not initial_state.is_contiguous():
+        if not use_gdn_cp_backend and state_indices is None:
             return "CP delta rule requires initial_state to be contiguous"
     return None
 
@@ -132,6 +597,8 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
+    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
+    max_seqlen: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -167,20 +634,19 @@ def chunk_gated_delta_rule(
         when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
-        from row ``state_indices[i]``; the pool may be non-compact (padded
-        first-dimension stride, inner ``[H, V, K]`` block contiguous).
+        from row ``state_indices[i]``; on SM100/SM103 every rank-4 positive,
+        non-overlapping stride layout is accepted.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
         Cumulative sequence lengths of shape ``[num_seqs + 1]``, integer
-        dtype on the same CUDA device as ``q``.  Required for
-        variable-length sequences (varlen mode); must not be ``None``
-        (asserted at the top of the function body).  Internally cast to
-        ``int32`` for the SM100/Blackwell CuTe-DSL kernel and to ``int64``
-        for the SM90/Hopper C++ kernel, so the caller can pass either
-        dtype.
+        int32 or int64 dtype on the same CUDA device as ``q``. Required for
+        variable-length sequences (varlen mode); must not be ``None``.
+        Repeated adjacent offsets represent legal zero-length sequences.
     use_qk_l2norm_in_kernel : bool
-        Whether to use QK L2 normalization in kernel.  Default: ``False``.
+        Whether to L2-normalize each Q/K head with epsilon ``1e-6``.
+        Normalization accumulates in float32 and rounds back to the input
+        dtype before the chunked kernel. Default: ``False``.
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape
         ``[total_seq_len, num_o_heads, head_size]`` where ``num_o_heads =
@@ -196,6 +662,8 @@ def chunk_gated_delta_rule(
         when ``output_state is initial_state``); it must be provided by the
         caller (auto-allocation is rejected, since a compact ``[num_seqs, ...]``
         buffer would be indexed out of bounds by the pool slot ids).
+        SM100/SM103 accepts the same positive, non-overlapping rank-4 stride
+        layouts as ``initial_state``.
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
         num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
@@ -203,21 +671,27 @@ def chunk_gated_delta_rule(
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
         currently supported on SM90, SM100, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
-        Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
+        Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
+        int64 on the same CUDA device as ``q``.
         ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the
         number of checkpoints for sequence ``i`` (= ``seq_len_i //
         checkpoint_every_n_tokens``).  Required when
-        ``checkpoint_every_n_tokens > 0``.
+        ``checkpoint_every_n_tokens > 0``. The values must be monotonic and
+        consistent with ``cu_seqlens``; this caller precondition is not checked
+        at launch to avoid a device-to-host synchronization.
     checkpoint_every_n_tokens : int
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use the SM90/SM120 context-parallel DSL implementation when
-        low-parallelism heuristics match. ``"auto"`` enables conservative
-        routing, ``True`` requires CP support, and ``False`` disables CP.
-        Default: ``"auto"``.
+        Whether to use context parallelism when low-parallelism heuristics
+        match. SM100/SM103 uses the generated GDN CP-only four-stage
+        implementation for structurally supported shapes. Other legal
+        configurations retain the CuTe-DSL implementation.
+        ``"auto"`` enables conservative routing, ``True`` requires CP support,
+        and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
-        Int32 tensor of shape ``[num_seqs]`` (SM90/SM100/SM103/SM120). When provided,
+        Int32 or int64 tensor of shape ``[num_seqs]``
+        (SM90/SM100/SM103/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
@@ -225,8 +699,9 @@ def chunk_gated_delta_rule(
         (in place when ``output_state is initial_state``). This lets callers
         that keep a paged/indexed state pool avoid gathering the active rows
         into a packed buffer and scattering the result back. The pool may be
-        non-compact (padded first-dimension stride). ``None`` (default) keeps
-        the packed, sequence-ordered layout.
+        any positive, non-overlapping rank-4 stride layout on SM100/SM103.
+        ``None`` (default) keeps sequence-ordered row mapping without requiring
+        the physical view itself to be contiguous.
 
         The ids **must be unique**: as with any indexed scatter, two sequences
         sharing a slot id would concurrently write the same pool row across
@@ -237,6 +712,24 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
+    backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
+        ``auto`` uses the same SM90/SM100/SM120 kernels and context-parallel
+        routing as ``flashinfer``. Cake kernels require an explicit ``cake_gdn``
+        request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
+        SM100/SM103; ``use_cp=False`` or ``"auto"`` retains Cake non-CP.
+        Explicit Cake requests fail for unsupported inputs without falling
+        back to another backend.
+        ``cudnn`` runs cuDNN's fused SM100 linear-attention engine through
+        :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_rule`.
+    max_seqlen : int, optional
+        Safe upper bound on the maximum logical sequence length, no larger
+        than ``total_seq_len``. CP kernels use this host-side hint to
+        bound their per-sequence launch grids without reading ``cu_seqlens``
+        back from the GPU. Pass the exact maximum for variable-length or
+        imbalanced batches. When omitted, CP assumes a balanced batch and uses
+        ``ceil(total_seq_len / num_seqs)``. That fallback can under-launch an
+        imbalanced batch, so callers allowing unequal lengths must provide this
+        argument whenever the CP path may be selected.
 
     Returns
     -------
@@ -254,11 +747,22 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.  The SM100
-      path requires ``head_size == 128`` and
+    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
+      path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
+      structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
+      CUDA 12.9, and CUDA 13.
+      Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
     """
+    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
+        raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if (
+        backend == "cake_gdn"
+        and use_cp is not True
+        and (not _CAKE_GDN_AVAILABLE or _cake_gdn is None)
+    ):
+        raise RuntimeError("the source-only Cake GDN backend is not installed")
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
     if checkpoint_every_n_tokens < 0:
@@ -293,11 +797,61 @@ def chunk_gated_delta_rule(
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
+    if num_seqs <= 0:
+        raise ValueError("cu_seqlens must contain at least two entries")
+    cp_max_seqlen = (
+        max_seqlen
+        if max_seqlen is not None
+        else (total_seq_len + num_seqs - 1) // num_seqs
+    )
+    if type(cp_max_seqlen) is not int or cp_max_seqlen < 0:
+        raise ValueError("max_seqlen must be a nonnegative integer")
+    if total_seq_len and cp_max_seqlen == 0:
+        raise ValueError("max_seqlen must be positive when q is nonempty")
+    minimum_cp_max_seqlen = (total_seq_len + num_seqs - 1) // num_seqs
+    if cp_max_seqlen < minimum_cp_max_seqlen:
+        raise ValueError(
+            "max_seqlen cannot be smaller than ceil(total_seq_len / num_seqs)"
+        )
+    if cp_max_seqlen > total_seq_len:
+        raise ValueError("max_seqlen cannot exceed total_seq_len")
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+
+    if backend == "cudnn":
+        from .cudnn import cudnn_chunk_gated_delta_rule
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("use_cp", use_cp is True or _cp_chunk_len is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
+                ("state_indices", state_indices is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                'chunk_gated_delta_rule(backend="cudnn") does not support '
+                + ", ".join(unsupported)
+            )
+        return cudnn_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+        )
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
@@ -353,7 +907,13 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _sm_count = get_device_sm_count(device)
-    _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    _cuda_version_parts = torch.version.cuda.split(".") if torch.version.cuda else []
+    _cuda_version = (
+        (int(_cuda_version_parts[0]), int(_cuda_version_parts[1]))
+        if len(_cuda_version_parts) >= 2
+        else (0, 0)
+    )
+    _cuda_major = _cuda_version[0]
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
@@ -363,7 +923,28 @@ def chunk_gated_delta_rule(
         _device_name,
         device_capability=_device_capability,
     )
-    will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
+    will_use_cp = use_cp is True or (
+        backend != "cake_gdn" and use_cp == "auto" and cp_heuristic_matches
+    )
+    use_gdn_cp_backend = bool(
+        backend == "cake_gdn"
+        and will_use_cp
+        and _device_capability in ((10, 0), (10, 3))
+        and _use_gdn_cp_sm100(
+            initial_state=initial_state,
+            output_state=output_state,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            cp_chunk_len=_cp_chunk_len,
+        )
+        and _is_gdn_cp_sm100_supported_shape(q, k, v)
+    )
+    if backend == "cake_gdn" and will_use_cp and not use_gdn_cp_backend:
+        raise ValueError(
+            "Cake GDN CP requires SM100/SM103 and supported head, state and "
+            "checkpoint configurations"
+        )
     if state_indices is not None:
         if not is_integer_dtype(state_indices.dtype):
             raise ValueError(
@@ -391,10 +972,26 @@ def chunk_gated_delta_rule(
                 "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
                 "compact [num_seqs, ...] tensor that would be indexed out of bounds."
             )
+    if (
+        use_qk_l2norm_in_kernel
+        and _arch_major in (9, 10, 12)
+        and (_arch_major != 10 or _cuda_major >= 13)
+        and is_cute_dsl_arch_supported(*_device_capability)
+    ):
+        # The chunked backends consume caller-normalized operands. Honor the
+        # public flag before dispatch; unnormalized keys can make the delta
+        # recurrence expansive and produce nonfinite outputs. Unsupported
+        # configurations must reach the backend checks without compiling here.
+        from .gdn_kernels.qk_l2norm import normalize_qk
+
+        q, k = normalize_qk(q, k)
+        use_qk_l2norm_in_kernel = False
+
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
-            cuda_major=_cuda_major,
+            use_gdn_cp_backend=use_gdn_cp_backend,
+            cuda_version=_cuda_version,
             q=q,
             k=k,
             v=v,
@@ -402,10 +999,12 @@ def chunk_gated_delta_rule(
             beta=beta,
             output=output,
             initial_state=initial_state,
+            output_state=output_state,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             state_indices=state_indices,
+            cp_chunk_len=_cp_chunk_len,
         )
         if cp_rejection_reason is not None:
             if use_cp is True:
@@ -423,6 +1022,33 @@ def chunk_gated_delta_rule(
                     dtype=torch.float32,
                     device=device,
                 )
+            if use_gdn_cp_backend:
+                gdn_cp_backend = cast(
+                    Callable[..., None], _chunk_gated_delta_rule_gdn_cp_sm100
+                )
+                gdn_cp_backend(
+                    output,
+                    output_state,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu_seqlens,
+                    _scale,
+                    initial_state=initial_state,
+                    state_indices=state_indices,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=checkpoint_cu_starts,
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    cp_chunk_len=_cp_chunk_len,
+                    max_seqlen=cp_max_seqlen,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+                if output_final_state:
+                    return output, output_state
+                return output
             _g = (
                 g
                 if g is not None
@@ -468,7 +1094,7 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
-                max_seqlen=total_seq_len,
+                max_seqlen=cp_max_seqlen,
                 cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,
@@ -476,6 +1102,29 @@ def chunk_gated_delta_rule(
             if output_final_state:
                 return output, output_state
             return output
+    # Compiled Cake specializations cover more shapes than have been qualified
+    # against the existing prefill kernels. Keep them opt-in until automatic
+    # dispatch has a performance-qualified domain.
+    if backend == "cake_gdn":
+        return _run_cake_gdn_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=_scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_indices=state_indices,
+        )
+
     if _arch_major == 10:
         if _cuda_major < 13:
             raise NotImplementedError(

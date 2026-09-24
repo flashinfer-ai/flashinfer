@@ -15,7 +15,7 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         autotune_mxfp8_mega_moe,
         create_dummy_mxfp8_inputs,
         mxfp8_candidates,
@@ -38,10 +38,11 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             args.intermediate,
             kind=args.dtype,
             gate_up_clamp=args.gate_up_clamp,
+            enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
             seed=args.seed,
         )
         candidates = mxfp8_candidates(
-            in_kernel_fc2_reduce=args.allow_nondeterministic,
+            enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
         )
 
         if args.sweep == "schedule":
@@ -62,6 +63,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     topk=args.topk,
                     max_tokens=max_tokens,
                     combine_dtype=args.combine_dtype,
+                    enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
