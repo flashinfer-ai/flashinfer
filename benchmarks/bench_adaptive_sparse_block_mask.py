@@ -11,15 +11,14 @@ from flashinfer.sparse import adaptive_sparse_block_mask
 from flashinfer.testing import bench_gpu_time
 
 
-def _median_ms(fn, *, enable_cupti: bool) -> float:
-    times = bench_gpu_time(
+def _samples_ms(fn, *, enable_cupti: bool) -> list[float]:
+    return bench_gpu_time(
         fn,
         enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=30,
+        dry_run_iters=5,
+        repeat_iters=15,
         cold_l2_cache=True,
     )
-    return statistics.median(times)
 
 
 def main() -> None:
@@ -88,13 +87,32 @@ def main() -> None:
     torch.testing.assert_close(kernel_mask, torch_mask)
 
     enable_cupti = not args.cuda_events
-    kernel_ms = _median_ms(flashinfer_kernel, enable_cupti=enable_cupti)
-    baseline_ms = _median_ms(torch_baseline, enable_cupti=enable_cupti)
+    kernel_times: list[float] = []
+    baseline_times: list[float] = []
+    timing_order: list[str] = []
+    timing_batches = (
+        (
+            ("flashinfer", flashinfer_kernel, kernel_times),
+            ("torch", torch_baseline, baseline_times),
+        ),
+        (
+            ("torch", torch_baseline, baseline_times),
+            ("flashinfer", flashinfer_kernel, kernel_times),
+        ),
+    )
+    for batch in timing_batches:
+        timing_order.append("->".join(name for name, _, _ in batch))
+        for _, fn, samples in batch:
+            samples.extend(_samples_ms(fn, enable_cupti=enable_cupti))
+
+    kernel_ms = statistics.median(kernel_times)
+    baseline_ms = statistics.median(baseline_times)
     print(f"gpu={torch.cuda.get_device_name(device)}")
     print(
         f"shape=B{args.batch_size},H{args.num_heads},Qb{args.q_blocks},"
         f"Kb{args.k_blocks},budget={budget}"
     )
+    print(f"timing_order={','.join(timing_order)}")
     print(f"adaptive_cuda_ms={kernel_ms:.6f}")
     print(f"torch_topk_pipeline_ms={baseline_ms:.6f}")
     print(f"speedup={baseline_ms / kernel_ms:.3f}x")

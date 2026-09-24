@@ -18,6 +18,12 @@ Supported contract:
 - CUDA architectures supported by FlashInfer from SM90 onward;
 - ties at the top-k boundary may select more than the nominal budget.
 
+The CUDA kernel uses 64-bit intermediate length arithmetic and clamps Q/K work
+to the supplied tensor shape. Set `FLASHINFER_VALIDATE_INPUTS=1` to additionally
+copy the small length vectors to the host and reject negative or out-of-capacity
+values. This strict content check is opt-in because it synchronizes the CUDA
+stream; tensor metadata is always validated.
+
 The port is derived from hpc-ops commit
 `2a2e26562433a8ba4b504858f1c938eb7612c901`. The experimental owner is
 [`@slhslh`](https://github.com/slhslh). Lifecycle and graduation work is

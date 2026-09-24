@@ -128,5 +128,64 @@ def test_adaptive_sparse_block_mask_reuses_output() -> None:
     assert (~out).any()
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("q", -1, "q_seq_lens must contain nonnegative"),
+        ("kv", -1, "kv_seq_lens must contain nonnegative"),
+        ("prompt", -1, "num_prompt_tokens must contain nonnegative"),
+        ("q", 4 * 128 + 1, "q_seq_lens must not exceed"),
+        ("kv", 64 * 128 + 1, "kv_seq_lens must not exceed"),
+    ],
+)
+def test_adaptive_sparse_block_mask_rejects_invalid_lengths(
+    field: str, value: int, match: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    logits = torch.randn(1, 1, 4, 64, device="cuda", dtype=torch.bfloat16)
+    lengths = {
+        "q": torch.tensor([4 * 128], device="cuda", dtype=torch.int32),
+        "kv": torch.tensor([64 * 128], device="cuda", dtype=torch.int32),
+        "prompt": torch.tensor([64 * 128], device="cuda", dtype=torch.int32),
+    }
+    lengths[field].fill_(value)
+
+    with pytest.raises(ValueError, match=match):
+        adaptive_sparse_block_mask(
+            logits, lengths["q"], lengths["kv"], lengths["prompt"]
+        )
+
+
+def test_adaptive_sparse_block_mask_treats_signed_zero_as_tie() -> None:
+    logits = torch.zeros(1, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    logits[..., 1::2] = -0.0
+    q_lens = torch.tensor([128], device="cuda", dtype=torch.int32)
+    kv_lens = torch.tensor([64 * 128], device="cuda", dtype=torch.int32)
+
+    actual = adaptive_sparse_block_mask(
+        logits,
+        q_lens,
+        kv_lens,
+        kv_lens,
+        initial_blocks=0,
+        window_size=0,
+    )
+
+    assert actual.all()
+
+
+def test_adaptive_sparse_block_mask_handles_max_prompt_length() -> None:
+    logits = torch.randn(1, 1, 1, 8, device="cuda", dtype=torch.bfloat16)
+    q_lens = torch.tensor([128], device="cuda", dtype=torch.int32)
+    kv_lens = torch.tensor([8 * 128], device="cuda", dtype=torch.int32)
+    prompt_lens = torch.tensor(
+        [torch.iinfo(torch.int32).max], device="cuda", dtype=torch.int32
+    )
+
+    actual = adaptive_sparse_block_mask(logits, q_lens, kv_lens, prompt_lens)
+
+    assert actual.all()
+
+
 def test_adaptive_sparse_block_mask_is_experimental() -> None:
     assert adaptive_sparse_block_mask.is_experimental
