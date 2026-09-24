@@ -395,3 +395,104 @@ def test_cudnn_prefill_fp8(
     output_ref = wrapper.run(q, kv_cache)
 
     torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
+
+
+def _paged_lse_problem(q_lens, kv_lens, num_qo_heads, num_kv_heads, page_size=16):
+    """Packed Q plus a token-major paged KV cache, with cuDNN and fa2 views of it."""
+    head_dim = 128
+    device = "cuda:0"
+    batch_size = len(q_lens)
+    pages = [(n + page_size - 1) // page_size for n in kv_lens]
+    qo_indptr = torch.tensor([0] + q_lens, device=device).cumsum(0).int()
+    kv_indptr = torch.tensor([0] + pages, device=device).cumsum(0).int()
+    kv_indices = torch.arange(sum(pages), device=device, dtype=torch.int32)
+    kv_last_page_len = torch.tensor(
+        [(n - 1) % page_size + 1 for n in kv_lens], device=device, dtype=torch.int32
+    )
+    block_tables = torch.zeros(batch_size, max(pages), device=device, dtype=torch.int32)
+    for i in range(batch_size):
+        block_tables[i, : pages[i]] = kv_indices[kv_indptr[i] : kv_indptr[i + 1]]
+
+    q = torch.randn(
+        sum(q_lens), num_qo_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    # [pages, 2, page_size, H_kv, D] token-major memory (NHD).
+    kv_cache = torch.randn(
+        sum(pages), 2, page_size, num_kv_heads, head_dim, device=device
+    ).to(torch.bfloat16)
+    # cuDNN takes [pages, H_kv, page_size, D]-shaped views over that memory.
+    cudnn_kv = (kv_cache[:, 0].transpose(1, 2), kv_cache[:, 1].transpose(1, 2))
+
+    plan_args = (
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+    )
+    cudnn_plan_kwargs = dict(
+        seq_lens=torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        seq_lens_q=torch.tensor(q_lens, device=device, dtype=torch.int32),
+        max_token_per_sequence=max(q_lens),
+        max_sequence_kv=max(kv_lens),
+        block_tables=block_tables,
+    )
+    return q, kv_cache, cudnn_kv, plan_args, cudnn_plan_kwargs
+
+
+@pytest.mark.parametrize("num_kv_heads", [2, 8])
+@pytest.mark.parametrize("causal", [True, False])
+def test_cudnn_paged_prefill_return_lse(num_kv_heads, causal):
+    """return_lse=True yields the packed [tokens, heads] LSE, matching fa2.
+
+    plan() gets no sm_scale, so this also covers the default softmax scale.
+    Regression test for https://github.com/flashinfer-ai/flashinfer/issues/5258.
+    """
+    torch.manual_seed(0)
+    q, kv_cache, cudnn_kv, plan_args, cudnn_plan_kwargs = _paged_lse_problem(
+        [17, 1, 64, 33], [40, 90, 64, 70], 8, num_kv_heads
+    )
+    plan_kwargs = dict(causal=causal, q_data_type=torch.bfloat16)
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=q.device)
+    wrapper_cudnn = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="cudnn"
+    )
+    wrapper_cudnn.plan(*plan_args, **plan_kwargs, **cudnn_plan_kwargs)
+    out, lse = wrapper_cudnn.run(q, cudnn_kv, return_lse=True)
+    assert lse.shape == (q.shape[0], q.shape[1])
+
+    workspace_ref = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=q.device)
+    wrapper_ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_ref, "NHD", backend="fa2"
+    )
+    wrapper_ref.plan(*plan_args, **plan_kwargs)
+    out_ref, lse_ref = wrapper_ref.run(q, kv_cache, return_lse=True)
+
+    torch.testing.assert_close(out, out_ref, atol=3e-3, rtol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-3)
+
+    # The LSE-free call must agree with the LSE-returning one.
+    torch.testing.assert_close(wrapper_cudnn.run(q, cudnn_kv), out)
+
+
+def test_cudnn_paged_prefill_single_token_gqa_lse_rejected():
+    """cuDNN's single-token GQA kernel writes a partial LSE; refuse it loudly."""
+    torch.manual_seed(0)
+    q, _, cudnn_kv, plan_args, cudnn_plan_kwargs = _paged_lse_problem(
+        [1, 1, 1, 1], [40, 90, 64, 70], 8, 2
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=q.device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="cudnn"
+    )
+    wrapper.plan(
+        *plan_args, causal=True, q_data_type=torch.bfloat16, **cudnn_plan_kwargs
+    )
+    with pytest.raises(NotImplementedError, match="single-token"):
+        wrapper.run(q, cudnn_kv, return_lse=True)
+    # Without the LSE the same call is fine.
+    assert wrapper.run(q, cudnn_kv).shape == q.shape

@@ -60,21 +60,7 @@ def _paged_backends():
     if is_sm100a_supported(dev):
         backends.append("cute-dsl")
     if is_sm100a_supported(dev) and CUDNN_AVAILABLE:
-        # Pre-existing, independent of lse_base: the paged cuDNN path insists on a
-        # padded (num_sequences, max_q_len, h) LSE buffer while the wrapper
-        # allocates the [total_tokens, h] one every other backend writes, so
-        # return_lse=True fails before any base handling. Strict xfail so the
-        # fix is noticed.
-        backends.append(
-            pytest.param(
-                "cudnn",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    raises=ValueError,
-                    reason="paged cuDNN backend rejects the wrapper's [tokens, h] LSE buffer",
-                ),
-            )
-        )
+        backends.append("cudnn")
     return backends
 
 
@@ -244,6 +230,9 @@ def test_paged_lse_base(backend, causal):
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend=backend)
     plan_kwargs = {}
     if backend == "cudnn":
+        # The cuDNN paged path takes [pages, H_kv, page_size, D]-shaped views over
+        # the token-major cache (same convention as test_cudnn_prefill.py).
+        k_cache, v_cache = k_cache.transpose(1, 2), v_cache.transpose(1, 2)
         plan_kwargs = dict(
             seq_lens=torch.tensor(KV_LENS, dtype=torch.int32, device=dev),
             seq_lens_q=torch.tensor(Q_LENS, dtype=torch.int32, device=dev),

@@ -3593,6 +3593,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
+            # Same cuDNN bug the ragged wrapper guards against; the paged
+            # kernel reproduces it too (observed on cuDNN 9.24).
+            if (
+                return_lse
+                and self._max_q_len == 1
+                and self._num_qo_heads != self._num_kv_heads
+            ):
+                raise NotImplementedError(
+                    "cuDNN's single-token (max q_len == 1) GQA kernel writes the "
+                    "LSE only for the first head of each kv group (NVBug 6783545); "
+                    "use another backend (e.g. fa2) or return_lse=False"
+                )
+
             # qo_indptr is token-unit (like every other backend). The low level
             # consumes it directly as cu_seq_len_q / the Q and O ragged offsets,
             # applying the per-tensor (num_heads * head_dim) multipliers itself, so
@@ -3601,7 +3614,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q,
                 k_cache,  # Need to be changed
                 v_cache,  # Need to be changed
-                self._sm_scale,
+                # The defaulted scale, not self._sm_scale: that is None when
+                # plan() got no sm_scale, which cuDNN reads as no scaling.
+                sm_scale,
                 self._float_workspace_buffer,
                 actual_seq_lens_q=self._seq_lens_q,
                 actual_seq_lens_kv=self._seq_lens_kv,
@@ -3615,6 +3630,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
                 batch_offsets_q=self._qo_indptr_buf,
+                # The wrapper's LSE is packed [num_tokens, num_qo_heads]; a
+                # token-unit stats offset makes cuDNN write that layout instead
+                # of the padded (batch, max_q_len, heads) one.
+                batch_offsets_stats=self._qo_indptr_buf if return_lse else None,
                 batch_offsets_units="tokens",
                 out=out,
                 lse=lse,
