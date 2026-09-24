@@ -339,8 +339,8 @@ classDiagram
     MoEEpSplitLayer --> SplitKernelBackend
     MoEEpSplitLayer --> Handle : per forward
 
-    MoEEpCommunication <|-- NVLinkOneSidedCommunication
-    MoEEpCommunication <|-- NVLinkTwoSidedCommunication
+    MoEEpCommunication <|-- NVLinkOneSidedAlltoAll
+    MoEEpCommunication <|-- NVLinkTwoSidedAlltoAll
     MoEEpCommunication <|-- NcclEpCommunication
     NcclEpCommunication --> Fleet
 

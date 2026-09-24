@@ -29,9 +29,9 @@ from flashinfer.moe_ep import (
     MoEEpTensors,
     NCCLEPConfig,
     NcclEpCommunication,
-    NVLinkOneSidedCommunication,
+    NVLinkOneSidedAlltoAll,
     NVLinkOneSidedConfig,
-    NVLinkTwoSidedCommunication,
+    NVLinkTwoSidedAlltoAll,
     SplitConfig,
     create_communication,
     dummy_moe_weights,
@@ -141,8 +141,8 @@ class TestRegistry:
         assert not is_communication_backend(object())
 
     def test_cuda_graph_capability(self) -> None:
-        assert NVLinkOneSidedCommunication.supports_cuda_graph
-        assert NVLinkTwoSidedCommunication.supports_cuda_graph
+        assert NVLinkOneSidedAlltoAll.supports_cuda_graph
+        assert NVLinkTwoSidedAlltoAll.supports_cuda_graph
         # Each NCCL-EP dispatch creates a handle on the host.
         assert not NcclEpCommunication.supports_cuda_graph
 
@@ -428,7 +428,7 @@ def fake_one_sided(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        NVLinkOneSidedCommunication,
+        NVLinkOneSidedAlltoAll,
         "is_platform_supported",
         classmethod(lambda cls: True),
     )
@@ -526,7 +526,7 @@ def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
         lambda bootstrap, comm_backend: (Mapping(), None),
     )
     monkeypatch.setattr(
-        NVLinkTwoSidedCommunication,
+        NVLinkTwoSidedAlltoAll,
         "is_platform_supported",
         classmethod(lambda cls: True),
     )

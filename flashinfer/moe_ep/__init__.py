@@ -254,9 +254,9 @@ __all__ = [
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
-    "NVLinkOneSidedCommunication",
+    "NVLinkOneSidedAlltoAll",
     "NVLinkOneSidedConfig",
-    "NVLinkTwoSidedCommunication",
+    "NVLinkTwoSidedAlltoAll",
     "NVLinkTwoSidedConfig",
     "NcclEpCommunication",
     "NcclEpConfig",
@@ -430,8 +430,8 @@ from .backends.split.comm.nccl_ep.communication import (  # noqa: E402
     NcclEpCommunication,
 )
 from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
-    NVLinkOneSidedCommunication,
+    NVLinkOneSidedAlltoAll,
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
-    NVLinkTwoSidedCommunication,
+    NVLinkTwoSidedAlltoAll,
 )

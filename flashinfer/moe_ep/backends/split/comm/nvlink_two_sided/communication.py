@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 @register_communication("nvlink_two_sided")
-class NVLinkTwoSidedCommunication(MoEEpCommunication):
+class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
     """Rank-major dispatch/combine with NVLink two-sided all-to-all-v kernels.
 
     Requires ``num_experts`` divisible by 4. EPLB statistics, when passed to
@@ -46,7 +46,7 @@ class NVLinkTwoSidedCommunication(MoEEpCommunication):
 
         if params.num_experts % 4 != 0:
             raise ValueError(
-                "NVLinkTwoSidedCommunication requires num_experts divisible by 4, "
+                "NVLinkTwoSidedAlltoAll requires num_experts divisible by 4, "
                 f"got {params.num_experts}"
             )
         self.config = NVLinkTwoSidedConfig() if config is None else config
