@@ -24,6 +24,10 @@ from .cake_minimax_h3_mxfp8 import (
     PreparedMiniMaxH3Mxfp8PreAttention,
     prepare_minimax_h3_mxfp8_pre_attention,
 )
+from .cake_minimax_h3_nvfp4 import (
+    PreparedMiniMaxH3Nvfp4PreAttention,
+    prepare_minimax_h3_nvfp4_pre_attention,
+)
 
 __all__ = [
     "fused_dit_gate_residual_layernorm_gamma_beta",
