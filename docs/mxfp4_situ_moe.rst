@@ -1,5 +1,5 @@
 Planned native MXFP4 SiTU MoE
-============================
+=============================
 
 The CuTe DSL planned runner targets SM100 and SM103, including NVIDIA B300.
 It consumes native packed E2M1 weights and UE8M0 scales with block size 32,
@@ -154,8 +154,10 @@ Workspace and kernel selection
 256-byte-aligned CUDA uint8 buffer. Its regions hold worst-case padded route
 indices, the FP8 GEMM1 result and scales, routing conversion, unit per-expert
 GEMM scales, (for T>1024) expert-count scratch and, at the full B300 shape
-with T=512, a BF16 expanded-contribution buffer of ``T * top_k * H`` elements
-(117,440,512 bytes) consumed by the combine kernel. Output is separate.
+with T=512 under the SiTU activation with PDL off and the default tactic (the
+only configuration whose plan binds it), a BF16 expanded-contribution buffer
+of ``T * top_k * H`` elements (117,440,512 bytes) consumed by the combine
+kernel. Output is separate.
 The padded-row bound is ``tile_size * max_tiles``, where
 ``max_tiles = T*top_k`` if ``T*top_k <= local_experts``, otherwise
 ``(T*top_k + (tile_size-1)*local_experts) // tile_size``.
@@ -285,8 +287,10 @@ and routing in FP64. Reports include relative L2, cosine, absolute-error
 percentiles/max, worst-token error and finite checks. All full-dimension
 outputs are finite.
 
-Independent worst values over the 66 required full-size post-timing
-observations of the paired comparison on the exported tree (all finite):
+Independent worst values over the 66 required full-size observations that
+the export/source paired-comparison harness recorded from outputs produced
+after each row's timing pass on the exported tree (all finite; the public
+benchmark script computes its accuracy metrics before timing):
 
 .. list-table::
    :header-rows: 1
@@ -334,10 +338,13 @@ distributions (balanced, empty-expert, hot), eager and CUDA Graph execution,
 66 rows in total. Every row compares identical operands on the same B300 with
 packed BF16 routing, seed 123, beta 4 and linear_beta 25. Timing uses CUPTI
 activity records with a cold L2 cache, alternating implementation order, five
-warmups and 20 samples per measurement, and requires the SM clock to stay at
-or above 97% of the reported maximum before and after every measurement; rows
-that fail the clock check are excluded, never counted as a pass. No CUDA-event
-fallback qualifies.
+warmups and 20 samples per measurement. The paired-comparison harness that
+produced these tables also sampled the SM clock through NVML before and after
+every measurement and required at least 97% of the reported maximum; rows that
+failed that check were excluded, never counted as a pass. No CUDA-event
+fallback qualifies. ``benchmarks/bench_mxfp4_situ_moe.py`` does not implement
+the clock check: lock or verify the SM clock separately when reproducing,
+otherwise the rows are not comparable to these tables.
 
 Ratios are TRT-LLM Gen over this runner on the exported tree; values above
 one favor this runner. Balanced medians are in microseconds, this runner /

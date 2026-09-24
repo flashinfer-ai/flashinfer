@@ -305,7 +305,7 @@ class CuteDslMxfp4MoEWrapper:
     def _workspace_fields(self, num_tokens):
         if num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
-        tile = self._tactic(num_tokens)[0]
+        tile, gemm1, gemm2 = self._tactic(num_tokens)
         tiles = get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
         rows = tiles * tile
         specs = [
@@ -332,6 +332,9 @@ class CuteDslMxfp4MoEWrapper:
             ("w1_alpha", (self.num_local_experts,), torch.float32, 4),
             ("w2_alpha", (self.num_local_experts,), torch.float32, 4),
         ]
+        # Reserve the expanded-contribution buffer only for the configuration
+        # whose plan binds it (see write_expanded_weighted in plan): the full
+        # B300 shape at T=512 with SiTU, PDL off and the default tactic.
         if (
             num_tokens == 512
             and self.hidden_size == 7168
@@ -339,6 +342,11 @@ class CuteDslMxfp4MoEWrapper:
             and self.num_experts == 896
             and self.num_local_experts == 112
             and self.top_k == 16
+            and self.activation_type == ActivationType.Situ
+            and not self.enable_pdl
+            and tile == 128
+            and gemm1 == ((128, 128), (1, 1), False)
+            and gemm2 == ((128, 128), (1, 1), False)
         ):
             specs.append(
                 (

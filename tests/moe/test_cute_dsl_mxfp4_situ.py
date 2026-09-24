@@ -1293,3 +1293,37 @@ def test_decode_routing_opt_in_fallback_graph():
                     )
                     assert output.count_nonzero() == 0
         stream.synchronize()
+
+
+def test_workspace_reserves_expanded_contributions_only_when_bound():
+    """T512 reserves the 117 MB expanded-contribution buffer only when plan binds it."""
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
+    from flashinfer.tllm_enums import ActivationType
+
+    def wrapper(**kwargs):
+        return CuteDslMxfp4MoEWrapper(
+            896, 16, 7168, 3072, num_local_experts=112, **kwargs
+        )
+
+    def field_names(w, tokens):
+        return [field.name for field in w._workspace_fields(tokens)[0]]
+
+    default = wrapper()
+    expanded_bytes = 512 * 16 * 7168 * 2
+    assert "expanded_contributions_bf16" in field_names(default, 512)
+    assert "expanded_contributions_bf16" not in field_names(default, 256)
+    for variant in (
+        wrapper(activation_type=ActivationType.Swiglu),
+        wrapper(enable_pdl=True),
+    ):
+        assert "expanded_contributions_bf16" not in field_names(variant, 512)
+        assert (
+            default.get_workspace_size(512) - variant.get_workspace_size(512)
+            == expanded_bytes
+        )
+    tactic = (256, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False))
+    offline = wrapper(offline_tactics={512: tactic})
+    assert "expanded_contributions_bf16" not in field_names(offline, 512)
+    assert "expanded_contributions_bf16" in field_names(
+        wrapper(offline_tactics={16: tactic}), 512
+    )
