@@ -11,4 +11,5 @@ csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_both.cu
 csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_both_sm103.cu
 
 # Byte-faithful generated MegaMoE terminal reducer.
-csrc/cake_megamoe_topk_reduce/cake_megamoe_topk_reduce_kernels.cu
+csrc/cake_megamoe_topk_reduce/sm100a/cake_megamoe_topk_reduce_kernels.cu
+csrc/cake_megamoe_topk_reduce/sm103a/cake_megamoe_topk_reduce_kernels.cu
