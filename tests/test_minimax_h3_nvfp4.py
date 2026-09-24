@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import sys
+from typing import Callable, Optional
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -102,7 +103,12 @@ def _aligned_workspace(size: int, device: torch.device):
     return backing, backing[offset : offset + size]
 
 
-def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
+def _prepare_zero_smoke(
+    adaln_index: int,
+    M: int = 1,
+    P: int = 8,
+    configure: Optional[Callable[[dict], None]] = None,
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
@@ -143,6 +149,11 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         ),
         "out_sf": torch.full((P, out_sf_stride), 255, dtype=torch.uint8, device=device),
     }
+    if configure is not None:
+        # The fused route derives alpha and the CTA-pair-ordered weight scales at
+        # preparation, so operand values a test depends on are set before the
+        # operation is prepared (the E2M1 weight bytes are still read in place).
+        configure(values)
     route = router.minimax_h3_nvfp4_route_record(device, P)
     norm_backing, norm_workspace = _aligned_workspace(
         int(route["stages"]["norm_adaln_nvfp4_quantize"]["tma_workspace_bytes"]),
@@ -214,6 +225,12 @@ def test_prepared_instances_run_on_independent_streams() -> None:
     first, first_values, first_norm, _first_norm_view, first_post, _first_post_view = (
         _prepare_zero_smoke(-1)
     )
+
+    def configure(values: dict) -> None:
+        values["adaln_shift"][0].fill_(1)
+        values["qkv_weight_q"].fill_(0x22)
+        values["qkv_weight_sf"].fill_(0x38)
+
     (
         second,
         second_values,
@@ -221,10 +238,7 @@ def test_prepared_instances_run_on_independent_streams() -> None:
         _second_norm_view,
         second_post,
         _second_post_view,
-    ) = _prepare_zero_smoke(0)
-    second_values["adaln_shift"][0].fill_(1)
-    second_values["qkv_weight_q"].fill_(0x22)
-    second_values["qkv_weight_sf"].fill_(0x38)
+    ) = _prepare_zero_smoke(0, configure=configure)
     first_stream = torch.cuda.Stream()
     second_stream = torch.cuda.Stream()
     current_stream = torch.cuda.current_stream()
