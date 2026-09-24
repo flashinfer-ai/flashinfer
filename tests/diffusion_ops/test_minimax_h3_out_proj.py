@@ -483,8 +483,8 @@ def test_minimax_h3_out_proj_rejects_bad_inputs(model, device):
         minimax_h3_out_proj(attn_out.reshape(8, 4, 14, 128), *args)  # P must be first
     with pytest.raises(ValueError):
         minimax_h3_out_proj(
-            attn_out.reshape(2, 8, 28, 128), *args
-        )  # P=2 must hold 28 heads
+            attn_out.reshape(2, 16, 14, 128), *args
+        )  # P=2 must hold 28 heads per block, not 14
     with pytest.raises(ValueError):
         minimax_h3_out_proj(attn_out[:, :, :7], *args)
     with pytest.raises(ValueError):
