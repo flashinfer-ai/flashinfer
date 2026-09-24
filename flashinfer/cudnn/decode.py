@@ -7,7 +7,12 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
-from .utils import get_cudnn_fmha_gen_module, get_cudnn_attention_handle
+from .utils import (
+    execute_cudnn_backend,
+    get_cudnn_fmha_gen_module,
+    get_cudnn_attention_handle,
+    prepare_cudnn_backend_execution,
+)
 
 try:
     import cudnn
@@ -479,6 +484,7 @@ def _execute_decode(
     block_tables,
     return_lse,
     sinks,
+    backend_execution=None,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
     handle_ = _create_cudnn_handle(torch.cuda.current_stream(q.device))
@@ -502,7 +508,10 @@ def _execute_decode(
         var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
         var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
 
-    graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
+    if backend_execution is None:
+        graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
+    else:
+        execute_cudnn_backend(backend_execution, var_map, workspace_buffer, handle_)
 
     if return_lse:
         # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
@@ -539,6 +548,7 @@ class CudnnDecodeGraph:
         "lse_shape",
         "sinks_view",
         "seq_lens_q",
+        "backend_execution",
     )
 
     def __init__(
@@ -563,6 +573,7 @@ class CudnnDecodeGraph:
         self.lse_shape = lse_shape
         self.sinks_view = sinks_view
         self.seq_lens_q = seq_lens_q
+        self.backend_execution = prepare_cudnn_backend_execution(graph)
 
     def _q_graph(self, q: torch.Tensor) -> torch.Tensor:
         return _decode_q_view(q, self.batch_size, self.q_len_per_req)
@@ -671,6 +682,7 @@ class CudnnDecodeGraph:
             # Normalize current values on this call's stream. In capture, a
             # strided sink's copy is captured too, rather than cached stale.
             sinks=self.sinks_view if sinks is None else _decode_sinks(q, sinks),
+            backend_execution=self.backend_execution,
         )
 
 
