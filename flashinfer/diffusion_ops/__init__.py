@@ -29,6 +29,11 @@ from .cake_minimax_h3_nvfp4 import (
     PreparedMiniMaxH3Nvfp4PreAttention,
     prepare_minimax_h3_nvfp4_pre_attention,
 )
+from .cake_minimax_h3_qkv_pack import (
+    PreparedMiniMaxH3QkvQuantizePack,
+    minimax_h3_qkv_quantize_pack,
+    prepare_minimax_h3_qkv_quantize_pack,
+)
 
 __all__ = [
     "fused_dit_gate_residual_layernorm_gamma_beta",
@@ -47,4 +52,7 @@ __all__ = [
     "minimax_h3_nvfp4_pre_attention",
     "quantize_minimax_h3_qkv_weight_fp8",
     "quantize_minimax_h3_qkv_weight_nvfp4",
+    "PreparedMiniMaxH3QkvQuantizePack",
+    "minimax_h3_qkv_quantize_pack",
+    "prepare_minimax_h3_qkv_quantize_pack",
 ]

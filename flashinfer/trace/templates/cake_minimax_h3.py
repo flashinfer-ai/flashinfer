@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trace definitions for MiniMax-H3 MXFP8 and NVFP4 pre-attention."""
+"""Trace definitions for MiniMax-H3 MXFP8 / NVFP4 pre-attention and QKV quantize-and-pack."""
 
 from ..template import Const, Tensor, TraceTemplate, Var
 
@@ -188,7 +188,82 @@ minimax_h3_nvfp4_pre_attention_trace = TraceTemplate(
 )
 
 
+minimax_h3_qkv_quantize_pack_trace = TraceTemplate(
+    op_type="minimax_h3_qkv_quantize_pack",
+    name_prefix="minimax_h3_qkv_quantize_pack",
+    description=(
+        "One-pass destination-major routing of BF16 Q/K/V into the Ulysses "
+        "send buffer with per-destination block quantization: NVFP4 (E2M1 "
+        "nibble pairs, swizzled E4M3 block-16 scales, static global scale) or "
+        "MXFP8 (E4M3 values, swizzled UE8M0 block-32 scales)."
+    ),
+    axes={
+        "M": Var(description="Token rows."),
+        "num_heads": Const(value=56, abbrev=""),
+        "P": Const(abbrev="p", description="Destination partitions."),
+        "heads_per_destination": Const(abbrev="hdst"),
+        "qkv_kinds": Const(value=3, abbrev=""),
+        "head_dim": Const(value=128, abbrev="d"),
+        "packed_head_dim": Const(
+            abbrev="pk",
+            description=(
+                "Bytes per packed head row: 64 (NVFP4 nibble pairs) or 128 (MXFP8)."
+            ),
+        ),
+        "output_scale_stride": Var(),
+    },
+    inputs={
+        "q": Tensor(["M", "num_heads", "head_dim"]),
+        "k": Tensor(["M", "num_heads", "head_dim"]),
+        "v": Tensor(["M", "num_heads", "head_dim"]),
+        "out_global_scale": Tensor(
+            ["1"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Float32 static NVFP4 global encode scale (448 * 6 / amax); "
+                "absent for MXFP8."
+            ),
+        ),
+        "out_q": Tensor(
+            ["P", "M", "heads_per_destination", "qkv_kinds", "packed_head_dim"],
+            description=(
+                "Caller-owned destination-major packed output: uint8 E2M1 nibble "
+                "pairs (NVFP4) or float8_e4m3fn (MXFP8)."
+            ),
+        ),
+        "out_sf": Tensor(
+            ["P", "output_scale_stride"],
+            description=(
+                "Caller-owned per-destination swizzled-128x4 scale tile (E4M3 for "
+                "NVFP4, UE8M0 for MXFP8) including zero padding rows."
+            ),
+        ),
+    },
+    outputs={
+        "out_q": Tensor(
+            ["P", "M", "heads_per_destination", "qkv_kinds", "packed_head_dim"],
+            param="out_q",
+            dtype_from="out_q",
+        ),
+        "out_sf": Tensor(
+            ["P", "output_scale_stride"],
+            param="out_sf",
+            dtype_from="out_sf",
+        ),
+    },
+    constraints=["P * heads_per_destination == 56"],
+    tags=[
+        "stage:pre_attention",
+        "status:verified",
+        "quantization:fp4",
+        "quantization:mxfp8",
+    ],
+)
+
+
 __all__ = [
     "minimax_h3_mxfp8_pre_attention_trace",
     "minimax_h3_nvfp4_pre_attention_trace",
+    "minimax_h3_qkv_quantize_pack_trace",
 ]
