@@ -120,14 +120,18 @@ KV_SPLIT_MIN_GAIN = 0.03
 KV_SPLIT_MAX_WAVES = 4
 # Per-unit cost of the split-capable NVFP4 attention program relative to the
 # dense program, per (pv_mode, arch), measured with both programs on the same
-# unsplit plan: the sm_103a fp8pv split program runs 1.21x slower per unit
-# (its block loop is rescheduled at the softmax register budget), the sm_100a
-# fp4pv split program 1.03x, the other two combinations are at parity. A split
+# plan: the sm_103a fp8pv split program runs 1.21x slower per unit on a
+# 33k-token plan and an effective 1.30-1.42x on the 48-58 block units of the
+# partial-wave rows (its block loop is rescheduled at the softmax register
+# budget; the per-unit prologue/epilogue is a larger share of a short unit),
+# so it carries 1.35: the 1.42-wave row stays dense, the 1.14-wave row still
+# splits. The sm_100a fp4pv split program costs 1.03x, the other two
+# combinations are at parity. A split
 # plan runs the split program on every unit, so the planner scales the split
 # candidates' makespan by this cost (mirrors the production planner's
 # ``SPLIT_PROGRAM_COST``).
 SPLIT_PROGRAM_COST: dict[tuple[str, str], float] = {
-    ("fp8", "sm_103a"): 1.21,
+    ("fp8", "sm_103a"): 1.35,
     ("fp4", "sm_100a"): 1.03,
 }
 # Combine kernel: 128 threads = one warp per output row, four rows per CTA.
