@@ -109,6 +109,43 @@ def _svec(base_addr, elem_off, dtype=None):
     )
 
 
+def _state_tile(addr, JJ, KQ, dtype):
+    """One thread's (4, JJ) slice of a checkpoint row in global memory."""
+    w = dtype.width // 8
+    return cute.make_tensor(
+        cute.make_ptr(dtype, addr, cutlass.AddressSpace.gmem, assumed_align=4 * w),
+        cute.make_layout((4, JJ), stride=(1, KQ * 4)),
+    )
+
+
+def _load_state(addr, frag, JJ, KQ, dtype):
+    """Load a checkpoint slice into the FP32 register fragment."""
+    tile = _state_tile(addr, JJ, KQ, dtype)
+    evict = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
+    if dtype is cutlass.Float32:
+        cute.autovec_copy(tile, frag, l1c_evict_priority=evict)
+    else:
+        stage = cute.make_rmem_tensor(cute.make_layout((4, JJ)), dtype)
+        cute.autovec_copy(tile, stage, l1c_evict_priority=evict)
+        frag.store(stage.load().to(cutlass.Float32))
+
+
+def _store_state(frag, addr, JJ, KQ, dtype):
+    """Store the FP32 register fragment as a checkpoint slice.
+
+    A BF16 pool is rounded on store only; the recurrence continues from the
+    FP32 registers, matching vLLM's speculative KDA kernel.
+    """
+    tile = _state_tile(addr, JJ, KQ, dtype)
+    evict = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
+    if dtype is cutlass.Float32:
+        cute.autovec_copy(frag, tile, l1c_evict_priority=evict)
+    else:
+        stage = cute.make_rmem_tensor(cute.make_layout((4, JJ)), dtype)
+        stage.store(frag.load().to(dtype))
+        cute.autovec_copy(stage, tile, l1c_evict_priority=evict)
+
+
 @cute.kernel
 def _kda_kernel(
     gX: cute.Tensor,
@@ -133,7 +170,10 @@ def _kda_kernel(
     KQ: cutlass.Constexpr,
     SPLIT: cutlass.Constexpr,
     NCH: cutlass.Constexpr,
+    SBF16: cutlass.Constexpr,
 ):
+    SDT = cutlass.BFloat16 if SBF16 else cutlass.Float32
+    SW = SDT.width // 8
     RB = _D // SPLIT
     RC = RB // NCH
     JJ = _D // (KQ * 4)
@@ -238,30 +278,18 @@ def _kda_kernel(
             ogv.append(og)
             nwv.append(gNW[pvv])
 
-    src_base = p_state + src.to(cutlass.Int64) * (state_page * 4)
+    src_base = p_state + src.to(cutlass.Int64) * (state_page * SW)
     if cutlass.const_expr(NCH == 1):
         sfrg0 = [
             cute.make_rmem_tensor(cute.make_layout((4, JJ)), cutlass.Float32)
             for _ in range(R)
         ]
         lane_off0 = [
-            ((h * _D + row0 + rg * R + r) * _D + kq * 4).to(cutlass.Int64) * 4
+            ((h * _D + row0 + rg * R + r) * _D + kq * 4).to(cutlass.Int64) * SW
             for r in range(R)
         ]
         for r in cutlass.range_constexpr(R):
-            cute.autovec_copy(
-                cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.Float32,
-                        src_base + lane_off0[r],
-                        cutlass.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((4, JJ), stride=(1, KQ * 4)),
-                ),
-                sfrg0[r],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.EVICT_FIRST,
-            )
+            _load_state(src_base + lane_off0[r], sfrg0[r], JJ, KQ, SDT)
 
     # ========== stage 1: causal conv + SiLU, decay, beta, checkpoints ========
     # 4*D "channel tasks": 3*D convolution channels then D decay channels.
@@ -400,24 +428,11 @@ def _kda_kernel(
             ]
             lane_off = [
                 ((h * _D + row0 + ch * RC + rg * R + r) * _D + kq * 4).to(cutlass.Int64)
-                * 4
+                * SW
                 for r in range(R)
             ]
             for r in cutlass.range_constexpr(R):
-                gtile = cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.Float32,
-                        src_base + lane_off[r],
-                        cutlass.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((4, JJ), stride=(1, KQ * 4)),
-                )
-                cute.autovec_copy(
-                    gtile,
-                    sfrg[r],
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.EVICT_FIRST,
-                )
+                _load_state(src_base + lane_off[r], sfrg[r], JJ, KQ, SDT)
 
         for t in cutlass.range_constexpr(T):
             if t < seq_len:
@@ -501,23 +516,10 @@ def _kda_kernel(
                 if live:
                     if slots[t] > 0:
                         dst_base = p_state + slots[t].to(cutlass.Int64) * (
-                            state_page * 4
+                            state_page * SW
                         )
                         for r in cutlass.range_constexpr(R):
-                            gwtile = cute.make_tensor(
-                                cute.make_ptr(
-                                    cutlass.Float32,
-                                    dst_base + lane_off[r],
-                                    cutlass.AddressSpace.gmem,
-                                    assumed_align=16,
-                                ),
-                                cute.make_layout((4, JJ), stride=(1, KQ * 4)),
-                            )
-                            cute.autovec_copy(
-                                sfrg[r],
-                                gwtile,
-                                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.EVICT_FIRST,
-                            )
+                            _store_state(sfrg[r], dst_base + lane_off[r], JJ, KQ, SDT)
 
     if lane == 0:
         for t in cutlass.range_constexpr(T):
@@ -610,6 +612,7 @@ def _kda_launch(
     bpm: cutlass.Constexpr,
     SPLIT: cutlass.Constexpr,
     NCH: cutlass.Constexpr,
+    SBF16: cutlass.Constexpr,
 ):
     p_x = m_x.iterator.toint()
     p_w = m_w.iterator.toint()
@@ -673,6 +676,7 @@ def _kda_launch(
         KQ,
         SPLIT,
         NCH,
+        SBF16,
     )
     if cutlass.const_expr(SPLIT > 1):
         kernel.launch(
@@ -735,6 +739,7 @@ def _get_compiled_kernel(
     bpm,
     NCH,
     SPLIT,
+    state_is_bf16=False,
 ):
     dim = H * _D
     sequences = cute.sym_int()
@@ -768,7 +773,7 @@ def _get_compiled_kernel(
         _compact_fake((boundaries,), cutlass.Int32),
         _compact_fake((sequences,), cutlass.Int32),
         cute.runtime.make_fake_tensor(
-            cutlass.Float32,
+            cutlass.BFloat16 if state_is_bf16 else cutlass.Float32,
             (slots, H, _D, _D),
             (cute.sym_int64(divisibility=16), _D * _D, _D, 1),
             assumed_align=16,
@@ -787,6 +792,7 @@ def _get_compiled_kernel(
         f"_lb{str(lower_bound).replace('.', '_').replace('-', 'm')}"
         f"_eps{str(norm_eps).replace('.', '_').replace('-', 'm')}"
         f"_r{R}_kq{KQ}_bpm{bpm}_nch{NCH}_split{SPLIT}"
+        f"{'_sbf16' if state_is_bf16 else ''}"
     )
     return build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
@@ -807,6 +813,7 @@ def _get_compiled_kernel(
             bpm,
             SPLIT,
             NCH,
+            state_is_bf16,
             options="--enable-tvm-ffi --generate-line-info",
         ),
         extra_key_files=_SOURCE_FILES,
@@ -869,6 +876,7 @@ def _run_fused_kda_decode_multitoken(
         bpm,
         NCH,
         SPLIT,
+        state.dtype == torch.bfloat16,
     )
 
     entry(
@@ -895,8 +903,10 @@ def _run_fused_kda_decode_multitoken(
 def _check_cuda_tensor(name, tensor, dtype):
     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    expected = dtype if isinstance(dtype, tuple) else (dtype,)
+    if tensor.dtype not in expected:
+        names = " or ".join(str(item) for item in expected)
+        raise TypeError(f"{name} must have dtype {names}, got {tensor.dtype}")
 
 
 @torch.no_grad()
@@ -936,7 +946,7 @@ def run_fused_kda_decode_multitoken(
     _check_cuda_tensor("state_indices", state_indices, torch.int32)
     _check_cuda_tensor("query_start_loc", query_start_loc, torch.int32)
     _check_cuda_tensor("num_accepted_tokens", num_accepted_tokens, torch.int32)
-    _check_cuda_tensor("state", state, torch.float32)
+    _check_cuda_tensor("state", state, (torch.float32, torch.bfloat16))
     _check_cuda_tensor("output_gate", output_gate, torch.bfloat16)
     _check_cuda_tensor("norm_weight", norm_weight, torch.float32)
 
