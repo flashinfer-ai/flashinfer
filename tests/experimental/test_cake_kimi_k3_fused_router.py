@@ -19,6 +19,9 @@ import torch
 
 from flashinfer.experimental.kimi_k3_fused_router import cake_backend
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
+    ARM_G_CTAS_PER_SM,
+    ARM_L_MIN_GRID,
+    ARM_LC_TOKENS,
     ARM_Q_CLUSTER,
     BLOCK_M_VALUES,
     NUM_EXPERTS,
@@ -191,16 +194,16 @@ def test_route_tables_cover_the_routed_shapes():
         assert sorted(table) == sorted(ROUTED_SHAPES), arch
         assert len(table) == 28
     assert {arm for arm in SHAPE_ROUTES["sm_100a"].values()} == {
-        "A",
         "L",
+        "LC",
         "M",
         "M4S",
         "Q",
         "G",
     }
     assert {arm for arm in SHAPE_ROUTES["sm_103a"].values()} == {
-        "A",
         "L",
+        "LC",
         "M",
         "Q",
         "G",
@@ -208,7 +211,11 @@ def test_route_tables_cover_the_routed_shapes():
     assert route_arm("sm_100a", 512, 8) == "M4S"
     assert route_arm("sm_103a", 512, 8) == "Q"
     for arch in SHAPE_ROUTES:
-        assert route_arm(arch, 1, 16) == "A"
+        assert route_arm(arch, 1, 16) == "L"
+        for rows in ARM_LC_TOKENS:
+            assert route_arm(arch, rows, 8) == "LC"
+            assert route_arm(arch, rows, 16) == "LC"
+        assert route_arm(arch, 16, 8) == "L"
         assert route_arm(arch, 128, 8) == "L"
         assert route_arm(arch, 256, 16) == "M"
         assert route_arm(arch, 2048, 8) == "Q"
@@ -231,17 +238,20 @@ def test_persistent_grid_cap():
 def test_launch_grid_rules(compute_capability, sm_count):
     cap = persistent_grid_cap(compute_capability, sm_count)
     kw = dict(compute_capability=compute_capability, sm_count=sm_count)
-    assert launch_grid("A", 1, **kw) == 1
-    # Two and four tokens launch eight CTAs; otherwise one CTA per token up to the cap.
-    assert launch_grid("L", 2, **kw) == 8
-    assert launch_grid("L", 4, **kw) == 8
-    assert launch_grid("L", 8, **kw) == 8
+    # Arm LC: one cluster of num_tokens CTAs.
+    for rows in ARM_LC_TOKENS:
+        assert launch_grid("LC", rows, **kw) == rows
+    # Arm L: at least the 128 plan owners, otherwise one CTA per token up to the cap.
+    assert launch_grid("L", 1, **kw) == ARM_L_MIN_GRID
+    assert launch_grid("L", 16, **kw) == ARM_L_MIN_GRID
     assert launch_grid("L", 128, **kw) == 128
     assert launch_grid("L", 512, **kw) == min(512, cap)
     assert launch_grid("M", 256, **kw) == 256
     assert launch_grid("M", 2048, **kw) == cap
-    assert launch_grid("G", 4096, **kw) == cap
-    assert launch_grid("G", 8192, **kw) == cap
+    # Arm G: CTAs-per-SM launch bound of the architecture.
+    g_ctas = ARM_G_CTAS_PER_SM[compute_capability] * sm_count
+    assert launch_grid("G", 4096, **kw) == min(4096, g_ctas)
+    assert launch_grid("G", 8192, **kw) == g_ctas
     # Arm M4S: four CTAs per SM regardless of the architecture cap.
     assert launch_grid("M4S", 512, **kw) == 512
     assert launch_grid("M4S", 2048, **kw) == 4 * sm_count
@@ -264,8 +274,12 @@ def test_launch_grid_rules(compute_capability, sm_count):
         launch_grid("M", 64, **kw)
     with pytest.raises(RuntimeError):
         launch_grid("M4S", 256, **kw)
-    with pytest.raises(RuntimeError):
-        launch_grid("A", 2, **kw)
+    with pytest.raises(RuntimeError, match="exactly num_tokens"):
+        launch_grid("LC", 16, **kw)
+    with pytest.raises(RuntimeError, match="launch bound"):
+        launch_grid("G", 4096, compute_capability=(9, 0), sm_count=132)
+    with pytest.raises(ValueError):
+        launch_grid("A", 1, **kw)
     with pytest.raises(ValueError):
         launch_grid("Z", 8, **kw)
 
@@ -392,7 +406,9 @@ def test_allocating_api_matches_reference():
     assert torch.equal(plan.expert_offsets, expected.expert_offsets)
 
 
-@pytest.mark.parametrize("num_tokens,block_m", [(8, 16), (256, 8), (2048, 16)])
+@pytest.mark.parametrize(
+    "num_tokens,block_m", [(1, 8), (8, 16), (256, 8), (2048, 16), (4096, 8)]
+)
 def test_graph_replay_follows_device_inputs(num_tokens, block_m):
     """Capture once, replay with new logits / bias written into the same buffers."""
     runner, logits, bias, plan = _run_and_check(num_tokens, block_m, seed=21)

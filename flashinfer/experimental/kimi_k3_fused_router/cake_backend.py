@@ -21,10 +21,12 @@ sigmoid scores) and writes the expert-aligned route plan (``sorted_token_ids``,
 ``expert_ids``, ``num_tokens_post_padded``, per-expert counts / offsets /
 scatter offsets) consumed by grouped MoE GEMMs.  The program is a family of
 kernels: one dispatch arm per exact ``(num_tokens, block_m)`` shape of the
-routed set, selected by a per-architecture table, each launched as a
-persistent grid bounded by the device's SM count (cooperative launch; arm Q
+routed set, selected by a per-architecture table.  Most arms launch as a
+cooperative persistent grid bounded by the device's SM count (arm Q
 additionally uses 4-CTA clusters and is bounded by the driver's co-resident
-cluster capacity).  Nothing is planned on the host and nothing is allocated
+cluster capacity; arm G uses a per-architecture CTAs-per-SM bound); arm LC
+launches one non-cooperative cluster of ``num_tokens`` CTAs for the smallest
+batches.  Nothing is planned on the host and nothing is allocated
 at launch, so a prepared runner is CUDA Graph safe.  See ``README.md`` in
 this package.
 """
@@ -40,6 +42,7 @@ import tvm_ffi
 from .cake_jit import (
     MODULES,
     load_kimi_k3_fused_router_module,
+    module_num_tokens,
     registered_programs,
     select_module,
     uses_cluster_launch,
@@ -57,6 +60,12 @@ THREADS = 224
 NUM_WARPS = THREADS // 32
 OWNER_CTAS = NUM_EXPERTS // NUM_WARPS
 ARM_L_MAX_TOKENS = 512
+# Arm L launches at least this many CTAs (the plan owners) whatever num_tokens is.
+ARM_L_MIN_GRID = 128
+# Arm LC: one kernel per row count, launched as a single cluster of num_tokens CTAs.
+ARM_LC_TOKENS = (2, 4, 8)
+# Arm G: persistent grid of CTAs-per-SM x SM count (launch bounds of the kernel).
+ARM_G_CTAS_PER_SM = {(10, 0): 4, (10, 3): 6}
 ARM_M_MAX_TOKENS = 2048
 ARM_Q_MAX_TOKENS = 2048
 ARM_Q_CLUSTER = 4
@@ -84,14 +93,14 @@ MAIN_KWARGS = (
 # the same 28 shapes; SM100 (B200) serves num_tokens = 512 with arm M4S where
 # SM103 (B300) already fits arm Q.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
-    (1, 8): "A",
-    (1, 16): "A",
-    (2, 8): "L",
-    (2, 16): "L",
-    (4, 8): "L",
-    (4, 16): "L",
-    (8, 8): "L",
-    (8, 16): "L",
+    (1, 8): "L",
+    (1, 16): "L",
+    (2, 8): "LC",
+    (2, 16): "LC",
+    (4, 8): "LC",
+    (4, 16): "LC",
+    (8, 8): "LC",
+    (8, 16): "LC",
     (16, 8): "L",
     (16, 16): "L",
     (32, 8): "L",
@@ -220,16 +229,19 @@ def launch_grid(
     arm-Q kernel (required for arm Q only).
     """
     rows = int(num_tokens)
+    major, minor = (int(v) for v in compute_capability)
+    compute_capability = (major, minor)
     grid_rows = 8 if rows in (2, 4) else rows
-    grid_x = max(1, min(grid_rows, persistent_grid_cap(compute_capability, sm_count)))
-    if arm == "A":
-        if rows != 1:
-            raise RuntimeError("arm A serves exactly one token")
-        return 1
+    cap = persistent_grid_cap(compute_capability, sm_count)
+    grid_x = max(1, min(grid_rows, cap))
+    if arm == "LC":
+        if rows not in ARM_LC_TOKENS:
+            raise RuntimeError(f"arm LC serves exactly num_tokens in {ARM_LC_TOKENS}")
+        return rows
     if arm == "L":
         if rows > ARM_L_MAX_TOKENS:
             raise RuntimeError(f"arm L admits at most {ARM_L_MAX_TOKENS} tokens")
-        return grid_x
+        return max(1, min(max(grid_rows, ARM_L_MIN_GRID), cap))
     if arm == "M":
         if rows > ARM_M_MAX_TOKENS or rows < OWNER_CTAS:
             raise RuntimeError(
@@ -264,7 +276,13 @@ def launch_grid(
             )
         return grid_x
     if arm == "G":
-        return grid_x
+        try:
+            ctas_per_sm = ARM_G_CTAS_PER_SM[compute_capability]
+        except KeyError:
+            raise RuntimeError(
+                f"arm G has no launch bound for compute capability {compute_capability}"
+            ) from None
+        return max(1, min(grid_rows, ctas_per_sm * int(sm_count)))
     raise ValueError(f"unknown dispatch arm {arm!r}")
 
 
@@ -423,13 +441,18 @@ def generated_program_available(
         return False
     registered = registered_programs(arch)
     if num_tokens is None and block_m is None:
-        needed = {(arm, bm) for (_, bm), arm in SHAPE_ROUTES[arch].items()}
+        needed = {
+            (arm, bm, module_num_tokens(arm, rows))
+            for (rows, bm), arm in SHAPE_ROUTES[arch].items()
+        }
         return bool(MODULES) and needed <= registered
     if num_tokens is None or block_m is None:
         raise ValueError("pass both num_tokens and block_m or neither")
     key = (int(num_tokens), int(block_m))
     arm = SHAPE_ROUTES[arch].get(key)
-    return arm is not None and (arm, key[1]) in registered
+    return (
+        arm is not None and (arm, key[1], module_num_tokens(arm, key[0])) in registered
+    )
 
 
 def _max_active_clusters(module: Any, record: dict[str, Any], device_index: int) -> int:
@@ -479,14 +502,14 @@ def prepare_kimi_k3_fused_router(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    module_name = select_module(arch, arm, block_m)
+    module_name = select_module(arch, arm, block_m, module_num_tokens(arm, num_tokens))
     record = MODULES[module_name]
     physical = record["main"]
     with torch.cuda.device(device_index):
         module = load_kimi_k3_fused_router_module(module_name, "main")
         properties = torch.cuda.get_device_properties(device_index)
         max_active_clusters = None
-        if uses_cluster_launch(record):
+        if arm == "Q" and uses_cluster_launch(record):
             max_active_clusters = _max_active_clusters(module, record, device_index)
         grid_x = launch_grid(
             arm,

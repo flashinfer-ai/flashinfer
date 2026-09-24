@@ -42,34 +42,48 @@ ARCH_NVCC_FLAGS = {
 
 # Dispatch arms of the generated program.  The per-shape route tables in
 # ``cake_backend`` name one arm per (architecture, num_tokens, block_m):
-#   A   : single-CTA interval kernel for one token
-#   L   : one-join plan builder, num_tokens <= 512
+#   L   : one-join plan builder, num_tokens <= 512, at least 128 CTAs launched
+#   LC  : one cluster of num_tokens CTAs (2, 4 or 8) exchanging selected ids
+#         through distributed shared memory; one kernel per row count,
+#         non-cooperative cluster launch
 #   M   : one-join bitmap plan builder, 128 <= num_tokens <= 2048
 #   M4S : arm M with four CTAs per SM and spread owner CTAs (SM100 only)
 #   Q   : arm M's cp.async ID stream in 4-CTA clusters (cooperative cluster launch)
-#   G   : two-join persistent kernel for the largest batches
-ARMS = ("A", "L", "M", "M4S", "Q", "G")
+#   G   : two-join persistent kernel for the largest batches, compiled with
+#         per-architecture launch bounds (4 CTAs/SM on SM100, 6 on SM103)
+ARMS = ("L", "LC", "M", "M4S", "Q", "G")
+# Arms registered per row count (one kernel per num_tokens); every other arm
+# registers one module per (arch, block_m) and serves all of its rows.
+PER_ROW_COUNT_ARMS = ("LC",)
 
 
-def select_module(arch: str, arm: str, block_m: int) -> str:
-    """Return the registered module name for ``arch``, dispatch ``arm`` and ``block_m``."""
+def module_num_tokens(arm: str, num_tokens: int):
+    """``num_tokens`` key of the module serving ``arm`` (``None`` for shared kernels)."""
+    return int(num_tokens) if arm in PER_ROW_COUNT_ARMS else None
+
+
+def select_module(arch: str, arm: str, block_m: int, num_tokens=None) -> str:
+    """Registered module name for ``arch``, dispatch ``arm``, ``block_m`` (and, for
+    per-row-count arms, ``num_tokens``)."""
     for name, record in MODULES.items():
         if (
             record["arch"] == arch
             and record["arm"] == arm
             and int(record["block_m"]) == int(block_m)
+            and record.get("num_tokens") == num_tokens
         ):
             return name
+    rows = "" if num_tokens is None else f", num_tokens {num_tokens}"
     raise NotImplementedError(
-        f"The generated Kimi-K3 fused router program (arm {arm}, block_m {block_m}) "
+        f"The generated Kimi-K3 fused router program (arm {arm}, block_m {block_m}{rows}) "
         f"for {arch} is not registered in this checkout yet"
     )
 
 
-def registered_programs(arch: str) -> set[tuple[str, int]]:
-    """``{(arm, block_m)}`` registered for ``arch``."""
+def registered_programs(arch: str) -> set[tuple[str, int, Any]]:
+    """``{(arm, block_m, num_tokens_or_None)}`` registered for ``arch``."""
     return {
-        (record["arm"], int(record["block_m"]))
+        (record["arm"], int(record["block_m"]), record.get("num_tokens"))
         for record in MODULES.values()
         if record["arch"] == arch
     }

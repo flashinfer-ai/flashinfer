@@ -23,14 +23,17 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
 - The program is a family of kernels. A per-architecture table maps each
   exact `(num_tokens, block_m)` shape of the routed set,
   `num_tokens in {1, 2, 4, ..., 8192}` (powers of two) x `block_m in {8, 16}`,
-  to one dispatch arm (a single-CTA kernel for one token, one-join plan
-  builders for small and medium batches, a 4-CTA-cluster variant and a
-  two-join persistent kernel for the largest batches). Other shapes raise
-  `NotImplementedError`.
-- Every arm but the single-token one is a cooperative persistent launch whose
-  grid is bounded by the device SM count (three CTAs per SM on CC 10.0, four
-  on CC 10.3). The cluster arm is additionally bounded by the number of
-  co-resident 4-CTA clusters the driver reports for the kernel
+  to one dispatch arm (a single cluster of 2, 4 or 8 CTAs exchanging the
+  selected ids through distributed shared memory for the smallest batches,
+  one-join plan builders for small and medium batches, a 4-CTA-cluster
+  variant and a two-join persistent kernel for the largest batches). Other
+  shapes raise `NotImplementedError`.
+- Every arm but the small-batch cluster one is a cooperative persistent launch
+  whose grid is bounded by the device SM count (three CTAs per SM on CC 10.0,
+  four on CC 10.3; the largest-batch arm uses its own launch bound of four or
+  six CTAs per SM, and the one-join arm launches at least its 128 plan-owner
+  CTAs). The 4-CTA-cluster arm is additionally bounded by the number of
+  co-resident clusters the driver reports for the kernel
   (`cudaOccupancyMaxActiveClusters`, queried once at preparation through a
   small helper linked next to the generated binding).
 - Nothing is planned on the host and nothing is allocated at launch: a
