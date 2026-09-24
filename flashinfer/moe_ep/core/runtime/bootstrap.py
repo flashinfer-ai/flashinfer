@@ -305,8 +305,17 @@ def finalize_moe_ep_runtime(handle: MoEEpRuntimeHandle | None) -> None:
 
 
 def split_comm_runtime_requirements(comm_backend_name: str) -> FrozenSet[str]:
-    """Runtime needs for a split-path comm backend."""
-    if comm_backend_name in ("nccl_ep", "nixl_ep"):
+    """Runtime needs for a split-path comm backend.
+
+    The NVLink backends exchange their symmetric-memory handles over
+    torch.distributed.
+    """
+    if comm_backend_name in (
+        "nccl_ep",
+        "nixl_ep",
+        "nvlink_one_sided",
+        "nvlink_two_sided",
+    ):
         return frozenset({TORCH_DIST})
     return frozenset()
 
