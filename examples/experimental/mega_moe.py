@@ -1,4 +1,5 @@
 """Run one prepared MoE example; minimum hardware SM103a with 152 SMs."""
+
 import argparse
 import torch
 from mega_moe_inputs import make_smoke, make_grouped_l2
@@ -6,7 +7,9 @@ from mega_moe_inputs import make_smoke, make_grouped_l2
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--family", choices=("source", "v3", "grouped-l2"), default="source")
+    parser.add_argument(
+        "--family", choices=("source", "v3", "grouped-l2"), default="source"
+    )
     parser.add_argument("--precision", choices=("fp4", "fp8"), default="fp4")
     args = parser.parse_args()
     if args.family == "grouped-l2":

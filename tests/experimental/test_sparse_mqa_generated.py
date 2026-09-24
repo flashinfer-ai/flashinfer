@@ -4,6 +4,7 @@ non-default-stream dependencies, changed-input graph replay, invalid-slot retent
 Analytical fixture derived from DeepGEMM schedule semantics.
 Copyright (c) 2025 DeepSeek; upstream-derived portions are MIT licensed.
 """
+
 import pytest
 import torch
 
@@ -14,7 +15,7 @@ def analytical_case(fmt, paged):
     queries, capacity, block, page = 9, 2048, 8, 64
     row = 64 if fmt == "mxfp4" else 128
     keys = 640 if fmt == "mxfp4" else 512
-    positive, negative = (0x22, 0xaa) if fmt == "mxfp4" else (0x38, 0xb8)
+    positive, negative = (0x22, 0xAA) if fmt == "mxfp4" else (0x38, 0xB8)
     pages = keys // page
     counts = [keys // block - 2 * ((qi // 2) % 4) - qi % 2 for qi in range(queries)]
     requests = [qi // 3 for qi in range(queries)]
@@ -33,33 +34,60 @@ def analytical_case(fmt, paged):
         qscale.extend(bytes([127 + qi % 2]) * (32 * 4))
     q = packed(qbytes, (queries, 32, row))
     sf_q = packed(qscale, (queries, 32), torch.int32)
-    weights = tensor([[1/32] * 16 + [1/64] * 16 for _ in range(queries)], torch.bfloat16)
+    weights = tensor(
+        [[1 / 32] * 16 + [1 / 64] * 16 for _ in range(queries)], torch.bfloat16
+    )
     kvbytes, kvscale = bytearray(), bytearray()
     if paged:
         stride = (page * (row + 4) + 511) // 512 * 512
         for pi in range(pages):
             for token in range(page):
                 kvbytes.extend(bytes([negative if token % 2 else positive]) * row)
-            kvbytes.extend(bytes([127 + pi % 2, 128 + pi % 2, 126 + pi % 2, 127 + pi % 2]) * page)
+            kvbytes.extend(
+                bytes([127 + pi % 2, 128 + pi % 2, 126 + pi % 2, 127 + pi % 2]) * page
+            )
             kvbytes.extend(bytes(stride - page * (row + 4)))
         kv, sf_kv = packed(kvbytes, (pages, stride)), None
     else:
         for token in range(keys):
             pi = token // page
             kvbytes.extend(bytes([negative if token % 2 else positive]) * row)
-            kvscale.extend(bytes([127 + pi % 2, 128 + pi % 2, 126 + pi % 2, 127 + pi % 2]))
+            kvscale.extend(
+                bytes([127 + pi % 2, 128 + pi % 2, 126 + pi % 2, 127 + pi % 2])
+            )
         kv = packed(kvbytes, (keys, row))
         sf_kv = packed(kvscale, (keys,), torch.int32)
-    sparse = tensor([list(range(n)) + [n-1] * (capacity-n) for n in counts], torch.int32)
+    sparse = tensor(
+        [list(range(n)) + [n - 1] * (capacity - n) for n in counts], torch.int32
+    )
     ends = tensor([n * block for n in counts], torch.int32)
     kwargs = dict(fmt=fmt, sparse_block_kv=block, page_kv=page)
     if paged:
-        kwargs.update(context_lens=ends, block_table=tensor(table, torch.int32), request_indices=tensor(requests, torch.int32))
+        kwargs.update(
+            context_lens=ends,
+            block_table=tensor(table, torch.int32),
+            request_indices=tensor(requests, torch.int32),
+        )
     else:
         kwargs.update(starts=torch.zeros_like(ends), ends=ends, num_kv_tokens=keys)
-    return dict(q=q, sf_q=sf_q, kv=kv, sf_kv=sf_kv, weights=weights, sparse=sparse,
-                ends=ends, kwargs=kwargs, counts=counts, table=table, fmt=fmt, paged=paged,
-                page=page, block=block, capacity=capacity, row=row)
+    return dict(
+        q=q,
+        sf_q=sf_q,
+        kv=kv,
+        sf_kv=sf_kv,
+        weights=weights,
+        sparse=sparse,
+        ends=ends,
+        kwargs=kwargs,
+        counts=counts,
+        table=table,
+        fmt=fmt,
+        paged=paged,
+        page=page,
+        block=block,
+        capacity=capacity,
+        row=row,
+    )
 
 
 def analytical_expected(case, changed):
@@ -68,7 +96,11 @@ def analytical_expected(case, changed):
         valid = count - int(changed)
         values = []
         for token in range(valid * case["block"]):
-            pi = case["table"][qi][token // case["page"]] if case["paged"] else token // case["page"]
+            pi = (
+                case["table"][qi][token // case["page"]]
+                if case["paged"]
+                else token // case["page"]
+            )
             dot = 144 * (1 << (qi % 2 + pi % 2))
             values.append((dot // (4 if token % 2 else 2)) * (2 if changed else 1))
         rows.append(values + [-1] * (case["capacity"] * case["block"] - len(values)))
@@ -77,16 +109,27 @@ def analytical_expected(case, changed):
 
 def consume_native(case, metadata):
     import deep_gemm
+
     dtype = torch.int8 if case["fmt"] == "mxfp4" else torch.float8_e4m3fn
     q = case["q"].view(dtype)
-    common = dict(weights=case["weights"], metadata=metadata,
-                  num_max_sparse_blocks=case["capacity"], sparse_block_kv=case["block"])
+    common = dict(
+        weights=case["weights"],
+        metadata=metadata,
+        num_max_sparse_blocks=case["capacity"],
+        sparse_block_kv=case["block"],
+    )
     if case["paged"]:
         kv = case["kv"]
         width = case["row"] + 4
-        cache = kv.as_strided((kv.shape[0], case["page"], 1, width), (kv.stride(0), width, width, 1))
-        return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(q=(q[:, None], case["sf_q"][:, None]), kv_cache=cache, **common)
-    return deep_gemm.fp8_fp4_sparse_mqa_logits(q=(q, case["sf_q"]), kv=(case["kv"].view(dtype), case["sf_kv"]), **common)
+        cache = kv.as_strided(
+            (kv.shape[0], case["page"], 1, width), (kv.stride(0), width, width, 1)
+        )
+        return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+            q=(q[:, None], case["sf_q"][:, None]), kv_cache=cache, **common
+        )
+    return deep_gemm.fp8_fp4_sparse_mqa_logits(
+        q=(q, case["sf_q"]), kv=(case["kv"].view(dtype), case["sf_kv"]), **common
+    )
 
 
 @pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
@@ -97,8 +140,18 @@ def test_sparse_metadata_stream_and_replay(fmt, paged):
     deep_gemm = pytest.importorskip("deep_gemm")
     case = analytical_case(fmt, paged)
     metadata = prepare_sparse_mqa_metadata(case["sparse"], **case["kwargs"])
-    output = torch.full((9, case["capacity"] * case["block"]), -1, device="cuda", dtype=torch.bfloat16)
-    plan = prepare_sparse_mqa_logits(case["q"], case["sf_q"], case["kv"], case["sf_kv"], case["weights"], metadata, output=output)
+    output = torch.full(
+        (9, case["capacity"] * case["block"]), -1, device="cuda", dtype=torch.bfloat16
+    )
+    plan = prepare_sparse_mqa_logits(
+        case["q"],
+        case["sf_q"],
+        case["kv"],
+        case["sf_kv"],
+        case["weights"],
+        metadata,
+        output=output,
+    )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     previous = deep_gemm.get_num_sms()

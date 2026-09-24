@@ -4,6 +4,7 @@ Requires an installed CUDA toolkit and Apache TVM FFI with ``embed_cubin``
 support. Build products live in the supplied private workspace. This module
 accepts no precompiled GPU binary and imports no source-generation framework.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -54,15 +55,21 @@ def build_from_ptx(
     binding_source = binding_bytes.decode("utf-8")
     target = re.search(r"(?m)^\s*\.target\s+([^\s,]+)", ptx_source)
     if target is None or target.group(1) != arch:
-        raise ValueError(f"exported PTX .target must equal requested architecture {arch!r}")
+        raise ValueError(
+            f"exported PTX .target must equal requested architecture {arch!r}"
+        )
     if isinstance(ptxas_options, str):
         raise TypeError("ptxas_options must be a sequence of individual arguments")
     options = tuple(ptxas_options)
     for option in options:
         if not isinstance(option, str) or not option.startswith("-"):
             raise ValueError("assembler options must be individual flag arguments")
-        if option.startswith(("-arch", "--gpu-name", "-o", "--output-file", "--options-file")):
-            raise ValueError(f"builder owns source, target and output selection: {option!r}")
+        if option.startswith(
+            ("-arch", "--gpu-name", "-o", "--output-file", "--options-file")
+        ):
+            raise ValueError(
+                f"builder owns source, target and output selection: {option!r}"
+            )
     assembler = shutil.which("ptxas")
     if assembler is None:
         raise FileNotFoundError("installed CUDA toolkit ptxas is required")
@@ -72,7 +79,9 @@ def build_from_ptx(
         raise FileNotFoundError(f"CUDA toolkit headers are absent from {include_dir}")
     target_includes = [str(Path(path).resolve(strict=True)) for path in include_paths]
     if any(not Path(path).is_dir() for path in target_includes):
-        raise NotADirectoryError("include_paths must name existing target header directories")
+        raise NotADirectoryError(
+            "include_paths must name existing target header directories"
+        )
     root = Path(workdir).resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     private = Path(tempfile.mkdtemp(prefix="ptx-build-", dir=root))
@@ -87,14 +96,21 @@ def build_from_ptx(
         "target_include_paths": target_includes,
     }
     if module_name is None:
-        module_name = "ptx_export_" + _sha256(json.dumps(identity, sort_keys=True).encode())[:24]
+        module_name = (
+            "ptx_export_" + _sha256(json.dumps(identity, sort_keys=True).encode())[:24]
+        )
     if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", module_name):
         raise ValueError("module_name must be a C++ identifier")
     record: dict[str, Any] = {
-        "status": "started", "phase": "assembly", "source_identity": identity,
-        "ptx_path": str(ptx_path), "binding_path": str(binding_path),
-        "private_build_directory": str(private), "module_name": module_name,
-        "assembler": assembler, "fresh_source_assembly": True,
+        "status": "started",
+        "phase": "assembly",
+        "source_identity": identity,
+        "ptx_path": str(ptx_path),
+        "binding_path": str(binding_path),
+        "private_build_directory": str(private),
+        "module_name": module_name,
+        "assembler": assembler,
+        "fresh_source_assembly": True,
     }
 
     def save() -> None:
@@ -107,15 +123,31 @@ def build_from_ptx(
         source.write_bytes(ptx_bytes)
         (private / "binding.cpp").write_bytes(binding_bytes)
         cubin_path = private / "kernel.cubin"
-        version = subprocess.run([assembler, "--version"], check=True, text=True,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+        version = subprocess.run(
+            [assembler, "--version"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+        )
         record["assembler_version"] = version.stdout.strip()
-        command = [assembler, "-v", *options, f"--gpu-name={arch}", str(source), "-o", str(cubin_path)]
+        command = [
+            assembler,
+            "-v",
+            *options,
+            f"--gpu-name={arch}",
+            str(source),
+            "-o",
+            str(cubin_path),
+        ]
         record["assembly_command"] = command
         save()
         t = time.monotonic()
         with (private / "ptxas.log").open("w", encoding="utf-8") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=120)
+            result = subprocess.run(
+                command, stdout=log, stderr=subprocess.STDOUT, timeout=120
+            )
         record["assembly_seconds"] = time.monotonic() - t
         record["assembly_exit_code"] = result.returncode
         record["assembly_log"] = str(private / "ptxas.log")

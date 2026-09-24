@@ -1,11 +1,26 @@
 """Experimental grouped FP4 E2M1 GEMM using prepacked UE8M0 scales."""
+
 from .api_logging import flashinfer_experimental_api
 
 
 @flashinfer_experimental_api
-def prepare_fp4_k_grouped_gemm(a,b,a_scales,b_scales,*,m,group_ks,k_alignment=256,
-        use_psum_layout=True,output_dtype='bf16',accumulate=False,num_stages=7,
-        out=None,grouped_layout=None,descriptor_workspace=None):
+def prepare_fp4_k_grouped_gemm(
+    a,
+    b,
+    a_scales,
+    b_scales,
+    *,
+    m,
+    group_ks,
+    k_alignment=256,
+    use_psum_layout=True,
+    output_dtype="bf16",
+    accumulate=False,
+    num_stages=7,
+    out=None,
+    grouped_layout=None,
+    descriptor_workspace=None,
+):
     """Prepare independently reduced A_g @ B_g.T products, optionally adding to out.
 
     A is [ceil(m/256)*256, sum(padded_K)/2], B is [N,sum(padded_K)/2].
@@ -21,7 +36,20 @@ def prepare_fp4_k_grouped_gemm(a,b,a_scales,b_scales,*,m,group_ks,k_alignment=25
     replay safe. Nonempty shapes must have an exported schedule in the catalog.
     """
     from .experimental.deepgemm_kgroup_gemm.kgroup_gemm import GroupedFP4Plan
-    return GroupedFP4Plan(a,b,a_scales,b_scales,m=m,group_ks=group_ks,k_alignment=k_alignment,
-        use_psum_layout=use_psum_layout,output_dtype=output_dtype,accumulate=accumulate,
-        num_stages=num_stages,out=out,grouped_layout=grouped_layout,
-        descriptor_workspace=descriptor_workspace)
+
+    return GroupedFP4Plan(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        m=m,
+        group_ks=group_ks,
+        k_alignment=k_alignment,
+        use_psum_layout=use_psum_layout,
+        output_dtype=output_dtype,
+        accumulate=accumulate,
+        num_stages=num_stages,
+        out=out,
+        grouped_layout=grouped_layout,
+        descriptor_workspace=descriptor_workspace,
+    )
