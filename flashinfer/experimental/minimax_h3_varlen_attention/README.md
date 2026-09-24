@@ -84,8 +84,15 @@ unit with one table lookup. The host builds, from `cu_seqlens` (empty segments
 dropped) and `num_heads`:
 
 * `seg_begin[s]`, `seg_len[s]` (int32, `num_segments` entries),
-* `unit_table` (int32, `2 * total_tiles` entries): per slot the segment index
-  and `head << 16 | cluster_in_segment`.
+* `unit_table` (int32, `4 * total_tiles` entries): per slot the segment index,
+  `head << 16 | cluster_in_segment`, `kv_block_begin << 16 | kv_blocks` (the
+  unit's K/V block range inside the segment) and its partial slot (`-1` for an
+  unsplit unit, which writes the BF16 output directly),
+* `combine_table` (int32, `4 * num_combine_units` entries): per K/V-split
+  unit the segment index, `head << 16 | cluster_in_segment`, its first partial
+  slot and the number of splits, plus the plan's partial workspace
+  `partial_O` (FP16, `num_partial_slots * 512 * 128`) and `partial_ML` (FP32,
+  `num_partial_slots * 512 * 2`).
 
 Units are enumerated segment-major (heads slow, clusters fast, so a cluster's
 Q tiles reuse the segment's K/V from L2) and placed into slots
@@ -93,6 +100,24 @@ longest-processing-time first over the per-unit cost `ceil(seg_len / 128) + 2`
 K/V blocks (`assign_unit_slots`): the partial tail round receives the cheapest
 units and, within every full round, the clusters that also own a tail unit
 receive that round's cheapest units; equal costs keep the enumeration order.
+
+**K/V splits for the partial wave.** When the unit count leaves a partial
+wave on the persistent grid (`total_units mod num_clusters != 0`, fewer than
+four waves), the planner (`choose_kv_splits`) simulates the slot assignment
+for splitting the `total_units mod num_clusters` most expensive units (and,
+as the fallback, every unit) `k = 2..8` ways into near-equal K/V block ranges
+and keeps the candidate with the lowest makespan plus combine cost when it
+beats the unsplit plan by more than 3 %. A split unit's ranges are separate
+units of the table; each runs the full online softmax over its range and
+writes its rows normalized by its own softmax sum as FP16 into its partial
+slot together with the FP32 `(scaled log2 row max, row sum)`. The `combine`
+stage (one warp per output row, `128` CTAs of 128 threads per split unit)
+then merges the slots with the exact FlashAttention formula
+`O = sum_i 2^(m_i - m) l_i O_i / sum_i 2^(m_i - m) l_i` into the BF16 output.
+It is launched after the attention kernel on the same stream and skipped when
+the plan has no split units. Plans with at least as many units as clusters
+per wave are unchanged (unsplit units are bitwise identical to the previous
+kernel).
 The plan is a host-side function of `(cu_seqlens, num_heads, num_SMs)` and
 reproduces the Cake production plan table for table (`num_heads < 2^15`,
 fewer than `2^16` clusters per segment). K/V TMA loads that run past a segment
@@ -123,16 +148,23 @@ kernel is unchanged. Host tables (int32):
   K and V of the 32-token slice `b % 4` of packed block `(b // 4) % PB` for
   head `(b // 4) // PB`.
 * attention scheduler (built once per `(cu_seqlens, heads)`,
-  `build_tile_tables`), `total_tiles = heads * sum(ceil(len / 512))` entries:
-  `cl_head[t]`, `cl_seg_begin[t]`, `cl_seg_len[t]`, `cl_kv_base[t] =
-  seg_tile_base[s]`, `cl_q_block[t]` (first Q block of the cluster tile inside
-  its segment, a multiple of four). Tiles are ordered segment-major with the
-  longest segments first (ties keep segment order), then head, then the
-  segment's cluster tiles, so the statically round-robined persistent grid
-  (`grid = 2 * min(num_SMs / 2, total_tiles)` CTAs, cluster `i` runs tiles
-  `i, i + G, ...`) ends on the cheapest tiles while consecutive tiles stream
-  one head's K/V. CTA rank `r` of a cluster owns blocks `cl_q_block + 2r` and
-  `cl_q_block + 2r + 1`.
+  `build_tile_tables`), one entry per scheduled unit (`heads * sum(ceil(len /
+  512))` cluster tiles plus the extra K/V-split ranges): `cl_head[t]`,
+  `cl_seg_begin[t]`, `cl_seg_len[t]`, `cl_kv_base[t] = seg_tile_base[s]`,
+  `cl_q_block[t]` (first Q block of the cluster tile inside its segment, a
+  multiple of four), `cl_kv_begin[t]` / `cl_kv_blocks[t]` (the unit's K/V
+  block range inside the segment) and `cl_ws_slot[t]` (partial slot, `-1` for
+  an unsplit unit). Units are enumerated segment-major with the longest
+  segments first (ties keep segment order), then head, then the segment's
+  cluster tiles (consecutive units stream one head's K/V), split by the same
+  `choose_kv_splits` planner as the BF16 family, and placed into the
+  statically strided persistent grid (`grid = 2 * min(num_SMs / 2,
+  total_tiles)` CTAs, cluster `i` runs units `i, i + G, ...`)
+  longest-processing-time first (`assign_unit_slots`). CTA rank `r` of a
+  cluster owns blocks `cl_q_block + 2r` and `cl_q_block + 2r + 1`. The tables
+  also carry the `combine_table`, `seg_begin` / `seg_len` and the FP16 / FP32
+  partial workspace of the `combine` stage, which runs after the attention
+  launch (ordinary serial launch) when the plan has split units.
 
 The attention launch is a **programmatic dependent launch**: the quantizer
 signals `griddepcontrol.launch_dependents` at its end, the attention prologue
@@ -140,7 +172,8 @@ runs its barrier/TMEM setup and then waits with `griddepcontrol.wait` before
 reading the packed operands. The launch attribute
 (`cudaLaunchAttributeProgrammaticStreamSerialization`) is baked into the
 generated attention host binding by the export, so the runner only enqueues
-the two launches in order on the current stream; the `fp8` `amax(V)`
+the launches in order on the current stream (quantizer, attention and, for
+plans with K/V-split units, the `combine` stage); the `fp8` `amax(V)`
 reduction runs before the quantizer launch.
 
 Packed operands (`q_fp4`, `k_fp4`, `q_scale`, `k_scale`, plus `v_fp4_t`,

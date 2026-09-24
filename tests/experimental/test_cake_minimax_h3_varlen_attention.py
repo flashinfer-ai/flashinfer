@@ -24,6 +24,10 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     BLOCK_M,
     CLUSTER_Q_ROWS,
     BLOCK_N,
+    COMBINE_WORDS,
+    MAX_KV_SPLITS,
+    PARTIAL_ROWS,
+    UNIT_WORDS,
     BF16_UNIT_OVERHEAD_BLOCKS,
     HEAD_DIM,
     QUANTIZE_SUBS_PER_BLOCK,
@@ -31,6 +35,8 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     TileTables,
     assign_unit_slots,
     build_bf16_segment_plan,
+    choose_kv_splits,
+    split_chunks,
     build_packed_segment_plan,
     build_tile_tables,
     normalize_cu_seqlens,
@@ -103,52 +109,150 @@ def test_assign_unit_slots_lpt():
     assert assign_unit_slots([2, 2, 2, 2], 2) == [1, 0, 3, 2]
 
 
+def _decode_unit_table(plan):
+    """``(segment, head, cluster, kv_begin, kv_blocks, slot)`` per scheduled unit."""
+    table = plan.unit_table.tolist()
+    assert len(table) == UNIT_WORDS * plan.total_tiles
+    return [
+        (
+            table[UNIT_WORDS * u],
+            table[UNIT_WORDS * u + 1] >> 16,
+            table[UNIT_WORDS * u + 1] & 0xFFFF,
+            table[UNIT_WORDS * u + 2] >> 16,
+            table[UNIT_WORDS * u + 2] & 0xFFFF,
+            table[UNIT_WORDS * u + 3],
+        )
+        for u in range(plan.total_tiles)
+    ]
+
+
+def _check_split_units(units, combine, blocks_of, num_partial_slots, num_combine_units):
+    """Shared K/V-split invariants of both planners.
+
+    ``units`` are ``(key, kv_begin, kv_blocks, slot)`` rows in slot order,
+    ``combine`` the flat combine table, ``blocks_of[key]`` the K/V block count
+    of the unit's segment.  Every unit key is covered exactly once by its
+    ranges; an unsplit unit is one range with slot -1; a split unit's ranges
+    are the near-equal chunks in consecutive partial slots, recorded once in the
+    combine table.
+    """
+    by_key = {}
+    for key, begin, count, slot in units:
+        by_key.setdefault(key, []).append((begin, count, slot))
+    assert len(combine) == COMBINE_WORDS * num_combine_units
+    combine_rows = {
+        (combine[COMBINE_WORDS * i], combine[COMBINE_WORDS * i + 1] >> 16, combine[COMBINE_WORDS * i + 1] & 0xFFFF): (
+            combine[COMBINE_WORDS * i + 2],
+            combine[COMBINE_WORDS * i + 3],
+        )
+        for i in range(num_combine_units)
+    }
+    assert len(combine_rows) == num_combine_units
+    slots_seen = []
+    for key, ranges in by_key.items():
+        ranges.sort()
+        blocks = blocks_of[key]
+        assert ranges[0][0] == 0 and ranges[-1][0] + ranges[-1][1] == blocks
+        for (b0, n0, _), (b1, _, _) in zip(ranges, ranges[1:], strict=False):
+            assert b0 + n0 == b1
+        if len(ranges) == 1:
+            assert ranges[0][2] == -1 and key not in combine_rows
+            continue
+        assert 2 <= len(ranges) <= MAX_KV_SPLITS
+        assert [(b, n) for b, n, _ in ranges] == split_chunks(blocks, len(ranges))
+        first, splits = combine_rows[key]
+        assert splits == len(ranges)
+        assert [slot for _, _, slot in ranges] == list(range(first, first + splits))
+        slots_seen.extend(range(first, first + splits))
+    assert set(combine_rows) <= set(by_key)
+    assert sorted(slots_seen) == list(range(num_partial_slots))
+
+
+@pytest.mark.parametrize("kv_splits", [None, 1, 3])
 @pytest.mark.parametrize("grid_clusters", PLAN_GRID_CLUSTERS)
 @pytest.mark.parametrize("label,cu,heads", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS)
-def test_bf16_segment_plan(label, cu, heads, grid_clusters):
+def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
     plan = build_bf16_segment_plan(
-        cu, torch.device("cpu"), heads, num_clusters=grid_clusters
+        cu, torch.device("cpu"), heads, num_clusters=grid_clusters, kv_splits=kv_splits
     )
     lengths = [b - a for a, b in zip(cu, cu[1:], strict=False) if b > a]
     clusters = [_ceil_div(n, CLUSTER_Q_ROWS) for n in lengths]
+    blocks = [_ceil_div(n, BLOCK_N) for n in lengths]
     assert plan.num_heads == heads
     assert plan.num_segments == len(lengths)
     assert plan.total_clusters == sum(clusters)
-    assert plan.total_tiles == heads * plan.total_clusters
     assert plan.num_clusters == min(grid_clusters, max(plan.total_tiles, 1))
     assert (
         plan.seg_begin.dtype
         == plan.seg_len.dtype
         == plan.unit_table.dtype
+        == plan.combine_table.dtype
         == torch.int32
     )
+    assert plan.partial_O.dtype == torch.float16 and plan.partial_ML.dtype == torch.float32
+    assert plan.partial_O.numel() == max(plan.num_partial_slots, 1) * PARTIAL_ROWS * HEAD_DIM
+    assert plan.partial_ML.numel() == max(plan.num_partial_slots, 1) * PARTIAL_ROWS * 2
     assert plan.seg_len.tolist() == lengths
     assert plan.seg_begin.tolist() == [
         a for a, b in zip(cu, cu[1:], strict=False) if b > a
     ]
-    table = plan.unit_table.tolist()
-    assert len(table) == 2 * plan.total_tiles
-    # Every (segment, head, cluster) unit appears exactly once.
-    decoded = [
-        (table[2 * u], table[2 * u + 1] >> 16, table[2 * u + 1] & 0xFFFF)
-        for u in range(plan.total_tiles)
-    ]
+    decoded = _decode_unit_table(plan)
     expected = [
         (s, h, c)
         for s, n in enumerate(clusters)
         for h in range(heads)
         for c in range(n)
     ]
-    assert sorted(decoded) == expected
+    # Every (segment, head, cluster) unit is covered exactly once by its K/V
+    # ranges; split units have consecutive partial slots and one combine row.
+    assert sorted({(s, h, c) for s, h, c, *_ in decoded}) == expected
+    _check_split_units(
+        [((s, h, c), b, n, slot) for s, h, c, b, n, slot in decoded],
+        plan.combine_table.tolist() if plan.num_combine_units else [],
+        {(s, h, c): blocks[s] for s, h, c in expected},
+        plan.num_partial_slots,
+        plan.num_combine_units,
+    )
+    # The split factors are the planner's (forced or chosen) per-unit factors.
+    split_of = choose_kv_splits(
+        [blocks[s] for s, _h, _c in expected], plan.num_clusters, force=kv_splits
+    )
+    assert plan.max_kv_splits == max(split_of, default=1)
+    assert plan.total_tiles == sum(min(k, blocks[s]) for k, (s, _h, _c) in zip(split_of, expected, strict=True))
+    if kv_splits == 1:
+        assert plan.total_tiles == heads * plan.total_clusters
+        assert plan.num_combine_units == 0 and plan.num_partial_slots == 0
     # Slot order is the longest-processing-time-first assignment of the
-    # segment-major enumeration under the per-unit cost.
-    cost = [_ceil_div(n, BLOCK_N) + BF16_UNIT_OVERHEAD_BLOCKS for n in lengths]
-    slots = assign_unit_slots([cost[s] for s, _h, _c in expected], plan.num_clusters)
-    assert decoded == [expected[u] for u in slots]
+    # segment-major enumeration (ranges in K/V order) under the per-range cost.
+    ranges = [
+        ((s, h, c), b, n)
+        for k, (s, h, c) in zip(split_of, expected, strict=True)
+        for b, n in split_chunks(blocks[s], k)
+    ]
+    cost = [n + BF16_UNIT_OVERHEAD_BLOCKS for _key, _b, n in ranges]
+    slots = assign_unit_slots(cost, plan.num_clusters)
+    assert [((s, h, c), b, n) for s, h, c, b, n, _ in decoded] == [ranges[u] for u in slots]
     G = plan.num_clusters
     for k in range(plan.total_tiles // G):
-        round_costs = [cost[decoded[k * G + i][0]] for i in range(G)]
+        round_costs = [decoded[k * G + i][4] for i in range(G)]
         assert round_costs == sorted(round_costs)
+
+
+def test_choose_kv_splits_policy():
+    # Four or more waves: never split.
+    assert choose_kv_splits([40] * 400, 74) == [1] * 400
+    # One unit per cluster and a partial wave of expensive units: the tail is
+    # split so the makespan drops below the unsplit wave.
+    blocks = [200] * 80
+    split_of = choose_kv_splits(blocks, 74)
+    assert len(split_of) == 80 and max(split_of) >= 2 and 1 <= min(split_of)
+    assert all(1 <= k <= MAX_KV_SPLITS for k in split_of)
+    # Cheap units gain nothing from splitting (combine cost dominates).
+    assert choose_kv_splits([2] * 80, 74) == [1] * 80
+    # Forced factors are clamped to the unit's block count.
+    assert choose_kv_splits([1, 5, 9], 74, force=4) == [1, 4, 4]
+    assert split_chunks(10, 4) == [(0, 3), (3, 3), (6, 2), (8, 2)]
+    assert split_chunks(2, 8) == [(0, 1), (1, 1)]
 
 
 @pytest.mark.parametrize("label,cu,heads", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS)
@@ -185,24 +289,30 @@ def test_packed_segment_plan(label, cu, heads):
         assert set(cl_kv_base[lo:hi]) == {plan.seg_tile_base[s]}
 
 
+@pytest.mark.parametrize("kv_splits", [None, 1, 3])
+@pytest.mark.parametrize("grid_clusters", PLAN_GRID_CLUSTERS)
 @pytest.mark.parametrize("heads", [7, 14, 28])
 @pytest.mark.parametrize(
     "label,cu,heads_unused", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS
 )
-def test_nvfp4_tile_tables(label, cu, heads_unused, heads):
+def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_splits):
     plan = build_packed_segment_plan(cu, torch.device("cpu"))
-    tiles = build_tile_tables(plan, heads, torch.device("cpu"))
+    tiles = build_tile_tables(
+        plan, heads, torch.device("cpu"), num_clusters=grid_clusters, kv_splits=kv_splits
+    )
     assert tiles.heads == heads
-    assert tiles.total_tiles == heads * plan.total_clusters
     tables = {name: getattr(tiles, name) for name in TileTables.NAMES}
     for name, table in tables.items():
         assert table.dtype == torch.int32, name
         assert table.shape == (max(tiles.total_tiles, 1),), name
+    assert tiles.seg_begin.tolist() == list(plan.seg_begin)
+    assert tiles.seg_len.tolist() == list(plan.seg_len)
+    assert tiles.partial_O.dtype == torch.float16 and tiles.partial_ML.dtype == torch.float32
+    assert tiles.partial_O.numel() == max(tiles.num_partial_slots, 1) * PARTIAL_ROWS * HEAD_DIM
     if tiles.total_tiles == 0:
+        assert tiles.num_combine_units == 0
         return
     rows = list(zip(*(tables[name].tolist() for name in TileTables.NAMES), strict=True))
-    # Every (head, cluster tile) pair appears exactly once, with the cluster's
-    # own per-cluster entries.
     cluster_rows = list(
         zip(
             plan.cl_seg_begin.tolist(),
@@ -212,41 +322,81 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads):
             strict=True,
         )
     )
-    per_cluster = {}
-    for c, row in enumerate(cluster_rows):
-        per_cluster.setdefault(row, []).append(c)
-    assert sorted(rows) == sorted(
-        (h, *row) for h in range(heads) for row in cluster_rows
+    segment_of_cluster = [
+        s for s in range(plan.num_segments) for _ in range(plan.cluster_off[s], plan.cluster_off[s + 1])
+    ]
+    # Every (head, cluster tile) pair is covered exactly once by its K/V ranges
+    # (the cluster's own per-cluster entries); split units park in
+    # consecutive partial slots with one combine row each.
+    assert sorted({row[:5] for row in rows}) == sorted(
+        (h, *cluster_rows[c]) for h in range(heads) for c in range(plan.total_clusters)
     )
-    # Order: segments by descending length (ties in segment order), then
-    # head, then the segment's cluster tiles in order.
+    combine = tiles.combine_table.tolist() if tiles.num_combine_units else []
+    key_of_row = {}
+    for c, crow in enumerate(cluster_rows):
+        s = segment_of_cluster[c]
+        for h in range(heads):
+            key_of_row[(h, *crow)] = (s, h, c - plan.cluster_off[s])
+    _check_split_units(
+        [(key_of_row[row[:5]], row[5], row[6], row[7]) for row in rows],
+        combine,
+        {key: _ceil_div(plan.seg_len[key[0]], BLOCK_N) for key in key_of_row.values()},
+        tiles.num_partial_slots,
+        tiles.num_combine_units,
+    )
+    # Enumeration: segments by descending length (ties in segment order), then
+    # head, then the segment's cluster tiles, then the unit's K/V ranges; the
+    # slots are that enumeration's longest-processing-time-first assignment.
     segments = sorted(range(plan.num_segments), key=lambda s: -plan.seg_len[s])
-    expected = [
-        (h, *cluster_rows[c])
+    keys = [
+        (h, c)
         for s in segments
         for h in range(heads)
         for c in range(plan.cluster_off[s], plan.cluster_off[s + 1])
     ]
-    assert rows == expected
-    # Consecutive tiles of one segment share a head (K/V stream locality).
-    for s in segments:
-        n = plan.cluster_off[s + 1] - plan.cluster_off[s]
-        if n > 1:
-            first = expected.index((0, *cluster_rows[plan.cluster_off[s]]))
-            assert len({row[0] for row in rows[first : first + n]}) == 1
+    blocks = [_ceil_div(plan.seg_len[segment_of_cluster[c]], BLOCK_N) for _h, c in keys]
+    split_of = choose_kv_splits(blocks, grid_clusters, force=kv_splits)
+    assert tiles.max_kv_splits == max(split_of)
+    ranges = [
+        (h, *cluster_rows[c], b, n)
+        for k, (h, c), nb in zip(split_of, keys, blocks, strict=True)
+        for b, n in split_chunks(nb, k)
+    ]
+    assert tiles.total_tiles == len(ranges)
+    if kv_splits == 1:
+        assert tiles.total_tiles == heads * plan.total_clusters
+        assert tiles.num_combine_units == 0
+    cost = [r[-1] + BF16_UNIT_OVERHEAD_BLOCKS for r in ranges]
+    G = min(grid_clusters, tiles.total_tiles)
+    slots = assign_unit_slots(cost, G)
+    assert [row[:7] for row in rows] == [ranges[u] for u in slots]
+    for k in range(tiles.total_tiles // G):
+        round_costs = [rows[k * G + i][6] for i in range(G)]
+        assert round_costs == sorted(round_costs)
 
 
 def test_nvfp4_tile_tables_lpt_order():
-    # Longest segment first, then head-major within the segment: the 600-token
-    # segment (two cluster tiles) precedes the 167- and 133-token segments.
+    # One cluster: the slots are the pure longest-processing-time order -- the
+    # 600-token segment's four units (5 + 2 blocks) precede the 167- and
+    # 133-token units (2 + 2 blocks, enumeration order kept on ties).
     plan = build_packed_segment_plan([0, 133, 300, 900], torch.device("cpu"))
-    tiles = build_tile_tables(plan, 2, torch.device("cpu"))
+    tiles = build_tile_tables(plan, 2, torch.device("cpu"), num_clusters=1, kv_splits=1)
     assert tiles.total_tiles == 2 * 4
     assert tiles.cl_seg_len.tolist() == [600, 600, 600, 600, 167, 167, 133, 133]
     assert tiles.cl_head.tolist() == [0, 0, 1, 1, 0, 1, 0, 1]
     assert tiles.cl_q_block.tolist() == [0, 4, 0, 4, 0, 0, 0, 0]
     assert tiles.cl_kv_base.tolist() == [4, 4, 4, 4, 2, 2, 0, 0]
     assert tiles.cl_seg_begin.tolist() == [300, 300, 300, 300, 133, 133, 0, 0]
+    assert tiles.cl_kv_begin.tolist() == [0] * 8
+    assert tiles.cl_kv_blocks.tolist() == [5, 5, 5, 5, 2, 2, 2, 2]
+    assert tiles.cl_ws_slot.tolist() == [-1] * 8
+    # Forced two-way split of every unit: the 600-token units become (0, 3) +
+    # (3, 2) block ranges in partial slots 0..7, the short units (0, 1) + (1, 1).
+    tiles = build_tile_tables(plan, 2, torch.device("cpu"), num_clusters=1, kv_splits=2)
+    assert tiles.total_tiles == 16 and tiles.num_combine_units == 8
+    assert tiles.num_partial_slots == 16 and tiles.max_kv_splits == 2
+    assert tiles.cl_kv_blocks.tolist()[:8] == [3, 3, 3, 3, 2, 2, 2, 2]
+    assert sorted(tiles.cl_ws_slot.tolist()) == list(range(16))
 
 
 def test_nvfp4_quantize_grid():
@@ -470,9 +620,9 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
         q, k, v, cu_seqlens, pv_mode=pv_mode, out=out, cu_seqlens_host=cu
     )
     assert runner.plan.PB == 2 + 2 + 5 and runner.plan.total_clusters == 1 + 1 + 2
-    assert runner.tile_tables.total_tiles == heads * 4
+    assert runner.tile_tables.total_tiles >= heads * 4
     assert runner.route_metadata["pv_mode"] == pv_mode
-    assert tuple(runner.stage_kwargs) == ("quantize", "attention")
+    assert tuple(runner.stage_kwargs) == ("quantize", "attention", "combine")
     assert runner.stage_kwargs["quantize"]["grid"] == (
         heads * 9 * QUANTIZE_SUBS_PER_BLOCK,
         1,
