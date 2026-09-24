@@ -78,22 +78,6 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     token_back_mode: (
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] | None
     ) = None
-    # Wire-level top-k dedup on dispatch: a token routed to several experts on
-    # the same remote rank crosses NVLink once; duplicate pool rows are
-    # re-materialized locally from the carrier row (bit-exact either way).
-    # COLLECTIVE: changes the route-word wire format, so it MUST match on
-    # every EP rank (like the geometry knobs).
-    dedup_dispatch: bool = False
-    # Combine dedup: fc2 rows of one (src_rank, src_token) group are
-    # pre-reduced in fp32 on the expert rank; one row per contributing rank
-    # crosses the wire.  Requires token_back_mode="reuse_dispatch_warps";
-    # COLLECTIVE like dedup_dispatch.
-    grouped_token_back: bool = False
-    # Combine wire format: "bf16" (default) or per-32 e8m0 fp8
-    # ("32e4m3xe8m0" / "32e5m2xe8m0"; halved return bytes, receiver
-    # dequantizes to fp32 before accumulating).  Quantized formats require
-    # grouped_token_back.  COLLECTIVE.
-    combine_format: Literal["bf16", "32e4m3xe8m0", "32e5m2xe8m0"] = "bf16"
     # How many of the 4 dispatch warps do token-comm work at all (1/2/4);
     # the rest stay fully idle (reserved for future in-kernel work).  The
     # physical warp layout stays at 4.  Output-invariant work partitioning
