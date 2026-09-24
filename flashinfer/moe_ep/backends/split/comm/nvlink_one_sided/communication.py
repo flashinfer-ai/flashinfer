@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 @register_communication("nvlink_one_sided")
-class NVLinkOneSidedCommunication(MoEEpCommunication):
+class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     """Rank-major dispatch/combine with NVLink one-sided put/get kernels.
 
     ``hidden_states``, its optional scale factors, ``topk_ids`` and
@@ -96,7 +96,7 @@ class NVLinkOneSidedCommunication(MoEEpCommunication):
     def alltoall(self) -> "MoeAlltoAll":
         """The underlying all-to-all primitive (checkpointing, metainfo access)."""
         if self._alltoall is None:
-            raise RuntimeError("NVLinkOneSidedCommunication has been destroyed")
+            raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
         return self._alltoall
 
     def dispatch(

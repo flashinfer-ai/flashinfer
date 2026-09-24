@@ -433,7 +433,7 @@ class MoEAlltoallInfo:
 class MnnvlMoe:
     """NVLink two-sided MoE all-to-all-v over MNNVL FIFO workspaces.
 
-    :class:`flashinfer.moe_ep.NVLinkTwoSidedCommunication` builds the MoE-level
+    :class:`flashinfer.moe_ep.NVLinkTwoSidedAlltoAll` builds the MoE-level
     dispatch/combine interface shared by all expert-parallel communication
     backends on top of it.
     """

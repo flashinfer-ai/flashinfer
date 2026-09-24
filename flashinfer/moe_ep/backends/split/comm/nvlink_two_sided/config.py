@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class NVLinkTwoSidedConfig:
-    """Options of :class:`NVLinkTwoSidedCommunication`.
+    """Options of :class:`NVLinkTwoSidedAlltoAll`.
 
     Pass to ``create_communication(..., backend=NVLinkTwoSidedConfig())`` or
     ``MoEEpLayer(..., backend=SplitConfig(comm=NVLinkTwoSidedConfig()))``.
