@@ -32,10 +32,10 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_nvfp4_mla_decode_sm_100a": {
         "arch": "sm_100a",
         "main": {
-            "module": "cake_nvfp4_mla_decode_a218732ec5ff9e037c52",
+            "module": "cake_nvfp4_mla_decode_c33925bbab8964a3547b",
             "sources": [
-                "cake_nvfp4_mla_decode/sm_100a/cake_nvfp4_mla_decode_a218732ec5ff9e037c52_kernel.cu",
-                "cake_nvfp4_mla_decode/sm_100a/cake_nvfp4_mla_decode_a218732ec5ff9e037c52_binding.cu",
+                "cake_nvfp4_mla_decode/sm_100a/cake_nvfp4_mla_decode_c33925bbab8964a3547b_kernel.cu",
+                "cake_nvfp4_mla_decode/sm_100a/cake_nvfp4_mla_decode_c33925bbab8964a3547b_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
@@ -66,7 +66,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "1a45836e6da6b3ccf20228f065d3d20b968616b6c67073b8ee311023ce3580b9",
+            "closure_sha256": "5f35ec151e3a8e867ca3294d4804c9b73bbdaced5fb94a5298c102df355d788e",
             "tma_workspace_bytes": 0,
         },
         "reduce": {
@@ -93,15 +93,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "closure_sha256": "f536377f9a2be25fd7e086698d51b67ddaefc26aa62fb26c65e9e15639820dd4",
             "tma_workspace_bytes": 0,
         },
-        "closure_sha256": "9ff1c85d14844a36a4d444a391dd2efcc47bc82706b3035b473263f0adda7f75",
+        "closure_sha256": "deda31f47a7e96d958dca5db306f7babebe692936d7fc517d2062b6eff1f049d",
     },
     "cake_nvfp4_mla_decode_sm_103a": {
         "arch": "sm_103a",
         "main": {
-            "module": "cake_nvfp4_mla_decode_34485223b7a400876785",
+            "module": "cake_nvfp4_mla_decode_6260e249381d96576baa",
             "sources": [
-                "cake_nvfp4_mla_decode/sm_103a/cake_nvfp4_mla_decode_34485223b7a400876785_kernel.cu",
-                "cake_nvfp4_mla_decode/sm_103a/cake_nvfp4_mla_decode_34485223b7a400876785_binding.cu",
+                "cake_nvfp4_mla_decode/sm_103a/cake_nvfp4_mla_decode_6260e249381d96576baa_kernel.cu",
+                "cake_nvfp4_mla_decode/sm_103a/cake_nvfp4_mla_decode_6260e249381d96576baa_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
@@ -132,7 +132,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "1e1d9c70f24af6920cf0d3a3e6b0e629ac54a98f99eccfe852dd3cb196e51be7",
+            "closure_sha256": "8c031ac48c9399d58aae84ea32f72e55ca82ada6562d85b1c8d799ead893a517",
             "tma_workspace_bytes": 0,
         },
         "reduce": {
@@ -159,7 +159,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "closure_sha256": "01f7776b52a67f27bf3f0e6b52e9f873a60ee08aa7c7a9d914bb53c952bad38d",
             "tma_workspace_bytes": 0,
         },
-        "closure_sha256": "d333bc196d92cabbb6e053f8855990e8bcc9053829af3a1021346f88fe9ae24f",
+        "closure_sha256": "ef1f4375f89cf17dbc10123a8ef49492023420681cf79404eabbf78cee6432ec",
     },
 }
 
