@@ -143,7 +143,9 @@ def test_minimax_h3_dense_attention_repeated_launches_reuse_workspace() -> None:
         torch.cuda.synchronize()
         expected = fp32_oracle(q, k, v)
         torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
-        torch.testing.assert_close(first.float(), expected.float(), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            first.float(), expected.float(), atol=1e-2, rtol=1e-2
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

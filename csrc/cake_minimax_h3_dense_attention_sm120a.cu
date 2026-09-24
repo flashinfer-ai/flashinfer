@@ -24,8 +24,10 @@
 #include <cstdint>
 
 static_assert(sizeof(CUtensorMap) == 128, "CUDA tensor-map ABI size mismatch");
-static_assert(alignof(CUtensorMap) >= 64, "CUDA tensor-map ABI requires at least 64-byte alignment");
+static_assert(alignof(CUtensorMap) >= 64,
+              "CUDA tensor-map ABI requires at least 64-byte alignment");
 
+// clang-format off
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
@@ -2019,12 +2021,81 @@ kernel_minimax_h3_dense_attention(const __grid_constant__ CUtensorMap Q_map, con
             if (store_rows != 0) {
                 __threadfence();
                 for (int other = 0; other < split_k; other++) {
-                    if (other != split_part) {
-                        int base = (split_slot - split_part) * 17408 + other * 17408 + tid;
-                        float m_o0 = partial_ws[base + 16384];
-                        float m_o1 = partial_ws[base + 16384 + 256];
-                        float d_o0 = partial_ws[base + 16384 + 512];
-                        float d_o1 = partial_ws[base + 16384 + 768];
+                    int base = (split_slot - split_part) * 17408 + other * 17408 + tid;
+                    float m_o0 = partial_ws[base + 16384];
+                    float m_o1 = partial_ws[base + 16384 + 256];
+                    float d_o0 = partial_ws[base + 16384 + 512];
+                    float d_o1 = partial_ws[base + 16384 + 768];
+                    if (other == 0) {
+                        m_state[0] = m_o0;
+                        m_state[1] = m_o1;
+                        d_state[0] = d_o0;
+                        d_state[1] = d_o1;
+                        out_acc[0] = partial_ws[base];
+                        out_acc[1] = partial_ws[base + 256];
+                        out_acc[2] = partial_ws[base + 512];
+                        out_acc[3] = partial_ws[base + 768];
+                        out_acc[4] = partial_ws[base + 1024];
+                        out_acc[5] = partial_ws[base + 1280];
+                        out_acc[6] = partial_ws[base + 1536];
+                        out_acc[7] = partial_ws[base + 1792];
+                        out_acc[8] = partial_ws[base + 2048];
+                        out_acc[9] = partial_ws[base + 2304];
+                        out_acc[10] = partial_ws[base + 2560];
+                        out_acc[11] = partial_ws[base + 2816];
+                        out_acc[12] = partial_ws[base + 3072];
+                        out_acc[13] = partial_ws[base + 3328];
+                        out_acc[14] = partial_ws[base + 3584];
+                        out_acc[15] = partial_ws[base + 3840];
+                        out_acc[16] = partial_ws[base + 4096];
+                        out_acc[17] = partial_ws[base + 4352];
+                        out_acc[18] = partial_ws[base + 4608];
+                        out_acc[19] = partial_ws[base + 4864];
+                        out_acc[20] = partial_ws[base + 5120];
+                        out_acc[21] = partial_ws[base + 5376];
+                        out_acc[22] = partial_ws[base + 5632];
+                        out_acc[23] = partial_ws[base + 5888];
+                        out_acc[24] = partial_ws[base + 6144];
+                        out_acc[25] = partial_ws[base + 6400];
+                        out_acc[26] = partial_ws[base + 6656];
+                        out_acc[27] = partial_ws[base + 6912];
+                        out_acc[28] = partial_ws[base + 7168];
+                        out_acc[29] = partial_ws[base + 7424];
+                        out_acc[30] = partial_ws[base + 7680];
+                        out_acc[31] = partial_ws[base + 7936];
+                        out_acc[32] = partial_ws[base + 8192];
+                        out_acc[33] = partial_ws[base + 8448];
+                        out_acc[34] = partial_ws[base + 8704];
+                        out_acc[35] = partial_ws[base + 8960];
+                        out_acc[36] = partial_ws[base + 9216];
+                        out_acc[37] = partial_ws[base + 9472];
+                        out_acc[38] = partial_ws[base + 9728];
+                        out_acc[39] = partial_ws[base + 9984];
+                        out_acc[40] = partial_ws[base + 10240];
+                        out_acc[41] = partial_ws[base + 10496];
+                        out_acc[42] = partial_ws[base + 10752];
+                        out_acc[43] = partial_ws[base + 11008];
+                        out_acc[44] = partial_ws[base + 11264];
+                        out_acc[45] = partial_ws[base + 11520];
+                        out_acc[46] = partial_ws[base + 11776];
+                        out_acc[47] = partial_ws[base + 12032];
+                        out_acc[48] = partial_ws[base + 12288];
+                        out_acc[49] = partial_ws[base + 12544];
+                        out_acc[50] = partial_ws[base + 12800];
+                        out_acc[51] = partial_ws[base + 13056];
+                        out_acc[52] = partial_ws[base + 13312];
+                        out_acc[53] = partial_ws[base + 13568];
+                        out_acc[54] = partial_ws[base + 13824];
+                        out_acc[55] = partial_ws[base + 14080];
+                        out_acc[56] = partial_ws[base + 14336];
+                        out_acc[57] = partial_ws[base + 14592];
+                        out_acc[58] = partial_ws[base + 14848];
+                        out_acc[59] = partial_ws[base + 15104];
+                        out_acc[60] = partial_ws[base + 15360];
+                        out_acc[61] = partial_ws[base + 15616];
+                        out_acc[62] = partial_ws[base + 15872];
+                        out_acc[63] = partial_ws[base + 16128];
+                    } else {
                         float _fmax_0 = fmaxf(m_state[0], m_o0);
                         float m_new0 = _fmax_0;
                         float _fmax_1 = fmaxf(m_state[1], m_o1);
@@ -2483,6 +2554,7 @@ kernel_minimax_h3_dense_attention(const __grid_constant__ CUtensorMap Q_map, con
 }
 
 } // extern "C"
+// clang-format on
 
 #include <cuda_runtime.h>
 
@@ -2501,9 +2573,11 @@ constexpr int64_t kMaxTokens = 131072;
 constexpr int kTileQ = 128;
 constexpr int kTileKv = 64;
 constexpr int kThreads = THREADS;
-constexpr int kDynamicSmemBytes = SMEM_TOTAL;  // 96 KiB ring + mbarriers + split flag: one persistent CTA per SM
-// Tail split-KV: the work items of the last persistent wave are split across up to kSplitKMax CTAs; each
-// part publishes 64 output accumulators + m[2] + d[2] per thread (thread-native layout) to the workspace.
+constexpr int kDynamicSmemBytes =
+    SMEM_TOTAL;  // 96 KiB ring + mbarriers + split flag: one persistent CTA per SM
+// Tail split-KV: the work items of the last persistent wave are split across up to kSplitKMax CTAs;
+// each part publishes 64 output accumulators + m[2] + d[2] per thread (thread-native layout) to the
+// workspace.
 constexpr int kSplitKMax = 8;
 constexpr int64_t kPartialBytesPerCta = int64_t{68} * kThreads * 4;
 constexpr int64_t kWorkspaceBytesPerCta = kPartialBytesPerCta + 4;  // + one arrival counter
@@ -2513,14 +2587,17 @@ constexpr float kSoftmaxScaleLog2 = 1.4426950408889634f;
 constexpr unsigned int kQueryScaleBf16x2 = 0x3DB53DB5u;
 
 void CheckRows(const TensorView& tensor, const char* name, int64_t tokens, DLDevice device) {
-  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
+  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError)
+      << name << " must be a CUDA tensor";
   TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
       << name << " must be on the same CUDA device as q";
   TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dl_bfloat16), ValueError)
       << name << " must be bfloat16";
-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) == kWidth, ValueError)
+  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) == kWidth,
+                ValueError)
       << name << " must have shape [tokens, 7168]";
-  TVM_FFI_CHECK(tensor.stride(1) == 1 && tensor.stride(0) == kWidth, ValueError) << name << " must be contiguous";
+  TVM_FFI_CHECK(tensor.stride(1) == 1 && tensor.stride(0) == kWidth, ValueError)
+      << name << " must be contiguous";
   TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0, ValueError)
       << name << " must be 16-byte aligned";
 }
@@ -2530,16 +2607,18 @@ void CheckRows(const TensorView& tensor, const char* name, int64_t tokens, DLDev
 // [tokens, 7168] rows with a 128-byte swizzle.  The token box may exceed a short sequence: TMA
 // zero-fills the rows beyond the tensor, the kernel masks those keys and never stores those
 // query rows.
-CUtensorMap EncodeRowsTile(const TensorView& rows, int64_t tokens, uint32_t box_rows, const char* name) {
+CUtensorMap EncodeRowsTile(const TensorView& rows, int64_t tokens, uint32_t box_rows,
+                           const char* name) {
   uint64_t global_dim[4] = {64, static_cast<uint64_t>(tokens), static_cast<uint64_t>(kNumHeads), 2};
-  uint64_t global_strides[3] = {static_cast<uint64_t>(kWidth * 2), static_cast<uint64_t>(kHeadDim * 2), 64 * 2};
+  uint64_t global_strides[3] = {static_cast<uint64_t>(kWidth * 2),
+                                static_cast<uint64_t>(kHeadDim * 2), 64 * 2};
   uint32_t box_dim[4] = {64, box_rows, 1, 2};
   uint32_t element_strides[4] = {1, 1, 1, 1};
   CUtensorMap descriptor{};
   CUresult result = cuTensorMapEncodeTiled(
-      &descriptor, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, rows.data_ptr(), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      &descriptor, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, rows.data_ptr(), global_dim, global_strides,
+      box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
       << "failed to encode the " << name << " tensor map: CUresult=" << static_cast<int>(result);
   return descriptor;
@@ -2560,10 +2639,11 @@ int ConfigureKernel() {
   status = cudaGetDeviceProperties(&properties, device);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to query CUDA device properties: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(properties.major == 12 || properties.major == 10 || properties.major == 9, RuntimeError)
+  TVM_FFI_CHECK(properties.major == 12 || properties.major == 10 || properties.major == 9,
+                RuntimeError)
       << "MiniMax-H3 dense attention requires compute capability 12.x (target), 10.x or 9.0";
-  status = cudaFuncSetAttribute(kernel_minimax_h3_dense_attention, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                kDynamicSmemBytes);
+  status = cudaFuncSetAttribute(kernel_minimax_h3_dense_attention,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmemBytes);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to opt in to dynamic shared memory: " << cudaGetErrorString(status);
   configured_devices.emplace_back(device, properties.multiProcessorCount);
@@ -2573,8 +2653,8 @@ int ConfigureKernel() {
 }  // namespace
 
 // y = softmax(BF16(q * BF16(1/sqrt(128))) @ k^T) @ v per head, batch 1, no mask, no dropout.
-// q, k, v, out: contiguous BF16 [tokens, 7168] rows (element [t, h * 128 + d]), 1 <= tokens <= 131072.
-// One persistent 256-thread CTA per SM walks the (head, 128-row query tile) work items.
+// q, k, v, out: contiguous BF16 [tokens, 7168] rows (element [t, h * 128 + d]), 1 <= tokens <=
+// 131072. One persistent 256-thread CTA per SM walks the (head, 128-row query tile) work items.
 // Bytes of the per-device workspace (split-KV partial states + arrival counters, sized for one
 // persistent grid).  Allocate it zero-filled once per device: the kernel rewinds every counter it
 // completes, so the workspace stays valid across launches on the same stream.
@@ -2584,11 +2664,13 @@ int64_t minimax_h3_dense_attention_workspace_size() {
 }
 
 // y = softmax(BF16(q * BF16(1/sqrt(128))) @ k^T) @ v per head, batch 1, no mask, no dropout.
-// q, k, v, out: contiguous BF16 [tokens, 7168] rows (element [t, h * 128 + d]), 1 <= tokens <= 131072.
-// workspace: uint8 buffer of at least minimax_h3_dense_attention_workspace_size() bytes, zero-filled
-// when allocated.  One persistent 256-thread CTA per SM walks the (head, 128-row query tile) work
-// items; the items of the last wave are split across idle CTAs by K/V range and merged in-kernel.
-void minimax_h3_dense_attention(TensorView q, TensorView k, TensorView v, TensorView out, TensorView workspace) {
+// q, k, v, out: contiguous BF16 [tokens, 7168] rows (element [t, h * 128 + d]), 1 <= tokens <=
+// 131072. workspace: uint8 buffer of at least minimax_h3_dense_attention_workspace_size() bytes,
+// zero-filled when allocated.  One persistent 256-thread CTA per SM walks the (head, 128-row query
+// tile) work items; the items of the last wave are split across idle CTAs by K/V range and merged
+// in-kernel.
+void minimax_h3_dense_attention(TensorView q, TensorView k, TensorView v, TensorView out,
+                                TensorView workspace) {
   const int64_t tokens = q.size(0);
   TVM_FFI_CHECK(q.ndim() == 2 && tokens >= 1 && tokens <= kMaxTokens, ValueError)
       << "q must be [tokens, 7168] with 1 <= tokens <= 131072";
@@ -2601,8 +2683,9 @@ void minimax_h3_dense_attention(TensorView q, TensorView k, TensorView v, Tensor
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
   const int num_sms = ConfigureKernel();
-  TVM_FFI_CHECK(workspace.device().device_type == kDLCUDA && workspace.device().device_id == device.device_id,
-                ValueError)
+  TVM_FFI_CHECK(
+      workspace.device().device_type == kDLCUDA && workspace.device().device_id == device.device_id,
+      ValueError)
       << "workspace must be a CUDA tensor on the same device as q";
   TVM_FFI_CHECK(encode_dlpack_dtype(workspace.dtype()) == encode_dlpack_dtype(dl_uint8), ValueError)
       << "workspace must be uint8";
@@ -2616,33 +2699,38 @@ void minimax_h3_dense_attention(TensorView q, TensorView k, TensorView v, Tensor
 
   const int num_q_tiles = static_cast<int>((tokens + kTileQ - 1) / kTileQ);
   const int num_kv_tiles = static_cast<int>((tokens + kTileKv - 1) / kTileKv);
-  const unsigned int total_items = static_cast<unsigned int>(num_q_tiles) * static_cast<unsigned int>(kNumHeads);
+  const unsigned int total_items =
+      static_cast<unsigned int>(num_q_tiles) * static_cast<unsigned int>(kNumHeads);
   const int grid = std::max(1, std::min<int>(static_cast<int>(total_items), num_sms));
   // Tail split-KV plan: split_k * tail_items <= grid, every part owns at least one K/V tile.
   const unsigned int tail_items = total_items % static_cast<unsigned int>(grid);
   int split_k = 1;
   if (tail_items != 0) {
     split_k = std::min<int>(kSplitKMax, grid / static_cast<int>(tail_items));
-    while (split_k > 1 && (split_k - 1) * ((num_kv_tiles + split_k - 1) / split_k) >= num_kv_tiles) --split_k;
+    while (split_k > 1 && (split_k - 1) * ((num_kv_tiles + split_k - 1) / split_k) >= num_kv_tiles)
+      --split_k;
   }
   const int split_tiles = (num_kv_tiles + split_k - 1) / split_k;
   const unsigned int split_base = split_k > 1 ? total_items - tail_items : total_items;
-  const unsigned int total_work = split_base + (total_items - split_base) * static_cast<unsigned int>(split_k);
+  const unsigned int total_work =
+      split_base + (total_items - split_base) * static_cast<unsigned int>(split_k);
   auto* partial_ws = static_cast<float*>(workspace.data_ptr());
   auto* split_counters =
-      reinterpret_cast<int*>(static_cast<char*>(workspace.data_ptr()) + static_cast<int64_t>(num_sms) * kPartialBytesPerCta);
+      reinterpret_cast<int*>(static_cast<char*>(workspace.data_ptr()) +
+                             static_cast<int64_t>(num_sms) * kPartialBytesPerCta);
 
   const CUtensorMap q_map = EncodeRowsTile(q, tokens, kTileQ, "q");
   const CUtensorMap k_map = EncodeRowsTile(k, tokens, kTileKv, "k");
   const CUtensorMap v_map = EncodeRowsTile(v, tokens, kTileKv, "v");
   kernel_minimax_h3_dense_attention<<<grid, kThreads, kDynamicSmemBytes, stream>>>(
       q_map, k_map, v_map, static_cast<__nv_bfloat16*>(out.data_ptr()), partial_ws, split_counters,
-      static_cast<int>(tokens), num_q_tiles, num_kv_tiles, total_work, split_base, split_k, split_tiles,
-      kSoftmaxScaleLog2, kQueryScaleBf16x2);
+      static_cast<int>(tokens), num_q_tiles, num_kv_tiles, total_work, split_base, split_k,
+      split_tiles, kSoftmaxScaleLog2, kQueryScaleBf16x2);
   const cudaError_t status = cudaGetLastError();
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "MiniMax-H3 dense attention launch failed: " << cudaGetErrorString(status);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_dense_attention, minimax_h3_dense_attention);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_dense_attention_workspace_size, minimax_h3_dense_attention_workspace_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_dense_attention_workspace_size,
+                              minimax_h3_dense_attention_workspace_size);
