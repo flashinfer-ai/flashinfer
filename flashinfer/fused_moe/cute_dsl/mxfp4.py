@@ -161,16 +161,21 @@ B300_SITU_DENSE_TACTIC = (128, ((128, 256), (1, 1), False), ((128, 256), (1, 1),
 # Dense-path W4A8 tactics by token-count bucket, measured on B300 (Kimi K3,
 # candidate-only CUPTI graph medians, every tactic of a bucket timed in the
 # same process on the same GPU). The rows per local expert set the M-tile
-# padding. Every bucket keeps the M128 GEMM1 tile: on the narrow MoE-TP
-# shard the 2-CTA M256 tactic measured best at T=8192 (every routing keeps
-# >= 146 rows per expert; GEMM1 905 -> 774 us), but compute-sanitizer
-# synccheck reports "Missing wait" records from that kernel's MMA warp, so
-# the shard runs the cluster-2 N256 GEMM2 with the M128 GEMM1 up to T=8192
-# instead (T=8192 balanced/hot/empty -0.4/-3.7/-0.8% against the base
-# tactic). The expert-parallel rank would gain 17% from M256 on the balanced
-# routing at T=8192 but lose 31% on the remote-dominated one (73 rows per
-# expert, padded 3.5x); a routing-aware tile choice needs both tile lists at
-# run time and is left open. The 192-wide GEMM2 helps where GEMM2 is
+# padding. The 2-CTA M256 GEMM1 tile wins where the rows of an expert pad
+# to the same 256-row multiple under both tiles, i.e. when ceil(rows / 128)
+# is even: 146 rows per expert (balanced routing at T=8192 on either
+# layout) pad to 256 either way and the 2-CTA tile streams each weight
+# tile once (GEMM1 905 -> 760 us), while 73 rows (T=4096, or the
+# remote-dominated routing at T=8192) pad 3.5x and 293 rows (T=16384) pad
+# 1.75x against 1.31x, where M128 wins by 7-16%. On the narrow MoE-TP
+# shard the bucket (7168, 14336] therefore takes the M256 tile with the
+# 2-CTA 256-wide GEMM2 (same GPU, T=8192 balanced/empty/hot -9.1/-4.2/-0.4%
+# against the cluster-2 N256 M128 tactic). The expert-parallel rank keeps
+# M128 in every bucket: at T=8192 M256 gains 17/13/5% on the
+# balanced/hot/empty routings but loses 34% on the remote-dominated one,
+# and at T=16384 the reverse (-18% remote-dominated, +16/+6% balanced/hot),
+# so its tile has to follow the rows per expert at run time (open). The
+# 192-wide GEMM2 helps where GEMM2 is
 # finalize-bound: cluster 1 wins 1-2% on the wide shard up to T=4096 and
 # cluster 2 wins 3-5% there at T=16384 (not at 32768, where the default is
 # best); on the narrow shard the cluster-2 N192 GEMM2 wins 1-7% on every
@@ -183,9 +188,11 @@ B300_SITU_DENSE_TACTIC_TABLE_WIDE = (
     (16384, _T128_N192_C2),
     (1 << 62, B300_SITU_DENSE_TACTIC),
 )
+_T256_N256_C1 = (256, ((256, 256), (2, 1), False), ((256, 256), (2, 1), False))
 B300_SITU_DENSE_TACTIC_TABLE_NARROW = (
     (2048, B300_SITU_DENSE_TACTIC),
-    (8192, _T128_N256_C2),
+    (7168, _T128_N256_C2),
+    (14336, _T256_N256_C1),
     (1 << 62, _T128_N192_C2),
 )
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``

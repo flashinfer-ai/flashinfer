@@ -655,10 +655,17 @@ def kimi_tp8_rank3(kimi_unsharded):
 
 
 def _kimi_tokens(base, tokens, ids, weights):
+    # The canonical bank carries 2048 activation rows; longer cases (the
+    # dense buckets above T=2048) tile them, the routing stays per token.
+    reps = -(-tokens // base.x.shape[0])
+
+    def rows(t):
+        return (t.repeat(reps, *([1] * (t.dim() - 1))) if reps > 1 else t)[:tokens]
+
     return replace(
         base,
-        x=base.x[:tokens],
-        x_scale=base.x_scale[:tokens],
+        x=rows(base.x),
+        x_scale=rows(base.x_scale),
         topk_ids=ids,
         topk_weights=weights,
     )
@@ -705,7 +712,8 @@ def test_full_kimi_tp8_shard_sum(
     record_property("numerical_report", json.dumps(report))
 
 
-@pytest.mark.parametrize("tokens", [1, 16, 128, 512, 2048])
+# T=8192 exercises the narrow shard's two-CTA M256 dense bucket (7168, 14336].
+@pytest.mark.parametrize("tokens", [1, 16, 128, 512, 2048, 8192])
 @pytest.mark.parametrize("distribution", ["balanced", "empty", "hot"])
 def test_full_kimi_tp8_paired_fp64(
     kimi_tp8_rank3, tokens, distribution, record_property

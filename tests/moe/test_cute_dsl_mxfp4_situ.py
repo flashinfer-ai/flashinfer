@@ -1310,7 +1310,7 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
             ),
         )
 
-        def check():
+        def check(expect_wide):
             swapab_dispatch(
                 tile_idx_to_mn_limit=buffers["out_tile_idx_to_mn_limit"],
                 num_non_exiting_tiles=buffers["out_num_non_exiting_tiles"],
@@ -1332,11 +1332,11 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
                 )
             total = int(buffers["out_num_non_exiting_tiles"].item())
             assert int(fused["wide_count"].item()) <= total
-            if permille == 0 and distribution in ("hot", "empty"):
+            if expect_wide:
                 # Without the rule the full 128-row groups are wide.
                 assert int(fused["wide_count"].item()) > 0
 
-        check()
+        check(expect_wide=permille == 0 and distribution in ("hot", "empty"))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             plan.run(cuda.CUstream(stream.cuda_stream))
@@ -1354,4 +1354,6 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
             for name in ("wide", "narrow", "all"):
                 buf[name + "_list"].fill_(-7)
         graph.replay()
-        check()
+        # The replayed routing is balanced (or hot) over 896 experts: only
+        # the equality with the dispatch kernel is asserted.
+        check(expect_wide=False)
