@@ -26,29 +26,18 @@ are GLOBAL across the EP group, including empty ranks below eight tokens:
         --precomputed-routing --warmup 3 --iters 100 \\
         --num-tokens 1,2,4,8,16,32,64,128,256,512,4096,8192,16384
 
-With ``--no-fused-finalize``, both W4A16 paths cast FC2 results to BF16 before
-applying FP32 routing weights. Split EP rounds each rank's weighted partial
-sum to BF16 before combine; MegaMoE reduces all per-route BF16 results at the
-source rank. Optional ``--refcheck`` checks only W4A16 MegaMoE against split
-W4A16, with a fixed tolerance for this reduction difference. Both MegaMoE
-variants use FC2 routing weights and disable in-kernel FC2 reduction by default.
-The MegaMoE precision speedup is W4A4 latency / W4A16 latency (>1 favors W4A16).
+Both timers include routing, staging, communication, compute, output handling,
+and MegaMoE runtime FP32 alpha copies. ``--precomputed-routing`` excludes routing.
+Preparation, tuning, warmup, graph capture, and L2 flushing are untimed. CUPTI
+reports the median per-iteration maximum rank activity span, including gaps and
+overlap; Nsight Systems' summed activity durations are a different metric.
 
-Both timers measure the full forward, including routing, input staging,
-communication, expert compute, and output handling. MegaMoE also stages runtime
-per-expert FP32 alphas on each forward. CUPTI measures the span
-from the first GPU activity's start to the last activity's end on each rank,
-then takes the maximum rank span per iteration and the median across
-iterations. This includes gaps and overlap; it is not a sum of kernel times.
-Weight preparation, compilation, autotuning, warmup, graph capture, and L2
-flushing are excluded. With ``--precomputed-routing``, EP routes are computed
-once before warmup and excluded from both Split and MegaMoE measurements.
-Use 4–512 tokens for decode retention; report 1/2 without including them in
-that decision and check prefill 4096/8192/16384 separately.
-``--apply-topk-in-fc1`` selects MegaMoE's distinct FC1-weighted rounding
-contract; validate it against its own reference, not Split's default contract.
-Nsight Systems' breakdown instead sums activity
-durations across ranks and must not be substituted for this latency metric.
+Both Mega variants default to FC2 routing weights without in-kernel FC2 reduction.
+With ``--no-fused-finalize``, Split W4A16 rounds each rank's weighted partial sum
+to BF16, while MegaMoE combines per-route BF16 results at the source rank.
+``--refcheck`` compares these W4A16 paths with tolerance for that difference;
+``--apply-topk-in-fc1`` has a separate rounding contract. The MegaMoE precision
+speedup is W4A4 latency / W4A16 latency (>1 favors W4A16).
 
 Run Nsight Systems mode directly to capture and report per-kernel breakdowns
 for all four topology/activation combinations:
@@ -65,20 +54,12 @@ tactics; use Nsight Systems mode to identify the real distributed kernels:
     python3 benchmarks/bench_cute_dsl_moe_distributed.py \\
         --mode profile_ncu --profile-iters 1
 
-MegaMoE NCU profiling instead launches all EP ranks under the profiler's
-shared-memory communicator, which coordinates mandatory concurrent kernels.
-It requires an NCU version supporting ``--communicator=shmem`` and an exact
-collective kernel filter supplied with ``--ncu-megamoe-kernel``. Isolated
-single-rank kernel replay is not valid for this backend.
-
-If NVSHMEM allocations prevent kernel-replay context save, use
-``--ncu-megamoe-replay application``. This starts one NCU instance per rank
-under torchrun and coordinates application replay over TCP. Each worker replay
-uses fresh process-group keys in the persistent torchrun store and bounds warp
-sampling to one pass so ranks cannot request different replay counts. It requires at
-least one input token on every rank because the synchronized MegaMoE NVTX
-range includes rank-local staging and final reduction. Use CUPTI for latency;
-profiler synchronization can substantially distort collective kernel duration.
+MegaMoE NCU profiling coordinates all EP ranks with ``--communicator=shmem``
+and a collective filter supplied via ``--ncu-megamoe-kernel``; isolated-rank
+replay is invalid. If NVSHMEM prevents kernel-replay context save, select
+``--ncu-megamoe-replay application`` for per-rank profilers coordinated over TCP.
+Application replay requires nonempty source ranks for lockstep staging/combine.
+Use CUPTI for latency: profiler synchronization can distort collective duration.
 
 The workload stages remain available as NVTX ranges. Kernel attribution uses
 those ranges rather than matching kernel names.
@@ -132,6 +113,7 @@ BENCH_VARIANTS = (
     BenchVariant("w4a4_megamoe", use_nvfp4_activations=True, use_megamoe=True),
     BenchVariant("w4a16_megamoe", use_nvfp4_activations=False, use_megamoe=True),
 )
+_VARIANTS_BY_NAME = {variant.name: variant for variant in BENCH_VARIANTS}
 
 
 @dataclass(frozen=True)
@@ -150,22 +132,28 @@ def _verbose_print(args, *values):
         print(*values, flush=True)
 
 
+def _print_json(prefix, payload):
+    print(
+        prefix + "," + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
+
+
 def _parse_profile_case(profile_case):
     mode, variant_name = profile_case.split("::", maxsplit=1)
-    variants = {variant.name: variant for variant in BENCH_VARIANTS}
-    if mode not in ("ep", "tp") or variant_name not in variants:
+    if mode not in ("ep", "tp") or variant_name not in _VARIANTS_BY_NAME:
         raise ValueError(f"Invalid {_PROFILE_CASE_ENV}: {profile_case}")
-    if mode == "tp" and variants[variant_name].use_megamoe:
+    variant = _VARIANTS_BY_NAME[variant_name]
+    if mode == "tp" and variant.use_megamoe:
         raise ValueError("MegaMoE supports expert parallelism only")
-    return mode, variants[variant_name]
+    return mode, variant
 
 
 def _selected_variants(args, mode):
-    variants = {variant.name: variant for variant in BENCH_VARIANTS}
     return tuple(
-        variants[name]
+        _VARIANTS_BY_NAME[name]
         for name in args.variants.split(",")
-        if mode == "ep" or not variants[name].use_megamoe
+        if mode == "ep" or not _VARIANTS_BY_NAME[name].use_megamoe
     )
 
 
@@ -526,13 +514,6 @@ def _run_ncu_profiles(args, token_counts):
             # participating ranks. Profiling only the fused collective avoids
             # treating rank-dependent staging/routing launches as collectives.
             # https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html
-            replay_arguments = [
-                "--communicator=shmem",
-                f"--communicator-shmem-num-peers={args.num_gpus}",
-                "--replay-mode=kernel",
-                "--kernel-name-base=demangled",
-                f"--kernel-name={args.ncu_megamoe_kernel}",
-            ]
             launcher = [
                 shutil.which("torchrun"),
                 *_profile_torchrun_arguments(args.num_gpus),
@@ -557,13 +538,23 @@ def _run_ncu_profiles(args, token_counts):
                     "--nvtx",
                     "--lockstep-kernel-launch",
                     "--lockstep-nvtx-include=stage::MegaMoE/",
-                    "--kernel-name-base=demangled",
-                    f"--kernel-name={args.ncu_megamoe_kernel}",
                 ]
                 outer_launcher = [*launcher, "--no-python"]
                 launcher = [sys.executable]
                 # NCU's documented environment macro avoids report collisions.
                 export_output += ".rank%q{RANK}"
+            else:
+                replay_arguments = [
+                    "--communicator=shmem",
+                    f"--communicator-shmem-num-peers={args.num_gpus}",
+                    "--replay-mode=kernel",
+                ]
+            replay_arguments.extend(
+                (
+                    "--kernel-name-base=demangled",
+                    f"--kernel-name={args.ncu_megamoe_kernel}",
+                )
+            )
             description = "coordinated EP collective kernels"
         else:
             replay_arguments = [
@@ -916,35 +907,30 @@ def _run_distributed_iterations(
     if args.log_timing_samples:
         wall_seconds = time.perf_counter() - wall_start
         if dist.get_rank() == 0:
-            print(
-                "DISTRIBUTED_TIMING_SAMPLES_JSON,"
-                + json.dumps(
-                    {
-                        "profile_label": profile_label,
-                        "global_tokens": num_tokens,
-                        "rank": 0,
-                        "world_size": dist.get_world_size(),
-                        "timer": args.timing,
-                        "warmup_iters": args.warmup,
-                        "repeat_iters": args.iters,
-                        "sample_count": len(samples),
-                        "cuda_graph": args.cuda_graph,
-                        "precomputed_routing": args.precomputed_routing,
-                        "apply_topk_in_fc1": args.apply_topk_in_fc1,
-                        "cold_l2_cache": True,
-                        "sample_aggregation": "per_iteration_rank_max",
-                        "samples_ms": [float(sample) for sample in samples],
-                        "wall_seconds": wall_seconds,
-                        "wall_scope": (
-                            "bench_gpu_time"
-                            if args.timing == "cupti"
-                            else "cuda_event_capture_and_sampling"
-                        ),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                flush=True,
+            _print_json(
+                "DISTRIBUTED_TIMING_SAMPLES_JSON",
+                {
+                    "profile_label": profile_label,
+                    "global_tokens": num_tokens,
+                    "rank": 0,
+                    "world_size": dist.get_world_size(),
+                    "timer": args.timing,
+                    "warmup_iters": args.warmup,
+                    "repeat_iters": args.iters,
+                    "sample_count": len(samples),
+                    "cuda_graph": args.cuda_graph,
+                    "precomputed_routing": args.precomputed_routing,
+                    "apply_topk_in_fc1": args.apply_topk_in_fc1,
+                    "cold_l2_cache": True,
+                    "sample_aggregation": "per_iteration_rank_max",
+                    "samples_ms": [float(sample) for sample in samples],
+                    "wall_seconds": wall_seconds,
+                    "wall_scope": (
+                        "bench_gpu_time"
+                        if args.timing == "cupti"
+                        else "cuda_event_capture_and_sampling"
+                    ),
+                },
             )
     return float(np.median(samples))
 
@@ -1082,9 +1068,12 @@ def _benchmark_distributed_ep(
             runtime_max_tokens_per_rank,
         )
 
+    def route():
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+
     def run_once():
         if not args.precomputed_routing:
-            _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+            route()
         return combine(compute(*dispatch()))
 
     profile_state = {}
@@ -1108,12 +1097,7 @@ def _benchmark_distributed_ep(
     def profile_once():
         _run_profile_iteration(
             (
-                (
-                    "routing",
-                    lambda: _route_tokens(
-                        router_logits, routing_bias, topk_values, topk_indices
-                    ),
-                ),
+                ("routing", route),
                 ("dispatch", profile_dispatch),
                 ("activation prep/quant", profile_activation_prep),
                 ("local MoE", profile_local_moe),
@@ -1123,10 +1107,7 @@ def _benchmark_distributed_ep(
 
     # Finish the setup collective before CuTe DSL selects a tactic. Inference
     # warmup likewise tunes the local runner outside the steady-state A2A phase.
-    run_setup_phase(
-        "routing",
-        lambda: _route_tokens(router_logits, routing_bias, topk_values, topk_indices),
-    )
+    run_setup_phase("routing", route)
     dispatched_inputs = run_setup_phase("dispatch", dispatch)
     tuning_inputs = run_setup_phase(
         "preserve dispatched inputs",
@@ -1304,22 +1285,17 @@ def _benchmark_distributed_megamoe(
                 knobs = {name: getattr(config, name) for name in nvfp4_candidates()[0]}
             else:
                 knobs = layer._kernel._autotune_winner
-            print(
-                "MEGAMOE_TACTIC_JSON,"
-                + json.dumps(
-                    {
-                        "variant": variant.name,
-                        "apply_topk_in_fc1": args.apply_topk_in_fc1,
-                        "global_tokens": num_tokens,
-                        "local_tokens": local_num_tokens,
-                        "max_tokens_per_rank": capacity,
-                        "rank": rank,
-                        "knobs": knobs,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                flush=True,
+            _print_json(
+                "MEGAMOE_TACTIC_JSON",
+                {
+                    "variant": variant.name,
+                    "apply_topk_in_fc1": args.apply_topk_in_fc1,
+                    "global_tokens": num_tokens,
+                    "local_tokens": local_num_tokens,
+                    "max_tokens_per_rank": capacity,
+                    "rank": rank,
+                    "knobs": knobs,
+                },
             )
         if reference_outputs is not None and not variant.use_nvfp4_activations:
             _check_megamoe_output(
@@ -1727,12 +1703,9 @@ def _run_parallel_mode(
         )
         print(f"\nMode: real {mode.upper()}{world_size}, {measurement}, cache=cold L2")
         if any(variant.use_megamoe for variant in variants):
-            print(
-                "MEGAMOE_KNOBS_JSON,"
-                + json.dumps(
-                    args.megamoe_knobs or {}, sort_keys=True, separators=(",", ":")
-                ),
-                flush=True,
+            _print_json(
+                "MEGAMOE_KNOBS_JSON",
+                args.megamoe_knobs or {},
             )
         if not is_profiling:
             if default_comparison:
@@ -1752,10 +1725,7 @@ def _run_parallel_mode(
         # collective still uses each case's runtime_max_tokens_per_rank.
         max_tokens_per_rank_budget = max(
             4096,
-            max(
-                (num_tokens + world_size - 1) // world_size
-                for num_tokens in token_counts
-            ),
+            (max(token_counts) + world_size - 1) // world_size,
         )
 
     reported_backend = False
@@ -2107,7 +2077,7 @@ def main():
     args = parser.parse_args()
 
     variant_names = args.variants.split(",")
-    if not set(variant_names) <= {variant.name for variant in BENCH_VARIANTS} or len(
+    if not set(variant_names) <= _VARIANTS_BY_NAME.keys() or len(
         set(variant_names)
     ) != len(variant_names):
         parser.error(
@@ -2170,10 +2140,9 @@ def main():
     if (
         args.mode == "profile_ncu"
         and args.ncu_megamoe_replay == "application"
-        and any(
-            mode == "ep" and variant.use_megamoe and value < args.num_gpus
-            for value, mode, variant in _profile_cases(args, tokens)
-        )
+        and has_megamoe
+        and "ep" in parallel_modes
+        and any(value < args.num_gpus for value in tokens)
     ):
         parser.error("MegaMoE NCU application replay requires nonempty source ranks")
 
