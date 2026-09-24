@@ -148,10 +148,24 @@ class Sm107BlockScaledMoeConfig:
     token_back_mode: Sm107TokenBackMode = "epi_warps"
     apply_topk_at_fc1: bool = True
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError("activation must be 'swiglu' or 'situ'.")
+        if self.activation == "situ":
+            for name in ("situ_beta", "situ_linear_beta"):
+                value = getattr(self, name)
+                if value is None or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"SiTU requires positive, finite {name}.")
+            if self.gate_up_clamp is not None:
+                raise ValueError("SiTU does not support gate_up_clamp.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU beta parameters require activation='situ'.")
         for name in (
             "num_total_experts",
             "max_tokens_per_rank",
@@ -395,6 +409,18 @@ class Sm107BlockScaledSymmBuffer:
         self.topk_idx = torch.full(
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
+        # Stable local-expert pointers allow per-call scaling updates in graphs.
+        # Defaults and overrides are copied on every backend staging call.
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            setattr(
+                self,
+                name,
+                torch.ones(
+                    cfg.experts_per_rank, dtype=torch.float32, device=self.device
+                )
+                if cfg.quant_kind == "nvfp4"
+                else None,
+            )
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
@@ -508,6 +534,8 @@ class Sm107BlockScaledSymmBuffer:
                 "b_major_mode": OperandMajorMode.K,
                 "combine_format": CombineFormat.parse("bf16"),
                 "gate_up_clamp": cfg.gate_up_clamp,
+                "situ_beta": cfg.situ_beta,
+                "situ_linear_beta": cfg.situ_linear_beta,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -580,10 +608,11 @@ class Sm107BlockScaledSymmBuffer:
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
-            # nvfp4 per-expert dequant scalars (fc1_alpha / fc2_alpha /
-            # fc1_norm_const) are omitted: the weight/staging transforms
-            # quantize with norm_const=1.0, so the scalars are identically 1
-            # and the epilogue's const_expr None-path is exact.
+            **{
+                name: _to_cute(getattr(self, name), assumed_align=4)
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                if self.config.quant_kind == "nvfp4"
+            },
         }
 
     def launch(
@@ -654,6 +683,7 @@ class Sm107BlockScaledSymmBuffer:
         self.output_activation = None
         self.local_workspace = None
         self.topk_idx = None
+        self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True
 
 
@@ -683,6 +713,9 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     token_back_mode: Sm107TokenBackMode = "epi_warps",
     apply_topk_at_fc1: bool = True,
     max_sm_count: Optional[int] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
@@ -715,6 +748,9 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         token_back_mode=token_back_mode,
         apply_topk_at_fc1=apply_topk_at_fc1,
         max_sm_count=max_sm_count,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     return Sm107BlockScaledSymmBuffer(config)
 

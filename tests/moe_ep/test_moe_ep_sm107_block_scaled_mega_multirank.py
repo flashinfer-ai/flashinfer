@@ -1,10 +1,10 @@
-"""4-GPU SM107 (Rubin) block-scaled mega multirank: MoEEpLayer vs torch oracle.
+"""EP2/EP4/EP8 SM107 block-scaled MegaMoE: MoEEpLayer vs Torch oracle.
 
 Runs ONLY under its own torchrun invocation (``run_tests.sh mega_sm107``)::
 
     torchrun --nproc_per_node=4 -m pytest \
         tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
-        -m "gpu_4 and arch_rubin"
+        -m "gpu_2 and arch_rubin"
 
 Every rank builds the SAME global expert bank (fixed seed), the layer routes
 real cross-rank EP traffic over the NVLink symmetric heap, and each rank's
@@ -98,8 +98,7 @@ def _global_problem(world_size: int):
         dtype=torch.float32,
         generator=gen,
     ).to(torch.bfloat16)
-    # Routing that guarantees cross-rank traffic: token 0 of every rank pins
-    # one expert per EP rank; the rest is random distinct top-k.
+    # Pin enough tokens to cover every destination rank, including EP8.
     topk_ids = torch.stack(
         [
             torch.stack(
@@ -114,7 +113,10 @@ def _global_problem(world_size: int):
     experts_per_rank = NUM_EXPERTS // world_size
     pinned = list(range(0, NUM_EXPERTS, experts_per_rank))
     pinned.extend(e for e in range(NUM_EXPERTS) if e not in pinned)
-    topk_ids[:, 0] = torch.tensor(pinned[:TOP_K], device="cuda", dtype=torch.int32)
+    for begin in range(0, len(pinned), TOP_K):
+        topk_ids[:, begin // TOP_K] = torch.tensor(
+            pinned[begin : begin + TOP_K], device="cuda", dtype=torch.int32
+        )
     topk_weights = torch.softmax(
         torch.randn(
             world_size,
@@ -137,6 +139,200 @@ def _megakernel_config(quant_kind: str, **overrides):
     return Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=INTERMEDIATE, top_k=TOP_K, kind=quant_kind, **overrides
     )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("ikr,early", [(False, True), (False, False), (True, True)])
+@pytest.mark.parametrize(
+    "kind,situ,scaled",
+    [(kind, True, False) for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2")]
+    + [("nvfp4", situ, True) for situ in (False, True)],
+)
+def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early):
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+    from tests.moe_ep.sm107_test_utils import (
+        assert_reference,
+        canonical_reference,
+        quantize,
+        weight_pack,
+    )
+
+    rank, world = _launcher_ranks()
+    if world < 2:
+        pytest.skip("requires torchrun with >= 2 ranks")
+    bootstrap = BootstrapConfig(rank=rank, world_size=world)
+    ensure_moe_ep_cuda_device(bootstrap)
+    w13, w2, x, ids, scores = _global_problem(world)
+    pack, norm, scalars = weight_pack(w13, w2, kind, scaled=scaled)
+    local_count = NUM_EXPERTS // world
+    local = slice(rank * local_count, (rank + 1) * local_count)
+    local_pack = PrequantizedMoEWeights(
+        *(getattr(pack, name)[local] for name in ("w13", "w2", "w13_scale", "w2_scale"))
+    )
+    kwargs = dict(in_kernel_fc2_reduce=ikr, apply_topk_in_fc1=early)
+    if situ:
+        kwargs.update(activation="situ", situ_beta=1.25, situ_linear_beta=0.75)
+    if kind == "nvfp4":
+        kwargs["input_norm_const"] = norm
+    cfg = _megakernel_config(kind, **kwargs)
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, create_mega_kernel(cfg).runtime_requirements(bootstrap)
+    )
+    layers = []
+    try:
+        for prequantized_input in (False, True):
+            layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(
+                    rank=rank, world_size=world, auto_bootstrap=False
+                ),
+                fleet_params=FleetParams(
+                    num_experts=NUM_EXPERTS,
+                    max_tokens_per_rank=MAX_TOKENS,
+                    token_hidden_size=HIDDEN,
+                ),
+                weights=local_pack,
+                backend=MegaConfig(
+                    megakernel=cfg, quantize_input=not prequantized_input
+                ),
+            )
+            layers.append(layer)
+            live = 0 if prequantized_input and rank == 0 else NUM_TOKENS
+            current_ids = ids[rank, :live].clone()
+            current_ids[::3, 0] = -1
+            xq, xsf = quantize(x[rank, :live], kind, norm)
+            t = MoEEpTensors(
+                xq if prequantized_input else x[rank, :live],
+                current_ids,
+                scores[rank, :live],
+                scales=xsf if prequantized_input else None,
+                **{name: value[local] for name, value in scalars.items()},
+            )
+            reference = canonical_reference(
+                xq,
+                xsf,
+                t.topk_ids,
+                t.topk_weights,
+                pack,
+                kind,
+                situ=situ,
+                early=early,
+                scalars=scalars,
+            )
+            assert_reference(layer.forward(t), reference, kind)
+        assert layers[0]._workspace is layers[1]._workspace
+    finally:
+        for layer in layers:
+            layer.destroy()
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+def test_prequantized_situ_pooled_graph_with_scaling(kind):
+    import torch.distributed as dist
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+    from tests.moe_ep.sm107_test_utils import (
+        assert_reference,
+        canonical_reference,
+        quantize,
+        weight_pack,
+    )
+
+    rank, world = _launcher_ranks()
+    if world < 2:
+        pytest.skip("requires torchrun with >= 2 ranks")
+    bootstrap = BootstrapConfig(rank=rank, world_size=world)
+    ensure_moe_ep_cuda_device(bootstrap)
+    w13, w2, x, ids, scores = _global_problem(world)
+    count = NUM_EXPERTS // world
+    local = slice(rank * count, (rank + 1) * count)
+    config = dict(activation="situ", situ_beta=1.25, situ_linear_beta=0.75)
+    cfg = _megakernel_config(kind, **config)
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, create_mega_kernel(cfg).runtime_requirements(bootstrap)
+    )
+    layers, inputs, banks = [], [], []
+    try:
+        for index, (a, b) in enumerate(((w13, w2), (-w13, w2 * 0.75))):
+            pack, norm, scalars = weight_pack(
+                a, b, kind, scaled=kind == "nvfp4" and index == 0
+            )
+            banks.append((pack, norm, scalars))
+            extra = (
+                dict(
+                    input_norm_const=norm,
+                    **{name: value[local] for name, value in scalars.items()},
+                )
+                if kind == "nvfp4"
+                else {}
+            )
+            cfg = _megakernel_config(kind, **config, **extra)
+            local_pack = PrequantizedMoEWeights(
+                *(
+                    getattr(pack, name)[local]
+                    for name in ("w13", "w2", "w13_scale", "w2_scale")
+                )
+            )
+            layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(
+                    rank=rank, world_size=world, auto_bootstrap=False
+                ),
+                fleet_params=FleetParams(
+                    num_experts=NUM_EXPERTS,
+                    max_tokens_per_rank=MAX_TOKENS,
+                    token_hidden_size=HIDDEN,
+                ),
+                weights=local_pack,
+                backend=MegaConfig(megakernel=cfg),
+            )
+            layers.append(layer)
+            t = MoEEpTensors(x[rank].clone(), ids[rank].clone(), scores[rank].clone())
+            if scalars:
+                t.fc2_alpha = scalars["fc2_alpha"][local].clone()
+            inputs.append(t)
+            layer.warmup(t)
+        assert layers[0]._workspace is layers[1]._workspace
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            outputs = [
+                layer.forward(t) for layer, t in zip(layers, inputs, strict=True)
+            ]
+        for iteration in range(3):
+            for t in inputs:
+                t.hidden_states.copy_(x[rank] * (1 + 0.1 * iteration))
+                t.topk_ids.copy_((ids[rank] + iteration) % NUM_EXPERTS)
+                t.topk_ids[::3, 0] = -1
+            override = {}
+            if kind == "nvfp4":
+                override = {
+                    "fc2_alpha": banks[0][2]["fc2_alpha"] * (0.6 + 0.1 * iteration)
+                }
+                inputs[0].fc2_alpha.copy_(override["fc2_alpha"][local])
+            dist.barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            for index, (output, t, (pack, norm, scalars)) in enumerate(
+                zip(outputs, inputs, banks, strict=True)
+            ):
+                xq, xsf = quantize(t.hidden_states, kind, norm)
+                reference = canonical_reference(
+                    xq,
+                    xsf,
+                    t.topk_ids,
+                    t.topk_weights,
+                    pack,
+                    kind,
+                    situ=True,
+                    scalars=scalars | (override if index == 0 else {}),
+                )
+                assert_reference(output, reference, kind)
+    finally:
+        for layer in layers:
+            layer.destroy()
+        finalize_moe_ep_runtime(runtime)
 
 
 def _torch_oracle(

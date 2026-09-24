@@ -46,3 +46,6 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # is unsupported because the kernel fixes its knobs at construction.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None

@@ -38,6 +38,10 @@ _KEY_FIELDS = (
     "num_experts",
     "topk",
     "combine_dtype",
+    "activation",
+    "situ_beta",
+    "situ_linear_beta",
+    "gate_up_clamp",
 )
 
 
@@ -118,15 +122,23 @@ def lookup_knobs(
     device: Optional[str] = None,
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
     if path is None:
         return None
     key = dict(
-        backend_revision="sm107-block-scaled-1667b47a-v3",
+        backend_revision="sm107-block-scaled-1667b47a-v4",
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -172,6 +184,10 @@ def record_knobs(
     source: str = "autotune",
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
 
@@ -186,9 +202,13 @@ def record_knobs(
     if path is None:
         return None
     entry = dict(
-        backend_revision="sm107-block-scaled-1667b47a-v3",
+        backend_revision="sm107-block-scaled-1667b47a-v4",
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -275,6 +295,10 @@ def resolve_knobs(
     combine_dtype: str = "bf16",
     allow_nondeterministic: bool = False,
     apply_topk_at_fc1: bool = True,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    gate_up_clamp: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -291,6 +315,10 @@ def resolve_knobs(
         combine_dtype=combine_dtype,
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_up_clamp=gate_up_clamp,
     )
     if cached is not None:
         return cached, "cache"
