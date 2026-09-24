@@ -71022,7 +71022,7 @@ void RunCompleteRoutedImpl(
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (route_id == 1) {
-    TVM_FFI_ICHECK(dims.m == 1) << "split-K route requires one token";
+    TVM_FFI_ICHECK(dims.m == 1 || dims.m == 8) << "split-K route requires one or eight tokens";
     TVM_FFI_ICHECK(partial_workspace.has_value()) << "missing split-K workspace";
     CheckTensor(partial_workspace.value(), dl_float32, 2, true, "partial_workspace", "float32");
     CheckSameDevice(partial_workspace.value(), device_id, "partial_workspace");
@@ -72306,7 +72306,7 @@ void RunCompleteRoutedFinalize(TensorView route_accumulator, TensorView route_ex
   const int64_t m = out.size(0);
   const int64_t k = out.size(1);
   TVM_FFI_ICHECK(top_k == 8 && k == 6144 && m >= 1) << "deferred finalize requires the complete route geometry";
-  TVM_FFI_ICHECK((route_id == 1 && m == 1) || ((route_id == 2 || route_id == 9) && m == 8) ||
+  TVM_FFI_ICHECK((route_id == 1 && (m == 1 || m == 8)) || ((route_id == 2 || route_id == 9) && m == 8) ||
                  (route_id == 8 && m >= 2 && m < 8) || (route_id == 7 && m >= 8 && m < 128))
       << "deferred finalize route id does not match token count";
   CheckShape2(seed, m, k, "seed");

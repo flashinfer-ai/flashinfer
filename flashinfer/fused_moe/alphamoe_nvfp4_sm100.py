@@ -1175,6 +1175,14 @@ def _uses_compact_owner_routed(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _m8_split_k_route_enabled() -> bool:
+    """Route eight-token decode through the split-K M1 chain (ALPHAMOE_NVFP4_M8_SPLITK=1)."""
+    import os
+
+    return os.environ.get("ALPHAMOE_NVFP4_M8_SPLITK", "0") == "1"
+
+
 def _alphamoe_complete_route_id(
     hidden_states,
     hidden_states_scale,
@@ -1196,8 +1204,10 @@ def _alphamoe_complete_route_id(
     k = packed_k * 2
     if (n, k, e, top_k, block_m) != (1024, 6144, 256, 8, 8):
         return 0
-    if m == 1 and is_alphamoe_nvfp4_small_alignment_seed_supported(
-        topk_ids, e + 1, block_m, out, True
+    if (m == 1 or (m == 8 and _m8_split_k_route_enabled())) and (
+        is_alphamoe_nvfp4_small_alignment_seed_supported(
+            topk_ids, e + 1, block_m, out, True
+        )
     ):
         return 1
     if (
