@@ -1915,6 +1915,8 @@ class AutoTuner:
         input_shapes: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor] | None = None,
+        *,
+        require_profiling_policy: bool = False,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
 
@@ -1931,6 +1933,10 @@ class AutoTuner:
             tuning_config (TuningConfig): Tuning configuration
             inputs (Optional[List[torch.Tensor]]): Raw input tensors, used to compute
                 per-runner cache key extras via get_cache_key_extras().
+            require_profiling_policy (bool): Require matching managed provenance
+                when choose_one can profile and when selecting its resulting winner.
+                Lookup-only callers leave this False, even inside tuning contexts.
+                Legacy v1 policy checks are unchanged.
 
         Returns:
             A tuple containing:
@@ -1952,6 +1958,9 @@ class AutoTuner:
             # 1. In-memory winners and provenance share the same partition.
             winners = self._winner_cache()
             winner_identity = self._winner_cache_identity()
+            check_memory_policy = require_profiling_policy or (
+                self.is_tuning_mode and self._active_managed_store is None
+            )
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
@@ -1967,7 +1976,7 @@ class AutoTuner:
                         (winner_identity, cache_key),
                         default_policy if winner_identity is None else None,
                     )
-                    if self.is_tuning_mode and cached_policy != requested_policy:
+                    if check_memory_policy and cached_policy != requested_policy:
                         continue
                     tactic, stored_profile = winners[cache_key]
                     if not self._tactic_still_valid(
@@ -2031,7 +2040,10 @@ class AutoTuner:
                             self._managed_decoded[memo_key] = hit
                     if hit is None:
                         continue
-                    if self.is_tuning_mode and hit.profiling_policy != requested_policy:
+                    if (
+                        require_profiling_policy
+                        and hit.profiling_policy != requested_policy
+                    ):
                         continue
                     runner_name, tactic = hit.runner, hit.tactic
                     if runner_name != runners[r_id].__class__.__name__:
@@ -2339,6 +2351,7 @@ class AutoTuner:
                         p.get_opt_shapes(),
                         tuning_config,
                         inputs=inputs,
+                        require_profiling_policy=True,
                     )
                     if not is_cache_hit:
                         input_preparation_oom = False
@@ -2579,7 +2592,12 @@ class AutoTuner:
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
             _, runner_id, tactic, _ = self.search_cache(
-                custom_op, runners, input_shapes, tuning_config, inputs=inputs
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                inputs=inputs,
+                require_profiling_policy=True,
             )
 
             return runners[runner_id], tactic
