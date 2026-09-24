@@ -37,7 +37,10 @@ def test_frozen_export_matches_pinned_identity(arch: str):
     arch_dir = _csrc_dir() / _ARCH_DIRS[arch]
     assert source.resolve() == arch_dir / "cake_megamoe_topk_reduce_kernels.cu"
     source_bytes = source.read_bytes()
-    assert hashlib.sha256(source_bytes).hexdigest() == reducer._ARCHS[arch]["source_sha256"]
+    assert (
+        hashlib.sha256(source_bytes).hexdigest()
+        == reducer._ARCHS[arch]["source_sha256"]
+    )
     assert manifest["arch"] == arch
     assert manifest["source_sha256"] == reducer._ARCHS[arch]["source_sha256"]
     assert manifest["launch"] == {
@@ -52,14 +55,14 @@ def test_frozen_export_matches_pinned_identity(arch: str):
     # SM103-only instructions, so the same schedule serves both targets.
     assert b"tcgen05" not in source_bytes
     assert b"mbarrier" not in source_bytes
-    assert json.loads((arch_dir / "manifest.json").read_text(encoding="utf-8")) == manifest
+    assert (
+        json.loads((arch_dir / "manifest.json").read_text(encoding="utf-8")) == manifest
+    )
 
 
 def test_frozen_exports_share_one_schedule():
     """Both per-arch drops are the same exporter output modulo nothing."""
-    sources = {
-        arch: reducer._program_source(arch)[0].read_bytes() for arch in _ARCHS
-    }
+    sources = {arch: reducer._program_source(arch)[0].read_bytes() for arch in _ARCHS}
     assert sources["sm_100a"] == sources["sm_103a"]
 
 
@@ -67,7 +70,10 @@ def test_frozen_exports_share_one_schedule():
 def test_binding_source_pins_exact_target(arch: str):
     binding = reducer._binding_source(arch)
     major, minor = _CAPABILITIES[arch]
-    assert f'#define CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE "{_ARCH_DIRS[arch]}/cake_megamoe_topk_reduce_kernels.cu"' in binding
+    assert (
+        f'#define CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE "{_ARCH_DIRS[arch]}/cake_megamoe_topk_reduce_kernels.cu"'
+        in binding
+    )
     assert f"#define CAKE_MEGAMOE_TOPK_REDUCE_CC_MAJOR {major}" in binding
     assert f"#define CAKE_MEGAMOE_TOPK_REDUCE_CC_MINOR {minor}" in binding
     assert "#define CAKE_MEGAMOE_TOPK_REDUCE_THREADS 256" in binding
@@ -90,7 +96,9 @@ def test_resolve_arch_maps_exact_capability(monkeypatch, capability, expected):
     import torch
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
     assert reducer.resolve_arch() == expected
     assert reducer.is_cake_megamoe_topk_reduce_module_loaded() is (
         expected in reducer._LOADED_MODULES
@@ -102,7 +110,9 @@ def test_resolve_arch_rejects_other_capabilities(monkeypatch, capability):
     import torch
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
     with pytest.raises(NotImplementedError, match="published for compute capabilities"):
         reducer.resolve_arch()
     assert reducer.is_cake_megamoe_topk_reduce_module_loaded() is False

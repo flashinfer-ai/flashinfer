@@ -54,9 +54,7 @@ _ARCHS: dict[str, dict[str, Any]] = {
         "source_sha256": "3b83507e0d50dd5089389650c692fd4c17283ebe1f371a62ccb2a7d07b854dda",
     },
 }
-_CAPABILITY_TO_ARCH = {
-    record["capability"]: arch for arch, record in _ARCHS.items()
-}
+_CAPABILITY_TO_ARCH = {record["capability"]: arch for arch, record in _ARCHS.items()}
 _SUPPORTED_CAPABILITIES = tuple(sorted(_CAPABILITY_TO_ARCH))
 _MANIFEST_KEYS = {
     "arch",
