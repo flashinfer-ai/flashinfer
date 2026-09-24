@@ -1216,7 +1216,11 @@ def compute_reference_moe_mxfp4_w4a4(
 
 
 def check_accuracy(
-    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.97
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    percent_threshold: float = 0.97,
+    atol_scale: float = 1.5,
+    rtol: float = 0.5,
 ):
     """Check numerical accuracy with percentage-based tolerance.
 
@@ -1227,8 +1231,7 @@ def check_accuracy(
     expected = expected.float()
 
     output_scale = max(expected.std().item(), 0.01)
-    atol = max(0.05, 1.5 * output_scale)
-    rtol = 0.5
+    atol = max(0.05, atol_scale * output_scale)
 
     abs_diff = torch.abs(actual - expected)
     rel_diff = abs_diff / (torch.abs(expected) + 1e-8)

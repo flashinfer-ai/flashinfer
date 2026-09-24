@@ -1987,7 +1987,9 @@ class TestCuteDslMoeW4A16:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -2126,7 +2128,7 @@ class TestCuteDslMoeKernelAccuracy:
                 and hidden_size >= 2048
             )
             tolerance = (
-                1.0 if c_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2) else 0.1
+                2e-3 if c_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2) else 1e-2
             )
             bias_enabled = c_dtype is cutlass.Float4E2M1FN
             generate_scaled_output = bias_enabled
@@ -2166,7 +2168,7 @@ class TestCuteDslMoeKernelAccuracy:
                 (weight_tile // 128, 1) if swap_ab else (tile_size // 128, 1)
             )
             init_normal = split_k > 1 and activation_format is QuantFormat.MXFP8
-            tolerance = 0.25
+            tolerance = 1e-2
             bias_enabled = True
             generate_scaled_output = False
 
@@ -2285,7 +2287,7 @@ class TestCuteDslMoeKernelAccuracy:
             b_dtype = getattr(cutlass, b_dtype_name)
             sf_dtype = getattr(cutlass, sf_dtype_name)
             out_dtype = getattr(cutlass, out_dtype_name)
-            tolerance = 2.0 if out_dtype is cutlass.BFloat16 else 0.25
+            tolerance = 0.6 if out_dtype is cutlass.BFloat16 else 0.05
             bias_enabled = False
             router_scale_value = None
             init_normal = hidden_dim >= 2048
@@ -2305,7 +2307,7 @@ class TestCuteDslMoeKernelAccuracy:
             cluster_shape_mn = (
                 (weight_tile // 128, 1) if swap_ab else (tile_size // 128, 1)
             )
-            tolerance = 0.25
+            tolerance = 0.05
             bias_enabled = True
             router_scale_value = 0.5
             init_normal = False
@@ -2390,7 +2392,7 @@ class TestCuteDslMoeKernelAccuracy:
             sf_vec_size=32,
             mma_tiler_mn=(8, 128),
             cluster_shape_mn=(1, 1),
-            tolerance=0.25,
+            tolerance=1e-2,
             warmup_iterations=0,
             iterations=1,
             swap_ab=True,
@@ -2524,7 +2526,9 @@ class TestCuteDslFusedMoeFunctional:
             intermediate_size=intermediate_size,
             **reference_inputs,
         )
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -2812,7 +2816,9 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -2887,7 +2893,9 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -2986,7 +2994,9 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -3111,7 +3121,9 @@ class TestCuteDslFusedMoeFunctional:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -3204,7 +3216,9 @@ class TestCuteDslMoEWrapper:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -3277,7 +3291,9 @@ class TestCuteDslMoEWrapper:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -3413,7 +3429,9 @@ class TestCuteDslMoEWrapper:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(results[0], ref_output)
+        passed, percent_within, atol = check_accuracy(
+            results[0], ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"CUDA graph accuracy: {percent_within * 100:.2f}% (atol={atol:.4f})"
         )
@@ -3506,7 +3524,9 @@ class TestCuteDslMoEWrapper:
             situ_linear_beta=situ_linear_beta,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
@@ -3869,7 +3889,9 @@ class TestExpertParallelism:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"EP accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}, "
             f"offset={local_expert_offset}): {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
@@ -3950,7 +3972,9 @@ class TestExpertParallelism:
             **reference_inputs,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"EP functional API accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}): "
             f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
@@ -4167,7 +4191,9 @@ class TestMoeSortBufferInitPoisoned:
             local_expert_offset=local_expert_offset,
         )
 
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"ep_size={ep_size}, num_tokens={num_tokens}: poisoned-buffer "
             f"test failed: only {percent_within * 100:.2f}% within "
@@ -4289,7 +4315,9 @@ class TestAllValidTactics:
             assert not torch.isnan(result).any(), f"NaN in output for tactic {tactic}"
             assert not torch.isinf(result).any(), f"Inf in output for tactic {tactic}"
 
-            passed, percent_within, atol = check_accuracy(result, ref_output)
+            passed, percent_within, atol = check_accuracy(
+                result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+            )
             if passed:
                 num_passed += 1
             else:
@@ -4755,7 +4783,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         enable_pdl=False,
     )
     wrapped = wrapper.run(**inputs, tactic=tactic, **bias_kwargs)
-    torch.testing.assert_close(functional, wrapped, atol=0.5, rtol=0.05)
+    torch.testing.assert_close(functional, wrapped, atol=1e-2, rtol=1e-2)
     if check_contract:
         import inspect
 
@@ -4792,9 +4820,9 @@ def test_w4a8_fused_moe_tactics_and_apis(
             tactic=tactic,
         )
         torch.testing.assert_close(
-            functional, deprecated_functional, atol=0.5, rtol=0.05
+            functional, deprecated_functional, atol=1e-2, rtol=1e-2
         )
-        torch.testing.assert_close(functional, deprecated_wrapped, atol=0.5, rtol=0.05)
+        torch.testing.assert_close(functional, deprecated_wrapped, atol=1e-2, rtol=1e-2)
 
         functional_params = inspect.signature(cute_dsl_fused_moe_mxfp8_mxfp4).parameters
         wrapper_params = inspect.signature(CuteDslMxfp8Mxfp4MoEWrapper.run).parameters
@@ -4809,7 +4837,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
             tactic=tactic,
         )
         assert torch.equal(snapshot, deprecated_wrapped)
-        torch.testing.assert_close(functional, rerun, atol=0.5, rtol=0.05)
+        torch.testing.assert_close(functional, rerun, atol=1e-2, rtol=1e-2)
 
         smaller_inputs = dict(deprecated_inputs)
         for name in ("x", "x_sf", "token_selected_experts", "token_final_scales"):
@@ -4881,7 +4909,9 @@ def test_w4a8_fused_moe_tactics_and_apis(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
         )
-        passed, percent_within, atol = check_accuracy(functional, reference)
+        passed, percent_within, atol = check_accuracy(
+            functional, reference, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance ({atol=:.4f})"
         )
@@ -4904,7 +4934,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
             **bias_kwargs,
             enable_pdl=False,
         )
-        torch.testing.assert_close(functional, unit_alpha, atol=0.5, rtol=0.05)
+        torch.testing.assert_close(functional, unit_alpha, atol=1e-2, rtol=1e-2)
 
 
 @cute_dsl_available
@@ -5225,7 +5255,9 @@ class TestOddTileCountBoundsContract:
             num_local_experts=num_experts,
             local_expert_offset=0,
         )
-        passed, percent_within, atol = check_accuracy(result, ref_output)
+        passed, percent_within, atol = check_accuracy(
+            result, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+        )
         assert passed, (
             f"odd tile count {target_tiles}: only {percent_within * 100:.2f}% "
             f"within tolerance (atol={atol:.4f}) -- a poison sentinel from "
@@ -5342,7 +5374,9 @@ class TestOddTileCountBoundsContract:
                 num_local_experts=num_experts,
                 local_expert_offset=0,
             )
-            passed, percent_within, atol = check_accuracy(output, ref_output)
+            passed, percent_within, atol = check_accuracy(
+                output, ref_output, percent_threshold=0.99, atol_scale=0.6, rtol=0.01
+            )
             assert passed, (
                 f"replay {label} ({expected} active tiles): only "
                 f"{percent_within * 100:.2f}% within tolerance "
