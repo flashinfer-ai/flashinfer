@@ -1016,7 +1016,7 @@ class _FusedAffineEpilogue:
         if pool.shape[1:] != (heads, HEAD_DIM, HEAD_DIM):
             return None
         first_rows = num_rows = 0
-        if impl._checkpoint_output is not None:
+        if impl._checkpoint_output is not None and not impl._checkpoint_in_place:
             num_rows = int(impl._checkpoint_main.shape[0])
             first_rows = num_rows - int(impl._checkpoint_correction.shape[0])
             if impl._checkpoint_output.stride(0) != row_elems:
@@ -1970,6 +1970,7 @@ class FlashKDABlackwellBF16FusedLaunch:
     _n32_ft_slab = False
     _pdl_wait_initial_state_f32 = False
     _pdl_publish_final_state = False
+    _checkpoint_accumulate = False
     _affine_main_indexed_initial = False
     _affine_main_indexed_initial_bf16 = False
     _n16_short_four_stage = False
@@ -2004,9 +2005,16 @@ class FlashKDABlackwellBF16FusedLaunch:
         _affine_cache_token_offset: int = 0,
         _affine_cache_part_offset: int = 0,
         _affine_active_beta_f32: bool = False,
+        _affine_checkpoint_rows_resolved_on_device: bool = False,
     ) -> None:
         import torch
 
+        # The affine composite resolves each window's destination row start on
+        # the device at every launch (caller cu_starts gathered per window), so
+        # the host cannot value-check the offsets; shape checks still apply.
+        self._affine_checkpoint_rows_resolved_on_device = (
+            _affine_checkpoint_rows_resolved_on_device
+        )
         if _affine_active_beta_f32:
             if compute_dtype != "tf32":
                 raise ValueError("active-beta affine windows require TF32 compute")
@@ -2694,7 +2702,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint_cu_starts must encode ceil(seq_len / checkpoint_every_n_tokens) rows"
                 )
-            if checkpoint_offsets[-1] != state_checkpoints.shape[0]:
+            if self._affine_checkpoint_rows_resolved_on_device:
+                if state_checkpoints.shape[0] < checkpoint_offsets[-1]:
+                    raise ValueError(
+                        "state_checkpoints has fewer rows than the affine windows write"
+                    )
+            elif checkpoint_offsets[-1] != state_checkpoints.shape[0]:
                 raise ValueError(
                     "state_checkpoints row count does not match checkpoint_cu_starts"
                 )
@@ -3121,6 +3134,10 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "the FP32 chunk carrier requires the N32 direct M128 body; "
                     "the N16 checkpoint-TMA body only carries BF16 state"
                 )
+            if self._checkpoint_accumulate and not fp32_carrier:
+                raise ValueError(
+                    "checkpoint accumulation requires FP32 checkpoint rows"
+                )
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
@@ -3129,6 +3146,11 @@ class FlashKDABlackwellBF16FusedLaunch:
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
                 **({"checkpoint_dtype_is_fp32": True} if fp32_carrier else {}),
                 **({"fp32_state_carrier": True} if fp32_state_carrier else {}),
+                **(
+                    {"checkpoint_accumulate": True}
+                    if self._checkpoint_accumulate
+                    else {}
+                ),
                 pair_packed_beta=use_pair_packed_beta,
                 scalar_beta=use_scalar_beta,
                 active_beta_f32=self._active_beta_f32,
@@ -4063,6 +4085,48 @@ class FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(
     _pdl_wait_initial_state_f32 = True
 
 
+class FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch(
+    FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+):
+    """Correction windows that add their FP32 rows onto the main pass's rows in place."""
+
+    _checkpoint_accumulate = True
+
+
+def _affine_rows_in_place_enabled() -> bool:
+    """FP32 affine checkpoint rows: main writes the caller's rows, correction accumulates.
+
+    ``CAKE_KDA_AFFINE_ROWS_IN_PLACE=0`` restores the private row windows plus
+    the merging epilogue (same values; used for A/B and bitwise tests).
+    """
+    import os
+
+    return os.environ.get("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "1") != "0"
+
+
+def _affine_window_row_starts(
+    token_offsets, part_offsets, *, checkpoint_every_n_tokens=64
+):
+    """Per window: (original sequence index, checkpoint rows before the window in that sequence).
+
+    Windows of a checkpointed sequence start on ``checkpoint_every_n_tokens``
+    boundaries (``_affine_split_windows`` keeps an even chunk count per
+    window), so each window's rows coincide with the sequence's own row grid
+    and the window can address the caller's rows directly.
+    """
+    import bisect
+
+    seq_ids, local_rows = [], []
+    for part in range(len(token_offsets) - 1):
+        seq = bisect.bisect_right(part_offsets, part) - 1
+        local = token_offsets[part] - token_offsets[part_offsets[seq]]
+        if local % checkpoint_every_n_tokens:
+            raise ValueError("affine window starts must sit on checkpoint boundaries")
+        seq_ids.append(seq)
+        local_rows.append(local // checkpoint_every_n_tokens)
+    return seq_ids, local_rows
+
+
 class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     """PR #4779 split-sequence affine prefix over direct-M128 windows.
 
@@ -4289,6 +4353,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._correction_out = torch.empty_like(out[:, first_part_tokens:])
         main_checkpoint_kwargs = {}
         correction_checkpoint_kwargs = {}
+        self._checkpoint_in_place = False
         if state_checkpoints is not None:
             cp_counts = [(length + 63) // 64 for length in resolved_lengths]
             cp_count = sum(cp_counts)
@@ -4301,37 +4366,58 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             correction_cp_offsets = [
                 offset - first_cp_count for offset in main_cp_offsets[1:]
             ]
-            # Window checkpoints follow the output contract: FP32 rows keep the
-            # main and correction windows exact before their merge.
-            self._checkpoint_main = torch.empty(
-                (cp_count, heads, HEAD_DIM, HEAD_DIM),
-                dtype=state_checkpoints.dtype,
-                device=q.device,
-            )
-            self._checkpoint_correction = torch.empty(
-                (cp_count - first_cp_count, heads, HEAD_DIM, HEAD_DIM),
-                dtype=state_checkpoints.dtype,
-                device=q.device,
-            )
+            self._checkpoint_start = checkpoint_cu_starts[:num_sequences]
             self._checkpoint_merged = None
             self._checkpoint_merged_first = None
             self._checkpoint_merged_tail = None
             self._first_cp_count = first_cp_count
-            self._checkpoint_main_first = self._checkpoint_main[:first_cp_count]
-            self._checkpoint_main_tail = self._checkpoint_main[first_cp_count:]
-            host_i64["checkpoint_offsets"] = [
-                row for count in cp_counts for row in range(count)
-            ]
-            host_i64["checkpoint_sequence_ids"] = [
-                seq for seq, count in enumerate(cp_counts) for _ in range(count)
-            ]
-            host_i64["main_cp_offsets"] = list(main_cp_offsets)
-            host_i64["correction_cp_offsets"] = list(correction_cp_offsets)
-            self._checkpoint_indices = torch.empty(
-                (cp_count,), dtype=torch.int64, device=q.device
+            self._checkpoint_in_place = (
+                state_checkpoints.dtype == torch.float32
+                and _affine_rows_in_place_enabled()
             )
-            self._checkpoint_start = checkpoint_cu_starts[:num_sequences]
-            self.schedule += "_checkpoint64"
+            if self._checkpoint_in_place:
+                # FP32 rows: the main windows write the caller's rows directly
+                # and the correction windows add theirs in place, so no row is
+                # staged, re-read and merged.  Each window's destination row
+                # start (caller cu_starts of its sequence + rows before it) is
+                # gathered on the device at every launch: no host readback.
+                part_seq_ids, part_local_rows = _affine_window_row_starts(
+                    token_offsets, part_offsets
+                )
+                host_i64["part_seq_ids"] = part_seq_ids
+                host_i64["part_local_rows"] = part_local_rows
+                self._part_row_starts = torch.zeros(
+                    (num_parts + 1,), dtype=torch.int64, device=q.device
+                )
+                self._checkpoint_main = self._checkpoint_correction = None
+                self.schedule += "_checkpoint64_rows_in_place"
+            else:
+                # Window checkpoints follow the output contract: BF16 rows keep
+                # the main and correction windows exact before their merge.
+                self._checkpoint_main = torch.empty(
+                    (cp_count, heads, HEAD_DIM, HEAD_DIM),
+                    dtype=state_checkpoints.dtype,
+                    device=q.device,
+                )
+                self._checkpoint_correction = torch.empty(
+                    (cp_count - first_cp_count, heads, HEAD_DIM, HEAD_DIM),
+                    dtype=state_checkpoints.dtype,
+                    device=q.device,
+                )
+                self._checkpoint_main_first = self._checkpoint_main[:first_cp_count]
+                self._checkpoint_main_tail = self._checkpoint_main[first_cp_count:]
+                host_i64["checkpoint_offsets"] = [
+                    row for count in cp_counts for row in range(count)
+                ]
+                host_i64["checkpoint_sequence_ids"] = [
+                    seq for seq, count in enumerate(cp_counts) for _ in range(count)
+                ]
+                host_i64["main_cp_offsets"] = list(main_cp_offsets)
+                host_i64["correction_cp_offsets"] = list(correction_cp_offsets)
+                self._checkpoint_indices = torch.empty(
+                    (cp_count,), dtype=torch.int64, device=q.device
+                )
+                self.schedule += "_checkpoint64"
         uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
         uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
         self._metadata_host = (
@@ -4345,7 +4431,22 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._last_correction_parts = uploaded_i64["last_correction_parts"]
         split_cu_seqlens = uploaded_i64["split_cu_seqlens"]
         tail_cu_seqlens = uploaded_i64["tail_cu_seqlens"]
-        if state_checkpoints is not None:
+        if state_checkpoints is not None and self._checkpoint_in_place:
+            self._part_seq_ids = uploaded_i64["part_seq_ids"]
+            self._part_local_rows = uploaded_i64["part_local_rows"]
+            main_checkpoint_kwargs = dict(
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=self._part_row_starts,
+                checkpoint_every_n_tokens=64,
+                _affine_checkpoint_rows_resolved_on_device=True,
+            )
+            correction_checkpoint_kwargs = dict(
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=self._part_row_starts[1:],
+                checkpoint_every_n_tokens=64,
+                _affine_checkpoint_rows_resolved_on_device=True,
+            )
+        elif state_checkpoints is not None:
             self._checkpoint_offsets = uploaded_i64["checkpoint_offsets"]
             self._checkpoint_sequence_ids = uploaded_i64["checkpoint_sequence_ids"]
             main_checkpoint_kwargs = dict(
@@ -4422,7 +4523,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._main.args["initial_state"] = self._initial_pool_pointer
         self._correction = None
         if not self._use_output_projection:
-            self._correction = FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(
+            correction_cls = (
+                FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch
+                if self._checkpoint_in_place
+                else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+            )
+            self._correction = correction_cls(
                 q[:, first_part_tokens:],
                 k[:, first_part_tokens:],
                 self._zero_v,
@@ -4554,7 +4660,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             )
             self._final_main_selected = torch.empty_like(self._final_compact)
             self._final_correction_selected = torch.empty_like(self._final_compact)
-            if self._checkpoint_output is not None:
+            if self._checkpoint_output is not None and not self._checkpoint_in_place:
                 self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
                 self._checkpoint_merged_first = self._checkpoint_merged[
                     : self._first_cp_count
@@ -4586,6 +4692,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._part_state_indices.index_copy_(
                 0, self._first_parts, self._state_indices
             )
+            if self._checkpoint_in_place:
+                starts = self._part_row_starts[: self.num_parts]
+                torch.index_select(
+                    self._checkpoint_start, 0, self._part_seq_ids, out=starts
+                )
+                starts.add_(self._part_local_rows)
             self._main.launch()
             self._map.launch()
             self._scan_module.launch(
@@ -4607,7 +4719,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             if self._fused_epilogue is not None:
                 self._launch_fused_epilogue()
                 return
-            if self._checkpoint_output is not None:
+            if self._checkpoint_output is not None and not self._checkpoint_in_place:
                 self._checkpoint_merged_first.copy_(self._checkpoint_main_first)
                 torch.add(
                     self._checkpoint_main_tail,
@@ -4672,7 +4784,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     def _launch_fused_epilogue(self) -> None:
         """One kernel: checkpoint-row merge/scatter, tail add, final state."""
         fused = self._fused_epilogue
-        if self._checkpoint_output is not None:
+        merge_rows = (
+            self._checkpoint_output is not None and not self._checkpoint_in_place
+        )
+        if merge_rows:
             rows = (
                 self._checkpoint_main,
                 self._checkpoint_correction,
@@ -4709,7 +4824,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._num_sequences,
             fused.heads,
             fused.tail_elems,
-            int(self._checkpoint_output is not None),
+            int(merge_rows),
         )
 
     def close(self) -> None:

@@ -444,3 +444,31 @@ def test_affine_fused_epilogue_keeps_subnormal_sums():
     assert torch.equal(tail, want_tail)
     assert torch.equal(final_compact, want_final)
     assert torch.equal(final_pool[2], want_final[0])
+
+
+@pytest.mark.parametrize("lengths", [[8192], [3000, 13384], [1000, 12000, 3384]])
+def test_affine_fp32_rows_in_place_match_the_window_merge_bitwise(monkeypatch, lengths):
+    # FP32 checkpoint rows of the affine composite: the main windows write the
+    # caller's rows and the correction windows accumulate onto them in place
+    # (red.global.add.v4.f32), replacing the staged windows plus merging
+    # epilogue.  Both paths perform the same single FP32 addition per element,
+    # so rows, output and final state must be bitwise identical.
+    d = _inputs(lengths, 16, seed=13)
+    d["state_checkpoints"] = torch.zeros_like(
+        d["state_checkpoints"], dtype=torch.float32
+    )
+    pool = d["pool"].clone()
+    monkeypatch.setenv("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "0")
+    windows = _run(d)
+    assert "affine" in str(windows.schedule) and "rows_in_place" not in str(
+        windows.schedule
+    )
+    want = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["out"].zero_()
+    d["state_checkpoints"].zero_()
+    monkeypatch.setenv("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "1")
+    in_place = _run(d)
+    assert "rows_in_place" in str(in_place.schedule)
+    _assert_same(_snapshot(d), want)
+    assert torch.isfinite(d["state_checkpoints"]).all()
