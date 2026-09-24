@@ -29,13 +29,166 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # entry and argument plan.  Populated verbatim by the generated-program
 # export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {
+    "cake_balanced_gqa_decode_mtp32_sm_100a": {
+        "arch": "sm_100a",
+        "kind": "mtp32",
+        "main": {
+            "module": "cake_balanced_gqa_decode_34b49a05ba3fbe366caa",
+            "sources": [
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_34b49a05ba3fbe366caa_kernel.cu",
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_34b49a05ba3fbe366caa_binding.cu",
+            ],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "Q"],
+                ["tma_buffer", "K"],
+                ["tma_buffer", "V"],
+                ["buffer", "O_ptr"],
+                ["buffer", "page_table"],
+                ["buffer", "seq_lens_kv"],
+                ["buffer", "partial_o"],
+                ["buffer", "partial_stats"],
+                ["buffer", "tile_counters"],
+                ["buffer", "queue_counters"],
+                ["parameter", "max_pages_per_seq"],
+                ["parameter", "softmax_scale_log2"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "batch_size"],
+                ["parameter", "q_len"],
+                ["parameter", "max_items"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "bb9dee11182b3843e1f7a768c7f2adca5d2f590cc8dd832d4cbf8a72e40efb19",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "bb9dee11182b3843e1f7a768c7f2adca5d2f590cc8dd832d4cbf8a72e40efb19",
+    },
+    "cake_balanced_gqa_decode_mtp32_sm_103a": {
+        "arch": "sm_103a",
+        "kind": "mtp32",
+        "main": {
+            "module": "cake_balanced_gqa_decode_9d653e956b812e3af73b",
+            "sources": [
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_9d653e956b812e3af73b_kernel.cu",
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_9d653e956b812e3af73b_binding.cu",
+            ],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "Q"],
+                ["tma_buffer", "K"],
+                ["tma_buffer", "V"],
+                ["buffer", "O_ptr"],
+                ["buffer", "page_table"],
+                ["buffer", "seq_lens_kv"],
+                ["buffer", "partial_o"],
+                ["buffer", "partial_stats"],
+                ["buffer", "tile_counters"],
+                ["buffer", "queue_counters"],
+                ["parameter", "max_pages_per_seq"],
+                ["parameter", "softmax_scale_log2"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "batch_size"],
+                ["parameter", "q_len"],
+                ["parameter", "max_items"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "ae6b62cddb935ce227b432b02300503f3ba206b57c1b6bdab3fb62aa64fee2aa",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "ae6b62cddb935ce227b432b02300503f3ba206b57c1b6bdab3fb62aa64fee2aa",
+    },
+    "cake_balanced_gqa_decode_mtp64_sm_100a": {
+        "arch": "sm_100a",
+        "kind": "mtp64",
+        "main": {
+            "module": "cake_balanced_gqa_decode_590799352820c65c9ac0",
+            "sources": [
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_590799352820c65c9ac0_kernel.cu",
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_590799352820c65c9ac0_binding.cu",
+            ],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "Q"],
+                ["tma_buffer", "K"],
+                ["tma_buffer", "V"],
+                ["buffer", "O_ptr"],
+                ["buffer", "page_table"],
+                ["buffer", "seq_lens_kv"],
+                ["buffer", "partial_o"],
+                ["buffer", "partial_stats"],
+                ["buffer", "tile_counters"],
+                ["buffer", "queue_counters"],
+                ["parameter", "max_pages_per_seq"],
+                ["parameter", "softmax_scale_log2"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "batch_size"],
+                ["parameter", "q_len"],
+                ["parameter", "max_items"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "19ee2736626d0bd4a71bfcac3b061d618412834824820902b76eeb4b63c67773",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "19ee2736626d0bd4a71bfcac3b061d618412834824820902b76eeb4b63c67773",
+    },
+    "cake_balanced_gqa_decode_mtp64_sm_103a": {
+        "arch": "sm_103a",
+        "kind": "mtp64",
+        "main": {
+            "module": "cake_balanced_gqa_decode_2783fca0e4f7b585ba5c",
+            "sources": [
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_2783fca0e4f7b585ba5c_kernel.cu",
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_2783fca0e4f7b585ba5c_binding.cu",
+            ],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "Q"],
+                ["tma_buffer", "K"],
+                ["tma_buffer", "V"],
+                ["buffer", "O_ptr"],
+                ["buffer", "page_table"],
+                ["buffer", "seq_lens_kv"],
+                ["buffer", "partial_o"],
+                ["buffer", "partial_stats"],
+                ["buffer", "tile_counters"],
+                ["buffer", "queue_counters"],
+                ["parameter", "max_pages_per_seq"],
+                ["parameter", "softmax_scale_log2"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "batch_size"],
+                ["parameter", "q_len"],
+                ["parameter", "max_items"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "2577686fd80c1a427b4282fcde163027914d1b19926b2292541b77eb982eb456",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "2577686fd80c1a427b4282fcde163027914d1b19926b2292541b77eb982eb456",
+    },
     "cake_balanced_gqa_decode_sm_100a": {
         "arch": "sm_100a",
+        "kind": "row",
         "main": {
-            "module": "cake_balanced_gqa_decode_27b47222f1570d742ffb",
+            "module": "cake_balanced_gqa_decode_db1624c38dc2f7ee3831",
             "sources": [
-                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_27b47222f1570d742ffb_kernel.cu",
-                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_27b47222f1570d742ffb_binding.cu",
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_db1624c38dc2f7ee3831_kernel.cu",
+                "cake_balanced_gqa_decode/sm_100a/cake_balanced_gqa_decode_db1624c38dc2f7ee3831_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -62,18 +215,19 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "f505ef788b473ea00bf708dd515dec0114ee2769ec331000ce1282499143411a",
+            "closure_sha256": "d3daccb022ced5249ad4f32175714650db940a32865c0ba4bda5993dca6681ca",
             "tma_workspace_bytes": 0,
         },
-        "closure_sha256": "f505ef788b473ea00bf708dd515dec0114ee2769ec331000ce1282499143411a",
+        "closure_sha256": "d3daccb022ced5249ad4f32175714650db940a32865c0ba4bda5993dca6681ca",
     },
     "cake_balanced_gqa_decode_sm_103a": {
         "arch": "sm_103a",
+        "kind": "row",
         "main": {
-            "module": "cake_balanced_gqa_decode_6996872de1bf4fcf9a2a",
+            "module": "cake_balanced_gqa_decode_e781b959832d27370afa",
             "sources": [
-                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_6996872de1bf4fcf9a2a_kernel.cu",
-                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_6996872de1bf4fcf9a2a_binding.cu",
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_e781b959832d27370afa_kernel.cu",
+                "cake_balanced_gqa_decode/sm_103a/cake_balanced_gqa_decode_e781b959832d27370afa_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -100,10 +254,10 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "75a0c7a9134f2fb13001e0e92d15157e323c4fa30696a7286166f622c03335af",
+            "closure_sha256": "9e0a8a3d38d3db854c3d875e9aaa284d02c9e3cf8458d50e8d062e255d5d436b",
             "tma_workspace_bytes": 0,
         },
-        "closure_sha256": "75a0c7a9134f2fb13001e0e92d15157e323c4fa30696a7286166f622c03335af",
+        "closure_sha256": "9e0a8a3d38d3db854c3d875e9aaa284d02c9e3cf8458d50e8d062e255d5d436b",
     },
 }
 
@@ -114,13 +268,16 @@ ARCH_NVCC_FLAGS = {
 }
 
 
-def select_module(arch: str) -> str:
-    """Return the registered module name for ``arch`` (``sm_100a`` / ``sm_103a``)."""
+# Program kinds: "row" = the row-tile kernel (any q_len_per_req), "mtp32" /
+# "mtp64" = the packed-row MTP kernel instances (32- and 64-row tiles).  Records
+# without a "kind" field are the row-tile program.
+def select_module(arch: str, kind: str = "row") -> str:
+    """Return the registered module name for ``arch`` and program ``kind``."""
     for name, record in MODULES.items():
-        if record["arch"] == arch:
+        if record["arch"] == arch and record.get("kind", "row") == kind:
             return name
     raise NotImplementedError(
-        "The generated balanced GQA decode program for "
+        f"The generated balanced GQA decode program ({kind}) for "
         f"{arch} is not registered in this checkout yet "
         "(see flashinfer-ai/flashinfer#4832)"
     )

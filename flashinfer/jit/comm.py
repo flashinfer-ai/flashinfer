@@ -365,36 +365,52 @@ def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
     )
 
 
-def gen_dcp_alltoall_module() -> JitSpec:
+def _dcp_alltoall_helix_sources() -> list:
+    return [
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_dcp_alltoall.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "tensorrt_llm"
+        / "kernels"
+        / "helixAllToAll.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "cpp" / "common" / "envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "cpp"
+        / "common"
+        / "tllmException.cpp",
+    ]
+
+
+def _dcp_alltoall_include_paths() -> list:
+    return [
+        str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
+        str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
+    ]
+
+
+def gen_dcp_alltoall_helix_module() -> JitSpec:
+    """Portable helix DCP all-to-all module (every supported target)."""
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10, 11, 12]
     )
     return gen_jit_spec(
         "dcp_alltoall",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_dcp_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "helixAllToAll.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "cpp"
-            / "common"
-            / "envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "cpp"
-            / "common"
-            / "tllmException.cpp",
-        ],
-        extra_include_paths=[
-            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
-            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
-        ],
+        _dcp_alltoall_helix_sources(),
+        extra_include_paths=_dcp_alltoall_include_paths(),
         extra_cuda_cflags=nvcc_flags,
     )
+
+
+def gen_dcp_alltoall_module() -> JitSpec:
+    from .cake_dcp_alltoall import generated_dcp_alltoall_spec
+
+    generated = generated_dcp_alltoall_spec(
+        _dcp_alltoall_helix_sources(), _dcp_alltoall_include_paths()
+    )
+    if generated is not None:
+        return generated
+    return gen_dcp_alltoall_helix_module()
 
 
 def gen_dcp_lse_reduce_module() -> JitSpec:

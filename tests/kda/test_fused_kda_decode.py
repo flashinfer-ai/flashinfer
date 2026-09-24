@@ -263,11 +263,14 @@ def _packed_reference(inputs, conv_state, state):
     ).to(torch.bfloat16)
 
 
-def _make_packed_inputs(num_heads, num_sequences, num_tokens, seed=42):
+def _make_packed_inputs(
+    num_heads, num_sequences, num_tokens, seed=42, state_dtype=torch.float32
+):
     inputs = _make_inputs(
         num_heads,
         num_sequences * num_tokens,
         seed=seed,
+        state_dtype=state_dtype,
         conv_history=num_tokens + 2,
     )
     inputs["state_indices"] = inputs["state_indices"].reshape(num_sequences, num_tokens)
@@ -481,10 +484,14 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
         pytest.param(32, 2, 4, id="h32-n2-t4"),
         pytest.param(48, 2, 8, id="h48-n2-t8"),
         pytest.param(96, 1, 3, id="h96-n1-t3"),
+        pytest.param(12, 32, 5, id="h12-n32-t5-wide"),
     ],
 )
-def test_packed_fused_kda_decode(num_heads, num_sequences, num_tokens):
-    inputs = _make_packed_inputs(num_heads, num_sequences, num_tokens)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_packed_fused_kda_decode(num_heads, num_sequences, num_tokens, state_dtype):
+    inputs = _make_packed_inputs(
+        num_heads, num_sequences, num_tokens, state_dtype=state_dtype
+    )
     reference_conv = _clone_strided(inputs["conv_state"])
     reference_state = _clone_strided(inputs["state"])
     actual_conv = _clone_strided(inputs["conv_state"])
@@ -686,11 +693,11 @@ def test_packed_fused_kda_decode_t1_empty_sequence(query_start_loc):
     ("state_dtype", "lower_bound", "error", "match"),
     [
         pytest.param(
-            torch.bfloat16,
+            torch.float16,
             -5.0,
             TypeError,
-            "state must have dtype torch.float32",
-            id="bf16-state",
+            "state must have dtype torch.float32 or torch.bfloat16",
+            id="fp16-state",
         ),
         pytest.param(
             torch.float32,
@@ -829,8 +836,9 @@ def test_packed_fused_kda_decode_ragged_rows_and_padding():
 
 
 @pytest.mark.parametrize("num_tokens", [3, 7, 8])
-def test_packed_fused_kda_decode_two_verification_windows(num_tokens):
-    first = _make_packed_inputs(12, 2, num_tokens, seed=41)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_packed_fused_kda_decode_two_verification_windows(num_tokens, state_dtype):
+    first = _make_packed_inputs(12, 2, num_tokens, seed=41, state_dtype=state_dtype)
     reference_conv = _clone_strided(first["conv_state"])
     reference_state = _clone_strided(first["state"])
     actual_conv = _clone_strided(first["conv_state"])
@@ -844,7 +852,7 @@ def test_packed_fused_kda_decode_two_verification_windows(num_tokens):
     torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
     torch.testing.assert_close(actual_first, expected_first, rtol=3e-2, atol=2e-2)
 
-    second = _make_packed_inputs(12, 2, num_tokens, seed=83)
+    second = _make_packed_inputs(12, 2, num_tokens, seed=83, state_dtype=state_dtype)
     second["state_indices"].copy_(first["state_indices"])
     second["num_accepted_tokens"].copy_(
         torch.tensor([2, num_tokens], dtype=torch.int32, device=torch.device("cuda"))
@@ -1373,8 +1381,8 @@ def test_packed_fused_kda_decode_cache_key(monkeypatch):
 
     monkeypatch.setattr(module, "build_and_load_cute_dsl_kernel", record_kernel_name)
     module._get_compiled_kernel.cache_clear()
-    base = [3, 12, -5.0, 1e-5, 2, 16, 1, 1, 1]
-    alternatives = [4, 24, -4.0, 2e-5, 1, 32, 2, 2, 4]
+    base = [3, 12, -5.0, 1e-5, 2, 16, 1, 1, 1, False]
+    alternatives = [4, 24, -4.0, 2e-5, 1, 32, 2, 2, 4, True]
     try:
         module._get_compiled_kernel(*base)
         for index, alternative in enumerate(alternatives):

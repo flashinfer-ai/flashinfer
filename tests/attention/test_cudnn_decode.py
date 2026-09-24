@@ -1,4 +1,7 @@
 import math
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -149,6 +152,102 @@ def _run_cudnn_decode(
         batch_offsets_o=ragged_q,
         **kwargs,
     )
+
+
+def _dense_offset_case(q_len_per_req=1, packed=False, with_end=True):
+    torch.manual_seed(14)
+    b, h, hk, d, sk = 2, 8, 2, 128, 32
+    q = torch.randn(
+        b * q_len_per_req, 2 if packed else 1, h, d, device="cuda", dtype=torch.bfloat16
+    )[:, 0]
+    k, v, tables = _build_paged_kv(b, sk, 16, hk, d, q.dtype, q.device)
+    lengths = torch.full((b, 1, 1, 1), sk, device=q.device, dtype=torch.int32)
+    workspace = torch.empty(128 << 20, device=q.device, dtype=torch.uint8)
+    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    lse = torch.empty(b * q_len_per_req, h, device=q.device)
+    offsets = {
+        "batch_offsets_q": torch.arange(
+            b + with_end, device=q.device, dtype=torch.int64
+        )
+        * (q_len_per_req * q.stride(0)),
+        "batch_offsets_o": torch.arange(
+            b + with_end, device=q.device, dtype=torch.int32
+        )
+        * (q_len_per_req * out.stride(0)),
+    }
+
+    def run():
+        return cudnn_decode.cudnn_batch_decode_with_kv_cache(
+            q,
+            k,
+            v,
+            d**-0.5,
+            workspace,
+            max_sequence_kv=sk,
+            actual_seq_lens_kv=lengths,
+            block_tables=tables,
+            q_len_per_req=q_len_per_req,
+            out=out,
+            lse=lse,
+            return_lse=True,
+            **offsets,
+        )
+
+    reference = _decode_ref(
+        q, k, v, tables, lengths, d**-0.5, q_len_per_req=q_len_per_req
+    )
+    return run, offsets, out, lse, reference
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("q_len_per_req", [1, 3])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("with_end", [False, True])
+def test_cudnn_decode_dense_offsets_capture(q_len_per_req, packed, with_end):
+    run, _, out, lse, (ref, stats) = _dense_offset_case(q_len_per_req, packed, with_end)
+    run()
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("name", ["batch_offsets_q", "batch_offsets_o"])
+@pytest.mark.parametrize("capture", [False, True])
+def test_cudnn_decode_invalid_offsets_fail_on_device(name, capture):
+    # A device assertion invalidates its CUDA context: isolate negative cases.
+    code = """
+import runpy, sys, torch
+run, offsets, *_ = runpy.run_path(sys.argv[1])["_dense_offset_case"]()
+run()
+torch.cuda.synchronize()
+if sys.argv[3] == "True":
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    offsets[sys.argv[2]][0] = 1
+    graph.replay()
+else:
+    offsets[sys.argv[2]][0] = 1
+    run()
+torch.cuda.synchronize()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(Path(__file__).resolve()), name, str(capture)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    log = result.stdout + result.stderr
+    assert result.returncode != 0, log
+    assert f"{name}: the cuDNN decode path only supports dense offsets" in log, log
 
 
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
