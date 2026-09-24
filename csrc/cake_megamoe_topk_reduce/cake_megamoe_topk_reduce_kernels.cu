@@ -40,10 +40,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
-
 #include <math_constants.h>
 
 __device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
@@ -65,7 +61,7 @@ __device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, flo
 }
 
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
-    asm("mul.rn.ftz.f32x2 %0, %0, %1;"
+    asm("mul.rn.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
@@ -130,8 +126,10 @@ __device__ __forceinline__ void fma_scale_x32(
     float* sv, const float2* scale2, const float2* neg_max2)
 {
     float2* sv_2 = reinterpret_cast<float2*>(sv);
-    #pragma unroll
-    for (int j = 0; j < 16; j++)
+
+#pragma unroll
+
+for (int j = 0; j < 16; j++)
         fma_f32x2_inplace(&sv_2[j], *scale2, *neg_max2);
 }
 
@@ -172,7 +170,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
 
 __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
     float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+    asm("mul.rn.f32x2 %0, %1, %2;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -556,15 +554,18 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
     return r;
 }
 
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+
 extern "C" {
 
 __global__ __launch_bounds__(256) void
 kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6(__nv_bfloat16* __restrict__ partials, __nv_bfloat16* __restrict__ out)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
 
 
     const int bid = blockIdx.x;
@@ -638,3 +639,7 @@ kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6(__nv_bfloat16* __res
 }
 
 } // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS

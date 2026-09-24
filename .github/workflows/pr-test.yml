@@ -50,7 +50,7 @@ permissions:
 
 env:
   EXECUTOR_NUMBER: "0"
-  SKIP_CI_PATTERNS: '\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/|^\.github/CODEOWNERS$'
+  SKIP_CI_PATTERNS: '\.md$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/|^\.github/CODEOWNERS$'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -111,6 +111,15 @@ jobs:
 
       - name: Validate CUDA configuration
         run: python3 ci/validate_cuda_versions.py
+
+      # A shard script that no longer parses fails here, on the PR that changed it,
+      # instead of silently un-scheduling later targeted A10G/T4 runs.
+      - name: Validate bare-run coverage parse
+        run: |
+          python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
+            --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh
+          python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
+            --scripts scripts/task_jit_run_tests_part3.sh
 
       - name: Get Docker Tag
         id: get-tag
@@ -201,6 +210,20 @@ jobs:
           # already validated in the step above. Empty for an unparameterised run.
           REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
         run: |
+          # A targeted run on a lane never tests more than that lane's bare run: H100
+          # gets the request as-is (its bare run covers tests/); A10G and T4 get it
+          # intersected with their shard lists, and a lane left with nothing is skipped.
+          A10G_SCOPE=""; T4_SCOPE=""
+          if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
+            A10G_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
+              --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh \
+              --targets "${REQUESTED_TEST_PATH}")
+            T4_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
+              --scripts scripts/task_jit_run_tests_part3.sh \
+              --targets "${REQUESTED_TEST_PATH}")
+            echo "A10G targeted scope: ${A10G_SCOPE:-<none: lane not scheduled>}"
+            echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
+          fi
           {
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
@@ -250,10 +273,9 @@ jobs:
               # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
               # paths. There is deliberately no arch selection: tests carry their own
               # arch guards (is_sm90a_supported() and friends) and skip themselves where
-              # unsupported, so the targets can run across the whole GPU matrix and the
-              # right subset executes per runner. Narrowing the scope reduces what runs
-              # in each cell, not which cells run - and nobody has to keep a
-              # path-to-arch mapping in sync with the tests.
+              # unsupported - nobody has to keep a path-to-arch mapping in sync with the
+              # tests. Per-lane scopes (A10G_SCOPE / T4_SCOPE) are computed above the
+              # brace group, which is piped into jq and so runs in a subshell.
               #
               # The default shards (task_jit_run_tests_part*.sh) are fixed pytest lists
               # and take no arguments, so a targeted run uses task_run_unit_tests.sh --
@@ -262,24 +284,28 @@ jobs:
               # This step does NOT parse the PR body. Turning a declared scope into paths
               # happens once, in whoever issues the trigger (a reviewer, or the screening
               # watcher posting under its own identity). CI runs what it is told.
-              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
-                name: "Targeted Unittest (A10G)",
-                kind: "gpu",
-                runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
-                cuda: "cu129",
-                script: "task_run_unit_tests.sh",
-                test_path: $test_path,
-                timeout: 360
-              }'
-              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
-                name: "Targeted Unittest (T4)",
-                kind: "gpu",
-                runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
-                cuda: "cu129",
-                script: "task_run_unit_tests.sh",
-                test_path: $test_path,
-                timeout: 360
-              }'
+              if [ -n "${A10G_SCOPE}" ]; then
+                jq -nc --arg test_path "${A10G_SCOPE}" '{
+                  name: "Targeted Unittest (A10G)",
+                  kind: "gpu",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 360
+                }'
+              fi
+              if [ -n "${T4_SCOPE}" ]; then
+                jq -nc --arg test_path "${T4_SCOPE}" '{
+                  name: "Targeted Unittest (T4)",
+                  kind: "gpu",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 360
+                }'
+              fi
               jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
                 name: "Targeted Unittest (H100)",
                 kind: "h100",
