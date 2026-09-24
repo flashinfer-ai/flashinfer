@@ -34,6 +34,9 @@ from flashinfer.utils import get_compute_capability
 def test_sm120_gemm_shared_memory(
     kernel, dtype, out_dtype, subtile, shape, beta, use_cuda_graph
 ):
+    """Check SM120 GEMM correctness and resource limits in eager and graph modes."""
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
     if get_compute_capability(torch.device("cuda")) != (12, 0):
         pytest.skip("Requires SM120's shared-memory limit")
 
@@ -55,7 +58,7 @@ def test_sm120_gemm_shared_memory(
     fn = getattr(sm_constraint_gemm, kernel)
 
     def run():
-        # Isolate resource selection from the separate beta=0/NaN issue.
+        """Reset C to isolate stage selection from the separate beta=0/NaN issue."""
         c.fill_(2)
         return fn(a, b, c=c, alpha=alpha, beta=beta, out_dtype=out_dtype, **kwargs)
 

@@ -13,6 +13,7 @@ from .utils import check_device, check_dim, check_input
 
 
 def _get_num_stages(a, out_dtype, *, descriptor=False, epilogue_subtile=False):
+    """Select pipeline stages that fit SM120's input and epilogue buffers."""
     if get_compute_capability(a.device) != (12, 0):
         return 3
 
