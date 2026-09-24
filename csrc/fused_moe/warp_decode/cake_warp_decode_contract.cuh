@@ -185,8 +185,8 @@ constexpr Schedule SelectAdditionalDirectSchedule(const Shape& shape) {
 constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
   if (IsGeometry(shape, 6144, 3072, 128, 4) && shape.num_tokens == 1) {
     return {true, Geometry::kH6144I3072E128K4, RouteLayout::kDirect,
-            RoutePacker::kNone, Fc1Schedule::kStatic,
-            Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed, 128, 4, 0};
+            RoutePacker::kNone, Fc1Schedule::kPersistent,
+            Fc2Schedule::kRouteParallelK256, 128, 4, 0};
   }
   if (shape.num_tokens < 1 || shape.num_tokens > kMaximumTokens) {
     return UnsupportedSchedule();
@@ -786,8 +786,8 @@ constexpr bool CheckPublicBoundaries(Shape shape, Geometry geometry,
             ActivationForGeometry(geometry) != activation ||
             schedule.route_layout != RouteLayout::kDirect ||
             schedule.route_packer != RoutePacker::kNone ||
-            schedule.fc1 != Fc1Schedule::kStatic ||
-            schedule.fc2 != Fc2Schedule::kRouteParallelK512MmaU2DeviceWorkfeed ||
+            schedule.fc1 != Fc1Schedule::kPersistent ||
+            schedule.fc2 != Fc2Schedule::kRouteParallelK256 ||
             schedule.finalize_threads != 128 || schedule.finalize_unroll != 4 ||
             schedule.workfeed_ctas != 0) return false;
       } else if (target == 1 && geometry == Geometry::kH6144I3072E128K4 &&

@@ -43,18 +43,18 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 208
+#define TMEM_NCOLS 256
 #define TMEM_ACCUM_OFFSET 0
 #define TMEM_SFA_OFFSET 16
-#define TMEM_SFB_OFFSET 144
-#define NUM_K_PIPE_STAGES 4
+#define TMEM_SFB_OFFSET 176
+#define NUM_K_PIPE_STAGES 5
 #define NUM_MMA_PIPE_STAGES 2
 #define NUM_WORK_PIPE_STAGES 3
 #define NUM_THROTTLE_PIPE_STAGES 3
 #define SMEM_SMEM_A_OFF 1024
 #define SMEM_SMEM_A_STAGE_BYTES 32768
 #define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 132096
+#define SMEM_SMEM_B_OFF 164864
 #define SMEM_SMEM_B_STAGE_BYTES 2048
 #define SMEM_SMEM_B_STRIDE 2048
 #define SMEM_SMEM_A_MMA0_OFF 1024
@@ -81,64 +81,64 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define SMEM_SMEM_A_MMA7_OFF 17504
 #define SMEM_SMEM_A_MMA7_STAGE_BYTES 4096
 #define SMEM_SMEM_A_MMA7_STRIDE 32768
-#define SMEM_SMEM_B_MMA0_OFF 132096
+#define SMEM_SMEM_B_MMA0_OFF 164864
 #define SMEM_SMEM_B_MMA0_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA0_STRIDE 2048
-#define SMEM_SMEM_B_MMA1_OFF 132128
+#define SMEM_SMEM_B_MMA1_OFF 164896
 #define SMEM_SMEM_B_MMA1_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA1_STRIDE 2048
-#define SMEM_SMEM_B_MMA2_OFF 132160
+#define SMEM_SMEM_B_MMA2_OFF 164928
 #define SMEM_SMEM_B_MMA2_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA2_STRIDE 2048
-#define SMEM_SMEM_B_MMA3_OFF 132192
+#define SMEM_SMEM_B_MMA3_OFF 164960
 #define SMEM_SMEM_B_MMA3_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA3_STRIDE 2048
-#define SMEM_SMEM_B_MMA4_OFF 133120
+#define SMEM_SMEM_B_MMA4_OFF 165888
 #define SMEM_SMEM_B_MMA4_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA4_STRIDE 2048
-#define SMEM_SMEM_B_MMA5_OFF 133152
+#define SMEM_SMEM_B_MMA5_OFF 165920
 #define SMEM_SMEM_B_MMA5_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA5_STRIDE 2048
-#define SMEM_SMEM_B_MMA6_OFF 133184
+#define SMEM_SMEM_B_MMA6_OFF 165952
 #define SMEM_SMEM_B_MMA6_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA6_STRIDE 2048
-#define SMEM_SMEM_B_MMA7_OFF 133216
+#define SMEM_SMEM_B_MMA7_OFF 165984
 #define SMEM_SMEM_B_MMA7_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA7_STRIDE 2048
 #define SMEM_SMEM_A_MMA0_NEXT_OFF 1024
 #define SMEM_SMEM_A_MMA0_NEXT_STAGE_BYTES 4096
 #define SMEM_SMEM_A_MMA0_NEXT_STRIDE 32768
-#define SMEM_SMEM_B_MMA0_NEXT_OFF 132096
+#define SMEM_SMEM_B_MMA0_NEXT_OFF 164864
 #define SMEM_SMEM_B_MMA0_NEXT_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA0_NEXT_STRIDE 2048
 #define SMEM_SMEM_A_MMA2_NEXT_OFF 1024
 #define SMEM_SMEM_A_MMA2_NEXT_STAGE_BYTES 4096
 #define SMEM_SMEM_A_MMA2_NEXT_STRIDE 32768
-#define SMEM_SMEM_B_MMA2_NEXT_OFF 132096
+#define SMEM_SMEM_B_MMA2_NEXT_OFF 164864
 #define SMEM_SMEM_B_MMA2_NEXT_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA2_NEXT_STRIDE 2048
 #define SMEM_SMEM_A_MMA5_NEXT_OFF 1024
 #define SMEM_SMEM_A_MMA5_NEXT_STAGE_BYTES 4096
 #define SMEM_SMEM_A_MMA5_NEXT_STRIDE 32768
-#define SMEM_SMEM_B_MMA5_NEXT_OFF 132096
+#define SMEM_SMEM_B_MMA5_NEXT_OFF 164864
 #define SMEM_SMEM_B_MMA5_NEXT_STAGE_BYTES 256
 #define SMEM_SMEM_B_MMA5_NEXT_STRIDE 2048
-#define SMEM_SMEM_SFA_OFF 140288
+#define SMEM_SMEM_SFA_OFF 175104
 #define SMEM_SMEM_SFA_STAGE_BYTES 4096
 #define SMEM_SMEM_SFA_STRIDE 4096
-#define SMEM_SMEM_SFB_OFF 156672
+#define SMEM_SMEM_SFB_OFF 195584
 #define SMEM_SMEM_SFB_STAGE_BYTES 256
 #define SMEM_SMEM_SFB_STRIDE 256
-#define SMEM_EPI_STAGING_OFF 157696
+#define SMEM_EPI_STAGING_OFF 196864
 #define SMEM_EPI_STAGING_STAGE_BYTES 2048
 #define SMEM_EPI_STAGING_STRIDE 2048
-#define SMEM_EPI_STAGING_U64_OFF 157696
+#define SMEM_EPI_STAGING_U64_OFF 196864
 #define SMEM_EPI_STAGING_U64_STAGE_BYTES 2048
 #define SMEM_EPI_STAGING_U64_STRIDE 2048
-#define SMEM_WORK_RESPONSE_OFF 159744
+#define SMEM_WORK_RESPONSE_OFF 198912
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 159872
+#define SMEM_TOTAL 199040
 #define THREADS 512
 #define BLOCK_M 128
 #define BLOCK_N 8
@@ -518,7 +518,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_warp_decode_f5274566e369dd01d4c9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -531,33 +531,33 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
 
     const int mbar_base = smem;
     #define a_full_addr (mbar_base + 0)
-    #define b_full_addr (mbar_base + 32)
-    #define sfa_full_addr (mbar_base + 64)
-    #define sfb_full_addr (mbar_base + 96)
-    #define sfa_smem_free_addr (mbar_base + 128)
-    #define sfb_smem_free_addr (mbar_base + 160)
-    #define tmem_sfa_full_addr (mbar_base + 192)
-    #define tmem_sfb_full_addr (mbar_base + 224)
-    #define a_empty_addr (mbar_base + 256)
-    #define b_empty_addr (mbar_base + 288)
-    #define tmem_sfa_empty_addr (mbar_base + 320)
-    #define tmem_sfb_empty_addr (mbar_base + 352)
-    #define mma_full_addr (mbar_base + 384)
-    #define mma_free_addr (mbar_base + 400)
-    #define work_full_addr (mbar_base + 416)
-    #define work_empty_addr (mbar_base + 440)
-    #define throttle_full_addr (mbar_base + 464)
-    #define throttle_empty_addr (mbar_base + 488)
+    #define b_full_addr (mbar_base + 40)
+    #define sfa_full_addr (mbar_base + 80)
+    #define sfb_full_addr (mbar_base + 120)
+    #define sfa_smem_free_addr (mbar_base + 160)
+    #define sfb_smem_free_addr (mbar_base + 200)
+    #define tmem_sfa_full_addr (mbar_base + 240)
+    #define tmem_sfb_full_addr (mbar_base + 280)
+    #define a_empty_addr (mbar_base + 320)
+    #define b_empty_addr (mbar_base + 360)
+    #define tmem_sfa_empty_addr (mbar_base + 400)
+    #define tmem_sfb_empty_addr (mbar_base + 440)
+    #define mma_full_addr (mbar_base + 480)
+    #define mma_free_addr (mbar_base + 496)
+    #define work_full_addr (mbar_base + 512)
+    #define work_empty_addr (mbar_base + 536)
+    #define throttle_full_addr (mbar_base + 560)
+    #define throttle_empty_addr (mbar_base + 584)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 512);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 608);
 
     // Kernel setup ops
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 132096);
-    const int smem_b_addr = smem + 132096;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 164864);
+    const int smem_b_addr = smem + 164864;
     uint8_t* smem_a_mma0 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_mma0_addr = smem + 1024;
     uint8_t* smem_a_mma1 = reinterpret_cast<uint8_t*>(smem_raw + 1056);
@@ -574,123 +574,123 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
     const int smem_a_mma6_addr = smem + 17472;
     uint8_t* smem_a_mma7 = reinterpret_cast<uint8_t*>(smem_raw + 17504);
     const int smem_a_mma7_addr = smem + 17504;
-    uint8_t* smem_b_mma0 = reinterpret_cast<uint8_t*>(smem_raw + 132096);
-    const int smem_b_mma0_addr = smem + 132096;
-    uint8_t* smem_b_mma1 = reinterpret_cast<uint8_t*>(smem_raw + 132128);
-    const int smem_b_mma1_addr = smem + 132128;
-    uint8_t* smem_b_mma2 = reinterpret_cast<uint8_t*>(smem_raw + 132160);
-    const int smem_b_mma2_addr = smem + 132160;
-    uint8_t* smem_b_mma3 = reinterpret_cast<uint8_t*>(smem_raw + 132192);
-    const int smem_b_mma3_addr = smem + 132192;
-    uint8_t* smem_b_mma4 = reinterpret_cast<uint8_t*>(smem_raw + 133120);
-    const int smem_b_mma4_addr = smem + 133120;
-    uint8_t* smem_b_mma5 = reinterpret_cast<uint8_t*>(smem_raw + 133152);
-    const int smem_b_mma5_addr = smem + 133152;
-    uint8_t* smem_b_mma6 = reinterpret_cast<uint8_t*>(smem_raw + 133184);
-    const int smem_b_mma6_addr = smem + 133184;
-    uint8_t* smem_b_mma7 = reinterpret_cast<uint8_t*>(smem_raw + 133216);
-    const int smem_b_mma7_addr = smem + 133216;
+    uint8_t* smem_b_mma0 = reinterpret_cast<uint8_t*>(smem_raw + 164864);
+    const int smem_b_mma0_addr = smem + 164864;
+    uint8_t* smem_b_mma1 = reinterpret_cast<uint8_t*>(smem_raw + 164896);
+    const int smem_b_mma1_addr = smem + 164896;
+    uint8_t* smem_b_mma2 = reinterpret_cast<uint8_t*>(smem_raw + 164928);
+    const int smem_b_mma2_addr = smem + 164928;
+    uint8_t* smem_b_mma3 = reinterpret_cast<uint8_t*>(smem_raw + 164960);
+    const int smem_b_mma3_addr = smem + 164960;
+    uint8_t* smem_b_mma4 = reinterpret_cast<uint8_t*>(smem_raw + 165888);
+    const int smem_b_mma4_addr = smem + 165888;
+    uint8_t* smem_b_mma5 = reinterpret_cast<uint8_t*>(smem_raw + 165920);
+    const int smem_b_mma5_addr = smem + 165920;
+    uint8_t* smem_b_mma6 = reinterpret_cast<uint8_t*>(smem_raw + 165952);
+    const int smem_b_mma6_addr = smem + 165952;
+    uint8_t* smem_b_mma7 = reinterpret_cast<uint8_t*>(smem_raw + 165984);
+    const int smem_b_mma7_addr = smem + 165984;
     uint8_t* smem_a_mma0_next = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_mma0_next_addr = smem + 1024;
-    uint8_t* smem_b_mma0_next = reinterpret_cast<uint8_t*>(smem_raw + 132096);
-    const int smem_b_mma0_next_addr = smem + 132096;
+    uint8_t* smem_b_mma0_next = reinterpret_cast<uint8_t*>(smem_raw + 164864);
+    const int smem_b_mma0_next_addr = smem + 164864;
     uint8_t* smem_a_mma2_next = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_mma2_next_addr = smem + 1024;
-    uint8_t* smem_b_mma2_next = reinterpret_cast<uint8_t*>(smem_raw + 132096);
-    const int smem_b_mma2_next_addr = smem + 132096;
+    uint8_t* smem_b_mma2_next = reinterpret_cast<uint8_t*>(smem_raw + 164864);
+    const int smem_b_mma2_next_addr = smem + 164864;
     uint8_t* smem_a_mma5_next = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_mma5_next_addr = smem + 1024;
-    uint8_t* smem_b_mma5_next = reinterpret_cast<uint8_t*>(smem_raw + 132096);
-    const int smem_b_mma5_next_addr = smem + 132096;
-    uint8_t* smem_sfa = reinterpret_cast<uint8_t*>(smem_raw + 140288);
-    const int smem_sfa_addr = smem + 140288;
-    uint8_t* smem_sfb = reinterpret_cast<uint8_t*>(smem_raw + 156672);
-    const int smem_sfb_addr = smem + 156672;
-    __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 157696);
-    const int epi_staging_addr = smem + 157696;
-    unsigned long long* epi_staging_u64 = reinterpret_cast<unsigned long long*>(smem_raw + 157696);
-    const int epi_staging_u64_addr = smem + 157696;
-    unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 159744);
-    const int work_response_addr = smem + 159744;
+    uint8_t* smem_b_mma5_next = reinterpret_cast<uint8_t*>(smem_raw + 164864);
+    const int smem_b_mma5_next_addr = smem + 164864;
+    uint8_t* smem_sfa = reinterpret_cast<uint8_t*>(smem_raw + 175104);
+    const int smem_sfa_addr = smem + 175104;
+    uint8_t* smem_sfb = reinterpret_cast<uint8_t*>(smem_raw + 195584);
+    const int smem_sfb_addr = smem + 195584;
+    __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 196864);
+    const int epi_staging_addr = smem + 196864;
+    unsigned long long* epi_staging_u64 = reinterpret_cast<unsigned long long*>(smem_raw + 196864);
+    const int epi_staging_u64_addr = smem + 196864;
+    unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 198912);
+    const int work_response_addr = smem + 198912;
 
-    // Mbarrier init (18 pipeline groups, 0 ordered-sequence groups, 64 barriers)
-    // Mbarriers at smem_raw[0..512)
+    // Mbarrier init (18 pipeline groups, 0 ordered-sequence groups, 76 barriers)
+    // Mbarriers at smem_raw[0..608)
 
     if (warp == 10) {
         // --- pipeline 'k_pipe' ---
-        // a_full: 4 barriers, init_count=1
-        // a_empty: 4 barriers, init_count=1
+        // a_full: 5 barriers, init_count=1
+        // a_empty: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
+        for (int _bar = lane; _bar < 5; _bar += 32) {
             mbarrier_init(smem + 0 + _bar * 8, 1);
         }
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 256 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 320 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp == 8) {
         // --- pipeline 'k_pipe' ---
-        // b_full: 4 barriers, init_count=1
-        // b_empty: 4 barriers, init_count=1
+        // b_full: 5 barriers, init_count=1
+        // b_empty: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 32 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 40 + _bar * 8, 1);
         }
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 288 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 360 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp == 11) {
         // --- pipeline 'k_pipe' ---
-        // sfa_full: 4 barriers, init_count=1
-        // sfa_smem_free: 4 barriers, init_count=1
+        // sfa_full: 5 barriers, init_count=1
+        // sfa_smem_free: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 64 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 80 + _bar * 8, 1);
         }
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 128 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 160 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp == 9) {
         // --- pipeline 'k_pipe' ---
-        // sfb_full: 4 barriers, init_count=1
-        // sfb_smem_free: 4 barriers, init_count=1
+        // sfb_full: 5 barriers, init_count=1
+        // sfb_smem_free: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 96 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 120 + _bar * 8, 1);
         }
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 160 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 200 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp == 12) {
         // --- pipeline 'k_pipe' ---
-        // tmem_sfa_full: 4 barriers, init_count=1
-        // tmem_sfa_empty: 4 barriers, init_count=1
+        // tmem_sfa_full: 5 barriers, init_count=1
+        // tmem_sfa_empty: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 192 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 240 + _bar * 8, 1);
         }
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 320 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 400 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     if (warp == 4) {
         // --- pipeline 'k_pipe' ---
-        // tmem_sfb_full: 4 barriers, init_count=1
-        // tmem_sfb_empty: 4 barriers, init_count=1
+        // tmem_sfb_full: 5 barriers, init_count=1
+        // tmem_sfb_empty: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 224 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 280 + _bar * 8, 1);
         }
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 352 + _bar * 8, 1);
+        for (int _bar = lane; _bar < 5; _bar += 32) {
+            mbarrier_init(smem + 440 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -700,10 +700,10 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
         // mma_free: 2 barriers, init_count=4
         // Warp-cooperative initialization, grouped by equal arrival count.
         for (int _bar = lane; _bar < 2; _bar += 32) {
-            mbarrier_init(smem + 384 + _bar * 8, 1);
+            mbarrier_init(smem + 480 + _bar * 8, 1);
         }
         for (int _bar = lane; _bar < 2; _bar += 32) {
-            mbarrier_init(smem + 400 + _bar * 8, 4);
+            mbarrier_init(smem + 496 + _bar * 8, 4);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -716,22 +716,22 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
         // throttle_empty: 3 barriers, init_count=32
         // Warp-cooperative initialization, grouped by equal arrival count.
         for (int _bar = lane; _bar < 3; _bar += 32) {
-            mbarrier_init(smem + 416 + _bar * 8, 1);
+            mbarrier_init(smem + 512 + _bar * 8, 1);
         }
         for (int _bar = lane; _bar < 3; _bar += 32) {
-            mbarrier_init(smem + 440 + _bar * 8, 512);
+            mbarrier_init(smem + 536 + _bar * 8, 512);
         }
         for (int _bar = lane; _bar < 6; _bar += 32) {
-            mbarrier_init(smem + 464 + _bar * 8, 32);
+            mbarrier_init(smem + 560 + _bar * 8, 32);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
     __syncwarp();
 
-    // TMEM alloc (256 columns, 208 used)
+    // TMEM alloc (256 columns, 256 used)
     if (warp == 0) {
-        int _tmem_hold = smem + 512;
+        int _tmem_hold = smem + 608;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -744,7 +744,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
     // Kernel post-init ops
     const int tmem_accum = taddr;
     const int tmem_sfa = taddr + 16;
-    const int tmem_sfb = taddr + 144;
+    const int tmem_sfb = taddr + 176;
 
     // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
@@ -907,7 +907,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16), "r"(word[0]));
                     const int q_0 = 1;
                     for (int reg_1 = 0; reg_1 < 1; reg_1++) {
                         word[reg_1] = 0;
@@ -918,7 +918,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 2), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 2), "r"(word[0]));
                     const int q_1 = 2;
                     for (int reg_2 = 0; reg_2 < 1; reg_2++) {
                         word[reg_2] = 0;
@@ -929,7 +929,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 4), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 4), "r"(word[0]));
                     const int q_2 = 3;
                     for (int reg_3 = 0; reg_3 < 1; reg_3++) {
                         word[reg_3] = 0;
@@ -940,7 +940,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 6), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 6), "r"(word[0]));
                     const int q_3 = 4;
                     for (int reg_4 = 0; reg_4 < 1; reg_4++) {
                         word[reg_4] = 0;
@@ -951,7 +951,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 8), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 8), "r"(word[0]));
                     const int q_4 = 5;
                     for (int reg_5 = 0; reg_5 < 1; reg_5++) {
                         word[reg_5] = 0;
@@ -962,7 +962,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 10), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 10), "r"(word[0]));
                     const int q_5 = 6;
                     for (int reg_6 = 0; reg_6 < 1; reg_6++) {
                         word[reg_6] = 0;
@@ -973,7 +973,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 12), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 12), "r"(word[0]));
                     const int q_6 = 7;
                     for (int reg_7 = 0; reg_7 < 1; reg_7++) {
                         word[reg_7] = 0;
@@ -984,7 +984,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + 16 + 128 + stage * 16 + 14), "r"(word[0]));
+                        :: "r"(taddr + 16 + 160 + stage * 16 + 14), "r"(word[0]));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
@@ -995,7 +995,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                         }
                     }
                     stage += 1;
-                    if (stage == 4) { stage = 0; _phase_sfb_full ^= 1; _phase_tmem_sfb_empty ^= 1; }
+                    if (stage == 5) { stage = 0; _phase_sfb_full ^= 1; _phase_tmem_sfb_empty ^= 1; }
                 }
                 {
                     mbarrier_wait_hint(work_full_addr + (work_stage_1) * 8, _phase_work_full_1, 10000000);
@@ -1045,7 +1045,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                         mbarrier_arrive_expect_tx(b_full_addr + (stage_1) * 8, 2048);
                     }
                     stage_1 += 1;
-                    if (stage_1 == 4) { stage_1 = 0; _phase_b_empty ^= 1; }
+                    if (stage_1 == 5) { stage_1 = 0; _phase_b_empty ^= 1; }
                 }
                 {
                     mbarrier_wait_hint(work_full_addr + (work_stage_2) * 8, _phase_work_full_2, 10000000);
@@ -1094,7 +1094,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                         mbarrier_arrive_expect_tx(sfb_full_addr + (stage_2) * 8, 256);
                     }
                     stage_2 += 1;
-                    if (stage_2 == 4) { stage_2 = 0; _phase_sfb_smem_free ^= 1; }
+                    if (stage_2 == 5) { stage_2 = 0; _phase_sfb_smem_free ^= 1; }
                 }
                 {
                     mbarrier_wait_hint(work_full_addr + (work_stage_3) * 8, _phase_work_full_3, 10000000);
@@ -1149,7 +1149,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                         mbarrier_arrive_expect_tx(a_full_addr + (stage_3) * 8, 32768);
                     }
                     stage_3 += 1;
-                    if (stage_3 == 4) { stage_3 = 0; _phase_a_empty ^= 1; }
+                    if (stage_3 == 5) { stage_3 = 0; _phase_a_empty ^= 1; }
                 }
                 {
                     mbarrier_wait_hint(work_full_addr + (work_stage_4) * 8, _phase_work_full_4, 10000000);
@@ -1197,7 +1197,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                         mbarrier_arrive_expect_tx(sfa_full_addr + (stage_4) * 8, 4096);
                     }
                     stage_4 += 1;
-                    if (stage_4 == 4) { stage_4 = 0; _phase_sfa_smem_free ^= 1; }
+                    if (stage_4 == 5) { stage_4 = 0; _phase_sfa_smem_free ^= 1; }
                 }
                 {
                     mbarrier_wait_hint(work_full_addr + (work_stage_5) * 8, _phase_work_full_5, 10000000);
@@ -1325,7 +1325,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     }
                     elect_commit2(tmem_sfa_full_addr + (stage_5) * 8, sfa_smem_free_addr + (stage_5) * 8);
                     stage_5 += 1;
-                    if (stage_5 == 4) { stage_5 = 0; _phase_sfa_full ^= 1; _phase_tmem_sfa_empty ^= 1; }
+                    if (stage_5 == 5) { stage_5 = 0; _phase_sfa_full ^= 1; _phase_tmem_sfa_empty ^= 1; }
                 }
                 {
                     mbarrier_wait_hint(work_full_addr + (work_stage_6) * 8, _phase_work_full_6, 10000000);
@@ -1507,7 +1507,7 @@ kernel_cake_warp_decode_65761f97d9972f3f8369(const __grid_constant__ CUtensorMap
                     }
                     {
                         k_stage += 1;
-                        if (k_stage == 4) { k_stage = 0; k_phase ^= 1; }
+                        if (k_stage == 5) { k_stage = 0; k_phase ^= 1; }
                     }
                 }
                 acc_stage_1 += 1;
