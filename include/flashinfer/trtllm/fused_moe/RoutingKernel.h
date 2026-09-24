@@ -130,6 +130,29 @@ struct DataBase {
   int16_t* mPtrRoutingReplayOut{nullptr};
   // optional: final token count for each expert, separate from histogram scratch
   int32_t* mPtrNumTokensPerExpert{nullptr};
+  //
+  // Optional run-time choice between two tile paddings (dual-tile routing).
+  //
+  // When mPaddingLog2Alt > mPaddingLog2 and the three *Alt pointers are set, the
+  // permutation pads every local expert to whichever of the two tiles the rule
+  // selects for this routing: the alternate (coarser) tile is taken when the
+  // rows it pads to are at most mDualTileThresholdPermille / 1000 of the rows
+  // the base tile pads to, summed over the local experts. The base-granularity
+  // tile list (mPtrCtaIdxXyToBatchIdx / mPtrCtaIdxXyToMnLimit) is written over
+  // the chosen padding and is always valid (the alternate tile is a multiple of
+  // the base tile); mPtrNumNonExitingCtas holds its full count. The alternate
+  // list is written only when the alternate tile is chosen. The two "active"
+  // counts let one grouped-GEMM launch per tile variant consume the routing:
+  // mPtrNumNonExitingCtasBaseActive = base count when the base tile is chosen,
+  // else 0; mPtrNumNonExitingCtasAlt = alternate count when it is chosen, else 0.
+  // mPtrPermutedIdxSize is the padded row total of the chosen tile.
+  // Appended at the end to preserve field offsets for existing routing kernels.
+  int32_t mPaddingLog2Alt{0};
+  int32_t mDualTileThresholdPermille{0};
+  int32_t* mPtrCtaIdxXyToBatchIdxAlt{nullptr};
+  int32_t* mPtrCtaIdxXyToMnLimitAlt{nullptr};
+  int32_t* mPtrNumNonExitingCtasAlt{nullptr};
+  int32_t* mPtrNumNonExitingCtasBaseActive{nullptr};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -176,6 +199,13 @@ struct KernelParamsBase {
   bool mUseContiguousRouteWindows = false;
   // Optional final token count for each expert, separate from histogram scratch.
   int32_t* mPtrNumTokensPerExpert = nullptr;
+  // Dual-tile routing (see DataBase). Appended for the same reason.
+  int32_t mPaddingLog2Alt = 0;
+  int32_t mDualTileThresholdPermille = 0;
+  int32_t* mPtrCtaIdxXyToBatchIdxAlt = nullptr;
+  int32_t* mPtrCtaIdxXyToMnLimitAlt = nullptr;
+  int32_t* mPtrNumNonExitingCtasAlt = nullptr;
+  int32_t* mPtrNumNonExitingCtasBaseActive = nullptr;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
@@ -210,6 +240,12 @@ struct KernelParamsBase {
     mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
     mSharedExpertNumTokens = data.mSharedExpertNumTokens;
     mTotalExpertsPerToken = data.mTotalExpertsPerToken;
+    mPaddingLog2Alt = data.mPaddingLog2Alt;
+    mDualTileThresholdPermille = data.mDualTileThresholdPermille;
+    mPtrCtaIdxXyToBatchIdxAlt = data.mPtrCtaIdxXyToBatchIdxAlt;
+    mPtrCtaIdxXyToMnLimitAlt = data.mPtrCtaIdxXyToMnLimitAlt;
+    mPtrNumNonExitingCtasAlt = data.mPtrNumNonExitingCtasAlt;
+    mPtrNumNonExitingCtasBaseActive = data.mPtrNumNonExitingCtasBaseActive;
   }
 };
 

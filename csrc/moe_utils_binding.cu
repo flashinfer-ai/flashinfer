@@ -364,6 +364,13 @@ void moe_sort(
     // Optional: expert counts buffer for large token counts (>1024)
     // Should be size 2 * num_experts, int32
     int64_t expert_counts_ptr,
+    // Optional dual-tile routing (0 / nullptr = off): pad each routing to
+    // tile_tokens_dim or tile_tokens_dim_alt at run time (see
+    // DataBase::mPaddingLog2Alt) and write the alternate tile list and the
+    // two active counts into these buffers.
+    int32_t tile_tokens_dim_alt, int32_t dual_tile_threshold_permille,
+    int64_t alt_tile_idx_to_expert_idx_ptr, int64_t alt_tile_idx_to_mn_limit_ptr,
+    int64_t alt_num_non_exiting_tiles_ptr, int64_t base_active_num_non_exiting_tiles_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
     int64_t cuda_stream_ptr) {
@@ -405,6 +412,26 @@ void moe_sort(
   routingData.mTopK = top_k;
   routingData.mPaddingLog2 = computeLog2(tile_tokens_dim);
   routingData.mTileTokensDim = tile_tokens_dim;
+  if (tile_tokens_dim_alt > 0) {
+    TVM_FFI_ICHECK(tile_tokens_dim_alt > tile_tokens_dim &&
+                   tile_tokens_dim_alt % tile_tokens_dim == 0 &&
+                   (tile_tokens_dim_alt & (tile_tokens_dim_alt - 1)) == 0 &&
+                   (tile_tokens_dim & (tile_tokens_dim - 1)) == 0)
+        << "dual-tile routing needs power-of-two tiles with tile_tokens_dim_alt a multiple "
+           "of tile_tokens_dim";
+    TVM_FFI_ICHECK(alt_tile_idx_to_expert_idx_ptr != 0 && alt_tile_idx_to_mn_limit_ptr != 0 &&
+                   alt_num_non_exiting_tiles_ptr != 0 && base_active_num_non_exiting_tiles_ptr != 0)
+        << "dual-tile routing needs the alternate list and both active-count buffers";
+    routingData.mPaddingLog2Alt = computeLog2(tile_tokens_dim_alt);
+    routingData.mDualTileThresholdPermille = dual_tile_threshold_permille;
+    routingData.mPtrCtaIdxXyToBatchIdxAlt =
+        reinterpret_cast<int32_t*>(alt_tile_idx_to_expert_idx_ptr);
+    routingData.mPtrCtaIdxXyToMnLimitAlt = reinterpret_cast<int32_t*>(alt_tile_idx_to_mn_limit_ptr);
+    routingData.mPtrNumNonExitingCtasAlt =
+        reinterpret_cast<int32_t*>(alt_num_non_exiting_tiles_ptr);
+    routingData.mPtrNumNonExitingCtasBaseActive =
+        reinterpret_cast<int32_t*>(base_active_num_non_exiting_tiles_ptr);
+  }
   routingData.mLocalExpertsStartIdx = local_expert_offset;
   routingData.mLocalExpertsStrideLog2 = 0;
   routingData.mNumLocalExperts = num_local_experts;

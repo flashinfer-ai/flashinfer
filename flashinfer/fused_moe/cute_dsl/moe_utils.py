@@ -592,6 +592,19 @@ def moe_sort(
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
     out_expert_counts: Optional[torch.Tensor] = None,
+    # Dual-tile routing (off when tile_tokens_dim_alt == 0): the routing kernel
+    # pads each routing to tile_tokens_dim or tile_tokens_dim_alt (the coarser
+    # tile, a power-of-two multiple of tile_tokens_dim), taking the coarser
+    # tile when its padded rows are within dual_tile_threshold_permille / 1000
+    # of the base tile's. The base list is always written over the chosen
+    # padding; the alternate list and the two active counts (base count or 0,
+    # alternate count or 0) select which of two grouped-GEMM launches runs.
+    tile_tokens_dim_alt: int = 0,
+    dual_tile_threshold_permille: int = 0,
+    out_alt_tile_idx_to_expert_idx: Optional[torch.Tensor] = None,
+    out_alt_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
+    out_alt_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    out_base_active_num_non_exiting_tiles: Optional[torch.Tensor] = None,
     *,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
@@ -695,13 +708,32 @@ def moe_sort(
 
     device = token_selected_experts.device
 
-    # Calculate buffer sizes
-    max_num_tiles = get_max_num_tiles(
-        num_tokens, top_k, num_local_experts, tile_tokens_dim
-    )
-    max_num_permuted_tokens = get_max_num_permuted_tokens(
-        num_tokens, top_k, num_local_experts, tile_tokens_dim
-    )
+    # Calculate buffer sizes. Dual-tile routing sizes the permuted rows by the
+    # coarser tile (its padding is the larger) and the base list by those rows.
+    if tile_tokens_dim_alt:
+        if (
+            tile_tokens_dim_alt <= tile_tokens_dim
+            or tile_tokens_dim_alt % tile_tokens_dim
+            or tile_tokens_dim_alt & (tile_tokens_dim_alt - 1)
+            or tile_tokens_dim & (tile_tokens_dim - 1)
+        ):
+            raise ValueError(
+                "tile_tokens_dim_alt must be a power-of-two multiple of tile_tokens_dim"
+            )
+        if dual_tile_threshold_permille <= 0:
+            raise ValueError("dual_tile_threshold_permille must be positive")
+        max_num_permuted_tokens = get_max_num_permuted_tokens(
+            num_tokens, top_k, num_local_experts, tile_tokens_dim_alt
+        )
+        max_num_tiles = max_num_permuted_tokens // tile_tokens_dim
+        max_num_alt_tiles = max_num_permuted_tokens // tile_tokens_dim_alt
+    else:
+        max_num_tiles = get_max_num_tiles(
+            num_tokens, top_k, num_local_experts, tile_tokens_dim
+        )
+        max_num_permuted_tokens = get_max_num_permuted_tokens(
+            num_tokens, top_k, num_local_experts, tile_tokens_dim
+        )
 
     # Ensure inputs are contiguous and correct dtypes
     token_selected_experts = token_selected_experts.contiguous()
@@ -757,6 +789,50 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
+    dual_ptrs = (0, 0, 0, 0)
+    if tile_tokens_dim_alt:
+        alt_expert_idx = out_alt_tile_idx_to_expert_idx
+        if alt_expert_idx is None:
+            alt_expert_idx = torch.empty(
+                (max_num_alt_tiles,), dtype=torch.int32, device=device
+            )
+        alt_mn_limit = out_alt_tile_idx_to_mn_limit
+        if alt_mn_limit is None:
+            alt_mn_limit = torch.empty(
+                (max_num_alt_tiles,), dtype=torch.int32, device=device
+            )
+        alt_count = out_alt_num_non_exiting_tiles
+        if alt_count is None:
+            alt_count = torch.empty((1,), dtype=torch.int32, device=device)
+        base_active = out_base_active_num_non_exiting_tiles
+        if base_active is None:
+            base_active = torch.empty((1,), dtype=torch.int32, device=device)
+        for name, buf, need in (
+            ("out_alt_tile_idx_to_expert_idx", alt_expert_idx, max_num_alt_tiles),
+            ("out_alt_tile_idx_to_mn_limit", alt_mn_limit, max_num_alt_tiles),
+            ("out_alt_num_non_exiting_tiles", alt_count, 1),
+            ("out_base_active_num_non_exiting_tiles", base_active, 1),
+        ):
+            if buf.dtype != torch.int32 or buf.numel() < need or buf.device != device:
+                raise ValueError(
+                    f"{name} must be int32 with >= {need} elements on {device}"
+                )
+        if (
+            tile_idx_to_expert_idx.numel() < max_num_tiles
+            or tile_idx_to_mn_limit.numel() < max_num_tiles
+            or permuted_idx_to_expanded_idx.numel() < max_num_permuted_tokens
+        ):
+            raise ValueError(
+                "dual-tile routing needs the base list sized by the coarser tile's "
+                f"padded rows ({max_num_tiles} tiles, {max_num_permuted_tokens} rows)"
+            )
+        dual_ptrs = (
+            alt_expert_idx.data_ptr(),
+            alt_mn_limit.data_ptr(),
+            alt_count.data_ptr(),
+            base_active.data_ptr(),
+        )
+
     # Allocate expert counts buffer for large token counts (>1024).
     # Required size: 2 * num_experts. The kernel zeros this internally via
     # launchInitExpertCounts before reading, so no Python-side init is needed
@@ -808,6 +884,10 @@ def moe_sort(
         num_non_exiting_tiles.data_ptr(),
         # Optional buffer
         expert_counts_ptr,
+        # Dual-tile routing
+        tile_tokens_dim_alt,
+        dual_tile_threshold_permille,
+        *dual_ptrs,
     )
     if _prepared_launches is not None:
         _prepared_launches["sort"] = (func, launch_args)

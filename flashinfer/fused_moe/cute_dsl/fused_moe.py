@@ -209,6 +209,26 @@ def _moe_core_impl(
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    # Dual-tile routing (Blackwell, off when dual_tile_size == 0): the routing
+    # pads each routing to tile_size or dual_tile_size at run time and both GEMMs
+    # are launched once per tile variant; the variant the routing did not choose
+    # reads a zero tile count and exits. ``moe_sort_buffers`` must carry the
+    # ``out_alt_*`` and ``out_base_active_num_non_exiting_tiles`` buffers.
+    dual_tile_size: int = 0,
+    dual_gemm1_mma_tiler_mn: Tuple[int, int] = (256, 256),
+    dual_gemm1_cluster_shape_mn: Tuple[int, int] = (2, 1),
+    dual_gemm2_mma_tiler_mn: Tuple[int, int] = (256, 256),
+    dual_gemm2_cluster_shape_mn: Tuple[int, int] = (2, 1),
+    dual_tile_threshold_permille: int = 0,
+    # GEMM2 tile raster order (Blackwell finalize kernel): M-fastest keeps the
+    # fused finalize's reduce target slab (one N tile of every token row)
+    # L2-resident; N-fastest (default) reuses each A tile across N tiles.
+    gemm2_raster_along_m: bool = False,
+    gemm2_swizzle_size: int = 1,
+    # Launch the alternate-tile GEMMs as programmatic dependents of the base
+    # ones (PDL): their launch overlaps the base kernel's tail, so the variant
+    # the routing did not choose costs about a launch gap instead of ~3 us.
+    dual_alt_pdl: bool = True,
     # Tactic parameters (Rubin — when set, use SM107 kernel)
     gemm1_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -370,7 +390,20 @@ def _moe_core_impl(
         )
 
     # Step 1: Sort tokens by expert
-    moe_sort_kwargs = moe_sort_buffers or {}
+    moe_sort_kwargs = dict(moe_sort_buffers or {})
+    if dual_tile_size:
+        if is_rubin:
+            raise NotImplementedError("dual-tile routing is a Blackwell path")
+        for name in (
+            "out_alt_tile_idx_to_expert_idx",
+            "out_alt_tile_idx_to_mn_limit",
+            "out_alt_num_non_exiting_tiles",
+            "out_base_active_num_non_exiting_tiles",
+        ):
+            if name not in moe_sort_kwargs:
+                raise ValueError(f"dual-tile routing needs moe_sort_buffers[{name!r}]")
+        moe_sort_kwargs["tile_tokens_dim_alt"] = dual_tile_size
+        moe_sort_kwargs["dual_tile_threshold_permille"] = dual_tile_threshold_permille
     (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
@@ -417,7 +450,11 @@ def _moe_core_impl(
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
+            num_non_exiting_tiles=(
+                moe_sort_kwargs["out_base_active_num_non_exiting_tiles"]
+                if dual_tile_size
+                else num_non_exiting_tiles
+            ),
             out=gemm1_out,
             out_scale=None if use_per_token_activation else gemm1_out_scale,
             global_scale=(
@@ -449,6 +486,54 @@ def _moe_core_impl(
             _prepared_launches=_prepared_launches,
         )
     )
+    if dual_tile_size:
+        # Alternate-tile GEMM1 over the same permuted rows and output buffers;
+        # it runs only when the routing chose the alternate tile.
+        alt_launches: Optional[Dict[str, Any]] = (
+            {} if _prepared_launches is not None else None
+        )
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+            a=x,
+            b=w1_weight,
+            a_scale=x_sf,
+            b_scale=w1_weight_sf,
+            alpha=w1_alpha,
+            tile_idx_to_expert_idx=moe_sort_kwargs["out_alt_tile_idx_to_expert_idx"],
+            tile_idx_to_mn_limit=moe_sort_kwargs["out_alt_tile_idx_to_mn_limit"],
+            token_id_mapping=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=moe_sort_kwargs["out_alt_num_non_exiting_tiles"],
+            out=gemm1_out,
+            out_scale=None if use_per_token_activation else gemm1_out_scale,
+            global_scale=(
+                fc2_input_scale
+                if not is_mxfp8 and not use_per_token_activation
+                else None
+            ),
+            a_per_token_scale=per_token_scale,
+            c_dtype=c_dtype,
+            a_dtype=a_dtype,
+            b_dtype="float4_e2m1fn",
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            quantize_output=not use_per_token_activation,
+            topk=top_k,
+            mma_tiler_mn=dual_gemm1_mma_tiler_mn,
+            cluster_shape_mn=dual_gemm1_cluster_shape_mn,
+            mma_tiler=None,
+            mma_inst_shape=None,
+            enable_pdl=enable_pdl or dual_alt_pdl,
+            activation_type=activation.value,
+            weight_l2_hint=weight_l2_hint,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            gated=gated,
+            _prepared_launches=alt_launches,
+        )
+        if _prepared_launches is not None:
+            _prepared_launches["gather_alt"] = alt_launches["gather"]
     if use_per_token_activation:
         intermediate, intermediate_sf, intermediate_per_token_scale = (
             nvfp4_quantize_per_token_cute_dsl(
@@ -504,7 +589,11 @@ def _moe_core_impl(
         b_scale=w2_weight_sf,
         alpha=w2_alpha,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        num_non_exiting_tiles=num_non_exiting_tiles,
+        num_non_exiting_tiles=(
+            moe_sort_kwargs["out_base_active_num_non_exiting_tiles"]
+            if dual_tile_size
+            else num_non_exiting_tiles
+        ),
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
@@ -522,9 +611,47 @@ def _moe_core_impl(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         weight_l2_hint=weight_l2_hint,
+        raster_along_m=gemm2_raster_along_m,
+        swizzle_size=gemm2_swizzle_size,
         _prepared_launches=_prepared_launches,
         _enable_narrow_a=_enable_decode_specialization,
     )
+    if dual_tile_size:
+        # Alternate-tile GEMM2 (same output, same permuted rows); runs only when
+        # the routing chose the alternate tile.
+        alt_launches = {} if _prepared_launches is not None else None
+        blockscaled_contiguous_grouped_gemm_finalize_fusion(
+            a=intermediate,
+            b=w2_weight,
+            a_scale=intermediate_sf,
+            b_scale=w2_weight_sf,
+            alpha=w2_alpha,
+            tile_idx_to_expert_idx=moe_sort_kwargs["out_alt_tile_idx_to_expert_idx"],
+            num_non_exiting_tiles=moe_sort_kwargs["out_alt_num_non_exiting_tiles"],
+            tile_idx_to_mn_limit=moe_sort_kwargs["out_alt_tile_idx_to_mn_limit"],
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            token_final_scales=token_final_scales,
+            out=gemm2_output,
+            a_per_token_scale=intermediate_per_token_scale,
+            a_dtype=a_dtype,
+            b_dtype="float4_e2m1fn",
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            out_dtype="bfloat16",
+            mma_tiler_mn=dual_gemm2_mma_tiler_mn,
+            mma_tiler=None,
+            mma_inst_shape=None,
+            cluster_shape_mn=dual_gemm2_cluster_shape_mn,
+            enable_pdl=enable_pdl or dual_alt_pdl,
+            use_fused_finalize=use_fused_finalize,
+            weight_l2_hint=weight_l2_hint,
+            raster_along_m=gemm2_raster_along_m,
+            swizzle_size=gemm2_swizzle_size,
+            _prepared_launches=alt_launches,
+            _enable_narrow_a=False,
+        )
+        if _prepared_launches is not None:
+            _prepared_launches["finalize_alt"] = alt_launches["finalize"]
 
     # Step 4: Deterministic routing-weight reduction
     if not use_fused_finalize and skip_unpermute:

@@ -195,9 +195,77 @@ B300_SITU_DENSE_TACTIC_TABLE_NARROW = (
     (14336, _T256_N256_C1),
     (1 << 62, _T128_N192_C2),
 )
+# Dual-tile dense routing. The rows per local expert decide whether the 2-CTA
+# M256 tile (GEMM1 761 vs 905 us, GEMM2 431 vs 543 us on 146-row experts at
+# EP8 T=8192, same padded rows) or the M128 tile (73- and 293-row experts,
+# where M256 pads 2x / 1.33x) is faster, and that depends on the routing, not
+# only on the token count (the remote-dominated routing at EP8 T=8192 has half
+# the rows per expert of the balanced one; the MoE-TP shard's hot routing at
+# T=16384 loses 7% under M256 while its empty routing gains). Above
+# ``DENSE_DUAL_TILE_MIN_TOKENS`` the routing kernel therefore pads each routing
+# to the 128- or 256-row tile at run time (M256 when its padded rows are within
+# ``DENSE_DUAL_TILE_THRESHOLD_PERMILLE`` / 1000 of the M128 padded rows) and
+# both GEMMs are launched in both tile variants; the variant the routing did
+# not choose reads a zero tile count and exits (about 3 us per launch, measured
+# on the mixed-form dense GEMM1). Measured on B300 (same GPU, T=8192..32768,
+# both layouts): M256 wins only where the padded rows are equal (ratio 1.0,
+# 4-17%), M128 wins at every measured ratio from 1.137 up (2-14%), so the
+# threshold is 1.10. The bucket whose table tactic is the M256 tile runs the
+# M128 base ``_T128_N256_C2`` under this rule instead.
+DENSE_DUAL_TILE = os.environ.get("MXFP4_DENSE_DUAL_TILE", "1") == "1"
+DENSE_DUAL_TILE_MIN_TOKENS = int(
+    os.environ.get("MXFP4_DENSE_DUAL_TILE_MIN_TOKENS", "7168")
+)
+# The two launches of the variant the routing did not choose cost 2.6-3.9 us
+# each plus their graph launch gaps (about 8 us together, measured EP8
+# T=8192..32768 on B300). That is below 0.5% of every MoE-TP shard row above
+# ``DENSE_DUAL_TILE_MIN_TOKENS`` (>= 1.07 ms) but 5-10% of the wide rank's
+# empty routings (86-160 us), which must not run slower than the single-tile
+# plan, so the default rule applies to shards up to ``DENSE_DUAL_TILE_MAX_SHARD``
+# columns only; the wide rank keeps it opt-in (``dense_dual_tile=True`` or a
+# larger ``MXFP4_DENSE_DUAL_TILE_MAX_SHARD``) until the unchosen launches can
+# be skipped on the device (graph conditional nodes).
+DENSE_DUAL_TILE_MAX_SHARD = int(
+    os.environ.get("MXFP4_DENSE_DUAL_TILE_MAX_SHARD", "512")
+)
+DENSE_DUAL_TILE_THRESHOLD_PERMILLE = int(
+    os.environ.get("MXFP4_DENSE_DUAL_TILE_THRESHOLD_PERMILLE", "1100")
+)
+B300_SITU_DENSE_DUAL_TACTIC = _T256_N256_C1
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
 # applies the route weights (no bulk reduce-add into the output).
 DENSE_TWO_STAGE_FINALIZE = os.environ.get("MXFP4_DENSE_TWO_STAGE", "0") == "1"
+# Dense GEMM2 tile raster. N-fastest (the finalize kernel's default) reuses
+# each 128-row A tile across the N tiles; M-fastest walks the M tiles of one
+# N tile so the fused finalize's reduce-add target (one 256-column slab of
+# every routed token row) stays L2-resident, and with ``swizzle`` N tiles per
+# group the A tile is still reused ``swizzle`` times. On the 384-wide MoE-TP
+# shard, whose GEMM2 is bound by the reduce-add traffic, M-fastest with groups
+# of 4 cuts the balanced and empty rows by 6-13% at T=8192..32768 (interleaved
+# A/B/A/B, 30 graph replays each) but costs the hot routing (one expert holding
+# every token plus 895 small ones) 1.2% at T=32768 and up to 3.4% at T=16384,
+# and the wide rank (K=3072) 3-5%. Off by default until the raster can follow
+# the routing on the device; ``MXFP4_GEMM2_RASTER_M=1`` (swizzle
+# ``MXFP4_GEMM2_SWIZZLE``, default 4) enables it, ``auto`` applies it to shards
+# up to ``MXFP4_GEMM2_RASTER_M_MAX_SHARD`` columns from
+# ``MXFP4_GEMM2_RASTER_M_MIN_TOKENS`` tokens.
+DENSE_GEMM2_RASTER_M = os.environ.get("MXFP4_GEMM2_RASTER_M", "0")
+DENSE_GEMM2_SWIZZLE = int(os.environ.get("MXFP4_GEMM2_SWIZZLE", "4"))
+DENSE_GEMM2_RASTER_M_MAX_SHARD = int(
+    os.environ.get("MXFP4_GEMM2_RASTER_M_MAX_SHARD", "512")
+)
+DENSE_GEMM2_RASTER_M_MIN_TOKENS = int(
+    os.environ.get("MXFP4_GEMM2_RASTER_M_MIN_TOKENS", "8192")
+)
+if DENSE_GEMM2_RASTER_M not in ("auto", "0", "1"):
+    raise ValueError("MXFP4_GEMM2_RASTER_M must be auto, 0 or 1")
+# Dual-tile routing: launching the alternate-tile GEMMs as programmatic
+# dependents (PDL) was meant to hide the unchosen variant's launch, but the
+# base kernels trigger their dependents only at their end, so the alternate
+# grid launches into the base kernel's tail and waits there: its CUPTI
+# duration grows to 26-61 us when unchosen (EP8 T=16384/32768) while the GPU
+# span does not improve. Off by default; ``MXFP4_DUAL_ALT_PDL=1`` restores it.
+DENSE_DUAL_ALT_PDL = os.environ.get("MXFP4_DUAL_ALT_PDL", "0") == "1"
 
 
 _PARALLEL_MODES = ("single", "expert_parallel", "moe_tensor_parallel")
@@ -522,6 +590,10 @@ class Mxfp4MoEPlan:
             _moe_core_impl(**self._kwargs, _prepared_launches=launches)
         self._sort, self._sort_args = launches["sort"]
         self._gather, self._gather_args, self._gather_kwargs = launches["gather"]
+        # Dual-tile routing: the alternate-tile GEMMs run after the base ones;
+        # the one the routing did not choose exits on a zero tile count.
+        self._gather_alt = launches.get("gather_alt")
+        self._finalize_alt = launches.get("finalize_alt")
         # No memset in the expanded-row (non-fused) finalize form.
         self._memset, self._memset_args = launches.get("memset", (None, None))
         self._finalize, self._finalize_args = launches["finalize"]
@@ -590,9 +662,15 @@ class Mxfp4MoEPlan:
             ):
                 self._sort(*self._sort_args, stream_ptr)
             self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
+            if self._gather_alt is not None:
+                gather_alt, gather_alt_args, gather_alt_kwargs = self._gather_alt
+                gather_alt(*gather_alt_args, stream=stream, **gather_alt_kwargs)
             if self._route_preprocess is None and self._memset is not None:
                 self._memset(*self._memset_args, stream_ptr)
             self._finalize(*self._finalize_args, stream=stream)
+            if self._finalize_alt is not None:
+                finalize_alt, finalize_alt_args = self._finalize_alt
+                finalize_alt(*finalize_alt_args, stream=stream)
             if self._unpermute is not None:
                 unpermute, unpermute_kwargs = self._unpermute
                 unpermute(**unpermute_kwargs)
@@ -1073,6 +1151,9 @@ class CuteDslMxfp4MoEWrapper:
         swapab_max_tokens: Optional[int] = None,
         swapab_n_tile: int = SWAP_ROW_TILE,
         swapab_tile_policy=None,
+        dense_dual_tile: Optional[bool] = None,
+        dense_dual_tile_min_tokens: Optional[int] = None,
+        dense_dual_tile_threshold_permille: Optional[int] = None,
     ):
         self.num_experts = num_experts
         self.top_k = top_k
@@ -1090,6 +1171,21 @@ class CuteDslMxfp4MoEWrapper:
             raise ValueError("swapab_n_tile must be 8, 16, 32, 64 or 128")
         self.swapab_max_tokens = swapab_max_tokens
         self.swapab_n_tile = swapab_n_tile
+        # Dual-tile dense routing (see DENSE_DUAL_TILE). ``dense_dual_tile=True``
+        # forces it for every dense token count (tests); ``False`` disables it.
+        self.dense_dual_tile = dense_dual_tile
+        self.dense_dual_tile_min_tokens = (
+            DENSE_DUAL_TILE_MIN_TOKENS
+            if dense_dual_tile_min_tokens is None
+            else dense_dual_tile_min_tokens
+        )
+        self.dense_dual_tile_threshold_permille = (
+            DENSE_DUAL_TILE_THRESHOLD_PERMILLE
+            if dense_dual_tile_threshold_permille is None
+            else dense_dual_tile_threshold_permille
+        )
+        if self.dense_dual_tile_threshold_permille <= 0:
+            raise ValueError("dense_dual_tile_threshold_permille must be positive")
         # (max_tokens, rows per expert group) buckets for T > 16; T <= 16 uses
         # ``swapab_n_tile``. Weights are re-streamed once per group, so the
         # group width grows with the expected rows per local expert.
@@ -1202,8 +1298,55 @@ class CuteDslMxfp4MoEWrapper:
             )
             for limit, tactic in table:
                 if num_tokens <= limit:
+                    if tactic == B300_SITU_DENSE_DUAL_TACTIC and self._dual_enabled(
+                        num_tokens
+                    ):
+                        # The routing picks M256 at run time; base is M128.
+                        return _T128_N256_C2
                     return tactic
         return DEFAULT_BLACKWELL_MOE_TACTIC
+
+    def _dual_enabled(self, num_tokens):
+        if self.activation_type != ActivationType.Situ or self.dense_dual_tile is False:
+            return False
+        if self.dense_dual_tile is True:
+            return True
+        return (
+            DENSE_DUAL_TILE
+            and num_tokens > self.dense_dual_tile_min_tokens
+            and self.intermediate_shard <= DENSE_DUAL_TILE_MAX_SHARD
+        )
+
+    def _gemm2_raster(self, num_tokens, gemm2_tile_n):
+        """(raster_along_m, swizzle_size) of the dense GEMM2 (see
+        DENSE_GEMM2_RASTER_M). The swizzle groups N tiles, so it must divide
+        the N tile count; otherwise the raster runs ungrouped."""
+        if DENSE_GEMM2_RASTER_M == "auto":
+            along_m = (
+                self.intermediate_shard <= DENSE_GEMM2_RASTER_M_MAX_SHARD
+                and num_tokens >= DENSE_GEMM2_RASTER_M_MIN_TOKENS
+            )
+        else:
+            along_m = DENSE_GEMM2_RASTER_M == "1"
+        if not along_m:
+            return False, 1
+        n_tiles = -(-self.hidden_size // gemm2_tile_n)
+        swizzle = (
+            DENSE_GEMM2_SWIZZLE
+            if DENSE_GEMM2_SWIZZLE > 0 and n_tiles % DENSE_GEMM2_SWIZZLE == 0
+            else 1
+        )
+        return True, swizzle
+
+    def _dual_tactic(self, num_tokens):
+        """Alternate (M256, two-CTA) dense tactic the routing may select at run
+        time, or None when this token count runs one tile (see DENSE_DUAL_TILE)."""
+        if not self._dual_enabled(num_tokens):
+            return None
+        base = self._tactic(num_tokens)
+        if base[0] != 128:
+            return None
+        return B300_SITU_DENSE_DUAL_TACTIC
 
     def _use_swapab(self, num_tokens, do_finalize=True):
         # Deferred output exists only on the swap-AB path, at any token count.
@@ -1353,8 +1496,15 @@ class CuteDslMxfp4MoEWrapper:
                 offset += size
             return fields, _align(offset)
         tile = self._tactic(num_tokens)[0]
-        tiles = get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
-        rows = tiles * tile
+        dual = self._dual_tactic(num_tokens)
+        # Dual-tile routing: the coarser tile's padding bounds the permuted
+        # rows; the base list is sized by those rows.
+        cap_tile = dual[0] if dual is not None else tile
+        tiles = get_max_num_tiles(
+            num_tokens, self.top_k, self.num_local_experts, cap_tile
+        )
+        rows = tiles * cap_tile
+        base_tiles = rows // tile
         specs = [
             *(
                 [
@@ -1368,8 +1518,18 @@ class CuteDslMxfp4MoEWrapper:
                 if self._dense_two_stage(num_tokens)
                 else []
             ),
-            ("out_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
-            ("out_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
+            ("out_tile_idx_to_expert_idx", (base_tiles,), torch.int32, 4),
+            ("out_tile_idx_to_mn_limit", (base_tiles,), torch.int32, 4),
+            *(
+                [
+                    ("out_alt_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
+                    ("out_alt_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
+                    ("out_alt_num_non_exiting_tiles", (1,), torch.int32, 4),
+                    ("out_base_active_num_non_exiting_tiles", (1,), torch.int32, 4),
+                ]
+                if dual is not None
+                else []
+            ),
             (
                 "out_expanded_idx_to_permuted_idx",
                 (num_tokens, self.top_k),
@@ -1670,6 +1830,8 @@ class CuteDslMxfp4MoEWrapper:
                 swap_plan._prepare()
                 return swap_plan
             tile, gemm1, gemm2 = self._tactic(num_tokens)
+            gemm2_raster = self._gemm2_raster(num_tokens, gemm2[0][1])
+            dual = self._dual_tactic(num_tokens)
             # The public routing contract requires distinct IDs per token,
             # so an expert has at most T rows. Restrict this specialization
             # to the qualified B300 SiTU decode tactic.
@@ -1705,6 +1867,15 @@ class CuteDslMxfp4MoEWrapper:
                 gemm1_cluster_shape_mn=gemm1[1],
                 gemm2_mma_tiler_mn=gemm2[0],
                 gemm2_cluster_shape_mn=gemm2[1],
+                dual_tile_size=dual[0] if dual is not None else 0,
+                dual_gemm1_mma_tiler_mn=dual[1][0] if dual is not None else (256, 256),
+                dual_gemm1_cluster_shape_mn=dual[1][1] if dual is not None else (2, 1),
+                dual_gemm2_mma_tiler_mn=dual[2][0] if dual is not None else (256, 256),
+                dual_gemm2_cluster_shape_mn=dual[2][1] if dual is not None else (2, 1),
+                dual_tile_threshold_permille=self.dense_dual_tile_threshold_permille,
+                gemm2_raster_along_m=gemm2_raster[0],
+                gemm2_swizzle_size=gemm2_raster[1],
+                dual_alt_pdl=DENSE_DUAL_ALT_PDL,
                 moe_sort_buffers={
                     name: value
                     for name, value in buffers.items()

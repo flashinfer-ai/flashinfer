@@ -224,6 +224,7 @@ def _get_compiled_finalize_kernel(
     use_fused_finalize: bool = True,
     enable_narrow_a: bool = False,
     weight_l2_hint: Optional[int] = None,
+    swizzle_size: int = 1,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -261,6 +262,7 @@ def _get_compiled_finalize_kernel(
         use_fused_finalize,
         enable_narrow_a,
         weight_l2_hint,
+        swizzle_size,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -313,6 +315,7 @@ def _get_compiled_finalize_kernel(
                 use_fused_finalize=use_fused_finalize,
                 enable_narrow_a=enable_narrow_a,
                 weight_l2_hint=weight_l2_hint,
+                swizzle_size=swizzle_size,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -381,6 +384,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     mma_tiler_mn: Tuple[int, int] = (256, 128),
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
+    # Persistent scheduler swizzle: with raster_along_m, tiles advance along M in
+    # groups of swizzle_size N tiles (must divide the N tile count).
+    swizzle_size: int = 1,
     sm_count: Optional[int] = None,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
@@ -691,6 +697,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         tile_size=tile_size,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
+        swizzle_size=swizzle_size,
         a_dtype=a_dtype_cutlass,
         b_dtype=b_dtype_cutlass,
         sf_dtype=sf_dtype_cutlass,

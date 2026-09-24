@@ -643,6 +643,187 @@ def test_situ_partial_m_tile_matches_quantized_oracle(tokens, linear_beta):
     torch.testing.assert_close(output.double(), reference, atol=1e-3, rtol=1e-2)
 
 
+def _dual_tile_expectations(case, tile=128, alt=256, threshold_permille=1150):
+    """Host model of the routing kernel's dual-tile rule for ``case``."""
+    ids = case.topk_ids.to("cpu")
+    local = (ids - case.local_expert_offset).clamp(min=-1)
+    local = local[(local >= 0) & (local < case.local_num_experts)]
+    counts = torch.bincount(local, minlength=case.local_num_experts)
+    pad = lambda n: int((-(-counts // n) * n).sum())
+    use_alt = pad(alt) * 1000 <= pad(tile) * threshold_permille
+    rows = pad(alt) if use_alt else pad(tile)
+    return {
+        "use_alt": use_alt,
+        "rows": rows,
+        "base_tiles": rows // tile,
+        "alt_tiles": rows // alt if use_alt else 0,
+        "base_active": 0 if use_alt else rows // tile,
+    }
+
+
+def _set_routing(case, hot):
+    """Deterministic routings: round-robin pairs (every local expert gets
+    2 * tokens / 8 rows) or two experts holding every route."""
+    tokens, top_k = case.topk_ids.shape
+    assert top_k == 2 and case.local_num_experts == 8 and case.local_expert_offset == 0
+    t = torch.arange(tokens, device=case.topk_ids.device, dtype=torch.int32)
+    if hot:
+        ids = torch.stack([torch.zeros_like(t), torch.ones_like(t)], dim=1)
+    else:
+        ids = torch.stack([t % 8, (t + 4) % 8], dim=1)
+    case.topk_ids.copy_(ids)
+    case.topk_weights.fill_(0.5)
+
+
+def _make_dual_tile_wrapper(case, dense_dual_tile):
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
+
+    return CuteDslMxfp4MoEWrapper(
+        case.num_experts,
+        case.topk_ids.shape[1],
+        case.hidden_size,
+        case.intermediate_size,
+        num_local_experts=case.local_num_experts,
+        local_expert_offset=case.local_expert_offset,
+        swapab_max_tokens=0,  # dense path at every token count
+        dense_dual_tile=dense_dual_tile,
+    )
+
+
+def _plan_dense(wrapper, case, weights):
+    output = torch.empty(case.x.shape, device=case.x.device, dtype=torch.bfloat16)
+    workspace = torch.empty(
+        wrapper.get_workspace_size(case.x.shape[0]),
+        device=case.x.device,
+        dtype=torch.uint8,
+    )
+    plan = wrapper.plan(
+        case.x,
+        case.x_scale,
+        case.topk_ids,
+        case.topk_weights,
+        *weights,
+        beta=case.beta,
+        linear_beta=case.linear_beta,
+        workspace=workspace,
+        output=output,
+    )
+    return plan, output
+
+
+def _dual_tile_observed(plan):
+    buffers = plan._kwargs["moe_sort_buffers"]
+    return {
+        "rows": int(buffers["out_total_num_padded_tokens"].item()),
+        "base_tiles": int(buffers["out_num_non_exiting_tiles"].item()),
+        "alt_tiles": int(buffers["out_alt_num_non_exiting_tiles"].item()),
+        "base_active": int(buffers["out_base_active_num_non_exiting_tiles"].item()),
+    }
+
+
+def _assert_dual_tile_matches_single(case, dual_output, single_output, references):
+    """Development gate of the dual-tile routing against the single-tile plan on
+    the same routing: at most one BF16 representation-error floor beyond it."""
+    ref = references["ideal_fp64"]
+    assert torch.isfinite(dual_output).all()
+    floor = torch.linalg.vector_norm(ref.to(torch.bfloat16).double() - ref)
+    dual_error = torch.linalg.vector_norm(dual_output.double() - ref)
+    single_error = torch.linalg.vector_norm(single_output.double() - ref)
+    assert dual_error <= single_error + floor, (float(dual_error), float(single_error))
+
+
+def test_dense_dual_tile_routing_follows_rows_per_expert():
+    """The routing kernel pads to the 256-row tile where that pads no more rows
+    than the 128-row tile (146-row experts) and to 128 where it would (73-row
+    and 584-row experts); the GEMMs of the unchosen tile exit on the zero count
+    and the output matches the single-tile plan. The choice is made on the
+    device, so a CUDA-graph replay with a different routing flips it."""
+    _require_blackwell()
+    # 8 local experts, top_k 2: 584 tokens balanced = 146 rows per expert.
+    case = make_case(
+        tokens=584,
+        hidden=256,
+        intermediate=256,
+        num_experts=8,
+        local_num_experts=8,
+        local_expert_offset=0,
+        top_k=2,
+    )
+    _set_routing(case, hot=False)
+    weights = prepare_cute_weights(case)
+    dual_plan, dual_output = _plan_dense(
+        _make_dual_tile_wrapper(case, True), case, weights
+    )
+    single_plan, single_output = _plan_dense(
+        _make_dual_tile_wrapper(case, False), case, weights
+    )
+    dual_plan.run()
+    single_plan.run()
+    torch.cuda.synchronize()
+    expected = _dual_tile_expectations(case)
+    assert expected["use_alt"], expected
+    observed = _dual_tile_observed(dual_plan)
+    assert observed == {k: expected[k] for k in observed}, (observed, expected)
+    _assert_dual_tile_matches_single(
+        case, dual_output, single_output, reference_moe(case)
+    )
+
+    # Graph replay with the hot routing (two experts hold every route, 584 rows
+    # each: 128-tile padding 1280 rows against 1536 for the 256 tile) flips the
+    # device-side choice without re-planning.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        dual_plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    _set_routing(case, hot=True)
+    graph.replay()
+    single_plan.run()
+    torch.cuda.synchronize()
+    expected = _dual_tile_expectations(case)
+    assert not expected["use_alt"], expected
+    observed = _dual_tile_observed(dual_plan)
+    assert observed == {k: expected[k] for k in observed}, (observed, expected)
+    _assert_dual_tile_matches_single(
+        case, dual_output, single_output, reference_moe(case)
+    )
+
+
+@pytest.mark.parametrize("rows_per_expert", [73, 293])
+def test_dense_dual_tile_keeps_128_where_256_pads(rows_per_expert):
+    """73- and 293-row experts pad 2x / 1.33x under the 256 tile: the routing
+    keeps the 128 tile and the alternate GEMMs run on an empty list."""
+    _require_blackwell()
+    case = make_case(
+        tokens=rows_per_expert * 4,
+        hidden=256,
+        intermediate=256,
+        num_experts=8,
+        local_num_experts=8,
+        local_expert_offset=0,
+        top_k=2,
+    )
+    _set_routing(case, hot=False)
+    weights = prepare_cute_weights(case)
+    dual_plan, dual_output = _plan_dense(
+        _make_dual_tile_wrapper(case, True), case, weights
+    )
+    single_plan, single_output = _plan_dense(
+        _make_dual_tile_wrapper(case, False), case, weights
+    )
+    dual_plan.run()
+    single_plan.run()
+    torch.cuda.synchronize()
+    expected = _dual_tile_expectations(case)
+    assert not expected["use_alt"], expected
+    observed = _dual_tile_observed(dual_plan)
+    assert observed == {k: expected[k] for k in observed}, (observed, expected)
+    _assert_dual_tile_matches_single(
+        case, dual_output, single_output, reference_moe(case)
+    )
+
+
 @pytest.mark.parametrize("tokens", [16, 1025])
 def test_run_uses_caller_output_without_torch_storage_allocation(tokens):
     _require_blackwell()
@@ -1357,3 +1538,72 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
         # The replayed routing is balanced (or hot) over 896 experts: only
         # the equality with the dispatch kernel is asserted.
         check(expect_wide=False)
+
+
+def _policy_wrapper(*, ep_size=1, ep_rank=0, moe_tp_size=1, moe_tp_rank=0):
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import (
+        CuteDslMxfp4MoEWrapper,
+        Mxfp4MoEParallelLayout,
+    )
+
+    layout = Mxfp4MoEParallelLayout.from_sizes(
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        moe_tp_size=moe_tp_size,
+        moe_tp_rank=moe_tp_rank,
+    )
+    # Kimi K3 geometry: 896 experts, top_k 16, hidden 7168, intermediate 3072.
+    return CuteDslMxfp4MoEWrapper(896, 16, 7168, 3072, parallel_layout=layout)
+
+
+def test_dense_dual_tile_default_follows_the_shard(monkeypatch):
+    """The unchosen tile's two launches cost about 8 us, which the wide rank's
+    empty routings (86-160 us at T=8192..32768) cannot absorb: the default rule
+    applies to the MoE-TP shard (384 columns) only; ``dense_dual_tile=True``
+    forces it, ``False`` disables it."""
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE", True)
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE_MAX_SHARD", 512)
+    tp8 = _policy_wrapper(moe_tp_size=8, moe_tp_rank=0)
+    ep8 = _policy_wrapper(ep_size=8, ep_rank=3)
+    assert tp8.intermediate_shard == 384 and ep8.intermediate_shard == 3072
+    assert tp8._dual_enabled(8192) and not tp8._dual_enabled(4096)
+    assert not ep8._dual_enabled(8192) and not ep8._dual_enabled(32768)
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE_MAX_SHARD", 4096)
+    assert ep8._dual_enabled(8192)
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import (
+        CuteDslMxfp4MoEWrapper,
+        Mxfp4MoEParallelLayout,
+    )
+
+    layout = Mxfp4MoEParallelLayout.from_sizes(ep_size=8, ep_rank=3)
+    assert CuteDslMxfp4MoEWrapper(
+        896, 16, 7168, 3072, parallel_layout=layout, dense_dual_tile=True
+    )._dual_enabled(1024)
+    assert not CuteDslMxfp4MoEWrapper(
+        896, 16, 7168, 3072, parallel_layout=layout, dense_dual_tile=False
+    )._dual_enabled(32768)
+
+
+def test_dense_gemm2_raster_policy(monkeypatch):
+    """M-fastest GEMM2 raster: off by default, ``1`` forces it with the swizzle
+    when the swizzle divides the N tile count (7168 / 256 = 28 tiles), ``auto``
+    applies the shard/token rule."""
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    tp8 = _policy_wrapper(moe_tp_size=8, moe_tp_rank=0)
+    ep8 = _policy_wrapper(ep_size=8, ep_rank=3)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 4)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_RASTER_M", "0")
+    assert tp8._gemm2_raster(32768, 256) == (False, 1)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_RASTER_M", "1")
+    assert tp8._gemm2_raster(128, 256) == (True, 4)
+    assert ep8._gemm2_raster(8192, 256) == (True, 4)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 3)
+    assert tp8._gemm2_raster(8192, 256) == (True, 1)  # 28 N tiles: no group of 3
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 7)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_RASTER_M", "auto")
+    assert tp8._gemm2_raster(8192, 256) == (True, 7)
+    assert tp8._gemm2_raster(4096, 256) == (False, 1)
+    assert ep8._gemm2_raster(32768, 256) == (False, 1)

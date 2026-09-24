@@ -374,6 +374,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         use_fused_finalize: bool = True,
         enable_narrow_a: bool = False,
         weight_l2_hint: Optional[int] = None,
+        swizzle_size: int = 1,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -408,6 +409,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
+        if swizzle_size < 1:
+            raise ValueError("swizzle_size must be >= 1")
+        self.swizzle_size = swizzle_size
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -903,6 +907,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cluster_shape_mn,
             max_active_clusters,
             self.raster_along_m,
+            self.swizzle_size,
         )
 
         self.buffer_align_bytes = 1024
@@ -2576,6 +2581,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
         raster_along_m: bool,
+        swizzle_size: int = 1,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size based on GEMM shape.
 
@@ -2604,9 +2610,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_ctas_mnl = (num_ctas_m, num_ctas_n, num_ctas_l)
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl, raster_along_m=raster_along_m
-        )
+        if swizzle_size > 1:
+            tile_sched_params = utils.PersistentTileSchedulerParams(
+                num_ctas_mnl,
+                cluster_shape_mnl,
+                swizzle_size=swizzle_size,
+                raster_along_m=raster_along_m,
+            )
+        else:
+            tile_sched_params = utils.PersistentTileSchedulerParams(
+                num_ctas_mnl, cluster_shape_mnl, raster_along_m=raster_along_m
+            )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )
