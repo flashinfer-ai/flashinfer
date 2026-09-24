@@ -49604,7 +49604,7 @@ namespace nvfp4_qualified_c271_up {
 #define TMEM_UP_GATE_SF_OFFSET 64
 #define TMEM_UP_UP_SF_OFFSET 80
 #define TMEM_UP_X_SF_OFFSET 96
-#define NUM_UP_PIPE_STAGES 2
+#define NUM_UP_PIPE_STAGES 5
 #define NUM_SINGLE_PIPE_STAGES 1
 #define SMEM_SMEM_W1_OFF 1024
 #define SMEM_SMEM_W1_STAGE_BYTES 32768
@@ -49630,7 +49630,7 @@ namespace nvfp4_qualified_c271_up {
 #define SMEM_SMEM_ACT_SCALE_OFF 38912
 #define SMEM_SMEM_ACT_SCALE_STAGE_BYTES 512
 #define SMEM_SMEM_ACT_SCALE_STRIDE 512
-#define SMEM_TOTAL 87040
+#define SMEM_TOTAL 216064
 #define THREADS 192
 #define PACKED_SCALE_LOADS 1
 
@@ -50081,8 +50081,8 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
     const int mbar_base = smem;
     #define up_full_addr (mbar_base + 0)
-    #define up_free_addr (mbar_base + 16)
-    #define up_ready_addr (mbar_base + 32)
+    #define up_free_addr (mbar_base + 40)
+    #define up_ready_addr (mbar_base + 80)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -50105,22 +50105,28 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
     float* smem_act_scale = reinterpret_cast<float*>(smem_raw + 38912);
     const int smem_act_scale_addr = smem + 38912;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[0..40)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 11 barriers)
+    // Mbarriers at smem_raw[0..88)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'up_pipe' ---
-            // up_full: 2 barriers, init_count=4
+            // up_full: 5 barriers, init_count=4
             mbarrier_init(smem + 0, 4);
             mbarrier_init(smem + 8, 4);
-            // up_free: 2 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 16, 4);
+            mbarrier_init(smem + 24, 4);
+            mbarrier_init(smem + 32, 4);
+            // up_free: 5 barriers, init_count=1
+            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
             // --- pipeline 'single_pipe' ---
             // up_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 80, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -50128,9 +50134,9 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
     __syncwarp();
 
     // TMEM alloc (128 columns, 112 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 40);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 88);
     if (warp == 0) {
-        int _tmem_hold = smem + 40;
+        int _tmem_hold = smem + 88;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -50181,7 +50187,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                         tma_4d_gmem2smem(smem_w1_addr + up_stage * 43008, (&W1), 0, intermediate_block * 128, kb, expert, up_full_addr + (up_stage) * 8);
                     }
                     up_stage += 1;
-                    if (up_stage == 2) { up_stage = 0; _phase_up_free ^= 1; }
+                    if (up_stage == 5) { up_stage = 0; _phase_up_free ^= 1; }
                 }
                 asm volatile("barrier.sync 14, 192;" ::: "memory");
             }
@@ -50270,7 +50276,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 } else {
                     #pragma unroll 1
@@ -50333,7 +50339,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 }
                 elect_commit(up_ready_addr);
@@ -50401,7 +50407,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                         sf_second_token_hi_c = _min_3;
                     }
                 }
-                int _min_4 = ((2) < (K / 256) ? (2) : (K / 256));
+                int _min_4 = ((5) < (K / 256) ? (5) : (K / 256));
                 #pragma unroll 1
                 for (int zero_stage = 0; zero_stage < _min_4; zero_stage++) {
                     int x_zero_base = smem_x_sf_addr + (unsigned int)(zero_stage * 43008);
@@ -50461,7 +50467,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                             tma_4d_gmem2smem(smem_w1_addr + up_w1_stage * 43008 + 16384, (&W1), 0, up_intermediate_blocks_c * 128 + up_intermediate_block_c * 128, kb_w1_up, expert_c, up_full_addr + (up_w1_stage) * 8);
                         }
                         up_w1_stage += 1;
-                        if (up_w1_stage == 2) { up_w1_stage = 0; _phase_up_free_1 ^= 1; }
+                        if (up_w1_stage == 5) { up_w1_stage = 0; _phase_up_free_1 ^= 1; }
                     }
                 }
                 if (consumer_warp == 1) {
@@ -50545,7 +50551,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                             }
                         }
                         up_x_stage += 1;
-                        if (up_x_stage == 2) { up_x_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; }
+                        if (up_x_stage == 5) { up_x_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; }
                     }
                 }
                 if (consumer_warp == 0) {
@@ -50626,7 +50632,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
                             mbarrier_arrive(up_full_addr + (up_scale_stage) * 8);
                         }
                         up_scale_stage += 1;
-                        if (up_scale_stage == 2) { up_scale_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; _phase_up_free_3 ^= 1; }
+                        if (up_scale_stage == 5) { up_scale_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; _phase_up_free_3 ^= 1; }
                     }
                 }
                 asm volatile("barrier.sync 15, 128;" ::: "memory");
@@ -50834,7 +50840,7 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 
 constexpr int kGeneratedThreads = 192;
-constexpr int kGeneratedSmemTotal = 87040;
+constexpr int kGeneratedSmemTotal = 216064;
 #undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
@@ -62631,7 +62637,7 @@ namespace nvfp4_qualified_c334_up {
 #define TMEM_UP_GATE_SF_OFFSET 64
 #define TMEM_UP_UP_SF_OFFSET 80
 #define TMEM_UP_X_SF_OFFSET 96
-#define NUM_UP_PIPE_STAGES 2
+#define NUM_UP_PIPE_STAGES 5
 #define NUM_SINGLE_PIPE_STAGES 1
 #define SMEM_SMEM_W1_OFF 1024
 #define SMEM_SMEM_W1_STAGE_BYTES 32768
@@ -62666,7 +62672,7 @@ namespace nvfp4_qualified_c334_up {
 #define SMEM_SMEM_ACT_SCALE_OFF 38912
 #define SMEM_SMEM_ACT_SCALE_STAGE_BYTES 512
 #define SMEM_SMEM_ACT_SCALE_STRIDE 512
-#define SMEM_TOTAL 87040
+#define SMEM_TOTAL 216064
 #define THREADS 192
 #define PACKED_SCALE_LOADS 1
 
@@ -63114,8 +63120,8 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
 
     const int mbar_base = smem;
     #define up_full_addr (mbar_base + 0)
-    #define up_free_addr (mbar_base + 16)
-    #define up_ready_addr (mbar_base + 32)
+    #define up_free_addr (mbar_base + 40)
+    #define up_ready_addr (mbar_base + 80)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -63144,22 +63150,28 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
     float* smem_act_scale = reinterpret_cast<float*>(smem_raw + 38912);
     const int smem_act_scale_addr = smem + 38912;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[0..40)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 11 barriers)
+    // Mbarriers at smem_raw[0..88)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'up_pipe' ---
-            // up_full: 2 barriers, init_count=4
+            // up_full: 5 barriers, init_count=4
             mbarrier_init(smem + 0, 4);
             mbarrier_init(smem + 8, 4);
-            // up_free: 2 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 16, 4);
+            mbarrier_init(smem + 24, 4);
+            mbarrier_init(smem + 32, 4);
+            // up_free: 5 barriers, init_count=1
+            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
             // --- pipeline 'single_pipe' ---
             // up_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 80, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -63167,9 +63179,9 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
     __syncwarp();
 
     // TMEM alloc (128 columns, 112 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 40);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 88);
     if (warp == 0) {
-        int _tmem_hold = smem + 40;
+        int _tmem_hold = smem + 88;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -63220,7 +63232,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                         tma_4d_gmem2smem(smem_w1_addr + up_stage * 43008, (&W1), 0, intermediate_block * 128, kb, expert, up_full_addr + (up_stage) * 8);
                     }
                     up_stage += 1;
-                    if (up_stage == 2) { up_stage = 0; _phase_up_free ^= 1; }
+                    if (up_stage == 5) { up_stage = 0; _phase_up_free ^= 1; }
                 }
                 asm volatile("barrier.sync 14, 192;" ::: "memory");
             }
@@ -63309,7 +63321,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 } else if (pair_upper_m) {
                     #pragma unroll 1
@@ -63372,7 +63384,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 } else {
                     #pragma unroll 1
@@ -63489,7 +63501,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 }
                 elect_commit(up_ready_addr);
@@ -63557,7 +63569,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                         sf_second_token_hi_c = _min_3;
                     }
                 }
-                int _min_4 = ((2) < (K / 256) ? (2) : (K / 256));
+                int _min_4 = ((5) < (K / 256) ? (5) : (K / 256));
                 #pragma unroll 1
                 for (int zero_stage = 0; zero_stage < _min_4; zero_stage++) {
                     int x_zero_base = smem_x_sf_addr + (unsigned int)(zero_stage * 43008);
@@ -63617,7 +63629,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                             tma_4d_gmem2smem(smem_w1_addr + up_w1_stage * 43008 + 16384, (&W1), 0, up_intermediate_blocks_c * 128 + up_intermediate_block_c * 128, kb_w1_up, expert_c, up_full_addr + (up_w1_stage) * 8);
                         }
                         up_w1_stage += 1;
-                        if (up_w1_stage == 2) { up_w1_stage = 0; _phase_up_free_1 ^= 1; }
+                        if (up_w1_stage == 5) { up_w1_stage = 0; _phase_up_free_1 ^= 1; }
                     }
                 }
                 if (consumer_warp == 1) {
@@ -63706,7 +63718,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                             }
                         }
                         up_x_stage += 1;
-                        if (up_x_stage == 2) { up_x_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; }
+                        if (up_x_stage == 5) { up_x_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; }
                     }
                 }
                 if (consumer_warp == 0) {
@@ -63787,7 +63799,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
                             mbarrier_arrive(up_full_addr + (up_scale_stage) * 8);
                         }
                         up_scale_stage += 1;
-                        if (up_scale_stage == 2) { up_scale_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; _phase_up_free_3 ^= 1; }
+                        if (up_scale_stage == 5) { up_scale_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; _phase_up_free_3 ^= 1; }
                     }
                 }
                 asm volatile("barrier.sync 15, 128;" ::: "memory");
@@ -64096,7 +64108,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
 
 
 constexpr int kGeneratedThreads = 192;
-constexpr int kGeneratedSmemTotal = 87040;
+constexpr int kGeneratedSmemTotal = 216064;
 #undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
@@ -64156,7 +64168,7 @@ namespace nvfp4_qualified_c338_up {
 #define TMEM_UP_GATE_SF_OFFSET 64
 #define TMEM_UP_UP_SF_OFFSET 80
 #define TMEM_UP_X_SF_OFFSET 96
-#define NUM_UP_PIPE_STAGES 2
+#define NUM_UP_PIPE_STAGES 5
 #define NUM_SINGLE_PIPE_STAGES 1
 #define SMEM_SMEM_W1_OFF 1024
 #define SMEM_SMEM_W1_STAGE_BYTES 32768
@@ -64191,7 +64203,7 @@ namespace nvfp4_qualified_c338_up {
 #define SMEM_SMEM_ACT_SCALE_OFF 38912
 #define SMEM_SMEM_ACT_SCALE_STAGE_BYTES 512
 #define SMEM_SMEM_ACT_SCALE_STRIDE 512
-#define SMEM_TOTAL 87040
+#define SMEM_TOTAL 216064
 #define THREADS 192
 #define PACKED_SCALE_LOADS 1
 
@@ -64628,8 +64640,8 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
 
     const int mbar_base = smem;
     #define up_full_addr (mbar_base + 0)
-    #define up_free_addr (mbar_base + 16)
-    #define up_ready_addr (mbar_base + 32)
+    #define up_free_addr (mbar_base + 40)
+    #define up_ready_addr (mbar_base + 80)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -64658,22 +64670,28 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
     float* smem_act_scale = reinterpret_cast<float*>(smem_raw + 38912);
     const int smem_act_scale_addr = smem + 38912;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[0..40)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 11 barriers)
+    // Mbarriers at smem_raw[0..88)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'up_pipe' ---
-            // up_full: 2 barriers, init_count=4
+            // up_full: 5 barriers, init_count=4
             mbarrier_init(smem + 0, 4);
             mbarrier_init(smem + 8, 4);
-            // up_free: 2 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
-            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 16, 4);
+            mbarrier_init(smem + 24, 4);
+            mbarrier_init(smem + 32, 4);
+            // up_free: 5 barriers, init_count=1
+            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
             // --- pipeline 'single_pipe' ---
             // up_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 80, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -64681,9 +64699,9 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
     __syncwarp();
 
     // TMEM alloc (128 columns, 112 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 40);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 88);
     if (warp == 0) {
-        int _tmem_hold = smem + 40;
+        int _tmem_hold = smem + 88;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -64734,7 +64752,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                         tma_3d_gmem2smem(smem_w1_addr + up_stage * 43008, (&W1), 0, 0, (expert * (2 * intermediate_blocks) + intermediate_block) * (K / 256) + kb, up_full_addr + (up_stage) * 8);
                     }
                     up_stage += 1;
-                    if (up_stage == 2) { up_stage = 0; _phase_up_free ^= 1; }
+                    if (up_stage == 5) { up_stage = 0; _phase_up_free ^= 1; }
                 }
                 asm volatile("barrier.sync 14, 192;" ::: "memory");
             }
@@ -64823,7 +64841,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 } else if (pair_upper_m) {
                     #pragma unroll 1
@@ -64886,7 +64904,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 } else {
                     #pragma unroll 1
@@ -65003,7 +65021,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                         }
                         elect_commit(up_free_addr + (up_stage_mma) * 8);
                         up_stage_mma += 1;
-                        if (up_stage_mma == 2) { up_stage_mma = 0; _phase_up_full ^= 1; }
+                        if (up_stage_mma == 5) { up_stage_mma = 0; _phase_up_full ^= 1; }
                     }
                 }
                 elect_commit(up_ready_addr);
@@ -65071,7 +65089,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                         sf_second_token_hi_c = _min_3;
                     }
                 }
-                int _min_4 = ((2) < (K / 256) ? (2) : (K / 256));
+                int _min_4 = ((5) < (K / 256) ? (5) : (K / 256));
                 #pragma unroll 1
                 for (int zero_stage = 0; zero_stage < _min_4; zero_stage++) {
                     int x_zero_base = smem_x_sf_addr + (unsigned int)(zero_stage * 43008);
@@ -65131,7 +65149,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                             tma_3d_gmem2smem(smem_w1_addr + up_w1_stage * 43008 + 16384, (&W1), 0, 0, (expert_c * (2 * up_intermediate_blocks_c) + up_intermediate_blocks_c + up_intermediate_block_c) * (K / 256) + kb_w1_up, up_full_addr + (up_w1_stage) * 8);
                         }
                         up_w1_stage += 1;
-                        if (up_w1_stage == 2) { up_w1_stage = 0; _phase_up_free_1 ^= 1; }
+                        if (up_w1_stage == 5) { up_w1_stage = 0; _phase_up_free_1 ^= 1; }
                     }
                 }
                 if (consumer_warp == 1) {
@@ -65220,7 +65238,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                             }
                         }
                         up_x_stage += 1;
-                        if (up_x_stage == 2) { up_x_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; }
+                        if (up_x_stage == 5) { up_x_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; }
                     }
                 }
                 if (consumer_warp == 0) {
@@ -65301,7 +65319,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
                             mbarrier_arrive(up_full_addr + (up_scale_stage) * 8);
                         }
                         up_scale_stage += 1;
-                        if (up_scale_stage == 2) { up_scale_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; _phase_up_free_3 ^= 1; }
+                        if (up_scale_stage == 5) { up_scale_stage = 0; _phase_up_free_1 ^= 1; _phase_up_free_2 ^= 1; _phase_up_free_3 ^= 1; }
                     }
                 }
                 asm volatile("barrier.sync 15, 128;" ::: "memory");
@@ -71268,8 +71286,8 @@ void RunCompleteRoutedImpl(
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87040), "cudaFuncSetAttribute(complete up)");
-  nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 87040, stream>>>(
+      216064), "cudaFuncSetAttribute(complete up)");
+  nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 216064, stream>>>(
       hidden_states_map,
       prepared_w1_map,
       static_cast<uint8_t*>(hidden_states_scale.data_ptr()),
@@ -71346,8 +71364,8 @@ void RunCompleteRoutedImpl(
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87040), "cudaFuncSetAttribute(complete up)");
-  nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 87040, stream>>>(
+      216064), "cudaFuncSetAttribute(complete up)");
+  nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 216064, stream>>>(
       hidden_states_map,
       gemm1_map,
       static_cast<uint8_t*>(hidden_states_scale.data_ptr()),
@@ -72198,8 +72216,8 @@ void RunCompleteRoutedImpl(
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
   CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87040), "cudaFuncSetAttribute(complete up)");
-  nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 87040, stream>>>(
+      216064), "cudaFuncSetAttribute(complete up)");
+  nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 216064, stream>>>(
       hidden_states_map,
       gemm1_map,
       static_cast<uint8_t*>(hidden_states_scale.data_ptr()),
