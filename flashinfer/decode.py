@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 import warnings
 from types import SimpleNamespace
 from typing import Any, List, Literal, Optional, Tuple, Union, overload
@@ -39,6 +40,8 @@ from .mla import (
 )
 from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
+from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
+from .cudnn_frost import frost_decode_engines_available
 from .jit import (
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -635,6 +638,103 @@ def get_trtllm_gen_fmha_module():
 # max_seq_len_kv / block-table width, so one built cuDNN graph serves many steps.
 _CUDNN_DECODE_MAX_KV_BUCKET = 1024
 
+# backend="auto" on the decode wrapper: "0" never resolves to cudnn, "1" applies
+# the cudnn rule even without the FROST engines (benchmarking / bisection),
+# unset applies the rule below when the FROST engines serve this process.
+_DECODE_AUTO_CUDNN_ENV = "FLASHINFER_DECODE_AUTO_CUDNN"
+
+
+def _auto_decode_prefers_cudnn(
+    *,
+    compute_capability: Tuple[int, int],
+    frost_available: bool,
+    cudnn_available: bool,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
+    head_dim: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    page_size: int,
+    pos_encoding_mode: str,
+    window_left: int,
+    logits_soft_cap: float,
+    q_len_per_req: int,
+    sm_count: int,
+    override: Optional[str] = None,
+) -> bool:
+    """Whether ``backend="auto"`` should run this decode plan on cuDNN.
+
+    The rule is the envelope where cuDNN's FROST d128 decode tile (cudnn-
+    frontend 1.30) measured at or ahead of fa2's tensor-core decode on B200
+    (KV 4096, page 16, bf16, CUDA-graph replay, ``benchmarks/
+    flashinfer_benchmark.py`` and the wrapper under ``bench_gpu_time``). The
+    tile launches one CTA per (batch, KV head) unit and wins while those
+    units fill about one wave of SMs: 64/4 at b=32 (128 units) 65 vs 68 us
+    at one row, 67 vs 131 us at two rows and 67 vs 143 us at four (fa2 runs
+    its prefill kernel for multi-token rows); at b=8 it ties (33 vs 32 us).
+    Past a wave the fa2 kernel pulls ahead: 64/4 at b=128 (512 units) 472
+    vs 334 us, 64/8 at b=32 (256 units) 194 vs 160 us and at b=128 931 vs
+    669 us. Hence ``batch_size * num_kv_heads <= sm_count``. The d256
+    (swap-AB) decode tile is left to fa2 for now: at 32/2 it ties at b=8
+    (38 vs 35 us) but loses at b=32 (89 vs 70 us) and only leads at b=128
+    (256 vs 338 us), so it needs its own rule once it leads across the
+    batch range. Also outside the envelope: a GQA group that does not
+    divide the 128-row tile (GLM-4.5's 96/8 packs 4 of 12 heads per row
+    group: 424 vs 212 us), d64 (rides the d128 tile at half occupancy),
+    b < 8 (launch-bound: 31 vs 24 us at b=4), a sliding window (the tile's
+    window path is unmeasured), RoPE / soft-cap (the cudnn path does not
+    apply them), and multi-token rows past the tile's row budget
+    (``S_q * G <= 128``), where cuDNN serves the graph with its prefill tile.
+
+    The FROST engines are required unless forced: the classic backend engine
+    is 20x slower on multi-token rows and rejects an attention sink at
+    ``q_len_per_req == 1``, and sinks are only known at ``run()``, so auto
+    must never route a sink-carrying model there. ``FLASHINFER_DECODE_AUTO_CUDNN``
+    overrides: ``0`` never, ``1`` also without the FROST engines.
+    """
+    if override is None:
+        override = os.environ.get(_DECODE_AUTO_CUDNN_ENV, "")
+    override = override.strip().lower()
+    if override in ("0", "false", "no", "off"):
+        return False
+    forced = override in ("1", "true", "yes", "on")
+    if not cudnn_available or not (frost_available or forced):
+        return False
+    if tuple(compute_capability) not in ((10, 0), (10, 3)):
+        return False
+    if q_data_type not in (torch.float16, torch.bfloat16) or not (
+        q_data_type == kv_data_type == o_data_type
+    ):
+        return False
+    if head_dim != 128:
+        return False
+    if num_kv_heads <= 0 or num_qo_heads % num_kv_heads != 0:
+        return False
+    group = num_qo_heads // num_kv_heads
+    if group > 128 or 128 % group != 0:
+        return False
+    if batch_size < 8:
+        return False
+    # One CTA per (batch, KV head) unit: the decode tile wins while the units
+    # fill about one wave of SMs.
+    if sm_count <= 0 or batch_size * num_kv_heads > sm_count:
+        return False
+    if page_size <= 0 or page_size % 8 != 0:
+        return False
+    if not (128 % page_size == 0 or page_size % 128 == 0):
+        return False
+    if pos_encoding_mode != "NONE" or (logits_soft_cap or 0.0) > 0 or window_left >= 0:
+        return False
+    if not 1 <= q_len_per_req <= 4:
+        return False
+    # The FROST decode tile has to be the kernel that serves the graph: it
+    # packs S_q * G <= 128 rows; beyond that cuDNN falls back to its prefill
+    # tile and loses to fa2.
+    return q_len_per_req * group <= 128
+
+
 _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES = {
     "k_only": 1,
     "separate_kv": 2,
@@ -1082,7 +1182,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``trtllm-gen``/
             ``cute-dsl``/``cudnn``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
-            device architecture and kernel availability.
+            device architecture and kernel availability. On SM100-class GPUs with cuDNN's
+            FROST engines switched on (``FLASHINFER_CUDNN_FROST_ENGINES=1`` before importing
+            flashinfer, cudnn-frontend 1.30+), ``auto`` resolves to ``cudnn`` for the decode
+            shapes where cuDNN's d128 decode tile measures at or ahead of fa2 (fp16/bf16,
+            head_dim 128, a GQA group dividing 128, batch >= 8 with ``batch * num_kv_heads``
+            within one wave of SMs, no RoPE / soft-cap / window, ``q_len_per_req <= 4`` with
+            ``q_len_per_req * group <= 128``; see ``_auto_decode_prefers_cudnn``);
+            ``resolved_backend``
+            reports the choice after :meth:`plan`. ``FLASHINFER_DECODE_AUTO_CUDNN=0`` keeps
+            fa2, ``=1`` applies the rule without the FROST engines.
             The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
             (SM100+) and only supports a subset of features (equal head_dim_qk/vo,
             no RoPE/ALiBi/soft-cap).
@@ -1198,6 +1307,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     device=float_workspace_buffer.device,
                 )
         self._backend = backend
+        # backend="auto" is re-resolved at every plan(); the tensor-core path
+        # rewrites self._backend to its pick, so remember what was asked for.
+        self._requested_backend = backend
+        self._cudnn_auto = False
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -1210,6 +1323,23 @@ class BatchDecodeWithPagedKVCacheWrapper:
     @property
     def use_tensor_cores(self) -> bool:
         return self._use_tensor_cores
+
+    @property
+    def _uses_cudnn(self) -> bool:
+        return self._backend == "cudnn" or self._cudnn_auto
+
+    @property
+    def resolved_backend(self) -> str:
+        r"""What the last :meth:`plan` resolved ``backend="auto"`` to: ``"cudnn"``
+        when the auto rule picked cuDNN, the tensor-core pick (``"fa2"`` / ``"fa3"``)
+        otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
+        reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
+        first :meth:`plan`."""
+        if self._cudnn_auto:
+            return "cudnn"
+        if self._backend == "auto" and not self._use_tensor_cores:
+            return "fa2"
+        return self._backend
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1695,6 +1825,46 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+
+        if data_type is not None:
+            if q_data_type is None:
+                q_data_type = data_type
+            if kv_data_type is None:
+                kv_data_type = data_type
+
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        # backend="auto" may resolve to cudnn; decided per plan() so that the
+        # q_len_per_req / buffer checks below already know the path.
+        self._cudnn_auto = False
+        if self._requested_backend == "auto":
+            cc = get_compute_capability(self.device)
+            self._cudnn_auto = _auto_decode_prefers_cudnn(
+                compute_capability=cc,
+                frost_available=frost_decode_engines_available(cc),
+                cudnn_available=_CUDNN_GRAPH_AVAILABLE,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+                head_dim=head_dim,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                batch_size=batch_size,
+                page_size=page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                q_len_per_req=q_len_per_req,
+                sm_count=torch.cuda.get_device_properties(
+                    self.device
+                ).multi_processor_count,
+            )
         if window_right != 0 and self._backend != "cute-dsl":
             raise NotImplementedError(
                 "BatchDecodeWithPagedKVCacheWrapper only supports window_right != 0 "
@@ -1712,7 +1882,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
-            if not self.use_tensor_cores and self._backend != "cudnn":
+            if not self.use_tensor_cores and not self._uses_cudnn:
                 raise ValueError(
                     "q_len_per_req > 1 requires tensor-core decode "
                     "(use_tensor_cores=True or the trtllm-gen/cute-dsl/cudnn backend)."
@@ -1764,20 +1934,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         indptr_host = indptr.to("cpu")
         last_page_len_host = last_page_len.to("cpu")
-
-        if data_type is not None:
-            if q_data_type is None:
-                q_data_type = data_type
-            if kv_data_type is None:
-                kv_data_type = data_type
-
-        q_data_type = canonicalize_torch_dtype(q_data_type)
-        if kv_data_type is None:
-            kv_data_type = q_data_type
-        kv_data_type = canonicalize_torch_dtype(kv_data_type)
-        if o_data_type is None:
-            o_data_type = q_data_type
-        o_data_type = canonicalize_torch_dtype(o_data_type)
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -1874,7 +2030,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             return
-        if self._backend == "cudnn":
+        if self._uses_cudnn:
             self._plan_cudnn(
                 indptr_host,
                 indices,
@@ -2147,7 +2303,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
 
         self._page_size = page_size
-        if batch_size > self._kv_lens_buffer.shape[0]:
+        if self._kv_lens_buffer is None or batch_size > self._kv_lens_buffer.shape[0]:
             self._kv_lens_buffer = torch.empty(
                 (batch_size,), dtype=torch.int32, device=self.device
             )
@@ -2466,14 +2622,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
             q_len_per_req = q.size(0) // actual_batch_size
 
-        if not self.use_tensor_cores and self._backend != "cudnn" and q_len_per_req > 1:
+        if not self.use_tensor_cores and not self._uses_cudnn and q_len_per_req > 1:
             raise ValueError(
                 f"q implies q_len_per_req={q_len_per_req}, but the "
                 "non-tensor-core decode kernel only supports q_len_per_req=1."
             )
         planned_q_len = getattr(self, "_q_len_per_req", 1) or 1
         if (
-            (self.use_tensor_cores or self._backend == "cudnn")
+            (self.use_tensor_cores or self._uses_cudnn)
             and self._backend not in ("trtllm-gen", "cute-dsl")
             and q_len_per_req != planned_q_len
         ):
@@ -2652,7 +2808,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
-        if self._backend == "cudnn":
+        if self._uses_cudnn:
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support NVFP4 KV cache."

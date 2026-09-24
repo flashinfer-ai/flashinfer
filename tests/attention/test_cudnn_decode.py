@@ -5,6 +5,9 @@ import torch
 
 import flashinfer
 import flashinfer.cudnn.decode as cudnn_decode
+from flashinfer.cudnn_frost import frost_decode_engines_available
+from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
+from flashinfer.utils import get_compute_capability
 
 # The fallback (cubin) decode path is bf16-only and has no lse output; tests
 # exercising fp16 or return_lse need the cuDNN graph backend.
@@ -1200,3 +1203,195 @@ def test_cudnn_decode_standalone_q_len_per_req_matches_wrapper():
             block_tables=wrapper._block_tables,
             q_len_per_req=q_len_per_req,
         )
+
+
+# ------------------------------------------------------------- backend="auto" -> cudnn
+
+
+def _sm100_class():
+    return get_compute_capability(torch.device("cuda:0")) in ((10, 0), (10, 3))
+
+
+def _plan_auto(
+    dtype=torch.bfloat16,
+    kv_layout="HND",
+    num_qo_heads=64,
+    num_kv_heads=8,
+    head_dim=128,
+    batch_size=8,
+    page_size=16,
+    q_len_per_req=1,
+    use_tensor_cores=True,
+    **plan_kwargs,
+):
+    """Plan a backend="auto" decode wrapper; returns (wrapper, run args)."""
+    torch.manual_seed(0)
+    device = "cuda:0"
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        batch_size,
+        2048,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+        device,
+        q_len_per_req=q_len_per_req,
+    )
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout, use_tensor_cores=use_tensor_cores, backend="auto"
+    )
+    assert wrapper.resolved_backend != "cudnn"
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        q_len_per_req=q_len_per_req,
+        **plan_kwargs,
+    )
+    args = (
+        q,
+        kv_cache,
+        indptr,
+        indices,
+        last_page_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+    )
+    return wrapper, args
+
+
+def test_auto_backend_keeps_fa2_without_frost_engines(monkeypatch):
+    """Without the FROST opt-in, auto never picks cudnn: the classic backend
+    engine rejects sinks at q_len_per_req == 1 (only known at run()) and is
+    20x slower on multi-token rows."""
+    monkeypatch.delenv(_DECODE_AUTO_CUDNN_ENV, raising=False)
+    monkeypatch.delenv("FLASHINFER_CUDNN_FROST_ENGINES", raising=False)
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    wrapper, _ = _plan_auto()
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+
+
+def test_auto_backend_override_zero_keeps_fa2(monkeypatch):
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "0")
+    wrapper, _ = _plan_auto()
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+def test_auto_backend_forced_cudnn_matches_fa2(monkeypatch, kv_layout, q_len_per_req):
+    """FLASHINFER_DECODE_AUTO_CUDNN=1 applies the auto rule without the FROST
+    engines (benchmarking / bisection): on SM100 the wrapper resolves to cudnn,
+    also for multi-token rows without use_tensor_cores, and matches fa2."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto(
+        kv_layout=kv_layout, q_len_per_req=q_len_per_req, use_tensor_cores=False
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(args[0], args[1], return_lse=True)
+    out_ref, lse_ref = _run_wrapper("fa2", *args, q_len_per_req=q_len_per_req)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+def test_auto_backend_replan_outside_the_envelope_returns_to_fa2(monkeypatch):
+    """The choice is per plan(): the same wrapper goes cudnn -> fa2 -> cudnn
+    as the planned shape moves across the envelope's batch bound."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto(batch_size=8)
+    assert wrapper.resolved_backend == "cudnn"
+    out_first = wrapper.run(args[0], args[1])
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        4, 2048, 16, 8, 64, 128, torch.bfloat16, "HND", "cuda:0"
+    )
+    wrapper.plan(
+        indptr, indices, last_page_len, 64, 8, 128, 16, q_data_type=torch.bfloat16
+    )
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+    out_small = wrapper.run(q, kv_cache)
+    assert out_small.shape == (4, 64, 128)
+    indptr, indices, last_page_len = args[2:5]
+    wrapper.plan(
+        indptr, indices, last_page_len, 64, 8, 128, 16, q_data_type=torch.bfloat16
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    torch.testing.assert_close(wrapper.run(args[0], args[1]), out_first)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "changes",
+    [
+        dict(num_qo_heads=96, num_kv_heads=8),  # GLM-4.5 group 12: 225 vs 94 us
+        dict(batch_size=4),  # launch-bound
+        dict(batch_size=32),  # 64/8: 256 (batch, KV head) units, past one wave
+        dict(head_dim=64, num_qo_heads=32, num_kv_heads=8),
+        dict(page_size=24),
+        dict(window_left=128),
+        dict(q_len_per_req=8),
+        # the d256 decode tile loses to fa2 at b=32 (89 vs 70 us): not routed yet
+        dict(head_dim=256, num_qo_heads=32, num_kv_heads=2),
+        dict(head_dim=256, num_qo_heads=32, num_kv_heads=2, q_len_per_req=2),
+    ],
+)
+def test_auto_backend_gate_keeps_fa2_outside_the_envelope(monkeypatch, changes):
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, _ = _plan_auto(**changes)
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "q_len_per_req,num_qo_heads,num_kv_heads,head_dim",
+    [
+        (1, 64, 8, 128),
+        (2, 64, 8, 128),
+        (1, 64, 4, 128),
+        (4, 64, 4, 128),  # 64 rows in the d128 tile
+    ],
+)
+def test_auto_backend_resolves_cudnn_with_frost_engines(
+    q_len_per_req, num_qo_heads, num_kv_heads, head_dim
+):
+    """The real switch: FLASHINFER_CUDNN_FROST_ENGINES=1 set before importing
+    flashinfer, cudnn-frontend 1.30+, SM100. auto resolves to cudnn for the
+    measured envelope and matches fa2 on output and LSE."""
+    torch.manual_seed(0)
+    cc = get_compute_capability(torch.device("cuda:0"))
+    if not frost_decode_engines_available(cc):
+        pytest.skip(
+            "needs FLASHINFER_CUDNN_FROST_ENGINES=1 in the process environment, "
+            "cudnn-frontend 1.30+ and an SM100 / SM103 GPU"
+        )
+    wrapper, args = _plan_auto(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_len_per_req=q_len_per_req,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(args[0], args[1], return_lse=True)
+    out_ref, lse_ref = _run_wrapper("fa2", *args, q_len_per_req=q_len_per_req)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)

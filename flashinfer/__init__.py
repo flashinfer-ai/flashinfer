@@ -20,6 +20,14 @@ import importlib.util
 from .version import __version__ as __version__
 from .version import __git_commit__ as __git_commit__
 from .version import __git_version__ as __git_version__  # backward compat
+from .cudnn_frost import (
+    configure_cudnn_frost_engines as _configure_cudnn_frost_engines,
+)
+
+# cudnn-frontend reads its FROST-engine opt-in once, at `import cudnn`, and
+# FlashInfer imports cudnn lazily from several modules; apply
+# FLASHINFER_CUDNN_FROST_ENGINES before the first of them can run.
+_configure_cudnn_frost_engines()
 
 
 from . import jit as jit
