@@ -1228,3 +1228,130 @@ def test_decode_routing_opt_in_fallback_graph():
                     )
                     assert output.count_nonzero() == 0
         stream.synchronize()
+
+
+@pytest.mark.parametrize(
+    "tokens,local_experts,offset,distribution,narrow_tile,permille",
+    [
+        (128, 896, 0, "hot", 8, 0),
+        (128, 896, 0, "hot", 8, 500),
+        (128, 896, 0, "balanced", 8, 500),
+        (128, 896, 0, "empty", 16, 500),
+        (256, 896, 0, "balanced", 16, 0),
+        (256, 896, 0, "empty", 16, 500),
+        (256, 896, 0, "hot", 32, 500),
+        (200, 112, 336, "balanced", 32, 0),
+        (256, 112, 336, "empty", 8, 500),
+    ],
+)
+def test_fused_routing_dispatch_lists_match_dispatch_kernel(
+    tokens, local_experts, offset, distribution, narrow_tile, permille
+):
+    """The fused routing kernel's wide / narrow / all-sub-tile lists equal the
+    ``swapab_dispatch`` lists built from the same sort groups, on the first
+    run and after a graph replay over changed routing."""
+    _require_blackwell()
+    import cuda.bindings.driver as cuda
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        get_max_num_tiles,
+    )
+    from flashinfer.fused_moe.cute_dsl.mxfp4_routing import _plan_route_preprocess
+    from flashinfer.fused_moe.cute_dsl.swapab_moe import swapab_dispatch
+
+    group_rows, top_k = 128, 16
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ids, weights = make_routing(
+            tokens, 896, top_k, local_experts, offset, distribution
+        )
+        source_ids = pack_topk(ids, weights)
+        route_ids = torch.empty_like(ids)
+        route_weights = torch.empty_like(weights, dtype=torch.float32)
+        buffers = allocate_moe_sort_buffers(
+            tokens, 896, top_k, local_experts, group_rows
+        )
+        output = torch.zeros((tokens, 512), dtype=torch.bfloat16, device="cuda")
+        tiles = get_max_num_tiles(tokens, top_k, local_experts, group_rows)
+        sub = group_rows // narrow_tile
+
+        def lists():
+            return dict(
+                wide_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+                wide_count=torch.zeros((1,), dtype=torch.int32, device="cuda"),
+                narrow_list=torch.full(
+                    (tiles * sub,), -7, dtype=torch.int32, device="cuda"
+                ),
+                narrow_count=torch.zeros((1,), dtype=torch.int32, device="cuda"),
+                all_list=torch.full(
+                    (tiles * sub,), -7, dtype=torch.int32, device="cuda"
+                ),
+                all_count=torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            )
+
+        fused, reference = lists(), lists()
+        plan = _plan_route_preprocess(
+            source_ids,
+            None,
+            output=output,
+            route_ids=route_ids,
+            route_weights=route_weights,
+            moe_sort_buffers=buffers,
+            num_experts=896,
+            num_local_experts=local_experts,
+            local_expert_offset=offset,
+            tile_size=group_rows,
+            _single_tile_per_expert=group_rows >= tokens,
+            dispatch_lists=dict(
+                fused,
+                narrow_tile=narrow_tile,
+                wide_min_rows=64,
+                wide_min_permille=permille,
+            ),
+        )
+
+        def check():
+            swapab_dispatch(
+                tile_idx_to_mn_limit=buffers["out_tile_idx_to_mn_limit"],
+                num_non_exiting_tiles=buffers["out_num_non_exiting_tiles"],
+                group_rows=group_rows,
+                narrow_tile=narrow_tile,
+                wide_min_rows=64,
+                wide_min_permille=permille,
+                **reference,
+            )
+            stream.synchronize()
+            for name in ("wide", "narrow", "all"):
+                count = int(reference[name + "_count"].item())
+                assert int(fused[name + "_count"].item()) == count, name
+                torch.testing.assert_close(
+                    fused[name + "_list"][:count],
+                    reference[name + "_list"][:count],
+                    atol=0,
+                    rtol=0,
+                )
+            total = int(buffers["out_num_non_exiting_tiles"].item())
+            assert int(fused["wide_count"].item()) <= total
+            if permille == 0 and distribution in ("hot", "empty"):
+                # Without the rule the full 128-row groups are wide.
+                assert int(fused["wide_count"].item()) > 0
+
+        check()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            plan.run(cuda.CUstream(stream.cuda_stream))
+        changed_ids, changed_weights = make_routing(
+            tokens,
+            896,
+            top_k,
+            local_experts,
+            offset,
+            "balanced" if distribution != "balanced" else "hot",
+            seed=4242,
+        )
+        source_ids.copy_(pack_topk(changed_ids, changed_weights))
+        for buf in (fused, reference):
+            for name in ("wide", "narrow", "all"):
+                buf[name + "_list"].fill_(-7)
+        graph.replay()
+        check()

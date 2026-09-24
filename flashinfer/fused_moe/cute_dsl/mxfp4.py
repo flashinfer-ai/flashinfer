@@ -108,6 +108,14 @@ SWAP_HYBRID_DENSE_MIN_ROWS = int(os.environ.get("SWAPAB_HYBRID_DENSE_MIN_ROWS", 
 # expert-parallel ranks.
 SWAP_MIXED = os.environ.get("SWAPAB_MIXED", "0") == "1"
 SWAP_MIXED_MIN_TOKENS = int(os.environ.get("SWAPAB_MIXED_MIN_TOKENS", "128"))
+# Mixed form by default on the fused-routing path (T * top_k <= 4096, i.e.
+# T <= 256 for top-16) up to this token count (0 disables): there the fused
+# routing kernel emits the work lists itself, so the form costs no extra
+# launch besides the dense GEMM1 that may find an empty list.
+SWAP_MIXED_AUTO_MAX_TOKENS = int(os.environ.get("SWAPAB_MIXED_AUTO_MAX_TOKENS", "0"))
+# Timing switch: build the mixed-form lists in the fused routing kernel (1)
+# or with the separate ``swapab_dispatch`` launch (0).
+SWAP_MIXED_FUSED_LISTS = os.environ.get("SWAPAB_MIXED_FUSED_LISTS", "1") == "1"
 SWAP_MIXED_EP = os.environ.get("SWAPAB_MIXED_EP", "0") == "1"
 # Mixed form: dense tiles only when the full groups hold at least this share
 # (per mille) of the valid rows (0 = always); timing-only switch to keep the
@@ -706,6 +714,13 @@ class Mxfp4MoESwapAbPlan:
             clear_target = self._partial_rows[:num_tokens]
         else:
             clear_target = self.output[:num_tokens]
+        # Mixed form on the fused-routing path: the routing kernel emits the
+        # wide / narrow / all-sub-tile lists (no ``swapab_dispatch`` launch).
+        lists_from_routing = (
+            self.mixed
+            and SWAP_MIXED_FUSED_LISTS
+            and num_tokens * w.top_k <= FUSED_ROUTE_MAX_ROUTES
+        )
         with torch.cuda.device(self.device):
             if num_tokens * w.top_k <= FUSED_ROUTE_MAX_ROUTES:
                 # Fused routing (T <= 256 for top-16): ID unpack, FP32
@@ -725,6 +740,23 @@ class Mxfp4MoESwapAbPlan:
                     tile_size=self.group_rows,
                     _single_tile_per_expert=self.group_rows >= num_tokens,
                     clear_output=not self.two_stage,
+                    dispatch_lists=(
+                        dict(
+                            wide_list=b["swap_wide_list"],
+                            wide_count=b["swap_wide_count"],
+                            narrow_list=b["swap_row_groups"],
+                            narrow_count=b["swap_row_group_count"],
+                            all_list=b["swap_all_groups"],
+                            all_count=b["swap_all_count"],
+                            narrow_tile=self.n_tile,
+                            wide_min_rows=min(
+                                SWAP_HYBRID_DENSE_MIN_ROWS, self.group_rows
+                            ),
+                            wide_min_permille=SWAP_MIXED_WIDE_PERMILLE,
+                        )
+                        if lists_from_routing
+                        else None
+                    ),
                 )
             else:
                 # Generic routing: one conversion + output-clear launch, then
@@ -751,7 +783,7 @@ class Mxfp4MoESwapAbPlan:
                 )
                 self._sort, self._sort_args = launches["sort"]
             gemm1_lists = {}
-            if self.hybrid or self.mixed:
+            if (self.hybrid or self.mixed) and not lists_from_routing:
                 # Work lists over the 128-row sort groups: wide (dense GEMM1
                 # tiles), narrow (swap GEMM1 sub-tiles) and, in the mixed
                 # form, every occupied sub-tile for the swap GEMM2.
@@ -772,6 +804,7 @@ class Mxfp4MoESwapAbPlan:
                     _prepared_launches=launches,
                 )
                 self._dispatch, self._dispatch_args = launches["swap_dispatch"]
+            if self.hybrid or self.mixed:
                 gemm1_lists = dict(
                     tile_idx_to_row_group=b["swap_row_groups"],
                     num_non_exiting_tiles=b["swap_row_group_count"],
@@ -1209,7 +1242,13 @@ class CuteDslMxfp4MoEWrapper:
         """Mixed form: 128-row sort groups with dense / swap GEMM1 tiles and
         the swap GEMM2 of the policy tile over every occupied sub-tile."""
         return (
-            SWAP_MIXED
+            (
+                SWAP_MIXED
+                or (
+                    num_tokens <= SWAP_MIXED_AUTO_MAX_TOKENS
+                    and num_tokens * self.top_k <= FUSED_ROUTE_MAX_ROUTES
+                )
+            )
             and bool(do_finalize)
             and num_tokens >= SWAP_MIXED_MIN_TOKENS
             and (self.intermediate_shard < 1024 or SWAP_MIXED_EP)

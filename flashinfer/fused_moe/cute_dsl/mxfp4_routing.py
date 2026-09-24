@@ -31,6 +31,15 @@ from .moe_utils import get_max_num_tiles
 
 _route_preprocess_kernel_cache: dict = {}
 
+_LIST_BUFFER_NAMES = (
+    "wide_list",
+    "wide_count",
+    "narrow_list",
+    "narrow_count",
+    "all_list",
+    "all_count",
+)
+
 _SORT_BUFFER_NAMES = (
     "out_tile_idx_to_expert_idx",
     "out_tile_idx_to_mn_limit",
@@ -174,6 +183,38 @@ def _routing_warp_inclusive(value: cutlass.Int32, lane: cutlass.Int32):
     return value
 
 
+@cute.jit
+def _routing_block_exclusive(
+    value: cutlass.Int32,
+    lane: cutlass.Int32,
+    warp: cutlass.Int32,
+    warps: cutlass.Constexpr[int],
+    buf: cute.Tensor,
+):
+    """Exclusive prefix and total of ``value`` over the CTA (all threads
+    participate; ``buf`` holds ``warps`` int32 words and is reusable after
+    the call returns)."""
+    inclusive = _routing_warp_inclusive(value, lane)
+    if lane == 31:
+        buf[warp] = inclusive
+    cute.arch.sync_threads()
+    if warp == 0:
+        subtotal = cutlass.Int32(0)
+        if lane < warps:
+            subtotal = buf[lane]
+        subtotal = _routing_warp_inclusive(subtotal, lane)
+        if lane < warps:
+            buf[lane] = subtotal
+    cute.arch.sync_threads()
+    preceding = cutlass.Int32(0)
+    if warp > 0:
+        preceding = buf[warp - 1]
+    total = buf[warps - 1]
+    exclusive = preceding + inclusive - value
+    cute.arch.sync_threads()
+    return exclusive, total
+
+
 # Routes (token, slot) one fused sorting CTA handles: T*top_k up to 4096, i.e.
 # T <= 256 for Kimi's top-16. Beyond that the generic conversion kernel and
 # ``moe_sort`` run.
@@ -188,8 +229,14 @@ class _FusedRoutePreprocess:
         single_tile_per_expert=False,
         max_routes=FUSED_ROUTE_MAX_ROUTES,
         clear=True,
+        dispatch_lists=False,
     ):
         self.single_tile_per_expert = single_tile_per_expert
+        # ``dispatch_lists``: also emit the swap-AB work lists over the sort
+        # groups (wide = dense GEMM1 tiles, narrow = swap GEMM1 sub-tiles,
+        # all = every occupied sub-tile for the swap GEMM2), replacing the
+        # separate ``swapab_dispatch`` launch of the mixed form.
+        self.dispatch_lists = dispatch_lists
         self.packed = mode == "packed"
         self.convert_weights = mode != "separate_fp32"
         self.threads = threads
@@ -214,6 +261,12 @@ class _FusedRoutePreprocess:
         permuted_ptr: cute.Pointer,
         padded_total_ptr: cute.Pointer,
         active_total_ptr: cute.Pointer,
+        wide_list_ptr: cute.Pointer,
+        wide_count_ptr: cute.Pointer,
+        narrow_list_ptr: cute.Pointer,
+        narrow_count_ptr: cute.Pointer,
+        all_list_ptr: cute.Pointer,
+        all_count_ptr: cute.Pointer,
         tokens: cutlass.Int32,
         top_k: cutlass.Int32,
         hidden: cutlass.Int32,
@@ -222,6 +275,9 @@ class _FusedRoutePreprocess:
         local_offset: cutlass.Int32,
         tile_size: cutlass.Int32,
         tile_capacity: cutlass.Int32,
+        narrow_tile: cutlass.Int32,
+        wide_min_rows: cutlass.Int32,
+        wide_min_permille: cutlass.Int32,
         ids_row_stride: cutlass.Int32,
         ids_col_stride: cutlass.Int32,
         weights_row_stride: cutlass.Int32,
@@ -257,6 +313,13 @@ class _FusedRoutePreprocess:
         )
         padded_total = cute.make_tensor(padded_total_ptr, cute.make_layout((1,)))
         active_total = cute.make_tensor(active_total_ptr, cute.make_layout((1,)))
+        sub_tiles = tile_capacity * (tile_size // narrow_tile)
+        wide_list = cute.make_tensor(wide_list_ptr, cute.make_layout((tile_capacity,)))
+        wide_count = cute.make_tensor(wide_count_ptr, cute.make_layout((1,)))
+        narrow_list = cute.make_tensor(narrow_list_ptr, cute.make_layout((sub_tiles,)))
+        narrow_count = cute.make_tensor(narrow_count_ptr, cute.make_layout((1,)))
+        all_list = cute.make_tensor(all_list_ptr, cute.make_layout((sub_tiles,)))
+        all_count = cute.make_tensor(all_count_ptr, cute.make_layout((1,)))
         self.kernel(
             ids_src,
             weights_src,
@@ -269,10 +332,19 @@ class _FusedRoutePreprocess:
             permuted,
             padded_total,
             active_total,
+            wide_list,
+            wide_count,
+            narrow_list,
+            narrow_count,
+            all_list,
+            all_count,
             num_experts,
             local_experts,
             local_offset,
             tile_size,
+            narrow_tile,
+            wide_min_rows,
+            wide_min_permille,
         ).launch(
             grid=(
                 cute.ceil_div(cute.size(output), self.threads)
@@ -299,10 +371,19 @@ class _FusedRoutePreprocess:
         permuted: cute.Tensor,
         padded_total: cute.Tensor,
         active_total: cute.Tensor,
+        wide_list: cute.Tensor,
+        wide_count: cute.Tensor,
+        narrow_list: cute.Tensor,
+        narrow_count: cute.Tensor,
+        all_list: cute.Tensor,
+        all_count: cute.Tensor,
         num_experts: cutlass.Int32,
         local_experts: cutlass.Int32,
         local_offset: cutlass.Int32,
         tile_size: cutlass.Int32,
+        narrow_tile: cutlass.Int32,
+        wide_min_rows: cutlass.Int32,
+        wide_min_permille: cutlass.Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
@@ -312,6 +393,7 @@ class _FusedRoutePreprocess:
         counts = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
         bases = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
         warp_sums = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.warps,)))
+        scan_buf = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.warps,)))
         rank_buf = smem.allocate_tensor(
             cutlass.Int32, cute.make_layout((self.max_routes,))
         )
@@ -379,6 +461,70 @@ class _FusedRoutePreprocess:
             tile_base = preceding_warps + within_warp - ntiles
             row_base = tile_base * tile_size
             bases[tid] = row_base
+            if cutlass.const_expr(self.dispatch_lists):
+                # Swap-AB work lists over this CTA's sort groups (the same
+                # lists ``swapab_dispatch`` builds from tile_limit): ``full``
+                # complete groups and one ``last`` partial group per expert.
+                nonempty = (count > 0).to(cutlass.Int32)
+                full = ntiles - nonempty
+                last = count - full * tile_size
+                sub = tile_size // narrow_tile
+                last_sub = (last + narrow_tile - 1) // narrow_tile
+                # Global rule: dense tiles only when the groups above
+                # ``wide_min_rows`` hold ``wide_min_permille`` of the rows.
+                wide_rows = cutlass.Int32(0)
+                if tile_size > wide_min_rows:
+                    wide_rows = full * tile_size
+                if last > wide_min_rows:
+                    wide_rows = wide_rows + last
+                _, total_rows = _routing_block_exclusive(
+                    count, lane, warp, self.warps, scan_buf
+                )
+                _, total_wide = _routing_block_exclusive(
+                    wide_rows, lane, warp, self.warps, scan_buf
+                )
+                effective_min = wide_min_rows
+                if wide_min_permille > 0:
+                    if total_wide * 1000 < total_rows * wide_min_permille:
+                        effective_min = tile_size
+                full_wide = (tile_size > effective_min).to(cutlass.Int32)
+                last_wide = (last > effective_min).to(cutlass.Int32)
+                n_wide = full * full_wide + last_wide
+                n_all = full * sub + last_sub
+                n_narrow = full * sub * (1 - full_wide) + last_sub * (1 - last_wide)
+                wide_base, wide_total = _routing_block_exclusive(
+                    n_wide, lane, warp, self.warps, scan_buf
+                )
+                narrow_base, narrow_total = _routing_block_exclusive(
+                    n_narrow, lane, warp, self.warps, scan_buf
+                )
+                all_base, all_total = _routing_block_exclusive(
+                    n_all, lane, warp, self.warps, scan_buf
+                )
+                if tid < local_experts:
+                    for j in cutlass.range(full):
+                        tile = tile_base + j
+                        if full_wide == 1:
+                            wide_list[wide_base + j] = tile
+                        else:
+                            for s in cutlass.range(sub):
+                                narrow_list[narrow_base + j * sub + s] = tile * sub + s
+                        for s in cutlass.range(sub):
+                            all_list[all_base + j * sub + s] = tile * sub + s
+                    if last > 0:
+                        tile = tile_base + full
+                        if last_wide == 1:
+                            wide_list[wide_base + full * full_wide] = tile
+                        else:
+                            narrow_off = narrow_base + full * sub * (1 - full_wide)
+                            for s in cutlass.range(last_sub):
+                                narrow_list[narrow_off + s] = tile * sub + s
+                        for s in cutlass.range(last_sub):
+                            all_list[all_base + full * sub + s] = tile * sub + s
+                if tid == self.threads - 1:
+                    wide_count[0] = wide_total
+                    narrow_count[0] = narrow_total
+                    all_count[0] = all_total
             if tid < local_experts:
                 for j in cutlass.range(ntiles):
                     tile = tile_base + j
@@ -475,6 +621,7 @@ def _plan_route_preprocess(
     tile_size=128,
     _single_tile_per_expert=False,
     clear_output=True,
+    dispatch_lists=None,
 ):
     """Compile, bind and enqueue one warmup, outside CUDA Graph capture.
 
@@ -496,6 +643,16 @@ def _plan_route_preprocess(
     count; the fused sorting mode supports tokens from 1..16. Top-k is 1..32
     and the hidden size a positive even number. No input data are read on
     the host. Tensor contents must be valid when planning because warmup runs.
+    ``dispatch_lists`` (fused sorting only) is a dict with the int32 buffers
+    ``wide_list`` (tile_capacity), ``wide_count`` (1), ``narrow_list`` and
+    ``all_list`` (tile_capacity * tile_size // narrow_tile), ``narrow_count``
+    and ``all_count`` (1) plus the ints ``narrow_tile`` (divides tile_size),
+    ``wide_min_rows`` and ``wide_min_permille``: CTA0 then also emits the
+    swap-AB work lists ``swapab_dispatch`` would build from the sort groups
+    (dense-tile groups above ``wide_min_rows``, the narrow sub-tiles of the
+    others, and every occupied sub-tile), so the mixed form needs no extra
+    launch.
+
     Shapes/strides are dynamic kernel arguments; beta values and tactic choices
     do not enter compilation. Cache entries are per input/sort mode, thread
     count, device and single-tile prefix mode. Sorting uses 256..1024 threads,
@@ -570,6 +727,38 @@ def _plan_route_preprocess(
         # routes (4096 at T=256), and a 256-thread CTA took 12 us there.
         required = max(1024, num_local_experts)
         threads = 1 << (required - 1).bit_length()
+        if dispatch_lists is not None:
+            narrow_tile = int(dispatch_lists["narrow_tile"])
+            if narrow_tile <= 0 or tile_size % narrow_tile:
+                raise ValueError("dispatch_lists.narrow_tile must divide tile_size")
+            sub_tiles = tile_capacity * (tile_size // narrow_tile)
+            for name, expected in (
+                ("wide_list", (tile_capacity,)),
+                ("wide_count", (1,)),
+                ("narrow_list", (sub_tiles,)),
+                ("narrow_count", (1,)),
+                ("all_list", (sub_tiles,)),
+                ("all_count", (1,)),
+            ):
+                tensor = dispatch_lists[name]
+                _check_tensor(
+                    "dispatch_lists." + name,
+                    tensor,
+                    expected,
+                    torch.int32,
+                    device,
+                    contiguous=True,
+                )
+                writable.append(("dispatch_lists." + name, tensor))
+            list_ints = (
+                narrow_tile,
+                int(dispatch_lists["wide_min_rows"]),
+                int(dispatch_lists["wide_min_permille"]),
+            )
+        else:
+            list_ints = (tile_size, tile_size, 0)
+    elif dispatch_lists is not None:
+        raise ValueError("dispatch_lists requires moe_sort_buffers (fused sorting)")
 
     if topk_weights is None:
         mode = "packed"
@@ -681,6 +870,25 @@ def _plan_route_preprocess(
                 )
                 for name in _SORT_BUFFER_NAMES
             )
+            # Work-list pointers; without lists the (never written) slots
+            # alias the padded-total word so the signature stays fixed.
+            list_source = (
+                dispatch_lists
+                if dispatch_lists is not None
+                else {
+                    name: moe_sort_buffers["out_total_num_padded_tokens"]
+                    for name in _LIST_BUFFER_NAMES
+                }
+            )
+            pointers += tuple(
+                make_ptr(
+                    cutlass.Int32,
+                    list_source[name].data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                )
+                for name in _LIST_BUFFER_NAMES
+            )
             arguments = pointers + (
                 tokens,
                 top_k,
@@ -690,6 +898,7 @@ def _plan_route_preprocess(
                 local_expert_offset,
                 tile_size,
                 tile_capacity,
+                *list_ints,
                 *topk_ids.stride(),
                 *weight_strides,
             )
@@ -712,6 +921,7 @@ def _plan_route_preprocess(
             sorts_tokens,
             single_tile_per_expert,
             bool(clear_output),
+            dispatch_lists is not None,
         )
         compiled = _route_preprocess_kernel_cache.get(cache_key)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
@@ -723,6 +933,7 @@ def _plan_route_preprocess(
                     single_tile_per_expert,
                     max_routes=FUSED_ROUTE_MAX_ROUTES,
                     clear=bool(clear_output),
+                    dispatch_lists=dispatch_lists is not None,
                 )
                 if sorts_tokens
                 else _RoutePreprocess(mode, threads, clear=bool(clear_output))
@@ -739,6 +950,7 @@ def _plan_route_preprocess(
                 route_weights,
                 output,
                 moe_sort_buffers,
+                dispatch_lists,
             ),
             route_ids,
             route_weights,

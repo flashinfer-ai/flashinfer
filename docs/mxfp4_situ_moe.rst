@@ -360,12 +360,22 @@ block-scaled scale layout the dense tiles write), and a device-side rule
 the full groups hold that share of the valid rows, so only concentrated
 routings pay for dense tiles. Measured on B300 (TP8 rank 0, same GPU, rule
 500): ``empty`` T=128/256/512/1024 145 -> 94, 171 -> 103, 211 -> 152,
-388 -> 247 us (0.60-0.72 x), while ``balanced``/``hot`` rows pay the
-dispatch launch, the dense GEMM1 launch that finds an empty list and a
-slightly slower GEMM2 over 128-row groups: +1..2 % against the default
-form. Because the acceptance rule of this work forbids a slower row, the
-form is not the default; folding the list construction into the routing
-kernel is the open item that would make it free.
+388 -> 247 us (0.60-0.72 x), while ``balanced``/``hot`` rows pay for the
+128-row groups. On the fused-routing path (T <= 256) the routing kernel
+emits the three lists itself (``SWAPAB_MIXED_FUSED_LISTS``, default 1;
+the separate dispatch launch remains for ``moe_sort``-routed token
+counts), which the per-kernel breakdown shows is not where the cost is:
+at T=256 balanced the lists add 2.7 us to the routing kernel against the
+4.4 us dispatch launch they replace, the dense GEMM1 that finds an empty
+list costs 2.8 us, but the swap GEMM2 over the 128-row groups' sub-tiles
+takes 220 us against 209 us with 16-row groups and the swap GEMM1 405
+against 402 us, so the row reads 649 against 629 us (+3.1 %; T=128
+balanced/hot +1.4 %, same-GPU A/B/A, the two default arms within 0.1 %).
+The grouping itself, not a launch, is the price of the mixed form, so it
+stays opt-in; the open item is a dense tile that works on the default
+16-row group layout (a row-start work list and a per-row scale epilogue
+in the gather GEMM1), which would leave the balanced and hot rows at the
+default form's cost.
 
 Every weight TMA load (swap-AB and dense) can carry an L2 eviction hint.
 The dense GEMMs mark their B/SFB streams ``EVICT_FIRST`` (CUTLASS SM90 TMA
@@ -1008,9 +1018,11 @@ already take the dense tile for every full group: T=2048 empty 414 -> 295
 us in the A/B above, 298 us in the table (1.9 x its floor; TRT-LLM Gen 437
 us). Below T=1025 the opt-in mixed form (``SWAPAB_MIXED=1``) takes these
 rows to 94 / 103 / 152 / 247 us (0.60-0.72 x) but costs the balanced and
-hot rows 1-2 %, so it is not the default; folding its list construction
-into the fused routing kernel is the open item that would make it free for
-T=128..1024. This row class is open, not structural.
+hot rows 1.4-3.1 % through its 128-row groups (measured per kernel: the
+GEMM2 over the groups' sub-tiles, not the list construction, which the
+routing kernel now performs), so it is not the default; dense tiles over
+the default 16-row group layout are the open item for T=128..1024. This
+row class is open, not structural.
 
 *Prefill on the dense path, T >= 2048.* The dense GEMM1 runs at about 3.5
 PFLOPS with L2-resident weights (95-99% of the peak measured on the two
