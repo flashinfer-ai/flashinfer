@@ -133,6 +133,7 @@ def test_decode_q1(num_heads, kv_lens):
 
 @pytest.mark.parametrize("num_heads,q_lens,kv_lens", [
     (12, [1, 5, 8, 3], [300, 1500, 64, 129]),
+    (12, [5, 2], [1500, 2600]),  # 60 query rows -> the 64-row tile
     (96, [4, 4], [2048, 333]),
 ])
 def test_mtp_variable_q(num_heads, q_lens, kv_lens):
