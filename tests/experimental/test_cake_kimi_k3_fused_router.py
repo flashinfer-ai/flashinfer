@@ -303,10 +303,16 @@ def test_launch_grid_rules(compute_capability, sm_count):
     # whole co-resident clusters, then rounded down to clusters.
     q4s_ctas = ARM_Q4S_CTAS_PER_SM * sm_count
     assert launch_grid("Q4S", 512, max_active_clusters=1000, **kw) == 512
-    assert launch_grid("Q4S", 1024, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
-    assert launch_grid("Q4S", 2048, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
+    assert (
+        launch_grid("Q4S", 1024, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
+    )
+    assert (
+        launch_grid("Q4S", 2048, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
+    )
     assert launch_grid("Q4S", 1024, max_active_clusters=100, **kw) == 400
-    assert launch_grid("Q4S", 1024, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
+    assert (
+        launch_grid("Q4S", 1024, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
+    )
     with pytest.raises(RuntimeError, match="co-resident owner CTAs"):
         launch_grid(
             "Q4S", 1024, max_active_clusters=OWNER_CTAS // ARM_Q4S_CLUSTER - 1, **kw

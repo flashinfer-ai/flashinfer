@@ -251,7 +251,9 @@ def launch_grid(
                 f"arm Q4S admits {OWNER_CTAS} <= num_tokens <= {ARM_Q4S_MAX_TOKENS}"
             )
         if max_active_clusters is None:
-            raise RuntimeError("arm Q4S needs the driver's co-resident cluster capacity")
+            raise RuntimeError(
+                "arm Q4S needs the driver's co-resident cluster capacity"
+            )
         cluster_cap = int(max_active_clusters) * ARM_Q4S_CLUSTER
         grid_x = min(grid_rows, ARM_Q4S_CTAS_PER_SM * int(sm_count), cluster_cap)
         grid_x = (grid_x // ARM_Q4S_CLUSTER) * ARM_Q4S_CLUSTER
