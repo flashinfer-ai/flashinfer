@@ -362,6 +362,7 @@ struct FP8PagedTmaCollectiveMainloop {
           int col = (i % kVectorsPerRow) * kVectorElements;
           *reinterpret_cast<uint4*>(&sV(row, col, stage)) = uint4{0, 0, 0, 0};
         }
+        cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier::sync(Ktraits::NUM_PRODUCER_THREADS,
                                           static_cast<int>(NamedBarriers::kProducerWG));
       }
