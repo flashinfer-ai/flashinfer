@@ -7650,13 +7650,8 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                         f"implement problem {problem_mnkl}"
                     )
                 tactic = tactics[0]
-            else:
-                # Autotune caches written before CTA-M was tunable hold flat
-                # (cta_k, ...) tactics, which all used 128x8 tiles
-                if isinstance(tactic[0], int):
-                    tactic = ((128, 8, tactic[0]), *tactic[1:])
-                if tactic not in tactics:
-                    raise ValueError(f"Invalid low-latency GEMM tactic: {tactic}")
+            elif tactic not in tactics:
+                raise ValueError(f"Invalid low-latency GEMM tactic: {tactic}")
 
             m, n, _, batch_size = problem_mnkl
             cta_tile_shape_mnk, num_ab_stage, num_sfb_tmem_stage, split_k = tactic
