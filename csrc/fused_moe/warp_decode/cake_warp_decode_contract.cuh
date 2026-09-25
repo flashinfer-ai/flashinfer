@@ -48,6 +48,7 @@ enum class Geometry : uint8_t {
   kH2048I512E512K10,
   kH2048I1536E60K4,
   kH6144I1536E192K4,
+  kH4096I2048E256K6,
 };
 
 enum class Activation : uint8_t {
@@ -65,6 +66,9 @@ enum class RoutePacker : uint8_t {
   kE64Scan1,
   kE64Scan2,
   kGeneral,
+  kExpertOrder,
+  kSortedShort,
+  kCountRank,
 };
 
 enum class Fc1Schedule : uint8_t {
@@ -72,6 +76,8 @@ enum class Fc1Schedule : uint8_t {
   kPersistent,
   kPersistentDeviceWorkfeed,
   kPersistentPaddedScaleDeviceWorkfeed,
+  kPersistentExpertOrder,
+  kPersistentMetadataPublication,
 };
 
 enum class Fc2Schedule : uint8_t {
@@ -79,6 +85,8 @@ enum class Fc2Schedule : uint8_t {
   kRouteParallelK512DeviceWorkfeed,
   kRouteParallelK768K96,
   kRouteParallelK768K96PaddedScale,
+  kRouteParallelK512,
+  kImmutableWeightPrefill,
 };
 
 struct Shape {
@@ -227,6 +235,25 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
     return UnsupportedSchedule();
   }
 
+  if (IsGeometry(shape, 4096, 2048, 256, 6)) {
+    // Fixed top-k6 finalizers do not use the generic unroll/workfeed fields.
+    if (shape.num_tokens <= 8) {
+      const bool ordered = shape.num_tokens >= 7;
+      return {true, Geometry::kH4096I2048E256K6, RouteLayout::kDirect,
+              ordered ? RoutePacker::kExpertOrder : RoutePacker::kNone,
+              ordered ? Fc1Schedule::kPersistentExpertOrder : Fc1Schedule::kPersistent,
+              Fc2Schedule::kRouteParallelK512, 128, 0, 0};
+    }
+    const RoutePacker planner = shape.num_tokens <= 10
+                                    ? RoutePacker::kSortedShort
+                                    : (shape.num_tokens == 11 || shape.num_tokens == 23)
+                                          ? RoutePacker::kCountRank
+                                          : RoutePacker::kGeneral;
+    return {true, Geometry::kH4096I2048E256K6, RouteLayout::kGpuPacked, planner,
+            Fc1Schedule::kPersistentMetadataPublication,
+            Fc2Schedule::kImmutableWeightPrefill, 128, 0, 0};
+  }
+
   if (IsGeometry(shape, 2048, 512, 512, 10)) {
     return {true,
             Geometry::kH2048I512E512K10,
@@ -344,6 +371,11 @@ struct Invocation {
   const void* output1_scale_gate_scalar;
   const void* output2_scale_scalar;
   size_t workspace_bytes;
+  // Physical per-expert parameters in the FC1 raw-accumulator domain.
+  // Null on the unchanged default-activation entry.
+  const void* gemm1_alpha = nullptr;
+  const void* gemm1_beta = nullptr;
+  const void* gemm1_clamp_limit = nullptr;
 };
 
 enum class StatusDomain : uint8_t {

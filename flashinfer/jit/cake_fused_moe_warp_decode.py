@@ -357,6 +357,64 @@ def _load_exported_device_sources(
     return device_sources, has_silu
 
 
+
+def _load_clamped_e256_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> list[Path]:
+    """Enable the SM100 extension only with its complete generated inventory."""
+    if target != "sm100a":
+        return []
+    directory = csrc_dir / "generated" / "dsv4_clamped_e256"
+    manifest_path = directory / "module_manifest.json"
+    if not manifest_path.is_file():
+        return []
+    manifest = _require_dict(json.loads(manifest_path.read_text()), "clamped E256 modules")
+    if manifest.get("schema_version") != 1 or manifest.get("target") != "sm_100a":
+        raise ValueError("Clamped E256 inventory requires schema 1 and exact sm_100a")
+    modules = manifest.get("modules")
+    if not isinstance(modules, list) or len(modules) != 11:
+        raise ValueError("Clamped E256 inventory must contain its 11 selected modules")
+    paths: list[Path] = []
+    identifiers: set[str] = set()
+    for module in modules:
+        module = _require_dict(module, "clamped E256 module")
+        identity = module.get("id")
+        filename = module.get("file")
+        if (not isinstance(identity, str) or identity in identifiers
+                or not isinstance(filename, str) or Path(filename).name != filename
+                or not filename.endswith(".cu")):
+            raise ValueError("Clamped E256 module identity/source path is invalid")
+        if module.get("compile_options") != ["--use_fast_math"]:
+            raise ValueError("Clamped E256 module compile options differ from the selected source")
+        if module.get("pdl") is not True or module.get("cooperative") is not False:
+            raise ValueError("Clamped E256 requires non-cooperative programmatic dependent launch")
+        identifiers.add(identity)
+        paths.append(_resolve_export_path(
+            csrc_dir, "csrc/fused_moe/warp_decode/generated/dsv4_clamped_e256/" + filename,
+            "clamped E256 device source"))
+    if len(set(paths)) != len(paths):
+        raise ValueError("Clamped E256 inventory repeats a device source")
+    for filename in ("declarations.cuh", "dsv4_clamped_e256_manifest.cuh", "route_metadata.json"):
+        if not (directory / filename).is_file():
+            raise FileNotFoundError(f"Clamped E256 generated source missing: {directory / filename}")
+    routes = _require_dict(json.loads((directory / "route_metadata.json").read_text()), "clamped E256 routes")
+    rows = routes.get("routes")
+    if (routes.get("schema_version") != 1 or not isinstance(rows, list)
+            or [row.get("T") for row in rows] != list(range(1, 33))):
+        raise ValueError("Clamped E256 inventory must cover every token count 1..32")
+    used: set[str] = set()
+    for row in rows:
+        calls = row.get("launches")
+        expected = 3 if row["T"] <= 6 else 4
+        if not isinstance(calls, list) or len(calls) != expected:
+            raise ValueError("Clamped E256 route has an incomplete launch sequence")
+        for order, call in enumerate(calls):
+            if call.get("order") != order or call.get("module_id") not in identifiers:
+                raise ValueError("Clamped E256 route references a missing or unordered module")
+            used.add(call["module_id"])
+    if used != identifiers:
+        raise ValueError("Clamped E256 inventory contains an unselected module")
+    return paths
+
+
 def get_cake_fused_moe_warp_decode_uri(
     target: CakeWarpDecodeTarget = "sm103a",
 ) -> str:
@@ -377,6 +435,7 @@ def gen_cake_fused_moe_warp_decode_module(
     csrc_dir = _get_cake_fused_moe_warp_decode_csrc_dir()
     generated_dir = csrc_dir / "generated"
     generated_sources, has_silu = _load_exported_device_sources(csrc_dir, target)
+    clamped_sources = _load_clamped_e256_sources(csrc_dir, target)
     required_files = (
         csrc_dir / _BINDING_SOURCE,
         generated_dir / _GENERATED_MANIFEST,
@@ -393,12 +452,14 @@ def gen_cake_fused_moe_warp_decode_module(
         name=uri,
         sources=[
             *generated_sources,
+            *clamped_sources,
             csrc_dir / _BINDING_SOURCE,
         ],
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
             f"-DFLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR={_TARGET_MINOR[target]}",
             f"-DFLASHINFER_CAKE_WARP_DECODE_HAS_SILU={int(has_silu)}",
+            f"-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256={int(bool(clamped_sources))}",
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[

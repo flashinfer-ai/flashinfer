@@ -627,6 +627,9 @@ class CakeWarpDecodeConfig:
         Register the returned dictionary with
         ``MoEWeightPack.prepare_for("cake", view)``. The same dictionary may
         also be registered for ``"trtllm_fp4_routed"`` without copying.
+        Clamped views retain the per-expert alpha, beta and raw-accumulator
+        clamp tensors. Callers importing calibrated weights must preserve their
+        gate-scale-dependent clamp conversion for both backends.
         """
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             raise ValueError(
@@ -639,6 +642,7 @@ class CakeWarpDecodeConfig:
             (SwiGLU(), (2048, 512, 512)),
             (SwiGLU(), (2048, 1536, 60)),
             (SiLU(), (6144, 1536, 192)),
+            (SwiGLU(limit=10.0), (4096, 2048, 256)),
         )
         if not any(
             activation == supported_activation and geometry == supported_geometry
@@ -648,7 +652,8 @@ class CakeWarpDecodeConfig:
                 "Cake warp decode weight preparation supports only default "
                 "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
                 "= (2048, 512, 512) or (2048, 1536, 60), and SiLU() with "
-                "(6144, 1536, 192); got "
+                "(6144, 1536, 192), or SwiGLU(limit=10.0) with "
+                "(4096, 2048, 256) on SM100; got "
                 f"activation={activation!r}, geometry={geometry}."
             )
         return TrtllmFp4Config.prepare_weights(

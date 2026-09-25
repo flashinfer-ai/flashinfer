@@ -35,6 +35,10 @@
 #error "FLASHINFER_CAKE_WARP_DECODE_HAS_SILU must be 0 or 1"
 #endif
 
+#ifndef FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+#define FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256 0
+#endif
+
 #if !__has_include("generated/cake_warp_decode_generated_manifest.cuh")
 #error \
     "generated/cake_warp_decode_generated_manifest.cuh is required; generate the kernel manifest before building this module"
@@ -209,6 +213,9 @@ Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate
   TVM_FFI_ICHECK(ActivationForGeometry(schedule.geometry) != Activation::kSiLU ||
                  FLASHINFER_CAKE_WARP_DECODE_HAS_SILU)
       << "cake warp decode SiLU generated programs are not installed for this exact target";
+  TVM_FFI_ICHECK(schedule.geometry != Geometry::kH4096I2048E256K6 ||
+                 FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256)
+      << "clamped E256 generated programs are not installed for this exact target";
   return shape;
 }
 
@@ -639,12 +646,14 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
   return PrepareWorkspaceAlways(invocation, schedule, device_id, stream);
 }
 
-void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
+void RunImpl(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
          TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
          TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
          TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
          TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
-         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl) {
+         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl,
+         const TensorView* gemm1_alpha_f32, const TensorView* gemm1_beta_f32,
+         const TensorView* gemm1_clamp_limit_f32) {
   TVM_FFI_ICHECK(enable_pdl)
       << "cake warp decode requires programmatic dependent launch; enable_pdl must be true";
   TVM_FFI_ICHECK(output_bf16.device().device_type == kDLCUDA)
@@ -668,6 +677,27 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
                           output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
                           output2_scale_scalar_f32, shape, schedule, workspace_bytes);
 
+  const bool clamped = IsGeometry(shape, 4096, 2048, 256, 6);
+  TVM_FFI_ICHECK(clamped == (gemm1_alpha_f32 != nullptr) &&
+                 clamped == (gemm1_beta_f32 != nullptr) &&
+                 clamped == (gemm1_clamp_limit_f32 != nullptr))
+      << "clamped E256 warp decode requires alpha, beta and raw-accumulator clamp tensors";
+  if (clamped) {
+    TVM_FFI_ICHECK(kTarget == Target::kSm100a)
+        << "clamped E256 warp decode requires exact SM100";
+    const std::array<NamedTensor, 3> activation_parameters{{
+        {gemm1_alpha_f32, "gemm1_alpha_f32"},
+        {gemm1_beta_f32, "gemm1_beta_f32"},
+        {gemm1_clamp_limit_f32, "gemm1_clamp_limit_f32"},
+    }};
+    for (const auto& parameter : activation_parameters) {
+      CheckTensor(*parameter.tensor, parameter.name, device_id, dl_float32);
+      CheckShape(*parameter.tensor, parameter.name, {shape.num_experts});
+      CheckNoOverlap(output_bf16, "output_bf16", *parameter.tensor, parameter.name);
+      CheckNoOverlap(workspace_u8, "workspace_u8", *parameter.tensor, parameter.name);
+    }
+  }
+
   const cudaStream_t stream = get_current_stream();
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   CheckCuda(cudaStreamIsCapturing(stream, &capture_status),
@@ -675,11 +705,16 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
   const bool is_capturing = capture_status != cudaStreamCaptureStatusNone;
   CheckManifestStatus(generated::EnsureDeviceReady(device_id, false));
 
-  const Invocation invocation =
+  Invocation invocation =
       MakeInvocation(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
                      topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
                      gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
                      output1_scale_gate_scalar_f32, output2_scale_scalar_f32, shape);
+  if (clamped) {
+    invocation.gemm1_alpha = gemm1_alpha_f32->data_ptr();
+    invocation.gemm1_beta = gemm1_beta_f32->data_ptr();
+    invocation.gemm1_clamp_limit = gemm1_clamp_limit_f32->data_ptr();
+  }
   // Keep the registry lock across the complete host-side submission transaction:
   // receipt validation, dependency insertion, kernel submission, and completion
   // recording. GPU execution stays asynchronous. External event nodes make the
@@ -725,10 +760,41 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
     workspace.poisoned = false;
   }
   CheckCuda(completion_status, "cudaEventRecord(workspace completion)");
-  const int32_t expected_launches = schedule.route_layout == RouteLayout::kDirect ? 3 : 4;
+  const int32_t expected_launches =
+      schedule.route_layout == RouteLayout::kDirect && schedule.route_packer == RoutePacker::kNone
+          ? 3 : 4;
   TVM_FFI_ICHECK(context.launch_count == expected_launches)
       << "generated manifest emitted " << context.launch_count
       << " launches for a schedule that requires " << expected_launches;
+}
+
+void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
+         TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
+         TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
+         TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
+         TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
+         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl) {
+  RunImpl(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
+          topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
+          gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
+          output1_scale_gate_scalar_f32, output2_scale_scalar_f32, workspace_receipt, enable_pdl,
+          nullptr, nullptr, nullptr);
+}
+
+void RunClampedSwiGLU(
+    TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
+    TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
+    TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
+    TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
+    TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
+    TensorView output2_scale_scalar_f32, TensorView gemm1_alpha_f32,
+    TensorView gemm1_beta_f32, TensorView gemm1_clamp_limit_f32,
+    int64_t workspace_receipt, bool enable_pdl) {
+  RunImpl(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
+          topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
+          gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
+          output1_scale_gate_scalar_f32, output2_scale_scalar_f32, workspace_receipt, enable_pdl,
+          &gemm1_alpha_f32, &gemm1_beta_f32, &gemm1_clamp_limit_f32);
 }
 
 }  // namespace flashinfer::warp_decode
@@ -741,3 +807,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_release_workspace,
                               flashinfer::warp_decode::ReleaseWorkspaceReceipt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode, flashinfer::warp_decode::Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::warp_decode::Run);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_clamped_swiglu,
+                              flashinfer::warp_decode::RunClampedSwiGLU);
