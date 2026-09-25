@@ -88,7 +88,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_OWN_ROUTES_STRIDE 7168
 #define SMEM_TOTAL 17152
 #define THREADS 224
-#define BLOCK_M 8
+#define BLOCK_M 16
 #define NUM_EXPERTS 896
 #define TOP_K 16
 #define ITEMS_PER_THREAD 4
@@ -98,9 +98,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define RADIX_BINS_PER_LANE 8
 #define MAX_BLOCK_M 16
 #define OWNER_CTAS 128
-#define GATHER_LOADS 40
-#define GATHER_PASS_PAIRS 8960
-#define OWNER_STRIDE 4
+#define GATHER_LOADS 16
+#define GATHER_PASS_PAIRS 3584
+#define OWNER_STRIDE 1
 #define BITMAP_STRIDE 64
 #define ROUTE_STRIDE 256
 #define WORD_PASSES 2
@@ -141,8 +141,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224, 4) void
-kernel_cake_kimi_k3_fused_router_8f78b29ddd63e7f497f7(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+__global__ __launch_bounds__(224, 3) void
+kernel_cake_kimi_k3_fused_router_a4c4268c7580b6bd00ef(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -481,13 +481,9 @@ kernel_cake_kimi_k3_fused_router_8f78b29ddd63e7f497f7(float* __restrict__ logits
         }
         __syncthreads();
     }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
     int owner_index = bid / OWNER_STRIDE;
     int own_expert_base = owner_index * NUM_WARPS;
     if (bid % OWNER_STRIDE == 0 && owner_index < OWNER_CTAS) {
-        int total_pairs = M * TOP_K;
-        int bitmap_words = M + 31 >> 5;
         #pragma unroll 1
         for (int count_clear = tid; count_clear < NUM_EXPERTS; count_clear += THREADS) {
             plan_counts[count_clear] = 0;
@@ -500,7 +496,12 @@ kernel_cake_kimi_k3_fused_router_8f78b29ddd63e7f497f7(float* __restrict__ logits
         for (int route_clear = tid; route_clear < NUM_WARPS * ROUTE_STRIDE; route_clear += THREADS) {
             own_routes[route_clear] = (unsigned int)0;
         }
-        __syncthreads();
+    }
+    __threadfence();
+    cooperative_groups::this_grid().sync();
+    if (bid % OWNER_STRIDE == 0 && owner_index < OWNER_CTAS) {
+        int total_pairs = M * TOP_K;
+        int bitmap_words = M + 31 >> 5;
         #pragma unroll 1
         for (int gather_base = 0; gather_base < total_pairs; gather_base += GATHER_PASS_PAIRS) {
             int gathered[GATHER_LOADS];
@@ -609,18 +610,16 @@ kernel_cake_kimi_k3_fused_router_8f78b29ddd63e7f497f7(float* __restrict__ logits
         int own_padded = own_count + BLOCK_MASK & ~BLOCK_MASK;
         int own_bitmap_base = warp * BITMAP_STRIDE;
         int own_route_base = warp * ROUTE_STRIDE;
-        unsigned int lane_bit = (unsigned int)1 << (unsigned int)lane;
-        unsigned int lower_bits = lane_bit - (unsigned int)1;
         int emitted = 0;
         if (own_count > 0) {
             #pragma unroll
             for (int word_pass = 0; word_pass < WORD_PASSES; word_pass++) {
                 int pass_word = word_pass * 32 + lane;
-                int pass_bits = 0;
+                unsigned int pass_bits = 0;
                 if (pass_word < bitmap_words) {
-                    pass_bits = (int)own_bitmap[own_bitmap_base + pass_word];
+                    pass_bits = own_bitmap[own_bitmap_base + pass_word];
                 }
-                int _popc_0 = __popc((unsigned int)pass_bits);
+                int _popc_0 = __popc(pass_bits);
                 int pass_count = _popc_0;
                 int pass_inclusive = pass_count;
                 int _shfl_up_20 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 1, 32);
@@ -648,28 +647,19 @@ kernel_cake_kimi_k3_fused_router_8f78b29ddd63e7f497f7(float* __restrict__ logits
                 if (lane >= 16) {
                     pass_inclusive += pass_peer_3;
                 }
-                int pass_exclusive = pass_inclusive - pass_count;
-                int pass_words = bitmap_words - word_pass * 32;
-                if (pass_words > 32) {
-                    pass_words = 32;
-                }
+                int lane_rank = own_base + emitted + pass_inclusive - pass_count;
                 #pragma unroll 1
-                for (int output_word = 0; output_word < pass_words; output_word++) {
-                    int _shfl_3 = __shfl_sync(0xFFFFFFFF, pass_bits, output_word);
-                    unsigned int word_bits = (unsigned int)_shfl_3;
-                    int _shfl_4 = __shfl_sync(0xFFFFFFFF, pass_exclusive, output_word);
-                    int word_base = own_base + emitted + _shfl_4;
-                    if ((word_bits & lane_bit) != 0) {
-                        int output_token = (word_pass * 32 + output_word << 5) + lane;
-                        int _popc_1 = __popc(word_bits & lower_bits);
-                        int output_rank = word_base + _popc_1;
-                        unsigned int route_word = own_routes[own_route_base + (output_token >> 3)];
-                        unsigned int output_route = route_word >> (unsigned int)((output_token & 7) * 4) & (unsigned int)15;
-                        sorted_token_ids[output_rank] = output_token * TOP_K + (int)output_route;
-                    }
+                for (int emit_bit = 0; emit_bit < pass_count; emit_bit++) {
+                    int _ffs_0 = __ffs(pass_bits);
+                    int emit_offset = _ffs_0 - 1;
+                    int emit_token = (pass_word << 5) + emit_offset;
+                    unsigned int route_word = own_routes[own_route_base + (emit_token >> 3)];
+                    unsigned int emit_route = route_word >> (unsigned int)((emit_token & 7) * 4) & (unsigned int)15;
+                    sorted_token_ids[lane_rank + emit_bit] = emit_token * TOP_K + (int)emit_route;
+                    pass_bits = pass_bits & pass_bits - (unsigned int)1;
                 }
-                int _shfl_5 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
-                emitted += _shfl_5;
+                int _shfl_3 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
+                emitted += _shfl_3;
             }
         }
         #pragma unroll 1

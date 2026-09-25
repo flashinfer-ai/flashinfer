@@ -94,7 +94,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_STREAM_RING_STRIDE 28672
 #define SMEM_TOTAL 49408
 #define THREADS 224
-#define BLOCK_M 8
+#define BLOCK_M 16
 #define NUM_EXPERTS 896
 #define TOP_K 16
 #define ITEMS_PER_THREAD 4
@@ -170,8 +170,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224, 3) __cluster_dims__(4,1,1) void
-kernel_cake_kimi_k3_fused_router_d50e4db45a2c9bcff982(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+__global__ __launch_bounds__(224, 4) __cluster_dims__(4,1,1) void
+kernel_cake_kimi_k3_fused_router_105e3452054c9384311c(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -519,12 +519,8 @@ kernel_cake_kimi_k3_fused_router_d50e4db45a2c9bcff982(float* __restrict__ logits
         }
         __syncthreads();
     }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
     int own_expert_base = bid * NUM_WARPS;
     if (bid < OWNER_CTAS) {
-        int total_pairs = M * TOP_K;
-        int bitmap_words = M + 31 >> 5;
         #pragma unroll 1
         for (int count_clear = tid; count_clear < NUM_EXPERTS; count_clear += THREADS) {
             plan_counts[count_clear] = 0;
@@ -539,6 +535,12 @@ kernel_cake_kimi_k3_fused_router_d50e4db45a2c9bcff982(float* __restrict__ logits
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    }
+    __threadfence();
+    cooperative_groups::this_grid().sync();
+    if (bid < OWNER_CTAS) {
+        int total_pairs = M * TOP_K;
+        int bitmap_words = M + 31 >> 5;
         int slice_pairs = (total_pairs + CLUSTER - 1) / CLUSTER + 3 & -4;
         int slice_begin = cta_rank * slice_pairs;
         int slice_end = slice_begin + slice_pairs;
@@ -620,6 +622,14 @@ kernel_cake_kimi_k3_fused_router_d50e4db45a2c9bcff982(float* __restrict__ logits
                 : "=r"(_mapa_2) : "r"(plan_counts_addr), "r"(count_peer_map));
             peer_counts_base[count_peer_map] = _mapa_2;
         }
+        int expert_vec_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
+        unsigned int peer_count_words[16];
+        #pragma unroll
+        for (int count_peer_vec = 0; count_peer_vec < CLUSTER; count_peer_vec++) {
+            asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[count_peer_vec * ITEMS_PER_THREAD])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 3]))
+                : "r"(peer_counts_base[count_peer_vec] + (unsigned int)(expert_vec_base * 4)));
+        }
         int expert_scan_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
         int lane_prefixes[ITEMS_PER_THREAD];
         int lane_total = 0;
@@ -629,11 +639,7 @@ kernel_cake_kimi_k3_fused_router_d50e4db45a2c9bcff982(float* __restrict__ logits
             int count_scan = 0;
             #pragma unroll
             for (int count_peer = 0; count_peer < CLUSTER; count_peer++) {
-                int _cluster_ld_0;
-                asm volatile(
-                    "ld.shared::cluster.s32 %0, [%1];"
-                    : "=r"(_cluster_ld_0) : "r"(peer_counts_base[count_peer] + (unsigned int)(expert_scan * 4)) : "memory");
-                count_scan += _cluster_ld_0;
+                count_scan += (int)peer_count_words[count_peer * ITEMS_PER_THREAD + expert_slot_scan];
             }
             plan_totals[expert_scan] = count_scan;
             if (bid == 0) {

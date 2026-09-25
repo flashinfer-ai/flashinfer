@@ -77,9 +77,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PLAN_COUNTS_OFF 0
 #define SMEM_PLAN_COUNTS_STAGE_BYTES 3584
 #define SMEM_PLAN_COUNTS_STRIDE 3584
-#define SMEM_PLAN_TOTALS_OFF 45824
-#define SMEM_PLAN_TOTALS_STAGE_BYTES 3584
-#define SMEM_PLAN_TOTALS_STRIDE 3584
 #define SMEM_PLAN_OFFSETS_OFF 3584
 #define SMEM_PLAN_OFFSETS_STAGE_BYTES 3584
 #define SMEM_PLAN_OFFSETS_STRIDE 3584
@@ -89,12 +86,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_OWN_ROUTES_OFF 9984
 #define SMEM_OWN_ROUTES_STAGE_BYTES 7168
 #define SMEM_OWN_ROUTES_STRIDE 7168
-#define SMEM_STREAM_RING_OFF 17152
-#define SMEM_STREAM_RING_STAGE_BYTES 28672
-#define SMEM_STREAM_RING_STRIDE 28672
-#define SMEM_TOTAL 49408
+#define SMEM_TOTAL 17152
 #define THREADS 224
-#define BLOCK_M 16
+#define BLOCK_M 8
 #define NUM_EXPERTS 896
 #define TOP_K 16
 #define ITEMS_PER_THREAD 4
@@ -104,16 +98,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define RADIX_BINS_PER_LANE 8
 #define MAX_BLOCK_M 16
 #define OWNER_CTAS 128
-#define CLUSTER 4
-#define CLUSTER_EXPERTS 28
 #define GATHER_LOADS 16
 #define GATHER_PASS_PAIRS 3584
+#define OWNER_STRIDE 1
 #define BITMAP_STRIDE 64
 #define ROUTE_STRIDE 256
 #define WORD_PASSES 2
-#define STAGE_PAIRS 3584
-#define STAGE_BYTES 14336
-#define COPIES_PER_THREAD 4
 #define BLOCK_MASK (BLOCK_M - 1)
 #define BLOCK_SHIFT (3 + (BLOCK_M >> 4))
 
@@ -134,25 +124,6 @@ __device__ __forceinline__ uint32_t elect_sync() {
 }
 
 
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
-}
-
-
 __device__ __forceinline__ unsigned int __as_u32(float v) {
     unsigned int u;
     asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
@@ -170,8 +141,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224, 3) __cluster_dims__(4,1,1) void
-kernel_cake_kimi_k3_fused_router_7364ddef9d8205ca2386(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+__global__ __launch_bounds__(224, 3) void
+kernel_cake_kimi_k3_fused_router_5ea8397393c26c013b6c(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -179,17 +150,10 @@ kernel_cake_kimi_k3_fused_router_7364ddef9d8205ca2386(float* __restrict__ logits
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 4;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 4;
-    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
-
-    int cta_rank;
-    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
     int* histogram = reinterpret_cast<int*>(smem_raw + 0);
@@ -208,16 +172,12 @@ kernel_cake_kimi_k3_fused_router_7364ddef9d8205ca2386(float* __restrict__ logits
     const int phase2_warp_sums_addr = smem + 7168;
     int* plan_counts = reinterpret_cast<int*>(smem_raw + 0);
     const int plan_counts_addr = smem + 0;
-    int* plan_totals = reinterpret_cast<int*>(smem_raw + 45824);
-    const int plan_totals_addr = smem + 45824;
     int* plan_offsets = reinterpret_cast<int*>(smem_raw + 3584);
     const int plan_offsets_addr = smem + 3584;
     unsigned int* own_bitmap = reinterpret_cast<unsigned int*>(smem_raw + 8192);
     const int own_bitmap_addr = smem + 8192;
     unsigned int* own_routes = reinterpret_cast<unsigned int*>(smem_raw + 9984);
     const int own_routes_addr = smem + 9984;
-    int* stream_ring = reinterpret_cast<int*>(smem_raw + 17152);
-    const int stream_ring_addr = smem + 17152;
 
     // === Task calls (dependency order) ===
     int global_thread = bid * THREADS + tid;
@@ -520,12 +480,9 @@ kernel_cake_kimi_k3_fused_router_7364ddef9d8205ca2386(float* __restrict__ logits
         }
         __syncthreads();
     }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
-    int own_expert_base = bid * NUM_WARPS;
-    if (bid < OWNER_CTAS) {
-        int total_pairs = M * TOP_K;
-        int bitmap_words = M + 31 >> 5;
+    int owner_index = bid / OWNER_STRIDE;
+    int own_expert_base = owner_index * NUM_WARPS;
+    if (bid % OWNER_STRIDE == 0 && owner_index < OWNER_CTAS) {
         #pragma unroll 1
         for (int count_clear = tid; count_clear < NUM_EXPERTS; count_clear += THREADS) {
             plan_counts[count_clear] = 0;
@@ -538,105 +495,47 @@ kernel_cake_kimi_k3_fused_router_7364ddef9d8205ca2386(float* __restrict__ logits
         for (int route_clear = tid; route_clear < NUM_WARPS * ROUTE_STRIDE; route_clear += THREADS) {
             own_routes[route_clear] = (unsigned int)0;
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        int slice_pairs = (total_pairs + CLUSTER - 1) / CLUSTER + 3 & -4;
-        int slice_begin = cta_rank * slice_pairs;
-        int slice_end = slice_begin + slice_pairs;
-        if (slice_end > total_pairs) {
-            slice_end = total_pairs;
-        }
-        int cluster_expert_base = (bid - cta_rank) * NUM_WARPS;
-        #pragma unroll
-        for (int prologue_copy = 0; prologue_copy < COPIES_PER_THREAD; prologue_copy++) {
-            int prologue_chunk = prologue_copy * THREADS + tid;
-            int prologue_pair = slice_begin + prologue_chunk * 4;
-            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                :: "r"(stream_ring_addr + (unsigned int)(prologue_chunk * 16)), "l"(topk_ids + prologue_pair), "r"((prologue_pair < slice_end) ? 16 : 0));
-        }
-        asm volatile("cp.async.commit_group;");
-        int stream_stage = 0;
+    }
+    __threadfence();
+    cooperative_groups::this_grid().sync();
+    if (bid % OWNER_STRIDE == 0 && owner_index < OWNER_CTAS) {
+        int total_pairs = M * TOP_K;
+        int bitmap_words = M + 31 >> 5;
         #pragma unroll 1
-        for (int gather_base = slice_begin; gather_base < slice_end; gather_base += STAGE_PAIRS) {
-            int next_base = gather_base + STAGE_PAIRS;
-            if (next_base < slice_end) {
-                int next_stage_bytes = (1 - stream_stage) * STAGE_BYTES;
-                #pragma unroll
-                for (int next_copy = 0; next_copy < COPIES_PER_THREAD; next_copy++) {
-                    int next_chunk = next_copy * THREADS + tid;
-                    int next_pair = next_base + next_chunk * 4;
-                    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                        :: "r"(stream_ring_addr + (unsigned int)(next_stage_bytes + next_chunk * 16)), "l"(topk_ids + next_pair), "r"((next_pair < slice_end) ? 16 : 0));
+        for (int gather_base = 0; gather_base < total_pairs; gather_base += GATHER_PASS_PAIRS) {
+            int gathered[GATHER_LOADS];
+            #pragma unroll
+            for (int gather_slot = 0; gather_slot < GATHER_LOADS; gather_slot++) {
+                gathered[gather_slot] = -1;
+                int gather_pair = gather_base + gather_slot * THREADS + tid;
+                if (gather_pair < total_pairs) {
+                    gathered[gather_slot] = topk_ids[gather_pair];
                 }
-                asm volatile("cp.async.commit_group;");
-                asm volatile("cp.async.wait_group 1;");
-            } else {
-                asm volatile("cp.async.wait_group 0;");
             }
-            __syncthreads();
-            int stage_base = stream_stage * STAGE_PAIRS;
             #pragma unroll
             for (int store_slot = 0; store_slot < GATHER_LOADS; store_slot++) {
-                int stage_slot = store_slot * THREADS + tid;
-                int store_pair = gather_base + stage_slot;
-                if (store_pair < slice_end) {
-                    int store_id = stream_ring[stage_base + stage_slot];
+                int store_id = gathered[store_slot];
+                if (store_id >= 0) {
                     atomicAdd(&plan_counts[store_id], 1);
-                    int cluster_slot = store_id - cluster_expert_base;
-                    if (cluster_slot >= 0 && cluster_slot < CLUSTER_EXPERTS) {
-                        int hit_peer = cluster_slot / NUM_WARPS;
-                        int own_slot = cluster_slot - hit_peer * NUM_WARPS;
+                    int own_slot = store_id - own_expert_base;
+                    if (own_slot >= 0 && own_slot < NUM_WARPS) {
+                        int store_pair = gather_base + store_slot * THREADS + tid;
                         int store_token = store_pair >> 4;
                         int store_route = store_pair & 15;
-                        uint32_t _mapa_0;
-                        asm volatile(
-                            "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(_mapa_0) : "r"(own_bitmap_addr), "r"(hit_peer));
-                        unsigned int peer_bitmap = _mapa_0;
-                        asm volatile(
-                            "red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;"
-                            :: "r"(peer_bitmap + (unsigned int)((own_slot * BITMAP_STRIDE + (store_token >> 5)) * 4)), "r"((unsigned int)1 << (unsigned int)(store_token & 31)) : "memory");
-                        uint32_t _mapa_1;
-                        asm volatile(
-                            "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(_mapa_1) : "r"(own_routes_addr), "r"(hit_peer));
-                        unsigned int peer_routes = _mapa_1;
-                        asm volatile(
-                            "red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;"
-                            :: "r"(peer_routes + (unsigned int)((own_slot * ROUTE_STRIDE + (store_token >> 3)) * 4)), "r"((unsigned int)store_route << (unsigned int)((store_token & 7) * 4)) : "memory");
+                        atomicAdd(&own_bitmap[own_slot * BITMAP_STRIDE + (store_token >> 5)], (unsigned int)1 << (unsigned int)(store_token & 31));
+                        atomicAdd(&own_routes[own_slot * ROUTE_STRIDE + (store_token >> 3)], (unsigned int)store_route << (unsigned int)((store_token & 7) * 4));
                     }
                 }
             }
-            __syncthreads();
-            stream_stage = 1 - stream_stage;
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        unsigned int peer_counts_base[CLUSTER];
-        #pragma unroll
-        for (int count_peer_map = 0; count_peer_map < CLUSTER; count_peer_map++) {
-            uint32_t _mapa_2;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_2) : "r"(plan_counts_addr), "r"(count_peer_map));
-            peer_counts_base[count_peer_map] = _mapa_2;
-        }
+        __syncthreads();
         int expert_scan_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
         int lane_prefixes[ITEMS_PER_THREAD];
         int lane_total = 0;
         #pragma unroll
         for (int expert_slot_scan = 0; expert_slot_scan < ITEMS_PER_THREAD; expert_slot_scan++) {
             int expert_scan = expert_scan_base + expert_slot_scan;
-            int count_scan = 0;
-            #pragma unroll
-            for (int count_peer = 0; count_peer < CLUSTER; count_peer++) {
-                int _cluster_ld_0;
-                asm volatile(
-                    "ld.shared::cluster.s32 %0, [%1];"
-                    : "=r"(_cluster_ld_0) : "r"(peer_counts_base[count_peer] + (unsigned int)(expert_scan * 4)) : "memory");
-                count_scan += _cluster_ld_0;
-            }
-            plan_totals[expert_scan] = count_scan;
+            int count_scan = plan_counts[expert_scan];
             if (bid == 0) {
                 expert_counts[expert_scan] = count_scan;
                 expert_scatter_offsets[expert_scan] = count_scan;
@@ -703,10 +602,9 @@ kernel_cake_kimi_k3_fused_router_7364ddef9d8205ca2386(float* __restrict__ logits
                 num_tokens_post_padded[0] = padded_total;
             }
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        __syncthreads();
         int own_expert = own_expert_base + warp;
-        int own_count = plan_totals[own_expert];
+        int own_count = plan_counts[own_expert];
         int own_base = plan_offsets[own_expert];
         int own_padded = own_count + BLOCK_MASK & ~BLOCK_MASK;
         int own_bitmap_base = warp * BITMAP_STRIDE;
