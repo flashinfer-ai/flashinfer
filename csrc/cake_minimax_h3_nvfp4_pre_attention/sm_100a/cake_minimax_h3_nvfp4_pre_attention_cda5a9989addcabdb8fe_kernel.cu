@@ -52,10 +52,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 400
+#define TMEM_NCOLS 304
 #define TMEM_ACCUM_OFFSET 0
 #define TMEM_TMEM_SFA_OFFSET 256
-#define TMEM_TMEM_SFB_OFFSET 304
+#define TMEM_TMEM_SFB_OFFSET 272
 #define NUM_TMA_PIPE_STAGES 5
 #define NUM_MAINLOOP_PIPE_STAGES 1
 #define NUM_WORK_PIPE_STAGES 4
@@ -101,60 +101,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WORK_RESPONSE_OFF 228352
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_SMEM_V14_OFF 1024
-#define SMEM_SMEM_V14_STAGE_BYTES 6144
-#define SMEM_SMEM_V14_STRIDE 38912
-#define SMEM_SMEM_V15_OFF 1072
-#define SMEM_SMEM_V15_STAGE_BYTES 6144
-#define SMEM_SMEM_V15_STRIDE 38912
-#define SMEM_SMEM_V16_OFF 1120
-#define SMEM_SMEM_V16_STAGE_BYTES 6144
-#define SMEM_SMEM_V16_STRIDE 38912
-#define SMEM_SMEM_V17_OFF 1040
-#define SMEM_SMEM_V17_STAGE_BYTES 6144
-#define SMEM_SMEM_V17_STRIDE 38912
-#define SMEM_SMEM_V18_OFF 1088
-#define SMEM_SMEM_V18_STAGE_BYTES 6144
-#define SMEM_SMEM_V18_STRIDE 38912
-#define SMEM_SMEM_V19_OFF 1136
-#define SMEM_SMEM_V19_STAGE_BYTES 6144
-#define SMEM_SMEM_V19_STRIDE 38912
-#define SMEM_SMEM_V20_OFF 1056
-#define SMEM_SMEM_V20_STAGE_BYTES 6144
-#define SMEM_SMEM_V20_STRIDE 38912
-#define SMEM_SMEM_V21_OFF 1104
-#define SMEM_SMEM_V21_STAGE_BYTES 6144
-#define SMEM_SMEM_V21_STRIDE 38912
-#define SMEM_SMEM_V22_OFF 1024
-#define SMEM_SMEM_V22_STAGE_BYTES 6144
-#define SMEM_SMEM_V22_STRIDE 38912
-#define SMEM_SMEM_V23_OFF 17408
-#define SMEM_SMEM_V23_STAGE_BYTES 6144
-#define SMEM_SMEM_V23_STRIDE 38912
-#define SMEM_SMEM_V24_OFF 17456
-#define SMEM_SMEM_V24_STAGE_BYTES 6144
-#define SMEM_SMEM_V24_STRIDE 38912
-#define SMEM_SMEM_V25_OFF 17504
-#define SMEM_SMEM_V25_STAGE_BYTES 6144
-#define SMEM_SMEM_V25_STRIDE 38912
-#define SMEM_SMEM_V26_OFF 17424
-#define SMEM_SMEM_V26_STAGE_BYTES 6144
-#define SMEM_SMEM_V26_STRIDE 38912
-#define SMEM_SMEM_V27_OFF 17472
-#define SMEM_SMEM_V27_STAGE_BYTES 6144
-#define SMEM_SMEM_V27_STRIDE 38912
-#define SMEM_SMEM_V28_OFF 17520
-#define SMEM_SMEM_V28_STAGE_BYTES 6144
-#define SMEM_SMEM_V28_STRIDE 38912
-#define SMEM_SMEM_V29_OFF 17440
-#define SMEM_SMEM_V29_STAGE_BYTES 6144
-#define SMEM_SMEM_V29_STRIDE 38912
-#define SMEM_SMEM_V30_OFF 17488
-#define SMEM_SMEM_V30_STAGE_BYTES 6144
-#define SMEM_SMEM_V30_STRIDE 38912
-#define SMEM_SMEM_V31_OFF 17408
-#define SMEM_SMEM_V31_STAGE_BYTES 6144
-#define SMEM_SMEM_V31_STRIDE 38912
 #define SMEM_TOTAL 228480
 #define BLOCK_M 128
 #define BLOCK_N 256
@@ -391,22 +337,6 @@ __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2(
 }
 
 
-__device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(
-    int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
-    int sfa_taddr, int sfb_taddr, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block16"
-        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
-           "r"(enable_input_d));
-}
-
-
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4ULL;
 }
@@ -634,7 +564,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_nvfp4_pre_attention_21545cf935aa585ef34a(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -642,7 +572,8 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_21545cf935aa585ef34a(CakeTensorMap co
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -699,42 +630,6 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_21545cf935aa585ef34a(CakeTensorMap co
     const int epi_staging_addr = smem + 195584;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 228352);
     const int work_response_addr = smem + 228352;
-    uint8_t* smem_v14 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_v14_addr = smem + 1024;
-    uint8_t* smem_v15 = reinterpret_cast<uint8_t*>(smem_raw + 1072);
-    const int smem_v15_addr = smem + 1072;
-    uint8_t* smem_v16 = reinterpret_cast<uint8_t*>(smem_raw + 1120);
-    const int smem_v16_addr = smem + 1120;
-    uint8_t* smem_v17 = reinterpret_cast<uint8_t*>(smem_raw + 1040);
-    const int smem_v17_addr = smem + 1040;
-    uint8_t* smem_v18 = reinterpret_cast<uint8_t*>(smem_raw + 1088);
-    const int smem_v18_addr = smem + 1088;
-    uint8_t* smem_v19 = reinterpret_cast<uint8_t*>(smem_raw + 1136);
-    const int smem_v19_addr = smem + 1136;
-    uint8_t* smem_v20 = reinterpret_cast<uint8_t*>(smem_raw + 1056);
-    const int smem_v20_addr = smem + 1056;
-    uint8_t* smem_v21 = reinterpret_cast<uint8_t*>(smem_raw + 1104);
-    const int smem_v21_addr = smem + 1104;
-    uint8_t* smem_v22 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int smem_v22_addr = smem + 1024;
-    uint8_t* smem_v23 = reinterpret_cast<uint8_t*>(smem_raw + 17408);
-    const int smem_v23_addr = smem + 17408;
-    uint8_t* smem_v24 = reinterpret_cast<uint8_t*>(smem_raw + 17456);
-    const int smem_v24_addr = smem + 17456;
-    uint8_t* smem_v25 = reinterpret_cast<uint8_t*>(smem_raw + 17504);
-    const int smem_v25_addr = smem + 17504;
-    uint8_t* smem_v26 = reinterpret_cast<uint8_t*>(smem_raw + 17424);
-    const int smem_v26_addr = smem + 17424;
-    uint8_t* smem_v27 = reinterpret_cast<uint8_t*>(smem_raw + 17472);
-    const int smem_v27_addr = smem + 17472;
-    uint8_t* smem_v28 = reinterpret_cast<uint8_t*>(smem_raw + 17520);
-    const int smem_v28_addr = smem + 17520;
-    uint8_t* smem_v29 = reinterpret_cast<uint8_t*>(smem_raw + 17440);
-    const int smem_v29_addr = smem + 17440;
-    uint8_t* smem_v30 = reinterpret_cast<uint8_t*>(smem_raw + 17488);
-    const int smem_v30_addr = smem + 17488;
-    uint8_t* smem_v31 = reinterpret_cast<uint8_t*>(smem_raw + 17408);
-    const int smem_v31_addr = smem + 17408;
 
     // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 20 barriers)
     // Mbarriers at smem_raw[0..160)
@@ -780,7 +675,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_21545cf935aa585ef34a(CakeTensorMap co
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // TMEM alloc (512 columns, 400 used)
+    // TMEM alloc (512 columns, 304 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 160);
     if (warp == 0) {
         int _tmem_hold = smem + 160;
@@ -799,7 +694,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_21545cf935aa585ef34a(CakeTensorMap co
     // Kernel post-init ops
     const int tmem_accum = taddr;
     const int tmem_tmem_sfa = taddr + 256;
-    const int tmem_tmem_sfb = taddr + 304;
+    const int tmem_tmem_sfb = taddr + 272;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -920,180 +815,61 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_21545cf935aa585ef34a(CakeTensorMap co
                 for (unsigned int _tile_iter_1 = 0; _tile_iter_1 < num_cluster_tiles; _tile_iter_1++) {
                     mbarrier_wait(epilogue_done_addr + (acc_stage) * 8, _phase_epilogue_done);
                     #pragma unroll 1
-                    for (int super_k = 0; super_k < 7; super_k++) {
+                    for (int iter_k_1 = 0; iter_k_1 < NUM_K_ITERS; iter_k_1++) {
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        unsigned int stage_p0 = mma_tma_stage;
-                        int init_flag = ((super_k == 0) ? 1 : 0);
+                        int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                         if (elect_sync()) {
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_v4_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_v5_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 8, make_sf_cp_desc_lo_sbo128((((smem_v6_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 16, make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 16 + 4), make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 12, make_sf_cp_desc_lo_sbo128((((smem_v7_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 24, make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (mma_tma_stage) * 2432)));
+                            tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 24 + 4), make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (mma_tma_stage) * 2432 + 32)));
+                            int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
                             {
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa, make_sf_cp_desc_lo_sbo128((((smem_v4_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb, make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (stage_p0) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 4, make_sf_cp_desc_lo_sbo128((((smem_v5_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 8, make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 8 + 4), make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (stage_p0) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 8, make_sf_cp_desc_lo_sbo128((((smem_v6_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 16, make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 16 + 4), make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (stage_p0) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 12, make_sf_cp_desc_lo_sbo128((((smem_v7_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 24, make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (stage_p0) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 24 + 4), make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (stage_p0) * 2432 + 32)));
-                            }
-                            {
-                                int _mma_a_lo_0 = (((smem_v14_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_b_lo_0 = (((smem_v23_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_a_next_lo_0 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_b_next_lo_0 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0 | ((uint64_t)((uint32_t)_mma_a_next_lo_0 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0 | ((uint64_t)((uint32_t)_mma_b_next_lo_0 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
 
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0x90400480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
-                                }
+                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
+                                    0x10400480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
                             }
+                            int _mma_a_lo_1 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                            int _mma_b_lo_1 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
                             {
-                                int _mma_a_lo_1 = (((smem_v15_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_b_lo_1 = (((smem_v24_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_a_next_lo_1 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_b_next_lo_1 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_1 | ((uint64_t)((uint32_t)_mma_a_next_lo_1 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1 | ((uint64_t)((uint32_t)_mma_b_next_lo_1 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
 
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0xd04004a0U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 8 + 0, 1);
-                                }
+                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
+                                    0x10400480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 8 + 0, 1);
+                            }
+                            int _mma_a_lo_2 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                            int _mma_b_lo_2 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                            {
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_2) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_2) | ((uint64_t)0x40004040 << 32);
+
+                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
+                                    0x10400480U, tmem_tmem_sfa + 8 + 0, tmem_tmem_sfb + 16 + 0, 1);
+                            }
+                            int _mma_a_lo_3 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                            int _mma_b_lo_3 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (mma_tma_stage) * 2432;
+                            {
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_3) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_3) | ((uint64_t)0x40004040 << 32);
+
+                                tcgen05_mma_mxf4nvf4_bs_cta2(tmem_accum, a_desc + 0, b_desc + 0,
+                                    0x10400480U, tmem_tmem_sfa + 12 + 0, tmem_tmem_sfb + 24 + 0, 1);
                             }
                         }
-                        mma_tma_stage += 1;
-                        if (mma_tma_stage == 5) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
-                        mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        unsigned int stage_p1 = mma_tma_stage;
-                        if (elect_sync()) {
-                            {
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 16, make_sf_cp_desc_lo_sbo128((((smem_v4_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 32, make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 32 + 4), make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (stage_p1) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 20, make_sf_cp_desc_lo_sbo128((((smem_v5_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 40, make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 40 + 4), make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (stage_p1) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 24, make_sf_cp_desc_lo_sbo128((((smem_v6_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 48, make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 48 + 4), make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (stage_p1) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 28, make_sf_cp_desc_lo_sbo128((((smem_v7_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 56, make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (stage_p1) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 56 + 4), make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (stage_p1) * 2432 + 32)));
-                            }
-                            {
-                                int _mma_a_lo_2 = (((smem_v16_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_b_lo_2 = (((smem_v25_addr) >> 4) & 0x3FFF) + (stage_p0) * 2432;
-                                int _mma_a_next_lo_2 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_b_next_lo_2 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_2 | ((uint64_t)((uint32_t)_mma_a_next_lo_2 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_2 | ((uint64_t)((uint32_t)_mma_b_next_lo_2 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0x90400480U, tmem_tmem_sfa + 12 + 0, tmem_tmem_sfb + 24 + 0, 1);
-                                }
-                            }
-                        }
-                        elect_commit_cg2_multicast(mma_done_addr + (stage_p0) * 8, (uint16_t)(3));
-                        if (elect_sync()) {
-                            {
-                                int _mma_a_lo_3 = (((smem_v17_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_b_lo_3 = (((smem_v26_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_a_next_lo_3 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_b_next_lo_3 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_3 | ((uint64_t)((uint32_t)_mma_a_next_lo_3 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_3 | ((uint64_t)((uint32_t)_mma_b_next_lo_3 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0xd04004a0U, tmem_tmem_sfa + 16 + 0, tmem_tmem_sfb + 32 + 0, 1);
-                                }
-                            }
-                            {
-                                int _mma_a_lo_4 = (((smem_v18_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_b_lo_4 = (((smem_v27_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_a_next_lo_4 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_b_next_lo_4 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_4 | ((uint64_t)((uint32_t)_mma_a_next_lo_4 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_4 | ((uint64_t)((uint32_t)_mma_b_next_lo_4 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0x90400480U, tmem_tmem_sfa + 24 + 0, tmem_tmem_sfb + 48 + 0, 1);
-                                }
-                            }
-                        }
-                        mma_tma_stage += 1;
-                        if (mma_tma_stage == 5) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
-                        mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        unsigned int stage_p2 = mma_tma_stage;
-                        if (elect_sync()) {
-                            {
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 32, make_sf_cp_desc_lo_sbo128((((smem_v4_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 64, make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 64 + 4), make_sf_cp_desc_lo_sbo128((((smem_v8_addr) >> 4) + (stage_p2) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 36, make_sf_cp_desc_lo_sbo128((((smem_v5_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 72, make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 72 + 4), make_sf_cp_desc_lo_sbo128((((smem_v9_addr) >> 4) + (stage_p2) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 40, make_sf_cp_desc_lo_sbo128((((smem_v6_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 80, make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 80 + 4), make_sf_cp_desc_lo_sbo128((((smem_v10_addr) >> 4) + (stage_p2) * 2432 + 32)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfa + 44, make_sf_cp_desc_lo_sbo128((((smem_v7_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2(tmem_tmem_sfb + 88, make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (stage_p2) * 2432)));
-                                tcgen05_cp_32x128b_warpx4_cta2((tmem_tmem_sfb + 88 + 4), make_sf_cp_desc_lo_sbo128((((smem_v11_addr) >> 4) + (stage_p2) * 2432 + 32)));
-                            }
-                            {
-                                int _mma_a_lo_5 = (((smem_v19_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_b_lo_5 = (((smem_v28_addr) >> 4) & 0x3FFF) + (stage_p1) * 2432;
-                                int _mma_a_next_lo_5 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_b_next_lo_5 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_5 | ((uint64_t)((uint32_t)_mma_a_next_lo_5 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_5 | ((uint64_t)((uint32_t)_mma_b_next_lo_5 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0xd04004a0U, tmem_tmem_sfa + 28 + 0, tmem_tmem_sfb + 56 + 0, 1);
-                                }
-                            }
-                        }
-                        elect_commit_cg2_multicast(mma_done_addr + (stage_p1) * 8, (uint16_t)(3));
-                        if (elect_sync()) {
-                            {
-                                int _mma_a_lo_6 = (((smem_v20_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_b_lo_6 = (((smem_v29_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_a_next_lo_6 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_b_next_lo_6 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_6 | ((uint64_t)((uint32_t)_mma_a_next_lo_6 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_6 | ((uint64_t)((uint32_t)_mma_b_next_lo_6 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0x90400480U, tmem_tmem_sfa + 36 + 0, tmem_tmem_sfb + 72 + 0, 1);
-                                }
-                            }
-                            {
-                                int _mma_a_lo_7 = (((smem_v21_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_b_lo_7 = (((smem_v30_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_a_next_lo_7 = (((smem_v22_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                int _mma_b_next_lo_7 = (((smem_v31_addr) >> 4) & 0x3FFF) + (stage_p2) * 2432;
-                                {
-                                    uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_7 | ((uint64_t)((uint32_t)_mma_a_next_lo_7 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-                                    uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_7 | ((uint64_t)((uint32_t)_mma_b_next_lo_7 & ~7u) << 16)) | ((uint64_t)0x40104040 << 32);
-
-                                    tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(tmem_accum, a_desc + 0, b_desc + 0,
-                                        0xd04004a0U, tmem_tmem_sfa + 40 + 0, tmem_tmem_sfb + 80 + 0, 1);
-                                }
-                            }
-                        }
-                        elect_commit_cg2_multicast(mma_done_addr + (stage_p2) * 8, (uint16_t)(3));
+                        elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                         mma_tma_stage += 1;
                         if (mma_tma_stage == 5) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
