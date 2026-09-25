@@ -2714,24 +2714,22 @@ __device__ inline void finalizeAndWriteOut_sync(
     constexpr uint32_t grpSize = exactDiv(srcHeadBytes, grainBytes);
     constexpr uint32_t nbGrps = exactDiv(warp_size, grpSize);
     uint32_t const idxGrp = lane / grpSize;
+    uint32_t const cGrain = lane % grpSize;
     constexpr uint32_t grainsPerAtom = exactDiv(sizeof(Atom), grainBytes);
+    uint32_t const cAtom = cGrain / grainsPerAtom;
     uint32_t const rowBase = gmma::instM * m + 16 * warpRank;
-    constexpr uint32_t totalNbGrains = grainsPerAtom * SwizzleBuf::cols * 16;
-    uint32_t const nbIters = divUp(totalNbGrains, nbGrps);
-    constexpr bool wholeIters = (totalNbGrains % nbGrps == 0);
+    // Each lane group copies one output row, with one 16-byte grain per lane.
+    constexpr uint32_t nbIters = divUp(16U, nbGrps);
+    constexpr bool wholeIters = (16 % nbGrps == 0);
     constexpr bool wholeHeads = (validElemsPerHead == headElems);
+    constexpr uint32_t grainsPerDstHead = exactDiv(sizeof(DstHead), grainBytes);
 #pragma unroll
     for (uint32_t iter = 0; iter < nbIters; iter++) {
-      uint32_t const idxGrain = nbGrps * iter + idxGrp;
-      constexpr uint32_t grainsPerSrcHead = exactDiv(srcHeadBytes, grainBytes);
-      uint32_t const r = idxGrain / grainsPerSrcHead;
+      uint32_t const r = nbGrps * iter + idxGrp;
       if (!wholeIters && r >= 16) {
         break;
       }
-      uint32_t const cGrain = idxGrain % grainsPerSrcHead;
-      uint32_t const cAtom = cGrain / grainsPerAtom;
-      constexpr uint32_t grainsPerDstHead = exactDiv(sizeof(DstHead), grainBytes);
-      uint32_t const glbRow = gmma::instM * m + 16 * warpRank + r;
+      uint32_t const glbRow = rowBase + r;
       if (ctaNbValidQHeads != ctaNbQHeads && glbRow >= ctaNbValidQHeads) {
         break;
       }
