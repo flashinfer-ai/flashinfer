@@ -285,13 +285,27 @@ BF16_AFFINE_SPLIT_MIN_CHUNKS = 128
 # sm_100a (B200, 148 SMs), 2026-09-25: composite 75 + 14.2 * chunks/window,
 # sequential 20 + 4.0 * chunks (unbounded softplus, FP32 rows); composite
 # 84 + 8.8 * chunks/window, sequential 16 + 1.75 * chunks (bounded gate).
-# Windows never go below 16 chunks (512 tokens): the fused-body specialization
+# Windows never go below 8 chunks (256 tokens): the fused-body specialization
 # flags flip at 128 / 256 / 512 tokens of launch max_seq_len (H12 early state
 # pack, scalar beta / generic register inverse, sm_103a prediction-first), and
-# only the >= 512-token slab variants are exported.  Shorter windows would
-# select unexported programs; the sequences they could speed up (<= 2048
-# tokens) lose at most ~0.1 ms on the sequential body.
-AFFINE_MIN_CHUNKS_PER_WINDOW = 16
+# the >= 256-token slab variants are exported (the 256..511-token class since
+# the v6 export; the < 256-token class is not).  Shorter windows would select
+# unexported programs.
+AFFINE_MIN_CHUNKS_PER_WINDOW = 8
+# Resident-window budget in CTA waves (windows x heads per wave = SM count).
+# One wave is the measured default; FLASHINFER_KDA_AFFINE_WINDOW_WAVES=2 is an
+# A/B knob for shapes whose passes are chain-latency bound.
+AFFINE_WINDOW_WAVES_ENV = "FLASHINFER_KDA_AFFINE_WINDOW_WAVES"
+
+
+def _affine_window_waves() -> int:
+    import os
+
+    try:
+        waves = int(os.environ.get(AFFINE_WINDOW_WAVES_ENV, "1"))
+    except ValueError:
+        waves = 1
+    return min(4, max(1, waves))
 AFFINE_BF16_COST_MODEL_US: dict[tuple[str, str], tuple[float, float, float, float]] = {
     # (gpu_arch, gate_kind): (composite_fixed, composite_per_window_chunk,
     #                          sequential_fixed, sequential_per_chunk)
@@ -393,11 +407,11 @@ def _affine_bf16_window_targets(
     """Most windows the BF16 composite can give each sequence.
 
     One wave of windows per head (``sm_count // num_heads``), at least
-    ``AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks per window: shorter windows only
+    ``AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks per window (256-token launches): shorter windows only
     add per-window preparation while the main/correction passes stay
     chain-bound.
     """
-    per_head = max(1, sm_count // num_heads)
+    per_head = max(1, sm_count // num_heads) * _affine_window_waves()
     return [
         min(per_head, max(1, chunks // AFFINE_MIN_CHUNKS_PER_WINDOW))
         for chunks in chunk_counts
@@ -437,7 +451,7 @@ def _affine_bf16_split_estimate_us(
         chunk_counts, num_heads=num_heads, sm_count=sm_count
     )
     counts = _affine_window_counts(
-        chunk_counts, targets, max(len(sequence_lengths), sm_count // num_heads)
+        chunk_counts, targets, max(len(sequence_lengths), sm_count // num_heads * _affine_window_waves())
     )
     if sum(counts) <= len(sequence_lengths):
         return None
@@ -523,7 +537,7 @@ def _affine_split_windows(
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
     ]
-    window_budget = max(len(sequence_lengths), sm_count // num_heads)
+    window_budget = max(len(sequence_lengths), sm_count // num_heads * _affine_window_waves())
     if not shared_tf32_factors and _affine_split_policy() == "model":
         # The cost model already decided the split; give every sequence the
         # most windows the budget allows so the longest window is shortest.
