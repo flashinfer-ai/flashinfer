@@ -22,7 +22,8 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     ARM_G_CTAS_PER_SM,
     ARM_L_MIN_GRID,
     ARM_LC_TOKENS,
-    ARM_Q_CLUSTER,
+    ARM_Q4S_CLUSTER,
+    ARM_Q4S_CTAS_PER_SM,
     BLOCK_M_VALUES,
     NUM_EXPERTS,
     OWNER_CTAS,
@@ -244,23 +245,17 @@ def test_route_tables_cover_the_routed_shapes():
     for arch, table in SHAPE_ROUTES.items():
         assert sorted(table) == sorted(ROUTED_SHAPES), arch
         assert len(table) == 28
-    assert {arm for arm in SHAPE_ROUTES["sm_100a"].values()} == {
-        "L",
-        "LC",
-        "M",
-        "M4S",
-        "Q",
-        "G",
-    }
-    assert {arm for arm in SHAPE_ROUTES["sm_103a"].values()} == {
-        "L",
-        "LC",
-        "M",
-        "Q",
-        "G",
-    }
-    assert route_arm("sm_100a", 512, 8) == "M4S"
-    assert route_arm("sm_103a", 512, 8) == "Q"
+    for arch in SHAPE_ROUTES:
+        assert {arm for arm in SHAPE_ROUTES[arch].values()} == {
+            "L",
+            "LC",
+            "M",
+            "Q4S",
+            "G",
+        }
+    assert SHAPE_ROUTES["sm_100a"] == SHAPE_ROUTES["sm_103a"]
+    assert route_arm("sm_100a", 512, 8) == "Q4S"
+    assert route_arm("sm_103a", 512, 8) == "Q4S"
     for arch in SHAPE_ROUTES:
         assert route_arm(arch, 1, 16) == "L"
         for rows in ARM_LC_TOKENS:
@@ -269,7 +264,8 @@ def test_route_tables_cover_the_routed_shapes():
         assert route_arm(arch, 16, 8) == "L"
         assert route_arm(arch, 128, 8) == "L"
         assert route_arm(arch, 256, 16) == "M"
-        assert route_arm(arch, 2048, 8) == "Q"
+        assert route_arm(arch, 2048, 8) == "Q4S"
+        assert route_arm(arch, 1024, 16) == "Q4S"
         assert route_arm(arch, 8192, 16) == "G"
     with pytest.raises(NotImplementedError, match="exactly num_tokens"):
         route_arm("sm_100a", 3, 8)
@@ -303,28 +299,26 @@ def test_launch_grid_rules(compute_capability, sm_count):
     g_ctas = ARM_G_CTAS_PER_SM[compute_capability] * sm_count
     assert launch_grid("G", 4096, **kw) == min(4096, g_ctas)
     assert launch_grid("G", 8192, **kw) == g_ctas
-    # Arm M4S: four CTAs per SM regardless of the architecture cap.
-    assert launch_grid("M4S", 512, **kw) == 512
-    assert launch_grid("M4S", 2048, **kw) == 4 * sm_count
-    # Arm Q: bounded by whole co-resident clusters, then rounded down to clusters.
-    assert launch_grid("Q", 1024, max_active_clusters=1000, **kw) == (cap // 4) * 4
-    assert launch_grid("Q", 1024, max_active_clusters=100, **kw) == 400
-    assert (
-        launch_grid("Q", 512, max_active_clusters=200, **kw) == (min(512, cap) // 4) * 4
-    )
-    assert launch_grid("Q", 1024, max_active_clusters=37, **kw) == 37 * ARM_Q_CLUSTER
+    # Arm Q4S: four CTAs per SM regardless of the architecture cap, bounded by
+    # whole co-resident clusters, then rounded down to clusters.
+    q4s_ctas = ARM_Q4S_CTAS_PER_SM * sm_count
+    assert launch_grid("Q4S", 512, max_active_clusters=1000, **kw) == 512
+    assert launch_grid("Q4S", 1024, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
+    assert launch_grid("Q4S", 2048, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
+    assert launch_grid("Q4S", 1024, max_active_clusters=100, **kw) == 400
+    assert launch_grid("Q4S", 1024, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
     with pytest.raises(RuntimeError, match="co-resident owner CTAs"):
         launch_grid(
-            "Q", 1024, max_active_clusters=OWNER_CTAS // ARM_Q_CLUSTER - 1, **kw
+            "Q4S", 1024, max_active_clusters=OWNER_CTAS // ARM_Q4S_CLUSTER - 1, **kw
         )
     with pytest.raises(RuntimeError, match="cluster capacity"):
-        launch_grid("Q", 1024, **kw)
+        launch_grid("Q4S", 1024, **kw)
     with pytest.raises(RuntimeError):
         launch_grid("L", 1024, **kw)
     with pytest.raises(RuntimeError):
         launch_grid("M", 64, **kw)
     with pytest.raises(RuntimeError):
-        launch_grid("M4S", 256, **kw)
+        launch_grid("Q4S", 64, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError, match="exactly num_tokens"):
         launch_grid("LC", 16, **kw)
     with pytest.raises(RuntimeError, match="launch bound"):

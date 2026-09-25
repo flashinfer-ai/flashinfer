@@ -22,9 +22,10 @@ sigmoid scores) and writes the expert-aligned route plan (``sorted_token_ids``,
 scatter offsets) consumed by grouped MoE GEMMs.  The program is a family of
 kernels: one dispatch arm per exact ``(num_tokens, block_m)`` shape of the
 routed set, selected by a per-architecture table.  Most arms launch as a
-cooperative persistent grid bounded by the device's SM count (arm Q
-additionally uses 4-CTA clusters and is bounded by the driver's co-resident
-cluster capacity; arm G uses a per-architecture CTAs-per-SM bound); arm LC
+cooperative persistent grid bounded by the device's SM count (arm Q4S
+additionally uses 4-CTA clusters at four CTAs per SM and is bounded by the
+driver's co-resident cluster capacity; arm G uses a per-architecture
+CTAs-per-SM bound); arm LC
 launches one non-cooperative cluster of ``num_tokens`` CTAs for the smallest
 batches.  Nothing is planned on the host and nothing is allocated
 at launch, so a prepared runner is CUDA Graph safe.  See ``README.md`` in
@@ -67,10 +68,11 @@ ARM_LC_TOKENS = (2, 4, 8)
 # Arm G: persistent grid of CTAs-per-SM x SM count (launch bounds of the kernel).
 ARM_G_CTAS_PER_SM = {(10, 0): 4, (10, 3): 6}
 ARM_M_MAX_TOKENS = 2048
-ARM_Q_MAX_TOKENS = 2048
-ARM_Q_CLUSTER = 4
-ARM_M4S_CTAS_PER_SM = 4
-ARM_M4S_OWNER_STRIDE = 4
+# Arm Q4S: 4-CTA clusters, kernel compiled with __launch_bounds__(224, 4); grid =
+# min(num_tokens, 4 x SM count, co-resident cluster capacity) in whole clusters.
+ARM_Q4S_MAX_TOKENS = 2048
+ARM_Q4S_CLUSTER = 4
+ARM_Q4S_CTAS_PER_SM = 4
 
 # Exact keyword set of the generated program's ``run`` entry (bound by the
 # export's argument plan); ``grid`` is expanded to ``grid_x/y/z``.
@@ -90,8 +92,7 @@ MAIN_KWARGS = (
 )
 
 # Per-shape dispatch arm, keyed by (num_tokens, block_m).  Both tables cover
-# the same 28 shapes; SM100 (B200) serves num_tokens = 512 with arm M4S where
-# SM103 (B300) already fits arm Q.
+# the same 28 shapes with the same arms.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1, 8): "L",
     (1, 16): "L",
@@ -111,22 +112,18 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (128, 16): "L",
     (256, 8): "M",
     (256, 16): "M",
-    (512, 8): "M4S",
-    (512, 16): "M4S",
-    (1024, 8): "Q",
-    (1024, 16): "Q",
-    (2048, 8): "Q",
-    (2048, 16): "Q",
+    (512, 8): "Q4S",
+    (512, 16): "Q4S",
+    (1024, 8): "Q4S",
+    (1024, 16): "Q4S",
+    (2048, 8): "Q4S",
+    (2048, 16): "Q4S",
     (4096, 8): "G",
     (4096, 16): "G",
     (8192, 8): "G",
     (8192, 16): "G",
 }
-_SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = {
-    **{key: arm for key, arm in _SM100_SHAPE_ROUTE.items() if arm != "M4S"},
-    (512, 8): "Q",
-    (512, 16): "Q",
-}
+_SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = dict(_SM100_SHAPE_ROUTE)
 SHAPE_ROUTES = {"sm_100a": _SM100_SHAPE_ROUTE, "sm_103a": _SM103_SHAPE_ROUTE}
 SUPPORTED_NUM_TOKENS = tuple(sorted({rows for rows, _ in _SM100_SHAPE_ROUTE}))
 
@@ -226,7 +223,7 @@ def launch_grid(
     """``grid_x`` of the persistent launch for ``arm`` on the described device.
 
     ``max_active_clusters`` is the driver's co-resident cluster capacity for the
-    arm-Q kernel (required for arm Q only).
+    arm-Q4S kernel (required for arm Q4S only).
     """
     rows = int(num_tokens)
     major, minor = (int(v) for v in compute_capability)
@@ -248,30 +245,19 @@ def launch_grid(
                 f"arm M admits {OWNER_CTAS} <= num_tokens <= {ARM_M_MAX_TOKENS}"
             )
         return grid_x
-    if arm == "M4S":
-        if rows > ARM_M_MAX_TOKENS or rows < ARM_M4S_OWNER_STRIDE * OWNER_CTAS:
+    if arm == "Q4S":
+        if rows > ARM_Q4S_MAX_TOKENS or rows < OWNER_CTAS:
             raise RuntimeError(
-                f"arm M4S admits {ARM_M4S_OWNER_STRIDE * OWNER_CTAS} <= num_tokens "
-                f"<= {ARM_M_MAX_TOKENS}"
-            )
-        grid_x = max(1, min(rows, ARM_M4S_CTAS_PER_SM * int(sm_count)))
-        if grid_x < ARM_M4S_OWNER_STRIDE * OWNER_CTAS:
-            raise RuntimeError(
-                f"arm M4S needs a grid of at least {ARM_M4S_OWNER_STRIDE * OWNER_CTAS} CTAs"
-            )
-        return grid_x
-    if arm == "Q":
-        if rows > ARM_Q_MAX_TOKENS or rows < OWNER_CTAS:
-            raise RuntimeError(
-                f"arm Q admits {OWNER_CTAS} <= num_tokens <= {ARM_Q_MAX_TOKENS}"
+                f"arm Q4S admits {OWNER_CTAS} <= num_tokens <= {ARM_Q4S_MAX_TOKENS}"
             )
         if max_active_clusters is None:
-            raise RuntimeError("arm Q needs the driver's co-resident cluster capacity")
-        cluster_cap = int(max_active_clusters) * ARM_Q_CLUSTER
-        grid_x = (min(grid_x, cluster_cap) // ARM_Q_CLUSTER) * ARM_Q_CLUSTER
+            raise RuntimeError("arm Q4S needs the driver's co-resident cluster capacity")
+        cluster_cap = int(max_active_clusters) * ARM_Q4S_CLUSTER
+        grid_x = min(grid_rows, ARM_Q4S_CTAS_PER_SM * int(sm_count), cluster_cap)
+        grid_x = (grid_x // ARM_Q4S_CLUSTER) * ARM_Q4S_CLUSTER
         if grid_x < OWNER_CTAS:
             raise RuntimeError(
-                f"arm Q needs {OWNER_CTAS} co-resident owner CTAs; the driver admits "
+                f"arm Q4S needs {OWNER_CTAS} co-resident owner CTAs; the driver admits "
                 f"{cluster_cap} clustered CTAs"
             )
         return grid_x
@@ -509,7 +495,7 @@ def prepare_kimi_k3_fused_router(
         module = load_kimi_k3_fused_router_module(module_name, "main")
         properties = torch.cuda.get_device_properties(device_index)
         max_active_clusters = None
-        if arm == "Q" and uses_cluster_launch(record):
+        if arm == "Q4S" and uses_cluster_launch(record):
             max_active_clusters = _max_active_clusters(module, record, device_index)
         grid_x = launch_grid(
             arm,
