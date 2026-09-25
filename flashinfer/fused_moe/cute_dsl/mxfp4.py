@@ -322,8 +322,21 @@ DENSE_DUAL_TILE_THRESHOLD_PERMILLE = int(
 # stream order. With this on, ``run`` forks it onto an auxiliary stream right
 # after the sort (the previous run's GEMM2 is already ordered before it) and
 # joins before GEMM2, so it overlaps the sort and GEMM1; captured graphs get
-# the fork/join as edges. 0 = keep the zero-fill in the main stream.
-DENSE_ASYNC_MEMSET = os.environ.get("MXFP4_DENSE_ASYNC_MEMSET", "1") == "1"
+# the fork/join as edges. "ep" (default) enables it on expert-parallel ranks
+# only (num_local_experts < num_experts), where it was measured faster on
+# every dense row; on the MoE-TP shard the finalize GEMM2 reduce-adds ran
+# 2-4 % slower without the zero-fill immediately before it (its output no
+# longer in L2), so the shard keeps the in-order launch. "1" = every layout,
+# "0" = keep the zero-fill in the main stream everywhere.
+DENSE_ASYNC_MEMSET = os.environ.get("MXFP4_DENSE_ASYNC_MEMSET", "ep")
+
+
+def _dense_async_memset(num_experts: int, num_local_experts: int) -> bool:
+    if DENSE_ASYNC_MEMSET == "1":
+        return True
+    if DENSE_ASYNC_MEMSET == "ep":
+        return num_local_experts < num_experts
+    return False
 B300_SITU_DENSE_DUAL_TACTIC = _T256_N256_C1
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
 # applies the route weights (no bulk reduce-add into the output).
@@ -694,7 +707,9 @@ class Mxfp4MoEPlan:
         self._memset, self._memset_args = launches.get("memset", (None, None))
         # Auxiliary stream and fork/join events for the output zero-fill (see
         # DENSE_ASYNC_MEMSET); created here, outside any graph capture.
-        if self._memset is not None and DENSE_ASYNC_MEMSET:
+        if self._memset is not None and _dense_async_memset(
+            self._kwargs["num_experts"], self._kwargs["num_local_experts"]
+        ):
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
             self._memset_event = torch.cuda.Event()
