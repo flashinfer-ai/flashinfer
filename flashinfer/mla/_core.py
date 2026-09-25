@@ -3765,7 +3765,9 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             raise ValueError("backend='cake' takes host float bmm1_scale / bmm2_scale")
         if out is None:
             out = torch.empty(
-                (*query.shape[:-1], kv_lora_rank), dtype=torch.bfloat16, device=query.device
+                (*query.shape[:-1], kv_lora_rank),
+                dtype=torch.bfloat16,
+                device=query.device,
             )
         from .cake_kimi_k3_mla import run_cake_kimi_k3_mla_fp8_paged_attention
 

@@ -88,7 +88,9 @@ def _carve_workspace(workspace: torch.Tensor, rows_max: int, num_split: int):
     partial_o = None
     if num_split > 1:
         n = rows_max * num_split * V_DIM * 2
-        partial_o = raw[off : off + n].view(torch.bfloat16).view(rows_max, num_split, V_DIM)
+        partial_o = (
+            raw[off : off + n].view(torch.bfloat16).view(rows_max, num_split, V_DIM)
+        )
         off += _align16(n)
     n = rows_max * num_split * 4
     partial_max = raw[off : off + n].view(torch.float32).view(rows_max, num_split)
@@ -97,7 +99,9 @@ def _carve_workspace(workspace: torch.Tensor, rows_max: int, num_split: int):
     return partial_o, partial_max, partial_sum
 
 
-def _bound_args(contract: dict[str, Any], values: dict[str, Any], grid: tuple[int, int, int]):
+def _bound_args(
+    contract: dict[str, Any], values: dict[str, Any], grid: tuple[int, int, int]
+):
     """Order ``values`` by the generated argument plan (grid dims appended by kind)."""
     grid_args = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     args = []
@@ -168,12 +172,25 @@ class KimiK3MlaFp8PagedAttention:
             _, num_heads, _ = query.shape
         else:
             raise ValueError("query must be 3D or 4D")
-        for name, t in (("seq_lens", seq_lens), ("block_tables", block_tables), ("cum_seq_lens_q", cum_seq_lens_q)):
+        for name, t in (
+            ("seq_lens", seq_lens),
+            ("block_tables", block_tables),
+            ("cum_seq_lens_q", cum_seq_lens_q),
+        ):
             if t.dtype != torch.int32:
                 raise ValueError(f"{name} must be int32")
-        if out.dtype != torch.bfloat16 or out.shape[-1] != V_DIM or out.numel() != query.numel() // QK_DIM * V_DIM:
+        if (
+            out.dtype != torch.bfloat16
+            or out.shape[-1] != V_DIM
+            or out.numel() != query.numel() // QK_DIM * V_DIM
+        ):
             raise ValueError("out must be BF16 with shape query.shape[:-1] + (512,)")
-        if not (query.is_contiguous() and kv_cache.is_contiguous() and out.is_contiguous() and block_tables.is_contiguous()):
+        if not (
+            query.is_contiguous()
+            and kv_cache.is_contiguous()
+            and out.is_contiguous()
+            and block_tables.is_contiguous()
+        ):
             raise ValueError("query, kv_cache, block_tables and out must be contiguous")
         if max_seq_len is None:
             max_seq_len = int(block_tables.shape[-1]) * PAGE_SIZE
@@ -187,7 +204,9 @@ class KimiK3MlaFp8PagedAttention:
         self.rt = swapped_rt(rows_per_request)
         self.m_tiles = (rows_per_request + self.rt - 1) // self.rt
         self.num_split = (
-            int(num_split) if num_split else plan_num_split(self.batch * self.m_tiles, int(max_seq_len), sm_count)
+            int(num_split)
+            if num_split
+            else plan_num_split(self.batch * self.m_tiles, int(max_seq_len), sm_count)
         )
         self.max_pages_per_seq = int(block_tables.shape[-1])
         self.softmax_scale_log2 = float(bmm1_scale) * math.log2(math.e)
@@ -205,7 +224,11 @@ class KimiK3MlaFp8PagedAttention:
         if self.num_split <= REDUCE_WARP_MAX_SPLITS:
             self.reduce_warps = reduce_warps_per_row(self.rows_max)
             rows_per_cta = REDUCE_WARPS // self.reduce_warps
-            self.grid_reduce = ((self.rows_max + rows_per_cta - 1) // rows_per_cta, 1, 1)
+            self.grid_reduce = (
+                (self.rows_max + rows_per_cta - 1) // rows_per_cta,
+                1,
+                1,
+            )
             reduce_kind = f"reduce_w{self.reduce_warps}"
         else:
             self.reduce_warps = 0
@@ -214,24 +237,43 @@ class KimiK3MlaFp8PagedAttention:
         self._main = get_cake_kimi_k3_mla_route(f"main_rt{self.rt}", arch=self.arch)
         self._reduce = get_cake_kimi_k3_mla_route(reduce_kind, arch=self.arch)
         self.route_metadata = dict(
-            backend="cake", arch=self.arch, rt=self.rt, reducer=reduce_kind,
-            main_module=self._main["name"], reduce_module=self._reduce["name"],
+            backend="cake",
+            arch=self.arch,
+            rt=self.rt,
+            reducer=reduce_kind,
+            main_module=self._main["name"],
+            reduce_module=self._reduce["name"],
         )
         self.plan = dict(
-            rt=self.rt, m_tiles=self.m_tiles, num_split=self.num_split, rows_max=self.rows_max,
-            grid_main=tuple(self.grid_main), grid_reduce=tuple(self.grid_reduce),
-            reduce_warps=self.reduce_warps, softmax_scale_log2=self.softmax_scale_log2,
+            rt=self.rt,
+            m_tiles=self.m_tiles,
+            num_split=self.num_split,
+            rows_max=self.rows_max,
+            grid_main=tuple(self.grid_main),
+            grid_reduce=tuple(self.grid_reduce),
+            reduce_warps=self.reduce_warps,
+            softmax_scale_log2=self.softmax_scale_log2,
             max_pages_per_seq=self.max_pages_per_seq,
         )
         write_target = self.o_rows if self.num_split == 1 else self.partial_O
         self._main_args = _bound_args(
             self._main,
             dict(
-                tmap_q=self.q_rows, tmap_qr=self.q_rows, tmap_k=self.kv_rows, tmap_kr=self.kv_rows,
-                partial_O=write_target, partial_max=self.partial_max, partial_sum=self.partial_sum,
-                seq_lens=self.seq_lens, cum_seq_lens_q=self.cum_seq_lens_q, page_table=self.block_tables,
-                softmax_scale_log2=self.softmax_scale_log2, bmm2_scale=self.bmm2_scale,
-                num_heads=self.num_heads, num_split=self.num_split, max_pages_per_seq=self.max_pages_per_seq,
+                tmap_q=self.q_rows,
+                tmap_qr=self.q_rows,
+                tmap_k=self.kv_rows,
+                tmap_kr=self.kv_rows,
+                partial_O=write_target,
+                partial_max=self.partial_max,
+                partial_sum=self.partial_sum,
+                seq_lens=self.seq_lens,
+                cum_seq_lens_q=self.cum_seq_lens_q,
+                page_table=self.block_tables,
+                softmax_scale_log2=self.softmax_scale_log2,
+                bmm2_scale=self.bmm2_scale,
+                num_heads=self.num_heads,
+                num_split=self.num_split,
+                max_pages_per_seq=self.max_pages_per_seq,
             ),
             self.grid_main,
         )
@@ -240,9 +282,15 @@ class KimiK3MlaFp8PagedAttention:
             self._reduce_args = _bound_args(
                 self._reduce,
                 dict(
-                    partial_O=self.partial_O, partial_max=self.partial_max, partial_sum=self.partial_sum,
-                    O=self.o_rows, cum_seq_lens_q=self.cum_seq_lens_q, batch=self.batch,
-                    num_heads=self.num_heads, num_split=self.num_split, bmm2_scale=self.bmm2_scale,
+                    partial_O=self.partial_O,
+                    partial_max=self.partial_max,
+                    partial_sum=self.partial_sum,
+                    O=self.o_rows,
+                    cum_seq_lens_q=self.cum_seq_lens_q,
+                    batch=self.batch,
+                    num_heads=self.num_heads,
+                    num_split=self.num_split,
+                    bmm2_scale=self.bmm2_scale,
                 ),
                 self.grid_reduce,
             )
@@ -252,11 +300,14 @@ class KimiK3MlaFp8PagedAttention:
     def _load(self) -> Callable[..., Any]:
         from ..jit.cake_kimi_k3_mla import get_cake_kimi_k3_mla_module
 
-        main_fn = getattr(get_cake_kimi_k3_mla_module(self._main["name"]), self._main["ffi_entry"])
+        main_fn = getattr(
+            get_cake_kimi_k3_mla_module(self._main["name"]), self._main["ffi_entry"]
+        )
         self._main_fn = main_fn
         if self._reduce_args is not None:
             self._reduce_fn = getattr(
-                get_cake_kimi_k3_mla_module(self._reduce["name"]), self._reduce["ffi_entry"]
+                get_cake_kimi_k3_mla_module(self._reduce["name"]),
+                self._reduce["ffi_entry"],
             )
         return main_fn
 
@@ -284,9 +335,17 @@ def run_cake_kimi_k3_mla_fp8_paged_attention(
 ) -> torch.Tensor:
     """One-shot entry used by ``trtllm_batch_decode_with_kv_cache_mla(backend="cake")``."""
     runner = KimiK3MlaFp8PagedAttention(
-        query=query, kv_cache=kv_cache, block_tables=block_tables, seq_lens=seq_lens, out=out,
-        workspace_buffer=workspace_buffer, bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale,
-        cum_seq_lens_q=cum_seq_lens_q, max_q_len=max_q_len, max_seq_len=max_seq_len,
+        query=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        out=out,
+        workspace_buffer=workspace_buffer,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        max_seq_len=max_seq_len,
     )
     runner.launch()
     return out
