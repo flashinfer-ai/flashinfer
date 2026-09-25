@@ -206,3 +206,9 @@ docs/sg_execution_times.rst
 build_nvep/
 flashinfer/moe_ep/backends/split/comm/*/_libs/
 flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
+
+# Local SLURM/container artifacts (never publish: logs can embed internal
+# toolchain fragments; the sqsh image is a full environment snapshot)
+.sqsh_build_logs/
+*.sqsh
+.fi_workspace/

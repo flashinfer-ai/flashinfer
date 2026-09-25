@@ -463,6 +463,8 @@ _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 _CUTILE_NVFP4_ARCHS = (120, 121)
 _CUTILE_MXFP4_ARCHS = (120, 121)
 _CUTILE_W4A16_ARCHS = (89, 90, 120, 121)
+_CUTILE_FP8_ARCHS = (90, 120, 121)
+_CUTILE_MXFP8_ARCHS = (120, 121)
 _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Swiglu,
     ActivationType.SwigluStep,
@@ -1095,6 +1097,141 @@ class CuTileMxfp4Bf16Config(CuTileMxfp4Config):
 
 
 @dataclass(frozen=True)
+class CuTileFp8PerTensorConfig:
+    """cuTile per-tensor E4M3 weights and activations.
+
+    Inputs are BF16; both GEMM inputs are dynamically quantized to E4M3.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_FP8_ARCHS
+
+    @classmethod
+    def prepare_weights(
+        cls,
+        w1_fp8,
+        w1_scale,
+        w2_fp8,
+        w2_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with one FP32 dequantization scale per expert.
+
+        GEMM1 uses canonical ``[up, gate]`` rows for gated activations.
+        The result is shared with :class:`CuTileFp8PerTensorBf16Config`.
+        """
+        from .prepare import prepare_cutile_fp8_weights
+
+        return prepare_cutile_fp8_weights(
+            w1_fp8,
+            w1_scale,
+            w2_fp8,
+            w2_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            block_scaled=False,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+
+@dataclass(frozen=True)
+class CuTileFp8PerTensorBf16Config(CuTileFp8PerTensorConfig):
+    """cuTile per-tensor E4M3 weights with BF16 inputs to both GEMMs.
+
+    Shares prepared weights with :class:`CuTileFp8PerTensorConfig`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+
+@dataclass(frozen=True)
+class CuTileMxfp8Config:
+    """cuTile MXFP8 weights and activations, with E8M0 scales per 32 values.
+
+    Inputs are BF16; both GEMM inputs are dynamically quantized to MXFP8.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp8,
+        w1_scale,
+        w2_fp8,
+        w2_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with logical ``[E, N, K/32]`` E8M0 scales.
+
+        The result is shared with :class:`CuTileMxfp8Bf16Config`.
+        """
+        from .prepare import prepare_cutile_fp8_weights
+
+        return prepare_cutile_fp8_weights(
+            w1_fp8,
+            w1_scale,
+            w2_fp8,
+            w2_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            block_scaled=True,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+
+@dataclass(frozen=True)
+class CuTileMxfp8Bf16Config(CuTileMxfp8Config):
+    """cuTile MXFP8 weights with BF16 inputs to both GEMMs.
+
+    Shares prepared weights with :class:`CuTileMxfp8Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Mxfp8Config(CuTileMxfp4Config):
+    """cuTile MXFP4 weights with MXFP8 inputs to both GEMMs.
+
+    BF16 API inputs are dynamically quantized. Shares packed weights and scales
+    with :class:`CuTileMxfp4Config` and :class:`CuTileMxfp4Bf16Config` on SM12x.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP8_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Mxfp8Config()"
+
+
+@dataclass(frozen=True)
 class CutlassW4A16Config:
     """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
 
@@ -1586,6 +1723,50 @@ class CuteDslConfig:
 
 
 @dataclass(frozen=True)
+class SM12xFp8Config:
+    """SM120/SM121 CuTe-DSL DeepSeek FP8 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(w1_weight, w1_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native SM12x weight view from block-scaled FP8 tensors."""
+        return {
+            "w1_weight": w1_weight,
+            "w1_weight_sf": w1_weight_sf,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+        }
+
+    def __repr__(self) -> str:
+        return "SM12xFp8Config()"
+
+
+@dataclass(frozen=True)
+class SM12xMxfp8Mxfp4Config:
+    """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(w1_weight, w1_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native SM12x weight view from packed checkpoint tensors."""
+        return {
+            "w1_weight": w1_weight,
+            "w1_weight_sf": w1_weight_sf,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+        }
+
+    def __repr__(self) -> str:
+        return "SM12xMxfp8Mxfp4Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -1679,8 +1860,13 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,
     CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CutlassW4A16Config,
@@ -1692,6 +1878,8 @@ BackendConfigType = Union[
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    SM12xFp8Config,
+    SM12xMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -1705,8 +1893,13 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,
     CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CutlassW4A16Config,
@@ -1718,6 +1911,8 @@ ALL_BACKEND_CONFIGS = (
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    SM12xFp8Config,
+    SM12xMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )
@@ -1775,6 +1970,11 @@ _DEFAULT_BACKEND = BackendOptions(
         CutlassW4A16Config(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
+        CuTileFp8PerTensorBf16Config(),
+        CuTileFp8PerTensorConfig(),
+        CuTileMxfp4Mxfp8Config(),
+        CuTileMxfp8Bf16Config(),
+        CuTileMxfp8Config(),
         CuTileNvfp4Bf16Config(),
     )
 )
@@ -1937,6 +2137,10 @@ class MoEActivationPack:
       ``CutlassMxfp8Mxfp4Config``): ``float8_e4m3fn [M, H]`` MXFP8 values with
       token-major ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale
       bytes, matching the TRTLLM FP4 launcher ABI.
+    * MXFP4 x MXFP8 with ``SM12xMxfp8Mxfp4Config``: raw ``bfloat16 [M, H]``
+      values without an activation scale; K128 MXFP8 quantization runs internally.
+    * DeepSeek FP8 with ``SM12xFp8Config``: raw ``bfloat16 [M, H]`` values
+      without an activation scale; K128 FP8 quantization runs internally.
     * MXFP4×BF16 (TRTLLM W4A16): raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the MXFP4 preparation contract.
     * NVFP4×BF16 (CuTe-DSL / b12x W4A16): raw ``bfloat16 [M, H]`` values with no

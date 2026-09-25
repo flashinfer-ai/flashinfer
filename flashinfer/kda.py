@@ -31,8 +31,10 @@ import torch
 from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
+from . import kda_prefill_cute_small_bh as _kda_prefill_cute_small_bh
 from .jit import flash_kda_indexed as _flash_kda_indexed
 from .api_logging import flashinfer_api, flashinfer_experimental_api
+from .cute_dsl.availability import is_cute_dsl_available
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
@@ -70,7 +72,7 @@ def recurrent_kda(
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
-    backend: Literal["auto", "cute-dsl", "cake", "cudnn"] = "auto",
+    backend: Literal["auto", "cute-dsl", "cake", "small-bh", "cudnn"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -159,7 +161,8 @@ def recurrent_kda(
             to prepare and cache host scheduling metadata. CuTe DSL generates
             packed sequence ordering on the device and can generate decomposed
             chunk metadata there when using
-            :class:`RecurrentKDAPrefillWrapper`. Eligible 148-SM B200 and
+            :class:`RecurrentKDAPrefillWrapper`. Small-BH prefill caches the
+            maximum sequence length. Eligible 148-SM B200 and
             152-SM GB200 Cake calls additionally cache persistent worker task
             bins.
         ssm_state_indices (Optional[torch.Tensor]):
@@ -250,18 +253,22 @@ def recurrent_kda(
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
             64 or a larger cache-page-aligned multiple.
-        backend (Literal["auto", "cute-dsl", "cake", "cudnn"]):
-            Implementation backend. ``"auto"`` selects the architecture-
-            appropriate CuTe DSL kernel for supported ordinary multi-token
-            prefill, including the SM120 backend and SM100-family state
-            checkpoints, and otherwise falls back to an exported frozen Cake
-            specialization.
-            ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
-            Cake prefill path chooses among direct, persistent, small-BH, and
-            two-stage BT16 schedules from the input shape and physical device.
-            The SM100-family kernel additionally needs
-            ``nvidia-cutlass-dsl>=4.7``; below that ``"auto"`` uses Cake there
-            and ``"cute-dsl"`` raises :class:`ImportError`.
+        backend (Literal["auto", "cute-dsl", "cake", "small-bh", "cudnn"]):
+            Implementation backend. ``"auto"`` selects the bundled small-BH
+            CuTe DSL kernel for eligible SM100-family calls whose logical batch
+            size times head count does not exceed half the device's SM count. It
+            selects other architecture-appropriate CuTe DSL kernels for
+            supported ordinary multi-token prefill, including the SM120
+            backend and SM100-family state checkpoints, and otherwise falls
+            back to an exported frozen Cake specialization.
+            ``"cake"``, ``"small-bh"``, and ``"cute-dsl"`` select those backends
+            strictly. The Cake prefill path chooses among direct, persistent,
+            small-BH, and two-stage BT16 schedules from the input shape and
+            physical device. ``"small-bh"`` selects the small-BH CuTe DSL KDA
+            prefill kernel. The SM100-family CuTe DSL kernels (not including
+            small-BH) additionally need ``nvidia-cutlass-dsl>=4.7``; below that
+            ``"auto"`` uses Cake there and an explicitly selected CuTe backend
+            raises :class:`ImportError`.
             ``"cudnn"`` runs cuDNN's fused SM100 linear-attention engine
             through :func:`flashinfer.cudnn.cudnn_recurrent_kda`, and raises
             ``NotImplementedError`` carrying the reason when that engine cannot
@@ -280,9 +287,10 @@ def recurrent_kda(
         prefill_workspace, _kda_prefill.RecurrentKDAPrefillWorkspace
     ):
         raise TypeError("prefill_workspace must be a RecurrentKDAPrefillWorkspace")
-    if backend not in ("auto", "cute-dsl", "cake", "cudnn"):
+    if backend not in ("auto", "cute-dsl", "cake", "small-bh", "cudnn"):
         raise ValueError(
-            f"backend must be 'auto', 'cute-dsl', 'cake', or 'cudnn', got {backend!r}"
+            "backend must be 'auto', 'cute-dsl', 'cake', 'small-bh', or 'cudnn', "
+            f"got {backend!r}"
         )
     if backend == "cudnn":
         from .cudnn import cudnn_recurrent_kda
@@ -332,6 +340,137 @@ def recurrent_kda(
         )
     if checkpoint_state_indices is not None and backend == "cake":
         raise ValueError("checkpoint_state_indices is supported only by CuTe DSL")
+
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        # Frozen / speculative-verify mode (mirrors GDN's
+        # gated_delta_rule_mtp flag): outputs only, no state writes,
+        # optional slot-indexed correction/kg caches. Handled ahead of the
+        # prefill routing — none of the prefill-only features apply.
+        if backend == "small-bh":
+            raise ValueError(
+                f"backend={backend!r} has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if (
+            seq_order is not None
+            or prefill_workspace is not None
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+            or checkpoint_state_indices is not None
+            or checkpoint_every_n_tokens != 0
+        ):
+            raise ValueError(
+                "prefill-only arguments are incompatible with disable_state_update=True"
+            )
+        return _kda_decode._dispatch_recurrent_kda_decode(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            disable_state_update=disable_state_update,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+            backend=backend,
+        )
+
+    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
+        q, cu_seqlens, num_spec_tokens
+    )
+    if backend in ("auto", "small-bh"):
+        small_bh_available = (
+            is_cute_dsl_available()
+            if backend == "small-bh" or is_plain_prefill
+            else False
+        )
+        if backend == "small-bh" and not small_bh_available:
+            raise ImportError(
+                "backend='small-bh' requires the optional CuTe DSL runtime; "
+                "install the appropriate FlashInfer CUDA extra"
+            )
+        eligible = (
+            small_bh_available
+            and is_plain_prefill
+            and checkpoint_state_indices is None
+            and _kda_prefill_cute_small_bh._is_kda_prefill_cute_small_bh_eligible(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                initial_state=initial_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_gate_in_kernel=use_gate_in_kernel,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                seq_order=seq_order,
+                ssm_state_indices=ssm_state_indices,
+                num_spec_tokens=num_spec_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                output=output,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                beta_is_logit=beta_is_logit,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            )
+        )
+        if backend == "small-bh" and not eligible:
+            raise ValueError(
+                "backend='small-bh' does not support this recurrent_kda prefill contract"
+            )
+        use_small_bh = backend == "small-bh"
+        if eligible and backend == "auto":
+            batch_size = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+            use_small_bh = (
+                2 * batch_size * q.shape[2]
+                <= torch.cuda.get_device_properties(q.device).multi_processor_count
+            )
+        if eligible and use_small_bh:
+            assert A_log is not None
+            assert dt_bias is not None
+            return _kda_prefill_cute_small_bh._run_kda_prefill_cute_small_bh(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                prefill_workspace=prefill_workspace,
+            )
 
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before
     # the SM100-family CuTe DSL path, whose eligibility check rejects SM120.
@@ -398,60 +537,6 @@ def recurrent_kda(
                 **sm120_prefill_kwargs
             )
 
-    if (correction_cache is not None or kg_cache is not None) and (
-        not disable_state_update
-    ):
-        raise ValueError(
-            "correction_cache/kg_cache are speculative-verify caches and "
-            "require disable_state_update=True"
-        )
-    if disable_state_update:
-        # Frozen / speculative-verify mode (mirrors GDN's
-        # gated_delta_rule_mtp flag): outputs only, no state writes,
-        # optional slot-indexed correction/kg caches. Handled ahead of the
-        # prefill routing — none of the prefill-only features apply.
-        if (
-            seq_order is not None
-            or prefill_workspace is not None
-            or state_checkpoints is not None
-            or checkpoint_cu_starts is not None
-            or checkpoint_state_indices is not None
-            or checkpoint_every_n_tokens != 0
-        ):
-            raise ValueError(
-                "prefill-only arguments are incompatible with disable_state_update=True"
-            )
-        return _kda_decode._dispatch_recurrent_kda_decode(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices,
-            num_spec_tokens=num_spec_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            output=output,
-            initial_state_source=initial_state_source,
-            initial_state_indices=initial_state_indices,
-            beta_is_logit=beta_is_logit,
-            disable_state_update=disable_state_update,
-            correction_cache=correction_cache,
-            kg_cache=kg_cache,
-            backend=backend,
-        )
-
-    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
-        q, cu_seqlens, num_spec_tokens
-    )
     use_generated_indexed_prefill = (
         backend == "cake"
         and is_plain_prefill
@@ -673,6 +758,8 @@ def recurrent_kda(
             "seq_order is only supported by eligible packed ordinary "
             "SM100-family prefill"
         )
+    # An explicit small-BH request either returned or raised in prefill dispatch.
+    assert backend != "small-bh"
     return _kda_decode._dispatch_recurrent_kda_decode(
         q=q,
         k=k,
