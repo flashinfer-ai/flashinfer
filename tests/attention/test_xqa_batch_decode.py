@@ -4,7 +4,12 @@ from tests.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer import SfLayout
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+    is_sm12x_supported,
+    is_sm90a_supported,
+)
 from flashinfer.fp4_quantization import (
     nvfp4_quantize,
     e2m1_and_ufp8sf_scale_to_float,
@@ -442,6 +447,7 @@ def test_xqa_batch_decode(
     max_in_kv_len,
     kv_layout,
     spec_dec_mask_mode,
+    head_dim=128,
 ):
     """Test xqa_batch_decode_with_kv_cache across layouts and mask modes."""
     if q_len_per_req == 1 and spec_dec_mask_mode == "full":
@@ -586,6 +592,37 @@ def test_xqa_batch_decode(
         output_ref.float() / o_scale,
         rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
         atol=1e-1 if kv_dtype == "fp8" else 1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+        or is_sm12x_supported(torch.device("cuda"))
+    ),
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("q_dtype", ["bf16", "fp16"])
+def test_xqa_batch_decode_head_dim_256_small_pages(page_size, q_dtype):
+    """Cover head_dim=256 with the small pages from issue #2638."""
+    test_xqa_batch_decode(
+        batch_size=4,
+        q_len_per_req=1,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype=q_dtype,
+        o_dtype=q_dtype,
+        kv_dtype=q_dtype,
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=110,
+        kv_layout="NHD",
+        spec_dec_mask_mode="causal",
+        head_dim=256,
     )
 
 
