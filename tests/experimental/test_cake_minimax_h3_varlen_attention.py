@@ -107,7 +107,7 @@ def test_assign_unit_slots_lpt():
     # Fewer units than clusters: one round, descending cost reversed.
     assert assign_unit_slots([1, 3, 2], 8) == [0, 2, 1]
     # Equal costs keep the enumeration order within a round.
-    assert assign_unit_slots([2, 2, 2, 2], 2) == [1, 0, 3, 2]
+    assert assign_unit_slots([2, 2, 2, 2], 2) == [0, 1, 2, 3]
 
 
 def _decode_unit_table(plan):

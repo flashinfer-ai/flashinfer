@@ -344,12 +344,11 @@ def assign_unit_slots(unit_costs: Sequence[int], num_clusters: int) -> list[int]
     Slot ``k * num_clusters + i`` is the ``k``-th unit of cluster ``i``.  The
     partial tail round receives the cheapest units, and within every full
     round the clusters that also own a tail unit receive that round's cheapest
-    units.  Returns ``slot -> unit`` (a permutation).  Equal costs are placed
-    in reverse enumeration order within a round (the stable sort keeps the
-    enumeration order, each round is filled from its most expensive unit down);
-    measured equal to the plain enumeration order on uniform plans, i.e. the
-    round's unit set, not the order inside the round, is what matters for L2
-    locality.  Mirrors the production planner's ``assign_unit_slots``.
+    units.  Returns ``slot -> unit`` (a permutation).  Equal costs keep the
+    enumeration order within a round (both sorts are stable), so a uniform
+    plan reproduces the plain enumeration table exactly: consecutive slots
+    stream one head's K/V.  Mirrors the production planner's
+    ``assign_unit_slots``.
     """
     total = len(unit_costs)
     if total == 0:
@@ -360,9 +359,13 @@ def assign_unit_slots(unit_costs: Sequence[int], num_clusters: int) -> list[int]
     slots = [0] * total
     full_units = order[: total - tail]
     for k in range(len(full_units) // G):
-        chunk = full_units[k * G : (k + 1) * G]  # descending cost
-        for i in range(G):
-            slots[k * G + i] = chunk[G - 1 - i]
+        chunk = full_units[
+            k * G : (k + 1) * G
+        ]  # descending cost, ties in enumeration order
+        for i, unit in enumerate(
+            sorted(chunk, key=lambda u: unit_costs[u])
+        ):  # ascending, stable
+            slots[k * G + i] = unit
     for i, unit in enumerate(order[total - tail :] if tail else []):
         slots[(total // G) * G + i] = unit
     return slots
@@ -750,8 +753,9 @@ def build_tile_tables(
     near-equal K/V block ranges (:func:`choose_kv_splits`; ``kv_splits``
     forces one factor).  The units are then placed into the persistent grid's
     statically strided slots longest-processing-time first
-    (:func:`assign_unit_slots`; equal costs are placed in reverse enumeration
-    order within a round).
+    (:func:`assign_unit_slots`; equal costs keep the enumeration order).  The
+    kernel's five per-tile tables are allocated first, in the production
+    planner's order, so their placement relative to the workspace matches it.
     ``num_clusters`` is the grid capacity in 2-CTA clusters (default
     ``bf16_grid_clusters(device)``, a CUDA device).  Mirrors the Cake
     production planner's ``build_tile_tables``.
@@ -810,11 +814,16 @@ def build_tile_tables(
         units[u]
         for u in assign_unit_slots(costs, min(int(num_clusters), max(num_tiles, 1)))
     ]
+    cl_head = _table([head for _, head, _, _, _ in slots], device)
+    cl_tables = {
+        name: _table([values[c] for c, _, _, _, _ in slots], device)
+        for name, values in cl.items()
+    }
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
     return TileTables(
         heads=heads,
         total_tiles=num_tiles,
-        cl_head=_table([head for _, head, _, _, _ in slots], device),
+        cl_head=cl_head,
         cl_kv_begin=_table([begin for _, _, begin, _, _ in slots], device),
         cl_kv_blocks=_table([count for _, _, _, count, _ in slots], device),
         cl_ws_slot=_table([slot for _, _, _, _, slot in slots], device),
@@ -828,10 +837,7 @@ def build_tile_tables(
         num_partial_slots=partial_slots,
         num_combine_units=len(combine) // COMBINE_WORDS,
         max_kv_splits=max(split_of, default=1),
-        **{
-            name: _table([values[c] for c, _, _, _, _ in slots], device)
-            for name, values in cl.items()
-        },
+        **cl_tables,
     )
 
 
