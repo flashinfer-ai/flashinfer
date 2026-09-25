@@ -65,6 +65,7 @@ _K_TAIL_SHAPES = [
     (130, 5, 96, 2),
 ]
 
+
 def _require_supported_gpu():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
