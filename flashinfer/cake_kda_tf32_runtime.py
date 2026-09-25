@@ -274,6 +274,24 @@ AFFINE_SPLIT_MIN_CHUNKS_PER_PART = 32
 AFFINE_SPLIT_MIN_PARTS = 8
 AFFINE_SPLIT_LOW_PART_MIN_CHUNKS = 2048
 BF16_AFFINE_SPLIT_MIN_CHUNKS = 128
+# Measured cost model of the BF16 fused family, in microseconds.  The affine
+# composite runs its main, correction and map passes on every window at once,
+# so its time follows the longest window's chunk chain; the sequential fused
+# body runs one chain per sequence x head task, so its time follows the longest
+# sequence's chain (the number of tasks barely matters below the SM count).
+# Both are affine in their chain length: (fixed, per 32-token chunk).  Fitted
+# from paired forced-split / forced-sequential runs (fresh inputs, plan-cache
+# hits, profiler GPU time) on 15 shapes per gate; H12 and H16 share the fit.
+# sm_100a (B200, 148 SMs), 2026-09-25: composite 75 + 14.2 * chunks/window,
+# sequential 20 + 4.0 * chunks (unbounded softplus, FP32 rows); composite
+# 84 + 8.8 * chunks/window, sequential 16 + 1.75 * chunks (bounded gate).
+AFFINE_MIN_CHUNKS_PER_WINDOW = 4
+AFFINE_BF16_COST_MODEL_US: dict[tuple[str, str], tuple[float, float, float, float]] = {
+    # (gpu_arch, gate_kind): (composite_fixed, composite_per_window_chunk,
+    #                          sequential_fixed, sequential_per_chunk)
+    ("sm_100a", "unbounded_softplus"): (75.0, 14.2, 20.0, 4.0),
+    ("sm_100a", "lower_bound"): (84.0, 8.8, 16.0, 1.75),
+}
 SMALL_BH_GROUP_SIZE = 8
 SMALL_BH_RING_STAGES = 35
 SMALL_BH_PACKET_ELEMS = HEAD_DIM
@@ -311,18 +329,116 @@ class _PersistentM128Roofline:
 
 
 def _affine_split_policy() -> str:
-    """``packed`` (default) or ``legacy``.
+    """``model`` (default) or ``legacy``.
 
-    ``packed`` gates a multi-sequence call on its longest sequence: the split
-    is taken when any sequence of the pack crosses the single-sequence part
-    crossover (the sequential body's makespan is that sequence's chunk chain,
-    while the composite splits it across the window budget).  ``legacy``
-    keeps the pre-2026-09-23 gate (aggregate sequence x head tasks, 32-task
-    cap) for A/B measurement.
+    ``model`` decides the BF16-family split from the measured cost model
+    (``AFFINE_BF16_COST_MODEL_US``): the composite is taken when its estimated
+    time on the planned windows beats the sequential fused body's longest
+    chain.  ``legacy`` keeps the pre-2026-09-23 gate (aggregate sequence x head
+    tasks, 32-task cap, fixed chunk thresholds) for A/B measurement.
+    ``packed`` is accepted as the old name of the default.
     """
     import os
 
-    return os.environ.get("FLASHINFER_KDA_AFFINE_POLICY", "packed")
+    policy = os.environ.get("FLASHINFER_KDA_AFFINE_POLICY", "model")
+    return "legacy" if policy == "legacy" else "model"
+
+
+def _affine_window_counts(
+    chunk_counts: list[int], targets: list[int], window_budget: int
+) -> list[int]:
+    """Share the resident-window budget across original sequences.
+
+    Every sequence keeps at least one window; the remaining budget goes to the
+    sequence whose windows are currently longest (stable sequence tie-break),
+    never beyond its own target.
+    """
+    counts = targets.copy()
+    if sum(targets) > window_budget:
+        counts = [1] * len(chunk_counts)
+        for _ in range(window_budget - len(chunk_counts)):
+            eligible = [i for i in range(len(counts)) if counts[i] < targets[i]]
+            if not eligible:
+                break
+            selected = max(
+                eligible,
+                key=lambda i: ((chunk_counts[i] + counts[i] - 1) // counts[i], -i),
+            )
+            counts[selected] += 1
+    return counts
+
+
+def _affine_window_chunks(chunks: int, parts: int, checkpoints: bool) -> int:
+    """Chunks per window for one sequence; checkpointed windows start on 64-token boundaries."""
+    per_part = (chunks + parts - 1) // parts
+    if checkpoints:
+        per_part += per_part % 2
+    return per_part
+
+
+def _affine_bf16_window_targets(
+    chunk_counts: list[int], *, num_heads: int, sm_count: int
+) -> list[int]:
+    """Most windows the BF16 composite can give each sequence.
+
+    One wave of windows per head (``sm_count // num_heads``), at least
+    ``AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks per window: shorter windows only
+    add per-window preparation while the main/correction passes stay
+    chain-bound.
+    """
+    per_head = max(1, sm_count // num_heads)
+    return [
+        min(per_head, max(1, chunks // AFFINE_MIN_CHUNKS_PER_WINDOW))
+        for chunks in chunk_counts
+    ]
+
+
+def _affine_bf16_split_estimate_us(
+    *,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    gate_kind: str,
+    gpu_arch: str,
+):
+    """Estimated (composite, sequential) microseconds for a BF16-family call.
+
+    ``None`` when the architecture/gate has no measured model or the call is
+    outside the composite's contract (task cap, window budget, no sequence
+    that would actually split).
+    """
+    model = AFFINE_BF16_COST_MODEL_US.get((gpu_arch, gate_kind))
+    tasks = len(sequence_lengths) * num_heads
+    if (
+        model is None
+        or not sequence_lengths
+        or min(sequence_lengths) <= 0
+        or num_heads <= 0
+        or tasks > AFFINE_SPLIT_MAX_TASKS
+        or 2 * tasks > sm_count
+    ):
+        return None
+    chunk_counts = [
+        (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
+    ]
+    targets = _affine_bf16_window_targets(
+        chunk_counts, num_heads=num_heads, sm_count=sm_count
+    )
+    counts = _affine_window_counts(
+        chunk_counts, targets, max(len(sequence_lengths), sm_count // num_heads)
+    )
+    if sum(counts) <= len(sequence_lengths):
+        return None
+    window_chunks = max(
+        _affine_window_chunks(chunks, parts, checkpoints)
+        for chunks, parts in zip(chunk_counts, counts, strict=True)
+    )
+    composite_fixed, composite_chunk, sequential_fixed, sequential_chunk = model
+    return (
+        composite_fixed + composite_chunk * window_chunks,
+        sequential_fixed + sequential_chunk * max(chunk_counts),
+    )
 
 
 def _affine_max_tasks() -> int:
@@ -396,44 +512,38 @@ def _affine_split_windows(
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
     ]
-    targets = [
-        _affine_split_part_count(
-            sm_count=sm_count,
-            tasks=num_heads,
-            chunks=chunks,
-            fp32_indexed_state=fp32_indexed_state,
-            shared_tf32_factors=shared_tf32_factors,
-            unbounded_softplus=unbounded_softplus,
-        )
-        for chunks in chunk_counts
-    ]
     window_budget = max(len(sequence_lengths), sm_count // num_heads)
-    if len(sequence_lengths) > 1 and max(targets) > 1:
-        chunks_per_window = 8
+    if not shared_tf32_factors and _affine_split_policy() == "model":
+        # The cost model already decided the split; give every sequence the
+        # most windows the budget allows so the longest window is shortest.
+        targets = _affine_bf16_window_targets(
+            chunk_counts, num_heads=num_heads, sm_count=sm_count
+        )
+    else:
         targets = [
-            max(target, min(window_budget, max(1, chunks // chunks_per_window)))
-            for target, chunks in zip(targets, chunk_counts, strict=True)
-        ]
-    counts = targets.copy()
-    if sum(targets) > window_budget:
-        counts = [1] * len(sequence_lengths)
-        for _ in range(window_budget - len(sequence_lengths)):
-            eligible = [i for i in range(len(counts)) if counts[i] < targets[i]]
-            if not eligible:
-                break
-            selected = max(
-                eligible,
-                key=lambda i: ((chunk_counts[i] + counts[i] - 1) // counts[i], -i),
+            _affine_split_part_count(
+                sm_count=sm_count,
+                tasks=num_heads,
+                chunks=chunks,
+                fp32_indexed_state=fp32_indexed_state,
+                shared_tf32_factors=shared_tf32_factors,
+                unbounded_softplus=unbounded_softplus,
             )
-            counts[selected] += 1
+            for chunks in chunk_counts
+        ]
+        if len(sequence_lengths) > 1 and max(targets) > 1:
+            chunks_per_window = 8
+            targets = [
+                max(target, min(window_budget, max(1, chunks // chunks_per_window)))
+                for target, chunks in zip(targets, chunk_counts, strict=True)
+            ]
+    counts = _affine_window_counts(chunk_counts, targets, window_budget)
     token_offsets = [0]
     part_offsets = [0]
     for length, chunks, parts in zip(
         sequence_lengths, chunk_counts, counts, strict=True
     ):
-        per_part = (chunks + parts - 1) // parts
-        if checkpoints:
-            per_part += per_part % 2
+        per_part = _affine_window_chunks(chunks, parts, checkpoints)
         start = token_offsets[-1]
         for chunk in range(per_part, chunks, per_part):
             token_offsets.append(start + chunk * BF16_M128_CHUNK)
@@ -5028,7 +5138,8 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
         return False
-    if detect_gpu_arch() not in ("sm_100a", "sm_103a"):
+    gpu_arch = detect_gpu_arch()
+    if gpu_arch not in ("sm_100a", "sm_103a"):
         return False
     heads = int(q.shape[2])
     crossover = dict(
@@ -5037,6 +5148,33 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         shared_tf32_factors=compute_dtype == "tf32",
         unbounded_softplus=argument(9, "lower_bound") is None,
     )
+    if not crossover["shared_tf32_factors"] and _affine_split_policy() == "model":
+        # BF16 family: compare the measured cost model of the composite on the
+        # windows it would actually get against the sequential body's longest
+        # chain.  The fixed thresholds below were fitted on GB300 and put the
+        # 8192-token break-even one chunk above an 8128-token member, which
+        # left 8128+64 packs on a 1.0 ms chain where the composite takes 0.42
+        # (B200, H12); the model also declines 2x8192 at H16 with the bounded
+        # gate (0.62 vs 0.47 ms sequential), which the thresholds accepted.
+        estimate = _affine_bf16_split_estimate_us(
+            sequence_lengths=lengths,
+            num_heads=heads,
+            sm_count=crossover["sm_count"],
+            checkpoints=checkpoint_request,
+            gate_kind=(
+                "unbounded_softplus"
+                if crossover["unbounded_softplus"]
+                else "lower_bound"
+            ),
+            gpu_arch=gpu_arch,
+        )
+        if estimate is not None:
+            composite_us, sequential_us = estimate
+            return composite_us < sequential_us
+        if (gpu_arch, "lower_bound") in AFFINE_BF16_COST_MODEL_US:
+            # Modelled architecture, but the call is outside the composite's
+            # contract (task cap, half the SM count, nothing to split).
+            return False
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in lengths
     ]
