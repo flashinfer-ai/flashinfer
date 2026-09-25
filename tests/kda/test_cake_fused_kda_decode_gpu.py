@@ -178,7 +178,17 @@ _H8_WIDE_OFFSET_POOL = 16384
 _H8_ROUTE_CASES = (
     ("repeated_safe_f32", 5, torch.float32, "page", "repeated", None),
     ("repeated_safe_bf16", 70, torch.bfloat16, "padded", "repeated", None),
-    ("wide512_positive_f32", 1, torch.float32, "page", "positive", None),
+    ("cluster2_wide_positive_f32", 1, torch.float32, "page", "positive", None),
+    ("cluster2_wide_positive_f32", 9, torch.float32, "padded", "positive", None),
+    (
+        "cluster2_wide_positive_f32_wide_slot_offsets",
+        8,
+        torch.float32,
+        "page",
+        "random_positive",
+        _H8_WIDE_OFFSET_POOL,
+    ),
+    ("wide512_positive_f32", 10, torch.float32, "page", "positive", None),
     ("wide512_positive_f32", 18, torch.float32, "page", "positive", None),
     ("wide512_positive_f32", 37, torch.float32, "padded", "positive", None),
     ("wide512_positive_f32", 56, torch.float32, "page", "positive", None),

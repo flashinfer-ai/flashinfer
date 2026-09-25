@@ -185,7 +185,7 @@ def test_cake_targets_share_sources_but_have_distinct_build_identities():
     sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
-    assert len(sm100_variants) == len(sm103_variants) == 48
+    assert len(sm100_variants) == len(sm103_variants) == 50
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
         assert replace(sm100, target="sm103a") == sm103
         assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
@@ -333,10 +333,13 @@ def _select_h8_route(
 # H=8 route bands mirror the Cake launcher (B200_SM_COUNT = 148): one wide512
 # wave ends at rows 18, the staged compact band spans 38..55 for nullable FP32
 # and 19..63 for BF16, high-work starts at rows 148 for nullable slots, and the
-# measured positive-FP32 schedule alternates wide512 (<= 37, 56..76) with
-# high-work (38..55, >= 77).
+# measured positive-FP32 schedule runs the two-CTA cluster split while one
+# B200 wave holds every CTA pair (<= 9) and then alternates wide512 (10..37,
+# 56..76) with high-work (38..55, >= 77).
 _H8_ROUTES = (
-    ("float32", "positive_unique", 1, "wide512_positive_f32"),
+    ("float32", "positive_unique", 1, "cluster2_wide_positive_f32"),
+    ("float32", "positive_unique", 9, "cluster2_wide_positive_f32"),
+    ("float32", "positive_unique", 10, "wide512_positive_f32"),
     ("float32", "positive_unique", 18, "wide512_positive_f32"),
     ("float32", "positive_unique", 19, "wide512_positive_f32"),
     ("float32", "positive_unique", 37, "wide512_positive_f32"),
@@ -532,6 +535,44 @@ def test_registered_sources_match_their_launch_contract():
             "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES "
             f"{variant.dynamic_smem_bytes}"
         ) in binding
+        assert (
+            f"#define FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X {variant.cluster_x}"
+            in binding
+        )
+        # A clustered source declares its compile-time geometry; every other
+        # frozen kernel is a plain single-CTA launch.
+        cluster_dims = re.findall(r"__cluster_dims__\((\d+),\s*(\d+),\s*(\d+)\)", text)
+        if variant.cluster_x == 1:
+            assert cluster_dims == [], variant.name
+        else:
+            assert cluster_dims == [(str(variant.cluster_x), "1", "1")], variant.name
+            assert variant.abi_kind == "standard", variant.name
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    "name",
+    ("cluster2_wide_positive_f32", "cluster2_wide_positive_f32_wide_slot_offsets"),
+)
+def test_cluster_variants_render_the_cluster_launch_binding(target, name):
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
+    assert variant.cluster_x == 2
+    assert variant.threads == 512
+    assert variant.state_dtype == "float32"
+    assert variant.abi_kind == "standard"
+    binding = cake_jit._render_binding(variant)
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X 2" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS 0" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID 0" in binding
+    # The cluster geometry is part of the build identity: the same source with
+    # a different launch shape must not share a JIT URI.
+    payload = cake_jit._variant_build_identity_payload(variant)
+    assert payload["cluster_x"] == 2
+    rule = variant.eligibility[0]
+    assert rule.heads == (8,)
+    assert rule.minimum_rows == 1
+    assert rule.maximum_rows == cake_jit._H8_CLUSTER2_MAX_ROWS
+    assert rule.state_indices_modes == ("positive_unique",)
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))

@@ -101,6 +101,9 @@ CAKE_FUSED_KDA_DECODE_ABIS: dict[str, tuple[tuple[str, str, str], ...]] = {
 }
 _ROWS_ABI_KINDS = frozenset({"repeated_safe", "persistent_rows"})
 _HEADS: tuple[int, ...] = (8, 12, 24, 32, 48, 96)
+# H=8 positive-unique FP32 rows served by the two-CTA cluster split.  Mirrors
+# the Cake launcher's CLUSTER2_H8_MAX_ROWS (measured on B200 and B300).
+_H8_CLUSTER2_MAX_ROWS = 9
 _ARG_PLAN_SHA256 = {
     name: hashlib.sha256(
         json.dumps(arguments, separators=(",", ":")).encode()
@@ -138,6 +141,12 @@ class CakeFusedKDADecodeVariant:
     threads: int
     dynamic_smem_bytes: int
     eligibility: tuple[CakeFusedKDADecodeEligibility, ...]
+    # CTAs per (row, head) work item along grid.x.  1 for every single-CTA
+    # schedule; 2 for the two-CTA cluster split, whose frozen kernel carries
+    # compile-time ``__cluster_dims__(2,1,1)`` and reads its value tile from
+    # ``%cluster_ctarank``.  The binding multiplies grid.x by this value and
+    # launches with the matching cluster-dimension attribute.
+    cluster_x: int = 1
 
 
 # Target-owned static registration. There is deliberately no runtime generated
@@ -616,6 +625,68 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
                 "heads": [8],
                 "minimum_rows": 64,
                 "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "cluster2_wide_positive_f32_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_cluster2_wide_positive_f32_wide_slot_offsets.cu",
+        "source_sha256": "0629494828e975db00412e2f8704616569dcf6ffa131e4af7c19952ef79013de",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_cluster2_wide_positive_f32_wide_slot_offsets",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 9344,
+        "cluster_x": 2,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": _H8_CLUSTER2_MAX_ROWS,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "cluster2_wide_positive_f32",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_cluster2_wide_positive_f32.cu",
+        "source_sha256": "86dc8125ec2ca24d0bdfe2f6f59c350f24daa6e827ab209acf6b8c488deebef2",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_cluster2_wide_positive_f32",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 9344,
+        "cluster_x": 2,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": _H8_CLUSTER2_MAX_ROWS,
                 "state_indices_modes": ["positive_unique"],
                 "lower_bound_values": "any",
                 "norm_eps_values": "any",
@@ -4248,6 +4319,15 @@ def get_cake_fused_kda_decode_variants(
             # Preserve three resident CTAs when NVCC allocates more registers
             # than the source compiler for these wide-offset schedules.
             extra_cuda_cflags += ("-Xptxas=--minnctapersm=3",)
+        cluster_x = int(item.get("cluster_x", 1))
+        if cluster_x not in (1, 2):
+            raise ValueError(
+                f"unsupported Cake fused KDA cluster_x for {name}: {cluster_x}"
+            )
+        if cluster_x != 1 and item["abi_kind"] != "standard":
+            raise ValueError(
+                f"Cake fused KDA cluster variant {name} must use the standard launch ABI"
+            )
         eligibility = []
         for rule in item["eligibility"]:
             eligibility.append(
@@ -4275,6 +4355,7 @@ def get_cake_fused_kda_decode_variants(
                 threads=item["threads"],
                 dynamic_smem_bytes=item["dynamic_smem_bytes"],
                 eligibility=tuple(eligibility),
+                cluster_x=cluster_x,
             )
         )
     return tuple(result)
@@ -4302,6 +4383,7 @@ def _variant_build_identity_payload(
         "extra_cuda_cflags": variant.extra_cuda_cflags,
         "threads": variant.threads,
         "dynamic_smem_bytes": variant.dynamic_smem_bytes,
+        "cluster_x": variant.cluster_x,
         "eligibility": [
             {
                 "heads": rule.heads,
@@ -4385,12 +4467,15 @@ def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
 
     sm_count = 148
     if num_heads == 8:
-        # Measured H=8 bands (B200 and B300 route matrices, 2026-09-25): the
-        # staged compact family loses 5-16 % to high-work for rows 38..55,
-        # the vector-four producer loses to the spread producer, and the
-        # nearly empty third high-work wave makes wide512 the better route
-        # for rows 56..76.  Beyond that the rotating high-work pipeline is
-        # at least as fast everywhere.
+        # Measured H=8 bands (B200 and B300 route matrices, 2026-09-25): while
+        # SMs are idle the two-CTA cluster split halves each item's recurrence
+        # chain (rows <= _H8_CLUSTER2_MAX_ROWS); the staged compact family
+        # loses 5-16 % to high-work for rows 38..55, the vector-four producer
+        # loses to the spread producer, and the nearly empty third high-work
+        # wave makes wide512 the better route for rows 56..76.  Beyond that
+        # the rotating high-work pipeline is at least as fast everywhere.
+        if num_rows <= _H8_CLUSTER2_MAX_ROWS:
+            return ("cluster2_wide_positive_f32",)
         if num_rows <= 37 or 56 <= num_rows <= 76:
             return ("wide512_positive_f32",)
         return ("high_work_positive_f32",)
@@ -4612,6 +4697,7 @@ def _render_binding(variant: CakeFusedKDADecodeVariant) -> str:
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS {has_rows}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID {persistent_grid}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 {state_is_bfloat16}
+#define FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X {variant.cluster_x}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256 "{_ARG_PLAN_SHA256[variant.abi_kind]}"
 
 #include "{_BINDING_HEADER}"

@@ -34,6 +34,9 @@
 #ifndef FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16
 #error "FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 must match the frozen state dtype"
 #endif
+#ifndef FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X
+#error "FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X must match the frozen cluster launch geometry"
+#endif
 #ifndef FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256
 #error "FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256 must seal the kernel ABI"
 #endif
@@ -51,6 +54,12 @@ static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID == 0 ||
               "persistent Cake fused KDA decode kernels receive the row count");
 static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 == 0 ||
               FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 == 1);
+static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X == 1 ||
+              FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X == 2);
+static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X == 1 ||
+                  (FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS == 0 &&
+                   FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID == 0),
+              "clustered Cake fused KDA decode kernels use the standard per-item launch");
 static_assert(sizeof(FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256) == 65,
               "Cake fused KDA decode argument-plan identity must be a full SHA-256");
 
@@ -351,6 +360,28 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
         cudaLaunchKernel(kernel, grid, block, args, FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES, stream),
         "Cake fused KDA decode repeated-row launch");
   }
+#elif FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X > 1
+  // Two-CTA cluster split: consecutive CTAs along grid.x form one cluster
+  // and each owns one half of a (row, head) item's value rows.  The frozen
+  // kernel carries compile-time __cluster_dims__; the launch restates the
+  // same geometry as an explicit attribute so a driver that cannot honor it
+  // fails loudly instead of running the CTAs unclustered.
+  const dim3 grid(static_cast<uint32_t>(num_heads) * FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X,
+                  static_cast<uint32_t>(rows), 1);
+  cudaLaunchConfig_t launch_config = {};
+  launch_config.gridDim = grid;
+  launch_config.blockDim = block;
+  launch_config.dynamicSmemBytes = FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES;
+  launch_config.stream = stream;
+  cudaLaunchAttribute cluster_attribute = {};
+  cluster_attribute.id = cudaLaunchAttributeClusterDimension;
+  cluster_attribute.val.clusterDim.x = FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X;
+  cluster_attribute.val.clusterDim.y = 1;
+  cluster_attribute.val.clusterDim.z = 1;
+  launch_config.attrs = &cluster_attribute;
+  launch_config.numAttrs = 1;
+  CheckCuda(cudaLaunchKernelExC(&launch_config, kernel, args),
+            "Cake fused KDA decode cluster launch");
 #else
   const dim3 grid(static_cast<uint32_t>(num_heads), static_cast<uint32_t>(rows), 1);
   CheckCuda(
