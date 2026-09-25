@@ -215,9 +215,9 @@ def _build_kda_module(factory, *args, **kwargs):
 
 'FlashKDA-compatible runtime for Blackwell schedules.\n\nMinimum architecture: sm_100a.\n\nThe public ``fwd`` boundary adds ``compute_dtype="bf16"`` to the FlashKDA\narguments. BF16 compute retains BF16/FP32 external state support; TF32 compute\nrequires FP32 initial/final state. Checkpoints remain BF16. Families without\na validated TF32 implementation report an explicit unsupported request. BF16 H12 dispatches\nbetween the chunk-16 and chunk-32 direct M128 bodies at their measured sequence\nlength crossover; sequences that fit in one 16-token tile and checkpoint\nintervals that require a physical 16-token boundary retain chunk-16.\nActive-FP32-beta H12 checkpoint64 requests on 152-SM GB300 use the M64 value\nsplit for 129-256-token residuals whose doubled task grid fits one SM wave.\nOther head counts dispatch among those direct bodies, the source static-binned\npersistent M128 body, its cross-CTA recurrence-piece specialization for\nquantization-bound uniform grids, and the M64 value-row split. FP32 state\nreuses those physical schedules as state-I/O specializations where validated.\nUnder-parallelized ultra-long fixed layouts additionally use a split-sequence\naffine-prefix DAG derived from FlashInfer PR4779; its main, map, and correction\nwindows reuse the same variable-shape direct-M128 identity. Remaining regions\nretain the source-derived compatibility fallback.\n'
 import heapq
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -264,7 +264,11 @@ BT16_N16_MAX_DIRECT_WAVES = 3
 BT16_MID_MIN_SEQ_LEN = 4096
 BT16_LONG_MIN_SEQ_LEN = 65536
 BT16_MID_MAX_TASKS = 32
-AFFINE_SPLIT_MAX_TASKS = 32
+# Sequence x head tasks the affine composite accepts.  The window budget
+# (``sm_count // num_heads`` windows) keeps the part grid to one wave; the cap
+# only bounds host-side plan size (8 sequences x 16 heads).
+AFFINE_SPLIT_MAX_TASKS = 128
+LEGACY_AFFINE_SPLIT_MAX_TASKS = 32
 AFFINE_SPLIT_MIN_CHUNKS = 256
 AFFINE_SPLIT_MIN_CHUNKS_PER_PART = 32
 AFFINE_SPLIT_MIN_PARTS = 8
@@ -306,6 +310,29 @@ class _PersistentM128Roofline:
     piece_ns: float
 
 
+def _affine_split_policy() -> str:
+    """``packed`` (default) or ``legacy``.
+
+    ``packed`` gates a multi-sequence call on its longest sequence: the split
+    is taken when any sequence of the pack crosses the single-sequence part
+    crossover (the sequential body's makespan is that sequence's chunk chain,
+    while the composite splits it across the window budget).  ``legacy``
+    keeps the pre-2026-09-23 gate (aggregate sequence x head tasks, 32-task
+    cap) for A/B measurement.
+    """
+    import os
+
+    return os.environ.get("FLASHINFER_KDA_AFFINE_POLICY", "packed")
+
+
+def _affine_max_tasks() -> int:
+    return (
+        LEGACY_AFFINE_SPLIT_MAX_TASKS
+        if _affine_split_policy() == "legacy"
+        else AFFINE_SPLIT_MAX_TASKS
+    )
+
+
 def _affine_split_part_count(
     *,
     sm_count: int,
@@ -325,7 +352,7 @@ def _affine_split_part_count(
         min_chunks = max(64, tasks * 8)
     if (
         tasks <= 0
-        or tasks > AFFINE_SPLIT_MAX_TASKS
+        or tasks > _affine_max_tasks()
         or 2 * tasks > sm_count
         or (chunks < min_chunks)
     ):
@@ -360,10 +387,11 @@ def _affine_split_windows(
     if (
         not sequence_lengths
         or min(sequence_lengths) <= 0
-        or tasks > AFFINE_SPLIT_MAX_TASKS
+        or tasks > _affine_max_tasks()
     ):
         raise ValueError(
-            "affine requires nonempty sequences and at most32 sequence/head tasks"
+            "affine requires nonempty sequences and at most "
+            f"{_affine_max_tasks()} sequence/head tasks"
         )
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
@@ -945,6 +973,68 @@ def _device_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
+def _fused_affine_epilogue_enabled() -> bool:
+    """Return whether the affine composite fuses its torch epilogue.
+
+    ``FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE=0`` restores the torch glue
+    (checkpoint merge + index_copy_, tail add, final-state select/add and pool
+    scatter); both paths are bitwise identical, the fused one saves the host
+    time of ~10 torch launches per call.
+    """
+    import os
+
+    return os.environ.get("FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE", "1") != "0"
+
+
+@dataclass(frozen=True)
+class _FusedAffineEpilogue:
+    """Static arguments of the fused affine epilogue launch."""
+
+    run: Any
+    heads: int
+    tail_elems: int
+    pool_slot_stride: int
+    first_rows: int
+    num_rows: int
+
+    @staticmethod
+    def build(impl) -> "_FusedAffineEpilogue | None":
+        import torch
+
+        from flashinfer.jit.cake_kda_affine_epilogue import load_for_device
+
+        out_tail = impl._out_tail
+        pool = impl._final_pool
+        heads = int(impl._main_final.shape[1])
+        row_elems = heads * HEAD_DIM * HEAD_DIM
+        if not out_tail.is_contiguous() or out_tail.numel() % 8:
+            return None
+        if pool.ndim != 4 or pool.stride(0) % 8 or not pool[0].is_contiguous():
+            return None
+        if pool.dtype not in (torch.float32, torch.bfloat16):
+            return None
+        if pool.shape[1:] != (heads, HEAD_DIM, HEAD_DIM):
+            return None
+        first_rows = num_rows = 0
+        if impl._checkpoint_output is not None and not impl._checkpoint_in_place:
+            num_rows = int(impl._checkpoint_main.shape[0])
+            first_rows = num_rows - int(impl._checkpoint_correction.shape[0])
+            if impl._checkpoint_output.stride(0) != row_elems:
+                return None
+        try:
+            run = load_for_device(impl._launch_device)
+        except NotImplementedError:
+            return None
+        return _FusedAffineEpilogue(
+            run=run,
+            heads=heads,
+            tail_elems=int(out_tail.numel()),
+            pool_slot_stride=int(pool.stride(0)),
+            first_rows=first_rows,
+            num_rows=num_rows,
+        )
+
+
 def _uses_measured_sm100_persistent_policy(*, gpu_arch: str, sm_count: int) -> bool:
     """Return whether an exact measured SM100 persistent policy applies."""
     return gpu_arch == "sm_100a" and sm_count in (148, 152)
@@ -964,6 +1054,48 @@ def _uniform_persistent_worker_count(total_tasks: int, *, worker_cap: int) -> in
     return worker_cap
 
 
+def _upload_int32_batch(device, host_lists: dict[str, list[int]]):
+    """Upload several host int32 lists with one pinned, stream-ordered copy."""
+    import torch
+
+    return _upload_int_batch(device, host_lists, torch.int32)
+
+
+def _upload_int_batch(device, host_lists: dict[str, list[int]], dtype):
+    """Upload several host int32/int64 lists with one pinned, stream-ordered copy.
+
+    Preparation used to issue one pageable ``torch.tensor(..., device=cuda)``
+    per metadata list; each pageable copy stages through the driver and
+    synchronizes the host.  Packing every list into one pinned buffer and
+    issuing one non-blocking copy keeps preparation asynchronous and
+    capturable.  The pinned source stays alive through PyTorch's caching host
+    allocator until the copy completes.
+    """
+    import torch
+    from array import array
+
+    names = list(host_lists)
+    lengths = [len(host_lists[name]) for name in names]
+    total = sum(lengths)
+    if total == 0:
+        empty = torch.empty(0, dtype=dtype, device=device)
+        return {name: empty for name in names}
+    flat: list[int] = []
+    for name in names:
+        flat.extend(host_lists[name])
+    typecode = {torch.int32: "i", torch.int64: "q"}[dtype]
+    host = torch.frombuffer(array(typecode, flat), dtype=dtype).pin_memory()
+    device_flat = host.to(device, non_blocking=True)
+    # The pinned source is kept alive by the returned dict so that a copy
+    # captured into a CUDA graph replays from stable host memory.
+    uploads = {"_host_pinned": host}
+    offset = 0
+    for name, length in zip(names, lengths, strict=False):
+        uploads[name] = device_flat[offset : offset + length]
+        offset += length
+    return uploads
+
+
 def _make_lpt_task_bins(
     ordered_seq_lens: tuple[int, ...], *, num_heads: int, worker_count: int
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -973,14 +1105,16 @@ def _make_lpt_task_bins(
         raise ValueError("LPT bins require positive sequence/head/task counts")
     bins: list[list[int]] = [[] for _ in range(worker_count)]
     loads = [0] * worker_count
+    # Least-loaded worker with the lowest index; a heap keyed on
+    # (load, index) reproduces the linear-scan argmin in O(log W) per task.
+    heap = [(0, index) for index in range(worker_count)]
     for ordered_seq_idx, seq_len in enumerate(ordered_seq_lens):
         chunk_count = (seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
         for head_idx in range(num_heads):
-            worker_idx = min(
-                range(worker_count), key=lambda index: (loads[index], index)
-            )
+            load, worker_idx = heapq.heappop(heap)
             bins[worker_idx].append(ordered_seq_idx * num_heads + head_idx)
-            loads[worker_idx] += chunk_count
+            loads[worker_idx] = load + chunk_count
+            heapq.heappush(heap, (load + chunk_count, worker_idx))
     task_ids: list[int] = []
     task_offsets = [0]
     for worker_tasks in bins:
@@ -1047,8 +1181,10 @@ def _make_uniform_piece_task_bins(
     chunk_count = (seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
     bins: list[list[tuple[int, int, int, int, int]]] = [[] for _ in range(worker_count)]
     loads = [0] * worker_count
+    # Uniform whole-chain LPT: task t lands on worker t % W (least loaded,
+    # lowest index), which is exactly the linear-scan argmin result.
     for task_idx in range(total_tasks):
-        worker_idx = min(range(worker_count), key=lambda index: (loads[index], index))
+        worker_idx = task_idx % worker_count
         bins[worker_idx].append((task_idx, 0, seq_len, -1, -1))
         loads[worker_idx] += chunk_count
     base_tasks, extra_tasks = divmod(total_tasks, worker_count)
@@ -1834,6 +1970,7 @@ class FlashKDABlackwellBF16FusedLaunch:
     _n32_ft_slab = False
     _pdl_wait_initial_state_f32 = False
     _pdl_publish_final_state = False
+    _checkpoint_accumulate = False
     _affine_main_indexed_initial = False
     _affine_main_indexed_initial_bf16 = False
     _n16_short_four_stage = False
@@ -1868,9 +2005,16 @@ class FlashKDABlackwellBF16FusedLaunch:
         _affine_cache_token_offset: int = 0,
         _affine_cache_part_offset: int = 0,
         _affine_active_beta_f32: bool = False,
+        _affine_checkpoint_rows_resolved_on_device: bool = False,
     ) -> None:
         import torch
 
+        # The affine composite resolves each window's destination row start on
+        # the device at every launch (caller cu_starts gathered per window), so
+        # the host cannot value-check the offsets; shape checks still apply.
+        self._affine_checkpoint_rows_resolved_on_device = (
+            _affine_checkpoint_rows_resolved_on_device
+        )
         if _affine_active_beta_f32:
             if compute_dtype != "tf32":
                 raise ValueError("active-beta affine windows require TF32 compute")
@@ -2018,6 +2162,33 @@ class FlashKDABlackwellBF16FusedLaunch:
             host_task_ids, host_task_offsets, lpt_loads = _make_lpt_task_bins(
                 ordered_seq_lens, num_heads=num_heads, worker_count=sm_count
             )
+        # FP32 intermediate states are carried only by the fused direct M128
+        # N32 body (the M64 value split, the N16 tile and the owner/helper
+        # routes write BF16 rows), so an FP32 checkpoint request pins that
+        # tile exactly like an explicit N32 request.
+        fp32_checkpoint_request = bool(
+            checkpoint_every_n_tokens
+            and state_checkpoints is not None
+            and state_checkpoints.dtype == torch.float32
+        )
+        # The FP32 chunk carrier also serves unbounded BF16-compute prefill on
+        # the FP32 external state pool without a checkpoint request: its final
+        # state resumes decode, and the BF16 carrier drifts to 0.02-0.05 rel L2
+        # on real 8K activations (Triton 0.002).
+        # BF16 checkpoint rows keep the legacy BF16 carrier: the body's
+        # CHECKPOINT_DTYPE_IS_FP32 specialization also types the checkpoint
+        # rows, so the FP32 carrier is only legal without rows or with FP32 rows.
+        # Affine split parts (_n32_ft_slab) carry workspace slabs, not the
+        # caller's state pool, and run outside the serving-native ABI: they
+        # keep the BF16 carrier the composite was measured with.
+        fp32_carrier_request = fp32_checkpoint_request or (
+            unbounded_softplus
+            and self._state_dtype_is_fp32
+            and not self._n32_ft_slab
+            and compute_dtype == "bf16"
+            and state_checkpoints is None
+        )
+        force_direct_m128_n32 = self._force_direct_m128_n32 or fp32_carrier_request
         needs_direct_m128 = (
             unbounded_softplus
             or self._force_direct_m128
@@ -2147,7 +2318,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             gate_kind=gate_kind,
             force_direct_m128=self._force_direct_m128,
-            force_direct_m128_n32=self._force_direct_m128_n32,
+            force_direct_m128_n32=force_direct_m128_n32,
             n16_short_four_stage=self._n16_short_four_stage,
         ):
             route = BF16_ROUTE_M64
@@ -2157,7 +2328,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 num_heads=num_heads,
                 max_seq_len=max_seq_len,
                 force_direct_m128=self._force_direct_m128,
-                force_direct_m128_n32=self._force_direct_m128_n32,
+                force_direct_m128_n32=force_direct_m128_n32,
                 unbounded_softplus=unbounded_softplus,
                 n16_short_four_stage=self._n16_short_four_stage,
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
@@ -2224,7 +2395,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
                 compute_dtype=compute_dtype,
                 force_direct_m128=self._force_direct_m128,
-                force_direct_m128_n32=self._force_direct_m128_n32,
+                force_direct_m128_n32=force_direct_m128_n32,
                 n16_short_four_stage=self._n16_short_four_stage,
                 # Logit beta whose token pitch the 8x32 TMA box cannot encode is
                 # refreshed into a padded carrier each launch (see
@@ -2378,7 +2549,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                     chunk_tokens=direct_chunk_tokens,
                 )
             )
-        seq_order = torch.tensor(ordered_sequences, dtype=torch.int32, device=q.device)
+        host_uploads: dict[str, list[int]] = {"seq_order": list(ordered_sequences)}
         persistent_worker_count = _uniform_persistent_worker_count(
             total_tasks, worker_cap=sm_count
         )
@@ -2479,15 +2650,28 @@ class FlashKDABlackwellBF16FusedLaunch:
             raise ValueError(
                 "BF16 fused M64 checkpoint interval must be a multiple of 32"
             )
+        # BF16 checkpoints are the legacy observation contract.  FP32
+        # checkpoints (the intermediate-state contract that resumes
+        # recurrences from them) require FP32 external state I/O, and only
+        # the fused M128 body carries the FP32 chunk carrier.
+        fp32_checkpoints = bool(
+            checkpoint_every_n_tokens
+            and state_checkpoints is not None
+            and state_checkpoints.dtype == torch.float32
+        )
         if checkpoint_every_n_tokens:
             if state_checkpoints is None or checkpoint_cu_starts is None:
                 raise ValueError(
                     "state_checkpoints and checkpoint_cu_starts are required when checkpointing"
                 )
+            if fp32_checkpoints and not self._state_dtype_is_fp32:
+                raise ValueError(
+                    "FP32 state_checkpoints require FP32 initial/final state"
+                )
             _require_tensor(
                 state_checkpoints,
                 name="state_checkpoints",
-                dtype=torch.bfloat16,
+                dtype=torch.float32 if fp32_checkpoints else torch.bfloat16,
                 ndim=4,
             )
             _require_tensor(
@@ -2518,7 +2702,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint_cu_starts must encode ceil(seq_len / checkpoint_every_n_tokens) rows"
                 )
-            if checkpoint_offsets[-1] != state_checkpoints.shape[0]:
+            if self._affine_checkpoint_rows_resolved_on_device:
+                if state_checkpoints.shape[0] < checkpoint_offsets[-1]:
+                    raise ValueError(
+                        "state_checkpoints has fewer rows than the affine windows write"
+                    )
+            elif checkpoint_offsets[-1] != state_checkpoints.shape[0]:
                 raise ValueError(
                     "state_checkpoints row count does not match checkpoint_cu_starts"
                 )
@@ -2666,16 +2855,8 @@ class FlashKDABlackwellBF16FusedLaunch:
             if final_state is not None and self._state_dtype_is_fp32
             else empty_f32
         )
-        task_ids = seq_order
-        task_offsets = seq_order
-        task_token_starts = seq_order
-        task_token_counts = seq_order
-        task_state_sources = seq_order
-        task_state_destinations = seq_order
         mid_state = empty_state
         mid_state_ready = empty_u32
-        scalar_chunk_schedule = empty_i32
-        scalar_chunk_schedule_counts = empty_i32
         scalar_chunk_schedule_stride = 1
         if use_scalar_chunk_lpt_m128:
             (
@@ -2687,30 +2868,18 @@ class FlashKDABlackwellBF16FusedLaunch:
                 num_heads,
                 sm_count,
             )
-            scalar_chunk_schedule = torch.tensor(
-                host_scalar_chunk_schedule, dtype=torch.int32, device=q.device
-            )
-            scalar_chunk_schedule_counts = torch.tensor(
-                host_scalar_chunk_schedule_counts, dtype=torch.int32, device=q.device
+            host_uploads["scalar_chunk_schedule"] = list(host_scalar_chunk_schedule)
+            host_uploads["scalar_chunk_schedule_counts"] = list(
+                host_scalar_chunk_schedule_counts
             )
         if use_persistent_m128:
-            task_ids = torch.tensor(host_task_ids, dtype=torch.int32, device=q.device)
-            task_offsets = torch.tensor(
-                host_task_offsets, dtype=torch.int32, device=q.device
-            )
+            host_uploads["task_ids"] = list(host_task_ids)
+            host_uploads["task_offsets"] = list(host_task_offsets)
         if use_piece_persistent_m128:
-            task_token_starts = torch.tensor(
-                host_task_token_starts, dtype=torch.int32, device=q.device
-            )
-            task_token_counts = torch.tensor(
-                host_task_token_counts, dtype=torch.int32, device=q.device
-            )
-            task_state_sources = torch.tensor(
-                host_task_state_sources, dtype=torch.int32, device=q.device
-            )
-            task_state_destinations = torch.tensor(
-                host_task_state_destinations, dtype=torch.int32, device=q.device
-            )
+            host_uploads["task_token_starts"] = list(host_task_token_starts)
+            host_uploads["task_token_counts"] = list(host_task_token_counts)
+            host_uploads["task_state_sources"] = list(host_task_state_sources)
+            host_uploads["task_state_destinations"] = list(host_task_state_destinations)
             mid_state = torch.empty(
                 (handoff_count, HEAD_DIM, HEAD_DIM),
                 dtype=torch.float32 if use_tf32_persistent_m128 else torch.bfloat16,
@@ -2719,8 +2888,6 @@ class FlashKDABlackwellBF16FusedLaunch:
             mid_state_ready = torch.zeros(
                 handoff_count, dtype=torch.uint32, device=q.device
             )
-        bt16_cu_chunks = empty_i32
-        bt16_chunk_to_seq = empty_i32
         bt16_qd = empty_state
         bt16_kd = empty_state
         bt16_w = empty_state
@@ -2773,12 +2940,8 @@ class FlashKDABlackwellBF16FusedLaunch:
                 bt16_prepare_total_ctas = min(
                     num_heads * bt16_total_chunks, BT16_DENSE_PREP_WAVES * sm_count
                 )
-            bt16_cu_chunks = torch.tensor(
-                host_cu_chunks, dtype=torch.int32, device=q.device
-            )
-            bt16_chunk_to_seq = torch.tensor(
-                host_chunk_to_seq, dtype=torch.int32, device=q.device
-            )
+            host_uploads["bt16_cu_chunks"] = list(host_cu_chunks)
+            host_uploads["bt16_chunk_to_seq"] = list(host_chunk_to_seq)
             padded_tokens = bt16_total_chunks * BT16_CHUNK
             factor_shape = (1, num_heads, padded_tokens, HEAD_DIM)
             factor_dtype = torch.float32 if compute_dtype == "tf32" else torch.bfloat16
@@ -2803,6 +2966,21 @@ class FlashKDABlackwellBF16FusedLaunch:
                 dtype=torch.float32,
                 device=q.device,
             )
+        uploaded = _upload_int32_batch(q.device, host_uploads)
+        seq_order = uploaded["seq_order"]
+        task_ids = uploaded.get("task_ids", seq_order)
+        task_offsets = uploaded.get("task_offsets", seq_order)
+        task_token_starts = uploaded.get("task_token_starts", seq_order)
+        task_token_counts = uploaded.get("task_token_counts", seq_order)
+        task_state_sources = uploaded.get("task_state_sources", seq_order)
+        task_state_destinations = uploaded.get("task_state_destinations", seq_order)
+        scalar_chunk_schedule = uploaded.get("scalar_chunk_schedule", empty_i32)
+        scalar_chunk_schedule_counts = uploaded.get(
+            "scalar_chunk_schedule_counts", empty_i32
+        )
+        bt16_cu_chunks = uploaded.get("bt16_cu_chunks", empty_i32)
+        bt16_chunk_to_seq = uploaded.get("bt16_chunk_to_seq", empty_i32)
+        self._metadata_host = uploaded.get("_host_pinned")
         serving_native_abi = (
             self._active_beta_f32
             or state_indices is not None
@@ -2831,6 +3009,35 @@ class FlashKDABlackwellBF16FusedLaunch:
             or use_source_vtile_m128
             or use_scalar_chunk_lpt_m128
             or use_persistent_m128
+        )
+        if fp32_checkpoints and not uses_default_fused_m128:
+            raise NotImplementedError(
+                "FP32 intermediate states are only carried by the fused direct M128 body; "
+                f"route {route!r} writes BF16 checkpoints"
+            )
+        # FP32 chunk carrier: FP32 checkpoint rows, or unbounded BF16-compute
+        # prefill on the FP32 external state pool (see fp32_carrier_request).
+        fp32_carrier = fp32_checkpoints or (
+            unbounded_softplus
+            and self._state_dtype_is_fp32
+            and not self._n32_ft_slab
+            and compute_dtype == "bf16"
+            and uses_default_fused_m128
+            and state_checkpoints is None
+        )
+        # Affine split parts (_n32_ft_slab) run outside the serving-native ABI
+        # and cannot take the checkpoint-typed carrier unless they carry FP32
+        # rows.  Their map pass (BF16 state I/O, no rows) and row-less main /
+        # correction passes otherwise keep the BF16 carrier, whose per-part
+        # error compounds across the composed parts (0.002 -> 0.03 rel L2 over
+        # twelve parts on real 8K unbounded activations).  The standalone FP32
+        # state carrier keeps every part at sequential-body precision.
+        fp32_state_carrier = (
+            unbounded_softplus
+            and self._n32_ft_slab
+            and compute_dtype == "bf16"
+            and uses_default_fused_m128
+            and not fp32_carrier
         )
         if backend != "cuda_cpp" and (
             compute_dtype == "tf32"
@@ -2922,12 +3129,28 @@ class FlashKDABlackwellBF16FusedLaunch:
             not (use_tf32_direct_m128 or use_tf32_owner_helper)
             and not use_independent_dvsplit
         ):
+            if fp32_carrier and use_direct_m128_n16:
+                raise NotImplementedError(
+                    "the FP32 chunk carrier requires the N32 direct M128 body; "
+                    "the N16 checkpoint-TMA body only carries BF16 state"
+                )
+            if self._checkpoint_accumulate and not fp32_carrier:
+                raise ValueError(
+                    "checkpoint accumulation requires FP32 checkpoint rows"
+                )
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
+                **({"checkpoint_dtype_is_fp32": True} if fp32_carrier else {}),
+                **({"fp32_state_carrier": True} if fp32_state_carrier else {}),
+                **(
+                    {"checkpoint_accumulate": True}
+                    if self._checkpoint_accumulate
+                    else {}
+                ),
                 pair_packed_beta=use_pair_packed_beta,
                 scalar_beta=use_scalar_beta,
                 active_beta_f32=self._active_beta_f32,
@@ -2970,6 +3193,10 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if use_n32_tensor_state_decay
                 else "fused_direct_m128"
             )
+            if fp32_checkpoints:
+                self.schedule += "_fp32_checkpoints"
+            elif fp32_carrier or fp32_state_carrier:
+                self.schedule += "_fp32_carrier"
         if use_tf32_owner_helper:
             n32_value_rows = (
                 64 if 2 * SMALL_BH_GROUP_SIZE * total_tasks <= sm_count else 128
@@ -3454,7 +3681,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 zero_words=0,
                 num_sequences=num_seqs,
                 state_checkpoints_tma=state_checkpoints
-                if state_checkpoints is not None
+                if state_checkpoints is not None and not fp32_checkpoints
                 else empty_checkpoint_tma,
             )
         if use_small_bh_owner_helper:
@@ -3630,10 +3857,23 @@ class FlashKDABlackwellBF16FusedLaunch:
         self._cuda_graph_capture_stream = None
         self._cuda_graph_warmed = False
 
+    _descriptors_stale = False
+
+    def _prepare_descriptors_in_stream(self) -> None:
+        """Encode and upload every TMA descriptor on the current stream."""
+        if self.prepare_module is not None:
+            self.prepare_module.prepare(grid=self.prepare_grid, **self.prepare_args)
+        self.module.prepare(grid=self.grid, **self.args)
+        self._descriptors_stale = False
+
     def _launch_uncaptured(self) -> None:
         import tvm_ffi
 
         with tvm_ffi.use_torch_stream():
+            if self._descriptors_stale:
+                # A plan-cache rebind moved a descriptor source; re-encode in
+                # the same stream context as the launch it precedes.
+                self._prepare_descriptors_in_stream()
             for destination, source in self._token_storage_refreshes:
                 destination.copy_(source)
             if self._beta_tma_valid is not None:
@@ -3845,6 +4085,48 @@ class FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(
     _pdl_wait_initial_state_f32 = True
 
 
+class FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch(
+    FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+):
+    """Correction windows that add their FP32 rows onto the main pass's rows in place."""
+
+    _checkpoint_accumulate = True
+
+
+def _affine_rows_in_place_enabled() -> bool:
+    """FP32 affine checkpoint rows: main writes the caller's rows, correction accumulates.
+
+    ``CAKE_KDA_AFFINE_ROWS_IN_PLACE=0`` restores the private row windows plus
+    the merging epilogue (same values; used for A/B and bitwise tests).
+    """
+    import os
+
+    return os.environ.get("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "1") != "0"
+
+
+def _affine_window_row_starts(
+    token_offsets, part_offsets, *, checkpoint_every_n_tokens=64
+):
+    """Per window: (original sequence index, checkpoint rows before the window in that sequence).
+
+    Windows of a checkpointed sequence start on ``checkpoint_every_n_tokens``
+    boundaries (``_affine_split_windows`` keeps an even chunk count per
+    window), so each window's rows coincide with the sequence's own row grid
+    and the window can address the caller's rows directly.
+    """
+    import bisect
+
+    seq_ids, local_rows = [], []
+    for part in range(len(token_offsets) - 1):
+        seq = bisect.bisect_right(part_offsets, part) - 1
+        local = token_offsets[part] - token_offsets[part_offsets[seq]]
+        if local % checkpoint_every_n_tokens:
+            raise ValueError("affine window starts must sit on checkpoint boundaries")
+        seq_ids.append(seq)
+        local_rows.append(local // checkpoint_every_n_tokens)
+    return seq_ids, local_rows
+
+
 class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     """PR #4779 split-sequence affine prefix over direct-M128 windows.
 
@@ -3971,11 +4253,18 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 raise ValueError(
                     "affine checkpoints require output, offsets and interval64"
                 )
-            if (
-                state_checkpoints.dtype != torch.bfloat16
-                or not state_checkpoints.is_contiguous()
+            if not state_checkpoints.is_contiguous() or state_checkpoints.dtype not in (
+                torch.bfloat16,
+                torch.float32,
             ):
-                raise TypeError("affine checkpoint output must be contiguous BF16")
+                raise TypeError(
+                    "affine checkpoint output must be contiguous BF16 or FP32"
+                )
+            if (
+                state_checkpoints.dtype == torch.float32
+                and initial_state.dtype != torch.float32
+            ):
+                raise TypeError("FP32 affine checkpoints require an FP32 state pool")
             if state_checkpoints.ndim != 4 or state_checkpoints.shape[1:] != (
                 q.shape[2],
                 HEAD_DIM,
@@ -3999,26 +4288,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         num_parts = len(token_offsets) - 1
         self._num_sequences = num_sequences
         self.sequence_lengths = resolved_lengths
-        self._part_cu_seqlens = torch.tensor(
-            part_offsets, dtype=torch.int32, device=q.device
-        )
-        self._first_parts = torch.tensor(
-            part_offsets[:-1], dtype=torch.int64, device=q.device
-        )
-        self._last_parts = torch.tensor(
-            [end - 1 for end in part_offsets[1:]], dtype=torch.int64, device=q.device
-        )
-        self._last_correction_parts = torch.tensor(
-            [max(0, end - 2) for end in part_offsets[1:]],
-            dtype=torch.int64,
-            device=q.device,
-        )
-        self._zero_first_correction = part_offsets[1] == 1
-        self._part_state_indices = torch.full(
-            (num_parts,), -1, dtype=torch.int32, device=q.device
-        )
+        # Every host-side metadata list of the composite (part windows, part
+        # selectors, checkpoint-row plan) goes up in two pinned, stream-ordered
+        # copies (int32 / int64) after the lists are complete; one pageable
+        # ``torch.tensor(..., device=cuda)`` per list synchronized the host on
+        # every plan-cache miss (Phase A contract for the fused body).
         first_part_tokens = token_offsets[1]
         tail_offsets = [offset - first_part_tokens for offset in token_offsets[1:]]
+        host_i32 = {
+            "part_cu_seqlens": list(part_offsets),
+            "part_state_indices": [-1] * num_parts,
+        }
+        host_i64 = {
+            "first_parts": list(part_offsets[:-1]),
+            "last_parts": [end - 1 for end in part_offsets[1:]],
+            "last_correction_parts": [max(0, end - 2) for end in part_offsets[1:]],
+            "split_cu_seqlens": list(token_offsets),
+            "tail_cu_seqlens": list(tail_offsets),
+        }
+        self._zero_first_correction = part_offsets[1] == 1
         self.num_parts = num_parts
         self.split_parts = num_parts
         state_shape = (num_sequences, heads, HEAD_DIM, HEAD_DIM)
@@ -4035,9 +4323,9 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         if compute_dtype == "tf32":
             self.schedule += "_tf32_compute"
-        self._final_external = torch.empty(
-            state_shape, dtype=final_state.dtype, device=q.device
-        )
+        # Torch-epilogue scratch (final_external / *_selected / checkpoint_merged)
+        # is allocated only when the fused epilogue is unavailable (see below).
+        self._final_external = None
         self._main_initial = torch.zeros(
             (num_parts, heads, HEAD_DIM, HEAD_DIM), dtype=torch.float32, device=q.device
         )
@@ -4058,17 +4346,14 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._final_compact = torch.empty(
             state_shape, dtype=torch.float32, device=q.device
         )
-        self._final_main_selected = torch.empty_like(self._final_compact)
-        self._final_correction_selected = torch.empty_like(self._final_compact)
+        self._final_main_selected = None
+        self._final_correction_selected = None
         self._zero_v = torch.zeros_like(v[:, first_part_tokens:])
         self._map_out = torch.empty_like(out[:, first_part_tokens:])
         self._correction_out = torch.empty_like(out[:, first_part_tokens:])
-        split_cu_seqlens = torch.tensor(
-            token_offsets, dtype=torch.int64, device=q.device
-        )
-        tail_cu_seqlens = torch.tensor(tail_offsets, dtype=torch.int64, device=q.device)
         main_checkpoint_kwargs = {}
         correction_checkpoint_kwargs = {}
+        self._checkpoint_in_place = False
         if state_checkpoints is not None:
             cp_counts = [(length + 63) // 64 for length in resolved_lengths]
             cp_count = sum(cp_counts)
@@ -4081,48 +4366,99 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             correction_cp_offsets = [
                 offset - first_cp_count for offset in main_cp_offsets[1:]
             ]
-            self._checkpoint_main = torch.empty(
-                (cp_count, heads, HEAD_DIM, HEAD_DIM),
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
-            self._checkpoint_correction = torch.empty(
-                (cp_count - first_cp_count, heads, HEAD_DIM, HEAD_DIM),
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
-            self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
-            self._checkpoint_main_first = self._checkpoint_main[:first_cp_count]
-            self._checkpoint_main_tail = self._checkpoint_main[first_cp_count:]
-            self._checkpoint_merged_first = self._checkpoint_merged[:first_cp_count]
-            self._checkpoint_merged_tail = self._checkpoint_merged[first_cp_count:]
-            self._checkpoint_offsets = torch.tensor(
-                [row for count in cp_counts for row in range(count)],
-                dtype=torch.int64,
-                device=q.device,
-            )
-            self._checkpoint_sequence_ids = torch.tensor(
-                [seq for seq, count in enumerate(cp_counts) for _ in range(count)],
-                dtype=torch.int64,
-                device=q.device,
-            )
-            self._checkpoint_indices = torch.empty_like(self._checkpoint_offsets)
             self._checkpoint_start = checkpoint_cu_starts[:num_sequences]
+            self._checkpoint_merged = None
+            self._checkpoint_merged_first = None
+            self._checkpoint_merged_tail = None
+            self._first_cp_count = first_cp_count
+            self._checkpoint_in_place = (
+                state_checkpoints.dtype == torch.float32
+                and _affine_rows_in_place_enabled()
+            )
+            if self._checkpoint_in_place:
+                # FP32 rows: the main windows write the caller's rows directly
+                # and the correction windows add theirs in place, so no row is
+                # staged, re-read and merged.  Each window's destination row
+                # start (caller cu_starts of its sequence + rows before it) is
+                # gathered on the device at every launch: no host readback.
+                part_seq_ids, part_local_rows = _affine_window_row_starts(
+                    token_offsets, part_offsets
+                )
+                host_i64["part_seq_ids"] = part_seq_ids
+                host_i64["part_local_rows"] = part_local_rows
+                self._part_row_starts = torch.zeros(
+                    (num_parts + 1,), dtype=torch.int64, device=q.device
+                )
+                self._checkpoint_main = self._checkpoint_correction = None
+                self.schedule += "_checkpoint64_rows_in_place"
+            else:
+                # Window checkpoints follow the output contract: BF16 rows keep
+                # the main and correction windows exact before their merge.
+                self._checkpoint_main = torch.empty(
+                    (cp_count, heads, HEAD_DIM, HEAD_DIM),
+                    dtype=state_checkpoints.dtype,
+                    device=q.device,
+                )
+                self._checkpoint_correction = torch.empty(
+                    (cp_count - first_cp_count, heads, HEAD_DIM, HEAD_DIM),
+                    dtype=state_checkpoints.dtype,
+                    device=q.device,
+                )
+                self._checkpoint_main_first = self._checkpoint_main[:first_cp_count]
+                self._checkpoint_main_tail = self._checkpoint_main[first_cp_count:]
+                host_i64["checkpoint_offsets"] = [
+                    row for count in cp_counts for row in range(count)
+                ]
+                host_i64["checkpoint_sequence_ids"] = [
+                    seq for seq, count in enumerate(cp_counts) for _ in range(count)
+                ]
+                host_i64["main_cp_offsets"] = list(main_cp_offsets)
+                host_i64["correction_cp_offsets"] = list(correction_cp_offsets)
+                self._checkpoint_indices = torch.empty(
+                    (cp_count,), dtype=torch.int64, device=q.device
+                )
+                self.schedule += "_checkpoint64"
+        uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
+        uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
+        self._metadata_host = (
+            uploaded_i32.get("_host_pinned"),
+            uploaded_i64.get("_host_pinned"),
+        )
+        self._part_cu_seqlens = uploaded_i32["part_cu_seqlens"]
+        self._part_state_indices = uploaded_i32["part_state_indices"]
+        self._first_parts = uploaded_i64["first_parts"]
+        self._last_parts = uploaded_i64["last_parts"]
+        self._last_correction_parts = uploaded_i64["last_correction_parts"]
+        split_cu_seqlens = uploaded_i64["split_cu_seqlens"]
+        tail_cu_seqlens = uploaded_i64["tail_cu_seqlens"]
+        if state_checkpoints is not None and self._checkpoint_in_place:
+            self._part_seq_ids = uploaded_i64["part_seq_ids"]
+            self._part_local_rows = uploaded_i64["part_local_rows"]
+            main_checkpoint_kwargs = dict(
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=self._part_row_starts,
+                checkpoint_every_n_tokens=64,
+                _affine_checkpoint_rows_resolved_on_device=True,
+            )
+            correction_checkpoint_kwargs = dict(
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=self._part_row_starts[1:],
+                checkpoint_every_n_tokens=64,
+                _affine_checkpoint_rows_resolved_on_device=True,
+            )
+        elif state_checkpoints is not None:
+            self._checkpoint_offsets = uploaded_i64["checkpoint_offsets"]
+            self._checkpoint_sequence_ids = uploaded_i64["checkpoint_sequence_ids"]
             main_checkpoint_kwargs = dict(
                 state_checkpoints=self._checkpoint_main,
-                checkpoint_cu_starts=torch.tensor(
-                    main_cp_offsets, dtype=torch.int64, device=q.device
-                ),
+                checkpoint_cu_starts=uploaded_i64["main_cp_offsets"],
                 checkpoint_every_n_tokens=64,
             )
             correction_checkpoint_kwargs = dict(
                 state_checkpoints=self._checkpoint_correction,
-                checkpoint_cu_starts=torch.tensor(
-                    correction_cp_offsets, dtype=torch.int64, device=q.device
-                ),
+                checkpoint_cu_starts=uploaded_i64["correction_cp_offsets"],
                 checkpoint_every_n_tokens=64,
             )
-            self.schedule += "_checkpoint64"
         main_factor_kwargs = {}
         tail_factor_kwargs = {}
         self._factor_cache = None
@@ -4187,7 +4523,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._main.args["initial_state"] = self._initial_pool_pointer
         self._correction = None
         if not self._use_output_projection:
-            self._correction = FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(
+            correction_cls = (
+                FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch
+                if self._checkpoint_in_place
+                else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
+            )
+            self._correction = correction_cls(
                 q[:, first_part_tokens:],
                 k[:, first_part_tokens:],
                 self._zero_v,
@@ -4305,6 +4646,28 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             tail_cu_seqlens,
         )
         self._launch_device = q.device
+        self._fused_epilogue = None
+        if not self._use_output_projection and _fused_affine_epilogue_enabled():
+            self._fused_epilogue = _FusedAffineEpilogue.build(self)
+            if self._fused_epilogue is not None:
+                self.schedule += "_fused_epilogue"
+        if self._fused_epilogue is None:
+            # Torch epilogue scratch: a merged copy of the checkpoint rows plus
+            # the selected/converted final states (~4x the checkpoint rows of a
+            # 16K pack; retained per plan-cache entry, so only when needed).
+            self._final_external = torch.empty(
+                state_shape, dtype=final_state.dtype, device=q.device
+            )
+            self._final_main_selected = torch.empty_like(self._final_compact)
+            self._final_correction_selected = torch.empty_like(self._final_compact)
+            if self._checkpoint_output is not None and not self._checkpoint_in_place:
+                self._checkpoint_merged = torch.empty_like(self._checkpoint_main)
+                self._checkpoint_merged_first = self._checkpoint_merged[
+                    : self._first_cp_count
+                ]
+                self._checkpoint_merged_tail = self._checkpoint_merged[
+                    self._first_cp_count :
+                ]
         self._use_cuda_graph = True
         self._cuda_graph_warmed = False
         self._cuda_graph = None
@@ -4314,6 +4677,14 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         import torch
         import tvm_ffi
 
+        if self._descriptors_stale:
+            # A plan-cache hit under CUDA-graph capture marks the composite;
+            # every part re-encodes its descriptors in its own stream context.
+            for sub_name in AFFINE_SUB_LAUNCHES:
+                sub = getattr(self, sub_name, None)
+                if sub is not None:
+                    sub._descriptors_stale = True
+            self._descriptors_stale = False
         with tvm_ffi.use_torch_stream():
             for destination, source in self._affine_input_refreshes:
                 destination.copy_(source)
@@ -4321,6 +4692,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._part_state_indices.index_copy_(
                 0, self._first_parts, self._state_indices
             )
+            if self._checkpoint_in_place:
+                starts = self._part_row_starts[: self.num_parts]
+                torch.index_select(
+                    self._checkpoint_start, 0, self._part_seq_ids, out=starts
+                )
+                starts.add_(self._part_local_rows)
             self._main.launch()
             self._map.launch()
             self._scan_module.launch(
@@ -4339,7 +4716,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 )
             else:
                 self._correction.launch()
-            if self._checkpoint_output is not None:
+            if self._fused_epilogue is not None:
+                self._launch_fused_epilogue()
+                return
+            if self._checkpoint_output is not None and not self._checkpoint_in_place:
                 self._checkpoint_merged_first.copy_(self._checkpoint_main_first)
                 torch.add(
                     self._checkpoint_main_tail,
@@ -4400,6 +4780,52 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._final_pool.index_copy_(
                     0, self._state_indices_long, self._final_external
                 )
+
+    def _launch_fused_epilogue(self) -> None:
+        """One kernel: checkpoint-row merge/scatter, tail add, final state."""
+        fused = self._fused_epilogue
+        merge_rows = (
+            self._checkpoint_output is not None and not self._checkpoint_in_place
+        )
+        if merge_rows:
+            rows = (
+                self._checkpoint_main,
+                self._checkpoint_correction,
+                self._checkpoint_output,
+                self._checkpoint_offsets,
+                self._checkpoint_sequence_ids,
+                self._checkpoint_start,
+            )
+        else:
+            # Unused by the kernel (has_rows=0); any tensors of the right kind.
+            rows = (
+                self._main_final,
+                self._main_final,
+                self._main_final,
+                self._last_parts,
+                self._last_parts,
+                self._last_parts,
+            )
+        fused.run(
+            *rows,
+            fused.first_rows,
+            fused.num_rows,
+            self._out_tail,
+            self._correction_out,
+            self._main_final,
+            self._correction_final,
+            self._last_parts,
+            self._last_correction_parts,
+            int(self._zero_first_correction),
+            self._final_compact,
+            self._final_pool,
+            fused.pool_slot_stride,
+            self._state_indices_long,
+            self._num_sequences,
+            fused.heads,
+            fused.tail_elems,
+            int(merge_rows),
+        )
 
     def close(self) -> None:
         self._cuda_graph = None
@@ -4592,21 +5018,412 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or checkpoint_every_n_tokens != 64
     ):
         return False
+    # Unbounded (softplus) prefill on the FP32 external state pool is the
+    # serving contract (final state resumes decode; checkpoint rows feed the
+    # radix cache).  Its split parts carry the standalone FP32 state carrier,
+    # which removed the composed per-part drift (real 8K activations: per-chunk
+    # rel L2 flat at 0.002-0.0034 across nine parts, Triton 0.0026-0.0031),
+    # and the composite is covered by the plan cache, so it takes the split at
+    # the same part-count crossover as every other caller.
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
         return False
-    return (
-        detect_gpu_arch() in ("sm_100a", "sm_103a")
-        and _affine_split_part_count(
-            sm_count=_device_sm_count(q.device),
-            tasks=len(lengths) * int(q.shape[2]),
-            chunks=(max(lengths) + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK,
-            fp32_indexed_state=initial_state.dtype == torch.float32,
-            shared_tf32_factors=compute_dtype == "tf32",
-            unbounded_softplus=argument(9, "lower_bound") is None,
-        )
-        >= 2
+    if detect_gpu_arch() not in ("sm_100a", "sm_103a"):
+        return False
+    heads = int(q.shape[2])
+    crossover = dict(
+        sm_count=_device_sm_count(q.device),
+        fp32_indexed_state=initial_state.dtype == torch.float32,
+        shared_tf32_factors=compute_dtype == "tf32",
+        unbounded_softplus=argument(9, "lower_bound") is None,
     )
+    chunk_counts = [
+        (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in lengths
+    ]
+    if len(lengths) == 1 or _affine_split_policy() == "legacy":
+        return (
+            _affine_split_part_count(
+                tasks=len(lengths) * heads, chunks=max(chunk_counts), **crossover
+            )
+            >= 2
+        )
+    # Packed call: the sequential body's makespan is the longest sequence's
+    # chunk chain (GB300 H16, rows every 64: ~3.7 us per chunk), while the
+    # composite costs ~0.93 ms for a 16K pack regardless of how it is split.
+    # Measured break-even is a 256-chunk (8192-token) longest member: packs
+    # with a longer member gain up to 1.5x (1000+12000+3384: 1.39 -> 0.97 ms),
+    # balanced packs below it lose (4x4096: 0.52 -> 0.96 ms).  Packs beyond
+    # half the SM count in sequence x head tasks get too few windows for the
+    # long member (6x500+13384: 1.64 -> 1.78 ms) and stay sequential.
+    tasks = len(lengths) * heads
+    if tasks > _affine_max_tasks() or 2 * tasks > crossover["sm_count"]:
+        return False
+    longest = max(chunk_counts)
+    return (
+        longest >= AFFINE_SPLIT_MIN_CHUNKS
+        and _affine_split_part_count(tasks=heads, chunks=longest, **crossover) >= 2
+    )
+
+
+REBIND_INPUT_NAMES = (
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "out",
+    "A_log",
+    "dt_bias",
+    "initial_state",
+    "final_state",
+    "cu_seqlens",
+    "state_indices",
+    "state_checkpoints",
+    "checkpoint_cu_starts",
+)
+
+
+def _rebind_tensor_signature(tensor) -> tuple | None:
+    """Layout facts a prepared launch depends on, excluding the base address.
+
+    The low address bits are kept because preparation branches on 16-byte
+    alignment (pair-packed beta TMA, checkpoint TMA) and TMA descriptors
+    require 16-byte aligned bases.
+    """
+    if tensor is None:
+        return None
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.data_ptr() & 0xFF,
+        tensor.device.index,
+    )
+
+
+def _storage_base_address(tensor) -> int:
+    """Byte address of the tensor's storage start without materializing a Storage."""
+    return tensor.data_ptr() - tensor.storage_offset() * tensor.element_size()
+
+
+def rebind_signature(inputs: dict) -> tuple:
+    """Structural key under which a prepared launch can be rebound to new inputs.
+
+    Two calls share a signature when every caller tensor has the same shape,
+    strides, dtype, device and 256-byte alignment, and the same tensors alias
+    each other (``initial_state is final_state`` for an in-place pool,
+    packed ``q``/``k``/``v`` slices of one projection buffer, ...).
+    """
+    storage_groups: dict[int, int] = {}
+    facts: list[Optional[tuple]] = []
+    aliases: list[Optional[int]] = []
+    for name in REBIND_INPUT_NAMES:
+        tensor = inputs.get(name)
+        if tensor is None:
+            facts.append(None)
+            aliases.append(None)
+            continue
+        pointer = tensor.data_ptr()
+        facts.append(
+            (
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+                pointer & 0xFF,
+                tensor.device.index,
+            )
+        )
+        base = pointer - tensor.storage_offset() * tensor.element_size()
+        aliases.append(storage_groups.setdefault(base, len(storage_groups)))
+    return (tuple(facts), tuple(aliases))
+
+
+@dataclass(frozen=True)
+class _RebindView:
+    container: str
+    key: Any
+    input_name: str
+    byte_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: Any
+
+
+@dataclass(frozen=True)
+class _RebindAddress:
+    container: str
+    key: Any
+    input_name: str
+    byte_offset: int
+
+
+@dataclass
+class RebindPlan:
+    """Address-relative record of every prepared argument aliasing a caller tensor."""
+
+    signature: tuple
+    views: tuple[_RebindView, ...]
+    addresses: tuple[_RebindAddress, ...]
+    owned_keepalive: tuple[Any, ...]
+    sub_owned_keepalive: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+
+
+# Split-sequence affine composites hold three prepared part launches plus a
+# few caller-aliasing attributes of their own; their containers are addressed
+# as "<sub launch>.<container>" so one rebind plan covers the whole DAG.
+AFFINE_SUB_LAUNCHES = ("_main", "_map", "_correction")
+AFFINE_REBIND_ATTRIBUTES = (
+    "_state_indices",
+    "_initial_pool",
+    "_initial_pool_pointer",
+    "_final_pool",
+    "_checkpoint_output",
+    "_checkpoint_start",
+    "_out_tail",
+)
+
+
+def _rebind_owner(impl, container_name: str):
+    """Resolve (owner object, base container name) for a plan container."""
+    if "." in container_name:
+        sub_name, base = container_name.split(".", 1)
+        return getattr(impl, sub_name), base
+    return impl, container_name
+
+
+def _rebind_containers(impl) -> dict[str, Any]:
+    if hasattr(impl, "_main"):
+        containers: dict[str, Any] = {}
+        for sub_name in AFFINE_SUB_LAUNCHES:
+            sub = getattr(impl, sub_name, None)
+            if sub is None:
+                continue
+            for key, value in _rebind_containers(sub).items():
+                containers[f"{sub_name}.{key}"] = value
+        containers["attributes"] = {
+            name: getattr(impl, name)
+            for name in AFFINE_REBIND_ATTRIBUTES
+            if getattr(impl, name, None) is not None
+        }
+        refreshes = getattr(impl, "_affine_input_refreshes", ())
+        if refreshes:
+            containers["affine_refresh_sources"] = {
+                index: source for index, (_, source) in enumerate(refreshes)
+            }
+        return containers
+    containers = {"args": impl.args}
+    prepare_args = getattr(impl, "prepare_args", None)
+    if prepare_args:
+        containers["prepare_args"] = prepare_args
+    refreshes = getattr(impl, "_token_storage_refreshes", ())
+    if refreshes:
+        # Sources are logical views of the caller's g/beta storage; the
+        # destinations are launch-owned staging buffers.
+        containers["refresh_sources"] = {
+            index: source for index, (_, source) in enumerate(refreshes)
+        }
+    attributes = {}
+    for name in ("_beta_tma_source", "_beta_tma_valid"):
+        value = getattr(impl, name, None)
+        if value is not None:
+            attributes[name] = value
+    if attributes:
+        containers["attributes"] = attributes
+    return containers
+
+
+def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
+    """Record how a freshly prepared launch aliases its caller tensors.
+
+    Every tensor argument that shares storage with a caller tensor is stored
+    as (input name, byte offset from that input's data pointer, view shape,
+    view stride, dtype); every ``*_addr`` integer inside a caller storage is
+    stored as (input name, byte offset).  Launch-owned buffers (dummies,
+    staging copies, persistent-task metadata, TMA workspace) are not aliased
+    and are left untouched by :func:`rebind_prepared_launch`.
+    """
+    import torch
+
+    storages: dict[int, tuple[str, Any, int]] = {}
+    for name in REBIND_INPUT_NAMES:
+        tensor = inputs.get(name)
+        if tensor is None:
+            continue
+        storage = tensor.untyped_storage()
+        storages.setdefault(storage.data_ptr(), (name, tensor, storage.nbytes()))
+
+    def classify(tensor):
+        hit = storages.get(_storage_base_address(tensor))
+        if hit is None:
+            return None
+        name, source, _ = hit
+        return name, tensor.data_ptr() - source.data_ptr()
+
+    views: list[_RebindView] = []
+    addresses: list[_RebindAddress] = []
+    for container_name, container in _rebind_containers(impl).items():
+        for key, value in container.items():
+            if isinstance(value, torch.Tensor):
+                hit = classify(value)
+                if hit is not None:
+                    views.append(
+                        _RebindView(
+                            container_name,
+                            key,
+                            hit[0],
+                            hit[1],
+                            tuple(value.shape),
+                            tuple(value.stride()),
+                            value.dtype,
+                        )
+                    )
+            elif (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and isinstance(key, str)
+                and key.endswith("_addr")
+            ):
+                for base, (name, source, nbytes) in storages.items():
+                    if base <= value < base + nbytes:
+                        addresses.append(
+                            _RebindAddress(
+                                container_name, key, name, value - source.data_ptr()
+                            )
+                        )
+                        break
+
+    def owned_items(owner):
+        return tuple(
+            item
+            for item in getattr(owner, "_keepalive", ())
+            if not (isinstance(item, torch.Tensor) and classify(item) is not None)
+        )
+
+    sub_owned = {}
+    if hasattr(impl, "_main"):
+        for sub_name in AFFINE_SUB_LAUNCHES:
+            sub = getattr(impl, sub_name, None)
+            if sub is not None:
+                sub_owned[sub_name] = owned_items(sub)
+    return RebindPlan(
+        signature=rebind_signature(inputs),
+        views=tuple(views),
+        addresses=tuple(addresses),
+        owned_keepalive=owned_items(impl),
+        sub_owned_keepalive=sub_owned,
+    )
+
+
+def rebind_prepared_launch(
+    impl, plan: RebindPlan, inputs: dict, *, signature: tuple | None = None
+) -> bool:
+    """Point a prepared launch at new caller tensors with the recorded layout.
+
+    ``signature`` is the precomputed ``rebind_signature(inputs)``; when omitted
+    it is recomputed and checked here.  Only host-side view construction
+    happens in this call.  The return value reports whether any TMA-described
+    argument (``*_tma`` keys) moved, in which case the caller must re-encode
+    the descriptors (``prepare_descriptors``): one stream-ordered upload
+    kernel, and therefore CUDA-graph capturable.  Unchanged descriptor
+    sources may keep the workspace contents.
+    """
+    import torch
+
+    if signature is None:
+        signature = rebind_signature(inputs)
+    if signature != plan.signature:
+        raise ValueError("prepared launch signature does not match the new inputs")
+    containers = _rebind_containers(impl)
+    tma_moved = False
+    resolved: dict[tuple, Any] = {}
+
+    def view_for(spec: _RebindView):
+        cache_key = (
+            spec.input_name,
+            spec.byte_offset,
+            spec.shape,
+            spec.stride,
+            spec.dtype,
+        )
+        tensor = resolved.get(cache_key)
+        if tensor is not None:
+            return tensor
+        source = inputs[spec.input_name]
+        if (
+            spec.byte_offset == 0
+            and source.dtype == spec.dtype
+            and tuple(source.shape) == spec.shape
+            and tuple(source.stride()) == spec.stride
+        ):
+            tensor = source
+        elif (
+            source.dtype == spec.dtype and spec.byte_offset % source.element_size() == 0
+        ):
+            tensor = source.as_strided(
+                spec.shape,
+                spec.stride,
+                source.storage_offset() + spec.byte_offset // source.element_size(),
+            )
+        else:
+            tensor = torch.empty(0, dtype=spec.dtype, device=source.device)
+            base_bytes = source.data_ptr() - source.untyped_storage().data_ptr()
+            if (base_bytes + spec.byte_offset) % tensor.element_size():
+                raise ValueError("rebound view is not aligned to its element size")
+            tensor.set_(
+                source.untyped_storage(),
+                (base_bytes + spec.byte_offset) // tensor.element_size(),
+                spec.shape,
+                spec.stride,
+            )
+        resolved[cache_key] = tensor
+        return tensor
+
+    stale_owners: list = []
+    for spec in plan.views:
+        container = containers[spec.container]
+        replacement = view_for(spec)
+        if (
+            isinstance(spec.key, str)
+            and spec.key.endswith("_tma")
+            and container[spec.key].data_ptr() != replacement.data_ptr()
+        ):
+            tma_moved = True
+            owner, _ = _rebind_owner(impl, spec.container)
+            if owner is not impl and owner not in stale_owners:
+                stale_owners.append(owner)
+        container[spec.key] = replacement
+    for address in plan.addresses:
+        containers[address.container][address.key] = (
+            inputs[address.input_name].data_ptr() + address.byte_offset
+        )
+    new_inputs = tuple(
+        inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
+    )
+    for container_name, container in containers.items():
+        owner, base = _rebind_owner(impl, container_name)
+        if base == "refresh_sources":
+            owner._token_storage_refreshes = tuple(
+                (destination, container[index])
+                for index, (destination, _) in enumerate(owner._token_storage_refreshes)
+            )
+        elif base == "affine_refresh_sources":
+            owner._affine_input_refreshes = tuple(
+                (destination, container[index])
+                for index, (destination, _) in enumerate(owner._affine_input_refreshes)
+            )
+        elif base == "attributes":
+            for name, value in container.items():
+                setattr(owner, name, value)
+    for sub_name, owned in plan.sub_owned_keepalive.items():
+        sub = getattr(impl, sub_name, None)
+        if sub is not None:
+            sub._keepalive = owned + new_inputs
+    for owner in stale_owners:
+        # Part launches re-encode their own descriptors inside their launch
+        # stream context (see _launch_uncaptured).
+        owner._descriptors_stale = True
+    impl._keepalive = plan.owned_keepalive + new_inputs
+    return tma_moved
 
 
 class FlashKDABlackwellLaunch:
