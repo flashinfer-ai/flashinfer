@@ -1,0 +1,1494 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import threading
+from collections import OrderedDict
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Literal, Optional, Union
+
+import torch
+from filelock import FileLock
+from tvm_ffi import cpp
+
+from ..jit import env as jit_env
+from ..jit.core import logger
+from ..jit.cpp_ext import is_cuda_version_at_least
+from ..utils import get_compute_capability, get_device_sm_count, log2e
+
+# --- Source-built domain loader (formerly flashinfer/jit/cake_trtllm_mla_blackwell.py) ---
+
+_TARGETS = {
+    "sm_100a_148": ("sm_100a", 148),
+    "sm_100a_152": ("sm_100a", 152),
+    "sm_103a_148": ("sm_103a", 148),
+    "sm_103a_152": ("sm_103a", 152),
+}
+_TARGET_ORDER = tuple(_TARGETS)
+_ARCH_CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
+_SOURCE_CATALOG_RELATIVE_PATH = Path("generated") / "cake_source_catalog.json"
+_DOMAIN_DEVICE_COUNTS = {
+    "mla_bf16_vquarter": 1,
+    "mla_bf16_vhalf": 1,
+    "mla_bf16_unsplit": 1,
+    "mla_bf16_clc": 8,
+    "mla_bf16_tail": 1,
+    "mla_fp8_tail": 1,
+    "mla_fp8_p32_qk_l2": 1,
+    "mla_fp8_page64_pdl": 2,
+    "mla_bf16_native_split8_pdl": 2,
+}
+_DOMAIN_ORDER = tuple(_DOMAIN_DEVICE_COUNTS)
+_EXPORTED_COMPILE_FLAGS = ["--use_fast_math"]
+_HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_C_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _source_dir() -> Path:
+    """Locate the generated MLA source package in installs and checkouts."""
+
+    packaged = jit_env.FLASHINFER_CSRC_DIR / "cake_trtllm_mla_blackwell"
+    if packaged.is_dir():
+        return packaged
+    return Path(__file__).resolve().parents[2] / "csrc" / "cake_trtllm_mla_blackwell"
+
+
+def _source_record(
+    value: object,
+    *,
+    domain: str,
+    kind: str,
+    target: str | None = None,
+    index: int | None = None,
+) -> Mapping[str, object]:
+    location_parts = [domain]
+    if target is not None:
+        location_parts.append(target)
+    location_parts.append(kind if index is None else f"{kind}[{index}]")
+    location = "/".join(location_parts)
+    expected_keys = {"path", "sha256"}
+    if kind == "device_source":
+        expected_keys.update({"module_ident", "compile_flags"})
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise RuntimeError(
+            f"TRT-LLM MLA Blackwell catalog {location} schema is invalid"
+        )
+
+    relative = value["path"]
+    sha256 = value["sha256"]
+    suffix = ".cpp" if kind == "host_source" else ".cu"
+    if not isinstance(relative, str):
+        raise RuntimeError(f"TRT-LLM MLA Blackwell catalog {location} path is invalid")
+    path = PurePosixPath(relative)
+    if (
+        not relative
+        or "\\" in relative
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.as_posix() != relative
+        or path.suffix != suffix
+    ):
+        raise RuntimeError(
+            f"TRT-LLM MLA Blackwell catalog {location} path is noncanonical: {relative!r}"
+        )
+    if not isinstance(sha256, str) or _HEX_SHA256.fullmatch(sha256) is None:
+        raise RuntimeError(
+            f"TRT-LLM MLA Blackwell catalog {location} sha256 is invalid"
+        )
+
+    if kind == "device_source":
+        module_ident = value["module_ident"]
+        compile_flags = value["compile_flags"]
+        if (
+            not isinstance(module_ident, str)
+            or _C_IDENTIFIER.fullmatch(module_ident) is None
+        ):
+            raise RuntimeError(
+                f"TRT-LLM MLA Blackwell catalog {location} module identity is invalid"
+            )
+        if compile_flags != _EXPORTED_COMPILE_FLAGS:
+            raise RuntimeError(
+                f"TRT-LLM MLA Blackwell catalog {location} compile flags differ from "
+                f"the exported contract: {compile_flags!r}"
+            )
+    return value
+
+
+@functools.cache
+def _source_catalog() -> Mapping[str, object]:
+    """Load and validate the exact physical-target generated-source catalog."""
+
+    catalog_path = _source_dir() / _SOURCE_CATALOG_RELATIVE_PATH
+    if not catalog_path.is_file():
+        raise RuntimeError(
+            f"TRT-LLM MLA Blackwell generated-source catalog is missing: {catalog_path}"
+        )
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"TRT-LLM MLA Blackwell generated-source catalog is unreadable: {catalog_path}"
+        ) from error
+    if not isinstance(catalog, dict) or set(catalog) != {
+        "schema_version",
+        "target_order",
+        "targets",
+        "domain_order",
+        "domains",
+    }:
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell generated-source catalog schema is invalid"
+        )
+    target_order = catalog["target_order"]
+    canonical_targets = [
+        target
+        for target in _TARGET_ORDER
+        if isinstance(target_order, list) and target in target_order
+    ]
+    expected_targets = {
+        target: {"arch": arch, "multi_processor_count": multi_processor_count}
+        for target, (arch, multi_processor_count) in _TARGETS.items()
+        if target in canonical_targets
+    }
+    if (
+        isinstance(catalog["schema_version"], bool)
+        or catalog["schema_version"] != 4
+        or not canonical_targets
+        or target_order != canonical_targets
+        or not isinstance(catalog["targets"], dict)
+        or list(catalog["targets"]) != target_order
+        or catalog["targets"] != expected_targets
+        or catalog["domain_order"] != list(_DOMAIN_ORDER)
+    ):
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell generated-source catalog identity is invalid"
+        )
+
+    domains = catalog["domains"]
+    if not isinstance(domains, dict) or tuple(domains) != _DOMAIN_ORDER:
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell generated-source catalog domain topology is invalid"
+        )
+    source_paths: set[str] = set()
+    # Every physical target carries its own generated host source and device
+    # identities: the schedules are traced per target, so module identities and
+    # host dispatch code are independent between targets.
+    module_idents_by_target: dict[str, set[str]] = {
+        target: set() for target in target_order
+    }
+    device_source_count = {target: 0 for target in target_order}
+    for domain, expected_device_count in _DOMAIN_DEVICE_COUNTS.items():
+        profile = domains[domain]
+        if not isinstance(profile, dict) or set(profile) != {
+            "host_sources",
+            "device_sources",
+        }:
+            raise RuntimeError(
+                f"TRT-LLM MLA Blackwell catalog domain {domain!r} schema is invalid"
+            )
+        hosts_by_target = profile["host_sources"]
+        devices_by_target = profile["device_sources"]
+        if (
+            not isinstance(hosts_by_target, dict)
+            or list(hosts_by_target) != target_order
+            or not isinstance(devices_by_target, dict)
+            or list(devices_by_target) != target_order
+        ):
+            raise RuntimeError(
+                f"TRT-LLM MLA catalog domain {domain!r} target inventory is invalid"
+            )
+        for target in target_order:
+            host = _source_record(
+                hosts_by_target[target],
+                domain=domain,
+                target=target,
+                kind="host_source",
+            )
+            host_path = str(host["path"])
+            if (
+                host_path != f"host/{target}/cake_{domain}.cpp"
+                or host_path in source_paths
+            ):
+                raise RuntimeError("TRT-LLM MLA catalog host source paths are invalid")
+            source_paths.add(host_path)
+            devices = devices_by_target[target]
+            if not isinstance(devices, list) or len(devices) != expected_device_count:
+                raise RuntimeError(
+                    f"TRT-LLM MLA catalog domain {domain!r}/{target} must contain "
+                    f"exactly {expected_device_count} device sources"
+                )
+            records = [
+                _source_record(
+                    device,
+                    domain=domain,
+                    target=target,
+                    kind="device_source",
+                    index=index,
+                )
+                for index, device in enumerate(devices)
+            ]
+            idents = tuple(str(record["module_ident"]) for record in records)
+            module_idents = module_idents_by_target[target]
+            if len(set(idents)) != len(idents) or any(
+                ident in module_idents for ident in idents
+            ):
+                raise RuntimeError(
+                    "TRT-LLM MLA catalog contains duplicate device module identities"
+                )
+            module_idents.update(idents)
+            paths = [str(record["path"]) for record in records]
+            expected_paths = [f"device/{target}/cake_{ident}.cu" for ident in idents]
+            if paths != expected_paths or any(path in source_paths for path in paths):
+                raise RuntimeError(
+                    "TRT-LLM MLA catalog device source paths are invalid"
+                )
+            source_paths.update(paths)
+            device_source_count[target] += len(records)
+    if device_source_count != {target: 18 for target in target_order} or any(
+        len(module_idents_by_target[target]) != 18 for target in target_order
+    ):
+        raise RuntimeError(
+            "TRT-LLM MLA generated-source catalog must contain exactly 18 "
+            "device sources for each supported target"
+        )
+    return catalog
+
+
+def _domain_profile(domain: str, target: str) -> Mapping[str, object]:
+    if domain not in _DOMAIN_DEVICE_COUNTS:
+        raise ValueError(
+            f"unknown TRT-LLM MLA domain {domain!r}; expected one of "
+            f"{list(_DOMAIN_ORDER)!r}"
+        )
+    if target not in _TARGETS:
+        raise ValueError(
+            f"unsupported TRT-LLM MLA target {target!r}; expected one of "
+            f"{list(_TARGET_ORDER)!r}"
+        )
+    catalog = _source_catalog()
+    targets = catalog["targets"]
+    assert isinstance(targets, dict)
+    if target not in targets:
+        raise ValueError(
+            f"TRT-LLM MLA target {target!r} is absent from the generated-source "
+            f"catalog; available targets: {catalog['target_order']!r}"
+        )
+    domains = catalog["domains"]
+    assert isinstance(domains, dict)
+    profile = domains[domain]
+    assert isinstance(profile, dict)
+    return profile
+
+
+def _target_key(device: torch.device | int | str | None = None) -> str:
+    capability = torch.cuda.get_device_capability(device)
+    multi_processor_count = torch.cuda.get_device_properties(
+        device
+    ).multi_processor_count
+    for target, (arch, expected_multi_processor_count) in _TARGETS.items():
+        if (
+            capability == _ARCH_CAPABILITIES[arch]
+            and multi_processor_count == expected_multi_processor_count
+        ):
+            return target
+    raise ValueError(
+        "TRT-LLM MLA requires one of the exact targets "
+        f"{list(_TARGET_ORDER)!r}, got compute capability "
+        f"{capability[0]}.{capability[1]} with {multi_processor_count} SMs"
+    )
+
+
+def _sealed_source_bytes(
+    source_dir: Path,
+    record: Mapping[str, object],
+) -> tuple[Path, bytes]:
+    relative = record["path"]
+    expected_sha256 = record["sha256"]
+    assert isinstance(relative, str)
+    assert isinstance(expected_sha256, str)
+    generated_root = (source_dir / "generated").resolve()
+    path = (generated_root / relative).resolve()
+    if generated_root not in path.parents:
+        raise RuntimeError(
+            f"TRT-LLM MLA Blackwell generated source path escapes its package: {path}"
+        )
+    if not path.is_file():
+        raise RuntimeError(f"TRT-LLM MLA Blackwell generated source is missing: {path}")
+    payload = path.read_bytes()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell generated source identity drift: "
+            f"{path} has sha256={actual_sha256}, expected {expected_sha256}"
+        )
+    return path, payload
+
+
+def _nvcc() -> Path:
+    candidate = shutil.which("nvcc")
+    if candidate is None:
+        cuda_root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if cuda_root:
+            path = Path(cuda_root) / "bin" / "nvcc"
+            if path.is_file():
+                candidate = str(path)
+    if candidate is None:
+        raise RuntimeError(
+            "nvcc is required to build the TRT-LLM MLA Blackwell backend"
+        )
+    return Path(candidate).resolve()
+
+
+def _digest_field(digest, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+@functools.cache
+def _load_domain_module(domain: str, target: str):
+    """Compile and load one catalog-bound domain for an exact physical target."""
+
+    profile = _domain_profile(domain, target)
+    arch, multi_processor_count = _TARGETS[target]
+    source_dir = _source_dir()
+    hosts_by_target = profile["host_sources"]
+    devices_by_target = profile["device_sources"]
+    assert isinstance(hosts_by_target, dict)
+    assert isinstance(devices_by_target, dict)
+    host = hosts_by_target[target]
+    devices = devices_by_target[target]
+    assert isinstance(host, dict)
+    assert isinstance(devices, list)
+    _, host_payload = _sealed_source_bytes(source_dir, host)
+    nvcc = _nvcc()
+
+    digest = hashlib.sha256()
+    for value in (
+        domain.encode(),
+        target.encode(),
+        arch.encode(),
+        str(multi_processor_count).encode(),
+        str(nvcc).encode(),
+        host_payload,
+    ):
+        _digest_field(digest, value)
+    resolved_devices: list[tuple[str, Path, tuple[str, ...]]] = []
+    for device in devices:
+        assert isinstance(device, dict)
+        module_ident = device["module_ident"]
+        compile_flags = device["compile_flags"]
+        assert isinstance(module_ident, str)
+        assert isinstance(compile_flags, list)
+        device_path, device_payload = _sealed_source_bytes(source_dir, device)
+        flags = tuple(compile_flags)
+        for value in (
+            module_ident.encode(),
+            device_payload,
+            "\0".join(flags).encode(),
+        ):
+            _digest_field(digest, value)
+        resolved_devices.append((module_ident, device_path, flags))
+
+    module_name = f"trtllm_mla_{domain}_{target}_{digest.hexdigest()[:16]}"
+    build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
+    build_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = build_dir / f"{module_name}.lock"
+    with FileLock(lock_path, thread_local=False):
+        cubins: dict[str, bytes] = {}
+        for module_ident, device_path, compile_flags in resolved_devices:
+            cubin_path = build_dir / f"{module_ident}.cubin"
+            if not cubin_path.is_file():
+                temporary = build_dir / f"{module_ident}.{os.getpid()}.tmp.cubin"
+                command = [
+                    str(nvcc),
+                    "-cubin",
+                    f"-arch={arch}",
+                    "--std=c++17",
+                    "-O3",
+                    "-I",
+                    str(nvcc.parent.parent / "include"),
+                    *compile_flags,
+                    str(device_path),
+                    "-o",
+                    str(temporary),
+                ]
+                process = subprocess.run(command, text=True, capture_output=True)
+                if process.returncode != 0:
+                    temporary.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"TRT-LLM MLA Blackwell nvcc failed for {domain}/"
+                        f"{module_ident} ({target}, {arch}):\n{process.stderr}"
+                    )
+                os.replace(temporary, cubin_path)
+            cubins[module_ident] = cubin_path.read_bytes()
+
+        module = cpp.load_inline(
+            module_name,
+            cpp_sources=host_payload.decode("utf-8"),
+            embed_cubin=cubins,
+            extra_include_paths=[str(nvcc.parent.parent / "include")],
+            extra_cflags=["-O3"],
+            extra_ldflags=["-lcuda"],
+            build_directory=str(build_dir),
+        )
+    logger.info("Loaded TRT-LLM MLA domain %s for target %s (%s)", domain, target, arch)
+    return module
+
+
+def get_domain_module(domain: str, device: torch.device | int | str | None = None):
+    """Return the cached source-built module for one exact public domain."""
+
+    if domain not in _DOMAIN_DEVICE_COUNTS:
+        raise ValueError(
+            f"unknown TRT-LLM MLA domain {domain!r}; expected one of "
+            f"{list(_DOMAIN_ORDER)!r}"
+        )
+    return _load_domain_module(domain, _target_key(device))
+
+
+# --- Semantic dispatcher ---
+
+
+_ALIGNED_HEADS = 128
+_ALIGNED_QK_DIM = 576
+_ALIGNED_VALUE_DIM = 512
+_CLUSTER_SIZE = 2
+_MAX_GENERIC_TOKENS = 4096
+_WORKSPACE_CACHE_CAPACITY = 8
+_HOST_METADATA_CACHE_CAPACITY = 16
+
+_VHALF_ROUTE = "bf16_q128_runtime_vhalf_underfill_sink_one_launch_v1"
+_VQUARTER_ROUTE = "bf16_q128_runtime_vquarter_underfill_sink_one_launch_v1"
+_UNSPLIT_ROUTE = "bf16_b64_q16_kv1024_unsplit_v1"
+_CLC_ROUTE = "bf16_clc_packed_affine_full_tile_mask_bmm2_one_v1"
+_GENERIC_BF16_ROUTE = "bf16_full_abi_runtime_tail_one_launch_v1"
+_GENERIC_FP8_ROUTE = "fp8_full_abi_runtime_tail_one_launch_v1"
+_FP8_P32_QK_L2_ROUTE = "fp8_p32_q2_kv1024_qk_l2_resident_v1"
+_FP8_PAGE64_ROUTE = "fp8_page64_native_pdl_sequence_unified_v_leader_consumer_v1"
+_NATIVE_BF16_ROUTE = "v32_15stage_page_native_sink_pdl_runtime_v4_full_tmem_scrub"
+
+ROUTE_TO_DOMAIN = {
+    _VQUARTER_ROUTE: "mla_bf16_vquarter",
+    _VHALF_ROUTE: "mla_bf16_vhalf",
+    _UNSPLIT_ROUTE: "mla_bf16_unsplit",
+    _CLC_ROUTE: "mla_bf16_clc",
+    _GENERIC_BF16_ROUTE: "mla_bf16_tail",
+    _GENERIC_FP8_ROUTE: "mla_fp8_tail",
+    _FP8_P32_QK_L2_ROUTE: "mla_fp8_p32_qk_l2",
+    _FP8_PAGE64_ROUTE: "mla_fp8_page64_pdl",
+    _NATIVE_BF16_ROUTE: "mla_bf16_native_split8_pdl",
+}
+
+_WORKSPACE_CACHE: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_WORKSPACE_CACHE_LOCK = threading.Lock()
+_HOST_METADATA_CACHE: "OrderedDict[tuple[Any, ...], tuple[torch.Tensor, tuple[int, ...]]]" = OrderedDict()
+_HOST_METADATA_CACHE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _BlackwellDispatchMetadata:
+    """Host-visible values which determine the exported semantic domain."""
+
+    dtype: torch.dtype
+    batch_size: int
+    q_len: int
+    total_q: int
+    q_lens: tuple[int, ...]
+    kv_lens: tuple[int, ...]
+    num_heads: int
+    qk_dim: int
+    value_dim: int
+    page_size: int
+    max_seq_len: int
+    topk: int
+    table_ndim: int
+    num_sms: int
+    ragged_query: bool = False
+    uses_shared_paged_kv_idx: bool = True
+    enable_sink: bool = False
+    skip_softmax: bool = False
+    return_lse: bool = False
+    provide_lse: bool = False
+    device_scale: bool = False
+    bmm2_scale: float = 1.0
+
+    @property
+    def variant(self) -> str:
+        return "topk" if self.topk > 0 else "dense"
+
+
+def _workspace_get_or_create(
+    key: tuple[Any, ...], builder: Callable[[], dict[str, Any]]
+) -> dict[str, Any]:
+    with _WORKSPACE_CACHE_LOCK:
+        state = _WORKSPACE_CACHE.get(key)
+        if state is not None:
+            _WORKSPACE_CACHE.move_to_end(key)
+            return state
+    state = builder()
+    with _WORKSPACE_CACHE_LOCK:
+        existing = _WORKSPACE_CACHE.get(key)
+        if existing is not None:
+            _WORKSPACE_CACHE.move_to_end(key)
+            return existing
+        _WORKSPACE_CACHE[key] = state
+        while len(_WORKSPACE_CACHE) > _WORKSPACE_CACHE_CAPACITY:
+            _WORKSPACE_CACHE.popitem(last=False)
+    return state
+
+
+def _tensor_ptr(value: Any) -> int:
+    return 0 if value is None else int(value.data_ptr())
+
+
+def _tensor_version(value: Any) -> int:
+    return -1 if value is None else int(getattr(value, "_version", 0))
+
+
+def _host_int_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
+    key = (
+        _tensor_ptr(tensor),
+        _tensor_version(tensor),
+        tuple(tensor.shape),
+        tensor.dtype,
+        tensor.device,
+    )
+    with _HOST_METADATA_CACHE_LOCK:
+        entry = _HOST_METADATA_CACHE.get(key)
+        if entry is not None and entry[0] is tensor:
+            _HOST_METADATA_CACHE.move_to_end(key)
+            return entry[1]
+    values = tuple(int(value) for value in tensor.tolist())
+    with _HOST_METADATA_CACHE_LOCK:
+        existing = _HOST_METADATA_CACHE.get(key)
+        if existing is not None and existing[0] is tensor:
+            _HOST_METADATA_CACHE.move_to_end(key)
+            return existing[1]
+        _HOST_METADATA_CACHE[key] = (tensor, values)
+        while len(_HOST_METADATA_CACHE) > _HOST_METADATA_CACHE_CAPACITY:
+            _HOST_METADATA_CACHE.popitem(last=False)
+    return values
+
+
+def _state_key(inputs: dict[str, Any], family: str) -> tuple[Any, ...]:
+    tensors = (
+        inputs.get("Q"),
+        inputs.get("KV_cache"),
+        inputs.get("page_table"),
+        inputs.get("q_indptr"),
+        inputs.get("seq_lens"),
+        inputs.get("O"),
+        inputs.get("LSE"),
+        inputs.get("sinks"),
+    )
+    return (
+        family,
+        *((_tensor_ptr(value), _tensor_version(value)) for value in tensors),
+        tuple(inputs["Q"].shape),
+        tuple(inputs["KV_cache"].shape),
+        str(inputs["dtype"]),
+        int(inputs["page_size"]),
+        int(inputs["q_len"]),
+        int(inputs["total_q"]),
+        tuple(inputs["q_lens"]),
+        tuple(inputs["kv_lens"]),
+        int(inputs["topk"]),
+        int(inputs["stream"]),
+    )
+
+
+def _e4m3_decode_table() -> list[float]:
+    values = []
+    for bits in range(256):
+        sign = -1.0 if bits & 0x80 else 1.0
+        exponent = (bits >> 3) & 0xF
+        mantissa = bits & 0x7
+        if exponent == 0:
+            magnitude = mantissa * (2.0**-9)
+        elif exponent == 0xF and mantissa == 0x7:
+            magnitude = 0.0
+        else:
+            magnitude = (1.0 + mantissa / 8.0) * (2.0 ** (exponent - 7))
+        values.append(sign * magnitude)
+    return values
+
+
+def _runtime_rows(inputs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    device = inputs["Q"].device
+    row_batches, causal_lens = [], []
+    for batch, (q_len, kv_len) in enumerate(
+        zip(inputs["q_lens"], inputs["kv_lens"], strict=True)
+    ):
+        for query in range(q_len):
+            row_batches.append(batch)
+            causal_lens.append(kv_len - q_len + query + 1)
+    row_batches = torch.tensor(row_batches, dtype=torch.int32, device=device)
+    row_seq_lens = torch.tensor(causal_lens, dtype=torch.int32, device=device)
+    return row_batches, row_seq_lens
+
+
+def _base_state(inputs: dict[str, Any], family: str) -> dict[str, Any]:
+    key = _state_key(inputs, family)
+
+    def build() -> dict[str, Any]:
+        row_batches, row_seq_lens = _runtime_rows(inputs)
+        device = inputs["Q"].device
+        row_batch_long = row_batches.to(torch.int64)
+        use_sparse = int(inputs["topk"]) > 0
+        sparse_width = int(inputs["topk"]) if use_sparse else 0
+        source_table = inputs["page_table"]
+        if source_table.ndim == 3:
+            source_table = source_table[:, 0]
+        source_table = source_table.to(dtype=torch.int32).contiguous()
+        row_table = source_table.index_select(0, row_batch_long)
+        if use_sparse:
+            sparse_indices = inputs["page_table"].reshape(
+                int(inputs["total_q"]), sparse_width
+            )
+            sparse_indices = sparse_indices.to(dtype=torch.int32).contiguous()
+            row_seq_lens = torch.full_like(row_seq_lens, sparse_width)
+        else:
+            sparse_indices = row_batches
+        sinks = inputs["sinks"]
+        if sinks is None:
+            sinks = torch.zeros(
+                int(inputs["num_heads"]), dtype=torch.float32, device=device
+            )
+        lse = inputs["LSE"]
+        if lse is None:
+            lse = torch.empty(
+                (int(inputs["total_q"]), int(inputs["num_heads"])),
+                dtype=torch.float32,
+                device=device,
+            )
+        fp8_lut = (
+            torch.tensor(_e4m3_decode_table(), dtype=torch.float32, device=device)
+            if inputs["dtype"] == torch.float8_e4m3fn
+            else torch.zeros(1, dtype=torch.float32, device=device)
+        )
+        return {
+            "num_rows": int(inputs["total_q"]),
+            "row_batches": row_batches,
+            "row_seq_lens": row_seq_lens,
+            "source_page_table": source_table,
+            "row_page_table": row_table,
+            "sparse_indices": sparse_indices,
+            "sparse_width": sparse_width,
+            "use_sparse": use_sparse,
+            "sinks": sinks,
+            "lse": lse,
+            "fp8_lut": fp8_lut,
+        }
+
+    return _workspace_get_or_create(key, build)
+
+
+def _longest_first_work_order(tile_counts: list[int]) -> list[int]:
+    """Work ids in descending KV-tile order; ties keep row order."""
+    return sorted(
+        range(len(tile_counts)), key=lambda row: (-int(tile_counts[row]), row)
+    )
+
+
+def _append_work_order_rows(
+    table: torch.Tensor, inputs: dict[str, Any]
+) -> torch.Tensor:
+    """Append the longest-first work permutation after the num_rows page-table rows.
+
+    The persistent CLC kernels consume raw work ids in launch order and read
+    ``page_table[num_rows * max_pages_per_seq + raw_id]`` to find the row each id
+    processes, so long rows start first and the dynamic scheduler balances the
+    tail.  Padding entries hold -1; rows below num_rows are unchanged, so every
+    other aligned domain sees the same page table as before.
+    """
+    tile_counts = [
+        (kv_len - q_len + query + 128) // 128
+        for q_len, kv_len in zip(inputs["q_lens"], inputs["kv_lens"], strict=True)
+        for query in range(int(q_len))
+    ]
+    num_rows, width = int(table.shape[0]), int(table.shape[1])
+    if num_rows != len(tile_counts):
+        raise ValueError("aligned page table rows do not match the query rows")
+    order = _longest_first_work_order(tile_counts)
+    tail_rows = (num_rows + width - 1) // width
+    tail = torch.full((tail_rows * width,), -1, dtype=torch.int32, device=table.device)
+    tail[:num_rows] = torch.tensor(order, dtype=torch.int32, device=table.device)
+    return torch.cat(
+        (table.to(dtype=torch.int32), tail.view(tail_rows, width)), dim=0
+    ).contiguous()
+
+
+def _aligned_state(inputs: dict[str, Any]) -> dict[str, Any]:
+    state = _base_state(inputs, "aligned_bf16")
+    if "kv_half_pages" not in state:
+        table = state["row_page_table"]
+        if int(inputs["page_size"]) == 64:
+            table = torch.stack((table * 2, table * 2 + 1), dim=-1)
+            table = table.reshape(state["num_rows"], -1).contiguous()
+        table = _append_work_order_rows(table, inputs)
+        state.update(
+            {
+                "row_page_table": table,
+                "kv_half_pages": inputs["KV_cache"].reshape(-1, 32, _ALIGNED_QK_DIM),
+                "q_rows": inputs["Q"].reshape(-1, _ALIGNED_QK_DIM),
+                "o_rows": inputs["O"].reshape(-1, _ALIGNED_VALUE_DIM),
+                "num_sms": int(inputs["num_sms"]),
+            }
+        )
+    return state
+
+
+def _is_aligned(meta: _BlackwellDispatchMetadata) -> bool:
+    return (
+        meta.num_heads == _ALIGNED_HEADS
+        and meta.qk_dim == _ALIGNED_QK_DIM
+        and meta.value_dim == _ALIGNED_VALUE_DIM
+        and meta.topk == 0
+        and meta.uses_shared_paged_kv_idx
+        and not meta.return_lse
+        and not meta.provide_lse
+    )
+
+
+def _can_clc(meta: _BlackwellDispatchMetadata) -> bool:
+    q_lens = meta.q_lens
+    return (
+        meta.dtype == torch.bfloat16
+        and _is_aligned(meta)
+        and meta.page_size == 32
+        and meta.variant == "dense"
+        and not meta.enable_sink
+        and not meta.skip_softmax
+        and meta.bmm2_scale == 1.0
+        and bool(q_lens)
+        and min(q_lens) > 0
+        and len(set(q_lens)) == 1
+    )
+
+
+def _use_unsplit(meta: _BlackwellDispatchMetadata) -> bool:
+    return (
+        _can_clc(meta)
+        and meta.q_lens == (16,) * 64
+        and len(meta.kv_lens) == 64
+        and max(meta.kv_lens) == 1024
+        and meta.kv_lens[-1] == 1024
+    )
+
+
+def _use_native_bf16(meta: _BlackwellDispatchMetadata) -> bool:
+    if (
+        meta.dtype != torch.bfloat16
+        or not _is_aligned(meta)
+        or meta.variant != "dense"
+        or meta.ragged_query
+        or meta.skip_softmax
+    ):
+        return False
+    return (
+        meta.page_size == 32
+        and not meta.enable_sink
+        and meta.q_lens == (4,)
+        and meta.kv_lens == (1024,)
+    ) or (
+        meta.page_size == 64
+        and meta.enable_sink
+        and meta.q_lens == (1,)
+        and meta.kv_lens == (1024,)
+    )
+
+
+def _can_fp8_p32(meta: _BlackwellDispatchMetadata) -> bool:
+    q_lens = meta.q_lens
+    if not q_lens or len(q_lens) != len(meta.kv_lens) or len(set(q_lens)) != 1:
+        return False
+    q_len = q_lens[0]
+    causal = [
+        kv_len - q_len + query + 1
+        for kv_len, query_len in zip(meta.kv_lens, q_lens, strict=True)
+        for query in range(query_len)
+    ]
+    return (
+        meta.dtype == torch.float8_e4m3fn
+        and _is_aligned(meta)
+        and q_len == 2
+        and meta.kv_lens == (1024,)
+        and not meta.ragged_query
+        and meta.page_size == 32
+        and meta.variant == "dense"
+        and meta.table_ndim == 2
+        and not meta.device_scale
+        and not meta.enable_sink
+        and not meta.skip_softmax
+        and all(length > 256 for length in causal)
+    )
+
+
+def _can_page64(meta: _BlackwellDispatchMetadata) -> bool:
+    if meta.ragged_query and len(set(meta.q_lens)) != 1:
+        return False
+    return (
+        meta.dtype == torch.float8_e4m3fn
+        and _is_aligned(meta)
+        and meta.page_size == 64
+        and meta.variant == "dense"
+        and not meta.enable_sink
+        and not meta.skip_softmax
+    )
+
+
+def _select_route(meta: _BlackwellDispatchMetadata) -> str:
+    if meta.dtype == torch.bfloat16 and _is_aligned(meta):
+        resident = max(1, meta.num_sms // _CLUSTER_SIZE)
+        if _use_native_bf16(meta):
+            return _NATIVE_BF16_ROUTE
+        if _use_unsplit(meta):
+            return _UNSPLIT_ROUTE
+        if meta.enable_sink or meta.total_q * 4 <= resident:
+            return _VQUARTER_ROUTE
+        if meta.total_q * 2 <= resident:
+            return _VHALF_ROUTE
+        if _can_clc(meta):
+            return _CLC_ROUTE
+        raise ValueError(
+            "TRT-LLM MLA Blackwell has no qualified aligned BF16 domain for this configuration"
+        )
+    if _can_fp8_p32(meta):
+        return _FP8_P32_QK_L2_ROUTE
+    if _can_page64(meta):
+        return _FP8_PAGE64_ROUTE
+    if max(meta.kv_lens) > _MAX_GENERIC_TOKENS:
+        raise ValueError(
+            "TRT-LLM MLA Blackwell generic tail supports max_seq_len <= "
+            f"{_MAX_GENERIC_TOKENS}"
+        )
+    return _GENERIC_BF16_ROUTE if meta.dtype == torch.bfloat16 else _GENERIC_FP8_ROUTE
+
+
+def _clc_source_selector_eligibility(
+    inputs: dict[str, Any], q_lens: tuple[int, ...], kv_lens: tuple[int, ...]
+) -> int:
+    """Resolve page-table eligibility bits 1/2 and all-KV-uniform bit 4."""
+    source_page_table = inputs.get("page_table")
+    q4_source_eligible = (
+        source_page_table is not None
+        and int(source_page_table.ndim) == 2
+        and int(source_page_table.shape[1]) == 32
+        and int(source_page_table.data_ptr()) % 16 == 0
+    )
+    register_profile_source_eligible = (
+        source_page_table is not None
+        and int(source_page_table.ndim) == 2
+        and int(source_page_table.shape[0]) == len(q_lens)
+    )
+    return (
+        int(q4_source_eligible)
+        + 2 * int(register_profile_source_eligible)
+        + 4
+        * int(
+            len(kv_lens) == len(q_lens)
+            and all(length == kv_lens[0] for length in kv_lens)
+        )
+    )
+
+
+def _aligned_launch(inputs: dict[str, Any], route: str):
+    state = _aligned_state(inputs)
+    resident = max(1, state["num_sms"] // _CLUSTER_SIZE)
+    if route == _VQUARTER_ROUTE:
+        split = 4
+        work = state["num_rows"] * 4
+        grid_x = min(work, resident) * 2
+        grid_z = 1
+    elif route == _VHALF_ROUTE:
+        split = 2
+        work = state["num_rows"] * 2
+        grid_x = min(work, resident) * 2
+        grid_z = 1
+    elif route == _UNSPLIT_ROUTE:
+        split = 1
+        work = state["num_rows"]
+        grid_x = min(work, resident) * 2
+        grid_z = 1
+    else:
+        split = int(inputs["q_len"])
+        work = state["num_rows"]
+        grid_x = 2 * split
+        grid_z = int(inputs["batch_size"])
+    tensors = (
+        state["q_rows"],
+        state["kv_half_pages"],
+        state["o_rows"],
+        state["row_seq_lens"],
+        state["row_page_table"],
+        state["sinks"],
+    )
+    scalars: tuple[Any, ...] = (
+        float(inputs["bmm1_scale"]) * log2e,
+        float(inputs["bmm2_scale"]),
+        work,
+        split,
+        int(state["row_page_table"].shape[1]),
+        int(inputs["sinks"] is not None),
+        grid_x,
+        grid_z,
+    )
+    if route == _CLC_ROUTE:
+        kv_lens = tuple(int(value) for value in inputs["kv_lens"])
+        q_lens = tuple(int(value) for value in inputs["q_lens"])
+        scalars += (
+            max(kv_lens),
+            kv_lens[-1],
+            _clc_source_selector_eligibility(inputs, q_lens, kv_lens),
+        )
+    return tensors, scalars
+
+
+def _native_launch(inputs: dict[str, Any]):
+    state = _aligned_state(inputs)
+    num_split = 8
+    total_work_items = state["num_rows"] * num_split
+    grid_x = min(total_work_items, state["num_sms"] // _CLUSTER_SIZE) * _CLUSTER_SIZE
+    if "native_partial_output" not in state:
+        state["native_partial_output"] = torch.empty(
+            (state["num_rows"], _ALIGNED_HEADS, num_split, _ALIGNED_VALUE_DIM),
+            dtype=torch.bfloat16,
+            device=inputs["Q"].device,
+        )
+        state["native_partial_lse"] = torch.empty(
+            (state["num_rows"], _ALIGNED_HEADS, num_split),
+            dtype=torch.float32,
+            device=inputs["Q"].device,
+        )
+    tensors = (
+        state["q_rows"],
+        state["kv_half_pages"],
+        state["o_rows"],
+        state["row_seq_lens"],
+        state["row_page_table"],
+        state["sinks"],
+        state["native_partial_output"],
+        state["native_partial_lse"],
+    )
+    scalars = (
+        float(inputs["bmm1_scale"]) * log2e,
+        1.0,
+        float(inputs["bmm2_scale"]),
+        num_split,
+        total_work_items,
+        int(state["row_page_table"].shape[1]),
+        int(inputs["sinks"] is not None),
+        grid_x,
+        state["num_rows"],
+    )
+    return tensors, scalars
+
+
+def _generic_launch(inputs: dict[str, Any]):
+    state = _base_state(inputs, "generic")
+    num_heads = int(inputs["num_heads"])
+    qk_dim = int(inputs["Q"].shape[-1])
+    value_dim = int(inputs["O"].shape[-1])
+    kv_stride = int(inputs["KV_cache"].shape[-1])
+    query = inputs["Q"].reshape(-1, qk_dim)
+    kv = inputs["KV_cache"].reshape(-1, kv_stride)
+    if inputs["dtype"] == torch.float8_e4m3fn:
+        query = query.view(torch.uint8)
+        kv = kv.view(torch.uint8)
+    tensors = (
+        query,
+        kv,
+        state["fp8_lut"],
+        state["source_page_table"],
+        state["sparse_indices"],
+        state["row_batches"],
+        state["row_seq_lens"],
+        inputs["O"].reshape(-1, value_dim),
+        state["lse"].reshape(-1),
+        state["sinks"],
+    )
+    scalars = (
+        num_heads,
+        qk_dim,
+        value_dim,
+        kv_stride,
+        int(inputs["page_size"]),
+        int(state["source_page_table"].shape[1]),
+        state["sparse_width"],
+        int(state["use_sparse"]),
+        float(inputs["bmm1_scale"]),
+        float(inputs["bmm2_scale"]),
+        int(inputs["sinks"] is not None),
+        int(inputs["return_lse"] or inputs["provide_lse"]),
+        state["num_rows"],
+    )
+    return tensors, scalars
+
+
+def _p32_launch(inputs: dict[str, Any]):
+    reduction_groups = int(inputs["batch_size"]) * 32 * int(inputs["q_len"])
+    key = _state_key(inputs, "fp8_p32")
+    state = _workspace_get_or_create(
+        key,
+        lambda: {
+            "completion": torch.zeros(
+                reduction_groups,
+                dtype=torch.uint32,
+                device=inputs["Q"].device,
+            )
+        },
+    )
+    if "partial_output" not in state:
+        state["partial_output"] = torch.empty(
+            (reduction_groups, 2, 16, 128),
+            dtype=torch.bfloat16,
+            device=inputs["Q"].device,
+        )
+        state["partial_stats"] = torch.empty(
+            (reduction_groups, 2, 16, 2),
+            dtype=torch.float32,
+            device=inputs["Q"].device,
+        )
+    tensors = (
+        inputs["Q"].reshape(-1, 576).view(torch.uint8),
+        inputs["KV_cache"].reshape(-1, 32, 576).view(torch.uint8),
+        inputs["page_table"].reshape(-1),
+        inputs["seq_lens"],
+        inputs["O"].reshape(-1),
+        state["completion"],
+        state["partial_output"],
+        state["partial_stats"],
+    )
+    scalars = (
+        int(inputs["batch_size"]),
+        int(inputs["q_len"]),
+        int(inputs["page_table"].shape[-1]),
+        int(inputs["q_len"]),
+        2,
+        float(inputs["bmm1_scale"]) * log2e,
+        float(inputs["bmm2_scale"]),
+    )
+    return tensors, scalars
+
+
+def _pick_num_split(work_items: int, tiles: list[int], num_sms: int) -> int:
+    tiles = [int(value) for value in tiles if int(value) > 0]
+    if not tiles:
+        return 1
+    min_tiles, max_tiles = min(tiles), max(tiles)
+    source_cap = max(1, (max_tiles + 1) // 2)
+    if min_tiles <= 2:
+        return 1
+    target = min(source_cap, max(1, num_sms // max(1, work_items * 2)))
+    split = max(1, min(target, min_tiles))
+    blocks = (min_tiles + split - 1) // split
+    split = (min_tiles + blocks - 1) // blocks
+    while split > 1:
+        if all((split - 1) * ((count + split - 1) // split) < count for count in tiles):
+            break
+        split -= 1
+    return split
+
+
+def _page64_launch(inputs: dict[str, Any]):
+    state = _base_state(inputs, "fp8_page64")
+    q_lens = inputs["q_lens"]
+    kv_lens = inputs["kv_lens"]
+    work_items = sum(q_lens)
+    causal_lengths = [
+        kv_lens[batch] - q_len + query
+        for batch, q_len in enumerate(q_lens)
+        for query in range(q_len)
+    ]
+    tiles = [(length + 127) // 128 for length in causal_lengths]
+    num_split = _pick_num_split(work_items, tiles, int(inputs["num_sms"]))
+    if num_split <= 1:
+        raise ValueError(
+            "TRT-LLM MLA Blackwell page-64 PDL domain requires split-K reduction"
+        )
+    reduce_ctas = min(
+        64,
+        max(1, (int(inputs["num_sms"]) * 2) // max(1, work_items * 2)),
+    )
+    if "partial_output" not in state:
+        state["partial_output"] = torch.empty(
+            (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
+            dtype=torch.bfloat16,
+            device=inputs["Q"].device,
+        )
+        state["partial_stats"] = torch.empty(
+            (work_items, num_split, _ALIGNED_HEADS, 2),
+            dtype=torch.float32,
+            device=inputs["Q"].device,
+        )
+    tensors = (
+        inputs["Q"].reshape(-1, 576).view(torch.uint8),
+        inputs["KV_cache"].reshape(-1, 576).view(torch.uint8),
+        inputs["O"].reshape(-1, 512),
+        state["lse"].reshape(-1, 128),
+        torch.tensor(causal_lengths, dtype=torch.int32, device=inputs["Q"].device),
+        state["row_batches"],
+        inputs["page_table"].reshape(-1),
+        state["partial_output"],
+        state["partial_stats"],
+    )
+    scalars = (
+        float(inputs["bmm1_scale"]) * log2e,
+        float(inputs["bmm2_scale"]),
+        num_split,
+        work_items,
+        int(inputs["page_table"].shape[-1]),
+        reduce_ctas,
+    )
+    return tensors, scalars
+
+
+def _prepare(inputs: dict[str, Any], route: str):
+    if route == _NATIVE_BF16_ROUTE:
+        tensors, scalars = _native_launch(inputs)
+    elif route in {_VQUARTER_ROUTE, _VHALF_ROUTE, _UNSPLIT_ROUTE, _CLC_ROUTE}:
+        tensors, scalars = _aligned_launch(inputs, route)
+    elif route in {_GENERIC_BF16_ROUTE, _GENERIC_FP8_ROUTE}:
+        tensors, scalars = _generic_launch(inputs)
+    elif route == _FP8_P32_QK_L2_ROUTE:
+        tensors, scalars = _p32_launch(inputs)
+    elif route == _FP8_PAGE64_ROUTE:
+        tensors, scalars = _page64_launch(inputs)
+    else:
+        raise ValueError(
+            f"route is outside the TRT-LLM MLA Blackwell export inventory: {route!r}"
+        )
+    return ROUTE_TO_DOMAIN[route], tensors, scalars
+
+
+def _check_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _normalize_sinks(
+    sinks: Optional[Union[list[torch.Tensor], tuple[torch.Tensor, ...], torch.Tensor]],
+    *,
+    num_heads: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if sinks is None:
+        return None
+    if isinstance(sinks, (list, tuple)):
+        if len(sinks) != 1:
+            raise ValueError("TRT-LLM MLA Blackwell expects one sink tensor")
+        sink = sinks[0]
+    else:
+        sink = sinks
+    _check_tensor(sink, name="sinks", dtype=torch.float32, device=device)
+    if tuple(sink.shape) != (num_heads,):
+        raise ValueError(f"sinks must have shape ({num_heads},)")
+    return sink
+
+
+def _normalize_scale(value: float | torch.Tensor, name: str) -> float:
+    if isinstance(value, torch.Tensor):
+        raise TypeError(f"TRT-LLM MLA Blackwell requires scalar {name}")
+    if not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a scalar float")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def trtllm_mla_blackwell_decode(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    max_seq_len: int,
+    *,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sparse_mla_top_k: int,
+    out: Optional[torch.Tensor],
+    bmm1_scale: float | torch.Tensor,
+    bmm2_scale: float | torch.Tensor,
+    sinks: Optional[list[torch.Tensor]],
+    skip_softmax_threshold_scale_factor: Optional[float],
+    enable_pdl: Optional[bool],
+    uses_shared_paged_kv_idx: bool,
+    lse: Optional[torch.Tensor],
+    return_lse: bool,
+    cum_seq_lens_q: Optional[torch.Tensor],
+    max_q_len: Optional[int],
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor],
+    sparse_mla_top_k_lens: Optional[torch.Tensor],
+    enable_dcp: bool,
+    backend: Literal["cake"] = "cake",
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Dispatch the qualified SM100a/SM103a MLA semantic envelope."""
+
+    if backend != "cake":
+        raise ValueError(f"backend must be 'cake', got {backend!r}")
+    if not isinstance(query, torch.Tensor):
+        raise TypeError("query must be a torch.Tensor")
+    if not query.is_cuda:
+        raise ValueError("query must be a CUDA tensor")
+    device = query.device
+    capability = get_compute_capability(device)
+    if capability not in {(10, 0), (10, 3)}:
+        major, minor = capability
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell requires compute capability 10.0 or 10.3, "
+            f"got {major}.{minor}"
+        )
+    if not is_cuda_version_at_least("12.9"):
+        raise RuntimeError(
+            "TRT-LLM MLA Blackwell on SM100a/SM103a requires CUDA 12.9 or newer"
+        )
+    if enable_dcp:
+        raise ValueError("TRT-LLM MLA Blackwell does not support DCP")
+    if multi_ctas_kv_counter_buffer is not None:
+        raise ValueError(
+            "TRT-LLM MLA Blackwell does not use a multi-CTA counter buffer"
+        )
+    if sparse_mla_top_k_lens is not None:
+        raise ValueError("TRT-LLM MLA Blackwell does not accept sparse_mla_top_k_lens")
+    if seq_lens is None:
+        raise ValueError("seq_lens is required for TRT-LLM MLA Blackwell")
+
+    if query.dtype not in {torch.bfloat16, torch.float8_e4m3fn}:
+        raise TypeError("TRT-LLM MLA Blackwell query must use BF16 or FP8 E4M3")
+    _check_tensor(query, name="query", dtype=query.dtype, device=device)
+    _check_tensor(kv_cache, name="kv_cache", dtype=query.dtype, device=device)
+    if query.ndim not in {3, 4}:
+        raise ValueError(
+            "query must be a fixed [B, Q, H, D] or compact [T, H, D] tensor"
+        )
+    if kv_cache.ndim not in {3, 4}:
+        raise ValueError("kv_cache must be a 3D or 4D paged tensor")
+    if kv_cache.ndim == 4 and kv_cache.shape[1] != 1:
+        raise ValueError("4D kv_cache must have a singleton head axis")
+    page_size = int(kv_cache.shape[-2])
+    if page_size not in {32, 64}:
+        raise ValueError("TRT-LLM MLA Blackwell requires page size 32 or 64")
+    if int(query.shape[-1]) != int(kv_cache.shape[-1]):
+        raise ValueError("query and kv_cache head dimensions differ")
+
+    ragged_query = cum_seq_lens_q is not None
+    if ragged_query != (query.ndim == 3):
+        raise ValueError("compact query and cum_seq_lens_q must be provided together")
+    if ragged_query:
+        _check_tensor(
+            cum_seq_lens_q,
+            name="cum_seq_lens_q",
+            dtype=torch.int32,
+            device=device,
+        )
+        if cum_seq_lens_q.ndim != 1 or cum_seq_lens_q.numel() < 2:
+            raise ValueError("cum_seq_lens_q must have shape [batch_size + 1]")
+        if max_q_len is None or max_q_len <= 0:
+            raise ValueError(
+                "max_q_len is required for compact TRT-LLM MLA Blackwell queries"
+            )
+        batch_size = int(cum_seq_lens_q.numel() - 1)
+        q_len = int(max_q_len)
+        total_q = int(query.shape[0])
+    else:
+        batch_size = int(query.shape[0])
+        q_len = int(query.shape[1])
+        total_q = batch_size * q_len
+    if batch_size <= 0 or q_len <= 0 or total_q <= 0:
+        raise ValueError(
+            "TRT-LLM MLA Blackwell requires nonempty batch and query dimensions"
+        )
+
+    _check_tensor(seq_lens, name="seq_lens", dtype=torch.int32, device=device)
+    if tuple(seq_lens.shape) != (batch_size,):
+        raise ValueError(f"seq_lens must have shape ({batch_size},)")
+    if ragged_query:
+        q_indptr_host = _host_int_tuple(cum_seq_lens_q)
+        if q_indptr_host[0] != 0 or q_indptr_host[-1] != total_q:
+            raise ValueError("cum_seq_lens_q must start at 0 and end at total_q")
+        q_lens = tuple(
+            right - left
+            for left, right in zip(q_indptr_host[:-1], q_indptr_host[1:], strict=True)
+        )
+        if any(q <= 0 for q in q_lens) or max(q_lens) > q_len:
+            raise ValueError("cum_seq_lens_q contains an invalid query length")
+    else:
+        q_lens = (q_len,) * batch_size
+    kv_lens = _host_int_tuple(seq_lens)
+    if len(q_lens) != len(kv_lens) or any(
+        q <= 0 or kv <= 0 or q > kv for q, kv in zip(q_lens, kv_lens, strict=True)
+    ):
+        raise ValueError("every TRT-LLM MLA Blackwell row requires 0 < q_len <= kv_len")
+    if max_seq_len <= 0 or max(kv_lens) > max_seq_len:
+        raise ValueError("max_seq_len must cover every runtime KV length")
+    _check_tensor(block_tables, name="block_tables", dtype=torch.int32, device=device)
+    if sparse_mla_top_k > 0:
+        expected_table_shape = (
+            (total_q, sparse_mla_top_k)
+            if ragged_query
+            else (batch_size, q_len, sparse_mla_top_k)
+        )
+        if tuple(block_tables.shape) != expected_table_shape:
+            raise ValueError(
+                f"sparse block_tables must have shape {expected_table_shape}"
+            )
+    else:
+        expected_ndim = 2 if uses_shared_paged_kv_idx else 3
+        if block_tables.ndim != expected_ndim or block_tables.shape[0] != batch_size:
+            raise ValueError(
+                "dense block_tables must match the batch and shared-index layout"
+            )
+
+    num_heads = int(query.shape[-2])
+    qk_dim = int(query.shape[-1])
+    value_dim = int(kv_lora_rank)
+    valid_dense = sparse_mla_top_k == 0 and (
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        num_heads,
+    ) in {
+        (128, 512, 64, 128),
+        (128, 512, 64, 64),
+        (64, 256, 64, 32),
+        (512, 512, 64, 128),
+    }
+    valid_topk = sparse_mla_top_k > 0 and (
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        num_heads,
+    ) in {
+        (128, 512, 64, 128),
+        (128, 512, 64, 64),
+        (192, 512, 64, 128),
+        (192, 512, 64, 64),
+    }
+    if not valid_dense and not valid_topk:
+        raise ValueError("unsupported TRT-LLM MLA Blackwell dimension tuple")
+    if qk_dim != kv_lora_rank + qk_rope_head_dim:
+        raise ValueError("query width must equal kv_lora_rank + qk_rope_head_dim")
+
+    sink = _normalize_sinks(sinks, num_heads=num_heads, device=device)
+    bmm1_scale_value = _normalize_scale(bmm1_scale, "bmm1_scale")
+    bmm2_scale_value = _normalize_scale(bmm2_scale, "bmm2_scale")
+    if skip_softmax_threshold_scale_factor is not None:
+        threshold = float(skip_softmax_threshold_scale_factor)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("skip_softmax_threshold_scale_factor must be positive")
+    expected_out_shape = (*query.shape[:-1], value_dim)
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=device)
+    else:
+        _check_tensor(out, name="out", dtype=torch.bfloat16, device=device)
+        if tuple(out.shape) != expected_out_shape:
+            raise ValueError(f"out must have shape {expected_out_shape}")
+    if lse is not None:
+        _check_tensor(lse, name="lse", dtype=torch.float32, device=device)
+        valid_lse_shapes = {(total_q, num_heads), (*query.shape[:-1],)}
+        if tuple(lse.shape) not in valid_lse_shapes:
+            raise ValueError("lse shape must match flattened or physical query rows")
+    if return_lse and lse is None:
+        lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=device)
+
+    num_sms = get_device_sm_count(device)
+    metadata = _BlackwellDispatchMetadata(
+        dtype=query.dtype,
+        batch_size=batch_size,
+        q_len=q_len,
+        total_q=total_q,
+        q_lens=q_lens,
+        kv_lens=kv_lens,
+        num_heads=num_heads,
+        qk_dim=qk_dim,
+        value_dim=value_dim,
+        page_size=page_size,
+        max_seq_len=int(max_seq_len),
+        topk=int(sparse_mla_top_k),
+        table_ndim=int(block_tables.ndim),
+        num_sms=num_sms,
+        ragged_query=ragged_query,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        enable_sink=sink is not None,
+        skip_softmax=skip_softmax_threshold_scale_factor is not None,
+        return_lse=return_lse,
+        provide_lse=lse is not None and not return_lse,
+        device_scale=False,
+        bmm2_scale=bmm2_scale_value,
+    )
+    route = _select_route(metadata)
+    stream = int(torch.cuda.current_stream(device).cuda_stream)
+    inputs = {
+        "Q": query,
+        "KV_cache": kv_cache,
+        "page_table": block_tables,
+        "q_indptr": cum_seq_lens_q,
+        "seq_lens": seq_lens,
+        "O": out,
+        "LSE": lse,
+        "sinks": sink,
+        "dtype": query.dtype,
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "total_q": total_q,
+        "q_lens": q_lens,
+        "kv_lens": kv_lens,
+        "num_heads": num_heads,
+        "page_size": page_size,
+        "max_seq_len": int(max_seq_len),
+        "topk": int(sparse_mla_top_k),
+        "bmm1_scale": bmm1_scale_value,
+        "bmm2_scale": bmm2_scale_value,
+        "return_lse": return_lse,
+        "provide_lse": lse is not None and not return_lse,
+        "num_sms": num_sms,
+        "stream": stream,
+    }
+    domain, tensors, scalars = _prepare(inputs, route)
+    with torch.cuda.device(device):
+        get_domain_module(domain, device).run(*tensors, *scalars, stream)
+    if return_lse:
+        assert lse is not None
+        return out, lse
+    return out
+
+
+__all__ = ["ROUTE_TO_DOMAIN", "trtllm_mla_blackwell_decode"]
