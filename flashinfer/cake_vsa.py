@@ -89,7 +89,7 @@ def _manifest_source_records(
     architectures = manifest.get("architectures")
     profiles = manifest.get("profiles")
     if (
-        architectures != ["sm_100a", "sm_103a"]
+        architectures != ["sm_100a", "sm_103a", "sm_107a"]
         or not isinstance(profiles, list)
         or not profiles
     ):
@@ -139,11 +139,11 @@ def _manifest_source_records(
     expected_source_paths = {
         f"cake_vsa_{profile}_{suffix}"
         for profile in _EXPECTED_PROFILES
-        for suffix in ("host.cpp", "sm_100a.cu", "sm_103a.cu")
+        for suffix in ("host.cpp", "sm_100a.cu", "sm_103a.cu", "sm_107a.cu")
     }
     if (
         profile_names != _EXPECTED_PROFILES
-        or len(records) != 3 * len(_EXPECTED_PROFILES)
+        or len(records) != 4 * len(_EXPECTED_PROFILES)
         or source_paths != expected_source_paths
     ):
         raise RuntimeError("incomplete Cake VSA source manifest inventory")
@@ -164,8 +164,10 @@ def _arch_for_device(device: torch.device) -> str:
         return "sm_100a"
     if cc == (10, 3):
         return "sm_103a"
+    if cc == (10, 7):
+        return "sm_107a"
     raise RuntimeError(
-        "Cake VSA requires an SM100 or SM103 GPU, "
+        "Cake VSA requires an SM100, SM103 or SM107 GPU, "
         f"got compute capability {properties.major}.{properties.minor}"
     )
 

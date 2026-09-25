@@ -1,9 +1,10 @@
 {
   "architectures": [
     "sm_100a",
-    "sm_103a"
+    "sm_103a",
+    "sm_107a"
   ],
-  "export_content_sha256": "c3150affcec9daea4fbf6b7eb0d982255b0c1b6849cf34ba3094b43d4347df35",
+  "export_content_sha256": "2473edd841c286b0138f18424db734f7cd2f2f8c9e3ca6e5ee5e6365980a3c33",
   "profiles": [
     {
       "arg_plan": [
@@ -91,6 +92,11 @@
         },
         "sm_103a": {
           "path": "cake_vsa_blk128_compact_sm_103a.cu",
+          "sha256": "e220b84c36930737d9da00676950a547402ba34e40eaa2f33061102bb6b4f7b6",
+          "size_bytes": 101122
+        },
+        "sm_107a": {
+          "path": "cake_vsa_blk128_compact_sm_107a.cu",
           "sha256": "e220b84c36930737d9da00676950a547402ba34e40eaa2f33061102bb6b4f7b6",
           "size_bytes": 101122
         }
@@ -199,6 +205,11 @@
           "path": "cake_vsa_blk64_persistent_sm_103a.cu",
           "sha256": "3f5e9e5ffd7a9dbb8d3a868e86a09af7938ac606b1b430f6b692a8a1953595cf",
           "size_bytes": 120734
+        },
+        "sm_107a": {
+          "path": "cake_vsa_blk64_persistent_sm_107a.cu",
+          "sha256": "3f5e9e5ffd7a9dbb8d3a868e86a09af7938ac606b1b430f6b692a8a1953595cf",
+          "size_bytes": 120734
         }
       },
       "dynamic_smem_bytes": 183296,
@@ -305,6 +316,11 @@
           "path": "cake_vsa_blk64_persistent_ws_m64n256_sm_103a.cu",
           "sha256": "58bee4973fc9fc0af9e54a89ee7d647f70018b549f858d8233a669986dbdc0b8",
           "size_bytes": 103640
+        },
+        "sm_107a": {
+          "path": "cake_vsa_blk64_persistent_ws_m64n256_sm_107a.cu",
+          "sha256": "58bee4973fc9fc0af9e54a89ee7d647f70018b549f858d8233a669986dbdc0b8",
+          "size_bytes": 103640
         }
       },
       "dynamic_smem_bytes": 232448,
@@ -409,6 +425,11 @@
         },
         "sm_103a": {
           "path": "cake_vsa_longseq_sm_103a.cu",
+          "sha256": "647951f777c17fa4e74e892843ce5ba8ff25d4abf1b0e68b19a264e25532c71d",
+          "size_bytes": 108728
+        },
+        "sm_107a": {
+          "path": "cake_vsa_longseq_sm_107a.cu",
           "sha256": "647951f777c17fa4e74e892843ce5ba8ff25d4abf1b0e68b19a264e25532c71d",
           "size_bytes": 108728
         }
@@ -521,6 +542,11 @@
           "path": "cake_vsa_ultrasparse_bsr_sm_103a.cu",
           "sha256": "e850a27705a8ccde640b5417bea5e2e3bbc4efcda8a7e578845bd5e0b0c32a73",
           "size_bytes": 72552
+        },
+        "sm_107a": {
+          "path": "cake_vsa_ultrasparse_bsr_sm_107a.cu",
+          "sha256": "e850a27705a8ccde640b5417bea5e2e3bbc4efcda8a7e578845bd5e0b0c32a73",
+          "size_bytes": 72552
         }
       },
       "dynamic_smem_bytes": 135424,
@@ -621,6 +647,11 @@
         },
         "sm_103a": {
           "path": "cake_vsa_gqa_mask_sm_103a.cu",
+          "sha256": "588c851d36f6ac28e37090d364d655c3677af66ff4ec7f324de604338efea939",
+          "size_bytes": 112321
+        },
+        "sm_107a": {
+          "path": "cake_vsa_gqa_mask_sm_107a.cu",
           "sha256": "588c851d36f6ac28e37090d364d655c3677af66ff4ec7f324de604338efea939",
           "size_bytes": 112321
         }
@@ -725,6 +756,11 @@
           "path": "cake_vsa_head64_native_sm_103a.cu",
           "sha256": "9dc37906b471fb3fd61ca44eabcb418fbda920ebb912303d01a35c390d2941d7",
           "size_bytes": 78986
+        },
+        "sm_107a": {
+          "path": "cake_vsa_head64_native_sm_107a.cu",
+          "sha256": "9dc37906b471fb3fd61ca44eabcb418fbda920ebb912303d01a35c390d2941d7",
+          "size_bytes": 78986
         }
       },
       "dynamic_smem_bytes": 108928,
@@ -827,6 +863,11 @@
           "path": "cake_vsa_head96_native_sm_103a.cu",
           "sha256": "de522a7d283cda97a05364025c3a429f97758ffebcd3cf1e73a742cb18e0d032",
           "size_bytes": 80947
+        },
+        "sm_107a": {
+          "path": "cake_vsa_head96_native_sm_107a.cu",
+          "sha256": "de522a7d283cda97a05364025c3a429f97758ffebcd3cf1e73a742cb18e0d032",
+          "size_bytes": 80947
         }
       },
       "dynamic_smem_bytes": 182656,
@@ -927,6 +968,11 @@
         },
         "sm_103a": {
           "path": "cake_vsa_blk128_fp16_compact_sm_103a.cu",
+          "sha256": "2e321f770e0a9ea493aa33a340a7c686f3c335dae0fe6d7a2a58dcc95ac2d7da",
+          "size_bytes": 101011
+        },
+        "sm_107a": {
+          "path": "cake_vsa_blk128_fp16_compact_sm_107a.cu",
           "sha256": "2e321f770e0a9ea493aa33a340a7c686f3c335dae0fe6d7a2a58dcc95ac2d7da",
           "size_bytes": 101011
         }
@@ -1085,6 +1131,11 @@
         },
         "sm_103a": {
           "path": "cake_vsa_fp16_direct_sm_103a.cu",
+          "sha256": "444793d0696e2d32ea535d13c2d74aff5119509080183a2292215d069c5ae114",
+          "size_bytes": 119577
+        },
+        "sm_107a": {
+          "path": "cake_vsa_fp16_direct_sm_107a.cu",
           "sha256": "444793d0696e2d32ea535d13c2d74aff5119509080183a2292215d069c5ae114",
           "size_bytes": 119577
         }
