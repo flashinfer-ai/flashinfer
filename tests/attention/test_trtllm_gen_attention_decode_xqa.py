@@ -12,10 +12,9 @@ so its first-touch compile cluster (~4.6s per unique URI) dominated the
 previous single-file wall time.  Isolating it lets that cluster run
 concurrently instead of serialized with every other decode case.
 
-The parametrize matrix below is identical to the original
-``test_trtllm_batch_decode`` except ``backend`` is restricted to
-``["xqa"]``.  ``_test_trtllm_batch_decode`` and all helpers continue to
-live in the decode file and are imported here.
+The parameter matrix below includes only configurations supported by XQA.
+``_test_trtllm_batch_decode`` and all helpers continue to live in the decode
+file and are imported here.
 """
 
 import pytest
@@ -62,19 +61,14 @@ pytestmark = pytest.mark.long_running
             ("fp16", "fp8", "fp16"),
             ("bf16", "fp8", "fp8"),
             ("fp16", "fp8", "fp8"),
-            ("fp8", "fp8", "bf16"),
-            ("fp8", "fp8", "fp16"),
-            ("fp8", "fp8", "fp8"),
-            ("fp8", "fp8", "nvfp4"),
-            ("fp8", "nvfp4", "fp8"),
         ],
         "enable_pdl": [True, False, None],
         "enable_sink": [True, False],
         "max_in_kv_len": [110],
         "head_dim": [128, 256],
-        "non_contiguous_query": [False, True],
-        "skips_softmax": [False, True],
-        "uses_shared_paged_kv_idx": [True, False],
+        "non_contiguous_query": [False],
+        "skips_softmax": [False],
+        "uses_shared_paged_kv_idx": [True],
     },
     regular=pairwise_product_cases,
 )
