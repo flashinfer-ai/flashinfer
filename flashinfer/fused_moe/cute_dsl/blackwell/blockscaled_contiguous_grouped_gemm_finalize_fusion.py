@@ -40,6 +40,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
     blk_copy,
+    blk_copy_peer,
     blk_reduce_bf16,
     blk_reduce_fp16,
     blk_reduce_fp32,
@@ -313,6 +314,23 @@ if not hasattr(cutlass, "__version__"):
     cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
 
 
+# Peer-scatter metadata packing.
+#
+# In peer-scatter mode the meta warp must hand the epilogue two values per row
+# instead of one: the rank that owns the token, and the row this route occupies
+# inside that rank's combine buffer. Both are packed into the existing int32
+# `sMetaTokenIdx` slot rather than staged through a third smem array, because a
+# third array would grow `meta_smem_bytes` in `_compute_stages` and could cost
+# the default (non-peer) path a pipeline stage for a feature it never uses.
+# The row keeps the low bits so the packed value stays positive in int32; the
+# host validates that both fields fit (see the caller in
+# flashinfer/fused_moe/cute_dsl/blockscaled_contiguous_grouped_gemm_finalize_fusion.py).
+PEER_DST_ROW_BITS = 24
+PEER_DST_ROW_LIMIT = 1 << PEER_DST_ROW_BITS
+PEER_DST_ROW_MASK = PEER_DST_ROW_LIMIT - 1
+PEER_DST_RANK_LIMIT = 1 << (31 - PEER_DST_ROW_BITS)
+
+
 class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -367,6 +385,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        use_peer_scatter: bool = False,
+        peer_release_fence: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -390,6 +410,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        self.use_peer_scatter = use_peer_scatter
+        self.peer_release_fence = peer_release_fence
+        if peer_release_fence and not use_peer_scatter:
+            raise ValueError(
+                "peer_release_fence only has meaning with use_peer_scatter=True."
+            )
+        if use_peer_scatter and use_fused_finalize:
+            # Peer scatter gives every (token, k_slot) route its own
+            # destination slot on the owning rank, so the epilogue must use the
+            # plain non-accumulating store and the routing-weight reduction
+            # must happen later, on that rank.
+            raise ValueError("use_peer_scatter requires use_fused_finalize=False.")
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -647,6 +679,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        peer_addresses: Optional[cute.Tensor] = None,
+        token_dst_rank: Optional[cute.Tensor] = None,
+        token_dst_local_idx: Optional[cute.Tensor] = None,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation in steps:
@@ -683,6 +718,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type token_final_scales: cute.Tensor
         :param a_per_token_scale: Optional per-row scale for operand A, shape (permuted_m,)
         :type a_per_token_scale: Optional[cute.Tensor]
+        :param peer_addresses: Peer combine-buffer base addresses, shape (world_size,), int64.
+            Required when use_peer_scatter is set; entry ``r`` is the address of
+            rank ``r``'s combine buffer in this process' address space, as
+            produced by ``SymmetricBuffer.rendezvous(materialize_peer_addresses=True)``.
+        :type peer_addresses: Optional[cute.Tensor]
+        :param token_dst_rank: Owning rank per token, shape (num_tokens,), int32
+        :type token_dst_rank: Optional[cute.Tensor]
+        :param token_dst_local_idx: Token index within its owning rank, shape (num_tokens,), int32
+        :type token_dst_local_idx: Optional[cute.Tensor]
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
@@ -974,6 +1018,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             permuted_idx_to_expanded_idx,
             token_final_scales,
             a_per_token_scale,
+            peer_addresses,
+            token_dst_rank,
+            token_dst_local_idx,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1062,6 +1109,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        peer_addresses: Optional[cute.Tensor],
+        token_dst_rank: Optional[cute.Tensor],
+        token_dst_local_idx: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1996,6 +2046,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     if cutlass.const_expr(not self.use_fused_finalize):
                         token_scale = self.final_scale_dtype(1.0)
                         output_idx = safe_idx
+                    if cutlass.const_expr(self.use_peer_scatter):
+                        # Retarget the row at the slot this route owns on the
+                        # rank that owns the token. Both lookups use gather_tok
+                        # for the same reason token_final_scales does above:
+                        # padding rows may carry out-of-range garbage, and
+                        # gather_tok clamps them to token 0 branchlessly.
+                        output_idx = (
+                            token_dst_rank[gather_tok] * PEER_DST_ROW_LIMIT
+                            + token_dst_local_idx[gather_tok] * topK
+                            + topk_idx
+                        )
                     if cutlass.const_expr(self.use_a_per_token_scale):
                         token_scale = cutlass.Float32(token_scale) * cutlass.Float32(
                             a_per_token_scale[permuted_row]
@@ -2188,16 +2249,42 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         reduce_token_idx = sMetaTokenIdx[
                             (reduce_row, meta_consumer_state.index)
                         ]
-                        scatter_out_offset = cute.domain_offset(
-                            (reduce_token_idx, coord_n, 0), out
-                        )
+                        scatter_out_offset = None
+                        if cutlass.const_expr(not self.use_peer_scatter):
+                            scatter_out_offset = cute.domain_offset(
+                                (reduce_token_idx, coord_n, 0), out
+                            )
                         valid_copy_size = cutlass.Int32(
                             valid_columns * (self.out_dtype.width // 8)
                         )
                         # is_valid_tensor_alignment requires each output row to
                         # end on a 16-byte boundary, matching the bulk-copy
                         # instruction's size and address requirements.
-                        if cutlass.const_expr(not self.use_fused_finalize):
+                        if cutlass.const_expr(self.use_peer_scatter):
+                            # Here sMetaTokenIdx holds a packed (dst_rank,
+                            # dst_row) pair rather than a local row, so aim the
+                            # same bulk copy at the owning rank's combine
+                            # buffer instead of the local `out`. The peer
+                            # buffer is symmetric, so it shares `out`'s row
+                            # length and element type.
+                            dst_rank = reduce_token_idx // PEER_DST_ROW_LIMIT
+                            dst_row = reduce_token_idx & cutlass.Int32(
+                                PEER_DST_ROW_MASK
+                            )
+                            peer_base = cute.arch.load(
+                                (peer_addresses.iterator + dst_rank).llvm_ptr,
+                                cutlass.Int64,
+                            )
+                            peer_elem_offset = cutlass.Int64(dst_row) * cutlass.Int64(
+                                out.shape[1]
+                            ) + cutlass.Int64(coord_n)
+                            blk_copy_peer(
+                                peer_base
+                                + peer_elem_offset * (self.out_dtype.width // 8),
+                                sC[reduce_row, None, 0],
+                                valid_copy_size,
+                            )
+                        elif cutlass.const_expr(not self.use_fused_finalize):
                             blk_copy(
                                 scatter_out_offset,
                                 sC[reduce_row, None, 0],
@@ -2245,6 +2332,35 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+
+            if cutlass.const_expr(self.peer_release_fence):
+                # Make this CTA's peer writes visible before the kernel ends.
+                #
+                # Ordering matters, and the drain is the load-bearing half. The
+                # per-tile wait above uses read=True, which only guarantees sC
+                # can be recycled -- the bulk copies may still be in flight to
+                # the peer. This one is cumulative over every group this thread
+                # committed, so a single wait here drains them all; there is no
+                # need to pay it per tile, and by this point every tile but the
+                # last has had the rest of the loop to land.
+                cute.arch.cp_async_bulk_wait_group(0)
+                # A fence before the drain would order nothing: cp.async.bulk
+                # completion is tracked by the async-group counter, not by the
+                # memory model.
+                #
+                # Every epilogue thread fences, because fence.acq_rel.sys (what
+                # __threadfence_system lowers to) orders only the writes of the
+                # thread that executes it, and each of them issued its own
+                # stores. The alternative idiom is bar.sync followed by a fence
+                # on a single thread, which covers the CTA by transitivity
+                # through the barrier's CTA-scope ordering; that is what the
+                # TRT-LLM MoE dispatch kernel does. It is cheaper by one fence
+                # per thread, but it exists to guard a flag store made by that
+                # one thread, and this kernel signals nothing in-kernel -- the
+                # signal is the kernel ending -- so there is no single thread
+                # to privilege here.
+                cute.arch.fence_acq_rel_sys()
+
             #
             # Dealloc the tensor memory buffer
             #
@@ -2896,6 +3012,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        # Peer-scatter inputs. Only passed by callers that set
+        # use_peer_scatter; left None/0 otherwise so the default path compiles
+        # exactly as before.
+        peer_addresses_ptr: Optional[cute.Pointer] = None,
+        token_dst_rank_ptr: Optional[cute.Pointer] = None,
+        token_dst_local_idx_ptr: Optional[cute.Pointer] = None,
+        world_size: cutlass.Constexpr = 0,
+        peer_rows: cutlass.Constexpr = 0,
     ):
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
@@ -2918,7 +3042,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             ),
         )
         output_rows = num_tokens
-        if cutlass.const_expr(not self.use_fused_finalize):
+        if cutlass.const_expr(self.use_peer_scatter):
+            # `c` is this rank's own symmetric combine buffer. The epilogue
+            # never stores through it in peer-scatter mode -- every store goes
+            # through the peer table, including this rank's own entry -- so it
+            # is read only for its column count and element type.
+            output_rows = peer_rows
+        elif cutlass.const_expr(not self.use_fused_finalize):
             output_rows = num_tokens * top_k
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((output_rows, n, 1), order=(1, 0, 2))
@@ -2946,6 +3076,23 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
             else None
         )
+        peer_addresses = (
+            cute.make_tensor(peer_addresses_ptr, layout=cute.make_layout((world_size,)))
+            if cutlass.const_expr(peer_addresses_ptr is not None)
+            else None
+        )
+        token_dst_rank = (
+            cute.make_tensor(token_dst_rank_ptr, layout=cute.make_layout((num_tokens,)))
+            if cutlass.const_expr(token_dst_rank_ptr is not None)
+            else None
+        )
+        token_dst_local_idx = (
+            cute.make_tensor(
+                token_dst_local_idx_ptr, layout=cute.make_layout((num_tokens,))
+            )
+            if cutlass.const_expr(token_dst_local_idx_ptr is not None)
+            else None
+        )
 
         return self(
             a,
@@ -2962,6 +3109,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
             a_per_token_scale=a_per_token_scale,
+            peer_addresses=peer_addresses,
+            token_dst_rank=token_dst_rank,
+            token_dst_local_idx=token_dst_local_idx,
             epilogue_op=epilogue_op,
         )
 
