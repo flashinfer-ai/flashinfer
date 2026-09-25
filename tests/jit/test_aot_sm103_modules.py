@@ -170,17 +170,17 @@ def test_registered_tgv_gemm_runs_on_every_targeted_arch(
 
 
 @pytest.mark.parametrize(
-    ("arch_list", "expected", "unexpected"),
+    ("arch_list", "expected"),
     [
-        ("10.0a", "-gencode=arch=compute_100a,code=sm_100a", "sm_103a"),
-        ("10.3a", "-gencode=arch=compute_103a,code=sm_103a", "sm_100a"),
+        ("10.0a", "-gencode=arch=compute_100a,code=sm_100a"),
+        ("10.3a", "-gencode=arch=compute_103a,code=sm_103a"),
     ],
 )
 @pytest.mark.parametrize(
     "generator", ["gen_trtllm_gen_gemm_module", "gen_trtllm_low_latency_gemm_module"]
 )
 def test_trtllm_gen_gemm_runners_target_the_built_sm10x_arch(
-    monkeypatch, generator, arch_list, expected, unexpected
+    monkeypatch, generator, arch_list, expected
 ):
     # Provider validation rejects an sm_100a image in the sm103a wheel.
     from flashinfer.compilation_context import CompilationContext
@@ -195,5 +195,4 @@ def test_trtllm_gen_gemm_runners_target_the_built_sm10x_arch(
 
     flags = getattr(gemm_core, generator)().extra_cuda_cflags
 
-    assert expected in flags
-    assert unexpected not in " ".join(flags)
+    assert [flag for flag in flags if flag.startswith("-gencode=")] == [expected]
