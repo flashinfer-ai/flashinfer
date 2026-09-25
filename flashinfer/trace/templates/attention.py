@@ -2750,6 +2750,7 @@ def mla_paged_decode_trace_dispatch(**kwargs):
         and planned_total_q is not None
         and q_nope is not None
         and int(q_nope.shape[0]) == planned_total_q
+        and not kwargs.get("return_lse_base_on_e", False)
     ):
         return mla_paged_decode_trace
     return None
