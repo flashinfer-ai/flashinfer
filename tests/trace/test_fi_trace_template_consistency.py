@@ -397,8 +397,7 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
                 continue
             p = _resolved_param(json_key, descriptor)
             shape = [sizes.get(d, axis_size) for d in descriptor.dim_names]
-            if not shape:
-                continue
+            # An empty shape is a scalar tensor, not an absent input.
             # Prefer the descriptor's own dtype hint; fall back to bfloat16
             dtype = _DTYPE_MAP.get(descriptor.dtype or "", torch.bfloat16)
             t = torch.zeros(shape, dtype=dtype)
@@ -417,6 +416,18 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
         kwargs[p] = tuple(parts)
 
     return kwargs
+
+
+def test_sample_kwargs_include_zero_dimensional_tensors():
+    template = TraceTemplate(
+        op_type="scalar_tensor_test",
+        axes={},
+        inputs={"scale": Tensor([], dtype="float32")},
+        outputs={},
+    )
+    kwargs = _make_sample_kwargs(template)
+    assert kwargs["scale"].shape == torch.Size([])
+    assert kwargs["scale"].dtype == torch.float32
 
 
 def assert_fi_trace_complete(

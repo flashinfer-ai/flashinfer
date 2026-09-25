@@ -129,12 +129,27 @@ _SMOKE_CONST_OVERRIDES: Dict[str, int] = {
 
 # Coupled dimensions that cannot use the generic tiny smoke values.
 _SMOKE_TEMPLATE_OVERRIDES: Dict[str, Dict[str, int]] = {
+    "minimax_m3_sparse_attn_decode": {
+        "total_q": 8,
+        "batch_size": 4,
+        "num_qo_heads": 16,
+        "num_kv_heads": 1,
+        "head_dim": 128,
+        "page_size": 128,
+        "topk": 16,
+        "scale_size": 1,
+    },
     "group_gemm_fp8_nt_groupwise_contiguous": {
         "N": 128,
         "K_div_128": 1,
         "N_div_128": 1,
     },
 }
+
+for _m3_suffix in ("_k0v0", "_k0v1", "_k1v0"):
+    _SMOKE_TEMPLATE_OVERRIDES["minimax_m3_sparse_attn_decode" + _m3_suffix] = (
+        _SMOKE_TEMPLATE_OVERRIDES["minimax_m3_sparse_attn_decode"].copy()
+    )
 
 
 def _canonical_var_kwargs(template: TraceTemplate) -> Dict[str, int]:
