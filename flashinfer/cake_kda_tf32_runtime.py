@@ -4001,21 +4001,25 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.prepare(grid=self.grid, **self.args)
         self._descriptors_stale = False
 
+    def _launch_in_stream(self) -> None:
+        """Launch inside an already entered FFI/Torch stream context."""
+        if self._descriptors_stale:
+            # A plan-cache rebind moved a descriptor source; re-encode in
+            # the same stream context as the launch it precedes.
+            self._prepare_descriptors_in_stream()
+        for destination, source in self._token_storage_refreshes:
+            destination.copy_(source)
+        if self._beta_tma_valid is not None:
+            self._beta_tma_valid.copy_(self._beta_tma_source)
+        if self.prepare_module is not None:
+            self.prepare_module.launch(grid=self.prepare_grid, **self.prepare_args)
+        self.module.launch(grid=self.grid, **self.args)
+
     def _launch_uncaptured(self) -> None:
         import tvm_ffi
 
         with tvm_ffi.use_torch_stream():
-            if self._descriptors_stale:
-                # A plan-cache rebind moved a descriptor source; re-encode in
-                # the same stream context as the launch it precedes.
-                self._prepare_descriptors_in_stream()
-            for destination, source in self._token_storage_refreshes:
-                destination.copy_(source)
-            if self._beta_tma_valid is not None:
-                self._beta_tma_valid.copy_(self._beta_tma_source)
-            if self.prepare_module is not None:
-                self.prepare_module.launch(grid=self.prepare_grid, **self.prepare_args)
-            self.module.launch(grid=self.grid, **self.args)
+            self._launch_in_stream()
 
     def launch(self) -> None:
         self._launch_uncaptured()
@@ -4823,7 +4827,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         with tvm_ffi.use_torch_stream():
             for destination, source in self._affine_input_refreshes:
                 destination.copy_(source)
-            self._state_indices_long.copy_(self._state_indices)
             self._part_state_indices.index_copy_(
                 0, self._first_parts, self._state_indices
             )
@@ -4833,8 +4836,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     self._checkpoint_start, 0, self._part_seq_ids, out=starts
                 )
                 starts.add_(self._part_local_rows)
-            self._main.launch()
-            self._map.launch()
+            # The parts share this stream context (no re-entry per part); the
+            # int64 index copy is only consumed by the final-state scatter and
+            # the fused epilogue, so it follows the first chain kernel.
+            self._main._launch_in_stream()
+            self._state_indices_long.copy_(self._state_indices)
+            self._map._launch_in_stream()
             self._scan_module.launch(
                 grid=(self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1),
                 split_state=self._main_final,
@@ -4850,7 +4857,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     grid=self._projection_grid, **self._projection_args
                 )
             else:
-                self._correction.launch()
+                self._correction._launch_in_stream()
             if self._fused_epilogue is not None:
                 self._launch_fused_epilogue()
                 return
