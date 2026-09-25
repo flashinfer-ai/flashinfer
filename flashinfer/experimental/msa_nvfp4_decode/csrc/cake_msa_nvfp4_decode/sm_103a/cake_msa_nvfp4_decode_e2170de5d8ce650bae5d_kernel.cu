@@ -961,7 +961,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_msa_nvfp4_decode_71099de146be1a2db209(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+kernel_cake_msa_nvfp4_decode_e2170de5d8ce650bae5d(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -969,8 +969,7 @@ kernel_cake_msa_nvfp4_decode_71099de146be1a2db209(const __grid_constant__ CUtens
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)
@@ -1845,20 +1844,6 @@ kernel_cake_msa_nvfp4_decode_71099de146be1a2db209(const __grid_constant__ CUtens
                             if (load_stage == 11) { load_stage = 0; load_phase ^= 1; }
                             kt_l = kt_l + 1;
                         }
-                        if (npairs_l > 1) {
-                            #pragma unroll
-                            for (int k_tile_1 = 0; k_tile_1 < 2; k_tile_1++) {
-                                mbarrier_wait(kv_raw_empty_addr + (load_stage) * 8, load_phase);
-                                mbarrier_arrive_expect_tx(kv_raw_full_addr + (kt_l % 16) * 8, 9216);
-                                int physical_page_2 = smem_page[slot0_l + 2 + k_tile_1] / num_kv_heads;
-                                int kv_head_2 = smem_page[slot0_l + 2 + k_tile_1] - physical_page_2 * num_kv_heads;
-                                tma_4d_gmem2smem(smem_raw_addr + (unsigned int)(load_stage * 8192), (&K), 0, 0, kv_head_2, physical_page_2, kv_raw_full_addr + (kt_l % 16) * 8);
-                                tma_4d_gmem2smem(smem_scale_addr + (unsigned int)(load_stage * 1024), (&K_scale), 0, 0, kv_head_2, physical_page_2, kv_raw_full_addr + (kt_l % 16) * 8);
-                                load_stage += 1;
-                                if (load_stage == 11) { load_stage = 0; load_phase ^= 1; }
-                                kt_l = kt_l + 1;
-                            }
-                        }
                     }
                 }
                 mbarrier_wait(q_empty_addr + (item_par_1) * 8, me_phase);
@@ -1866,6 +1851,22 @@ kernel_cake_msa_nvfp4_decode_71099de146be1a2db209(const __grid_constant__ CUtens
                     int q_row_l = query_l * num_q_heads + kv_head_l * group_size_l;
                     mbarrier_arrive_expect_tx(q_full_addr + (item_par_1) * 8, 4096);
                     tma_3d_gmem2smem(smem_qt_addr + (unsigned int)(item_par_1 * 4096), (&Q), 0, q_row_l, 0, q_full_addr + (item_par_1) * 8);
+                }
+                if (elect_sync()) {
+                    if (npairs_l > 1) {
+                        #pragma unroll
+                        for (int k_tile_1 = 0; k_tile_1 < 2; k_tile_1++) {
+                            mbarrier_wait(kv_raw_empty_addr + (load_stage) * 8, load_phase);
+                            mbarrier_arrive_expect_tx(kv_raw_full_addr + (kt_l % 16) * 8, 9216);
+                            int physical_page_2 = smem_page[slot0_l + 2 + k_tile_1] / num_kv_heads;
+                            int kv_head_2 = smem_page[slot0_l + 2 + k_tile_1] - physical_page_2 * num_kv_heads;
+                            tma_4d_gmem2smem(smem_raw_addr + (unsigned int)(load_stage * 8192), (&K), 0, 0, kv_head_2, physical_page_2, kv_raw_full_addr + (kt_l % 16) * 8);
+                            tma_4d_gmem2smem(smem_scale_addr + (unsigned int)(load_stage * 1024), (&K_scale), 0, 0, kv_head_2, physical_page_2, kv_raw_full_addr + (kt_l % 16) * 8);
+                            load_stage += 1;
+                            if (load_stage == 11) { load_stage = 0; load_phase ^= 1; }
+                            kt_l = kt_l + 1;
+                        }
+                    }
                 }
                 if (elect_sync()) {
                     smem_npairs[item_par_1] = npairs_l;
