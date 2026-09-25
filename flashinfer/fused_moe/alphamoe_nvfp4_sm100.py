@@ -724,6 +724,8 @@ def _alphamoe_nvfp4_routed_moe_impl(
     w1_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
+    w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    accumulate: bool = True,
 ) -> None:
     if _alphamoe_try_complete_routed(
         hidden_states,
@@ -749,8 +751,14 @@ def _alphamoe_nvfp4_routed_moe_impl(
         w1_data_prepared,
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
+        w2_scale_prepared,
+        w1_scale_prepared_interleaved,
+        accumulate,
     ):
         return
+    if not accumulate:
+        # The remaining (non-complete) paths seed from the caller output.
+        out.zero_()
     # The private buffer is seeded by the alignment kernel on this stream.
     # During graph capture it belongs to PyTorch's graph memory pool.
     accumulator = torch.empty_like(out, dtype=torch.float32)
@@ -837,6 +845,8 @@ def _alphamoe_nvfp4_routed_moe_fake(
     w1_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
+    w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    accumulate: bool = True,
 ) -> None:
     pass
 
@@ -867,6 +877,8 @@ def alphamoe_nvfp4_routed_moe(
     w1_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
+    w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    accumulate: bool = True,
 ) -> torch.Tensor:
     """Run route alignment, complete expert computation and weighted accumulation.
 
@@ -887,7 +899,10 @@ def alphamoe_nvfp4_routed_moe(
     ``w1_gate_up_data_prepared`` and ``w1_gate_up_scale_prepared`` from the
     matching model-load preparation helpers. They use a distinct layout
     from the optional old prepared inputs. No packing occurs in this call.
-    The caller-owned output is updated and returned.
+    The caller-owned output is updated and returned. With ``accumulate=False`` the
+    weighted route sum is written directly (the prior contents of ``out`` are
+    ignored, so no zero fill is needed); the result equals the seeded path on a
+    zero output bit for bit.
     """
     _check_alphamoe_nvfp4_supported(
         hidden_states,
@@ -913,6 +928,9 @@ def alphamoe_nvfp4_routed_moe(
     _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
     _check_prepared_w1_gate_up(
         gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
+    )
+    _check_prepared_w1_interleaved(
+        gemm1_weights, gemm1_weights_scale, w1_scale_prepared_interleaved
     )
     if not (
         is_alphamoe_nvfp4_routed_seed_supported(
@@ -960,6 +978,8 @@ def alphamoe_nvfp4_routed_moe(
         w1_data_prepared,
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
+        w1_scale_prepared_interleaved,
+        accumulate,
     )
     return out
 
@@ -1129,6 +1149,68 @@ __all__ += [
 ]
 
 
+def _interleave_gate_up_rows(t):
+    """[E, N, C] with rows = N/2 gate then N/2 up -> rows ordered (j, {gate, up}, r) for 64-row groups."""
+    experts, rows, cols = map(int, t.shape)
+    if rows % 128:
+        raise ValueError("interleaved W1 preparation requires N%128=0")
+    return (
+        t.view(experts, 2, rows // 128, 64, cols)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(experts, rows, cols)
+        .contiguous()
+    )
+
+
+def prepare_nvfp4_w1_scales_interleaved(w1_scale):
+    """CP-layout W1 scale panels ``[E*(N/128)*(K/256),16,128]`` in the gate/up-interleaved row order.
+
+    Panel ``j`` of an expert holds the scales of gate rows ``64j..64j+63`` followed by up rows
+    ``64j..64j+63``. Consumed by the eight-token complete route together with the existing
+    :func:`prepare_nvfp4_w1_data` panels (no separate interleaved W1 data copy is needed); keep it
+    alive and immutable while routing.
+    """
+    return prepare_nvfp4_w1_scales(_interleave_gate_up_rows(w1_scale))
+
+
+def _check_prepared_w1_interleaved(w1, w1_scale, scales):
+    if scales is None:
+        return
+    e, n, packed_k = w1.shape
+    panels = e * (n // 128) * (packed_k // 128)
+    _require_cuda_tensor("w1_scale_prepared_interleaved", scales, dtype=torch.uint8, ndim=3)
+    if (
+        scales.device != w1_scale.device
+        or tuple(scales.shape) != (panels, 16, 128)
+        or scales.data_ptr() % 16 != 0
+    ):
+        raise ValueError(
+            "Interleaved prepared W1 scales must match the raw weights and panel layout"
+        )
+
+
+_S5_MERGE_COUNTERS = {}
+
+
+def _s5_merge_counters(count, device):
+    """Zeroed uint32 last-arriver counters for the one-token route.
+
+    The kernels reset every counter they consume, so one zero-initialised buffer per
+    (device, stream) is reused across calls without any per-call fill launch.
+    """
+    key = (device.index if device.index is not None else torch.cuda.current_device(), torch.cuda.current_stream(device).cuda_stream, int(count))
+    buffer = _S5_MERGE_COUNTERS.get(key)
+    if buffer is None:
+        buffer = torch.zeros((int(count),), dtype=torch.uint32, device=device)
+        _S5_MERGE_COUNTERS[key] = buffer
+    return buffer
+
+
+__all__ += [
+    "prepare_nvfp4_w1_scales_interleaved",
+]
+
+
 def _uses_compact_owner_routed(
     hidden_states,
     hidden_states_scale,
@@ -1290,6 +1372,9 @@ def _alphamoe_try_complete_routed(
     w1_data_prepared=None,
     w1_gate_up_data_prepared=None,
     w1_gate_up_scale_prepared=None,
+    w2_scale_prepared=None,
+    w1_scale_prepared_interleaved=None,
+    accumulate=True,
 ):
     route_id = _alphamoe_complete_route_id(
         hidden_states,
@@ -1314,6 +1399,7 @@ def _alphamoe_try_complete_routed(
     blocks = n // 256
     owner_plan = owner_count = initial_out = None
     partial_workspace = act_workspace = sf_workspace = None
+    merge_counters = None
     if route_id == 1:
         initial_out = torch.empty_like(out, dtype=torch.float32)
         route_accumulator = torch.empty(
@@ -1323,6 +1409,19 @@ def _alphamoe_try_complete_routed(
         partial_workspace = torch.empty(
             (capacity * blocks, 8192), dtype=torch.float32, device=hidden_states.device
         )
+        e_, n_, packed_k_ = gemm1_weights.shape
+        if (
+            w1_scale_prepared is not None
+            and tuple(w1_scale_prepared.shape) == (e_ * (n_ // 128) * (packed_k_ // 128), 16, 128)
+        ):
+            # S5 one-token path: act/sf workspaces + zeroed self-resetting merge counters
+            act_workspace = torch.empty(
+                (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
+            )
+            sf_workspace = torch.empty(
+                (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+            )
+            merge_counters = _s5_merge_counters(capacity * blocks, hidden_states.device)
     elif route_id == 8:
         get_alphamoe_nvfp4_sm100_module().nvfp4_complete_small_alignment_op(
             hidden_states,
@@ -1422,6 +1521,10 @@ def _alphamoe_try_complete_routed(
         w1_data_prepared,
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
+        w2_scale_prepared,
+        w1_scale_prepared_interleaved,
+        merge_counters,
+        accumulate,
     )
     return True
 
@@ -1607,6 +1710,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
     w1_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
+    w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
 ) -> AlphaMoeNvfp4DeferredOutput:
     """Run alignment and the expert GEMMs now; finalize later with a BF16 seed.
 
@@ -1645,6 +1749,9 @@ def alphamoe_nvfp4_routed_moe_deferred(
     _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
     _check_prepared_w1_gate_up(
         gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
+    )
+    _check_prepared_w1_interleaved(
+        gemm1_weights, gemm1_weights_scale, w1_scale_prepared_interleaved
     )
     route_id = _alphamoe_complete_route_id(
         hidden_states,
@@ -1689,6 +1796,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
             w1_data_prepared,
             w1_gate_up_data_prepared,
             w1_gate_up_scale_prepared,
+            w1_scale_prepared_interleaved,
         )
         return AlphaMoeNvfp4DeferredOutput(
             route_id, None, None, topk_weights, output2_scale_scalar,
@@ -1701,6 +1809,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
     module = get_alphamoe_nvfp4_sm100_module()
     owner_plan = owner_count = None
     partial_workspace = act_workspace = sf_workspace = None
+    merge_counters = None
     if route_id == 1:
         route_accumulator = torch.empty(
             (m * top_k, k), dtype=torch.float32, device=out.device
@@ -1709,6 +1818,19 @@ def alphamoe_nvfp4_routed_moe_deferred(
         partial_workspace = torch.empty(
             (capacity * blocks, 8192), dtype=torch.float32, device=hidden_states.device
         )
+        e_, n_, packed_k_ = gemm1_weights.shape
+        if (
+            w1_scale_prepared is not None
+            and tuple(w1_scale_prepared.shape) == (e_ * (n_ // 128) * (packed_k_ // 128), 16, 128)
+        ):
+            # S5 one-token path: act/sf workspaces + zeroed self-resetting merge counters
+            act_workspace = torch.empty(
+                (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
+            )
+            sf_workspace = torch.empty(
+                (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+            )
+            merge_counters = _s5_merge_counters(capacity * blocks, hidden_states.device)
     elif route_id == 8:
         module.nvfp4_complete_small_alignment_op(
             hidden_states,
@@ -1801,6 +1923,9 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w1_data_prepared,
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
+        w2_scale_prepared,
+        w1_scale_prepared_interleaved,
+        merge_counters,
     )
     return AlphaMoeNvfp4DeferredOutput(
         route_id, route_accumulator, route_experts, topk_weights,
