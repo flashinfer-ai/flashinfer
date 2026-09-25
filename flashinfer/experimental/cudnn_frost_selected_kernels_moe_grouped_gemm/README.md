@@ -170,6 +170,13 @@ A shape or scale version evicted from lookup must be prepared again outside
 capture before capturing a new call. MoELayer keeps at most 128 winner entries;
 `reset_winner()` clears them as before.
 
+BF16 admission and packing share a 128-entry selection cache keyed by artifact
+roots and cache version, architecture, exact geometry, and activation. It holds
+only kernel metadata; tensor layouts, alignment, and semantics are checked on
+each call. `bf16.runtime.clear_artifact_cache()` invalidates this metadata when
+refreshing artifacts. Measure ordinary warm calls separately from CUDA Graph
+replay, which bypasses Python admission and packing.
+
 The `artifacts/mxfp8/` pool retains 169 selected configurations in 39 source
 templates, with 400 measured two-by-two profiles. The offline pool covers all
 44 families: ten FC1 activations and one shared FC2, each with normal/swap-AB
@@ -260,9 +267,11 @@ for discovery, scale packing, JIT, or execution.
 
 The `benchmark` subcommand measures the complete MoELayer pipeline and compares
 the original eligible backend pool, the same pool with automatic Frost
-admission, and Frost alone:
+admission, and Frost alone. Enable experimental automatic selection when running
+the full-MoE benchmarks for any dtype:
 
 ```bash
+export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1
 python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
   --activation swiglu --experts 8 --hidden 4096 --intermediate 14336 \
   --top-k 2 --tokens 1,16,128,512,2048,4096,8192,12288 \
@@ -438,7 +447,11 @@ reuses the grouped-input buffer after FC1 finishes consuming it. Exact-shape
 host plans share power-of-two-sized workspace allocations on the layer's
 stream; varying the token count does not allocate a large buffer per shape.
 
-Users keep calling the original API:
+Enable experimental automatic selection before using the original API:
+
+```bash
+export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1
+```
 
 ```python
 with flashinfer.autotune():
@@ -473,8 +486,10 @@ Automatic candidates are registered lazily through
 checks, runner fields, or cache branches. Each dtype's `support.py` owns admission
 and the deferred runner factory. Winner keys include the eligible automatic candidate
 set and exact input shape, so incompatible weight views cannot reuse a cuDNN Frost
-winner. Other registrations require the normal experimental-auto gate; the
-branch-local cuDNN Frost exception described below remains explicit.
+winner. All four cuDNN Frost registrations require
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`, including reuse of cached
+runners and winners after autotuning. Disabling the gate removes these
+candidates from subsequent calls while retaining resources used by captured graphs.
 
 ### Rubin artifacts and swap AB
 
@@ -605,12 +620,11 @@ unexplained E64/16-token/skew illegal-memory-access failure; subsequent reruns
 and memchecks passed. The source-distribution change does not establish a fix
 for that historical failure.
 
-This branch intentionally allows automatic admission without an environment
-variable, per the requested unchanged-user-code PoC. This is a scoped exception
-to the usual experimental-auto gate, not a change to the policy for other
-experimental backends. A once-per-backend experimental warning is issued if
-cuDNN Frost actually wins. Release admission/ownership and the tracking issue remain
-to be settled before publishing this research integration.
+Automatic admission follows the experimental-auto gate. Explicit experimental
+API calls remain an opt-in and do not require the environment variable. A
+once-per-backend experimental warning is issued if cuDNN Frost actually wins.
+Release admission/ownership and the tracking issue remain to be settled before
+publishing this research integration.
 
 Keep the layer alive while its CUDA graphs are used, and use one instance per
 thread/stream. Input contents, including expert ids, may change between

@@ -345,7 +345,138 @@ def test_bf16_unsupported_semantics_are_not_automatic_candidates(overrides):
     )
 
 
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"])
+@pytest.mark.parametrize("gate", [None, "0", "1"])
+def test_frost_auto_selection_gate_applies_to_cached_runners_and_winners(
+    dtype, gate, monkeypatch
+):
+    from flashinfer.fused_moe import (
+        CutlassMxfp8Config,
+        CutlassMxfp8Mxfp4Config,
+        CutlassNvfp4Config,
+        QuantFormat,
+    )
+    from flashinfer.fused_moe.auto_candidates import _AUTO_CANDIDATES
+
+    weight_format, act_format, backend, tensor_dtype = {
+        "bf16": (QuantFormat.BF16, QuantFormat.BF16, CutlassBf16Config, torch.bfloat16),
+        "mxfp8": (
+            QuantFormat.MXFP8,
+            QuantFormat.MXFP8,
+            CutlassMxfp8Config,
+            torch.float8_e4m3fn,
+        ),
+        "nvfp4": (
+            QuantFormat.NVFP4,
+            QuantFormat.NVFP4,
+            CutlassNvfp4Config,
+            torch.uint8,
+        ),
+        "mxfp8_mxfp4": (
+            QuantFormat.MXFP4,
+            QuantFormat.MXFP8,
+            CutlassMxfp8Mxfp4Config,
+            torch.float8_e4m3fn,
+        ),
+    }[dtype]
+    cfg = replace(
+        bf16_config(experts=12, intermediate=3072),
+        quant=QuantConfig(weight=weight_format, activation=act_format),
+        backend=BackendOptions((backend(),)),
+    )
+    act = MoEActivationPack(
+        torch.empty(
+            4096,
+            7168 // (2 if dtype == "nvfp4" else 1),
+            dtype=tensor_dtype,
+            device="meta",
+        ),
+        None,
+        torch.empty(4096, 2, dtype=torch.int32, device="meta"),
+        torch.empty(4096, 2, dtype=torch.float32, device="meta"),
+    )
+    weights = MoEWeightPack({})
+    key = f"cudnn_frost_{dtype}"
+    support = importlib.import_module(_AUTO_CANDIDATES[key].support_module)
+    # Keep the real registry and cheap dtype/geometry admission. Only execution
+    # is stubbed so this exercises the gate without a GPU or compiler baseline.
+    assert support.is_eligible(cfg, act, 107)
+    accepted, created, selections = [], [], []
+
+    def accepts(act, weights):
+        accepted.append((act, weights))
+        return True
+
+    def runner(backend_key):
+        return SimpleNamespace(
+            backend_key=backend_key,
+            supported_routing_modes=bf16_moe.CudnnFrostBf16MoeRunner.supported_routing_modes,
+            accepts=accepts,
+            pack_inputs=lambda act, weights: [act.hidden_states_q],
+            launch_kwargs_for=lambda inputs: {},
+            forward=lambda inputs, **kwargs: inputs[0],
+        )
+
+    original, frost = runner("original_backend"), runner(key)
+
+    def create_runner(config, device):
+        created.append((config, device))
+        return frost
+
+    monkeypatch.setattr(support, "create_runner", create_runner)
+    layer = MoELayer.__new__(MoELayer)
+    layer.config, layer.device, layer._arch = cfg, torch.device("cuda", 0), 107
+    layer.tuner = SimpleNamespace(is_tuning_mode=True)
+    layer.runners, layer._automatic_runners, layer._winners = (
+        [original],
+        {},
+        OrderedDict(),
+    )
+
+    def select(act, weights, runners):
+        selections.append([r.backend_key for r in runners])
+        return runners[-1], -1
+
+    monkeypatch.setattr(layer, "_select_winner", select)
+
+    def set_gate(value):
+        if value is None:
+            monkeypatch.delenv(
+                "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False
+            )
+        else:
+            monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", value)
+
+    set_gate(gate)
+    assert layer(act, weights) is act.hidden_states_q
+    expected_key = key if gate == "1" else "original_backend"
+    assert layer.winner_backend == expected_key
+    assert selections == [
+        ["original_backend", key] if gate == "1" else ["original_backend"]
+    ]
+    assert len(created) == len(accepted) == (1 if gate == "1" else 0)
+
+    set_gate("1")
+    assert layer(act, weights) is act.hidden_states_q
+    assert layer.winner_backend == key
+    assert layer._automatic_runners[key] is frost
+    assert len(created) == 1
+    layer.tuner.is_tuning_mode = False
+    accepted_before = len(accepted)
+    selections_before = len(selections)
+
+    set_gate(gate)
+    assert layer(act, weights) is act.hidden_states_q
+    assert layer.winner_backend == expected_key
+    assert len(accepted) == accepted_before + (1 if gate == "1" else 0)
+    assert len(selections) == selections_before
+    # Disabling admission must not destroy resources retained by CUDA graphs.
+    assert layer._automatic_runners[key] is frost
+    assert len(created) == 1
+
+
 def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     # Dispatch-policy test without allocating multi-GB weights or benchmarking.
     cfg = bf16_config(experts=12, intermediate=3072)
     calls = []
@@ -418,6 +549,7 @@ def test_bf16_original_layer_api_can_execute_winning_cudnn_frost_and_replay(
 ):
     from flashinfer.autotuner import autotune
 
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     torch.manual_seed(83)
     act, weights = bf16_packs(
         tokens=4096, experts=experts, hidden=hidden, intermediate=intermediate
@@ -582,14 +714,31 @@ def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
 
 
 @pytest.fixture
-def bf16_compiler_probe(monkeypatch):
+def bf16_compiler_environment(monkeypatch):
     pytest.importorskip("cutlass.cute")
     monkeypatch.setattr(bf16_moe, "require_graph_resource_retention", lambda: None)
     capabilities._compiler_error.cache_clear()
     monkeypatch.delenv("CUTE_DSL_ARCH", raising=False)
     # Compiler admission does not need GPU allocation or kernel compilation.
     monkeypatch.setattr(bf16_moe, "get_compute_capability", lambda device: (10, 7))
-    yield
+    try:
+        yield
+    finally:
+        capabilities._compiler_error.cache_clear()
+
+
+@pytest.fixture
+def bf16_compiler_probe(bf16_compiler_environment):
+    # Removing one capability only isolates that rejection when the installed
+    # compiler supports the unmodified sources for both tested activations.
+    for name in ("swiglu", "geglu"):
+        cfg = replace(bf16_config(), activation=ACTIVATIONS[name]())
+        try:
+            runner = bf16_moe.CudnnFrostBf16MoeRunner(cfg, torch.device("cuda", 0))
+            runner.check_support()
+        except NotImplementedError as exc:
+            pytest.skip(f"Compiler fault-injection tests need compatible APIs: {exc}")
+    # Fault injection below must inspect the modified APIs, not this baseline.
     capabilities._compiler_error.cache_clear()
 
 
@@ -601,12 +750,28 @@ def _assert_bf16_compiler_rejected(message):
 
 
 def test_bf16_automatic_candidate_declines_missing_source_compiler(
-    monkeypatch, bf16_compiler_probe
+    monkeypatch, bf16_compiler_environment
 ):
     monkeypatch.setitem(sys.modules, "cutlass.experimental.primitives", None)
     # Newer DSL releases import primitives through tensor_map first. Either
     # import path must report the missing dependency and decline admission.
     _assert_bf16_compiler_rejected(r"cutlass\.experimental\.primitives")
+
+
+def test_bf16_compiler_admission_rejects_older_alloc_api(
+    monkeypatch, bf16_compiler_environment
+):
+    from cutlass.experimental import primitives
+
+    # DSL 4.7 lacks this keyword. Keep its rejection covered independently of
+    # the compatible baseline required by the other fault-injection tests.
+    def older_tcgen05_alloc(tmem_ptr, num_cols, *, group=None):
+        raise AssertionError("compiler admission must not execute primitives")
+
+    monkeypatch.setattr(primitives, "tcgen05_alloc", older_tcgen05_alloc)
+    _assert_bf16_compiler_rejected(
+        "incompatible signature.*tcgen05_alloc.*is_exclusive"
+    )
 
 
 def test_bf16_missing_activation_primitive_preserves_other_activations(
@@ -726,6 +891,7 @@ def test_bf16_missing_compiler_preserves_layer_backend(
 ):
     from cutlass.experimental import primitives
 
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     monkeypatch.delattr(primitives, "tcgen05_mma")
     cfg = bf16_config(experts=12, intermediate=3072)
     original = SimpleNamespace(
@@ -851,6 +1017,120 @@ def test_bf16_shortlist_survives_autotuner_plain_tensor_profiles(monkeypatch):
     tactics = runner.get_valid_tactics(inputs, None)
     assert len(tactics) == 4
     assert calls == [(16, 7168, 3072, 12, 2)]
+
+
+def test_bf16_selection_cache_shared_by_admission_and_packing(monkeypatch):
+    from contextlib import nullcontext
+
+    runtime = bf16_moe.runtime
+    runtime.clear_artifact_cache()
+    runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cpu")
+    runner._built = True
+    act, weights = bf16_packs(tokens=16, device="cpu")
+    monkeypatch.setattr(bf16_moe, "get_compute_capability", lambda _: (10, 7))
+    monkeypatch.setattr(bf16_moe, "large_bf16_moe", lambda *_: True)
+    monkeypatch.setattr(runtime, "_arch_for", lambda _: "sm_107a")
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(bf16_moe, "_Plans", lambda *args: SimpleNamespace())
+    matching = bf16_moe._matching_kernels
+    calls = []
+
+    def match(*args):
+        calls.append(args)
+        return matching(*args)
+
+    monkeypatch.setattr(bf16_moe, "_matching_kernels", match)
+    try:
+        for _ in range(2):
+            assert runner.accepts(act, weights)
+            assert runner.pack_inputs(act, weights)[1] is act.hidden_states_q
+        assert len(calls) == 1
+
+        # A selection hit must still inspect this call's layout and semantics.
+        view = weights.get_view("cutlass_bf16")
+        original = view["fc1_expert_weights"]
+        view["fc1_expert_weights"] = torch.empty(
+            original.numel() + 1, dtype=original.dtype
+        )[1:].view_as(original)
+        assert not runner.accepts(act, weights)
+        with pytest.raises(ValueError, match="16B-aligned"):
+            runner.pack_inputs(act, weights)
+        view["fc1_expert_weights"] = original
+        view["bias"] = torch.empty(1)
+        assert not runner.accepts(act, weights)
+        with pytest.raises(ValueError, match="without overrides"):
+            runner.pack_inputs(act, weights)
+        del view["bias"]
+        assert runner.accepts(act, weights)
+        assert len(calls) == 1
+    finally:
+        runtime.clear_artifact_cache()
+
+
+def test_bf16_selection_cache_identity_refresh_and_bound(tmp_path, monkeypatch):
+    runtime = bf16_moe.runtime
+    runtime.clear_artifact_cache()
+    roots, arch = (tmp_path,), "sm_107a"
+    monkeypatch.setattr(runtime, "_artifact_roots", lambda: roots)
+    monkeypatch.setattr(runtime, "_arch_for", lambda _: arch)
+    calls = []
+
+    def match(*args):
+        calls.append(args)
+        return (), ()
+
+    monkeypatch.setattr(bf16_moe, "_matching_kernels", match)
+
+    def select(**changes):
+        args = dict(
+            tokens=16,
+            hidden=128,
+            intermediate=256,
+            experts=8,
+            topk=2,
+            device="cpu",
+            activation=SwiGLU(),
+        )
+        args.update(changes)
+        return bf16_moe._selected_kernels(**args)
+
+    try:
+        assert select() == ((), ())
+        select()  # Unsupported geometries are cached too.
+        assert len(calls) == 1
+        for key, value in (
+            ("tokens", 17),
+            ("hidden", 256),
+            ("intermediate", 512),
+            ("experts", 12),
+            ("topk", 4),
+            ("activation", ACTIVATIONS["relu"]()),
+        ):
+            select(**{key: value})
+        assert len(calls) == 7
+        arch = "sm_100a"
+        select()
+        roots = (tmp_path / "other",)
+        select()
+        assert len(calls) == 9
+        version = runtime._artifact_cache_version
+        runtime.clear_artifact_cache()
+        assert runtime._artifact_cache_version != version
+        select()
+        assert len(calls) == 10
+
+        for tokens in range(1, 130):
+            select(tokens=tokens)
+        info = bf16_moe._selected_kernels_cached.cache_info()
+        assert info.currsize == info.maxsize == 128
+        before = len(calls)
+        select(tokens=129)
+        assert len(calls) == before
+        select(tokens=1)  # Oldest geometry was evicted.
+        assert len(calls) == before + 1
+    finally:
+        runtime.clear_artifact_cache()
 
 
 def test_mxfp8_geometry_sharing_and_roundtrip_without_cudnn(monkeypatch):
@@ -2408,7 +2688,8 @@ def test_frost_moe_forward_accepts_base_runner_kwargs(dtype, runner_name, monkey
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_bf16_grouped_api_preserves_explicit_tactic(explicit, monkeypatch):
+@pytest.mark.parametrize("gate", [None, "0", "1"])
+def test_bf16_grouped_api_preserves_explicit_tactic(explicit, gate, monkeypatch):
     from flashinfer.autotuner import AutoTuner
     from flashinfer.experimental import (
         cudnn_frost_selected_kernels_moe_grouped_gemm as package,
@@ -2417,6 +2698,10 @@ def test_bf16_grouped_api_preserves_explicit_tactic(explicit, monkeypatch):
         cudnn_frost_grouped_gemm1_swiglu,
     )
 
+    if gate is None:
+        monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", gate)
     calls, choices = [], []
     requested = ("manual", "artifact", "digest")
     selected = ("autotuned", "artifact", "digest")

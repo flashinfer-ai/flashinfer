@@ -32,6 +32,8 @@ from ..runtime import (
     artifact_root as artifact_root,
 )
 
+_artifact_cache_version = 0
+
 
 @dataclass(frozen=True)
 class CudnnFrostGroupedGemm1Kernel:
@@ -142,11 +144,16 @@ def _discover(
 
 
 def clear_artifact_cache() -> None:
+    global _artifact_cache_version
+
     from ..shortlist import _read
     from .fc2 import discover as discover_fc2
+    from .moe import _selected_kernels_cached
 
+    _artifact_cache_version += 1
     _discover.cache_clear()
     discover_fc2.cache_clear()
+    _selected_kernels_cached.cache_clear()
     _clear_source_cache()
     _read.cache_clear()
 

@@ -48,31 +48,69 @@ def _module(arch):
 
 def _kernels(rows, hidden, intermediate, experts, device, activation=None):
     name = activation_name(SwiGLU() if activation is None else activation)
+    return _matching_kernels(
+        runtime._artifact_roots(),
+        runtime._arch_for(device),
+        rows,
+        hidden,
+        intermediate,
+        experts,
+        name,
+    )
+
+
+def _matching_kernels(roots, arch, rows, hidden, intermediate, experts, name):
     values = dict(s=rows, n=intermediate, k=hidden, experts=experts, groups=experts)
-    arch = runtime._arch_for(device)
     first = tuple(
         k
-        for k in runtime._discover(runtime._artifact_roots())
+        for k in runtime._discover(roots)
         if k.arch == arch
         and k.activation == name
         and all(
             runtime._dimension_matches(v, k.contract.get(d)) for d, v in values.items()
         )
     )
-    second = fc2.matching_kernels(rows, hidden, intermediate, experts, device)
+    values = dict(s=rows, n=hidden, k=intermediate, experts=experts, groups=experts)
+    second = tuple(
+        k
+        for k in fc2.discover(roots)
+        if k.arch == arch
+        and all(
+            runtime._dimension_matches(v, k.contract.get(d)) for d, v in values.items()
+        )
+    )
     return first, second
 
 
 def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activation):
+    return _selected_kernels_cached(
+        runtime._artifact_roots(),
+        runtime._artifact_cache_version,
+        runtime._arch_for(device),
+        tokens,
+        hidden,
+        intermediate,
+        experts,
+        topk,
+        activation_name(activation),
+    )
+
+
+@functools.lru_cache(maxsize=128)
+def _selected_kernels_cached(
+    roots, artifact_version, arch, tokens, hidden, intermediate, experts, topk, name
+):
+    # Admission and packing share sealed artifact metadata, never runtime tensors
+    # or pointers. Explicit artifact refresh advances the version in this key.
     from ..shortlist import select
 
-    first, second = _kernels(
-        tokens * topk, hidden, intermediate, experts, device, activation
+    first, second = _matching_kernels(
+        roots, arch, tokens * topk, hidden, intermediate, experts, name
     )
     return select(
-        runtime._artifact_roots(),
-        runtime._arch_for(device),
-        activation_name(activation),
+        roots,
+        arch,
+        name,
         tokens,
         hidden,
         intermediate,

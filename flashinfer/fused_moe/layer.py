@@ -437,9 +437,13 @@ class MoELayer:
                 **launch_kwargs,
             )
             # Still select the best tactic, but no cross-backend measurement
-            # can change the winner when only one runner is eligible.
+            # can change the winner when only one runner is eligible. Keep
+            # the common winner preparation below before caching it.
             if len(runners) == 1:
-                return runner, tactic
+                best_runner = runner
+                best_tactic = tactic
+                best_inputs = inputs
+                break
             from ..testing.utils import bench_gpu_time
 
             # Measure runner at its winning tactic.  Use CUDA-graph timing so
