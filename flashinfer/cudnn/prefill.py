@@ -1,4 +1,7 @@
+import contextlib
 import functools
+import os
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional
 
@@ -6,8 +9,8 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
-from ..utils import log2e
-from .utils import get_cudnn_fmha_gen_module
+from ..utils import check_lse_base, log2e
+from .utils import get_cudnn_fmha_gen_module, get_cudnn_attention_handle
 
 try:
     import cudnn
@@ -56,8 +59,92 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
         return False
 
 
-# Global cudnn handle. need to make it per device in future
-_cudnn_handle = None
+# Execute-time shape override for the ragged (token-indptr) path. cuDNN
+# finalizes one execution plan per declared (batch, max_seq_len) -- 55-70 ms on
+# SM100, ~1 s when a kernel variant compiles -- and serving changes both every
+# step. With override the graph is built once at a "cache shape" and every
+# execute passes the real (b, s_q, s_kv) through override_uids/shapes/strides:
+# no per-shape plan, no padding rows. q and kv lengths are classed as 1, <=128
+# or 65536+: s_q == 1 is cuDNN's decode kernel (an override may not cross that
+# boundary), and the heuristic picks the short-row engine for a declared
+# max_len <= 128 and another engine above (flip measured between 128 and 256 on
+# SM100 and SM107, independent of batch, LSE and head dims). Within a class
+# override matches a natively built plan.
+_PREFILL_SHAPE_OVERRIDE_ENV = "FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE"
+_OVERRIDE_SHORT_SEQ = 128
+_OVERRIDE_CACHE_SEQ_LONG = 65536
+_OVERRIDE_CACHE_BATCH = 4096
+
+
+@functools.cache
+def _cudnn_version_supports_shape_override() -> bool:
+    """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
+    cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
+    if not CUDNN_AVAILABLE:
+        return False
+    try:
+        if cudnn.backend_version() < 92200:
+            return False
+        major, minor = map(int, cudnn.__version__.split(".")[:2])
+        return (major, minor) >= (1, 29)
+    except Exception:
+        return False
+
+
+def _cudnn_supports_shape_override() -> bool:
+    if os.environ.get(_PREFILL_SHAPE_OVERRIDE_ENV, "1") == "0":
+        return False
+    return _cudnn_version_supports_shape_override()
+
+
+def _override_seq_class(max_seq: int, *, is_q: bool) -> int:
+    s = max(int(max_seq), 1)
+    if is_q and s == 1:
+        # cuDNN builds a distinct decode kernel for s_q == 1 and rejects an
+        # override that crosses the s_q == 1 boundary in either direction.
+        return 1
+    if s <= _OVERRIDE_SHORT_SEQ:
+        return _OVERRIDE_SHORT_SEQ
+    return max(_OVERRIDE_CACHE_SEQ_LONG, 1 << (s - 1).bit_length())
+
+
+def _override_cache_shape(
+    batch_size: int, max_seq_q: int, max_seq_kv: int
+) -> tuple[int, int, int]:
+    """Declared (batch, s_q, s_kv) of the override graph for a real (b, s_q,
+    s_kv). q and kv are classed separately (a short-q / long-kv step must not
+    be declared as short kv). Grows by powers of two when a caller exceeds the
+    defaults; that changes the cache key and builds one more plan."""
+    cache_b = max(
+        _OVERRIDE_CACHE_BATCH, 1 << (max(int(batch_size), 1) - 1).bit_length()
+    )
+    return (
+        cache_b,
+        _override_seq_class(max_seq_q, is_q=True),
+        _override_seq_class(max_seq_kv, is_q=False),
+    )
+
+
+# Workspace bytes a built graph needs, memoized by the graph-cache key (the
+# same tuple `_sdpa_prefill_key_fn` builds): the size is a function of the
+# declared shape, so the memo stays valid when the FE cache evicts and rebuilds
+# a graph, whereas an id(graph) key could be reused by a later object. The
+# override graphs reserve per-declared-batch TMA descriptors (~1 MiB at batch
+# 4096), so a caller's small workspace is checked before use.
+_graph_workspace_bytes: dict[tuple, int] = {}
+
+
+def _graph_workspace_size(graph, key: tuple) -> int:
+    size = _graph_workspace_bytes.get(key)
+    if size is None:
+        size = int(graph.get_workspace_size())
+        _graph_workspace_bytes[key] = size
+    return size
+
+
+# Graph builds (cache misses) since import; read by tests.
+_prefill_graph_builds = 0
+
 
 _dummy_scale_tensors: dict[torch.device, torch.Tensor] = {}
 
@@ -71,12 +158,7 @@ def _get_dummy_scale_tensor(device: torch.device):
 
 
 def _create_cudnn_handle(stream: torch.cuda.Stream):
-    global _cudnn_handle
-
-    if _cudnn_handle is None:
-        _cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
-    return _cudnn_handle
+    return get_cudnn_attention_handle(cudnn, stream)
 
 
 # Tensor ids
@@ -114,11 +196,27 @@ class UIDs(Enum):
     O_AMAX_UID = 161  # Output amax tensor
 
 
-def _sdpa_prefill_key_fn(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    scale: float,
+def _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type):
+    # Only execute-time tensors belong here. Plan metadata is keyed once by
+    # _prefill_descriptor_key; pointer values never select a graph.
+    return (
+        q.device,
+        q.dtype,
+        q.dtype if o_data_type is None else o_data_type,
+        q.dim(),
+        q.shape[1:],
+        k_cache.dtype,
+        v_cache.dtype,
+        k_cache.shape if k_cache.dim() == 4 else k_cache.shape[1:],
+        v_cache.shape if v_cache.dim() == 4 else v_cache.shape[1:],
+        q.stride(),
+        k_cache.stride(),
+        v_cache.stride(),
+        scale,
+    )
+
+
+def _prefill_descriptor_key(
     *,
     max_token_seq_q: Optional[int] = None,
     max_sequence_kv: Optional[int] = None,
@@ -138,6 +236,7 @@ def _sdpa_prefill_key_fn(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
+    override_cache: Optional[tuple[int, int, int]] = None,
 ):
     if actual_seq_lens_q is not None:
         graph_b = actual_seq_lens_q.shape[0]
@@ -145,42 +244,71 @@ def _sdpa_prefill_key_fn(
         graph_b = cu_seq_lens_q.shape[0] - 1
     else:
         raise ValueError("Either actual_seq_lens_q or cu_seq_lens_q must be provided")
+    layouts = {}
 
-    if q.dim() == 3:
-        h_qo, d_qk = q.shape[1], q.shape[2]
-    elif q.dim() == 4:
-        h_qo, d_qk = q.shape[1], q.shape[3]
+    def layout(t):
+        if t is None:
+            return None
+        if id(t) not in layouts:
+            layouts[id(t)] = (tuple(t.shape), tuple(t.stride()), t.dtype)
+        return layouts[id(t)]
 
-    if v_cache.dim() == 3:
-        h_kv, d_vo = k_cache.shape[1], k_cache.shape[2]
-    elif k_cache.dim() == 4:
-        h_kv, d_vo = k_cache.shape[1], k_cache.shape[3]
-
-    if block_tables is not None:
-        page_size = k_cache.shape[2]
-
-    key = (
-        graph_b,
-        q.dim(),
-        q.dtype,
-        k_cache.dim(),
-        max_token_seq_q,
-        max_sequence_kv,
-        h_qo,
-        d_qk,
-        h_kv,
-        d_vo,
-        block_tables is not None,
-        return_lse,
+    core = (
+        (graph_b, max_token_seq_q, max_sequence_kv),
         bottom_right_causal_mask,
-        page_size,
-        cu_seq_lens_q is not None,
-        # attn_scale is baked into the built graph as a compile-time constant
-        # (see _build_prefill_graph); omitting it here silently replays a
-        # stale-scale graph for any same-shape call with a different scale.
-        scale,
+        False,
+        layout(block_tables),
+        layout(actual_seq_lens_q) if cu_seq_lens_q is None else None,
+        layout(actual_seq_lens_kv) if cu_seq_lens_kv is None else None,
+        tuple(
+            layout(t)
+            for t in (
+                cu_seq_lens_q,
+                cu_seq_lens_kv,
+                batch_offsets_q,
+                batch_offsets_o,
+                batch_offsets_k,
+                batch_offsets_v,
+            )
+        ),
     )
-    return key
+    key = (core, (return_lse, layout(batch_offsets_stats) if return_lse else None))
+    return (
+        _prefill_override_descriptor_key(key, override_cache)
+        if override_cache is not None
+        else key
+    )
+
+
+def _prefill_override_descriptor_key(key, override_cache):
+    core, (return_lse, stats) = key
+    _, causal, _, table, seq_q, seq_kv, offsets = core
+
+    def indptr_layout(layout):
+        if layout is None:
+            return None
+        # Match indptr_tensor's declaration at the cache batch size.
+        return ((override_cache[0] + 1, 1, 1, 1), (1, 1, 1, 1), layout[2])
+
+    return (
+        (
+            override_cache,
+            causal,
+            True,
+            table,
+            seq_q,
+            seq_kv,
+            tuple(indptr_layout(t) for t in offsets),
+        ),
+        (return_lse, indptr_layout(stats)),
+    )
+
+
+def _sdpa_prefill_key_fn(q, k_cache, v_cache, scale, *, o_data_type=None, **metadata):
+    return (
+        _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type),
+        _prefill_descriptor_key(**metadata),
+    )
 
 
 if CUDNN_AVAILABLE:
@@ -210,7 +338,10 @@ if CUDNN_AVAILABLE:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         o_data_type: Optional[torch.dtype] = None,
+        override_cache: Optional[tuple[int, int, int]] = None,
     ):
+        global _prefill_graph_builds
+        _prefill_graph_builds += 1
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
         # cu_seq_lens_q/kv select the direct path: cuDNN consumes (b+1)-shaped
@@ -256,6 +387,19 @@ if CUDNN_AVAILABLE:
             )
         graph_s_qo = max_token_seq_q
         graph_s_kv = max_sequence_kv
+        if override_cache is not None:
+            graph_b, graph_s_qo, graph_s_kv = override_cache
+
+        def indptr_tensor(like: torch.Tensor):
+            # (b+1)-row int32 buffers (ragged offsets, cu_seq_lens). Declared at
+            # the cache batch under override, else shaped like the caller's.
+            if override_cache is None:
+                return g.tensor_like(like)
+            return g.tensor(
+                dim=(graph_b + 1, 1, 1, 1),
+                stride=(1, 1, 1, 1),
+                data_type=cudnn.datatypes._torch_to_cudnn_data_type(like.dtype),
+            )
 
         if not cudnn.datatypes.is_torch_available():
             raise RuntimeError("torch is not available")
@@ -277,7 +421,24 @@ if CUDNN_AVAILABLE:
                 f"FP8 is not supported in cuDNN backend version < 9.17.1, current version is {cudnn.backend_version()}"
             )
 
-        with cudnn.graph(handle) as (g, _):
+        graph_ctx: contextlib.AbstractContextManager
+        if override_cache is not None:
+            graph_ctx = contextlib.nullcontext(
+                (
+                    cudnn.pygraph(
+                        name="cudnn_graph",
+                        io_data_type=cudnn.data_type.HALF,
+                        intermediate_data_type=cudnn.data_type.FLOAT,
+                        compute_data_type=cudnn.data_type.FLOAT,
+                        handle=handle,
+                        is_override_shape_enabled=True,
+                    ),
+                    [],
+                )
+            )
+        else:
+            graph_ctx = cudnn.graph(handle)
+        with graph_ctx as (g, _):
             # Create tensors from the input tensors
             if q.dim() == 3:
                 h_qo, d_qk = q.shape[1], q.shape[2]
@@ -288,6 +449,7 @@ if CUDNN_AVAILABLE:
             else:
                 raise ValueError(f"Invalid query tensor shape: {q.shape}")
 
+            q_token_stride = s_stride
             cudnn_q = g.tensor(
                 name="q",
                 dim=(graph_b, h_qo, graph_s_qo, d_qk),
@@ -349,13 +511,14 @@ if CUDNN_AVAILABLE:
                 cudnn_o_scale.set_uid(UIDs.O_SCALE_UID.value)
 
             if batch_offsets_q is not None:
-                ragged_q = g.tensor_like(batch_offsets_q)
+                ragged_q = indptr_tensor(batch_offsets_q)
                 ragged_q.set_uid(UIDs.RAGGED_Q_UID.value)
                 cudnn_q.set_ragged_offset(ragged_q)
                 if use_cu_seq_lens:
                     # Offsets are token-unit indptrs; the engine scales them
-                    # back to elements.
-                    cudnn_q.set_ragged_offset_multiplier(h_qo * d_qk)
+                    # back to elements with the tensor's own token stride, so a
+                    # non-contiguous q (T3HD: 3*h*d per token) addresses correctly.
+                    cudnn_q.set_ragged_offset_multiplier(q_token_stride)
 
             if v_cache.dim() == 3:
                 assert block_tables is None, (
@@ -380,11 +543,11 @@ if CUDNN_AVAILABLE:
                 )
 
                 if batch_offsets_k is not None:
-                    ragged_k = g.tensor_like(batch_offsets_k)
+                    ragged_k = indptr_tensor(batch_offsets_k)
                     ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
                     cudnn_k_cache.set_ragged_offset(ragged_k)
                     if use_cu_seq_lens:
-                        cudnn_k_cache.set_ragged_offset_multiplier(h_kv * d_qk)
+                        cudnn_k_cache.set_ragged_offset_multiplier(s_stride)
 
                 assert v_cache.dim() == 3, (
                     "v_cache must have 3 dimensions since k_cache has 3 dimensions"
@@ -398,11 +561,11 @@ if CUDNN_AVAILABLE:
                 )
 
                 if batch_offsets_v is not None:
-                    ragged_v = g.tensor_like(batch_offsets_v)
+                    ragged_v = indptr_tensor(batch_offsets_v)
                     ragged_v.set_uid(UIDs.RAGGED_V_UID.value)
                     cudnn_v_cache.set_ragged_offset(ragged_v)
                     if use_cu_seq_lens:
-                        cudnn_v_cache.set_ragged_offset_multiplier(h_kv * d_vo)
+                        cudnn_v_cache.set_ragged_offset_multiplier(s_stride)
 
             elif k_cache.dim() == 4:
                 cudnn_k_cache = g.tensor(
@@ -437,7 +600,7 @@ if CUDNN_AVAILABLE:
                 # cu_seq_len_q occupies the Q seq-len UID slot (mutually
                 # exclusive with a per-batch seq_len_q, same role). On the
                 # ragged path it is the same buffer as the Q ragged offset.
-                cudnn_cu_seq_lens_q = g.tensor_like(cu_seq_lens_q)
+                cudnn_cu_seq_lens_q = indptr_tensor(cu_seq_lens_q)
                 cudnn_cu_seq_lens_q.set_name("cu_seq_lens_q")
                 cudnn_cu_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
 
@@ -459,7 +622,7 @@ if CUDNN_AVAILABLE:
                 # or actual_seq_lens_kv to it accordingly.
                 if cu_seq_lens_kv is not None:
                     # Non-paged: both-cumulative (KV also token-unit ragged).
-                    cudnn_cu_seq_lens_kv = g.tensor_like(cu_seq_lens_kv)
+                    cudnn_cu_seq_lens_kv = indptr_tensor(cu_seq_lens_kv)
                     cudnn_cu_seq_lens_kv.set_name("cu_seq_lens_kv")
                     cudnn_cu_seq_lens_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
                     seq_len_kwargs["cu_seq_len_kv"] = cudnn_cu_seq_lens_kv
@@ -563,14 +726,14 @@ if CUDNN_AVAILABLE:
                 ).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
 
             if batch_offsets_o is not None:
-                ragged_o = g.tensor_like(batch_offsets_o)
+                ragged_o = indptr_tensor(batch_offsets_o)
                 ragged_o.set_uid(UIDs.RAGGED_O_UID.value)
                 O.set_ragged_offset(ragged_o)
                 if use_cu_seq_lens:
                     O.set_ragged_offset_multiplier(h_qo * d_vo)
 
             if batch_offsets_stats is not None:
-                ragged_stats = g.tensor_like(batch_offsets_stats)
+                ragged_stats = indptr_tensor(batch_offsets_stats)
                 ragged_stats.set_uid(UIDs.RAGGED_STATS_UID.value)
                 Stats.set_ragged_offset(ragged_stats)
                 if use_cu_seq_lens:
@@ -611,119 +774,595 @@ if CUDNN_AVAILABLE:
             return g, tensors_to_return
 
 
-def _batch_prefill_with_kv_cache(
+def _override_execute_kwargs(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    batch_size: int,
+    s_qo: int,
+    s_kv: int,
+    with_stats: bool,
+) -> dict:
+    """Real shapes for an override-graph execute: the dims/strides
+    _build_prefill_graph would have declared for this call, in the same form."""
+    h_qo, d_qk = q.shape[1], q.shape[2]
+    h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
+    q_s, q_h, q_d = q.stride()
+    k_s, k_h, k_d = k_cache.stride()
+    v_s, v_h, v_d = v_cache.stride()
+    rows, unit = [batch_size + 1, 1, 1, 1], [1, 1, 1, 1]
+    uids = [
+        UIDs.Q_UID.value,
+        UIDs.K_UID.value,
+        UIDs.V_UID.value,
+        UIDs.O_UID.value,
+        UIDs.RAGGED_Q_UID.value,
+        UIDs.RAGGED_K_UID.value,
+        UIDs.RAGGED_V_UID.value,
+        UIDs.RAGGED_O_UID.value,
+        UIDs.ACTUAL_SEQ_LENS_Q_UID.value,
+        UIDs.ACTUAL_SEQ_LENS_KV_UID.value,
+    ]
+    shapes = [
+        [batch_size, h_qo, s_qo, d_qk],
+        [batch_size, h_kv, s_kv, d_qk],
+        [batch_size, h_kv, s_kv, d_vo],
+        [batch_size, h_qo, s_qo, d_vo],
+    ] + [rows] * 6
+    strides = [
+        [h_qo * d_qk, q_h, q_s, q_d],
+        [h_kv * d_qk * s_kv, k_h, k_s, k_d],
+        [h_kv * d_vo * s_kv, v_h, v_s, v_d],
+        [s_qo * d_vo * h_qo, d_vo, d_vo * h_qo, 1],
+    ] + [unit] * 6
+    if with_stats:
+        uids += [UIDs.STATS_UID.value, UIDs.RAGGED_STATS_UID.value]
+        shapes += [[batch_size, h_qo, s_qo, 1], rows]
+        strides += [[s_qo * h_qo, 1, h_qo, 1], unit]
+    return dict(override_uids=uids, override_shapes=shapes, override_strides=strides)
+
+
+@dataclass(slots=True)
+class _PrefillMetadata:
+    """Resolved cuDNN metadata; wrappers resolve this once per plan.
+
+    Cumulative lengths and ragged offsets already have the units expected by
+    the graph. One explicit mapping supplies both build and match, including
+    every descriptor argument even if today's cache key ignores some of them.
+    FP8 scales are runtime bindings, and outputs stay call-local.
+    """
+
+    max_token_per_sequence: int
+    max_sequence_kv: int
+    causal: bool
+    return_lse: bool
+    o_data_type: Optional[torch.dtype] = None
+    actual_seq_lens_q: Optional[torch.Tensor] = None
+    actual_seq_lens_kv: Optional[torch.Tensor] = None
+    cu_seq_lens_q: Optional[torch.Tensor] = None
+    cu_seq_lens_kv: Optional[torch.Tensor] = None
+    block_tables: Optional[torch.Tensor] = None
+    batch_offsets_q: Optional[torch.Tensor] = None
+    batch_offsets_o: Optional[torch.Tensor] = None
+    batch_offsets_k: Optional[torch.Tensor] = None
+    batch_offsets_v: Optional[torch.Tensor] = None
+    batch_offsets_stats: Optional[torch.Tensor] = None
+    q_scale: Optional[torch.Tensor] = None
+    k_scale: Optional[torch.Tensor] = None
+    v_scale: Optional[torch.Tensor] = None
+
+    def resolve(self, q, k_cache, v_cache, *, batch_offsets_units="elements"):
+        return self.resolve_from_plan(
+            q.dtype,
+            q.shape[1],
+            k_cache.shape[1],
+            q.shape[-1],
+            v_cache.shape[-1],
+            batch_offsets_units=batch_offsets_units,
+        )
+
+    def resolve_from_plan(
+        self,
+        q_dtype,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        *,
+        batch_offsets_units="tokens",
+    ):
+        if batch_offsets_units != "tokens":
+            return self
+        if self.batch_offsets_o is None:
+            self.batch_offsets_o = self.batch_offsets_q
+        if self.batch_offsets_v is None:
+            self.batch_offsets_v = self.batch_offsets_k
+        paged = self.block_tables is not None
+        direct = (
+            _cudnn_supports_direct_seqlens(q_dtype, mixed=paged)
+            and self.batch_offsets_q is not None
+            and (
+                self.actual_seq_lens_kv is not None
+                if paged
+                else self.batch_offsets_k is not None
+            )
+        )
+        if direct:
+            self.cu_seq_lens_q = self.batch_offsets_q
+            self.cu_seq_lens_kv = None if paged else self.batch_offsets_k
+        else:
+            if self.actual_seq_lens_q is None:
+                self.actual_seq_lens_q = (
+                    self.batch_offsets_q[1:] - self.batch_offsets_q[:-1]
+                ).view(-1, 1, 1, 1)
+            if self.actual_seq_lens_kv is None:
+                self.actual_seq_lens_kv = (
+                    self.batch_offsets_k[1:] - self.batch_offsets_k[:-1]
+                ).view(-1, 1, 1, 1)
+            for name, multiplier in (
+                ("batch_offsets_q", num_qo_heads * head_dim_qk),
+                ("batch_offsets_o", num_qo_heads * head_dim_vo),
+                ("batch_offsets_k", num_kv_heads * head_dim_qk),
+                ("batch_offsets_v", num_kv_heads * head_dim_vo),
+                ("batch_offsets_stats", num_qo_heads),
+            ):
+                offsets = getattr(self, name)
+                if offsets is not None:
+                    setattr(self, name, offsets * multiplier)
+        return self
+
+    def override_shape(self, q, k_cache):
+        return self.override_shape_from_plan(
+            q.dtype, q.dim() == 3 and k_cache.dim() == 3
+        )
+
+    def override_shape_from_plan(self, q_dtype, ragged):
+        # Override descriptors declare contiguous indptrs at the cache batch.
+        if (
+            self.cu_seq_lens_q is not None
+            and self.cu_seq_lens_kv is not None
+            and self.block_tables is None
+            and ragged
+            and q_dtype in (torch.float16, torch.bfloat16)
+            and self.q_scale is None
+            and self.k_scale is None
+            and self.v_scale is None
+            and self.batch_offsets_q is not None
+            and self.batch_offsets_k is not None
+            and self.batch_offsets_v is not None
+            and self.batch_offsets_o is not None
+            and (self.batch_offsets_stats is not None or not self.return_lse)
+            and all(
+                t.is_contiguous()
+                for t in (
+                    self.cu_seq_lens_q,
+                    self.cu_seq_lens_kv,
+                    self.batch_offsets_q,
+                    self.batch_offsets_k,
+                    self.batch_offsets_v,
+                    self.batch_offsets_o,
+                )
+            )
+            and (
+                self.batch_offsets_stats is None
+                or self.batch_offsets_stats.is_contiguous()
+            )
+            and _cudnn_supports_shape_override()
+        ):
+            return _override_cache_shape(
+                self.cu_seq_lens_q.shape[0] - 1,
+                self.max_token_per_sequence,
+                self.max_sequence_kv,
+            )
+        return None
+
+    def graph_kwargs(self, override_cache):
+        return dict(
+            max_token_seq_q=self.max_token_per_sequence,
+            max_sequence_kv=self.max_sequence_kv,
+            override_cache=override_cache,
+            actual_seq_lens_q=self.actual_seq_lens_q,
+            actual_seq_lens_kv=self.actual_seq_lens_kv,
+            cu_seq_lens_q=self.cu_seq_lens_q,
+            cu_seq_lens_kv=self.cu_seq_lens_kv,
+            block_tables=self.block_tables,
+            bottom_right_causal_mask=self.causal,
+            return_lse=self.return_lse,
+            batch_offsets_q=self.batch_offsets_q,
+            batch_offsets_o=self.batch_offsets_o,
+            batch_offsets_k=self.batch_offsets_k,
+            batch_offsets_v=self.batch_offsets_v,
+            batch_offsets_stats=self.batch_offsets_stats,
+            o_data_type=self.o_data_type,
+        )
+
+
+def _prefill_plan_bindings(metadata, dtype, device):
+    """Bindings whose layout and ownership are fixed by a plan."""
+    var_map = {}
+    # The cumulative seq lens feed the padding mask via the seq-lens UID
+    # slots (on the ragged path these are the same buffers as the
+    # token-unit ragged offsets below).
+    if metadata.cu_seq_lens_q is not None:
+        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = metadata.cu_seq_lens_q
+    elif metadata.actual_seq_lens_q is not None:
+        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = metadata.actual_seq_lens_q
+    if metadata.cu_seq_lens_kv is not None:
+        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = metadata.cu_seq_lens_kv
+    elif metadata.actual_seq_lens_kv is not None:
+        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = metadata.actual_seq_lens_kv
+    if metadata.batch_offsets_q is not None:
+        var_map[UIDs.RAGGED_Q_UID.value] = metadata.batch_offsets_q
+    if metadata.batch_offsets_o is not None:
+        var_map[UIDs.RAGGED_O_UID.value] = metadata.batch_offsets_o
+    if metadata.batch_offsets_k is not None:
+        var_map[UIDs.RAGGED_K_UID.value] = metadata.batch_offsets_k
+    if metadata.batch_offsets_v is not None:
+        var_map[UIDs.RAGGED_V_UID.value] = metadata.batch_offsets_v
+    if metadata.block_tables is not None:
+        var_map[UIDs.BLOCK_TABLES_K_UID.value] = metadata.block_tables
+        var_map[UIDs.BLOCK_TABLES_V_UID.value] = metadata.block_tables
+    if metadata.return_lse:
+        if metadata.batch_offsets_stats is not None:
+            var_map[UIDs.RAGGED_STATS_UID.value] = metadata.batch_offsets_stats
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        dummy_scale_tensor = _get_dummy_scale_tensor(device)
+        for uid, scale in (
+            (UIDs.Q_SCALE_UID, metadata.q_scale),
+            (UIDs.K_SCALE_UID, metadata.k_scale),
+            (UIDs.V_SCALE_UID, metadata.v_scale),
+        ):
+            if scale is None:
+                scale = dummy_scale_tensor
+            elif not isinstance(scale, torch.Tensor):
+                # Fill on the GPU: torch.tensor would copy unpinned host data
+                # during capture. Each call owns its scalar storage.
+                scale = torch.full((1,), scale, device=device, dtype=torch.float32)
+            if (
+                scale.dtype != torch.float32
+                or scale.numel() != 1
+                or not scale.is_contiguous()
+            ):
+                raise ValueError("cuDNN FP8 scales must be scalar float32 tensors")
+            var_map[uid.value] = scale
+        var_map[UIDs.S_SCALE_UID.value] = dummy_scale_tensor
+        var_map[UIDs.S_DESCALE_UID.value] = dummy_scale_tensor
+        var_map[UIDs.O_SCALE_UID.value] = dummy_scale_tensor
+
+    for tensor in var_map.values():
+        if tensor.device != device:
+            raise ValueError(
+                "all cuDNN prefill buffers must be on the same device as q"
+            )
+    return var_map
+
+
+class _CudnnPrefillPlan:
+    """Plan-owned metadata snapshots, keys and static bindings.
+
+    Tensor values can change in place. Layout changes require another plan;
+    detached views keep a caller's later Tensor metadata mutation from changing
+    these descriptors. Each execute copies its binding map before rebinding.
+    """
+
+    _tensor_fields = (
+        "actual_seq_lens_q",
+        "actual_seq_lens_kv",
+        "cu_seq_lens_q",
+        "cu_seq_lens_kv",
+        "block_tables",
+        "batch_offsets_q",
+        "batch_offsets_o",
+        "batch_offsets_k",
+        "batch_offsets_v",
+        "batch_offsets_stats",
+    )
+
+    @classmethod
+    def prepare(cls, metadata, dtype, device, previous=None):
+        inputs = tuple(getattr(metadata, name) for name in cls._tensor_fields)
+        exact = _prefill_descriptor_key(**metadata.graph_kwargs(None))
+        enabled = _cudnn_supports_shape_override()
+        if (
+            previous is not None
+            and previous.device == device
+            and previous.dtype == dtype
+            and previous.metadata.o_data_type == metadata.o_data_type
+            and previous.override_enabled == enabled
+            and previous.exact_keys[True] == exact
+            and all(a is b for a, b in zip(previous.inputs, inputs, strict=True))
+        ):
+            # Values changed in stable buffers. Descriptor equality above is
+            # still required: tensor identity alone does not freeze its layout.
+            return previous
+        return cls(
+            metadata,
+            dtype,
+            device,
+            previous,
+            exact=exact,
+            inputs=inputs,
+            override_enabled=enabled,
+        )
+
+    def __init__(
+        self,
+        metadata,
+        dtype,
+        device,
+        previous=None,
+        *,
+        exact,
+        inputs,
+        override_enabled,
+    ):
+        self.inputs = inputs
+        views = {}
+        for name in self._tensor_fields:
+            tensor = getattr(metadata, name)
+            if tensor is not None:
+                if id(tensor) not in views:
+                    views[id(tensor)] = tensor.detach()
+                setattr(metadata, name, views[id(tensor)])
+        self.metadata = metadata
+        self.device = device
+        self.override_enabled = override_enabled
+        self.dtype = dtype
+        if (
+            previous is not None
+            and exact == previous.exact_keys[True]
+            and dtype == previous.dtype
+            and self.override_enabled == previous.override_enabled
+        ):
+            self.override = previous.override
+            self.exact_keys = previous.exact_keys
+            self.override_keys = previous.override_keys
+        else:
+            self.override = metadata.override_shape_from_plan(
+                dtype, metadata.block_tables is None
+            )
+            self.exact_keys = ((exact[0], (False, None)), exact)
+            if self.override is not None:
+                override = _prefill_override_descriptor_key(exact, self.override)
+                self.override_keys = ((override[0], (False, None)), override)
+            else:
+                self.override_keys = self.exact_keys
+        bindings = _prefill_plan_bindings(metadata, dtype, device)
+        without_stats = bindings.copy()
+        without_stats.pop(UIDs.RAGGED_STATS_UID.value, None)
+        self.bindings = (without_stats, bindings)
+        self.execution_shape = exact[0][0]
+        self.bound_graph = None
+        self.execute_kwargs = {}
+        # Real shape overrides depend on bounds and on the prepared graph's
+        # runtime tensor layout, not on the new indptr pointers or values.
+        if previous is not None and previous.execution_shape == self.execution_shape:
+            self.bound_graph = previous.bound_graph
+            self.execute_kwargs = previous.execute_kwargs
+
+    def build_metadata(self, return_lse):
+        # The output-only variant is needed only when preparing a new graph.
+        return (
+            self.metadata
+            if return_lse
+            else replace(self.metadata, return_lse=False, batch_offsets_stats=None)
+        )
+
+
+class CudnnPrefillGraph:
+    """A built prefill graph prepared once for one graph signature, so a
+    wrapper's per-step ``run()`` only rebinds the tensors and executes.
+
+    The signature is the graph-cache key of :func:`_build_prefill_graph`
+    (declared shape or override class, dtypes, strides, scale, mask, flags), so
+    a prepared graph is reused exactly where the graph cache would replay the
+    same graph and re-prepared otherwise. The wrapper owns a metadata plan
+    that caches real-shape execute kwargs, checks matches_plan before running,
+    and invalidates the prepared graph on workspace replacement. Each run
+    binds fresh pointers. Planning and workspace replacement must not race
+    with a run on the same wrapper.
+
+    ``out`` and ``lse`` are bound as given: callers validate their shapes
+    (the wrappers do, and :func:`cudnn_batch_prefill_with_kv_cache` does
+    before preparing).
+    """
+
+    __slots__ = (
+        "key",
+        "graph",
+        "override_cache",
+        "return_lse",
+    )
+
+    def __init__(self, key, graph, *, override_cache, return_lse: bool):
+        self.key = key
+        self.graph = graph
+        self.override_cache = override_cache
+        self.return_lse = return_lse
+
+    def matches_plan(self, q, k_cache, v_cache, scale, plan, return_lse):
+        metadata = plan.metadata
+        if self.override_cache is not None:
+            if plan.override != self.override_cache:
+                return False
+            key = plan.override_keys[return_lse]
+        else:
+            key = plan.exact_keys[return_lse]
+        return self.key[1] == key and self.key[0] == _prefill_runtime_key(
+            q, k_cache, v_cache, scale, metadata.o_data_type
+        )
+
+    def run_planned(
+        self, q, k_cache, v_cache, out, lse, workspace_buffer, *, plan, lse_base="log2"
+    ):
+        device = plan.device
+        if any(
+            t.device != device for t in (q, k_cache, v_cache, out, workspace_buffer)
+        ):
+            raise ValueError(
+                "all cuDNN prefill buffers must be on the same device as q"
+            )
+        if self.return_lse and (lse is None or lse.device != device):
+            raise ValueError(
+                "all cuDNN prefill buffers must be on the same device as q"
+            )
+        if plan.bound_graph is not self:
+            metadata = plan.metadata
+            plan.execute_kwargs = (
+                _override_execute_kwargs(
+                    q,
+                    k_cache,
+                    v_cache,
+                    batch_size=metadata.cu_seq_lens_q.shape[0] - 1,
+                    s_qo=metadata.max_token_per_sequence,
+                    s_kv=metadata.max_sequence_kv,
+                    with_stats=self.return_lse,
+                )
+                if self.override_cache is not None
+                else {}
+            )
+            plan.bound_graph = self
+        var_map = plan.bindings[self.return_lse].copy()
+        var_map.update(
+            {
+                UIDs.Q_UID.value: q,
+                UIDs.K_UID.value: k_cache,
+                UIDs.V_UID.value: v_cache,
+                UIDs.O_UID.value: out,
+            }
+        )
+        if self.return_lse:
+            var_map[UIDs.STATS_UID.value] = lse
+        return self._execute(
+            q, out, lse, workspace_buffer, var_map, plan.execute_kwargs, lse_base
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        lse: Optional[torch.Tensor],
+        workspace_buffer: torch.Tensor,
+        *,
+        metadata: _PrefillMetadata,
+        lse_base: str = "log2",
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        device = q.device
+        var_map = _prefill_plan_bindings(metadata, q.dtype, device)
+        var_map.update(
+            {
+                UIDs.Q_UID.value: q,
+                UIDs.K_UID.value: k_cache,
+                UIDs.V_UID.value: v_cache,
+                UIDs.O_UID.value: out,
+            }
+        )
+        if self.return_lse:
+            var_map[UIDs.STATS_UID.value] = lse
+        for tensor in (k_cache, v_cache, out, workspace_buffer):
+            if tensor.device != device:
+                raise ValueError(
+                    "all cuDNN prefill buffers must be on the same device as q"
+                )
+        if self.return_lse and (lse is None or lse.device != device):
+            raise ValueError(
+                "all cuDNN prefill buffers must be on the same device as q"
+            )
+
+        execute_kwargs: dict = {}
+        if self.override_cache is not None:
+            # The public entry point creates this wrapper per call. Repeated
+            # wrapper execution uses run_planned and its plan-owned kwargs.
+            execute_kwargs = _override_execute_kwargs(
+                q,
+                k_cache,
+                v_cache,
+                batch_size=metadata.cu_seq_lens_q.shape[0] - 1,
+                s_qo=metadata.max_token_per_sequence,
+                s_kv=metadata.max_sequence_kv,
+                with_stats=self.return_lse,
+            )
+
+        return self._execute(
+            q, out, lse, workspace_buffer, var_map, execute_kwargs, lse_base
+        )
+
+    def _execute(
+        self, q, out, lse, workspace_buffer, var_map, execute_kwargs, lse_base
+    ):
+        handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+        self.graph.execute(
+            var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs
+        )
+
+        if self.return_lse:
+            # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
+            # backend returns base-2 LSE (they fold log2e into the softmax scale, so
+            # their kernels emit base-2 directly). Convert here so the cuDNN backend
+            # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
+            # A caller that wants natural log gets the stats as written.
+            if lse_base == "log2":
+                lse.mul_(log2e)
+            return out, lse
+        return out, None
+
+
+def prepare_cudnn_batch_prefill(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     scale: float,
     workspace_buffer: torch.Tensor,
     *,
-    max_token_per_sequence: int,
-    max_sequence_kv: int,
-    actual_seq_lens_q: Optional[torch.Tensor] = None,
-    actual_seq_lens_kv: Optional[torch.Tensor] = None,
-    cu_seq_lens_q: Optional[torch.Tensor] = None,
-    cu_seq_lens_kv: Optional[torch.Tensor] = None,
-    block_tables: Optional[torch.Tensor] = None,
-    causal: bool,
-    return_lse: bool,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
-    batch_offsets_q: Optional[torch.Tensor] = None,
-    batch_offsets_o: Optional[torch.Tensor] = None,
-    batch_offsets_k: Optional[torch.Tensor] = None,
-    batch_offsets_v: Optional[torch.Tensor] = None,
-    batch_offsets_stats: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    lse: Optional[torch.Tensor] = None,
-    o_data_type: Optional[torch.dtype] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    graph, tensors = _build_prefill_graph(
+    metadata: _PrefillMetadata,
+) -> CudnnPrefillGraph:
+    """Fetch (or build into the graph cache) the prefill graph for this call's
+    signature and wrap it for execution.
+
+    Takes the resolved form :func:`cudnn_batch_prefill_with_kv_cache` hands to
+    the low level: token-unit ``cu_seq_lens_*`` on the direct path (with the
+    same buffers as ``batch_offsets_*``), or per-batch ``actual_seq_lens_*``
+    with element-unit offsets. The wrappers call this directly and keep the
+    result across steps, using :meth:`CudnnPrefillGraph.matches_plan` and
+    :meth:`CudnnPrefillGraph.run_planned` with their plan-owned metadata.
+    The public low-level entry point instead calls :meth:`CudnnPrefillGraph.run`
+    with metadata resolved for that call.
+    """
+    override_cache = metadata.override_shape(q, k_cache)
+
+    graph, _ = _build_prefill_graph(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
         scale=scale,
-        max_token_seq_q=max_token_per_sequence,
-        max_sequence_kv=max_sequence_kv,
-        actual_seq_lens_q=actual_seq_lens_q,
-        actual_seq_lens_kv=actual_seq_lens_kv,
-        cu_seq_lens_q=cu_seq_lens_q,
-        cu_seq_lens_kv=cu_seq_lens_kv,
-        block_tables=block_tables,
-        bottom_right_causal_mask=causal,
-        return_lse=return_lse,
-        batch_offsets_q=batch_offsets_q,
-        batch_offsets_o=batch_offsets_o,
-        batch_offsets_k=batch_offsets_k,
-        batch_offsets_v=batch_offsets_v,
-        batch_offsets_stats=batch_offsets_stats,
-        out=out,
-        lse=lse,
-        o_data_type=o_data_type,
+        **metadata.graph_kwargs(override_cache),
     )
-
-    var_map = {
-        UIDs.Q_UID.value: q,
-        UIDs.K_UID.value: k_cache,
-        UIDs.V_UID.value: v_cache,
-        UIDs.O_UID.value: out,
-    }
-
-    # The cumulative seq lens feed the padding mask via the seq-lens UID
-    # slots (on the ragged path these are the same buffers as the
-    # token-unit ragged offsets below).
-    if cu_seq_lens_q is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = cu_seq_lens_q
-    elif actual_seq_lens_q is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
-    if cu_seq_lens_kv is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = cu_seq_lens_kv
-    elif actual_seq_lens_kv is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
-
-    if batch_offsets_q is not None:
-        var_map[UIDs.RAGGED_Q_UID.value] = batch_offsets_q
-    if batch_offsets_o is not None:
-        var_map[UIDs.RAGGED_O_UID.value] = batch_offsets_o
-
-    if batch_offsets_k is not None:
-        var_map[UIDs.RAGGED_K_UID.value] = batch_offsets_k
-    if batch_offsets_v is not None:
-        var_map[UIDs.RAGGED_V_UID.value] = batch_offsets_v
-
-    if block_tables is not None:
-        var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
-        var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
-
-    if return_lse:
-        var_map[UIDs.STATS_UID.value] = lse
-        if batch_offsets_stats is not None:
-            var_map[UIDs.RAGGED_STATS_UID.value] = batch_offsets_stats
-
-    if q_scale is not None:
-        dummy_scale_tensor = _get_dummy_scale_tensor(q.device)
-        var_map[UIDs.Q_SCALE_UID.value] = q_scale
-        var_map[UIDs.S_SCALE_UID.value] = dummy_scale_tensor
-        var_map[UIDs.S_DESCALE_UID.value] = dummy_scale_tensor
-        var_map[UIDs.O_SCALE_UID.value] = dummy_scale_tensor
-    if k_scale is not None:
-        var_map[UIDs.K_SCALE_UID.value] = k_scale
-    if v_scale is not None:
-        var_map[UIDs.V_SCALE_UID.value] = v_scale
-
-    handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
-    graph.execute(var_map, workspace=workspace_buffer, handle=handle)
-
-    if return_lse:
-        # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
-        # backend returns base-2 LSE (they fold log2e into the softmax scale, so
-        # their kernels emit base-2 directly). Convert here so the cuDNN backend
-        # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
-        lse.mul_(log2e)
-        return out, lse
-    else:
-        return out, None
+    key = _sdpa_prefill_key_fn(
+        q, k_cache, v_cache, scale, **metadata.graph_kwargs(override_cache)
+    )
+    if override_cache is not None:
+        workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+        if _graph_workspace_size(graph, key) > workspace_bytes:
+            # The override graph reserves TMA descriptors for its declared
+            # batch (~1 MiB at 4096). A caller whose workspace cannot hold them
+            # gets the exact-shape graph instead of an out-of-bounds execute.
+            override_cache = None
+            graph, _ = _build_prefill_graph(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                scale=scale,
+                **metadata.graph_kwargs(None),
+            )
+            key = _sdpa_prefill_key_fn(
+                q, k_cache, v_cache, scale, **metadata.graph_kwargs(None)
+            )
+    return CudnnPrefillGraph(
+        key, graph, override_cache=override_cache, return_lse=metadata.return_lse
+    )
 
 
 @flashinfer_api(trace=cudnn_batch_prefill_trace)
@@ -755,6 +1394,7 @@ def cudnn_batch_prefill_with_kv_cache(
     is_cuda_graph_compatible: bool = False,
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
+    lse_base: str = "log2",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
@@ -859,6 +1499,10 @@ def cudnn_batch_prefill_with_kv_cache(
         autodetects based on cuDNN availability.
     o_data_type : Optional[torch.dtype]
         Optional output dtype; defaults to ``q.dtype``.
+    lse_base : str
+        ``"log2"`` (default): return the LSE in base 2 like every other FlashInfer
+        backend. ``"ln"``: return cuDNN's native natural-log stats, skipping the
+        conversion kernel.
 
     Returns
     -------
@@ -875,6 +1519,7 @@ def cudnn_batch_prefill_with_kv_cache(
     must reside on the same device as ``q``.  ``head_dim_qk`` must be 128 or 192,
     and ``head_dim_vo`` must be 128.
     """
+    check_lse_base(lse_base)
 
     num_tokens = q.shape[0]
 
@@ -923,10 +1568,21 @@ def cudnn_batch_prefill_with_kv_cache(
                 dtype=torch.float32,
             )
 
-    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
-        raise ValueError(
-            "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
-        )
+    if lse is not None:
+        padded = (num_sequences, max_token_per_sequence, h_qo)
+        # With a stats ragged offset cuDNN writes each request at its token
+        # offset, so a packed [num_tokens, h_qo] buffer (the wrapper contract)
+        # is a valid target too.
+        packed_ok = batch_offsets_stats is not None and lse.shape == (num_tokens, h_qo)
+        if lse.shape != padded and not packed_ok:
+            raise ValueError(
+                "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
+                + (
+                    " or, with batch_offsets_stats, (num_tokens, h_qo)"
+                    if batch_offsets_stats is not None
+                    else ""
+                )
+            )
 
     if o_data_type is None:
         o_data_type = q.dtype
@@ -957,12 +1613,7 @@ def cudnn_batch_prefill_with_kv_cache(
                 "cumsum([0, *actual_seq_lens_q]) * num_qo_heads * head_dim, or "
                 'token-unit indptrs with batch_offsets_units="tokens".'
             )
-        run_kwargs = dict(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            scale=scale,
-            workspace_buffer=workspace_buffer,
+        metadata = _PrefillMetadata(
             max_token_per_sequence=max_token_per_sequence,
             max_sequence_kv=max_sequence_kv,
             actual_seq_lens_q=actual_seq_lens_q,
@@ -973,72 +1624,25 @@ def cudnn_batch_prefill_with_kv_cache(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            out=out,
-            lse=lse,
             o_data_type=o_data_type,
-        )
-
-        if batch_offsets_units == "tokens":
-            h_kv = k_cache.shape[1]
-            if block_tables is None:
-                # Non-paged: both-cumulative direct path (KV is ragged). The
-                # token-unit q/k indptrs double as cu_seq_lens.
-                use_direct = (
-                    _cudnn_supports_direct_seqlens(q.dtype)
-                    and batch_offsets_q is not None
-                    and batch_offsets_k is not None
-                )
-            else:
-                # Paged: mixed direct path -- cu_seq_len_q (token-unit q indptr)
-                # + per-batch actual_seq_lens_kv for the mask; KV addressed via
-                # block_tables (no k/v ragged offsets). Requires mixed-form
-                # support (cuDNN 9.25+).
-                use_direct = (
-                    _cudnn_supports_direct_seqlens(q.dtype, mixed=True)
-                    and batch_offsets_q is not None
-                    and actual_seq_lens_kv is not None
-                )
-            if use_direct:
-                # The token-unit q indptr is both cu_seq_len_q and the Q/O
-                # ragged offset (per-tensor multipliers applied in the builder).
-                run_kwargs["cu_seq_lens_q"] = batch_offsets_q
-                if block_tables is None:
-                    run_kwargs["cu_seq_lens_kv"] = batch_offsets_k
-                # Paged: KV masked by actual_seq_lens_kv (already in run_kwargs);
-                # batch_offsets_k/v stay None.
-            else:
-                # Old cuDNN/frontend or paged: convert the token-unit indptrs
-                # to the element units the legacy graph expects. Names are
-                # rebound, not mutated, so the aliasing defaults above (o from
-                # q, v from k) still read the original token-unit buffers.
-
-                # The legacy graph's padding mask needs per-request lengths;
-                # derive them from the token-unit indptrs when omitted.
-                if actual_seq_lens_q is None:
-                    run_kwargs["actual_seq_lens_q"] = (
-                        batch_offsets_q[1:] - batch_offsets_q[:-1]
-                    ).view(-1, 1, 1, 1)
-                if actual_seq_lens_kv is None:
-                    run_kwargs["actual_seq_lens_kv"] = (
-                        batch_offsets_k[1:] - batch_offsets_k[:-1]
-                    ).view(-1, 1, 1, 1)
-
-                def apply_multiplier(offsets, multiplier):
-                    return offsets * multiplier if offsets is not None else None
-
-                batch_offsets_q = apply_multiplier(batch_offsets_q, h_qo * d_qk)
-                batch_offsets_o = apply_multiplier(batch_offsets_o, h_qo * d_vo)
-                batch_offsets_k = apply_multiplier(batch_offsets_k, h_kv * d_qk)
-                batch_offsets_v = apply_multiplier(batch_offsets_v, h_kv * d_vo)
-                batch_offsets_stats = apply_multiplier(batch_offsets_stats, h_qo)
-
-        return _batch_prefill_with_kv_cache(
-            **run_kwargs,
             batch_offsets_q=batch_offsets_q,
             batch_offsets_o=batch_offsets_o,
             batch_offsets_k=batch_offsets_k,
             batch_offsets_v=batch_offsets_v,
             batch_offsets_stats=batch_offsets_stats,
+        ).resolve(q, k_cache, v_cache, batch_offsets_units=batch_offsets_units)
+        prepared = prepare_cudnn_batch_prefill(
+            q, k_cache, v_cache, scale, workspace_buffer, metadata=metadata
+        )
+        return prepared.run(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            lse,
+            workspace_buffer,
+            metadata=metadata,
+            lse_base=lse_base,
         )
     else:
         if actual_seq_lens_q is None or actual_seq_lens_kv is None:
@@ -1061,6 +1665,10 @@ def cudnn_batch_prefill_with_kv_cache(
 
         actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device, non_blocking=True)
 
+        if lse_base != "log2":
+            raise NotImplementedError(
+                "the cubin cuDNN prefill path only returns base-2 LSE"
+            )
         run_func = get_cudnn_fmha_gen_module().prefill
         run_func(
             num_sequences,

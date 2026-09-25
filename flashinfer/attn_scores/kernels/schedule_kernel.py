@@ -204,8 +204,11 @@ def _compile_schedule_kernel(aligned_b: int, split_kv: int, num_sms: int, arch: 
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     sym_B = cute.sym_int()
-    cl_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_B,), stride_order=(0,)
+    # context_lens is read via its layout (context_lens[q_idx]), so any stride
+    # is fine: declare it symbolic so a strided view (seq_lens[::next_n]) is
+    # accepted zero-copy, matching the fp8/fp4 kernels' declarations.
+    cl_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (sym_B,), stride=(cute.sym_int(),), assumed_align=4
     )
     sm_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_sms + 1, 2), stride_order=(1, 0)

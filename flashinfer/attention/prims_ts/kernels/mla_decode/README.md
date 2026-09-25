@@ -22,9 +22,8 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
-| `batch_mla_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `batch_mla_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_mla_decode_workspace_size` | Size caller-owned standalone scratch. |
-| `prims_ts_batch_mla_decode_with_kv_cache` | Standalone launch with caller-owned scratch. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -79,7 +78,7 @@ tables and a plane view sliced from `[B, 2, max_num_pages]` metadata.
 is contiguous CUDA `torch.int32`. A caller-provided `out` must not overlap
 query, cache, `block_tables`, `seq_lens`, packed `qo_indptr`, or caller-owned
 workspace.
-The launch conservatively rejects overlapping storage spans. The API returns O
+Storage overlap is an unchecked caller precondition in both validation modes. The API returns O
 only. FP32 LSE is internal workspace and is not exposed as an output.
 
 ## Tensor and metadata layouts
@@ -135,13 +134,13 @@ Individual packed requests may be empty. An all-empty packed launch requires a
 positive `max_seq_len_q` and returns an empty output without GPU dispatch.
 
 With default `validate=True`, a wrapper run checks those metadata values and
-the tensor, output, and aliasing contracts. Once the caller has established
+the tensor and output contracts. Once the caller has established
 the conditions, `validate=False` avoids the explicit checks and host metadata
 reads. The caller-workspace standalone launch likewise trusts device-side
-metadata values, but still validates tensor structure and storage overlap.
+metadata values, but still validates tensor structure.
 Invalid per-run page IDs, lengths, or offsets in either unchecked-value path
-may cause incorrect results or out-of-bounds access. With wrapper
-`validate=False`, the caller also owns the aliasing contract. Do not mutate
+may cause incorrect results or out-of-bounds access. The caller owns the
+aliasing contract in both validation modes. Do not mutate
 metadata concurrently with a launch or graph replay that reads it. CUDA Graph
 replay also requires stable captured addresses, shapes, and strides.
 

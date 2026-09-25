@@ -65,7 +65,6 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.co
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
-    prims_ts_batch_mla_decode_with_kv_cache,
 )
 import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
@@ -815,15 +814,15 @@ def _run_standalone(
         if out is None
         else out
     )
-    result = prims_ts_batch_mla_decode_with_kv_cache(
+    result = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
-        workspace,
-        _LATENT_DIM,
-        _ROPE_DIM,
         case.block_tables,
         case.seq_lens,
-        case.max_seq_len,
+        workspace_buffer=workspace,
+        max_kv_len=case.max_seq_len,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
         qo_indptr=qo_indptr,
         max_seq_len_q=resolved_max_seq_len_q,
         out=output,
@@ -1141,7 +1140,6 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
         BatchMLADecodePagedTSWrapper.run,
         batch_mla_decode_with_paged_kv_cache,
         get_prims_ts_batch_mla_decode_workspace_size,
-        prims_ts_batch_mla_decode_with_kv_cache,
     )
     violations = []
     for surface in surfaces:
@@ -1195,6 +1193,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "o_data_type",
         "mask_type",
         "workspace_buffer",
+        "validate",
     )
     for name in (
         "device",
@@ -1238,12 +1237,18 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["validate"].default is True
 
 
+@pytest.mark.parametrize("validate", (True, False))
 def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     monkeypatch,
+    validate,
 ):
     """Keep plan publication atomic and compilation after workspace checks."""
 
     events = []
+    device_calls = []
+    expected_events = (
+        ["spec"] + (["validate_workspace"] if validate else []) + ["bind_workspace"]
+    )
     policy = (("source", "auto"), ("split_kv", 1))
     spec = mla_decode_module._MLADecodeLaunchSpec(
         kernel=object(),
@@ -1255,6 +1260,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
 
     def resolve_device(device):
         assert device == "cuda:0"
+        device_calls.append("resolve")
         return torch.device("cpu"), 0
 
     def resolve_spec(*args):
@@ -1271,11 +1277,16 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         return original_bind(workspace_buffer, layout)
 
     def compile_plan(*args):
-        assert events == ["spec", "validate_workspace", "bind_workspace"]
+        assert events == expected_events
         events.append("compile")
         return lambda *launch_args: None
 
     monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", resolve_device)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_validate_runtime_device",
+        lambda _device: device_calls.append("validate"),
+    )
     monkeypatch.setattr(
         mla_decode_module, "_resolve_mla_decode_launch_spec", resolve_spec
     )
@@ -1306,9 +1317,11 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
         workspace_buffer=workspace,
+        validate=validate,
     )
 
-    assert events == ["spec", "validate_workspace", "bind_workspace", "compile"]
+    assert events == [*expected_events, "compile"]
+    assert device_calls == (["resolve", "validate"] if validate else ["resolve"])
     assert tuple(vars(wrapper)) == ("_plan_state",)
     state = wrapper._plan_state
     assert state is not None
@@ -1335,6 +1348,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
             o_data_type=torch.bfloat16,
+            validate=validate,
             workspace_buffer=workspace,
         )
     assert wrapper._plan_state is state
@@ -1400,35 +1414,6 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     assert defn["axes"]["max_seq_len_q"]["value"] == 3
     assert defn["axes"]["max_kv_len"]["value"] == 64
     assert "mask:causal" in defn["tags"]
-
-
-def test_attention_ts_mla_output_guard_covers_every_live_allocation():
-    """Reject output overlap with inputs retained through an MLA launch."""
-
-    for aliased_name in (
-        "kv_cache",
-        "block_tables",
-        "seq_lens",
-        "qo_indptr",
-        "workspace_buffer",
-    ):
-        runtime = _empty_mla_runtime()
-        inputs = {
-            "block_tables": torch.empty(8),
-            "seq_lens": torch.empty(8),
-            "qo_indptr": torch.empty(8),
-            "workspace_buffer": torch.empty(8),
-        }
-        if aliased_name == "kv_cache":
-            runtime = replace(runtime, normalized_cache=runtime.out)
-        else:
-            inputs[aliased_name] = runtime.out
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            mla_decode_module._validate_mla_output_aliasing(runtime, **inputs)
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
@@ -1525,14 +1510,6 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch.setattr(mla_decode_module, "_prepare_mla_runtime", prepare_runtime)
     monkeypatch.setattr(
         mla_decode_module, "_validate_mla_run_metadata", fail_validation
-    )
-    monkeypatch.setattr(
-        mla_decode_module,
-        "_validate_tensor_does_not_overlap_inputs",
-        fail_validation,
-    )
-    monkeypatch.setattr(
-        mla_decode_module, "_validate_mla_output_aliasing", fail_validation
     )
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
 
@@ -1723,30 +1700,6 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_public_interfaces_reject_output_alias():
-    case = _make_mla_case(
-        batch_size=1,
-        num_qo_heads=8,
-        max_seq_len=128,
-        qkv_dtype=torch.bfloat16,
-        seq_len_q=1,
-        device="cuda",
-        seed=20260718,
-    )
-    # O is a compact view over the leading bytes of the 576-element query.
-    output_shape = (*case.query.shape[:-1], _LATENT_DIM)
-    output_elements = math.prod(output_shape)
-    aliased_out = case.query.view(-1)[:output_elements].view(output_shape)
-    wrapper = _plan_case(case)
-
-    with pytest.raises(ValueError, match="out must not overlap query storage"):
-        _run_case(wrapper, case, out=aliased_out)
-    with pytest.raises(ValueError, match="out must not overlap query storage"):
-        _run_standalone(case, out=aliased_out)
-
-
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_block_table_stride_contract():
     """Accept padded rows and reject non-unit inner or overlapping strides."""
 
@@ -1921,8 +1874,8 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
-    """The standalone ABI cannot derive a packed-Q JIT bound on its hot path."""
+def test_attention_ts_mla_packed_query_requires_trusted_static_bound():
+    """The trusted caller-workspace path requires an explicit packed-Q bound."""
 
     case = _make_mla_case(
         batch_size=2,
@@ -1935,17 +1888,18 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
     )
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="max_seq_len_q is required"):
-        prims_ts_batch_mla_decode_with_kv_cache(
+    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+        batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
-            workspace,
-            _LATENT_DIM,
-            _ROPE_DIM,
             case.block_tables,
             case.seq_lens,
-            case.max_seq_len,
+            workspace_buffer=workspace,
+            max_kv_len=case.max_seq_len,
+            kv_lora_rank=_LATENT_DIM,
+            qk_rope_head_dim=_ROPE_DIM,
             qo_indptr=qo_indptr,
+            validate=False,
         )
 
 

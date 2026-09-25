@@ -252,6 +252,7 @@ def generate_ninja_build_for_op(
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+    cuda_arch_flags = [flag for flag in cuda_cflags if flag.startswith("-gencode=")]
     cuda_cflags_by_source = {
         Path(source).resolve(): build_cuda_cflags(common_cflags, flags)
         for source, flags in (extra_cuda_cflags_by_source or {}).items()
@@ -292,6 +293,7 @@ def generate_ninja_build_for_op(
         "post_cflags =",
         "cuda_cflags = " + join_multiline(cuda_cflags),
         "cuda_post_cflags =",
+        "cuda_arch_flags = " + join_multiline(cuda_arch_flags),
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
@@ -321,7 +323,7 @@ def generate_ninja_build_for_op(
         lines.extend(
             [
                 "rule nvcc_link",
-                "  command = $nvcc -shared $in $ldflags -o $out",
+                "  command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out",
                 "",
             ]
         )
@@ -394,7 +396,12 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+def run_ninja(
+    workdir: Path,
+    ninja_file: Path,
+    verbose: bool,
+    max_jobs: Optional[int] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
@@ -404,7 +411,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

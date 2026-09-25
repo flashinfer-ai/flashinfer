@@ -16,6 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 
 import flashinfer
 from flashinfer.utils import is_sm90a_supported
@@ -205,14 +206,23 @@ def test_deepseek_prefill(
     torch.testing.assert_close(o_sm80, o_sm90, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
-@pytest.mark.parametrize("seq_len", [11, 12, 99, 1763, 9999, 32767])
-@pytest.mark.parametrize("page_size", [1, 16])
-@pytest.mark.parametrize("num_qo_heads", [1, 4, 8])
-@pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
-@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@parametrize_product(
+    {
+        "batch_size": [1, 4, 8, 16],
+        "seq_len": [11, 12, 99, 1763, 9999, 32767],
+        "page_size": [1, 16],
+        "num_qo_heads,num_kv_heads": [
+            (num_qo_heads, num_kv_heads)
+            for num_qo_heads in [1, 4, 8]
+            for num_kv_heads in [1, 4, 8]
+            if num_qo_heads % num_kv_heads == 0
+        ],
+        "causal": [False, True],
+        "logits_soft_cap": [0.0, 30.0],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_paged_prefill(
     batch_size,
     seq_len,
@@ -226,8 +236,6 @@ def test_batch_paged_prefill(
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("SM90A is not supported")
 
-    if num_qo_heads % num_kv_heads != 0:
-        pytest.skip("num_qo_heads must be divisible by num_kv_heads")
     torch.random.manual_seed(42)
     q = torch.randn(
         batch_size * seq_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda"

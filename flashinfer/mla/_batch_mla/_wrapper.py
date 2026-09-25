@@ -6,7 +6,6 @@ you may not use this file except in compliance with the License.
 """
 
 import functools
-import inspect
 import math
 import warnings
 from dataclasses import replace
@@ -14,27 +13,47 @@ from typing import Any, ClassVar, Literal, Optional, Protocol, Tuple, Union, ove
 
 import torch
 
-from ...api_logging import flashinfer_api
+from ...api_logging import (
+    _warn_from_external_caller,
+    flashinfer_api,
+    warn_experimental_backend_once,
+)
 from ...trace.templates.attention import mla_paged_decode_trace
-from ...utils import determine_mla_backend, get_compute_capability
-from ._backends._capabilities import MLAPlanCapabilities
+from ...utils import get_compute_capability
+from ._backends._capabilities import (
+    _BackendPlanUnsupportedError,
+    MLAPlanCapabilities,
+    plan_capability_rejection_reason,
+)
 from ._backends.cutlass_backend import _BatchMLAPagedAttentionCutlassBackend
+from ._backends.cute_dsl_modular_backend import (
+    _BatchMLAPagedAttentionCuteDslModularBackend,
+)
+from ._backends.cute_dsl_monolithic_backend import (
+    _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+)
 from ._backends.cutile_backend import (
-    _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES,
     _BatchMLAPagedAttentionCutileBackend,
 )
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
 from ._backends.fa3_backend import _BatchMLAPagedAttentionFa3Backend
+from ._backends.trtllm_gen_backend import _BatchMLAPagedAttentionTrtllmGenBackend
+from ._backends.xqa_backend import _BatchMLAPagedAttentionXqaBackend
 from ._contracts import (
+    MLABmmScale,
     MLAInputContract,
     MLAPlanMetadata,
     _resolve_structural_mla_input,
     _structural_mla_input_facts,
 )
 from ._planning import _MLAPlanArguments
+from ._auto_policy import _BatchMLAPagedAttentionAutoBackend
 
 
 class _PlannedBackend(Protocol):
+    _backend: str
+    _plan_capabilities: ClassVar[MLAPlanCapabilities]
+
     def run_from_wrapper(
         self,
         *,
@@ -51,18 +70,60 @@ class _PlannedBackend(Protocol):
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        bmm1_scale: Optional[MLABmmScale],
+        bmm2_scale: Optional[MLABmmScale],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: ...
 
 
 class _WrapperBackendType(Protocol):
-    _plan_capabilities: ClassVar[MLAPlanCapabilities]
-
     @classmethod
     def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _PlannedBackend: ...
 
 
+class _ConcreteWrapperBackendType(_WrapperBackendType, Protocol):
+    _plan_capabilities: ClassVar[MLAPlanCapabilities]
+
+
 def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
+
+
+class _BatchMLAPagedAttentionCuteDslBackend:
+    """Compatibility planner for the ``cute-dsl`` backend family alias."""
+
+    _candidate_types: ClassVar[tuple[type[_ConcreteWrapperBackendType], ...]] = (
+        _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+        _BatchMLAPagedAttentionCuteDslModularBackend,
+    )
+
+    @classmethod
+    def plan_from_wrapper(cls, plan_args: _MLAPlanArguments) -> _PlannedBackend:
+        """Lower the family alias to one concrete CuTe DSL backend."""
+        candidate_types = cls._candidate_types
+
+        if plan_args.use_sinks:
+            sink_candidate_types = tuple(
+                backend_type
+                for backend_type in candidate_types
+                if backend_type._plan_capabilities.supports_sinks
+            )
+            if sink_candidate_types:
+                candidate_types = sink_candidate_types
+
+        typed_rejections: list[str] = []
+        for backend_type in candidate_types:
+            capabilities = backend_type._plan_capabilities
+            try:
+                if reason := plan_capability_rejection_reason(plan_args, capabilities):
+                    raise _BackendPlanUnsupportedError(reason)
+                return backend_type.plan_from_wrapper(plan_args)
+            except _BackendPlanUnsupportedError as exc:
+                typed_rejections.append(f"{capabilities.backend_name}: {exc}")
+                continue
+
+        raise _BackendPlanUnsupportedError("; ".join(typed_rejections))
 
 
 _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
@@ -70,28 +131,20 @@ _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "fa3": _BatchMLAPagedAttentionFa3Backend,
     "cutlass": _BatchMLAPagedAttentionCutlassBackend,
     "cutile": _BatchMLAPagedAttentionCutileBackend,
+    "trtllm-gen": _BatchMLAPagedAttentionTrtllmGenBackend,
+    "xqa": _BatchMLAPagedAttentionXqaBackend,
+    "cute-dsl-monolithic": _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+    "cute-dsl-modular": _BatchMLAPagedAttentionCuteDslModularBackend,
+    "auto": _BatchMLAPagedAttentionAutoBackend,  # dispatch wrapper, see _auto_policy.py
+    "cute-dsl": _BatchMLAPagedAttentionCuteDslBackend,  # dispatch wrapper
 }
+
 
 _MIRRORED_BACKEND_ATTRS = (
     "_cached_module",
     "_int_workspace_buffer",
     "_pin_memory_int_workspace_buffer",
 )
-
-
-def _warn_from_external_caller(message: str, category: type[Warning]) -> None:
-    """Warn at the first caller outside the local and API-logging wrappers."""
-
-    frame = inspect.currentframe()
-    stacklevel = 1
-    internal_modules = {__name__, flashinfer_api.__module__}
-    try:
-        while frame is not None and frame.f_globals.get("__name__") in internal_modules:
-            stacklevel += 1
-            frame = frame.f_back
-    finally:
-        del frame
-    warnings.warn(message, category, stacklevel=stacklevel)
 
 
 def _warn_on_positional_mla_arguments(method: Any) -> Any:
@@ -114,10 +167,11 @@ class BatchMLAPagedAttentionWrapper:
     projections are absorbed before attention. For the non-absorbed MLA
     prefill path, use the appropriate prefill wrapper instead.
 
-    The planned-wrapper surface owns FA2, FA3, CUTLASS, and cuTile planning
-    and execution. Call :meth:`plan` once with canonical metadata before
-    invoking :meth:`run`; the plan captures the supported input/output contract
-    and the concrete backend's metadata representation.
+    The planned-wrapper surface owns FA2, FA3, CUTLASS, cuTile, TRTLLM-GEN,
+    XQA, and CuTe DSL planning and execution. Call :meth:`plan` once with
+    canonical metadata before invoking :meth:`run`; the plan captures the
+    supported input/output contract and the concrete backend's metadata
+    representation.
 
     See :ref:`MLA Page Layout <mla-page-layout>` for the paged KV-cache layout
     and the `FlashInfer MLA blog post
@@ -125,37 +179,7 @@ class BatchMLAPagedAttentionWrapper:
     computation and Matrix Absorption background.
     """
 
-    _blackwell_auto_fallback_warned: bool = False
     _legacy_plan_warned: bool = False
-
-    @classmethod
-    def _maybe_warn_blackwell_auto_fallback(
-        cls, device: torch.device, selected_backend: str
-    ) -> None:
-        if cls._blackwell_auto_fallback_warned:
-            return
-        major, minor = _get_compute_capability(device)
-        if major < 10:
-            return
-        cls._blackwell_auto_fallback_warned = True
-        if (major, minor) in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
-            in_wrapper_alternative = (
-                "backend='cutile' is the native in-wrapper cuda.tile alternative."
-            )
-        else:
-            in_wrapper_alternative = (
-                "backend='cutlass' is the closest in-wrapper alternative but may be "
-                "slower than this fallback for decode shapes."
-            )
-        warnings.warn(
-            f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
-            f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
-            f"and gives poor MLA decode performance. For decode, use "
-            f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
-            f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
-            UserWarning,
-            stacklevel=3,
-        )
 
     @classmethod
     def _warn_legacy_plan_once(cls) -> None:
@@ -250,14 +274,16 @@ class BatchMLAPagedAttentionWrapper:
         kv_len_arr : Optional[torch.Tensor]
             Caller-reserved ``int32`` buffer of shape ``[batch_size]`` for CSR
             KV lengths. Used only with CUDA graphs.
-        backend : {"auto", "fa2", "fa3", "cutlass", "cutile"}
-            Requested concrete backend. ``"auto"`` selects the architecture
-            default exposed by :func:`flashinfer.utils.determine_mla_backend`.
-            Explicit CUTLASS callers should plan with canonical dense metadata;
-            its historical planless ``run`` path remains deprecated.
-            Explicit cuTile callers should plan packed or split FP16/BF16
-            DeepSeek MLA decode inputs with canonical dense or CSR metadata.
-            cuTile is not selected automatically.
+        backend : {"auto", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"}
+            Requested policy or concrete backend. ``"auto"`` is resolved in
+            :meth:`plan`: SM100 orders supported backends using request facts;
+            other architectures use :func:`flashinfer.utils.determine_mla_backend`.
+            Explicit requests remain strict; ``"cute-dsl"`` is a family alias.
+            Compilation and selection finish before normal execution or capture.
+            Canonical dense or CSR metadata is accepted; independent split query
+            or KV storage requires a backend with native split-input support.
+            Existing non-FA graph plans allow one plan per wrapper. Use a new
+            wrapper when preparing a different backend for a new capture.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -266,19 +292,19 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
-        self._requested_backend = backend
-        if backend == "auto":
-            self._backend = determine_mla_backend(self.device)
-            self._maybe_warn_blackwell_auto_fallback(self.device, self._backend)
-        elif backend in _BACKEND_TYPES:
+        if backend in _BACKEND_TYPES:
+            self._backend_type = _BACKEND_TYPES[backend]
             self._backend = backend
         else:
+            accepted = sorted(_BACKEND_TYPES)
             raise ValueError(
-                "backend must be one of 'auto', 'fa2', 'fa3', 'cutlass', or "
-                "'cutile', "
-                f"got {backend!r}."
+                "backend must be one of "
+                + ", ".join(repr(name) for name in accepted)
+                + f", got {backend!r}."
             )
         self._planned_backend: Optional[_PlannedBackend] = None
+        self._planned_backend_name: Optional[str] = None
+        self._planned_backend_capabilities: Optional[MLAPlanCapabilities] = None
         self._input_contract: Optional[MLAInputContract] = None
         self._planned_query_layout: Optional[Literal["packed", "split"]] = None
         self._planned_kv_cache_layout: Optional[Literal["packed", "split"]] = None
@@ -307,8 +333,12 @@ class BatchMLAPagedAttentionWrapper:
         lse_mode: Literal["none", "base2", "basee"] = "none",
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
-        scale_mode: Literal["default", "kv-per-tensor"] = "default",
+        scale_mode: Literal[
+            "default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"
+        ] = "default",
         skip_softmax: bool = False,
+        enable_pdl: Optional[bool] = None,
+        use_sinks: bool = False,
     ) -> None: ...
 
     # Legacy flat-metadata compatibility: canonical CSR metadata, native for
@@ -335,8 +365,12 @@ class BatchMLAPagedAttentionWrapper:
         lse_mode: Literal["none", "base2", "basee"] = "none",
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
-        scale_mode: Literal["default", "kv-per-tensor"] = "default",
+        scale_mode: Literal[
+            "default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"
+        ] = "default",
         skip_softmax: bool = False,
+        enable_pdl: Optional[bool] = None,
+        use_sinks: bool = False,
     ) -> None: ...
 
     # Legacy flat-metadata compatibility: canonical dense page-table metadata,
@@ -363,8 +397,12 @@ class BatchMLAPagedAttentionWrapper:
         lse_mode: Literal["none", "base2", "basee"] = "none",
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
-        scale_mode: Literal["default", "kv-per-tensor"] = "default",
+        scale_mode: Literal[
+            "default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"
+        ] = "default",
         skip_softmax: bool = False,
+        enable_pdl: Optional[bool] = None,
+        use_sinks: bool = False,
     ) -> None: ...
 
     @_warn_on_positional_mla_arguments
@@ -395,8 +433,12 @@ class BatchMLAPagedAttentionWrapper:
         lse_mode: Literal["none", "base2", "basee"] = "none",
         output_dtype: Optional[torch.dtype] = None,
         output_scale: Literal["none", "per-tensor"] = "none",
-        scale_mode: Literal["default", "kv-per-tensor"] = "default",
+        scale_mode: Literal[
+            "default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"
+        ] = "default",
         skip_softmax: bool = False,
+        enable_pdl: Optional[bool] = None,
+        use_sinks: bool = False,
     ) -> None:
         r"""Plan a concrete MLA backend from canonical metadata.
 
@@ -412,15 +454,22 @@ class BatchMLAPagedAttentionWrapper:
         normalized to the device required by the selected backend; tensors on
         another accelerator device are rejected. Passing flat CSR or dense
         metadata fields remains supported for compatibility, but is deprecated
-        in favor of the ``metadata=`` object form.
+        in favor of the ``metadata=`` object form. TRTLLM-GEN, XQA, and CuTe
+        DSL CUDA graph plans require supplied contiguous ``int32`` dense
+        metadata on the wrapper device. Retain and update those device tensors
+        in place for replay; CPU and CSR-only graph metadata are rejected.
+        Query offsets and lengths must remain fixed after graph planning.
 
         The plan also declares the later :meth:`run` contract. In particular,
         ``query_layout``, ``kv_cache_layout``, ``lse_mode``, ``output_dtype``,
-        ``output_scale``, and ``scale_mode`` must agree with the subsequent
-        call. Canonical metadata defaults to packed inputs; the legacy flat
-        forms retain their historical split-input defaults. Deprecated flat
-        CSR plans also temporarily retain dynamic LSE behavior on FA2/FA3 and
-        emit a warning when it is used.
+        ``output_scale``, ``scale_mode``, ``skip_softmax``, and ``use_sinks``
+        must agree with the subsequent call. Backends may also consume
+        ``enable_pdl`` at plan time. Sequence variability is inferred from
+        canonical metadata by backends that require a specialized plan.
+        Canonical metadata defaults to packed inputs; the legacy flat forms
+        retain their historical split-input defaults. Deprecated flat CSR plans
+        also temporarily retain dynamic LSE behavior on FA2/FA3 and emit a
+        warning when it is used.
 
         Parameters
         ----------
@@ -432,7 +481,15 @@ class BatchMLAPagedAttentionWrapper:
             Deprecated flat dense page-table metadata fields.
         max_q_len : Optional[int]
             Maximum dense query length; inferred from query metadata when
-            omitted.
+            omitted. For CuTe DSL monolithic plans created with nonuniform
+            query lengths, this also sets the per-request CUDA graph launch
+            capacity. Those plans may update query offsets in place while
+            preserving batch size, total tokens, tensor addresses/shapes, and
+            positive request lengths within this capacity. Initially uniform
+            plans keep query lengths fixed. Other selected backends retain
+            their own graph contracts; automatic selection does not guarantee
+            support for query redistribution. Direct graph replay does not
+            validate updated offsets in Python.
         num_heads : Optional[int]
             Number of query heads.
         head_dim_ckv, head_dim_kpe : Optional[int]
@@ -455,10 +512,13 @@ class BatchMLAPagedAttentionWrapper:
             Required output dtype; defaults to ``q_data_type``.
         output_scale : {"none", "per-tensor"}
             Required output scaling mode.
-        scale_mode : {"default", "kv-per-tensor"}
-            Required KV-scale mode for subsequent :meth:`run` calls.
+        scale_mode : {"default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"}
+            Required KV or BMM scale mode for subsequent :meth:`run` calls.
         skip_softmax : bool
             Whether the plan must support the skip-softmax threshold feature.
+        enable_pdl, use_sinks : optional
+            Backend-specific planning controls. A backend that does not support
+            a non-default value rejects it during planning.
 
         Notes
         -----
@@ -466,6 +526,25 @@ class BatchMLAPagedAttentionWrapper:
         ``plan()`` parameters. Flat metadata arguments are also deprecated;
         use an ``MLAPlanMetadata`` object instead.
         """
+        previous_backend = getattr(self, "_planned_backend", None)
+        previous_backend_name = getattr(self, "_planned_backend_name", None)
+        previous_backend_capabilities = getattr(
+            self, "_planned_backend_capabilities", None
+        )
+        if (
+            self._use_cuda_graph
+            and previous_backend is not None
+            and (
+                previous_backend_capabilities is None
+                or not previous_backend_capabilities.supports_cuda_graph_replan
+            )
+        ):
+            raise RuntimeError(
+                f"CUDA graph plans for backend {previous_backend_name!r} "
+                "cannot replan because captured metadata pointers must remain "
+                "stable."
+            )
+
         # ---------------------------------------------------------------------------
         # Normalize metadata and handle legacy forms
         # ---------------------------------------------------------------------------
@@ -538,11 +617,17 @@ class BatchMLAPagedAttentionWrapper:
         if kv_cache_layout is None:
             kv_cache_layout = "split" if legacy_flat else "packed"
         output_dtype = q_data_type if output_dtype is None else output_dtype
-        if kv_data_type == torch.float8_e4m3fn and scale_mode == "default":
+        if (
+            kv_data_type == torch.float8_e4m3fn
+            and scale_mode == "default"
+            and not (
+                q_data_type == torch.float8_e4m3fn
+                and _get_compute_capability(self.device) == (10, 0)
+            )
+        ):
             # Existing FP8 callers always supply CKV/KPE scales at run time.
             scale_mode = "kv-per-tensor"
 
-        previous_backend = getattr(self, "_planned_backend", None)
         graph_plan_int_workspace_buffer = None
         if (
             self._use_cuda_graph
@@ -552,14 +637,6 @@ class BatchMLAPagedAttentionWrapper:
         ):
             graph_plan_int_workspace_buffer = previous_backend._int_workspace_buffer
 
-        backend_type = _BACKEND_TYPES[self._backend]
-        planned_capabilities = backend_type._plan_capabilities
-        planned_query_layout: Literal["packed", "split"] = (
-            "packed" if planned_capabilities.requires_packed_query else "split"
-        )
-        planned_kv_cache_layout: Literal["packed", "split"] = (
-            "packed" if planned_capabilities.requires_packed_kv_cache else "split"
-        )
         input_contract = MLAInputContract(
             lse_mode=lse_mode,
             output_dtype=output_dtype,
@@ -569,6 +646,8 @@ class BatchMLAPagedAttentionWrapper:
             kv_cache_layout=kv_cache_layout,
             head_dim_ckv=head_dim_ckv,
             head_dim_kpe=head_dim_kpe,
+            skip_softmax=skip_softmax,
+            use_sinks=use_sinks,
         )
 
         # ---------------------------------------------------------------------------
@@ -597,6 +676,8 @@ class BatchMLAPagedAttentionWrapper:
             output_scale=output_scale,
             scale_mode=scale_mode,
             skip_softmax=skip_softmax,
+            enable_pdl=enable_pdl,
+            use_sinks=use_sinks,
             use_profiler=use_profiler,
             legacy_flat_csr=legacy_flat_csr,
             _float_workspace_buffer=self._float_workspace_buffer,
@@ -606,64 +687,39 @@ class BatchMLAPagedAttentionWrapper:
             _kv_indices_buf=self._kv_indices_buf,
             _kv_len_arr_buf=self._kv_len_arr_buf,
             _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
+            _previous_backend_name=previous_backend_name,
         )
-
-        # ---------------------------------------------------------------------------
-        # Enforce CUDA graph replanning constraints
-        # ---------------------------------------------------------------------------
-        planned_backend_name = getattr(
-            getattr(self, "_planned_backend", None), "_backend", None
-        )
-        if (
-            self._use_cuda_graph
-            and getattr(self, "_planned_backend", None) is not None
-            and planned_backend_name in ("cutlass", "cutile")
-        ):
-            graph_backend_name = (
-                "CUTLASS" if planned_backend_name == "cutlass" else "cuTile"
-            )
-            raise RuntimeError(
-                f"CUDA graph {graph_backend_name} plans cannot replan because "
-                "dense metadata "
-                "pointers must remain stable."
-            )
 
         # ---------------------------------------------------------------------------
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
-        graph_workspace_snapshot = None
-        if graph_plan_int_workspace_buffer is not None:
-            prior_plan_workspace_bytes = int(
-                getattr(previous_backend, "_staged_int_workspace_bytes", 0)
+        planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+        capabilities = planned_backend._plan_capabilities
+        if capabilities.is_experimental:
+            warn_experimental_backend_once(
+                "BatchMLAPagedAttentionWrapper",
+                capabilities.backend_name,
+                automatic=self._backend_type is _BatchMLAPagedAttentionAutoBackend,
             )
-            if not (
-                0
-                <= prior_plan_workspace_bytes
-                <= graph_plan_int_workspace_buffer.numel()
-            ):
-                raise RuntimeError(
-                    "previous CUDA graph plan has an invalid device int workspace "
-                    "usage size."
-                )
-            graph_workspace_snapshot = graph_plan_int_workspace_buffer[
-                :prior_plan_workspace_bytes
-            ].clone()
-        try:
-            planned_backend = backend_type.plan_from_wrapper(plan_args)
-        except Exception:
-            if graph_workspace_snapshot is not None:
-                graph_plan_int_workspace_buffer[
-                    : graph_workspace_snapshot.numel()
-                ].copy_(graph_workspace_snapshot)
-            raise
 
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
         # ---------------------------------------------------------------------------
+        self._backend = planned_backend._backend
         self._planned_backend = planned_backend
+        self._planned_backend_name = planned_backend._backend
+        self._planned_backend_capabilities = planned_backend._plan_capabilities
         self._input_contract = input_contract
-        self._planned_query_layout = planned_query_layout
-        self._planned_kv_cache_layout = planned_kv_cache_layout
+        self._planned_query_layout = (
+            "packed"
+            if planned_backend._plan_capabilities.requires_packed_query
+            else "split"
+        )
+        self._planned_kv_cache_layout = (
+            "packed"
+            if planned_backend._plan_capabilities.requires_packed_kv_cache
+            else "split"
+        )
         self._publish_backend_mirrors(planned_backend)
         self._legacy_flat_csr_plan = legacy_flat_csr
         self._qo_indptr_buf = getattr(
@@ -706,6 +762,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[MLABmmScale] = None,
+        bmm2_scale: Optional[MLABmmScale] = None,
     ) -> torch.Tensor: ...
 
     # Output-and-LSE form -- ``return_lse=True`` returns ``(output, lse)``.
@@ -727,6 +787,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[MLABmmScale] = None,
+        bmm2_scale: Optional[MLABmmScale] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     # Deprecated separate-tensor output-only form. Pass split pairs through
@@ -750,6 +814,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[MLABmmScale] = None,
+        bmm2_scale: Optional[MLABmmScale] = None,
     ) -> torch.Tensor: ...
 
     # Deprecated separate-tensor output-and-LSE form. Pass split pairs through
@@ -773,6 +841,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[MLABmmScale] = None,
+        bmm2_scale: Optional[MLABmmScale] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @_warn_on_positional_mla_arguments
@@ -797,6 +869,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[MLABmmScale] = None,
+        bmm2_scale: Optional[MLABmmScale] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run one planned MLA attention request.
 
@@ -864,6 +940,17 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale, ckv_scale_arr, kpe_scale : optional
             Per-tensor or per-token FP8 KV-cache scales required by plans that
             selected ``scale_mode="kv-per-tensor"``.
+        sinks : Optional[torch.Tensor]
+            Per-head sink values. This must be present exactly when the plan
+            used ``use_sinks=True``.
+        skip_softmax_threshold_scale_factor : Optional[float]
+            Skip-softmax threshold scale. This must be present exactly when the
+            plan used ``skip_softmax=True``.
+        bmm1_scale, bmm2_scale : Optional[float or torch.Tensor]
+            Backend-specific BMM scale pair. Both values must be provided
+            together, use the same scalar/tensor family, and match the planned
+            ``scale_mode``. Tensor BMM scales are reserved for later backend
+            support and are rejected by this wrapper version.
 
         Notes
         -----
@@ -1011,6 +1098,10 @@ class BatchMLAPagedAttentionWrapper:
             ckv_scale=ckv_scale,
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
         )
 
         # ---------------------------------------------------------------------------
@@ -1063,6 +1154,10 @@ class BatchMLAPagedAttentionWrapper:
             ckv_scale=ckv_scale,
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
         )
 
 

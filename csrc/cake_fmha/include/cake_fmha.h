@@ -411,3 +411,131 @@ extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8(
     unsigned int grid_z,
     cudaStream_t stream
 );
+
+// CAKE-459 small-M BF16 head-dim-256 speculative decode (packed rows).
+extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n32_p16(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    uint32_t* counters,
+    int* page_table,
+    int* seq_lens,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n32_p32(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    uint32_t* counters,
+    int* page_table,
+    int* seq_lens,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n32_p64(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    uint32_t* counters,
+    int* page_table,
+    int* seq_lens,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n64_p16(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    uint32_t* counters,
+    int* page_table,
+    int* seq_lens,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n64_p32(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    uint32_t* counters,
+    int* page_table,
+    int* seq_lens,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n64_p64(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* partial_O_ptr,
+    float* partial_LSE_ptr,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    uint32_t* counters,
+    int* page_table,
+    int* seq_lens,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+

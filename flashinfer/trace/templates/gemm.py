@@ -14,6 +14,7 @@
 
 """TraceTemplates for GEMM operations."""
 
+import functools
 import math
 from typing import Any, cast
 
@@ -918,15 +919,140 @@ mm_bf16_fp4_cute_dsl_sm100_trace = TraceTemplate(
 )
 
 
+def _mm_bf16_fp4_native_reference(
+    a, b, b_descale, alpha=None, block_size=16, out_dtype=None, out=None
+):
+    """Decode canonical NVFP4 bytes and padded 128x4 E4M3 block scales."""
+    n, k_half = b.shape
+    k = k_half * 2
+    sf_bytes = _unswizzle_sf_128x4(
+        b_descale.view(torch.uint8).reshape(-1), n, k // block_size
+    ).contiguous()
+    sf = sf_bytes.view(torch.float8_e4m3fn).float().repeat_interleave(block_size, 1)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=b.device,
+    )
+    codes = torch.stack((b & 15, b >> 4), dim=-1).long().reshape(n, k)
+    weight = lut[codes] * sf
+    if alpha is not None:
+        weight = weight * alpha.float()
+    result_dtype = out.dtype if out is not None else (out_dtype or a.dtype)
+    result = (a.float() @ weight.T).to(result_dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+cast(Any, _mm_bf16_fp4_native_reference)._trace_reference_dependencies = (
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
+def _mm_bf16_fp4_native_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_packed: int = 0,  # derived
+    SF_dim_0: int = 0,  # derived from N/K padding
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build canonical weights without creating an alternate representation."""
+    del SF_dim_0, K_packed
+    from flashinfer import nvfp4_quantize  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("native mm_bf16_fp4 init requires CUDA")
+    if torch.cuda.get_device_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        raise NotImplementedError("native mm_bf16_fp4 requires SM120/121")
+    if M < 1 or block_size != 16:
+        raise NotImplementedError("native mm_bf16_fp4 requires M>=1 and block_size=16")
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = 2688.0 / w.float().abs().max()
+    b, sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    return dict(
+        a=a,
+        b=b,
+        b_descale=sf.reshape(-1),
+        alpha=g_w.reciprocal().reshape(1),
+        backend="cute-dsl-native",
+        block_size=block_size,
+    )
+
+
+@functools.cache
+def _mm_bf16_fp4_native_trace(scale_ndim):
+    """Preserve the caller's view of the contiguous canonical scale buffer."""
+    return TraceTemplate(
+        op_type="gemm_bf16_fp4",
+        name_prefix=f"mm_bf16_fp4_cute_dsl_native_sf{scale_ndim}d",
+        description=(
+            "BF16 x NVFP4 GEMM with canonical uint8 weights and padded 128x4-swizzled "
+            "E4M3 block scales on SM120/121. No alternate weight preparation; M>=1."
+        ),
+        axes={
+            "M": Var(),
+            "N": Const(),
+            "K": Const(),
+            "K_packed": Const(),
+            "block_size": Const(),
+            **{f"SF_dim_{i}": Const() for i in range(scale_ndim)},
+        },
+        inputs={
+            "A": Tensor(["M", "K"], param="a"),
+            "B": Tensor(["N", "K_packed"], param="b"),
+            "b_descale": Tensor(
+                [f"SF_dim_{i}" for i in range(scale_ndim)],
+                description="Contiguous 128x4-swizzled E4M3 buffer, including N/K padding.",
+            ),
+            "alpha": Tensor(["1"], optional=True),
+            "block_size": Scalar("int32"),
+            "out_dtype": Scalar("dtype", optional=True),
+            "out": Tensor(["M", "N"], optional=True),
+        },
+        outputs={
+            "C": Tensor(
+                ["M", "N"],
+                dtype="bfloat16",
+                dtype_from="out",
+                dtype_from_scalar="out_dtype",
+            )
+        },
+        constraints=["K == K_packed * 2", "block_size == 16", "M >= 1"],
+        tags=["status:verified", "quantization:fp4"],
+        reference=_mm_bf16_fp4_native_reference,
+        check=_fp4_gemm_check,
+        init=_mm_bf16_fp4_native_init if scale_ndim == 1 else None,
+    )
+
+
+mm_bf16_fp4_native_trace = _mm_bf16_fp4_native_trace(1)
+
+
 def mm_bf16_fp4_trace_dispatch(**kwargs):
     """Return the TraceTemplate for an ``mm_bf16_fp4`` call by backend.
 
     ``prepare_bf16_fp4_weights`` produces three distinct layouts: cute-dsl on
     SM12x tile-packs the weight into int32, cute-dsl on SM100/103 keeps the
     canonical uint8 weight but hands back a 6-D scale view, and cudnn keeps the
-    canonical weight with linear 2-D scales.  Pass as
+    canonical weight with linear 2-D scales. The explicit cute-dsl-native
+    backend consumes the contiguous canonical 128x4 scale buffer directly. Pass as
     ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
+    if kwargs.get("backend") == "cute-dsl-native":
+        sf = kwargs.get("b_descale")
+        return _mm_bf16_fp4_native_trace(sf.ndim if sf is not None else 1)
     b = kwargs.get("b")
     if b is not None and b.dtype == torch.int32:
         return mm_bf16_fp4_cute_dsl_trace
@@ -939,6 +1065,8 @@ def mm_bf16_fp4_trace_dispatch(**kwargs):
 # Expose the templates so _attach_fi_trace auto-registers them for the
 # consistency tests (same pattern as the MoE routing dispatchers).
 mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_bf16_fp4_native_trace,
+    _mm_bf16_fp4_native_trace(2),
     mm_bf16_fp4_cudnn_trace,
     mm_bf16_fp4_cute_dsl_trace,
     mm_bf16_fp4_cute_dsl_sm100_trace,
@@ -1859,6 +1987,79 @@ grouped_gemm_nt_masked_trace = TraceTemplate(
     tags=["status:verified", "moe", "quantization:fp8"],
     reference=_grouped_gemm_nt_masked_reference,
     init=_grouped_gemm_nt_masked_init,
+)
+
+
+@torch.no_grad()
+def _group_gemm_fp8_nt_groupwise_contiguous_reference(
+    a, b, a_scale, b_scale, m_indices, **_unused
+):
+    """Dequantize the row/block scales and multiply each expert's rows."""
+    af = a.float() * a_scale.float().repeat_interleave(128, dim=1)
+    bf = b.float() * b_scale.float().repeat_interleave(128, dim=1).repeat_interleave(
+        128, dim=2
+    )
+    out = torch.empty(a.shape[0], b.shape[1], dtype=torch.bfloat16, device=a.device)
+    for group in range(b.shape[0]):
+        rows = m_indices == group
+        out[rows] = (af[rows] @ bf[group].T).bfloat16()
+    return out
+
+
+def _group_gemm_fp8_nt_groupwise_contiguous_init(
+    *,
+    M: int,
+    num_groups: int = 2,
+    N: int = 128,
+    K: int = 128,
+    K_div_128: int = 0,
+    N_div_128: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Generate sorted, tile-aligned expert rows with a possible partial tail."""
+    del K_div_128, N_div_128
+    torch.manual_seed(seed)
+    a, a_scale = fp8_block_quant_1d(torch.randn(M, K, device=device), block=128)
+    b, b_scale = fp8_block_quant_2d(
+        torch.randn(num_groups, N, K, device=device), block=128
+    )
+    rows_per_group = max(128, (M // num_groups // 128) * 128)
+    indices = (
+        torch.arange(M, device=device, dtype=torch.int32) // rows_per_group
+    ).clamp(max=num_groups - 1)
+    return dict(a=a, b=b, a_scale=a_scale, b_scale=b_scale, m_indices=indices)
+
+
+group_gemm_fp8_nt_groupwise_contiguous_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="group_gemm_fp8_nt_groupwise_contiguous",
+    description=(
+        "Contiguous grouped FP8 E4M3 GEMM with per-row 128-element A scales "
+        "and 128x128 B scales. Expert indices must be sorted, in range, and "
+        "constant within each 128-row tile; the final tile may be partial. "
+        "Output is bfloat16."
+    ),
+    axes={
+        "M": Var(),
+        "num_groups": Const(abbrev="g"),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "a": Tensor(["M", "K"], dtype="float8_e4m3fn"),
+        "b": Tensor(["num_groups", "N", "K"], dtype="float8_e4m3fn"),
+        "a_scale": Tensor(["M", "K_div_128"], dtype="float32"),
+        "b_scale": Tensor(["num_groups", "N_div_128", "K_div_128"], dtype="float32"),
+        "m_indices": Tensor(["M"], dtype="int32"),
+    },
+    outputs={"out": Tensor(["M", "N"], dtype="bfloat16")},
+    constraints=["K_div_128 == K // 128", "N_div_128 == N // 128"],
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_group_gemm_fp8_nt_groupwise_contiguous_reference,
+    init=_group_gemm_fp8_nt_groupwise_contiguous_init,
 )
 
 
