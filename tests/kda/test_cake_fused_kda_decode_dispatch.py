@@ -185,7 +185,7 @@ def test_cake_targets_share_sources_but_have_distinct_build_identities():
     sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
-    assert len(sm100_variants) == len(sm103_variants) == 50
+    assert len(sm100_variants) == len(sm103_variants) == 52
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
         assert replace(sm100, target="sm103a") == sm103
         assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
@@ -334,13 +334,14 @@ def _select_h8_route(
 # wave ends at rows 18, the staged compact band spans 38..55 for nullable FP32
 # and 19..63 for BF16, high-work starts at rows 148 for nullable slots, and the
 # measured positive-FP32 schedule runs the two-CTA cluster split while one
-# B200 wave holds every CTA pair (<= 9) and then alternates wide512 (10..37,
-# 56..76) with high-work (38..55, >= 77).
+# B200 wave holds every CTA pair (<= 9), the 128-register wide512 instance
+# while one CTA per SM still covers the grid (10..18), and then alternates
+# wide512 (19..37, 56..76) with high-work (38..55, >= 77).
 _H8_ROUTES = (
     ("float32", "positive_unique", 1, "cluster2_wide_positive_f32"),
     ("float32", "positive_unique", 9, "cluster2_wide_positive_f32"),
-    ("float32", "positive_unique", 10, "wide512_positive_f32"),
-    ("float32", "positive_unique", 18, "wide512_positive_f32"),
+    ("float32", "positive_unique", 10, "wide512_regcap128_positive_f32"),
+    ("float32", "positive_unique", 18, "wide512_regcap128_positive_f32"),
     ("float32", "positive_unique", 19, "wide512_positive_f32"),
     ("float32", "positive_unique", 37, "wide512_positive_f32"),
     ("float32", "positive_unique", 38, "high_work_positive_f32"),
@@ -573,6 +574,34 @@ def test_cluster_variants_render_the_cluster_launch_binding(target, name):
     assert rule.minimum_rows == 1
     assert rule.maximum_rows == cake_jit._H8_CLUSTER2_MAX_ROWS
     assert rule.state_indices_modes == ("positive_unique",)
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    "name",
+    (
+        "wide512_regcap128_positive_f32",
+        "wide512_regcap128_positive_f32_wide_slot_offsets",
+    ),
+)
+def test_regcap128_variants_cover_the_one_cta_per_sm_band(target, name):
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
+    assert variant.cluster_x == 1
+    assert variant.threads == 512
+    assert variant.state_dtype == "float32"
+    assert variant.abi_kind == "standard"
+    rule = variant.eligibility[0]
+    assert rule.heads == (8,)
+    assert rule.minimum_rows == cake_jit._H8_CLUSTER2_MAX_ROWS + 1
+    assert rule.maximum_rows == cake_jit._H8_WIDE512_REGCAP128_MAX_ROWS
+    assert rule.state_indices_modes == ("positive_unique",)
+    # The instance differs from wide512_positive_f32 only by its launch bounds.
+    text = variant.body_path.read_text(encoding="utf-8")
+    assert "__launch_bounds__(512, 1)" in text
+    sibling = cake_jit.get_cake_fused_kda_decode_variant(
+        name.replace("wide512_regcap128_positive_f32", "wide512_positive_f32"), target
+    )
+    assert "__launch_bounds__(512, 2)" in sibling.body_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))

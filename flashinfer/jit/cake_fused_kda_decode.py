@@ -104,6 +104,10 @@ _HEADS: tuple[int, ...] = (8, 12, 24, 32, 48, 96)
 # H=8 positive-unique FP32 rows served by the two-CTA cluster split.  Mirrors
 # the Cake launcher's CLUSTER2_H8_MAX_ROWS (measured on B200 and B300).
 _H8_CLUSTER2_MAX_ROWS = 9
+# H=8 positive-unique FP32 rows above the cluster band that still fit one CTA
+# per SM: the 128-register wide512 instance (``__launch_bounds__(512, 1)``).
+# Mirrors the Cake launcher's WIDE512_REGCAP128_H8_MAX_ROWS.
+_H8_WIDE512_REGCAP128_MAX_ROWS = 18
 _ARG_PLAN_SHA256 = {
     name: hashlib.sha256(
         json.dumps(arguments, separators=(",", ":")).encode()
@@ -625,6 +629,66 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
                 "heads": [8],
                 "minimum_rows": 64,
                 "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "wide512_regcap128_positive_f32_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_wide512_regcap128_positive_f32_wide_slot_offsets.cu",
+        "source_sha256": "d0b2ff964434905da8529783ef9140b02c462ddde0a55d18ca0c59db2a585a5e",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_regcap128_positive_f32_wide_slot_offsets",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 3712,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": _H8_CLUSTER2_MAX_ROWS + 1,
+                "maximum_rows": _H8_WIDE512_REGCAP128_MAX_ROWS,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "wide512_regcap128_positive_f32",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_wide512_regcap128_positive_f32.cu",
+        "source_sha256": "3b10ef573d40127f6dfb65b92c65b80780d19e5a46aa0e8a06e352f755a85e51",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_regcap128_positive_f32",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 3712,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": _H8_CLUSTER2_MAX_ROWS + 1,
+                "maximum_rows": _H8_WIDE512_REGCAP128_MAX_ROWS,
                 "state_indices_modes": ["positive_unique"],
                 "lower_bound_values": "any",
                 "norm_eps_values": "any",
@@ -4469,13 +4533,19 @@ def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
     if num_heads == 8:
         # Measured H=8 bands (B200 and B300 route matrices, 2026-09-25): while
         # SMs are idle the two-CTA cluster split halves each item's recurrence
-        # chain (rows <= _H8_CLUSTER2_MAX_ROWS); the staged compact family
+        # chain (rows <= _H8_CLUSTER2_MAX_ROWS), the 128-register wide512
+        # instance serves rows up to _H8_WIDE512_REGCAP128_MAX_ROWS; the staged compact family
         # loses 5-16 % to high-work for rows 38..55, the vector-four producer
         # loses to the spread producer, and the nearly empty third high-work
         # wave makes wide512 the better route for rows 56..76.  Beyond that
         # the rotating high-work pipeline is at least as fast everywhere.
         if num_rows <= _H8_CLUSTER2_MAX_ROWS:
             return ("cluster2_wide_positive_f32",)
+        if num_rows <= _H8_WIDE512_REGCAP128_MAX_ROWS:
+            # One CTA per SM either way; the 128-register cap keeps more
+            # scattered slot loads in flight (B200 2026-09-25: 4-7 % on
+            # random 8192-slot pools, within noise on compact pools).
+            return ("wide512_regcap128_positive_f32",)
         if num_rows <= 37 or 56 <= num_rows <= 76:
             return ("wide512_positive_f32",)
         return ("high_work_positive_f32",)
