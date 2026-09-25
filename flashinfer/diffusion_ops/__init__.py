@@ -21,6 +21,12 @@ from .cake_minimax_h3_sm120_quant_pre_attention import (
     quantize_minimax_h3_qkv_weight_nvfp4,
 )
 
+from .cake_minimax_h3_sm120_quant_out_proj import (
+    minimax_h3_fp8_out_proj,
+    minimax_h3_nvfp4_out_proj,
+    quantize_minimax_h3_o_weight_fp8,
+    quantize_minimax_h3_o_weight_nvfp4,
+)
 from .cake_minimax_h3_mxfp8 import (
     PreparedMiniMaxH3Mxfp8PreAttention,
     prepare_minimax_h3_mxfp8_pre_attention,
@@ -55,4 +61,8 @@ __all__ = [
     "PreparedMiniMaxH3QkvQuantizePack",
     "minimax_h3_qkv_quantize_pack",
     "prepare_minimax_h3_qkv_quantize_pack",
+    "minimax_h3_fp8_out_proj",
+    "minimax_h3_nvfp4_out_proj",
+    "quantize_minimax_h3_o_weight_fp8",
+    "quantize_minimax_h3_o_weight_nvfp4",
 ]
