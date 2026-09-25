@@ -20,6 +20,8 @@ hidden elements (16 bytes) of one token; the kernel is a memory-bound gather.
 Minimum architecture SM100 (B300: SM103) only because the surrounding path is.
 """
 
+from typing import Optional, Tuple
+
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
@@ -106,12 +108,24 @@ class _FinalizeRows:
     """``expanded_rows=False``: row ``expanded_idx_to_permuted_idx[t, k]`` of
     ``rows`` holds slot ``k`` of token ``t`` (swap-AB ``partial`` order);
     ``True``: row ``t * top_k + k`` does (the dense kernel's expanded-row
-    order) and the map only marks rank-local slots (``>= 0``)."""
+    order) and the map only marks rank-local slots (``>= 0``).
+    ``accumulate``: the output rows hold a partial combine (the split form's
+    wide GEMM2 reduce-adds its rows there) and are added to instead of
+    overwritten -- only when the routing produced wide groups (device-side
+    ``wide_count``), otherwise the rows are zero-filled and the read is
+    skipped. ``skip_wide``: slots whose permuted row lies in the wide region
+    (from ``ceil(narrow_groups * narrow_tile / wide_tile) * wide_tile``) are
+    already combined and contribute nothing here; with no narrow groups at
+    all the kernel exits at once (the output is complete)."""
 
-    def __init__(self, top_k, threads, expanded_rows):
+    def __init__(
+        self, top_k, threads, expanded_rows, accumulate=False, skip_wide=False
+    ):
         self.top_k = top_k
         self.threads = threads
         self.expanded_rows = expanded_rows
+        self.accumulate = accumulate
+        self.skip_wide = skip_wide
 
     @cute.jit
     def __call__(
@@ -120,9 +134,13 @@ class _FinalizeRows:
         perm_ptr: cute.Pointer,
         weights_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
+        narrow_count_ptr: Optional[cute.Pointer],
+        wide_count_ptr: Optional[cute.Pointer],
         tokens: cutlass.Int32,
         hidden_words: cutlass.Int32,
         rows_words: cutlass.Int32,
+        narrow_tile: cutlass.Int32,
+        wide_tile: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         # 32-bit word views: two BF16 per word, four words per thread task.
@@ -137,9 +155,30 @@ class _FinalizeRows:
             cute.make_layout((tokens, self.top_k), stride=(self.top_k, 1)),
         )
         out = cute.make_tensor(out_ptr, cute.make_layout((tokens * hidden_words,)))
+        narrow_count = (
+            cute.make_tensor(narrow_count_ptr, cute.make_layout((1,)))
+            if cutlass.const_expr(narrow_count_ptr is not None)
+            else None
+        )
+        wide_count = (
+            cute.make_tensor(wide_count_ptr, cute.make_layout((1,)))
+            if cutlass.const_expr(wide_count_ptr is not None)
+            else None
+        )
         chunks = hidden_words // (FINALIZE_VEC // 2)
         tasks = tokens * chunks
-        self.kernel(rows, perm, weights, out, chunks, tasks).launch(
+        self.kernel(
+            rows,
+            perm,
+            weights,
+            out,
+            narrow_count,
+            wide_count,
+            chunks,
+            tasks,
+            narrow_tile,
+            wide_tile,
+        ).launch(
             grid=(cute.ceil_div(tasks, self.threads), 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
@@ -152,14 +191,32 @@ class _FinalizeRows:
         perm: cute.Tensor,
         weights: cute.Tensor,
         out: cute.Tensor,
+        narrow_count: Optional[cute.Tensor],
+        wide_count: Optional[cute.Tensor],
         chunks: cutlass.Int32,
         tasks: cutlass.Int32,
+        narrow_tile: cutlass.Int32,
+        wide_tile: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         task = bidx * self.threads + tidx
         words_per_chunk = FINALIZE_VEC // 2
-        if task < tasks:
+        # First row of the wide region (rows at or past it are combined by
+        # the wide GEMM2 already); the whole row space when not skipping.
+        # Without narrow groups the output is already complete: exit.
+        wide_row0 = cutlass.Int32(2**31 - 1)
+        has_wide = cutlass.Boolean(True)
+        active = task < tasks
+        if cutlass.const_expr(self.skip_wide):
+            narrow_groups = narrow_count[0]
+            wide_row0 = (
+                (narrow_groups * narrow_tile + wide_tile - 1) // wide_tile
+            ) * wide_tile
+            has_wide = wide_count[0] > 0
+            if narrow_groups == 0:
+                active = cutlass.Boolean(False)
+        if active:
             token = task // chunks
             chunk = task - token * chunks
             row_words = chunks * words_per_chunk
@@ -176,19 +233,34 @@ class _FinalizeRows:
             for k in cutlass.range_constexpr(self.top_k):
                 permuted = perm[(token, k)]
                 if permuted >= 0:
-                    if cutlass.const_expr(self.expanded_rows):
-                        row = token * self.top_k + k
-                    else:
-                        row = permuted
-                    wgt[k] = weights[(token, k)]
-                    base = cute.assume(row * row_words + chunk_words, divby=4)
-                    g = cute.make_tensor(
-                        rows.iterator + base, cute.make_layout((words_per_chunk,))
-                    )
-                    cute.autovec_copy(g, src[(k, None)])
+                    if permuted < wide_row0:
+                        if cutlass.const_expr(self.expanded_rows):
+                            row = token * self.top_k + k
+                        else:
+                            row = permuted
+                        wgt[k] = weights[(token, k)]
+                        base = cute.assume(row * row_words + chunk_words, divby=4)
+                        g = cute.make_tensor(
+                            rows.iterator + base, cute.make_layout((words_per_chunk,))
+                        )
+                        cute.autovec_copy(g, src[(k, None)])
             acc = cute.make_rmem_tensor((FINALIZE_VEC,), cutlass.Float32)
             for e in cutlass.range_constexpr(FINALIZE_VEC):
                 acc[e] = cutlass.Float32(0.0)
+            out_base = cute.assume(token * row_words + chunk_words, divby=4)
+            g_out = cute.make_tensor(
+                out.iterator + out_base, cute.make_layout((words_per_chunk,))
+            )
+            if cutlass.const_expr(self.accumulate):
+                # Start from the partial combine already in the output row
+                # (zero-filled when the routing produced no wide groups).
+                if has_wide:
+                    prev = cute.make_rmem_tensor((words_per_chunk,), cutlass.Uint32)
+                    cute.autovec_copy(g_out, prev)
+                    one = cutlass.Float32(1.0)
+                    for j in cutlass.range_constexpr(words_per_chunk):
+                        acc[2 * j] = _fma_bf16_lo(prev[j], one, acc[2 * j])
+                        acc[2 * j + 1] = _fma_bf16_hi(prev[j], one, acc[2 * j + 1])
             for k in cutlass.range_constexpr(self.top_k):
                 for j in cutlass.range_constexpr(words_per_chunk):
                     word = src[(k, j)]
@@ -197,10 +269,6 @@ class _FinalizeRows:
             packed = cute.make_rmem_tensor((words_per_chunk,), cutlass.Uint32)
             for j in cutlass.range_constexpr(words_per_chunk):
                 packed[j] = _pack_bf16x2(acc[2 * j], acc[2 * j + 1])
-            out_base = cute.assume(token * row_words + chunk_words, divby=4)
-            g_out = cute.make_tensor(
-                out.iterator + out_base, cute.make_layout((words_per_chunk,))
-            )
             cute.autovec_copy(packed, g_out)
 
 
@@ -227,6 +295,8 @@ def plan_finalize_rows(
     *,
     threads: int = 256,
     expanded_rows: bool = False,
+    accumulate: bool = False,
+    skip_wide: Optional[Tuple[torch.Tensor, torch.Tensor, int, int]] = None,
 ) -> _FinalizeRowsPlan:
     """Compile, bind and enqueue one warmup, outside CUDA Graph capture.
 
@@ -240,6 +310,17 @@ def plan_finalize_rows(
     (``rows[t * top_k + k]``, the dense kernel's non-fused output) and the map
     only marks the rank-local slots. All tensors must be contiguous and on one
     device; ``H`` must be a multiple of 8.
+
+    ``accumulate=True`` adds to the output rows instead of overwriting them
+    (they hold the reduce-adds of the split form's wide GEMM2); the read is
+    skipped when ``wide_group_count[0]`` is zero (the rows are zero-filled).
+    ``skip_wide=(narrow_group_count, wide_group_count, narrow_tile,
+    wide_tile)`` skips the slots whose permuted row lies in the wide region,
+    which starts at the first ``wide_tile`` multiple past
+    ``narrow_group_count[0] * narrow_tile`` rows, and exits at once when
+    there are no narrow groups (int32 device scalars read by the kernel, so
+    a captured graph follows the routing). ``accumulate`` requires
+    ``skip_wide``.
     """
     tokens, top_k = expanded_idx_to_permuted_idx.shape
     hidden = out.shape[1]
@@ -271,6 +352,27 @@ def plan_finalize_rows(
     if rows.shape[0] * (hidden // 2) >= 2**31 or tokens * (hidden // 2) >= 2**31:
         # 32-bit word offsets inside the kernel.
         raise ValueError("finalize rows/output exceed 2^31 32-bit words")
+    narrow_count = wide_count = None
+    narrow_tile = wide_tile = 0
+    if accumulate and skip_wide is None:
+        raise ValueError("accumulate requires skip_wide (the wide group count)")
+    if skip_wide is not None:
+        narrow_count, wide_count, narrow_tile, wide_tile = skip_wide
+        narrow_tile, wide_tile = int(narrow_tile), int(wide_tile)
+        for count in (narrow_count, wide_count):
+            if (
+                count.dtype != torch.int32
+                or count.numel() < 1
+                or not count.is_contiguous()
+                or count.device != device
+            ):
+                raise ValueError(
+                    "skip_wide group counts must be contiguous int32 scalars"
+                )
+        if narrow_tile <= 0 or wide_tile <= 0 or wide_tile % narrow_tile:
+            raise ValueError(
+                "skip_wide needs wide_tile a positive multiple of narrow_tile"
+            )
     with torch.cuda.device(device):
         major, minor = torch.cuda.get_device_capability(device)
         arguments = (
@@ -295,16 +397,45 @@ def plan_finalize_rows(
             make_ptr(
                 cutlass.Uint32, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
             ),
+            *(
+                (
+                    make_ptr(
+                        cutlass.Int32,
+                        count.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    if count is not None
+                    else None
+                )
+                for count in (narrow_count, wide_count)
+            ),
             cutlass.Int32(tokens),
             cutlass.Int32(hidden // 2),
             cutlass.Int32(rows.shape[0] * (hidden // 2)),
+            cutlass.Int32(narrow_tile),
+            cutlass.Int32(wide_tile),
         )
-        cache_key = (top_k, threads, bool(expanded_rows), device.index, (major, minor))
+        cache_key = (
+            top_k,
+            threads,
+            bool(expanded_rows),
+            bool(accumulate),
+            narrow_count is not None,
+            device.index,
+            (major, minor),
+        )
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         compiled = _finalize_kernel_cache.get(cache_key)
         if compiled is None:
             compiled = cute.compile(
-                _FinalizeRows(top_k, threads, bool(expanded_rows)),
+                _FinalizeRows(
+                    top_k,
+                    threads,
+                    bool(expanded_rows),
+                    accumulate=bool(accumulate),
+                    skip_wide=narrow_count is not None,
+                ),
                 *arguments,
                 stream=stream,
             )
@@ -312,7 +443,14 @@ def plan_finalize_rows(
         bound = _FinalizeRowsPlan(
             compiled,
             arguments,
-            (rows, expanded_idx_to_permuted_idx, route_weights, out),
+            (
+                rows,
+                expanded_idx_to_permuted_idx,
+                route_weights,
+                out,
+                narrow_count,
+                wide_count,
+            ),
             out,
         )
         bound.run(stream)

@@ -155,6 +155,23 @@ SWAP_SPLIT_EARLY_TRIGGER = os.environ.get("SWAPAB_SPLIT_EARLY_TRIGGER", "1") != 
 # 128-wide tile doubles the streaming CTAs (B300 TP8 empty: T=128 65 -> 57 us,
 # T=512 140 -> 134), from T=1024 the 256-wide tile is back ahead (236 vs 242).
 SWAP_SPLIT_GEMM1_N_POLICY = ((512, 128), (1 << 62, 256))
+# Wide GEMM2 of the split form on the dense finalize-fusion kernel: it
+# reduce-adds the route-weighted 128-row groups into the zero-filled output
+# (one 128 x N tile per weight tile, TMA-fed), and the two-stage finalize adds
+# the narrow groups' rows on top instead of overwriting. The swap GEMM2 at
+# ``n_tile = 128`` measured 35.9 us against 15.9 us for the dense kernel over
+# the same 16 experts x 128 rows (MoE-TP shard, T=128 empty, B300).
+SWAP_SPLIT_DENSE_GEMM2 = os.environ.get("SWAPAB_SPLIT_DENSE_GEMM2", "1") != "0"
+# Wide chain on a side stream (fork after the routing kernel, join before the
+# finalize / at the end): the two wide launches leave the narrow chain's
+# critical path, so a routing without wide experts pays no dependency hops
+# for them (measured 2 hops = ~5-7 us on the expert-parallel decode rows).
+SWAP_SPLIT_SIDE_STREAM = os.environ.get("SWAPAB_SPLIT_SIDE_STREAM", "0") == "1"
+SWAP_SPLIT_GEMM2_N = (
+    int(os.environ["SWAPAB_SPLIT_GEMM2_N"])
+    if os.environ.get("SWAPAB_SPLIT_GEMM2_N")
+    else None
+)
 SWAP_SPLIT_GEMM1_N = (
     int(os.environ["SWAPAB_SPLIT_GEMM1_N"])
     if os.environ.get("SWAPAB_SPLIT_GEMM1_N")
@@ -777,6 +794,13 @@ class Mxfp4MoESwapAbPlan:
         self.hybrid = wrapper._swap_hybrid(x.shape[0], self.finalize)
         self.mixed = wrapper._swap_mixed(x.shape[0], self.finalize)
         self.split = wrapper._swap_split(x.shape[0], self.finalize)
+        self.split_dense = False  # set by _prepare
+        self._side_stream = None
+        self._fork_event = self._join_event = None
+        if self.split and SWAP_SPLIT_SIDE_STREAM:
+            self._side_stream = torch.cuda.Stream(device=self.device)
+            self._fork_event = torch.cuda.Event()
+            self._join_event = torch.cuda.Event()
         self.group_rows = (
             SWAP_HYBRID_GROUP_ROWS if (self.hybrid or self.mixed) else n_tile
         )
@@ -850,8 +874,15 @@ class Mxfp4MoESwapAbPlan:
         # overwritten or padding, so the clear is harmless).
         # In the deferred and two-stage forms the first T permuted rows stand
         # in (overwritten or padding, so the clear is harmless): the finalize
-        # kernel writes every output row itself.
-        if self.finalize and not self.two_stage:
+        # kernel writes every output row itself -- except in the split form
+        # with the dense wide GEMM2, which reduce-adds into the output.
+        # With the fused (atomic) finalize the dense wide GEMM2 reduce-adds
+        # into the same zero-filled output as the narrow swap GEMM2; with the
+        # two-stage finalize the finalize kernel accumulates on top of it.
+        split_dense = self.split and SWAP_SPLIT_DENSE_GEMM2
+        self.split_dense = split_dense
+        clear_output = not self.two_stage or split_dense
+        if (self.finalize and not self.two_stage) or split_dense:
             clear_target = self.output
         elif self.two_stage:
             clear_target = self._partial_rows[:num_tokens]
@@ -883,7 +914,7 @@ class Mxfp4MoESwapAbPlan:
                     local_expert_offset=w.local_expert_offset,
                     tile_size=self.group_rows,
                     _single_tile_per_expert=self.group_rows >= num_tokens,
-                    clear_output=not self.two_stage,
+                    clear_output=clear_output,
                     dispatch_lists=(
                         dict(
                             wide_list=b["swap_wide_list"],
@@ -927,7 +958,7 @@ class Mxfp4MoESwapAbPlan:
                     route_ids=self._route_ids,
                     route_weights=self._route_weights,
                     output=clear_target,
-                    clear_output=not self.two_stage,
+                    clear_output=clear_output,
                 )
                 moe_sort(
                     token_selected_experts=self._route_ids,
@@ -1058,17 +1089,55 @@ class Mxfp4MoESwapAbPlan:
                     _prepared_launches=wide_launches,
                 )
                 self._gemm1_dense = wide_launches["gather"]
-                self._prepare_swap_gemm2(
-                    w,
-                    b,
-                    w2,
-                    w2_sf,
-                    num_tokens,
-                    fused_finalize,
-                    wide_launches,
-                    wide=True,
-                )
-                self._gemm2_wide = wide_launches["swap_gemm2"]
+                if split_dense:
+                    # Wide GEMM2 on the dense finalize-fusion kernel over the
+                    # same 128-row groups: route-weighted reduce-add into the
+                    # zero-filled output; the finalize adds the narrow rows.
+                    gemm2_tactic = w._tactic(num_tokens)[2]
+                    gemm2_n = SWAP_SPLIT_GEMM2_N or gemm2_tactic[0][1]
+                    if gemm2_tactic[0] != (SWAP_SPLIT_WIDE_TILE, gemm2_n):
+                        gemm2_tactic = ((SWAP_SPLIT_WIDE_TILE, gemm2_n), (1, 1), False)
+                    blockscaled_contiguous_grouped_gemm_finalize_fusion(
+                        a=b["gemm1_out"],
+                        b=w2,
+                        a_scale=b["gemm1_out_scale"],
+                        b_scale=w2_sf,
+                        alpha=b["w2_alpha"],
+                        tile_idx_to_expert_idx=b["swap_wide_expert"],
+                        num_non_exiting_tiles=b["swap_wide_count"],
+                        tile_idx_to_mn_limit=b["swap_wide_limit"],
+                        permuted_idx_to_expanded_idx=b[
+                            "out_permuted_idx_to_expanded_idx"
+                        ],
+                        token_final_scales=self._route_weights,
+                        out=self.output,
+                        a_dtype="float8_e4m3fn",
+                        b_dtype="float4_e2m1fn",
+                        sf_dtype="float8_e8m0fnu",
+                        sf_vec_size=32,
+                        out_dtype="bfloat16",
+                        mma_tiler_mn=gemm2_tactic[0],
+                        cluster_shape_mn=gemm2_tactic[1],
+                        enable_pdl=pdl,
+                        use_fused_finalize=True,
+                        weight_l2_hint=DENSE_WEIGHT_L2_HINT,
+                        tile_idx_to_row_group=b["swap_wide_list"],
+                        pdl_trigger_early=pdl and SWAP_SPLIT_EARLY_TRIGGER,
+                        _prepared_launches=wide_launches,
+                    )
+                    self._gemm2_wide = wide_launches["finalize"]
+                else:
+                    self._prepare_swap_gemm2(
+                        w,
+                        b,
+                        w2,
+                        w2_sf,
+                        num_tokens,
+                        fused_finalize,
+                        wide_launches,
+                        wide=True,
+                    )
+                    self._gemm2_wide = wide_launches["swap_gemm2"]
             if (
                 self.hybrid or self.mixed
             ) and self.group_rows > SWAP_HYBRID_DENSE_MIN_ROWS:
@@ -1158,6 +1227,17 @@ class Mxfp4MoESwapAbPlan:
                     b["out_expanded_idx_to_permuted_idx"],
                     self._route_weights,
                     self.output,
+                    accumulate=split_dense,
+                    skip_wide=(
+                        (
+                            b["out_num_non_exiting_tiles"],
+                            b["swap_wide_count"],
+                            self.n_tile,
+                            SWAP_SPLIT_WIDE_TILE,
+                        )
+                        if split_dense
+                        else None
+                    ),
                 )
 
     def _prepare_swap_gemm2(
@@ -1267,7 +1347,19 @@ class Mxfp4MoESwapAbPlan:
                 self._dispatch(*self._dispatch_args, stream_ptr)
             if self._token_index is not None:
                 self._token_index(*self._token_index_args, stream=stream)
-            if self.split:
+            if self.split and self._side_stream is not None:
+                # Fork: the wide chain runs on the plan's side stream after
+                # the routing kernel; the narrow chain keeps its PDL edges.
+                main = torch.cuda.current_stream()
+                self._fork_event.record(main)
+                self._side_stream.wait_event(self._fork_event)
+                side = cuda.CUstream(self._side_stream.cuda_stream)
+                compiled, args, kwargs = self._gemm1_dense
+                compiled(*args, stream=side, **kwargs)
+                compiled, args = self._gemm2_wide
+                compiled(*args, stream=side)
+                self._join_event.record(self._side_stream)
+            elif self.split:
                 # Wide launches first: when they find no groups, their CTAs
                 # are resident during the routing kernel and leave at once.
                 compiled, args, kwargs = self._gemm1_dense
@@ -1279,6 +1371,10 @@ class Mxfp4MoESwapAbPlan:
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
             self._gemm2(*self._gemm2_args, stream=stream)
+            if self._side_stream is not None:
+                # Join before the finalize reads the wide GEMM2's output rows
+                # (or before returning, when GEMM2 reduce-adds directly).
+                torch.cuda.current_stream().wait_event(self._join_event)
             if self._finalize_rows is not None:
                 self._finalize_rows.run(stream)
         return self.output

@@ -1837,10 +1837,85 @@ def test_fused_routing_split_layout(
             )
 
 
+def test_finalize_rows_accumulate_and_skip_wide():
+    """``accumulate`` adds the route-weighted narrow rows to the output rows
+    (which hold the wide GEMM2's reduce-adds) and ``skip_wide`` leaves out
+    the slots whose permuted row lies in the wide region, whose start the
+    kernel derives from the narrow group count at run time."""
+    _require_blackwell()
+    import cuda.bindings.driver as cuda
+
+    from flashinfer.fused_moe.cute_dsl.mxfp4_finalize import plan_finalize_rows
+
+    torch.manual_seed(0)
+    tokens, top_k, hidden = 37, 16, 256
+    narrow_tile, wide_tile = 16, 128
+    narrow_groups = 5  # 80 narrow rows -> the wide region starts at row 128
+    rows_total = wide_tile + 2 * wide_tile
+    rows = torch.randn(rows_total, hidden, device="cuda").to(torch.bfloat16)
+    perm = torch.randint(
+        0, rows_total, (tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    perm[:, 3] = -1  # one slot per token that is not rank-local
+    weights = torch.rand(tokens, top_k, device="cuda", dtype=torch.float32)
+    prior = torch.randn(tokens, hidden, device="cuda").to(torch.bfloat16)
+    out = prior.clone()
+    count = torch.tensor([narrow_groups], device="cuda", dtype=torch.int32)
+    wide_count = torch.tensor([2], device="cuda", dtype=torch.int32)
+    plan = plan_finalize_rows(
+        rows,
+        perm,
+        weights,
+        out,
+        accumulate=True,
+        skip_wide=(count, wide_count, narrow_tile, wide_tile),
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def expected(wide_row0, base):
+        mask = ((perm >= 0) & (perm < wide_row0)).float()
+        gathered = rows[perm.clamp(min=0).long()].float()
+        return base.float() + (gathered * (weights * mask).unsqueeze(-1)).sum(1)
+
+    out.copy_(prior)
+    plan.run(stream)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out.float(), expected(wide_tile, prior), atol=2e-2, rtol=1e-2
+    )
+    # A wider narrow region (device-side count) includes more slots without
+    # re-planning, as a captured graph must; with no wide groups the output
+    # rows are taken as zero (they were zero-filled) instead of read.
+    count.fill_(rows_total // narrow_tile)
+    wide_count.zero_()
+    out.copy_(prior)
+    plan.run(stream)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out.float(),
+        expected(rows_total, torch.zeros_like(prior)),
+        atol=2e-2,
+        rtol=1e-2,
+    )
+    # No narrow groups: the kernel leaves the (complete) output untouched.
+    count.zero_()
+    wide_count.fill_(3)
+    out.copy_(prior)
+    plan.run(stream)
+    torch.cuda.synchronize()
+    assert torch.equal(out, prior)
+
+
 @pytest.mark.parametrize("tokens", [128, 192, 256])
 @pytest.mark.parametrize("distribution", ["hot", "empty", "balanced"])
-def test_swap_split_form_matches_default(monkeypatch, tokens, distribution):
-    """The split form (wide experts through the 128-row swap launches)
+@pytest.mark.parametrize("dense_gemm2", [True, False], ids=["dense2", "swap2"])
+@pytest.mark.parametrize("shard", ["tp", "ep"])
+def test_swap_split_form_matches_default(
+    monkeypatch, tokens, distribution, dense_gemm2, shard
+):
+    """The split form (wide experts through the 128-row launches: dense
+    gather GEMM1, then either the dense finalize-fusion GEMM2 reduce-adding
+    into the output with an accumulating finalize, or the 128-row swap GEMM2)
     matches the default swap form and stays within the BF16 floor of the
     FP64 reference; a captured graph follows routing changes that move
     experts between the narrow and the wide layout."""
@@ -1850,10 +1925,18 @@ def test_swap_split_form_matches_default(monkeypatch, tokens, distribution):
     monkeypatch.setattr(mxfp4, "SWAP_SPLIT", True)
     monkeypatch.setattr(mxfp4, "SWAP_MIXED", False)
     monkeypatch.setattr(mxfp4, "SWAP_SPLIT_MIN_ROWS", 64)
-    case = make_case(tokens=tokens, distribution=distribution)
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT_DENSE_GEMM2", dense_gemm2)
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT_EP", shard == "ep")
+    # The wide expert-parallel shard (intermediate > SWAP_TWO_STAGE_MAX_SHARD)
+    # keeps the fused atomic finalize: no finalize kernel, the dense wide
+    # GEMM2 reduce-adds next to the narrow swap GEMM2.
+    kwargs = {"intermediate": 1024} if shard == "ep" else {}
+    case = make_case(tokens=tokens, distribution=distribution, **kwargs)
     prepared = prepare_cute_weights(case)
     split, output, _ = prepare_candidate(case, prepared_weights=prepared)
     assert split.split
+    assert split.split_dense is dense_gemm2
+    assert split.two_stage is (shard == "tp")
     monkeypatch.setattr(mxfp4, "SWAP_SPLIT", False)
     default, expected, _ = prepare_candidate(case, prepared_weights=prepared)
     assert not default.split

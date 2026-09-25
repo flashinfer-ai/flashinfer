@@ -225,6 +225,10 @@ def _get_compiled_finalize_kernel(
     enable_narrow_a: bool = False,
     weight_l2_hint: Optional[int] = None,
     swizzle_size: int = 1,
+    # Optional compacted work list (Blackwell only); its presence is part of
+    # the compiled kernel, the pointer value is a runtime parameter.
+    row_group_ptr=None,
+    pdl_trigger_early: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -263,10 +267,17 @@ def _get_compiled_finalize_kernel(
         enable_narrow_a,
         weight_l2_hint,
         swizzle_size,
+        row_group_ptr is not None,
+        pdl_trigger_early,
     )
 
     if cache_key not in _finalize_kernel_cache:
         if is_rubin:
+            if row_group_ptr is not None or pdl_trigger_early:
+                raise NotImplementedError(
+                    "tile_idx_to_row_group and pdl_trigger_early are not "
+                    "supported by the Rubin (SM107) finalize grouped GEMM kernel."
+                )
             if use_a_per_token_scale:
                 raise NotImplementedError(
                     "use_a_per_token_scale (per-token activation scale) is "
@@ -316,6 +327,7 @@ def _get_compiled_finalize_kernel(
                 enable_narrow_a=enable_narrow_a,
                 weight_l2_hint=weight_l2_hint,
                 swizzle_size=swizzle_size,
+                pdl_trigger_early=pdl_trigger_early,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -328,8 +340,8 @@ def _get_compiled_finalize_kernel(
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-        #  token_final_scales_ptr, [a_per_token_scale_ptr],
-        #  m, n, k, l, num_tokens, top_k,
+        #  token_final_scales_ptr, [a_per_token_scale_ptr,
+        #  tile_idx_to_row_group_ptr], m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
         compiled_gemm = cute.compile(
             wrapper_fn,
@@ -344,7 +356,7 @@ def _get_compiled_finalize_kernel(
             permuted_idx_ptr,
             num_tiles_ptr,
             token_scales_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr]),
+            *([] if is_rubin else [a_per_token_scale_ptr, row_group_ptr]),
             permuted_m,
             n,
             k,
@@ -396,6 +408,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     _prepared_launches: Optional[Dict[str, Any]] = None,
     _enable_narrow_a: bool = False,
     weight_l2_hint: Optional[int] = None,
+    tile_idx_to_row_group: Optional[torch.Tensor] = None,
+    pdl_trigger_early: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -430,6 +444,13 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        tile_idx_to_row_group: Optional int32 work list, shape (num_tiles,):
+            scheduler slot ``i`` processes the ``tile_size``-row group
+            ``tile_idx_to_row_group[i]`` of the permuted rows (its expert and
+            limit are read at that group index) and ``num_non_exiting_tiles``
+            counts list entries. Blackwell only.
+        pdl_trigger_early: Signal programmatic dependents right after the
+            dependency wait instead of at kernel end (Blackwell only).
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
 
@@ -651,6 +672,26 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     permuted_idx_ptr = make_ptr(
         cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(), cute.AddressSpace.gmem
     )
+    row_group_ptr = None
+    if tile_idx_to_row_group is not None:
+        if is_rubin:
+            raise NotImplementedError(
+                "tile_idx_to_row_group is not supported by the Rubin (SM107) "
+                "finalize grouped GEMM kernel."
+            )
+        if (
+            tile_idx_to_row_group.dtype != torch.int32
+            or tile_idx_to_row_group.device != a.device
+            or not tile_idx_to_row_group.is_contiguous()
+            or tile_idx_to_row_group.shape[0] < permuted_m // tile_size
+        ):
+            raise ValueError(
+                "tile_idx_to_row_group must be contiguous int32 on the input "
+                "device with at least permuted_m // tile_size entries"
+            )
+        row_group_ptr = make_ptr(
+            cutlass.Int32, tile_idx_to_row_group.data_ptr(), cute.AddressSpace.gmem
+        )
 
     # Token final scales - create pointer
     token_scales_ptr = make_ptr(
@@ -711,6 +752,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         weight_l2_hint=weight_l2_hint,
         use_a_per_token_scale=use_a_per_token_scale,
         enable_narrow_a=_enable_narrow_a,
+        row_group_ptr=row_group_ptr,
+        pdl_trigger_early=pdl_trigger_early,
     )
 
     # Execute kernel with runtime parameters.
@@ -719,7 +762,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     # so on Rubin the extra pointer must be omitted here too.
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
-    #  [a_per_token_scale_ptr], m, n, k, l, num_tokens, top_k, stream)
+    #  [a_per_token_scale_ptr, tile_idx_to_row_group_ptr], m, n, k, l,
+    #  num_tokens, top_k, stream)
     launch_args = (
         a_ptr,
         b_ptr,
@@ -732,7 +776,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         permuted_idx_ptr,
         num_tiles_ptr,
         token_scales_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr]),
+        *([] if is_rubin else [a_per_token_scale_ptr, row_group_ptr]),
         permuted_m,
         n,
         k,
