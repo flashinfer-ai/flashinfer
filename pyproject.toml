@@ -72,6 +72,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.cake_w4a8_megamoe_ep16_cutedsl" = ["README.md", "submission.cpp"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
