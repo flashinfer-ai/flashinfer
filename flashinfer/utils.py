@@ -712,23 +712,36 @@ def is_sm12x_supported(device: torch.device) -> bool:
     return version_at_least(torch.version.cuda, min_cuda)
 
 
+# Keep this table in sync with FLASHINFER_MAMBA_HAS_CVT_RS in
+# include/flashinfer/mamba/conversion.cuh.
+CVT_RS_SUPPORTED_ARCHES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
+
+
+def cvt_rs_supported_arches_text() -> str:
+    """Return the supported stochastic-rounding targets in a stable order."""
+    return ", ".join(CVT_RS_SUPPORTED_ARCHES.values())
+
+
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    Supported targets are listed in CVT_RS_SUPPORTED_ARCHES.
     ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
     Blackwell) — both must return False, else the kernels silently compile the
     ~12-instruction software-emulation fallback and stochastic rounding runs
     ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
     Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
-    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
+    include/flashinfer/mamba/conversion.cuh.
     """
     if device is None:
         device = torch.device("cuda")
-    # Match the CUDA guard exactly: only the arches where cvt.rs actually
-    # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
-    # (major 11) has no `.rs` feature.
-    return get_compute_capability(device) in ((10, 0), (10, 3))
+    # Match the CUDA guard exactly: only the arches where cvt.rs is supported.
+    # NOT a `major == 10/11` check — SM110a (major 11) has no `.rs` feature.
+    return get_compute_capability(device) in CVT_RS_SUPPORTED_ARCHES
 
 
 def determine_mla_backend(device: torch.device) -> str:
