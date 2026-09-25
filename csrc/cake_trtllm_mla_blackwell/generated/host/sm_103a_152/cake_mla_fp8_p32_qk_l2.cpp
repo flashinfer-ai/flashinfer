@@ -32,7 +32,7 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(fp8_p32_exact_producer_105fd84009);
+TVM_FFI_EMBED_CUBIN(fp8_p32_exact_producer_c3bae9716e);
 
 namespace mla_host_shim {
 
@@ -256,7 +256,7 @@ inline bool MlaConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id
 #endif
 }
 
-namespace variant_fp8_p32_exact_producer_105fd84009_b2c026f361b4 {
+namespace variant_fp8_p32_exact_producer_c3bae9716e_ad932b8f296a {
 
 // 2D TMA descriptor for buffer 'Q_map' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -434,7 +434,6 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
   CheckSameCudaDevice(arg_partial_stats, arg_Q_map, "partial_stats", "Q_map");
   CheckSameCudaDevice(arg_O, arg_Q_map, "O", "Q_map");
   CheckSameCudaDevice(arg_completion, arg_Q_map, "completion", "Q_map");
-  CheckCurrentCudaDevice(arg_Q_map, "Q_map");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -457,7 +456,7 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
   float v_bmm2_scale = (float)arg_bmm2_scale;
   void* kargs[] = {&p_Q_map, &p_K_map, &p_V_map, &p_page_table, &p_seq_lens, &p_partial_O, &p_partial_stats, &p_O, &p_completion, &v_q_len, &v_page_table_stride, &v_max_num_ctas_q, &v_max_num_ctas_kv, &v_bmm1_scale_log2, &v_bmm2_scale};
 
-  static auto kernel = EmbedCubinModule_fp8_p32_exact_producer_105fd84009::Global()->mod.GetKernel("kernel_fp8_p32_exact_producer");
+  static auto kernel = EmbedCubinModule_fp8_p32_exact_producer_c3bae9716e::Global()->mod.GetKernel("kernel_fp8_p32_exact_producer");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_Q_map.device().device_id, 178560,
@@ -511,7 +510,7 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
     TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 178560u));
   }
 }
-}  // namespace variant_fp8_p32_exact_producer_105fd84009_b2c026f361b4
+}  // namespace variant_fp8_p32_exact_producer_c3bae9716e_ad932b8f296a
 
 int SelectVariant(int32_t batch, int32_t q_len, int32_t page_table_stride, int32_t max_num_ctas_q, int32_t max_num_ctas_kv, float bmm1_scale_log2, float bmm2_scale) {
   if (((batch > 0) && (q_len > 0))) return 0;
@@ -543,7 +542,7 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
         int64_t gx = (q_len * 2);
         int64_t gy = 32;
         int64_t gz = batch;
-        mla_host_shim::variant_fp8_p32_exact_producer_105fd84009_b2c026f361b4::Run(arg_query, arg_kv, arg_kv, arg_page_table, arg_seq_lens, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_completion, q_len, page_table_stride, max_num_ctas_q, max_num_ctas_kv, bmm1_scale_log2, bmm2_scale, gx, gy, gz, stream);
+        mla_host_shim::variant_fp8_p32_exact_producer_c3bae9716e_ad932b8f296a::Run(arg_query, arg_kv, arg_kv, arg_page_table, arg_seq_lens, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_completion, q_len, page_table_stride, max_num_ctas_q, max_num_ctas_kv, bmm1_scale_log2, bmm2_scale, gx, gy, gz, stream);
       }
       return;
     }
