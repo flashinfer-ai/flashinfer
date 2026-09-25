@@ -288,9 +288,9 @@ BF16_AFFINE_SPLIT_MIN_CHUNKS = 128
 # Windows never go below 8 chunks (256 tokens): the fused-body specialization
 # flags flip at 128 / 256 / 512 tokens of launch max_seq_len (H12 early state
 # pack, scalar beta / generic register inverse, sm_103a prediction-first), and
-# the >= 256-token slab variants are exported (the 256..511-token class since
-# the v6 export; the < 256-token class is not).  Shorter windows would select
-# unexported programs.
+# the >= 256-token launch classes map onto exported programs (the 359-row
+# export with 8-chunk windows added no program variant); the < 256-token
+# class does not, so shorter windows would select unexported programs.
 AFFINE_MIN_CHUNKS_PER_WINDOW = 8
 # Resident-window budget in CTA waves (windows x heads per wave = SM count).
 # One wave is the measured default; FLASHINFER_KDA_AFFINE_WINDOW_WAVES=2 is an
@@ -5269,36 +5269,41 @@ def _storage_base_address(tensor) -> int:
     return tensor.data_ptr() - tensor.storage_offset() * tensor.element_size()
 
 
-def rebind_signature(inputs: dict) -> tuple:
-    """Structural key under which a prepared launch can be rebound to new inputs.
+def rebind_signature_and_facts(inputs: dict) -> tuple[tuple, tuple]:
+    """One pass over the rebind inputs: (structural signature, address facts).
 
-    Two calls share a signature when every caller tensor has the same shape,
-    strides, dtype, device and 256-byte alignment, and the same tensors alias
-    each other (``initial_state is final_state`` for an in-place pool,
-    packed ``q``/``k``/``v`` slices of one projection buffer, ...).
+    The signature is the key two calls share when every caller tensor has the
+    same shape, strides, dtype, device and 256-byte alignment, and the same
+    tensors alias each other (``initial_state is final_state`` for an
+    in-place pool, packed ``q``/``k``/``v`` slices of one projection buffer,
+    ...).  The facts add the full address per tensor: equal facts mean a
+    launch bound to the previous call already points at these tensors.
     """
     storage_groups: dict[int, int] = {}
     facts: list[Optional[tuple]] = []
     aliases: list[Optional[int]] = []
+    addresses: list[Optional[tuple]] = []
     for name in REBIND_INPUT_NAMES:
         tensor = inputs.get(name)
         if tensor is None:
             facts.append(None)
             aliases.append(None)
+            addresses.append(None)
             continue
         pointer = tensor.data_ptr()
-        facts.append(
-            (
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.dtype,
-                pointer & 0xFF,
-                tensor.device.index,
-            )
-        )
+        shape = tuple(tensor.shape)
+        stride = tuple(tensor.stride())
+        dtype = tensor.dtype
+        facts.append((shape, stride, dtype, pointer & 0xFF, tensor.device.index))
         base = pointer - tensor.storage_offset() * tensor.element_size()
         aliases.append(storage_groups.setdefault(base, len(storage_groups)))
-    return (tuple(facts), tuple(aliases))
+        addresses.append((pointer, shape, stride, dtype))
+    return (tuple(facts), tuple(aliases)), tuple(addresses)
+
+
+def rebind_signature(inputs: dict) -> tuple:
+    """Structural key under which a prepared launch can be rebound to new inputs."""
+    return rebind_signature_and_facts(inputs)[0]
 
 
 @dataclass(frozen=True)
@@ -5355,6 +5360,15 @@ def _rebind_owner(impl, container_name: str):
 
 
 def _rebind_containers(impl) -> dict[str, Any]:
+    memo = impl.__dict__.get("_rebind_containers_memo")
+    if memo is not None:
+        return memo
+    memo = _collect_rebind_containers(impl)
+    impl._rebind_containers_memo = memo
+    return memo
+
+
+def _collect_rebind_containers(impl) -> dict[str, Any]:
     if hasattr(impl, "_main"):
         containers: dict[str, Any] = {}
         for sub_name in AFFINE_SUB_LAUNCHES:
@@ -5550,9 +5564,11 @@ def rebind_prepared_launch(
         return tensor
 
     stale_owners: list = []
+    touched: set[str] = set()
     for spec in plan.views:
         if changed is not None and spec.input_name not in changed:
             continue
+        touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
         if (
@@ -5568,13 +5584,15 @@ def rebind_prepared_launch(
     for address in plan.addresses:
         if changed is not None and address.input_name not in changed:
             continue
+        touched.add(address.container)
         containers[address.container][address.key] = (
             inputs[address.input_name].data_ptr() + address.byte_offset
         )
     new_inputs = tuple(
         inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
     )
-    for container_name, container in containers.items():
+    for container_name in touched:
+        container = containers[container_name]
         owner, base = _rebind_owner(impl, container_name)
         if base == "refresh_sources":
             owner._token_storage_refreshes = tuple(

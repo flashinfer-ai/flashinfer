@@ -7420,26 +7420,6 @@ def kda_prefill_supports_fp32_checkpoints(device=None, *, lower_bound=None) -> b
     )
 
 
-def _fast_signature(inputs):
-    """Address-level identity of the rebind inputs: (data_ptr, shape, stride, dtype) per tensor.
-
-    Equal fast signatures mean a prepared launch rebound to the previous call
-    already points at these tensors; the structural key (``rebind_signature``)
-    is implied because shapes, strides, dtypes and low address bits are all
-    part of it.
-    """
-    from .cake_kda_tf32_runtime import REBIND_INPUT_NAMES
-
-    facts = []
-    for name in REBIND_INPUT_NAMES:
-        tensor = inputs.get(name)
-        if tensor is None:
-            facts.append(None)
-        else:
-            facts.append((tensor.data_ptr(), tensor.shape, tensor.stride(), tensor.dtype))
-    return tuple(facts)
-
-
 class KDAPrefillPlanCache:
     """Bounded LRU of prepared KDA launches keyed by structural signature.
 
@@ -7537,10 +7517,15 @@ class KDAPrefillPlanCache:
         graph replays with self-contained descriptor contents.
         """
         import torch
-        from .cake_kda_tf32_runtime import REBIND_INPUT_NAMES, rebind_prepared_launch
+        from .cake_kda_tf32_runtime import (
+            REBIND_INPUT_NAMES,
+            rebind_prepared_launch,
+            rebind_signature_and_facts,
+        )
 
-        facts = _fast_signature(inputs)
-        fast = (facts, tuple(sorted(scalars.items())))
+        signature, facts = rebind_signature_and_facts(inputs)
+        scalar_key = tuple(sorted(scalars.items()))
+        fast = (facts, scalar_key)
         if fast == self._last_fast:
             # Same addresses, layouts, dtypes and scalars as the previous hit:
             # the prepared launch is already bound to these tensors.
@@ -7550,7 +7535,7 @@ class KDAPrefillPlanCache:
             self.hits += 1
             self.fast_hits += 1
             return prepared
-        key = self._key(inputs, **scalars)
+        key = (signature, scalar_key)
         entry = self._entries.get(key)
         if entry is None:
             return None
@@ -7592,7 +7577,10 @@ class KDAPrefillPlanCache:
         evicts least-recently-used entries until both the entry count and the
         byte budget hold, always keeping the newest entry.
         """
-        from .cake_kda_tf32_runtime import capture_rebind_plan
+        from .cake_kda_tf32_runtime import (
+            capture_rebind_plan,
+            rebind_signature_and_facts,
+        )
 
         owner = getattr(prepared, "_impl", prepared)
         if not (hasattr(owner, "args") or hasattr(owner, "_main")):
@@ -7605,7 +7593,7 @@ class KDAPrefillPlanCache:
         self._last_fast = None
         self._last_entry = None
         self._entries[key] = (prepared, plan)
-        self._facts[key] = _fast_signature(inputs)
+        self._facts[key] = rebind_signature_and_facts(inputs)[1]
         self._entries.move_to_end(key)
         self._bytes[key] = int(retained_bytes)
         self.bytes += int(retained_bytes)
