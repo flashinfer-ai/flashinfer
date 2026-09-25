@@ -928,7 +928,13 @@ void RunWithActivationParams(
     workspace.poisoned = false;
   }
   CheckCuda(completion_status, "cudaEventRecord(workspace completion)");
-  const int32_t expected_launches = schedule.route_layout == RouteLayout::kDirect ? 3 : 4;
+  // Direct rows launch FC1/FC2/finalize; packed rows add the route_pack launch unless the
+  // route tables are derived inside FC1 (RoutePacker::kFusedFc1), which keeps three launches.
+  const int32_t expected_launches =
+      (schedule.route_layout == RouteLayout::kDirect ||
+       schedule.route_packer == RoutePacker::kFusedFc1)
+          ? 3
+          : 4;
   TVM_FFI_ICHECK(context.launch_count == expected_launches)
       << "generated manifest emitted " << context.launch_count
       << " launches for a schedule that requires " << expected_launches;
