@@ -32,8 +32,8 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(mla_decode_v32_paged_bf16_c80238a3c3);
-TVM_FFI_EMBED_CUBIN(mla_decode_v32_reduce_1db619cce9);
+TVM_FFI_EMBED_CUBIN(mla_decode_v32_paged_bf16_4095ec2a10);
+TVM_FFI_EMBED_CUBIN(mla_decode_v32_reduce_b541821ab1);
 
 namespace mla_host_shim {
 
@@ -257,7 +257,7 @@ inline bool MlaConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id
 #endif
 }
 
-namespace variant_mla_decode_v32_paged_bf16_c80238a3c3_1fef86a30b84 {
+namespace variant_mla_decode_v32_paged_bf16_4095ec2a10_83437753ac1d {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -539,7 +539,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -565,7 +564,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_partial_lse, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_num_split, &v_total_work_items, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_v32_paged_bf16_c80238a3c3::Global()->mod.GetKernel("kernel_mla_decode_v32_paged_bf16");
+  static auto kernel = EmbedCubinModule_mla_decode_v32_paged_bf16_4095ec2a10::Global()->mod.GetKernel("kernel_mla_decode_v32_paged_bf16");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 231424,
@@ -629,9 +628,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_v32_paged_bf16_c80238a3c3_1fef86a30b84
+}  // namespace variant_mla_decode_v32_paged_bf16_4095ec2a10_83437753ac1d
 
-namespace variant_mla_decode_v32_reduce_1db619cce9_4512a48ed07e {
+namespace variant_mla_decode_v32_reduce_b541821ab1_6d1098a733b9 {
 
 void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O, TensorView arg_sinks, int64_t arg_num_q_heads, int64_t arg_num_split, double arg_bmm2_scale, int64_t arg_enable_sink, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   DLDevice dev = arg_partial_O.device();
@@ -660,7 +659,6 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O,
   CheckSameCudaDevice(arg_partial_lse, arg_partial_O, "partial_lse", "partial_O");
   CheckSameCudaDevice(arg_O, arg_partial_O, "O", "partial_O");
   CheckSameCudaDevice(arg_sinks, arg_partial_O, "sinks", "partial_O");
-  CheckCurrentCudaDevice(arg_partial_O, "partial_O");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -676,7 +674,7 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O,
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_partial_O, &p_partial_lse, &p_O, &p_sinks, &v_num_q_heads, &v_num_split, &v_bmm2_scale, &v_enable_sink};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(mla_decode_v32_reduce_1db619cce9, "kernel_mla_decode_v32_reduce");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(mla_decode_v32_reduce_b541821ab1, "kernel_mla_decode_v32_reduce");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 
@@ -712,7 +710,7 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O,
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_v32_reduce_1db619cce9_4512a48ed07e
+}  // namespace variant_mla_decode_v32_reduce_b541821ab1_6d1098a733b9
 
 int SelectVariant(float softmax_scale_log2, float partial_bmm2_scale, float bmm2_scale, int32_t num_split, int32_t total_work_items, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t num_rows) {
   if (((((num_split == 8) && (total_work_items == (num_rows * num_split))) && (num_rows > 0)) && (grid_x > 0))) return 0;
@@ -744,13 +742,13 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_half_
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = 1;
-        mla_host_shim::variant_mla_decode_v32_paged_bf16_c80238a3c3_1fef86a30b84::Run(arg_q_rows, arg_kv_half_pages, arg_kv_half_pages, arg_kv_half_pages, arg_ws_partial_output, arg_ws_partial_lse, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, partial_bmm2_scale, num_split, total_work_items, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_v32_paged_bf16_4095ec2a10_83437753ac1d::Run(arg_q_rows, arg_kv_half_pages, arg_kv_half_pages, arg_kv_half_pages, arg_ws_partial_output, arg_ws_partial_lse, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, partial_bmm2_scale, num_split, total_work_items, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       {
         int64_t gx = num_rows;
         int64_t gy = 128;
         int64_t gz = 1;
-        mla_host_shim::variant_mla_decode_v32_reduce_1db619cce9_4512a48ed07e::Run(arg_ws_partial_output, arg_ws_partial_lse, arg_output, arg_sinks, 128, num_split, bmm2_scale, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_v32_reduce_b541821ab1_6d1098a733b9::Run(arg_ws_partial_output, arg_ws_partial_lse, arg_output, arg_sinks, 128, num_split, bmm2_scale, enable_sink, gx, gy, gz, stream);
       }
       return;
     }

@@ -32,14 +32,14 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_30cfe17e1f);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_3b5bd1e042);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_7aa2c0c00a);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_8587a85908);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_8ace9da7a5);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_bbfb74c484);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_c278f217ca);
-TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_c6609aef39);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_061ee4c834);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_2c970779bb);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_396dfd6644);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_42315468e3);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_6b9f6c36b1);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_8dbc14abc6);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_d8696664e2);
+TVM_FFI_EMBED_CUBIN(mla_decode_exact_live_bf16_clc_e0a2c7b9a7);
 
 namespace mla_host_shim {
 
@@ -263,7 +263,7 @@ inline bool MlaConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id
 #endif
 }
 
-namespace variant_mla_decode_exact_live_bf16_clc_bbfb74c484_2e80d8d24161 {
+namespace variant_mla_decode_exact_live_bf16_clc_6b9f6c36b1_0d1669d0c5fb {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -478,7 +478,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -502,7 +501,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_bbfb74c484::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_6b9f6c36b1::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -566,9 +565,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_bbfb74c484_2e80d8d24161
+}  // namespace variant_mla_decode_exact_live_bf16_clc_6b9f6c36b1_0d1669d0c5fb
 
-namespace variant_mla_decode_exact_live_bf16_clc_7aa2c0c00a_eda49f6bffff {
+namespace variant_mla_decode_exact_live_bf16_clc_d8696664e2_62e84a15be91 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -783,7 +782,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -807,7 +805,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_7aa2c0c00a::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_d8696664e2::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 231424,
@@ -871,9 +869,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_7aa2c0c00a_eda49f6bffff
+}  // namespace variant_mla_decode_exact_live_bf16_clc_d8696664e2_62e84a15be91
 
-namespace variant_mla_decode_exact_live_bf16_clc_3b5bd1e042_c01040d8bcfe {
+namespace variant_mla_decode_exact_live_bf16_clc_396dfd6644_3980ba2a971b {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -1088,7 +1086,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -1112,7 +1109,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_3b5bd1e042::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_396dfd6644::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -1176,9 +1173,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_3b5bd1e042_c01040d8bcfe
+}  // namespace variant_mla_decode_exact_live_bf16_clc_396dfd6644_3980ba2a971b
 
-namespace variant_mla_decode_exact_live_bf16_clc_8ace9da7a5_ba559c721d8a {
+namespace variant_mla_decode_exact_live_bf16_clc_42315468e3_920a8a19e028 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -1393,7 +1390,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -1417,7 +1413,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_8ace9da7a5::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_42315468e3::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -1481,9 +1477,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_8ace9da7a5_ba559c721d8a
+}  // namespace variant_mla_decode_exact_live_bf16_clc_42315468e3_920a8a19e028
 
-namespace variant_mla_decode_exact_live_bf16_clc_c6609aef39_924cd77cca78 {
+namespace variant_mla_decode_exact_live_bf16_clc_8dbc14abc6_0a8942ad3091 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -1698,7 +1694,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -1722,7 +1717,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_c6609aef39::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_8dbc14abc6::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -1786,9 +1781,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_c6609aef39_924cd77cca78
+}  // namespace variant_mla_decode_exact_live_bf16_clc_8dbc14abc6_0a8942ad3091
 
-namespace variant_mla_decode_exact_live_bf16_clc_8587a85908_2fcbb5c2e41d {
+namespace variant_mla_decode_exact_live_bf16_clc_061ee4c834_4c6a09be5f76 {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -2003,7 +1998,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -2027,7 +2021,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_8587a85908::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_061ee4c834::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 231424,
@@ -2091,314 +2085,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_8587a85908_2fcbb5c2e41d
+}  // namespace variant_mla_decode_exact_live_bf16_clc_061ee4c834_4c6a09be5f76
 
-namespace variant_mla_decode_exact_live_bf16_clc_c278f217ca_bf399908d27d {
-
-// 3D TMA descriptor for buffer 'tmap_q' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_tmap_q(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'tmap_q' must have at least 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'tmap_q' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError)
-      << "TMA source 'tmap_q' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "tmap_q");
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'tmap_q' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'tmap_q' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2], ValueError)
-      << "TMA box (64, 64, 1) exceeds resolved global dims for 'tmap_q'";
-  int64_t carrier_stride_0 = s2;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_q' resolved global stride 2 to a non-whole-byte offset";
-  uint64_t global_strides[2] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-  };
-  uint32_t box_dim[3] = {64u, 64u, 1u};
-  uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (3D, 'tmap_q') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-// 4D TMA descriptor for buffer 'tmap_k' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_tmap_k(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'tmap_k' must have at least 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'tmap_k' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
-      << "TMA source 'tmap_k' trailing dims must be positive";
-  int64_t outer2 = t.numel() / (d1 * d2);
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'tmap_k' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(outer2)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
-      << "TMA box (64, 32, 1, 1) exceeds resolved global dims for 'tmap_k'";
-  int64_t carrier_stride_0 = d1;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * d1);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_k' resolved global stride 3 to a non-whole-byte offset";
-  uint64_t global_strides[3] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-  };
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (4D, 'tmap_k') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-// 4D TMA descriptor for buffer 'tmap_v' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_tmap_v(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'tmap_v' must have at least 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'tmap_v' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
-      << "TMA source 'tmap_v' trailing dims must be positive";
-  int64_t outer2 = t.numel() / (d1 * d2);
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'tmap_v' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(outer2)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
-      << "TMA box (64, 32, 1, 1) exceeds resolved global dims for 'tmap_v'";
-  int64_t carrier_stride_0 = d1;
-  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 1 negative";
-  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 1 zero while global dimension 1 is not 1";
-  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = 64;
-  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 2 negative";
-  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 2 zero while global dimension 2 is not 1";
-  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 2 to a non-whole-byte offset";
-  int64_t carrier_stride_2 = (d2 * d1);
-  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 3 negative";
-  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 3 zero while global dimension 3 is not 1";
-  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
-      << "TMA descriptor for 'tmap_v' resolved global stride 3 to a non-whole-byte offset";
-  uint64_t global_strides[3] = {
-      (uint64_t)((carrier_stride_0 * 16) / 8),
-      (uint64_t)((carrier_stride_1 * 16) / 8),
-      (uint64_t)((carrier_stride_2 * 16) / 8),
-  };
-  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
-  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
-  CUtensorMap tm{};
-  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (4D, 'tmap_v') failed: CUresult=" << (int)r;
-  return tm;
-}
-
-void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, TensorView arg_O, TensorView arg_seq_lens_kv, TensorView arg_page_table, TensorView arg_sinks, double arg_softmax_scale_log2, double arg_bmm2_scale, int64_t arg_total_work_items, int64_t arg_value_split_count, int64_t arg_max_pages_per_seq, int64_t arg_enable_sink, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
-  DLDevice dev = arg_tmap_q.device();
-  ScopedCudaDevice device_guard(dev.device_id);
-  CheckCudaTensor(arg_tmap_q, "tmap_q");
-  CheckDtype(arg_tmap_q, "tmap_q", 4, 16, 1);
-  CheckCudaTensor(arg_tmap_k, "tmap_k");
-  CheckDtype(arg_tmap_k, "tmap_k", 4, 16, 1);
-  CheckContiguous(arg_tmap_k, "tmap_k");
-  CheckCudaTensor(arg_tmap_v, "tmap_v");
-  CheckDtype(arg_tmap_v, "tmap_v", 4, 16, 1);
-  CheckContiguous(arg_tmap_v, "tmap_v");
-  CheckCudaTensor(arg_O, "O");
-  CheckDtype(arg_O, "O", 4, 16, 1);
-  CheckContiguous(arg_O, "O");
-  CheckCudaTensor(arg_seq_lens_kv, "seq_lens_kv");
-  CheckDtype(arg_seq_lens_kv, "seq_lens_kv", 0, 32, 1);
-  CheckContiguous(arg_seq_lens_kv, "seq_lens_kv");
-  CheckCudaTensor(arg_page_table, "page_table");
-  CheckDtype(arg_page_table, "page_table", 0, 32, 1);
-  CheckContiguous(arg_page_table, "page_table");
-  CheckCudaTensor(arg_sinks, "sinks");
-  CheckDtype(arg_sinks, "sinks", 2, 32, 1);
-  CheckContiguous(arg_sinks, "sinks");
-  TVM_FFI_CHECK(arg_total_work_items >= -2147483648LL && arg_total_work_items <= 2147483647LL, ValueError)
-      << "scalar 'total_work_items' value " << arg_total_work_items
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_value_split_count >= -2147483648LL && arg_value_split_count <= 2147483647LL, ValueError)
-      << "scalar 'value_split_count' value " << arg_value_split_count
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_max_pages_per_seq >= -2147483648LL && arg_max_pages_per_seq <= 2147483647LL, ValueError)
-      << "scalar 'max_pages_per_seq' value " << arg_max_pages_per_seq
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_enable_sink >= -2147483648LL && arg_enable_sink <= 2147483647LL, ValueError)
-      << "scalar 'enable_sink' value " << arg_enable_sink
-      << " is outside i32 range [-2147483648, 2147483647]";
-  CheckSameCudaDevice(arg_tmap_k, arg_tmap_q, "tmap_k", "tmap_q");
-  CheckSameCudaDevice(arg_tmap_v, arg_tmap_q, "tmap_v", "tmap_q");
-  CheckSameCudaDevice(arg_O, arg_tmap_q, "O", "tmap_q");
-  CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
-  CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
-  CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
-  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
-      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
-      << ", " << grid_z << ")";
-  TVM_FFI_CHECK(grid_x % 2 == 0 && grid_y % 1 == 0 && grid_z % 1 == 0, ValueError)
-      << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
-      << ") must be divisible by cluster dims (2, 1, 1)";
-
-
-  CUtensorMap p_tmap_q = EncodeTma_tmap_q(arg_tmap_q);
-  CUtensorMap p_tmap_k = EncodeTma_tmap_k(arg_tmap_k);
-  CUtensorMap p_tmap_v = EncodeTma_tmap_v(arg_tmap_v);
-  void* p_O = arg_O.data_ptr();
-  void* p_seq_lens_kv = arg_seq_lens_kv.data_ptr();
-  void* p_page_table = arg_page_table.data_ptr();
-  void* p_sinks = arg_sinks.data_ptr();
-  float v_softmax_scale_log2 = (float)arg_softmax_scale_log2;
-  float v_bmm2_scale = (float)arg_bmm2_scale;
-  int32_t v_total_work_items = (int32_t)arg_total_work_items;
-  int32_t v_value_split_count = (int32_t)arg_value_split_count;
-  int32_t v_max_pages_per_seq = (int32_t)arg_max_pages_per_seq;
-  int32_t v_enable_sink = (int32_t)arg_enable_sink;
-  void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
-
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_c278f217ca::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
-  static signed char mla_smem_mode_cache[64] = {0};
-  const bool use_oversized_smem = MlaConfigureDynamicSmem(
-      kernel, (int)arg_tmap_q.device().device_id, 230912,
-      mla_smem_mode_cache, 64);
-  tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
-  tvm::ffi::dim3 block(384u, 1u, 1u);
-
-  // Extended launch — mirrors CUDAKernel.prepare_launch_cluster attributes.
-  tvm::ffi::cuda_api::LaunchConfig config;
-  int n = 0;
-#if TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API
-  CUlaunchAttribute attrs[3];
-  attrs[n].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-  attrs[n].value.clusterDim.x = 2u;
-  attrs[n].value.clusterDim.y = 1u;
-  attrs[n].value.clusterDim.z = 1u;
-  ++n;
-  attrs[n].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-  attrs[n].value.programmaticStreamSerializationAllowed = 1;
-  ++n;
-#if MLA_HAS_OVERSIZED_SMEM
-  if (use_oversized_smem) {
-    attrs[n].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
-    attrs[n].value.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
-    ++n;
-  }
-#endif
-  config.gridDimX = grid.x;
-  config.gridDimY = grid.y;
-  config.gridDimZ = grid.z;
-  config.blockDimX = block.x;
-  config.blockDimY = block.y;
-  config.blockDimZ = block.z;
-  config.sharedMemBytes = 230912u;
-  config.hStream = stream;
-  config.attrs = attrs;
-  config.numAttrs = n;
-#else
-  cudaLaunchAttribute attrs[3];
-  attrs[n].id = cudaLaunchAttributeClusterDimension;
-  attrs[n].val.clusterDim.x = 2u;
-  attrs[n].val.clusterDim.y = 1u;
-  attrs[n].val.clusterDim.z = 1u;
-  ++n;
-  attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[n].val.programmaticStreamSerializationAllowed = 1;
-  ++n;
-#if MLA_HAS_OVERSIZED_SMEM
-  if (use_oversized_smem) {
-    attrs[n].id = cudaLaunchAttributeSharedMemoryMode;
-    attrs[n].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
-    ++n;
-  }
-#endif
-  config.gridDim = {grid.x, grid.y, grid.z};
-  config.blockDim = {block.x, block.y, block.z};
-  config.dynamicSmemBytes = 230912u;
-  config.stream = stream;
-  config.attrs = attrs;
-  config.numAttrs = n;
-#endif
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
-}
-}  // namespace variant_mla_decode_exact_live_bf16_clc_c278f217ca_bf399908d27d
-
-namespace variant_mla_decode_exact_live_bf16_clc_30cfe17e1f_1abd96571256 {
+namespace variant_mla_decode_exact_live_bf16_clc_e0a2c7b9a7_e5ce1f78c04d {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -2613,7 +2302,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -2637,7 +2325,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_30cfe17e1f::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_e0a2c7b9a7::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 230912,
@@ -2701,7 +2389,311 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_exact_live_bf16_clc_30cfe17e1f_1abd96571256
+}  // namespace variant_mla_decode_exact_live_bf16_clc_e0a2c7b9a7_e5ce1f78c04d
+
+namespace variant_mla_decode_exact_live_bf16_clc_2c970779bb_712a12102523 {
+
+// 3D TMA descriptor for buffer 'tmap_q' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_tmap_q(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'tmap_q' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'tmap_q' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  TVM_FFI_CHECK(d1 > 0, ValueError)
+      << "TMA source 'tmap_q' trailing dims must be positive";
+  int64_t outer1 = t.numel() / (d1);
+  CheckDenseLeadingFold(t, 1, "tmap_q");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'tmap_q' physical strides must be positive";
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'tmap_q' extent " << d1
+      << " must divide exactly by " << 64;
+  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2], ValueError)
+      << "TMA box (64, 64, 1) exceeds resolved global dims for 'tmap_q'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_q' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t box_dim[3] = {64u, 64u, 1u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'tmap_q') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+// 4D TMA descriptor for buffer 'tmap_k' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_tmap_k(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'tmap_k' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'tmap_k' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+      << "TMA source 'tmap_k' trailing dims must be positive";
+  int64_t outer2 = t.numel() / (d1 * d2);
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'tmap_k' extent " << d1
+      << " must divide exactly by " << 64;
+  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(outer2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
+      << "TMA box (64, 32, 1, 1) exceeds resolved global dims for 'tmap_k'";
+  int64_t carrier_stride_0 = d1;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 2 to a non-whole-byte offset";
+  int64_t carrier_stride_2 = (d2 * d1);
+  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 3 negative";
+  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 3 zero while global dimension 3 is not 1";
+  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_k' resolved global stride 3 to a non-whole-byte offset";
+  uint64_t global_strides[3] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+      (uint64_t)((carrier_stride_2 * 16) / 8),
+  };
+  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
+  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (4D, 'tmap_k') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+// 4D TMA descriptor for buffer 'tmap_v' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_tmap_v(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'tmap_v' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'tmap_v' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+      << "TMA source 'tmap_v' trailing dims must be positive";
+  int64_t outer2 = t.numel() / (d1 * d2);
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'tmap_v' extent " << d1
+      << " must divide exactly by " << 64;
+  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(outer2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 32u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
+      << "TMA box (64, 32, 1, 1) exceeds resolved global dims for 'tmap_v'";
+  int64_t carrier_stride_0 = d1;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = 64;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 2 to a non-whole-byte offset";
+  int64_t carrier_stride_2 = (d2 * d1);
+  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 3 negative";
+  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 3 zero while global dimension 3 is not 1";
+  TVM_FFI_CHECK((carrier_stride_2 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'tmap_v' resolved global stride 3 to a non-whole-byte offset";
+  uint64_t global_strides[3] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+      (uint64_t)((carrier_stride_2 * 16) / 8),
+  };
+  uint32_t box_dim[4] = {64u, 32u, 1u, 1u};
+  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (4D, 'tmap_v') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, TensorView arg_O, TensorView arg_seq_lens_kv, TensorView arg_page_table, TensorView arg_sinks, double arg_softmax_scale_log2, double arg_bmm2_scale, int64_t arg_total_work_items, int64_t arg_value_split_count, int64_t arg_max_pages_per_seq, int64_t arg_enable_sink, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+  DLDevice dev = arg_tmap_q.device();
+  ScopedCudaDevice device_guard(dev.device_id);
+  CheckCudaTensor(arg_tmap_q, "tmap_q");
+  CheckDtype(arg_tmap_q, "tmap_q", 4, 16, 1);
+  CheckCudaTensor(arg_tmap_k, "tmap_k");
+  CheckDtype(arg_tmap_k, "tmap_k", 4, 16, 1);
+  CheckContiguous(arg_tmap_k, "tmap_k");
+  CheckCudaTensor(arg_tmap_v, "tmap_v");
+  CheckDtype(arg_tmap_v, "tmap_v", 4, 16, 1);
+  CheckContiguous(arg_tmap_v, "tmap_v");
+  CheckCudaTensor(arg_O, "O");
+  CheckDtype(arg_O, "O", 4, 16, 1);
+  CheckContiguous(arg_O, "O");
+  CheckCudaTensor(arg_seq_lens_kv, "seq_lens_kv");
+  CheckDtype(arg_seq_lens_kv, "seq_lens_kv", 0, 32, 1);
+  CheckContiguous(arg_seq_lens_kv, "seq_lens_kv");
+  CheckCudaTensor(arg_page_table, "page_table");
+  CheckDtype(arg_page_table, "page_table", 0, 32, 1);
+  CheckContiguous(arg_page_table, "page_table");
+  CheckCudaTensor(arg_sinks, "sinks");
+  CheckDtype(arg_sinks, "sinks", 2, 32, 1);
+  CheckContiguous(arg_sinks, "sinks");
+  TVM_FFI_CHECK(arg_total_work_items >= -2147483648LL && arg_total_work_items <= 2147483647LL, ValueError)
+      << "scalar 'total_work_items' value " << arg_total_work_items
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_value_split_count >= -2147483648LL && arg_value_split_count <= 2147483647LL, ValueError)
+      << "scalar 'value_split_count' value " << arg_value_split_count
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_max_pages_per_seq >= -2147483648LL && arg_max_pages_per_seq <= 2147483647LL, ValueError)
+      << "scalar 'max_pages_per_seq' value " << arg_max_pages_per_seq
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_enable_sink >= -2147483648LL && arg_enable_sink <= 2147483647LL, ValueError)
+      << "scalar 'enable_sink' value " << arg_enable_sink
+      << " is outside i32 range [-2147483648, 2147483647]";
+  CheckSameCudaDevice(arg_tmap_k, arg_tmap_q, "tmap_k", "tmap_q");
+  CheckSameCudaDevice(arg_tmap_v, arg_tmap_q, "tmap_v", "tmap_q");
+  CheckSameCudaDevice(arg_O, arg_tmap_q, "O", "tmap_q");
+  CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
+  CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
+  CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
+  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
+      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
+  TVM_FFI_CHECK(grid_x % 2 == 0 && grid_y % 1 == 0 && grid_z % 1 == 0, ValueError)
+      << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
+      << ") must be divisible by cluster dims (2, 1, 1)";
+
+
+  CUtensorMap p_tmap_q = EncodeTma_tmap_q(arg_tmap_q);
+  CUtensorMap p_tmap_k = EncodeTma_tmap_k(arg_tmap_k);
+  CUtensorMap p_tmap_v = EncodeTma_tmap_v(arg_tmap_v);
+  void* p_O = arg_O.data_ptr();
+  void* p_seq_lens_kv = arg_seq_lens_kv.data_ptr();
+  void* p_page_table = arg_page_table.data_ptr();
+  void* p_sinks = arg_sinks.data_ptr();
+  float v_softmax_scale_log2 = (float)arg_softmax_scale_log2;
+  float v_bmm2_scale = (float)arg_bmm2_scale;
+  int32_t v_total_work_items = (int32_t)arg_total_work_items;
+  int32_t v_value_split_count = (int32_t)arg_value_split_count;
+  int32_t v_max_pages_per_seq = (int32_t)arg_max_pages_per_seq;
+  int32_t v_enable_sink = (int32_t)arg_enable_sink;
+  void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
+
+  static auto kernel = EmbedCubinModule_mla_decode_exact_live_bf16_clc_2c970779bb::Global()->mod.GetKernel("kernel_mla_decode_exact_live_bf16_clc");
+  static signed char mla_smem_mode_cache[64] = {0};
+  const bool use_oversized_smem = MlaConfigureDynamicSmem(
+      kernel, (int)arg_tmap_q.device().device_id, 230912,
+      mla_smem_mode_cache, 64);
+  tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+  tvm::ffi::dim3 block(384u, 1u, 1u);
+
+  // Extended launch — mirrors CUDAKernel.prepare_launch_cluster attributes.
+  tvm::ffi::cuda_api::LaunchConfig config;
+  int n = 0;
+#if TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API
+  CUlaunchAttribute attrs[3];
+  attrs[n].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+  attrs[n].value.clusterDim.x = 2u;
+  attrs[n].value.clusterDim.y = 1u;
+  attrs[n].value.clusterDim.z = 1u;
+  ++n;
+  attrs[n].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+  attrs[n].value.programmaticStreamSerializationAllowed = 1;
+  ++n;
+#if MLA_HAS_OVERSIZED_SMEM
+  if (use_oversized_smem) {
+    attrs[n].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+    attrs[n].value.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+    ++n;
+  }
+#endif
+  config.gridDimX = grid.x;
+  config.gridDimY = grid.y;
+  config.gridDimZ = grid.z;
+  config.blockDimX = block.x;
+  config.blockDimY = block.y;
+  config.blockDimZ = block.z;
+  config.sharedMemBytes = 230912u;
+  config.hStream = stream;
+  config.attrs = attrs;
+  config.numAttrs = n;
+#else
+  cudaLaunchAttribute attrs[3];
+  attrs[n].id = cudaLaunchAttributeClusterDimension;
+  attrs[n].val.clusterDim.x = 2u;
+  attrs[n].val.clusterDim.y = 1u;
+  attrs[n].val.clusterDim.z = 1u;
+  ++n;
+  attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[n].val.programmaticStreamSerializationAllowed = 1;
+  ++n;
+#if MLA_HAS_OVERSIZED_SMEM
+  if (use_oversized_smem) {
+    attrs[n].id = cudaLaunchAttributeSharedMemoryMode;
+    attrs[n].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
+    ++n;
+  }
+#endif
+  config.gridDim = {grid.x, grid.y, grid.z};
+  config.blockDim = {block.x, block.y, block.z};
+  config.dynamicSmemBytes = 230912u;
+  config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = n;
+#endif
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
+}
+}  // namespace variant_mla_decode_exact_live_bf16_clc_2c970779bb_712a12102523
 
 int SelectVariant(float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z, int32_t max_kv_len, int32_t last_kv_len, int32_t source_selector_eligibility) {
   if (((((total_work_items == 512) && (value_split_count == 1)) && (grid_x == 2)) && (grid_z == 512))) return 0;
@@ -2730,7 +2722,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_bbfb74c484_2e80d8d24161::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_6b9f6c36b1_0d1669d0c5fb::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2739,7 +2731,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_7aa2c0c00a_eda49f6bffff::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_d8696664e2_62e84a15be91::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2748,7 +2740,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_3b5bd1e042_c01040d8bcfe::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_396dfd6644_3980ba2a971b::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2757,7 +2749,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_8ace9da7a5_ba559c721d8a::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_42315468e3_920a8a19e028::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2766,7 +2758,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_c6609aef39_924cd77cca78::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_8dbc14abc6_0a8942ad3091::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2775,7 +2767,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_8587a85908_2fcbb5c2e41d::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_061ee4c834_4c6a09be5f76::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2784,7 +2776,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_c278f217ca_bf399908d27d::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_e0a2c7b9a7_e5ce1f78c04d::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }
@@ -2793,7 +2785,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_30cfe17e1f_1abd96571256::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_exact_live_bf16_clc_2c970779bb_712a12102523::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }

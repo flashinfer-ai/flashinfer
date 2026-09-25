@@ -32,7 +32,7 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(full_abi_tail_fp8_26b36022eb);
+TVM_FFI_EMBED_CUBIN(full_abi_tail_fp8_7aadb6237d);
 
 namespace mla_host_shim {
 
@@ -256,7 +256,7 @@ inline bool MlaConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id
 #endif
 }
 
-namespace variant_full_abi_tail_fp8_26b36022eb_f0c2469a092e {
+namespace variant_full_abi_tail_fp8_7aadb6237d_1e6c8cbed036 {
 
 void Run(TensorView arg_Q, TensorView arg_KV, TensorView arg_fp8_lut, TensorView arg_page_table, TensorView arg_sparse_indices, TensorView arg_row_batches, TensorView arg_row_seq_lens, TensorView arg_O, TensorView arg_LSE, TensorView arg_sinks, int64_t arg_num_heads, int64_t arg_qk_dim, int64_t arg_value_dim, int64_t arg_kv_stride, int64_t arg_page_size, int64_t arg_page_table_width, int64_t arg_sparse_width, int64_t arg_use_sparse, double arg_softmax_scale, double arg_bmm2_scale, int64_t arg_enable_sink, int64_t arg_write_lse, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   DLDevice dev = arg_Q.device();
@@ -330,7 +330,6 @@ void Run(TensorView arg_Q, TensorView arg_KV, TensorView arg_fp8_lut, TensorView
   CheckSameCudaDevice(arg_O, arg_Q, "O", "Q");
   CheckSameCudaDevice(arg_LSE, arg_Q, "LSE", "Q");
   CheckSameCudaDevice(arg_sinks, arg_Q, "sinks", "Q");
-  CheckCurrentCudaDevice(arg_Q, "Q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -360,13 +359,13 @@ void Run(TensorView arg_Q, TensorView arg_KV, TensorView arg_fp8_lut, TensorView
   int32_t v_write_lse = (int32_t)arg_write_lse;
   void* kargs[] = {&p_Q, &p_KV, &p_fp8_lut, &p_page_table, &p_sparse_indices, &p_row_batches, &p_row_seq_lens, &p_O, &p_LSE, &p_sinks, &v_num_heads, &v_qk_dim, &v_value_dim, &v_kv_stride, &v_page_size, &v_page_table_width, &v_sparse_width, &v_use_sparse, &v_softmax_scale, &v_bmm2_scale, &v_enable_sink, &v_write_lse};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(full_abi_tail_fp8_26b36022eb, "kernel_full_abi_tail_fp8");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(full_abi_tail_fp8_7aadb6237d, "kernel_full_abi_tail_fp8");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(32u, 1u, 1u);
 
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 16384u));
 }
-}  // namespace variant_full_abi_tail_fp8_26b36022eb_f0c2469a092e
+}  // namespace variant_full_abi_tail_fp8_7aadb6237d_1e6c8cbed036
 
 int SelectVariant(int32_t num_heads, int32_t qk_dim, int32_t value_dim, int32_t kv_stride, int32_t page_size, int32_t page_table_width, int32_t sparse_width, int32_t use_sparse, float softmax_scale, float bmm2_scale, int32_t enable_sink, int32_t write_lse, int32_t num_rows) {
   if ((num_rows > 0)) return 0;
@@ -392,7 +391,7 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
         int64_t gx = num_rows;
         int64_t gy = num_heads;
         int64_t gz = 1;
-        mla_host_shim::variant_full_abi_tail_fp8_26b36022eb_f0c2469a092e::Run(arg_query, arg_kv, arg_fp8_lut, arg_page_table, arg_sparse_indices, arg_row_batches, arg_row_seq_lens, arg_output, arg_lse, arg_sinks, num_heads, qk_dim, value_dim, kv_stride, page_size, page_table_width, sparse_width, use_sparse, softmax_scale, bmm2_scale, enable_sink, write_lse, gx, gy, gz, stream);
+        mla_host_shim::variant_full_abi_tail_fp8_7aadb6237d_1e6c8cbed036::Run(arg_query, arg_kv, arg_fp8_lut, arg_page_table, arg_sparse_indices, arg_row_batches, arg_row_seq_lens, arg_output, arg_lse, arg_sinks, num_heads, qk_dim, value_dim, kv_stride, page_size, page_table_width, sparse_width, use_sparse, softmax_scale, bmm2_scale, enable_sink, write_lse, gx, gy, gz, stream);
       }
       return;
     }
