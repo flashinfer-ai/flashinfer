@@ -7461,9 +7461,19 @@ class KDAPrefillPlanCache:
         self._bytes: dict[object, int] = {}
         self.bytes = 0
         self.hits = 0
+        self.fast_hits = 0
         self.misses = 0
         self.uncacheable = 0
         self.evictions = 0
+        # Last hit: (address-level signature, entry).  A repeat call whose
+        # caller tensors kept their addresses, layouts and dtypes needs no
+        # rebind at all (static buffers, CUDA-graph style loops, allocator
+        # reuse between forwards), so ``get`` answers it from this memo.
+        self._last_fast = None
+        self._last_entry = None
+        # Address-level facts of the inputs each entry is currently bound to;
+        # a hit rebinds only the inputs whose facts changed.
+        self._facts: dict[object, tuple] = {}
 
     def __len__(self):
         return len(self._entries)
@@ -7475,12 +7485,19 @@ class KDAPrefillPlanCache:
                 close()
         self._entries.clear()
         self._bytes.clear()
+        self._facts.clear()
         self.bytes = 0
+        self._last_fast = None
+        self._last_entry = None
 
     def _evict_oldest(self):
         key, (evicted, _) = self._entries.popitem(last=False)
         self.bytes -= self._bytes.pop(key, 0)
+        self._facts.pop(key, None)
         self.evictions += 1
+        if self._last_entry is not None and self._last_entry[0] is evicted:
+            self._last_fast = None
+            self._last_entry = None
         close = getattr(evicted, "close", None)
         if callable(close):
             close()
@@ -7500,19 +7517,68 @@ class KDAPrefillPlanCache:
         graph replays with self-contained descriptor contents.
         """
         import torch
-        from .cake_kda_tf32_runtime import rebind_prepared_launch
+        from .cake_kda_tf32_runtime import (
+            AFFINE_DEFERRED_PARTS,
+            REBIND_INPUT_NAMES,
+            rebind_prepared_launch,
+            rebind_signature_and_facts,
+        )
 
-        key = self._key(inputs, **scalars)
+        signature, facts = rebind_signature_and_facts(inputs)
+        scalar_key = tuple(sorted(scalars.items()))
+        fast = (facts, scalar_key)
+        if fast == self._last_fast:
+            # Same addresses, layouts, dtypes and scalars as the previous hit:
+            # the prepared launch is already bound to these tensors.
+            prepared, _ = self._last_entry
+            if torch.cuda.is_current_stream_capturing():
+                getattr(prepared, "_impl", prepared)._descriptors_stale = True
+            self.hits += 1
+            self.fast_hits += 1
+            return prepared
+        key = (signature, scalar_key)
         entry = self._entries.get(key)
         if entry is None:
             return None
         self._entries.move_to_end(key)
         prepared, plan = entry
         owner = getattr(prepared, "_impl", prepared)
-        tma_moved = rebind_prepared_launch(owner, plan, inputs, signature=key[0])
-        if tma_moved or torch.cuda.is_current_stream_capturing():
+        bound = self._facts.get(key)
+        if bound == facts:
+            # Bound to exactly these tensors already (another entry was hit in
+            # between); nothing to re-point.
+            self.fast_hits += 1
+        else:
+            changed = None
+            if bound is not None:
+                # Same structural key, so only addresses can differ: re-point
+                # the views and addresses of the moved inputs only.
+                changed = frozenset(
+                    name
+                    for name, before, after in zip(
+                        REBIND_INPUT_NAMES, bound, facts, strict=True
+                    )
+                    if before != after
+                )
+            # The rebind marks the launches whose descriptor sources moved.
+            rebind_prepared_launch(
+                owner,
+                plan,
+                inputs,
+                signature=key[0],
+                changed=changed,
+                addresses=facts,
+                defer_parts=AFFINE_DEFERRED_PARTS if hasattr(owner, "_main") else (),
+            )
+            self._facts[key] = facts
+        if torch.cuda.is_current_stream_capturing():
+            # A captured launch always re-encodes so the graph replays with
+            # self-contained descriptor contents; outside capture the rebind
+            # marked exactly the launches whose descriptor sources moved.
             owner._descriptors_stale = True
         self.hits += 1
+        self._last_fast = fast
+        self._last_entry = entry
         return prepared
 
     def put(self, prepared, inputs, *, retained_bytes: int = 0, **scalars):
@@ -7523,7 +7589,10 @@ class KDAPrefillPlanCache:
         evicts least-recently-used entries until both the entry count and the
         byte budget hold, always keeping the newest entry.
         """
-        from .cake_kda_tf32_runtime import capture_rebind_plan
+        from .cake_kda_tf32_runtime import (
+            capture_rebind_plan,
+            rebind_signature_and_facts,
+        )
 
         owner = getattr(prepared, "_impl", prepared)
         if not (hasattr(owner, "args") or hasattr(owner, "_main")):
@@ -7533,7 +7602,10 @@ class KDAPrefillPlanCache:
         key = self._key(inputs, **scalars)
         if key in self._entries:
             self.bytes -= self._bytes.pop(key, 0)
+        self._last_fast = None
+        self._last_entry = None
         self._entries[key] = (prepared, plan)
+        self._facts[key] = rebind_signature_and_facts(inputs)[1]
         self._entries.move_to_end(key)
         self._bytes[key] = int(retained_bytes)
         self.bytes += int(retained_bytes)
@@ -7610,8 +7682,14 @@ def _prepare_kda_prefill(
                 checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
                 in_place_state=initial_state is final_state,
             )
-            with torch.cuda.device(q.device):
+            # ``torch.cuda.device`` costs several microseconds per entry; the
+            # hit path only needs it when another device is current.
+            device_index = q.get_device()
+            if torch.cuda.current_device() == device_index:
                 cached = plan_cache.get(cache_inputs, **cache_scalars)
+            else:
+                with torch.cuda.device(device_index):
+                    cached = plan_cache.get(cache_inputs, **cache_scalars)
             if cached is not None:
                 return cached
 

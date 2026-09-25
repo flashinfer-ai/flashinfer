@@ -1,4 +1,8 @@
-"""JIT loader for the fused epilogue of the split-sequence affine KDA prefill."""
+"""JIT loader for the split-sequence affine KDA prefill helpers.
+
+One module holds the fused epilogue (``run``) and the per-launch index
+preparation (``index_prep``) of the composite.
+"""
 
 from functools import cache
 from pathlib import Path
@@ -43,8 +47,9 @@ def load(arch: str):
         # implies --ftz=true and flushes subnormal sums that torch keeps.
         use_fast_math=False,
     ).build_and_load()
-    return module.run
+    return module
 
 
 def load_for_device(device):
+    """The loaded module for ``device``: ``.run`` (fused epilogue) and ``.index_prep``."""
     return load(arch_for(device))

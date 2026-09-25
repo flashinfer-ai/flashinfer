@@ -274,6 +274,57 @@ AFFINE_SPLIT_MIN_CHUNKS_PER_PART = 32
 AFFINE_SPLIT_MIN_PARTS = 8
 AFFINE_SPLIT_LOW_PART_MIN_CHUNKS = 2048
 BF16_AFFINE_SPLIT_MIN_CHUNKS = 128
+# Measured cost model of the BF16 fused family, in microseconds.  The affine
+# composite runs its main, correction and map passes on every window at once,
+# so its time follows the longest window's chunk chain; the sequential fused
+# body runs one chain per sequence x head task, so its time follows the longest
+# sequence's chain (the number of tasks barely matters below the SM count).
+# Both are affine in their chain length: (fixed, per 32-token chunk).  Fitted
+# from paired forced-split / forced-sequential runs (fresh inputs, plan-cache
+# hits, profiler GPU time) on 15 shapes per gate; H12 and H16 share the fit.
+# sm_100a (B200, 148 SMs), 2026-09-25: composite 75 + 14.2 * chunks/window,
+# sequential 20 + 4.0 * chunks (unbounded softplus, FP32 rows); composite
+# 84 + 8.8 * chunks/window, sequential 16 + 1.75 * chunks (bounded gate).
+# Windows never go below 8 chunks (256 tokens): the fused-body specialization
+# flags flip at 128 / 256 / 512 tokens of launch max_seq_len (H12 early state
+# pack, scalar beta / generic register inverse, sm_103a prediction-first), and
+# the >= 256-token launch classes map onto exported programs (the 359-row
+# export with 8-chunk windows added no program variant); the < 256-token
+# class does not, so shorter windows would select unexported programs.
+AFFINE_MIN_CHUNKS_PER_WINDOW = 8
+# Resident-window budget in CTA waves (windows x heads per wave = SM count).
+# One wave is the measured default; FLASHINFER_KDA_AFFINE_WINDOW_WAVES=2 is an
+# A/B knob for shapes whose passes are chain-latency bound.
+AFFINE_WINDOW_WAVES_ENV = "FLASHINFER_KDA_AFFINE_WINDOW_WAVES"
+AFFINE_MAX_WINDOW_WAVES = 3
+AFFINE_MULTI_WAVE_MIN_GAIN = 0.15
+
+
+def _affine_window_waves() -> int | None:
+    """Forced resident-window waves (``FLASHINFER_KDA_AFFINE_WINDOW_WAVES``), ``None`` = cost-model choice."""
+    import os
+
+    raw = os.environ.get(AFFINE_WINDOW_WAVES_ENV, "")
+    if raw in ("", "auto"):
+        return None
+    try:
+        waves = int(raw)
+    except ValueError:
+        return None
+    return min(AFFINE_MAX_WINDOW_WAVES, max(1, waves))
+
+
+AFFINE_BF16_COST_MODEL_US: dict[tuple[str, str], tuple[float, float, float, float]] = {
+    # (gpu_arch, gate_kind): (composite_fixed, composite_per_window_chunk,
+    #                          sequential_fixed, sequential_per_chunk)
+    ("sm_100a", "unbounded_softplus"): (75.0, 14.2, 20.0, 4.0),
+    ("sm_100a", "lower_bound"): (84.0, 8.8, 16.0, 1.75),
+    # sm_103a (GB300, 152 SMs), 2026-09-25: composite 95 + 11.7 * chunks/window
+    # (H12 87 + 12.05, H16 102 + 11.4), sequential 18 + 3.6 * chunks.
+    ("sm_103a", "unbounded_softplus"): (95.0, 11.7, 18.0, 3.6),
+    # bounded gate: composite 83 + 7.8 (H12 77 + 8.1, H16 89 + 7.5), sequential 14 + 1.66.
+    ("sm_103a", "lower_bound"): (83.0, 7.8, 14.0, 1.66),
+}
 SMALL_BH_GROUP_SIZE = 8
 SMALL_BH_RING_STAGES = 35
 SMALL_BH_PACKET_ELEMS = HEAD_DIM
@@ -311,18 +362,68 @@ class _PersistentM128Roofline:
 
 
 def _affine_split_policy() -> str:
-    """``packed`` (default) or ``legacy``.
+    """``model`` (default) or ``legacy``.
 
-    ``packed`` gates a multi-sequence call on its longest sequence: the split
-    is taken when any sequence of the pack crosses the single-sequence part
-    crossover (the sequential body's makespan is that sequence's chunk chain,
-    while the composite splits it across the window budget).  ``legacy``
-    keeps the pre-2026-09-23 gate (aggregate sequence x head tasks, 32-task
-    cap) for A/B measurement.
+    ``model`` decides the BF16-family split from the measured cost model
+    (``AFFINE_BF16_COST_MODEL_US``): the composite is taken when its estimated
+    time on the planned windows beats the sequential fused body's longest
+    chain.  ``legacy`` keeps the pre-2026-09-23 gate (aggregate sequence x head
+    tasks, 32-task cap, fixed chunk thresholds) for A/B measurement.
+    ``packed`` is accepted as the old name of the default.
     """
     import os
 
-    return os.environ.get("FLASHINFER_KDA_AFFINE_POLICY", "packed")
+    policy = os.environ.get("FLASHINFER_KDA_AFFINE_POLICY", "model")
+    return "legacy" if policy == "legacy" else "model"
+
+
+def _affine_window_counts(
+    chunk_counts: list[int], targets: list[int], window_budget: int
+) -> list[int]:
+    """Share the resident-window budget across original sequences.
+
+    Every sequence keeps at least one window; the remaining budget goes to the
+    sequence whose windows are currently longest (stable sequence tie-break),
+    never beyond its own target.
+    """
+    counts = targets.copy()
+    if sum(targets) > window_budget:
+        counts = [1] * len(chunk_counts)
+        for _ in range(window_budget - len(chunk_counts)):
+            eligible = [i for i in range(len(counts)) if counts[i] < targets[i]]
+            if not eligible:
+                break
+            selected = max(
+                eligible,
+                key=lambda i: ((chunk_counts[i] + counts[i] - 1) // counts[i], -i),
+            )
+            counts[selected] += 1
+    return counts
+
+
+def _affine_window_chunks(chunks: int, parts: int, checkpoints: bool) -> int:
+    """Chunks per window for one sequence; checkpointed windows start on 64-token boundaries."""
+    per_part = (chunks + parts - 1) // parts
+    if checkpoints:
+        per_part += per_part % 2
+    return per_part
+
+
+def _affine_bf16_window_targets(
+    chunk_counts: list[int], *, num_heads: int, sm_count: int, waves: int = 1
+) -> list[int]:
+    """Most windows the BF16 composite can give each sequence.
+
+    ``waves`` waves of windows per head (``sm_count // num_heads`` each), at
+    least ``AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks per window (256-token
+    launches): shorter windows only add per-window preparation while the
+    main/correction passes stay chain-bound.
+    """
+    per_head = max(1, sm_count // num_heads) * waves
+    return [
+        min(per_head, max(1, chunks // AFFINE_MIN_CHUNKS_PER_WINDOW))
+        for chunks in chunk_counts
+    ]
 
 
 def _affine_max_tasks() -> int:
@@ -372,6 +473,163 @@ def _affine_split_part_count(
     return parts
 
 
+def _affine_window_budget(
+    num_sequences: int,
+    num_heads: int,
+    sm_count: int,
+    waves: int,
+    *,
+    unsplittable: int = 0,
+) -> int:
+    """Windows the composite may plan for one call.
+
+    ``waves`` waves of ``sm_count // num_heads`` windows per head are shared by
+    the sequences that can split; every sequence that cannot (``unsplittable``,
+    target of one window) still gets its window on top of that budget.  Its
+    CTAs run a chain of at most ``2 * AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks and
+    free their SMs long before a resident wave of long windows ends, so they
+    never extend a wave; charging them against the budget only shortened the
+    long sequences' window count (2x(8128+64) H16 on 148 SMs: 7 windows for
+    two 254-chunk sequences, 86-chunk windows, instead of 9 and 64).
+    """
+    return max(num_sequences, sm_count // num_heads * waves + unsplittable)
+
+
+def _affine_unsplittable(targets: list[int]) -> int:
+    """Sequences whose window target is one: they cannot split and do not draw on the wave budget."""
+    return sum(1 for target in targets if target <= 1)
+
+
+def _affine_bf16_composite_estimate_us(
+    chunk_counts: list[int],
+    *,
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    model: tuple,
+    waves: int,
+):
+    """Modelled composite microseconds on the windows ``waves`` waves would plan; ``None`` if nothing splits.
+
+    Every pass is chain-bound on its longest window, and the resident waves of
+    one pass run back to back, so the per-window-chunk slope scales with the
+    wave count while the fixed part (launch chain, scan, epilogue) is paid
+    once.  Checked on the B200 two-wave lanes (round v6): H16 2x8192 927 vs
+    933 us measured, H12 2x(8128+64) 757 vs 777, H16 2x(8128+64) 984 vs 985,
+    H16 4x4096 984 vs 914, H16 8192 501 vs 581.
+    """
+    targets = _affine_bf16_window_targets(
+        chunk_counts, num_heads=num_heads, sm_count=sm_count, waves=waves
+    )
+    counts = _affine_window_counts(
+        chunk_counts,
+        targets,
+        _affine_window_budget(
+            len(chunk_counts),
+            num_heads,
+            sm_count,
+            waves,
+            unsplittable=_affine_unsplittable(targets),
+        ),
+    )
+    if sum(counts) <= len(chunk_counts):
+        return None
+    window_chunks = max(
+        _affine_window_chunks(chunks, parts, checkpoints)
+        for chunks, parts in zip(chunk_counts, counts, strict=True)
+    )
+    composite_fixed, composite_chunk, _, _ = model
+    return composite_fixed + waves * composite_chunk * window_chunks
+
+
+def _affine_bf16_waves(
+    chunk_counts: list[int],
+    *,
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    gate_kind: str,
+    gpu_arch: str | None,
+) -> tuple[int, float | None]:
+    """``(waves, composite_us)``: the forced wave count, else one wave unless more waves model clearly cheaper.
+
+    A second or third wave is taken only when its estimate beats the one-wave
+    composite by ``AFFINE_MULTI_WAVE_MIN_GAIN``: the model's error on the
+    two-wave B200 lanes is up to 15 %, so smaller modelled gains are noise
+    (H16 2x8192 927 vs 984 modelled, 933 vs 924 measured; H12 2x(8128+64) 757
+    vs 813 modelled, 777 vs 772 measured).  With unsplittable sequences kept
+    out of the wave budget (``_affine_window_budget``), 2x(8128+64) plans the
+    same windows as 2x8192 (H16: 5+4 windows of 64 chunks, 984 modelled) and
+    stays on one wave; the earlier 7-window plan (86-chunk windows, 1296) was
+    the only case the two-wave rule accepted (measured 985 vs 1125 one wave).
+    ``composite_us`` is ``None`` when the architecture/gate has no model or no
+    wave count splits anything (the caller then keeps one wave).
+    """
+    forced = _affine_window_waves()
+    model = AFFINE_BF16_COST_MODEL_US.get((gpu_arch, gate_kind))
+    if model is None:
+        return forced or 1, None
+    best: tuple[int, float] | None = None
+    for waves in (forced,) if forced else range(1, AFFINE_MAX_WINDOW_WAVES + 1):
+        estimate = _affine_bf16_composite_estimate_us(
+            chunk_counts,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            checkpoints=checkpoints,
+            model=model,
+            waves=waves,
+        )
+        if estimate is None:
+            continue
+        if best is None or estimate < best[1] * (1.0 - AFFINE_MULTI_WAVE_MIN_GAIN):
+            best = (waves, estimate)
+    return best if best is not None else (forced or 1, None)
+
+
+def _affine_bf16_split_estimate_us(
+    *,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    gate_kind: str,
+    gpu_arch: str,
+):
+    """Estimated (composite, sequential) microseconds for a BF16-family call.
+
+    The composite estimate is the cheapest wave count (``_affine_bf16_waves``).
+    ``None`` when the architecture/gate has no measured model or the call is
+    outside the composite's contract (task cap, window budget, no sequence
+    that would actually split).
+    """
+    model = AFFINE_BF16_COST_MODEL_US.get((gpu_arch, gate_kind))
+    tasks = len(sequence_lengths) * num_heads
+    if (
+        model is None
+        or not sequence_lengths
+        or min(sequence_lengths) <= 0
+        or num_heads <= 0
+        or tasks > _affine_max_tasks()
+        or 2 * tasks > sm_count
+    ):
+        return None
+    chunk_counts = [
+        (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
+    ]
+    _, composite_us = _affine_bf16_waves(
+        chunk_counts,
+        num_heads=num_heads,
+        sm_count=sm_count,
+        checkpoints=checkpoints,
+        gate_kind=gate_kind,
+        gpu_arch=gpu_arch,
+    )
+    if composite_us is None:
+        return None
+    _, _, sequential_fixed, sequential_chunk = model
+    return composite_us, sequential_fixed + sequential_chunk * max(chunk_counts)
+
+
 def _affine_split_windows(
     *,
     sequence_lengths: tuple[int, ...],
@@ -381,6 +639,7 @@ def _affine_split_windows(
     shared_tf32_factors: bool,
     checkpoints: bool,
     unbounded_softplus: bool = False,
+    gpu_arch: str | None = None,
 ):
     """Partition original sequences into runtime windows without crossing boundaries."""
     tasks = len(sequence_lengths) * num_heads
@@ -396,44 +655,62 @@ def _affine_split_windows(
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
     ]
-    targets = [
-        _affine_split_part_count(
+    if not shared_tf32_factors and _affine_split_policy() == "model":
+        # The cost model already decided the split and its wave count; give
+        # every sequence the most windows that budget allows so the longest
+        # window is shortest.
+        if gpu_arch is None:
+            # Planner-only callers (CPU tests) get the one-wave plan.
+            try:
+                gpu_arch = detect_gpu_arch()
+            except Exception:
+                gpu_arch = None
+        waves, _ = _affine_bf16_waves(
+            chunk_counts,
+            num_heads=num_heads,
             sm_count=sm_count,
-            tasks=num_heads,
-            chunks=chunks,
-            fp32_indexed_state=fp32_indexed_state,
-            shared_tf32_factors=shared_tf32_factors,
-            unbounded_softplus=unbounded_softplus,
+            checkpoints=checkpoints,
+            gate_kind="unbounded_softplus" if unbounded_softplus else "lower_bound",
+            gpu_arch=gpu_arch,
         )
-        for chunks in chunk_counts
-    ]
-    window_budget = max(len(sequence_lengths), sm_count // num_heads)
-    if len(sequence_lengths) > 1 and max(targets) > 1:
-        chunks_per_window = 8
+        targets = _affine_bf16_window_targets(
+            chunk_counts, num_heads=num_heads, sm_count=sm_count, waves=waves
+        )
+        window_budget = _affine_window_budget(
+            len(sequence_lengths),
+            num_heads,
+            sm_count,
+            waves,
+            unsplittable=_affine_unsplittable(targets),
+        )
+    else:
+        window_budget = _affine_window_budget(
+            len(sequence_lengths), num_heads, sm_count, _affine_window_waves() or 1
+        )
         targets = [
-            max(target, min(window_budget, max(1, chunks // chunks_per_window)))
-            for target, chunks in zip(targets, chunk_counts, strict=True)
-        ]
-    counts = targets.copy()
-    if sum(targets) > window_budget:
-        counts = [1] * len(sequence_lengths)
-        for _ in range(window_budget - len(sequence_lengths)):
-            eligible = [i for i in range(len(counts)) if counts[i] < targets[i]]
-            if not eligible:
-                break
-            selected = max(
-                eligible,
-                key=lambda i: ((chunk_counts[i] + counts[i] - 1) // counts[i], -i),
+            _affine_split_part_count(
+                sm_count=sm_count,
+                tasks=num_heads,
+                chunks=chunks,
+                fp32_indexed_state=fp32_indexed_state,
+                shared_tf32_factors=shared_tf32_factors,
+                unbounded_softplus=unbounded_softplus,
             )
-            counts[selected] += 1
+            for chunks in chunk_counts
+        ]
+        if len(sequence_lengths) > 1 and max(targets) > 1:
+            chunks_per_window = 8
+            targets = [
+                max(target, min(window_budget, max(1, chunks // chunks_per_window)))
+                for target, chunks in zip(targets, chunk_counts, strict=True)
+            ]
+    counts = _affine_window_counts(chunk_counts, targets, window_budget)
     token_offsets = [0]
     part_offsets = [0]
     for length, chunks, parts in zip(
         sequence_lengths, chunk_counts, counts, strict=True
     ):
-        per_part = (chunks + parts - 1) // parts
-        if checkpoints:
-            per_part += per_part % 2
+        per_part = _affine_window_chunks(chunks, parts, checkpoints)
         start = token_offsets[-1]
         for chunk in range(per_part, chunks, per_part):
             token_offsets.append(start + chunk * BF16_M128_CHUNK)
@@ -991,6 +1268,7 @@ class _FusedAffineEpilogue:
     """Static arguments of the fused affine epilogue launch."""
 
     run: Any
+    index_prep: Any
     heads: int
     tail_elems: int
     pool_slot_stride: int
@@ -1022,11 +1300,12 @@ class _FusedAffineEpilogue:
             if impl._checkpoint_output.stride(0) != row_elems:
                 return None
         try:
-            run = load_for_device(impl._launch_device)
+            module = load_for_device(impl._launch_device)
         except NotImplementedError:
             return None
         return _FusedAffineEpilogue(
-            run=run,
+            run=module.run,
+            index_prep=module.index_prep,
             heads=heads,
             tail_elems=int(out_tail.numel()),
             pool_slot_stride=int(pool.stride(0)),
@@ -3866,21 +4145,23 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.prepare(grid=self.grid, **self.args)
         self._descriptors_stale = False
 
-    def _launch_uncaptured(self) -> None:
-        import tvm_ffi
+    def _launch_in_stream(self) -> None:
+        """Launch inside an already entered FFI/Torch stream context."""
+        if self._descriptors_stale:
+            # A plan-cache rebind moved a descriptor source; re-encode in
+            # the same stream context as the launch it precedes.
+            self._prepare_descriptors_in_stream()
+        for destination, source in self._token_storage_refreshes:
+            destination.copy_(source)
+        if self._beta_tma_valid is not None:
+            self._beta_tma_valid.copy_(self._beta_tma_source)
+        if self.prepare_module is not None:
+            self.prepare_module.launch(grid=self.prepare_grid, **self.prepare_args)
+        self.module.launch(grid=self.grid, **self.args)
 
-        with tvm_ffi.use_torch_stream():
-            if self._descriptors_stale:
-                # A plan-cache rebind moved a descriptor source; re-encode in
-                # the same stream context as the launch it precedes.
-                self._prepare_descriptors_in_stream()
-            for destination, source in self._token_storage_refreshes:
-                destination.copy_(source)
-            if self._beta_tma_valid is not None:
-                self._beta_tma_valid.copy_(self._beta_tma_source)
-            if self.prepare_module is not None:
-                self.prepare_module.launch(grid=self.prepare_grid, **self.prepare_args)
-            self.module.launch(grid=self.grid, **self.args)
+    def _launch_uncaptured(self) -> None:
+        with _ffi_stream_context(self._launch_device):
+            self._launch_in_stream()
 
     def launch(self) -> None:
         self._launch_uncaptured()
@@ -4675,7 +4956,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
 
     def _launch_uncaptured(self) -> None:
         import torch
-        import tvm_ffi
 
         if self._descriptors_stale:
             # A plan-cache hit under CUDA-graph capture marks the composite;
@@ -4685,21 +4965,46 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 if sub is not None:
                     sub._descriptors_stale = True
             self._descriptors_stale = False
-        with tvm_ffi.use_torch_stream():
+        with _ffi_stream_context(self._launch_device):
             for destination, source in self._affine_input_refreshes:
                 destination.copy_(source)
-            self._state_indices_long.copy_(self._state_indices)
-            self._part_state_indices.index_copy_(
-                0, self._first_parts, self._state_indices
-            )
-            if self._checkpoint_in_place:
-                starts = self._part_row_starts[: self.num_parts]
-                torch.index_select(
-                    self._checkpoint_start, 0, self._part_seq_ids, out=starts
+            if self._fused_epilogue is not None:
+                # One kernel gathers every per-call index the parts consume
+                # (window state indices, in-place row starts, the int64 state
+                # indices of the epilogue); the torch sequence below costs
+                # four launches on the host path before the first chain kernel.
+                rows = self._checkpoint_in_place
+                self._fused_epilogue.index_prep(
+                    self._state_indices,
+                    self._first_parts,
+                    self._part_state_indices,
+                    self._state_indices_long,
+                    self._checkpoint_start if rows else self._first_parts,
+                    self._part_seq_ids if rows else self._first_parts,
+                    self._part_local_rows if rows else self._first_parts,
+                    self._part_row_starts if rows else self._first_parts,
+                    self.num_parts if rows else 0,
                 )
-                starts.add_(self._part_local_rows)
-            self._main.launch()
-            self._map.launch()
+            else:
+                self._part_state_indices.index_copy_(
+                    0, self._first_parts, self._state_indices
+                )
+                if self._checkpoint_in_place:
+                    starts = self._part_row_starts[: self.num_parts]
+                    torch.index_select(
+                        self._checkpoint_start, 0, self._part_seq_ids, out=starts
+                    )
+                    starts.add_(self._part_local_rows)
+            # The parts share this stream context (no re-entry per part).
+            self._main._launch_in_stream()
+            # The map/correction rebinds of a plan-cache hit were deferred
+            # past the first chain kernel; apply them while it runs.
+            flush_deferred_rebind(self)
+            if self._fused_epilogue is None:
+                # The int64 index copy is only consumed by the final-state
+                # scatter, so it follows the first chain kernel.
+                self._state_indices_long.copy_(self._state_indices)
+            self._map._launch_in_stream()
             self._scan_module.launch(
                 grid=(self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1),
                 split_state=self._main_final,
@@ -4715,7 +5020,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     grid=self._projection_grid, **self._projection_args
                 )
             else:
-                self._correction.launch()
+                self._correction._launch_in_stream()
             if self._fused_epilogue is not None:
                 self._launch_fused_epilogue()
                 return
@@ -5028,7 +5333,8 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
         return False
-    if detect_gpu_arch() not in ("sm_100a", "sm_103a"):
+    gpu_arch = detect_gpu_arch()
+    if gpu_arch not in ("sm_100a", "sm_103a"):
         return False
     heads = int(q.shape[2])
     crossover = dict(
@@ -5037,6 +5343,33 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         shared_tf32_factors=compute_dtype == "tf32",
         unbounded_softplus=argument(9, "lower_bound") is None,
     )
+    if not crossover["shared_tf32_factors"] and _affine_split_policy() == "model":
+        # BF16 family: compare the measured cost model of the composite on the
+        # windows it would actually get against the sequential body's longest
+        # chain.  The fixed thresholds below were fitted on GB300 and put the
+        # 8192-token break-even one chunk above an 8128-token member, which
+        # left 8128+64 packs on a 1.0 ms chain where the composite takes 0.42
+        # (B200, H12); the model also declines 2x8192 at H16 with the bounded
+        # gate (0.62 vs 0.47 ms sequential), which the thresholds accepted.
+        estimate = _affine_bf16_split_estimate_us(
+            sequence_lengths=lengths,
+            num_heads=heads,
+            sm_count=crossover["sm_count"],
+            checkpoints=checkpoint_request,
+            gate_kind=(
+                "unbounded_softplus"
+                if crossover["unbounded_softplus"]
+                else "lower_bound"
+            ),
+            gpu_arch=gpu_arch,
+        )
+        if estimate is not None:
+            composite_us, sequential_us = estimate
+            return composite_us < sequential_us
+        if (gpu_arch, "lower_bound") in AFFINE_BF16_COST_MODEL_US:
+            # Modelled architecture, but the call is outside the composite's
+            # contract (task cap, half the SM count, nothing to split).
+            return False
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in lengths
     ]
@@ -5063,6 +5396,33 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         longest >= AFFINE_SPLIT_MIN_CHUNKS
         and _affine_split_part_count(tasks=heads, chunks=longest, **crossover) >= 2
     )
+
+
+_TVM_DEVICES: dict[int, Any] = {}
+
+
+def _ffi_stream_context(device):
+    """FFI stream context on the current torch stream of ``device``.
+
+    ``tvm_ffi.use_torch_stream()`` builds a ``torch.cuda.Stream`` and parses a
+    device string on every entry; on the plan-cache hit path that sits before
+    the first chain kernel.  The raw current-stream handle and a cached FFI
+    device give the same context for a fraction of the cost (a CUDA-graph
+    capture stream is the current stream as well).
+    """
+    import torch
+    import tvm_ffi
+
+    raw_stream_of = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream_of is None:
+        return tvm_ffi.use_torch_stream()
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    ffi_device = _TVM_DEVICES.get(index)
+    if ffi_device is None:
+        ffi_device = _TVM_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(ffi_device, raw_stream_of(index))
 
 
 REBIND_INPUT_NAMES = (
@@ -5106,36 +5466,46 @@ def _storage_base_address(tensor) -> int:
     return tensor.data_ptr() - tensor.storage_offset() * tensor.element_size()
 
 
-def rebind_signature(inputs: dict) -> tuple:
-    """Structural key under which a prepared launch can be rebound to new inputs.
+def rebind_signature_and_facts(inputs: dict) -> tuple[tuple, tuple]:
+    """One pass over the rebind inputs: (structural signature, address facts).
 
-    Two calls share a signature when every caller tensor has the same shape,
-    strides, dtype, device and 256-byte alignment, and the same tensors alias
-    each other (``initial_state is final_state`` for an in-place pool,
-    packed ``q``/``k``/``v`` slices of one projection buffer, ...).
+    The signature is the key two calls share when every caller tensor has the
+    same shape, strides, dtype, device and 256-byte alignment, and the same
+    tensors alias each other (``initial_state is final_state`` for an
+    in-place pool, packed ``q``/``k``/``v`` slices of one projection buffer,
+    ...).  The facts add the full address per tensor: equal facts mean a
+    launch bound to the previous call already points at these tensors.
+
+    This runs on every plan-cache hit before the first chain kernel, so it
+    touches each tensor through the cheapest accessors only: ``torch.Size``
+    is kept as the shape (it hashes and compares as a tuple), the element
+    size comes from the dtype and the device index from ``get_device()``.
     """
     storage_groups: dict[int, int] = {}
     facts: list[Optional[tuple]] = []
     aliases: list[Optional[int]] = []
+    addresses: list[Optional[tuple]] = []
     for name in REBIND_INPUT_NAMES:
         tensor = inputs.get(name)
         if tensor is None:
             facts.append(None)
             aliases.append(None)
+            addresses.append(None)
             continue
         pointer = tensor.data_ptr()
-        facts.append(
-            (
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.dtype,
-                pointer & 0xFF,
-                tensor.device.index,
-            )
-        )
-        base = pointer - tensor.storage_offset() * tensor.element_size()
+        shape = tensor.shape
+        stride = tensor.stride()
+        dtype = tensor.dtype
+        facts.append((shape, stride, dtype, pointer & 0xFF, tensor.get_device()))
+        base = pointer - tensor.storage_offset() * dtype.itemsize
         aliases.append(storage_groups.setdefault(base, len(storage_groups)))
-    return (tuple(facts), tuple(aliases))
+        addresses.append((pointer, shape, stride, dtype))
+    return (tuple(facts), tuple(aliases)), tuple(addresses)
+
+
+def rebind_signature(inputs: dict) -> tuple:
+    """Structural key under which a prepared launch can be rebound to new inputs."""
+    return rebind_signature_and_facts(inputs)[0]
 
 
 @dataclass(frozen=True)
@@ -5166,12 +5536,43 @@ class RebindPlan:
     addresses: tuple[_RebindAddress, ...]
     owned_keepalive: tuple[Any, ...]
     sub_owned_keepalive: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    # Specs grouped by caller input, so a partial rebind (``changed``) walks
+    # only the moved inputs' specs instead of skipping through all of them.
+    views_by_input: dict[str, tuple[_RebindView, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    addresses_by_input: dict[str, tuple[_RebindAddress, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def __post_init__(self):
+        if not self.views_by_input:
+            for spec in self.views:
+                self.views_by_input.setdefault(spec.input_name, ())
+                self.views_by_input[spec.input_name] += (spec,)
+        if not self.addresses_by_input:
+            for spec in self.addresses:
+                self.addresses_by_input.setdefault(spec.input_name, ())
+                self.addresses_by_input[spec.input_name] += (spec,)
+
+    def specs_for(self, changed):
+        """(views, addresses) to re-point: every spec, or only the moved inputs' specs."""
+        if changed is None:
+            return self.views, self.addresses
+        views = []
+        addresses = []
+        for name in changed:
+            views.extend(self.views_by_input.get(name, ()))
+            addresses.extend(self.addresses_by_input.get(name, ()))
+        return views, addresses
 
 
 # Split-sequence affine composites hold three prepared part launches plus a
 # few caller-aliasing attributes of their own; their containers are addressed
 # as "<sub launch>.<container>" so one rebind plan covers the whole DAG.
 AFFINE_SUB_LAUNCHES = ("_main", "_map", "_correction")
+# Parts whose plan-cache rebinds may be applied after the first chain kernel.
+AFFINE_DEFERRED_PARTS = ("_map", "_correction")
 AFFINE_REBIND_ATTRIBUTES = (
     "_state_indices",
     "_initial_pool",
@@ -5192,6 +5593,15 @@ def _rebind_owner(impl, container_name: str):
 
 
 def _rebind_containers(impl) -> dict[str, Any]:
+    memo = impl.__dict__.get("_rebind_containers_memo")
+    if memo is not None:
+        return memo
+    memo = _collect_rebind_containers(impl)
+    impl._rebind_containers_memo = memo
+    return memo
+
+
+def _collect_rebind_containers(impl) -> dict[str, Any]:
     if hasattr(impl, "_main"):
         containers: dict[str, Any] = {}
         for sub_name in AFFINE_SUB_LAUNCHES:
@@ -5315,7 +5725,14 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
 
 
 def rebind_prepared_launch(
-    impl, plan: RebindPlan, inputs: dict, *, signature: tuple | None = None
+    impl,
+    plan: RebindPlan,
+    inputs: dict,
+    *,
+    signature: tuple | None = None,
+    changed: frozenset | None = None,
+    addresses: tuple | None = None,
+    defer_parts: tuple[str, ...] = (),
 ) -> bool:
     """Point a prepared launch at new caller tensors with the recorded layout.
 
@@ -5325,14 +5742,100 @@ def rebind_prepared_launch(
     argument (``*_tma`` keys) moved, in which case the caller must re-encode
     the descriptors (``prepare_descriptors``): one stream-ordered upload
     kernel, and therefore CUDA-graph capturable.  Unchanged descriptor
-    sources may keep the workspace contents.
+    sources may keep the workspace contents.  ``changed`` names the caller
+    tensors whose address differs from the previous binding of this plan;
+    when given, views and addresses of the other inputs are left in place
+    (their tensors still hold the recorded addresses and layouts).
+    ``addresses`` is the per-input ``(pointer, shape, stride, dtype)`` tuple
+    from :func:`rebind_signature_and_facts` for these inputs; with it the
+    rebind never re-reads tensor metadata.  ``defer_parts`` names composite
+    sub launches (``"_map"``, ``"_correction"``) whose specs are recorded on
+    ``impl`` and applied by the composite after its first chain kernel is
+    in flight (:func:`flush_deferred_rebind`), keeping them off the host
+    critical path; a pending deferred set is flushed before a new rebind.
     """
-    import torch
-
     if signature is None:
         signature = rebind_signature(inputs)
     if signature != plan.signature:
         raise ValueError("prepared launch signature does not match the new inputs")
+    flush_deferred_rebind(impl)
+    if addresses is None:
+        addresses = rebind_signature_and_facts(inputs)[1]
+    address_by_input = dict(zip(REBIND_INPUT_NAMES, addresses, strict=True))
+    view_specs, address_specs = plan.specs_for(changed)
+    if defer_parts:
+        prefixes = tuple(f"{name}." for name in defer_parts)
+        now_views: list[_RebindView] = []
+        later_views: list[_RebindView] = []
+        for spec in view_specs:
+            (later_views if spec.container.startswith(prefixes) else now_views).append(
+                spec
+            )
+        now_addresses: list[_RebindAddress] = []
+        later_addresses: list[_RebindAddress] = []
+        for spec in address_specs:
+            (
+                later_addresses
+                if spec.container.startswith(prefixes)
+                else now_addresses
+            ).append(spec)
+        view_specs, address_specs = now_views, now_addresses
+    else:
+        later_views = []
+        later_addresses = []
+    tma_moved = _apply_rebind_specs(
+        impl, view_specs, address_specs, inputs, address_by_input, changed
+    )
+    new_inputs = tuple(
+        inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
+    )
+    impl._keepalive = plan.owned_keepalive + new_inputs
+    deferred_owned = {}
+    for sub_name, owned in plan.sub_owned_keepalive.items():
+        if sub_name in defer_parts:
+            deferred_owned[sub_name] = owned + new_inputs
+            continue
+        sub = getattr(impl, sub_name, None)
+        if sub is not None:
+            sub._keepalive = owned + new_inputs
+    if later_views or later_addresses or deferred_owned:
+        for spec in later_views:
+            if (
+                isinstance(spec.key, str)
+                and spec.key.endswith("_tma")
+                and (changed is None or spec.input_name in changed)
+            ):
+                tma_moved = True
+        impl._deferred_rebind = (
+            tuple(later_views),
+            tuple(later_addresses),
+            inputs,
+            address_by_input,
+            changed,
+            deferred_owned,
+        )
+    return tma_moved
+
+
+def flush_deferred_rebind(impl) -> None:
+    """Apply the composite part rebinds recorded by ``defer_parts`` (no-op otherwise)."""
+    pending = impl.__dict__.pop("_deferred_rebind", None)
+    if pending is None:
+        return
+    views, addresses, inputs, address_by_input, changed, deferred_owned = pending
+    _apply_rebind_specs(impl, views, addresses, inputs, address_by_input, changed)
+    for sub_name, keepalive in deferred_owned.items():
+        sub = getattr(impl, sub_name, None)
+        if sub is not None:
+            sub._keepalive = keepalive
+
+
+def _apply_rebind_specs(
+    impl, view_specs, address_specs, inputs: dict, address_by_input: dict, changed
+) -> bool:
+    """Re-point the given view/address specs; mark owners whose TMA sources moved."""
+    import torch
+
     containers = _rebind_containers(impl)
     tma_moved = False
     resolved: dict[tuple, Any] = {}
@@ -5349,20 +5852,19 @@ def rebind_prepared_launch(
         if tensor is not None:
             return tensor
         source = inputs[spec.input_name]
+        _, shape, stride, dtype = address_by_input[spec.input_name]
         if (
             spec.byte_offset == 0
-            and source.dtype == spec.dtype
-            and tuple(source.shape) == spec.shape
-            and tuple(source.stride()) == spec.stride
+            and dtype == spec.dtype
+            and shape == spec.shape
+            and stride == spec.stride
         ):
             tensor = source
-        elif (
-            source.dtype == spec.dtype and spec.byte_offset % source.element_size() == 0
-        ):
+        elif dtype == spec.dtype and spec.byte_offset % dtype.itemsize == 0:
             tensor = source.as_strided(
                 spec.shape,
                 spec.stride,
-                source.storage_offset() + spec.byte_offset // source.element_size(),
+                source.storage_offset() + spec.byte_offset // dtype.itemsize,
             )
         else:
             tensor = torch.empty(0, dtype=spec.dtype, device=source.device)
@@ -5379,27 +5881,32 @@ def rebind_prepared_launch(
         return tensor
 
     stale_owners: list = []
-    for spec in plan.views:
+    touched: set[str] = set()
+    for spec in view_specs:
+        touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
-        if (
-            isinstance(spec.key, str)
-            and spec.key.endswith("_tma")
-            and container[spec.key].data_ptr() != replacement.data_ptr()
-        ):
-            tma_moved = True
-            owner, _ = _rebind_owner(impl, spec.container)
-            if owner is not impl and owner not in stale_owners:
-                stale_owners.append(owner)
+        if isinstance(spec.key, str) and spec.key.endswith("_tma"):
+            # With ``changed`` the moved inputs are known; otherwise compare
+            # the recorded pointer with the previous binding.
+            moved = (
+                spec.input_name in changed
+                if changed is not None
+                else container[spec.key].data_ptr() != replacement.data_ptr()
+            )
+            if moved:
+                tma_moved = True
+                owner, _ = _rebind_owner(impl, spec.container)
+                if owner not in stale_owners:
+                    stale_owners.append(owner)
         container[spec.key] = replacement
-    for address in plan.addresses:
+    for address in address_specs:
+        touched.add(address.container)
         containers[address.container][address.key] = (
-            inputs[address.input_name].data_ptr() + address.byte_offset
+            address_by_input[address.input_name][0] + address.byte_offset
         )
-    new_inputs = tuple(
-        inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
-    )
-    for container_name, container in containers.items():
+    for container_name in touched:
+        container = containers[container_name]
         owner, base = _rebind_owner(impl, container_name)
         if base == "refresh_sources":
             owner._token_storage_refreshes = tuple(
@@ -5414,15 +5921,11 @@ def rebind_prepared_launch(
         elif base == "attributes":
             for name, value in container.items():
                 setattr(owner, name, value)
-    for sub_name, owned in plan.sub_owned_keepalive.items():
-        sub = getattr(impl, sub_name, None)
-        if sub is not None:
-            sub._keepalive = owned + new_inputs
     for owner in stale_owners:
-        # Part launches re-encode their own descriptors inside their launch
-        # stream context (see _launch_uncaptured).
+        # Only the launches whose descriptor sources moved re-encode, inside
+        # their launch stream context (see _launch_uncaptured); a composite
+        # whose parts moved does not re-encode the untouched parts.
         owner._descriptors_stale = True
-    impl._keepalive = plan.owned_keepalive + new_inputs
     return tma_moved
 
 
