@@ -26,7 +26,11 @@ batch is too small to fill the machine the page pairs of every item are split
 across 2, 4 or 8 CTAs whose FP32 partials are merged by the last CTA to finish
 (``split_factor``); the split scratch lives in a caller-owned workspace so a
 prepared runner launches with no allocation and can be captured into a CUDA
-Graph.  See ``README.md`` in this package.
+Graph.  When the architecture also registers the short-item program, batches
+whose requests span at most ``max_pages`` (four) selected pages run it
+instead: one four-CTA cluster of register-MMA CTAs per work item, one CTA per
+selected page, the partials merged through distributed shared memory, no
+workspace.  See ``README.md`` in this package.
 """
 
 from __future__ import annotations
@@ -41,7 +45,9 @@ import tvm_ffi
 from .cake_jit import (
     MODULES,
     load_cake_msa_nvfp4_decode_module,
+    route_of,
     select_module,
+    select_short_module,
 )
 
 HEAD_DIM = 128
@@ -90,6 +96,42 @@ MAIN_KWARGS = (
     "grid",
 )
 
+# Semantic argument names of the short-item cluster program, in the order the
+# generated binding consumes them.  The four page views are passed as flat
+# byte aliases of their storage spans plus their page and head byte strides
+# (the program forms 64-bit offsets in place; no TMA descriptors).
+SHORT_KWARGS = (
+    "Q",
+    "K",
+    "K_scale",
+    "V",
+    "V_scale",
+    "O",
+    "msa_lse",
+    "kv_indices",
+    "kv_indptr",
+    "task_kind",
+    "task_request",
+    "task_kv_head",
+    "total_q",
+    "seqlen_q",
+    "num_q_heads",
+    "num_kv_heads",
+    "softmax_scale_log2",
+    "output_scale",
+    "msa_max_pages",
+    "k_page_stride",
+    "k_head_stride",
+    "ks_page_stride",
+    "ks_head_stride",
+    "v_page_stride",
+    "v_head_stride",
+    "vs_page_stride",
+    "vs_head_stride",
+    "grid",
+)
+STRIDE_LIMIT = 2**31  # the short program's page / head byte strides are int32
+
 
 # ---------------------------------------------------------------------------
 # Device geometry and the split-KV rule
@@ -108,7 +150,11 @@ def generated_program_available(device: torch.device) -> bool:
 
 def ctas_per_sm(arch: str) -> int:
     """Resident CTAs per SM of the generated program (a compile-time property)."""
-    values = {int(r["ctas_per_sm"]) for r in MODULES.values() if r["arch"] == arch}
+    values = {
+        int(r["ctas_per_sm"])
+        for r in MODULES.values()
+        if r["arch"] == arch and route_of(r) == "swap_tsk"
+    }
     if len(values) != 1:
         raise NotImplementedError(
             f"The generated NVFP4 MSA decode program for {arch} is not registered in this checkout"
@@ -151,6 +197,61 @@ def split_factor(total_work_items: int, cta_capacity: int, max_pages: int) -> in
 
 def persistent_grid(total_work_items: int, splits: int, cta_capacity: int) -> int:
     return max(1, min(int(total_work_items) * int(splits), int(cta_capacity)))
+
+
+# ---------------------------------------------------------------------------
+# Short-item cluster program (work items of at most ``max_pages`` pages)
+# ---------------------------------------------------------------------------
+
+
+def short_program_record(arch: str) -> Optional[dict]:
+    """Registry record of the short-item program for ``arch`` (``None`` when absent)."""
+    name = select_short_module(arch)
+    return None if name is None else MODULES[name]
+
+
+def short_route_applies(arch: str, max_pages: int) -> bool:
+    """True when ``arch`` registers the short-item program and every request spans at most its page budget."""
+    record = short_program_record(arch)
+    return record is not None and int(max_pages) <= int(record["max_pages"])
+
+
+def short_grid(
+    total_work_items: int, num_sms: int, record: dict
+) -> tuple[int, int, int]:
+    """Cluster-launch grid: one ``cluster``-CTA cluster per item, at most ``max_clusters`` clusters."""
+    cluster = int(record["cluster"])
+    clusters = max(
+        1,
+        min(
+            int(total_work_items),
+            int(record["max_clusters"]),
+            max(1, int(num_sms) // cluster),
+        ),
+    )
+    return (clusters * cluster, 1, 1)
+
+
+def _flat_page_operand(
+    name: str, view: torch.Tensor, inner: int
+) -> tuple[torch.Tensor, int, int]:
+    """Flat byte alias of a validated ``[pages, heads, 128, inner]`` page view plus its byte strides.
+
+    The binding checks contiguity per tensor while the pool views are strided
+    windows of one planar pool, so each view is passed as the contiguous byte
+    span it covers together with its page and head strides (dense rows are the
+    layout contract; ``validate_msa_nvfp4_decode_inputs`` has checked them).
+    """
+    b = view.view(torch.uint8) if view.dtype != torch.uint8 else view
+    pages, heads = int(b.shape[0]), int(b.shape[1])
+    page_stride, head_stride = int(b.stride(0)), int(b.stride(1))
+    if page_stride >= STRIDE_LIMIT or head_stride >= STRIDE_LIMIT:
+        raise ValueError(
+            f"{name} page / head strides ({page_stride}, {head_stride}) exceed the short "
+            f"program's 32-bit stride parameters"
+        )
+    span = (pages - 1) * page_stride + (heads - 1) * head_stride + PAGE_SIZE * inner
+    return b.as_strided((span,), (1,)), page_stride, head_stride
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +338,9 @@ class MSANvfp4DecodeRunner:
     lse: torch.Tensor
     entry: Callable[..., Any]
     arguments: tuple
+    route: str = (
+        "swap_tsk"  # ``swap_tsk`` persistent program or ``short`` cluster program
+    )
 
     def launch(self) -> torch.Tensor:
         # Tensor maps are encoded by the host binding and passed by value.
@@ -252,10 +356,23 @@ class MSANvfp4DecodeRunner:
 
 
 def bind_decode_payload(
-    arch: str, splits: int, main_kwargs: dict, out: torch.Tensor, lse: torch.Tensor
+    arch: str,
+    splits: int,
+    main_kwargs: dict,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    module_name: Optional[str] = None,
+    route: str = "swap_tsk",
 ) -> MSANvfp4DecodeRunner:
-    """Bind the prepared buffers to the generated physical argument order."""
-    module_name = select_module(arch, splits)
+    """Bind the prepared buffers to the generated physical argument order.
+
+    Without ``module_name`` the persistent program of ``arch`` and ``splits``
+    is bound; the short-item program passes its record name and
+    ``route="short"`` (``splits`` is then one).
+    """
+    if module_name is None:
+        module_name = select_module(arch, splits)
     physical = MODULES[module_name]["main"]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
     arguments = tuple(
@@ -265,7 +382,7 @@ def bind_decode_payload(
     module = load_cake_msa_nvfp4_decode_module(module_name, "main")
     entry = getattr(module, physical["ffi_entry"])
     return MSANvfp4DecodeRunner(
-        module_name, int(splits), main_kwargs, out, lse, entry, arguments
+        module_name, int(splits), main_kwargs, out, lse, entry, arguments, route
     )
 
 
@@ -425,11 +542,14 @@ def prepare_msa_nvfp4_sparse_decode(
     """Validate and bind one NVFP4 paged-KV sparse decode step.
 
     Every allocation happens here (only the optional ``out`` / ``lse``); the
-    returned runner launches with none.  The split factor is decided from the
-    batch geometry and the device's resident-CTA capacity; when it is greater
-    than one the FP32 partials and completion counters are carved out of
-    ``workspace_buffer`` and the counters are zeroed once (the kernel resets
-    them after every merge).
+    returned runner launches with none.  When the device registers the
+    short-item program and every request spans at most its page budget
+    (``short_route_applies``), the runner binds that program (``route ==
+    "short"``, one four-CTA cluster per work item, no workspace).  Otherwise
+    the split factor is decided from the batch geometry and the device's
+    resident-CTA capacity; when it is greater than one the FP32 partials and
+    completion counters are carved out of ``workspace_buffer`` and the
+    counters are zeroed once (the kernel resets them after every merge).
     """
     if backend != "cake":
         raise ValueError("NVFP4 MSA decode supports backend='cake'")
@@ -464,9 +584,6 @@ def prepare_msa_nvfp4_sparse_decode(
         )
     total_q = batch * int(seqlen_q)
     total_work_items = total_q * num_kv_heads
-    capacity = persistent_cta_capacity(device)
-    splits = split_factor(total_work_items, capacity, max_pages)
-    grid = (persistent_grid(total_work_items, splits, capacity), 1, 1)
     scale = HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
     # The global K multiplier is separable from every per-block scale: fold it
     # into the softmax scale; the global V multiplier is applied in the epilogue.
@@ -477,6 +594,54 @@ def prepare_msa_nvfp4_sparse_decode(
         )
     if lse is None:
         lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=device)
+
+    if short_route_applies(arch, max_pages):
+        short_name = select_short_module(arch)
+        assert short_name is not None
+        record = MODULES[short_name]
+        k_flat, k_ps, k_hs = _flat_page_operand("k", k, DATA_DIM)
+        ks_flat, ks_ps, ks_hs = _flat_page_operand("k_scale", k_scale, SCALE_DIM)
+        v_flat, v_ps, v_hs = _flat_page_operand("v", v, DATA_DIM)
+        vs_flat, vs_ps, vs_hs = _flat_page_operand("v_scale", v_scale, SCALE_DIM)
+        num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        short_kwargs = dict(
+            Q=q,
+            K=k_flat,
+            K_scale=ks_flat,
+            V=v_flat,
+            V_scale=vs_flat,
+            O=out,
+            msa_lse=lse,
+            kv_indices=page_table,
+            kv_indptr=seqused_k,
+            task_kind=q2k_indices,
+            task_request=seqused_k,
+            task_kv_head=seqused_k,
+            total_q=total_q,
+            seqlen_q=int(seqlen_q),
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            softmax_scale_log2=float(softmax_scale_log2),
+            output_scale=float(v_global_scale),
+            msa_max_pages=max_pages,
+            k_page_stride=k_ps,
+            k_head_stride=k_hs,
+            ks_page_stride=ks_ps,
+            ks_head_stride=ks_hs,
+            v_page_stride=v_ps,
+            v_head_stride=v_hs,
+            vs_page_stride=vs_ps,
+            vs_head_stride=vs_hs,
+            grid=short_grid(total_work_items, num_sms, record),
+        )
+        assert tuple(short_kwargs) == SHORT_KWARGS
+        return bind_decode_payload(
+            arch, 1, short_kwargs, out, lse, module_name=short_name, route="short"
+        )
+
+    capacity = persistent_cta_capacity(device)
+    splits = split_factor(total_work_items, capacity, max_pages)
+    grid = (persistent_grid(total_work_items, splits, capacity), 1, 1)
 
     if splits > 1:
         layout = workspace_layout(total_work_items, splits)

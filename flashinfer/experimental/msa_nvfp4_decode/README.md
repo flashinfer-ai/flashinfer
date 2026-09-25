@@ -29,9 +29,16 @@ persistent kernel:
   still fits one wave; items with fewer than four page pairs never split).
   The FP32 partials and the self-resetting completion counters live in a
   caller-owned workspace.
-- Preparation binds the tensors and decides the split factor; the runner
-  launches with no allocation and no host synchronization, reads every buffer
-  on device, and can be captured into a CUDA Graph.
+- Batches whose requests all span at most four selected pages (`page_table`
+  with at most four columns, e.g. the 257-token tail of a decode step) run the
+  short-item program when the architecture registers it
+  (`cake_jit.select_short_module`): one four-CTA cluster of register-MMA CTAs
+  per work item, one CTA per selected page, the FP32 partials merged through
+  distributed shared memory. It needs no workspace; the runner reports
+  `route == "short"`. Longer requests take the persistent program above.
+- Preparation binds the tensors and decides the program and the split factor;
+  the runner launches with no allocation and no host synchronization, reads
+  every buffer on device, and can be captured into a CUDA Graph.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
@@ -73,10 +80,11 @@ q.copy_(next_q); q2k_indices.copy_(next_selection)
 out = decode()          # same runner (or a captured graph), new step
 ```
 
-`cake_jit.py` registers the generated translation units per architecture and
-split factor (`MODULES`, populated by the generated-program export) and builds
-them with FlashInfer's JIT; `cake_backend.py` validates the inputs against the
-kernel's contract, mirrors the split rule and carves the workspace. The tests
+`cake_jit.py` registers the generated translation units per architecture,
+route and split factor (`MODULES`, populated by the generated-program export)
+and builds them with FlashInfer's JIT; `cake_backend.py` validates the inputs
+against the kernel's contract, selects the short-item program for four-page
+batches, mirrors the split rule and carves the workspace. The tests
 in `tests/experimental/test_cake_msa_nvfp4_decode.py` compare the program with
 the FP32 oracle of the existing NVFP4 route and with that route itself, and
 replay a captured graph; `benchmarks/bench_cake_msa_nvfp4_decode.py` times it

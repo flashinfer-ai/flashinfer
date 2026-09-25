@@ -24,10 +24,13 @@ from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Explicit target-owned registration of the generated programs.  One record per
-# (architecture, split-KV factor); each record carries the single physical
-# stage (the persistent decode kernel) with its translation units, compile
-# flags, FFI entry and argument plan, plus the resident-CTA count per SM the
-# host uses to size the persistent grid.  Populated verbatim by the
+# (architecture, route, split-KV factor): the ``swap_tsk`` records (one per
+# split factor) carry the persistent decode kernel with its translation units,
+# compile flags, FFI entry and argument plan, plus the resident-CTA count per SM
+# the host uses to size the persistent grid; the optional ``short`` record of an
+# architecture carries the four-CTA-cluster register-MMA program that serves
+# work items of at most ``max_pages`` selected pages (``cluster`` CTAs per item,
+# at most ``max_clusters`` clusters per launch).  Populated verbatim by the
 # generated-program export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_msa_nvfp4_decode_sm_100a_split1": {
@@ -399,26 +402,54 @@ ARCH_NVCC_FLAGS = {
 }
 
 
+def route_of(record: dict[str, Any]) -> str:
+    """Route family of a registry record (``swap_tsk`` persistent or ``short`` cluster program)."""
+    return str(record.get("route", "swap_tsk"))
+
+
 def registered_split_factors(arch: str) -> tuple[int, ...]:
-    """Split-KV factors with a registered program for ``arch``."""
+    """Split-KV factors with a registered persistent program for ``arch``."""
     return tuple(
         sorted(
             int(record["splits"])
             for record in MODULES.values()
-            if record["arch"] == arch
+            if record["arch"] == arch and route_of(record) == "swap_tsk"
         )
     )
 
 
 def select_module(arch: str, splits: int) -> str:
-    """Return the registered module name for ``arch`` and split factor ``splits``."""
+    """Return the registered persistent module name for ``arch`` and split factor ``splits``."""
     for name, record in MODULES.items():
-        if record["arch"] == arch and int(record["splits"]) == int(splits):
+        if (
+            record["arch"] == arch
+            and route_of(record) == "swap_tsk"
+            and int(record["splits"]) == int(splits)
+        ):
             return name
     raise NotImplementedError(
         "The generated NVFP4 MSA decode program for "
         f"{arch} with split factor {splits} is not registered in this checkout"
     )
+
+
+def select_short_module(arch: str) -> str | None:
+    """Return the short-item cluster program registered for ``arch``, or ``None``.
+
+    The short program serves work items whose requests span at most
+    ``MODULES[name]["max_pages"]`` pages; an architecture without it serves
+    those items with the persistent program.
+    """
+    names = [
+        name
+        for name, record in MODULES.items()
+        if record["arch"] == arch and route_of(record) == "short"
+    ]
+    if len(names) > 1:
+        raise NotImplementedError(
+            f"{arch} registers more than one short-item NVFP4 MSA decode program: {names}"
+        )
+    return names[0] if names else None
 
 
 def _header_dirs():

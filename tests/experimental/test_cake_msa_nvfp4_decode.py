@@ -24,14 +24,19 @@ from flashinfer.experimental.msa_nvfp4_decode.cake_backend import (
     MAIN_KWARGS,
     PAGE_SIZE,
     SCALE_DIM,
+    SHORT_KWARGS,
     SPLIT_FACTORS,
     STATS_PER_SLOT,
     SUPPORTED_COMPUTE_CAPABILITIES,
     WORKSPACE_ALIGN,
+    arch_for,
     generated_program_available,
     msa_nvfp4_decode_workspace_size,
     persistent_cta_capacity,
     prepare_msa_nvfp4_sparse_decode as prepare_backend,
+    short_grid,
+    short_program_record,
+    short_route_applies,
     split_factor,
     validate_msa_nvfp4_decode_inputs,
     workspace_layout,
@@ -281,11 +286,19 @@ def test_public_entry_routes_only_to_cake():
         )
 
 
+GRID_ARG_PLAN = [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
 EXPECTED_ARG_PLAN = (
     [["tma_buffer", n] for n in MAIN_KWARGS[:5]]
     + [["buffer", n] for n in MAIN_KWARGS[5:16]]
     + [["parameter", n] for n in MAIN_KWARGS[16:23]]
-    + [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
+    + GRID_ARG_PLAN
+)
+# The short-item program takes the page views as flat byte aliases (pointer
+# ABI, no tensor maps) and their page / head byte strides as parameters.
+EXPECTED_SHORT_ARG_PLAN = (
+    [["buffer", n] for n in SHORT_KWARGS[:12]]
+    + [["parameter", n] for n in SHORT_KWARGS[12:27]]
+    + GRID_ARG_PLAN
 )
 
 
@@ -295,28 +308,48 @@ def test_registry_records_match_the_host_binding():
     root = cake_jit.Path(cake_jit.__file__).resolve().parent / "csrc"
     seen = set()
     per_arch_ctas = {}
+    short_arches = set()
     for name, record in cake_jit.MODULES.items():
         assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
-        assert int(record["splits"]) in SPLIT_FACTORS
-        assert int(record["ctas_per_sm"]) >= 1
-        per_arch_ctas.setdefault(record["arch"], set()).add(int(record["ctas_per_sm"]))
-        key = (record["arch"], int(record["splits"]))
+        route = cake_jit.route_of(record)
+        assert route in {"swap_tsk", "short"}
+        if route == "swap_tsk":
+            assert int(record["splits"]) in SPLIT_FACTORS
+            assert int(record["ctas_per_sm"]) >= 1
+            per_arch_ctas.setdefault(record["arch"], set()).add(
+                int(record["ctas_per_sm"])
+            )
+            key = (record["arch"], int(record["splits"]))
+            expected_plan = EXPECTED_ARG_PLAN
+            assert cake_jit.select_module(record["arch"], int(record["splits"])) == name
+        else:
+            assert int(record["max_pages"]) >= 1
+            assert int(record["cluster"]) >= 2
+            assert int(record["max_clusters"]) >= 1
+            key = (record["arch"], "short")
+            expected_plan = EXPECTED_SHORT_ARG_PLAN
+            assert cake_jit.select_short_module(record["arch"]) == name
+            short_arches.add(record["arch"])
         assert key not in seen, f"duplicate registration for {key}"
         seen.add(key)
         main = record["main"]
         assert main["ffi_entry"] == "run"
-        assert [list(item) for item in main["arg_plan"]] == EXPECTED_ARG_PLAN
+        assert [list(item) for item in main["arg_plan"]] == expected_plan
         assert record["closure_sha256"] == main["closure_sha256"]
         assert len(main["sources"]) == 2
         for relative in main["sources"]:
             assert (root / relative).is_file(), relative
             assert relative.startswith(f"cake_msa_nvfp4_decode/{record['arch']}/")
-        assert cake_jit.select_module(record["arch"], int(record["splits"])) == name
     assert all(len(v) == 1 for v in per_arch_ctas.values())
     for arch in per_arch_ctas:
         assert cake_jit.registered_split_factors(arch) == SPLIT_FACTORS
+    # A short program is only registered next to the persistent programs of its architecture.
+    assert short_arches <= set(per_arch_ctas)
+    for arch in set(per_arch_ctas) - short_arches:
+        assert cake_jit.select_short_module(arch) is None
     with pytest.raises(NotImplementedError):
         cake_jit.select_module("sm_90a", 1)
+    assert cake_jit.select_short_module("sm_90a") is None
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +419,21 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
     )
     runner, workspace = _prepare(inputs)
     items = len(seq_lens) * seqlen_q * num_kv_heads
-    assert runner.splits == split_factor(
-        items, persistent_cta_capacity(inputs["q"].device), inputs["max_pages"]
-    )
+    device = inputs["q"].device
+    arch = arch_for(device)
+    if short_route_applies(arch, inputs["max_pages"]):
+        # Requests of at most the short program's page budget take the
+        # four-CTA-cluster program: one cluster per work item, no split.
+        assert runner.route == "short"
+        assert runner.splits == 1
+        record = short_program_record(arch)
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        assert runner.num_ctas == short_grid(items, sms, record)[0]
+    else:
+        assert runner.route == "swap_tsk"
+        assert runner.splits == split_factor(
+            items, persistent_cta_capacity(device), inputs["max_pages"]
+        )
     runner.out.fill_(float("nan"))
     out = runner()
     torch.cuda.synchronize()
@@ -402,7 +447,19 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
 @pytest.mark.parametrize(
     "seq_lens,num_kv_heads,group_size,seqlen_q",
     [
-        ([257, 300], 4, 16, 1),  # 257-token tail: two page pairs, unsplit
+        (
+            [257, 300],
+            4,
+            16,
+            1,
+        ),  # 257-token tail: three pages, short program when registered
+        (
+            [385, 300],
+            1,
+            8,
+            1,
+        ),  # eight query heads per KV head through the short program
+        ([513, 385], 4, 16, 1),  # five pages: just beyond the short program's budget
         ([8192] * 4, 4, 16, 1),  # 16 items: eight-way split
         ([65536] * 16, 4, 16, 1),  # 64 items: two-way split
         ([100_000] * 8, 4, 16, 1),  # 32 items: four-way split
@@ -465,6 +522,72 @@ def test_serves_a_geometry_the_existing_route_declines():
             out=torch.empty_like(inputs["q"]),
             **upstream_route_kwargs(inputs),
         )
+
+
+def _require_short_program():
+    _require_program()
+    if short_program_record(arch_for(torch.device("cuda"))) is None:
+        pytest.skip(
+            "short-item NVFP4 MSA decode program not registered for this device"
+        )
+
+
+def test_short_items_take_the_cluster_program():
+    """Requests within the short program's page budget run one four-CTA cluster
+    per work item from the same pages, with no workspace and no allocation."""
+    _require_short_program()
+    inputs, runner, _ = _run_and_check([257, 300, 1, 512], 4, seed=17)
+    assert runner.route == "short"
+    # A KV head serving fewer than sixteen query heads (tp8 geometry) is served
+    # from the same program; rows beyond the group are never read or written.
+    _run_and_check([385, 300, 129], 1, group_size=8, seed=29)
+    assert runner.main_kwargs["msa_max_pages"] == inputs["max_pages"]
+    # No workspace is bound: preparing without one succeeds for these requests.
+    bare = prepare_msa_nvfp4_sparse_decode(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["q2k_indices"],
+        k_scale=inputs["k_scale"],
+        v_scale=inputs["v_scale"],
+        page_table=inputs["page_table"],
+        seqused_k=inputs["seqused_k"],
+        k_global_scale=inputs["k_global_scale"],
+        v_global_scale=inputs["v_global_scale"],
+    )
+    assert bare.route == "short"
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()
+    bare()
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
+    torch.testing.assert_close(bare.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(bare.out, runner.out, atol=0, rtol=0)
+
+
+def test_short_program_graph_replay_follows_new_selections():
+    _require_short_program()
+    inputs, runner, _ = _run_and_check([300] * 8, 4, seed=19)
+    assert runner.route == "short"
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runner()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            runner()
+    torch.cuda.synchronize()
+    fresh = build_decode_inputs([300] * 8, num_kv_heads=4, device="cuda", seed=23)
+    inputs["q"].copy_(fresh["q"])
+    inputs["q2k_indices"].copy_(fresh["q2k_indices"])
+    del fresh
+    runner.out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
 
 
 def test_graph_replay_follows_new_queries_and_selections():
