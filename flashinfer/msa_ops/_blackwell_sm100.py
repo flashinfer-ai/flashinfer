@@ -2804,7 +2804,9 @@ def _run_packed_fp8_decode(
         expected = (hkv * 128 * 256, 128 * 256, 256, 1)
         if any(
             size > 1 and stride != want
-            for size, stride, want in zip(tensor.shape, tensor.stride(), expected)
+            for size, stride, want in zip(
+                tensor.shape, tensor.stride(), expected, strict=True
+            )
         ):
             raise ValueError(
                 "k/v must be split views of packed HND FP8 KV with token stride 256"

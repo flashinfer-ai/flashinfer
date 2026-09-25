@@ -135,8 +135,72 @@ def test_numeric_check_rejects_small_incorrect_rows():
         assert_numerics(torch.zeros_like(expected), expected)
 
 
+@pytest.mark.parametrize(
+    "scale", [0, -0.125, float("inf"), float("-inf"), float("nan"), torch.tensor(0.1)]
+)
+def test_packed_fp8_host_scale_rejected_before_cuda_work(monkeypatch, scale):
+    import flashinfer.msa_ops.sparse_decode as decode
+    import flashinfer.jit.blackwell_msa as jit_msa
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "invalid scale must not be converted from a Tensor or launch work"
+        )
+
+    monkeypatch.setattr(decode, "is_blackwell_msa_device", lambda device: True)
+    monkeypatch.setattr(torch.Tensor, "__float__", forbidden)
+    monkeypatch.setattr(jit_msa, "load_msa_decode_metadata_module", forbidden)
+    packed = torch.empty(1, 1, 128, 256, dtype=torch.float8_e4m3fn)
+    error = TypeError if isinstance(scale, torch.Tensor) else ValueError
+    with pytest.raises(error, match="softmax_scale"):
+        decode.msa_sparse_decode_attention(
+            torch.empty(4, 16, 128, dtype=torch.bfloat16),
+            packed[..., :128],
+            packed[..., 128:],
+            torch.empty(1, 4, 16, dtype=torch.int32),
+            softmax_scale=scale,
+        )
+
+
+def test_packed_fp8_dispatch_reuses_existing_msa_interface(monkeypatch):
+    import flashinfer.msa_ops.sparse_decode as decode
+    from flashinfer.msa_ops import _blackwell_sm100 as backend
+
+    packed = torch.empty(1, 1, 128, 256, dtype=torch.float8_e4m3fn)
+    q = torch.empty(4, 16, 128, dtype=torch.bfloat16)
+    indices = torch.empty(1, 4, 16, dtype=torch.int32)
+    workspace = object()
+
+    def route(actual_q, k, v, actual_indices, **kwargs):
+        assert actual_q is q and actual_indices is indices
+        assert k.stride(-2) == v.stride(-2) == 256
+        assert kwargs["seqlen_q"] == 4
+        assert kwargs["workspace"] is workspace
+        return q
+
+    monkeypatch.setattr(decode, "is_blackwell_msa_device", lambda device: True)
+    monkeypatch.setattr(backend, "_run_packed_fp8_decode", route)
+    assert (
+        decode.msa_sparse_decode_attention(
+            q,
+            packed[..., :128],
+            packed[..., 128:],
+            indices,
+            seqlen_q=4,
+            workspace=workspace,
+        )
+        is q
+    )
+
+
 @pytest.fixture(autouse=True)
-def require_blackwell():
+def require_blackwell(request):
+    # These descriptor/dispatch tests also run without a CUDA device.
+    if request.function in (
+        test_packed_fp8_host_scale_rejected_before_cuda_work,
+        test_packed_fp8_dispatch_reuses_existing_msa_interface,
+    ):
+        return
     if not torch.cuda.is_available() or get_compute_capability(
         torch.device("cuda")
     ) not in {(10, 0), (10, 3)}:
