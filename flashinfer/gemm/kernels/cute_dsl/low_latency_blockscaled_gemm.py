@@ -165,7 +165,8 @@ def autotune_tactics(
     _, _, k, _ = problem_sizes_mnkl
     mma_k = 64 if a_dtype.width == b_dtype.width == 4 else 32
     tactics = []
-    k_padded = (k + mma_k - 1) // mma_k * mma_k
+    sf_atom_k = 4 * sf_vec_size
+    k_padded = (k + sf_atom_k - 1) // sf_atom_k * sf_atom_k
     for cta_m in _SUPPORTED_CTA_M:
         for cta_k in range(mma_k, k_padded + 1, mma_k):
             if cta_k > 512 and k % cta_k:
@@ -767,7 +768,9 @@ class LowLatencyBlockscaledGemmKernel:
             cta_k = 4 * mma_k
         if cta_m not in _SUPPORTED_CTA_M or cta_n != 8 or cta_k <= 0:
             return False
-        if cta_k % mma_k != 0 or cta_k > (k + mma_k - 1) // mma_k * mma_k:
+        # A CTA-K tile may run past K up to the next 128; TMA zero-fills the padding
+        sf_atom_k = 4 * sf_vec_size
+        if cta_k % mma_k != 0 or cta_k > (k + sf_atom_k - 1) // sf_atom_k * sf_atom_k:
             return False
         # TMA OOB fill pads to CTA-K tiles; 16 B-aligned A/B rows needed
         if k % sf_vec_size or k * min(a_dtype.width, b_dtype.width) % 128:

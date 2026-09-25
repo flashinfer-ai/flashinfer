@@ -58,6 +58,12 @@ _EDGE_KERNEL_SHAPES = [
     (129, 3, 384, 2),
 ]
 
+_K_TAIL_SHAPES = [
+    (200, 8, 2880, 1),
+    (129, 3, 2912, 2),
+    (130, 5, 32, 1),
+    (130, 5, 96, 2),
+]
 
 def _require_supported_gpu():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
@@ -327,10 +333,6 @@ def test_low_latency_blockscaled_gemm_all_tactics_correctness(fmt):
     ]
     for shape in model_shapes[:1] + model_shapes[-1:] + edge_shapes[:1]:
         _run_all_tactics_and_check(runner, shape, fmt, workspace, alpha)
-
-
-# No CTA-K divides these K values; 2912 also leaves half an NVFP4 MMA-K step
-_K_TAIL_SHAPES = [(200, 8, 2880, 1), (129, 3, 2912, 2)]
 
 
 @pytest.mark.parametrize("mnkl", _K_TAIL_SHAPES)
