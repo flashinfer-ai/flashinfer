@@ -64,12 +64,12 @@ def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) CuTe DSL MoE kernels do not implement.
 
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
-    Blackwell kernels rather than a port of them: the gather kernel hardcodes
-    SwiGLU and exposes no ``activation_type``, its wrapper has no
-    ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
-    path. The wrappers raise ``NotImplementedError`` for these cases, which is
-    correct behaviour -- but on Rubin it reports as a test failure on every CI
-    sweep, for features the kernels were never built to have.
+    Blackwell kernels rather than a full port: the gather kernel implements
+    standard SwiGLU and ReLU^2, but not other gated formulas; its wrapper has
+    no ``a_per_token_scale_ptr``; and the finalize kernel implements no
+    unfused path. The wrappers raise ``NotImplementedError`` for these cases,
+    which is correct behaviour -- but on Rubin it reports as a test failure on
+    every CI sweep, for features the kernels were never built to have.
 
     The decision is made from the parameterization alone, before the test body
     runs. It therefore cannot absorb a genuine regression: anything that fails
@@ -97,7 +97,7 @@ def _skip_sm107_unimplemented_moe_features(request):
         pytest.skip("SM107 finalize kernel implements only the fused path")
 
     if params.get("activation_type") == ActivationType.GegluTanh:
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU")
 
     # test_geglu_tanh_accuracy sets the activation in its body rather than via a
     # parameter, so it has to be matched by identity. Match the function exactly
@@ -105,7 +105,7 @@ def _skip_sm107_unimplemented_moe_features(request):
     # prefix but only exercises normalize_cute_dsl_moe_activation_type, touches no
     # kernel, and passes on SM107 -- a substring match silently dropped it.
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU")
 
     if (
         request.node.function.__name__
@@ -1689,7 +1689,14 @@ class TestCuteDslFusedMoeFunctional:
         hidden_sizes: tuple[int, ...],
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Exercise finalize tactics with cluster padding and partial N tiles."""
         from flashinfer.autotuner import AutoTuner
+
+        if is_sm107():
+            pytest.skip(
+                "This test forces a Blackwell cluster-N=2 finalize tactic; "
+                "SM107 finalize tactics pin cluster-N to 1"
+            )
 
         if quant_mode == "w4a4":
             # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
@@ -1714,6 +1721,7 @@ class TestCuteDslFusedMoeFunctional:
         def choose_tail_config(
             _self, _custom_op, runners, _tuning_config, _inputs, **_kwargs
         ):
+            """Force the padding-sensitive tactic for this regression test."""
             return runners[0], tail_config
 
         monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
@@ -1743,12 +1751,6 @@ class TestCuteDslFusedMoeFunctional:
         use_fused_finalize: bool,
     ):
         from flashinfer import cute_dsl_fused_moe
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
@@ -1902,8 +1904,7 @@ class TestCuteDslFusedMoeFunctional:
         if is_sm107():
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
-                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
-                "situ_linear_beta"
+                "dispatcher accepts only plain SwiGLU or ReLU2"
             )
         from flashinfer import cute_dsl_fused_moe
 
@@ -2256,8 +2257,12 @@ class TestCuteDslMoEWrapper:
     )
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     @pytest.mark.parametrize("num_experts", [256, 384])
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
     def test_wrapper_cuda_graph(
         self,
+        activation_type: ActivationType,
         num_tokens: int,
         num_experts: int,
         quant_mode: str,
@@ -2265,7 +2270,7 @@ class TestCuteDslMoEWrapper:
         use_fused_finalize: bool,
     ):
         """Test wrapper API with CUDA graph capture and replay."""
-        if is_sm107():
+        if is_sm107() and activation_type == ActivationType.Swiglu:
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
                 "SwiGLU constants (swiglu_alpha/beta/limit)"
@@ -2274,6 +2279,7 @@ class TestCuteDslMoEWrapper:
 
         hidden_size, intermediate_size = 256, 512
         top_k = 2
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -2282,6 +2288,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=gated,
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
@@ -2296,7 +2303,7 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=num_tokens,
-            activation_type=ActivationType.Swiglu,
+            activation_type=activation_type,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -2371,7 +2378,7 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation_type=ActivationType.Swiglu,
+            activation_type=activation_type,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -2404,11 +2411,8 @@ class TestCuteDslMoEWrapper:
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
 
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
+        if situ_beta is not None and is_sm107():
+            pytest.skip("SM107 gather grouped GEMM does not implement SiTU")
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
@@ -3143,6 +3147,9 @@ class TestAllValidTactics:
     pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    @pytest.mark.parametrize(
         "num_tokens,hidden_size,intermediate_size,num_experts,top_k",
         [
             (128, 256, 512, 256, 2),
@@ -3151,6 +3158,7 @@ class TestAllValidTactics:
     )
     def test_all_tactics_accuracy(
         self,
+        activation_type: ActivationType,
         num_tokens: int,
         hidden_size: int,
         intermediate_size: int,
@@ -3161,6 +3169,7 @@ class TestAllValidTactics:
         from flashinfer import CuteDslMoEWrapper
 
         num_local_experts = num_experts
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -3169,6 +3178,7 @@ class TestAllValidTactics:
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             top_k=top_k,
+            gated=gated,
         )
 
         ref_output = compute_reference_moe_fp4(
@@ -3185,6 +3195,7 @@ class TestAllValidTactics:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            activation_type=activation_type,
         )
 
         # Create wrapper without CUDA graph so we can freely try different tile_sizes
@@ -3194,6 +3205,7 @@ class TestAllValidTactics:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            activation_type=activation_type,
         )
 
         # Get the filtered list of valid tactics for this problem size
