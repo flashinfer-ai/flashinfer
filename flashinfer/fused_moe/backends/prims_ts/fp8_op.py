@@ -560,17 +560,21 @@ def prims_ts_fp8_block_scale_moe(
     num_fused_shared_experts : Optional[int]
         Number of fused shared experts (default ``None`` / ``0``).
     activation_type : int
-        Activation enum value (default Swiglu).
+        Activation enum value (default Swiglu). Block-scale Prims-TS supports
+        SiTU for both DeepSeek FP8 and MXFP8. SiTU computes
+        ``beta*tanh(X1/beta) * alpha*tanh(X2/alpha)*sigmoid(X2)``.
     norm_topk_prob : bool
         Normalize top-k routing probabilities.
     routing_replay_out : Optional[torch.Tensor]
         Optional buffer that captures selected expert IDs.
     gemm1_alpha : Optional[torch.Tensor]
-        Optional per-expert SwiGLU alpha.
+        Optional per-expert SwiGLU alpha or SiTU gate tanh scale. SiTU uses
+        ``1.0`` when omitted.
     gemm1_beta : Optional[torch.Tensor]
-        Optional per-expert SwiGLU beta.
+        Optional per-expert SwiGLU beta or SiTU linear tanh scale. SiTU uses
+        ``1.0`` when omitted.
     gemm1_clamp_limit : Optional[torch.Tensor]
-        Optional per-expert clamp limit.
+        Optional per-expert gated-activation clamp limit.
     output : Optional[torch.Tensor]
         Optional in-place output tensor.
     gemm1_bias : Optional[torch.Tensor]
@@ -719,13 +723,17 @@ def prims_ts_fp8_block_scale_routed_moe(
     fp8_quantization_type : Fp8QuantizationType
         Block-scale recipe (DeepSeek FP8 or MXFP8).
     activation_type : int
-        Activation enum value (default Swiglu).
+        Activation enum value (default Swiglu). Block-scale Prims-TS supports
+        SiTU for both DeepSeek FP8 and MXFP8. SiTU computes
+        ``beta*tanh(X1/beta) * alpha*tanh(X2/alpha)*sigmoid(X2)``.
     gemm1_alpha : Optional[torch.Tensor]
-        Optional per-expert SwiGLU alpha.
+        Optional per-expert SwiGLU alpha or SiTU gate tanh scale. SiTU uses
+        ``1.0`` when omitted.
     gemm1_beta : Optional[torch.Tensor]
-        Optional per-expert SwiGLU beta.
+        Optional per-expert SwiGLU beta or SiTU linear tanh scale. SiTU uses
+        ``1.0`` when omitted.
     gemm1_clamp_limit : Optional[torch.Tensor]
-        Optional per-expert clamp limit.
+        Optional per-expert gated-activation clamp limit.
     gemm1_bias : Optional[torch.Tensor]
         Optional FC1 bias (keyword-only).
     gemm2_bias : Optional[torch.Tensor]

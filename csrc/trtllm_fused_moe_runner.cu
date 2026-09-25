@@ -498,6 +498,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.mDtypeElt = args.mDtypeElt;
   activationData.mUsePdl = enablePdl;
   activationData.mUseDeepSeekFp8 = true;
+  activationData.mUseSitu = args.activation_type == ActivationType::Situ;
   activationData.inPtr = workspace.gemm1_output;
   activationData.outPtr = workspace.activation_output;
   activationData.inDqSfsPtr = workspace.gemm1_output_scale;
@@ -510,8 +511,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 
   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
 
-  // SwiGLU OAI controls. The fused-epilogue paths get these through the FC1 GEMM instead; this
-  // kernel only runs for DeepSeek FP8, where FC1 has no fused activation to carry them.
+  // Per-expert gated-activation controls. The fused-epilogue paths get these through the FC1 GEMM
+  // instead; this kernel only runs for DeepSeek FP8, where FC1 has no fused activation to carry
+  // them.
   activationData.gatedActAlphaPtr = args.gemm1_alpha;
   activationData.gatedActBetaPtr = args.gemm1_beta;
   activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
@@ -694,8 +696,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   int32_t* permutedIdxToBiasRowIdx = args.gemm1_bias_type == batchedGemm::gemm::BiasType::Mn
                                          ? workspace.permuted_idx_to_expanded_idx
                                          : nullptr;
-  // DeepSeek FP8 activates in a separate kernel (see below), which owns the SwiGLU OAI controls.
-  // Keep them out of the FC1 GEMM there so they can only ever be applied once.
+  // DeepSeek FP8 activates in a separate kernel (see below), which owns the gated-activation
+  // controls. Keep them out of the FC1 GEMM there so they can only ever be applied once.
   bool const useUnfusedActivation = args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8;
   float* const gemm1Alpha = useUnfusedActivation ? nullptr : args.gemm1_alpha;
   float* const gemm1Beta = useUnfusedActivation ? nullptr : args.gemm1_beta;

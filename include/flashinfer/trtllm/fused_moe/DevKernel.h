@@ -166,6 +166,7 @@ struct Data {
   tg::Dtype mDtypeElt{tg::Dtype::Fp16};
   bool mUsePdl{false};
   bool mUseDeepSeekFp8{false};
+  bool mUseSitu{false};
 
   void* inPtr;
   void* outPtr;
@@ -179,10 +180,10 @@ struct Data {
 
   int32_t const* totalNumPaddedTokens;
 
-  // Optional per-local-expert SwiGLU OAI controls, [localNumExperts] each. Null means the
-  // neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to plain SwiGLU.
-  // The trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation
-  // kernel below (DeepSeek FP8) has to apply them itself.
+  // Optional per-local-expert gated-activation controls, [localNumExperts] each. For SwiGLU,
+  // null means alpha=1, beta=0, no clamp. For SiTU, null means alpha=1, beta=1, no clamp.
+  // The trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation kernel
+  // below (DeepSeek FP8) has to apply them itself.
   float const* gatedActAlphaPtr = nullptr;
   float const* gatedActBetaPtr = nullptr;
   float const* gatedActClampLimitPtr = nullptr;
@@ -211,6 +212,7 @@ struct KernelParams {
 
   int32_t const* totalNumPaddedTokens;
 
+  bool useSitu{false};
   float const* gatedActAlphaPtr = nullptr;
   float const* gatedActBetaPtr = nullptr;
   float const* gatedActClampLimitPtr = nullptr;
@@ -232,6 +234,7 @@ struct KernelParams {
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
 
+    params.useSitu = data.mUseSitu;
     params.gatedActAlphaPtr = data.gatedActAlphaPtr;
     params.gatedActBetaPtr = data.gatedActBetaPtr;
     params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
