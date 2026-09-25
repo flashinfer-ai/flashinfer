@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from flashinfer import prefill
+from flashinfer import BatchAttentionWithAttentionSinkWrapper, prefill
 from flashinfer.jit import core
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.attention import modules as attention_modules
@@ -236,6 +236,20 @@ def test_attention_sink_stays_independent_full(generated_sources):
         ).read_text()
         assert "/*SAME_KV_STRIDES=*/true" not in paged_text
         assert "/*SAME_KV_STRIDES=*/false" in paged_text
+
+
+def test_attention_sink_wrapper_uri_depends_on_kv_dtype(monkeypatch):
+    uris = []
+    monkeypatch.setattr(
+        prefill.BatchPrefillWithPagedKVCacheWrapper,
+        "__init__",
+        lambda self, **kwargs: uris.append(kwargs["jit_args"][0]),
+    )
+    for dtype_kv in (torch.bfloat16, torch.float8_e4m3fn):
+        BatchAttentionWithAttentionSinkWrapper(
+            torch.empty(0, dtype=torch.uint8), backend="fa2", kv_data_type=dtype_kv
+        )
+    assert uris[0] != uris[1]
 
 
 def test_batch_prefill_nvfp4_requires_sf_tensors():
