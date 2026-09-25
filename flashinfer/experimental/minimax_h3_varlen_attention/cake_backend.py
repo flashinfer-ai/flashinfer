@@ -70,8 +70,11 @@ Two program families share this package:
   tile tables' workspace and the ``combine`` stage finishes them after the
   attention launch (an ordinary serial launch on the same stream).  Two
   attention programs are registered per architecture -- the dense
-  ``attention`` (no K/V-split code) and ``attention_split`` -- and the runner
-  binds the one the plan needs (:func:`nvfp4_attention_stage`).
+  ``attention`` (the first delivery's kernel: no K/V-split code, no split
+  parameters) and ``attention_split`` (six more parameters: K/V range,
+  partial slots, partial workspace, unit count) -- and the runner binds the
+  one the plan needs with that program's parameter set
+  (:func:`nvfp4_attention_stage`).
 
 See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 """
@@ -208,6 +211,9 @@ QUANTIZE_QKV_KWARGS = (
 QUANTIZE_QK_FP8V_KWARGS = (
     QUANTIZE_COMMON_KWARGS + ("v_fp8", "v_amax") + QUANTIZE_TAIL_KWARGS
 )
+# The dense ``attention`` program takes the five scheduler tables (the first
+# delivery's kernel signature); the ``attention_split`` program adds the K/V
+# range and partial-slot tables, the partial workspace and the unit count.
 NVFP4_ATTENTION_COMMON_KWARGS = (
     "Q",
     "K",
@@ -219,17 +225,19 @@ NVFP4_ATTENTION_COMMON_KWARGS = (
     "cl_seg_len",
     "cl_kv_base",
     "cl_q_block",
+    "total_clusters",
+    "heads",
+    "PB",
+    "softmax_scale_log2",
+    "grid",
+)
+NVFP4_ATTENTION_SPLIT_KWARGS = (
     "cl_kv_begin",
     "cl_kv_blocks",
     "cl_ws_slot",
     "partial_O",
     "partial_ML",
     "num_tiles",
-    "total_clusters",
-    "heads",
-    "PB",
-    "softmax_scale_log2",
-    "grid",
 )
 NVFP4_ATTENTION_FP4PV_KWARGS = NVFP4_ATTENTION_COMMON_KWARGS + (
     "Vt",
@@ -237,6 +245,14 @@ NVFP4_ATTENTION_FP4PV_KWARGS = NVFP4_ATTENTION_COMMON_KWARGS + (
     "SFVtHi",
 )
 NVFP4_ATTENTION_FP8PV_KWARGS = NVFP4_ATTENTION_COMMON_KWARGS + ("V", "v_amax")
+NVFP4_ATTENTION_SPLIT_FP4PV_KWARGS = (
+    NVFP4_ATTENTION_COMMON_KWARGS
+    + NVFP4_ATTENTION_SPLIT_KWARGS
+    + ("Vt", "SFVtLo", "SFVtHi")
+)
+NVFP4_ATTENTION_SPLIT_FP8PV_KWARGS = (
+    NVFP4_ATTENTION_COMMON_KWARGS + NVFP4_ATTENTION_SPLIT_KWARGS + ("V", "v_amax")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1350,7 +1366,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
     )
     stage_kwargs: dict[str, dict] = {"quantize": quantize_kwargs}
     total_tiles = tiles.total_tiles
-    attention_kwargs = dict(
+    attention_common = dict(
         Q=workspace["q_fp4"],
         K=workspace["k_fp4"],
         SFQ=workspace["q_scale"],
@@ -1361,31 +1377,49 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         cl_seg_len=tiles.cl_seg_len,
         cl_kv_base=tiles.cl_kv_base,
         cl_q_block=tiles.cl_q_block,
-        cl_kv_begin=tiles.cl_kv_begin,
-        cl_kv_blocks=tiles.cl_kv_blocks,
-        cl_ws_slot=tiles.cl_ws_slot,
-        partial_O=tiles.partial_O,
-        partial_ML=tiles.partial_ML,
-        num_tiles=total_tiles,
         total_clusters=int(plan.total_clusters),
         heads=num_heads,
         PB=PB,
         softmax_scale_log2=float(softmax_scale) / math.log(2.0),
         grid=_persistent_grid(device, total_tiles, at_least_one=True),
     )
+    attention_split_extra = dict(
+        cl_kv_begin=tiles.cl_kv_begin,
+        cl_kv_blocks=tiles.cl_kv_blocks,
+        cl_ws_slot=tiles.cl_ws_slot,
+        partial_O=tiles.partial_O,
+        partial_ML=tiles.partial_ML,
+        num_tiles=total_tiles,
+    )
     if pv_mode == "fp4":
-        attention_kwargs.update(
+        pv_operands = dict(
             Vt=workspace["v_fp4_t"],
             SFVtLo=workspace["v_scale_lo"],
             SFVtHi=workspace["v_scale_hi"],
         )
-        assert tuple(attention_kwargs) == NVFP4_ATTENTION_FP4PV_KWARGS
+        dense_names, split_names = (
+            NVFP4_ATTENTION_FP4PV_KWARGS,
+            NVFP4_ATTENTION_SPLIT_FP4PV_KWARGS,
+        )
     else:
-        attention_kwargs.update(V=workspace["v_fp8"], v_amax=workspace["v_amax"])
-        assert tuple(attention_kwargs) == NVFP4_ATTENTION_FP8PV_KWARGS
-    # Both attention programs take the same bindings; exactly one is bound.
+        pv_operands = dict(V=workspace["v_fp8"], v_amax=workspace["v_amax"])
+        dense_names, split_names = (
+            NVFP4_ATTENTION_FP8PV_KWARGS,
+            NVFP4_ATTENTION_SPLIT_FP8PV_KWARGS,
+        )
+    # The dense program takes the first delivery's parameter set, the split
+    # program additionally the K/V range / partial-slot tables, the partial
+    # workspace and the unit count; exactly one of them is bound.
+    attention_kwargs = {**attention_common, **pv_operands}
+    attention_split_kwargs = {
+        **attention_common,
+        **attention_split_extra,
+        **pv_operands,
+    }
+    assert tuple(attention_kwargs) == dense_names
+    assert tuple(attention_split_kwargs) == split_names
     stage_kwargs["attention"] = attention_kwargs
-    stage_kwargs["attention_split"] = attention_kwargs
+    stage_kwargs["attention_split"] = attention_split_kwargs
     stage_kwargs["combine"] = combine_kwargs(
         tiles.partial_O,
         tiles.partial_ML,

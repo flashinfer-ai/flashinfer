@@ -674,6 +674,25 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
         "quantize",
         "attention",
     ]
+    # The dense program takes the first delivery's parameter set; the split
+    # program's bindings add the K/V range / partial-slot tables, the partial
+    # workspace and the unit count.
+    dense_names, split_names = (
+        (
+            cake_backend.NVFP4_ATTENTION_FP4PV_KWARGS,
+            cake_backend.NVFP4_ATTENTION_SPLIT_FP4PV_KWARGS,
+        )
+        if pv_mode == "fp4"
+        else (
+            cake_backend.NVFP4_ATTENTION_FP8PV_KWARGS,
+            cake_backend.NVFP4_ATTENTION_SPLIT_FP8PV_KWARGS,
+        )
+    )
+    assert tuple(runner.stage_kwargs["attention"]) == dense_names
+    assert tuple(runner.stage_kwargs["attention_split"]) == split_names
+    assert set(split_names) - set(dense_names) == set(
+        cake_backend.NVFP4_ATTENTION_SPLIT_KWARGS
+    )
     assert runner.stage_kwargs["quantize"]["grid"] == (
         heads * 9 * QUANTIZE_SUBS_PER_BLOCK,
         1,
