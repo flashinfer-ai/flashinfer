@@ -108,6 +108,27 @@ def _get_prims_ts_module():
     return prims_ts
 
 
+def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
+    """Helper for checking if PrimTS supports the given dtypes."""
+    return (
+        (
+            q_dtype == torch.float16
+            and kv_dtype == torch.float16
+            and out_dtype == torch.float16
+        )
+        or (
+            q_dtype == torch.bfloat16
+            and kv_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+            and out_dtype == torch.bfloat16
+        )
+        or (
+            q_dtype == torch.float8_e4m3fn
+            and kv_dtype in (torch.float8_e4m3fn, torch.uint8)
+            and out_dtype in (torch.float16, torch.float8_e4m3fn)
+        )
+    )
+
+
 def _select_reference_output(outputs, priority):
     """Return the first available reference backend and output."""
     for backend in priority:
@@ -815,16 +836,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             backends.remove("auto")
 
     if "prims-ts" in backends:
-        if is_nvfp4_kv:
-            _drop_backend(backends, "prims-ts", "does not support NVFP4 K/V")
-        elif q_dtype != kv_dtype:
-            _drop_backend(backends, "prims-ts", "requires matching Q and K/V dtypes")
-        elif v_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        if not _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, o_data_type):
             _drop_backend(
-                backends, "prims-ts", "supports only FP16, BF16, or FP8-E4M3 V"
+                backends,
+                "prims-ts",
+                "does not support the requested Q/KV/output dtype combination",
             )
         elif v_dtype != kv_dtype and not (
-            kv_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+            q_dtype == kv_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
         ):
             _drop_backend(
                 backends,
@@ -850,27 +869,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 backends,
                 "prims-ts",
                 "requires an integral Q/KV head ratio between 1 and 128",
-            )
-        elif q_dtype == torch.bfloat16 and o_data_type != torch.bfloat16:
-            _drop_backend(
-                backends,
-                "prims-ts",
-                "requires BF16 output for BF16 inputs",
-            )
-        elif q_dtype == torch.float16 and o_data_type != torch.float16:
-            _drop_backend(
-                backends,
-                "prims-ts",
-                "requires FP16 output for FP16 inputs",
-            )
-        elif q_dtype == torch.float8_e4m3fn and o_data_type not in (
-            torch.float8_e4m3fn,
-            torch.float16,
-        ):
-            _drop_backend(
-                backends,
-                "prims-ts",
-                "supports FP16 or FP8 output for FP8 inputs",
             )
         elif args.enable_pdl:
             print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
@@ -1089,10 +1087,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q = q.to(q_dtype)
     if is_nvfp4_kv:
-        # NVFP4 KV requires FP8 query
-        if q_dtype != torch.float8_e4m3fn:
-            print("[ERROR] NVFP4 KV cache requires --q_dtype fp8_e4m3.")
-            return res
         kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
             kv_cache[:, 0], kv_cache[:, 1]
         )
@@ -1110,6 +1104,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             kv_cache_for_trt = torch.cat([k_fp8, v_fp8], dim=1)
 
     prims_ts_kv_cache = None
+    prims_ts_kv_scale_factors = None
     prims_ts_out = None
     prims_ts_bmm2_scale = None
     if "prims-ts" in backends:
@@ -1126,7 +1121,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         # PrimTS accepts compact HND pages, so preserve the logical values in a
         # backend-specific compact cache. Matching K/V dtypes keep the combined
         # cache so both operands stay in one allocation.
-        if v_dtype != kv_dtype:
+        prims_ts_v_scale = v_scale
+        if is_nvfp4_kv:
+            prims_ts_kv_cache = tuple(cache.contiguous() for cache in kv_cache_nvfp4)
+            prims_ts_kv_scale_factors = tuple(
+                scale_factors.contiguous() for scale_factors in kv_cache_sf
+            )
+        elif v_dtype != kv_dtype:
             prims_ts_k_cache = kv_cache[:, 0].contiguous()
             prims_ts_v_cache, prims_ts_v_scale_t = to_float8(
                 kv_cache[:, 1].contiguous(), v_dtype
@@ -1140,7 +1141,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             if "trtllm-gen" in backends:
                 kv_cache_for_trt[:, 1].copy_(v_dequant)
         else:
-            prims_ts_v_scale = v_scale
             prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
@@ -1249,6 +1249,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 kv_cache,
                 None,
                 block_tables,
+                kv_scale_factors=prims_ts_kv_scale_factors,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=prims_ts_bmm2_scale,
                 out=out,
@@ -1341,6 +1342,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 prims_ts_kv_cache,
                 None,
                 block_tables,
+                kv_scale_factors=prims_ts_kv_scale_factors,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=prims_ts_bmm2_scale,
                 out=prims_ts_out,

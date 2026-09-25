@@ -38,25 +38,22 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..fmha_decode_config import FmhaDecodeConfig
 from ...placeholder_helpers import _placeholder_smem_array
+from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
-    Constexpr,
-    DecodeGenResourceBase,
-    ResourceVars,
-    fadd2,
-    ffma2,
-    fmul2,
     _TASK_CACHE_LANE_IDX,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_WARP_IDX,
+    Constexpr,
+    DecodeGenResourceBase,
+    ResourceVars,
+    _attention_sink_head_stride,
     _decode_gen_task_cache,
     _keeps_col_base,
     _keeps_row_idx,
     _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
-    _attention_sink_head_stride,
     _local_head_from_q_output_row,
     _logical_head_batch,
     _logical_q_group_idx,
@@ -69,6 +66,9 @@ from .helpers_common import (
     _neg_max_f32,
     _pack_float2_to_bf16,
     _pack_float2_to_fp16,
+    fadd2,
+    ffma2,
+    fmul2,
 )
 from .helpers_kv_tile_idx import (
     _load_runtime_seq_len_kv,
@@ -671,14 +671,15 @@ class TmemCorrResource(DecodeGenResourceBase):
         num_o_chunks: Constexpr[int],
         output_f32_regs: Constexpr[int],
     ) -> tuple[cutlass.Array, cutlass.Array]:
-        """Load matching chunks from the two final Swaps O stages."""
+        """Load matching chunks from the active final Swaps O stages."""
         cfg = self.cfg
         o0_vals = cutlass.Array(
             Float32, output_f32_regs, space=cutlass.AddressSpace.rmem
         )
-        o1_vals = cutlass.Array(
-            Float32, output_f32_regs, space=cutlass.AddressSpace.rmem
-        )
+        if cutlass.const_expr(cfg.num_insts_kv != 1):
+            o1_vals = cutlass.Array(
+                Float32, output_f32_regs, space=cutlass.AddressSpace.rmem
+            )
         for chunk_idx in cutlass.range_constexpr(num_o_chunks):
             o0_loaded = prims.tcgen05_ld(
                 "16x256b",
@@ -688,18 +689,23 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
                 num=q_repeats,
             )
-            o1_loaded = prims.tcgen05_ld(
-                "16x256b",
-                prims.make_tmem_ptr(
-                    base_addr1 + Int32(cfg.swaps_o_chunk_tmem_offset(chunk_idx)),
-                    Float32,
-                ),
-                num=q_repeats,
-            )
+            if cutlass.const_expr(cfg.num_insts_kv != 1):
+                o1_loaded = prims.tcgen05_ld(
+                    "16x256b",
+                    prims.make_tmem_ptr(
+                        base_addr1 + Int32(cfg.swaps_o_chunk_tmem_offset(chunk_idx)),
+                        Float32,
+                    ),
+                    num=q_repeats,
+                )
             for reg_idx in cutlass.range_constexpr(4 * q_repeats):
                 o0_vals[chunk_idx * 4 * q_repeats + reg_idx] = o0_loaded[reg_idx]
-                o1_vals[chunk_idx * 4 * q_repeats + reg_idx] = o1_loaded[reg_idx]
+                if cutlass.const_expr(cfg.num_insts_kv != 1):
+                    o1_vals[chunk_idx * 4 * q_repeats + reg_idx] = o1_loaded[reg_idx]
         cute.arch.fence_view_async_tmem_load()
+        if cutlass.const_expr(cfg.num_insts_kv == 1):
+            # Preserve the return shape; one-instance epilogues only consume o0.
+            return o0_vals, o0_vals
         return o0_vals, o1_vals
 
     @cute.jit
@@ -1069,8 +1075,8 @@ class TmemCorrResource(DecodeGenResourceBase):
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
-        if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
-            # Since P is scaled to [0, 448] for Fused GMEM/cluster FP8-Q,
+        if cutlass.const_expr(cfg.use_fp8_pv):
+            # Since P is scaled to [0, 448] for fused GMEM/cluster FP8-P,
             # divide the partial O by 448 before narrowing it to 16 bits,
             # and restore after the partials have been reduced in FP32.
             norm_scale *= Float32(448.0)
@@ -2860,7 +2866,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
 
         if cutlass.const_expr(
-            cfg.use_fp8_qkv
+            cfg.use_fp8_pv
             and cfg.use_fp8_output
             and cfg.tile_size_q == 128
             and cfg.headdim == 128
@@ -2937,7 +2943,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             partial_norm_scale = Float32(1.0)
             if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                 partial_norm_scale = self._separate_partial_norm_scale(reduced_sum_0)
-            elif cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
+            elif cutlass.const_expr(cfg.use_fp8_pv):
                 partial_norm_scale = Float32(1.0 / 448.0)
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             partial_o_row_base = self._gmem_partial_row_offset(
@@ -2987,9 +2993,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                             ),
                         )
                     if cutlass.const_expr(
-                        cfg.use_separate_reduction_kernel
-                        or cfg.use_fp8_qkv
-                        or cfg.v_dtype_bytes == 1
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_pv
                     ):
                         partial_pair = fmul2(
                             (partial_norm_scale, partial_norm_scale), partial_pair
@@ -3525,6 +3529,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             # Split-KV tail: separate reduction stores normalized 16-bit O
             # plus log2-LSE; fused GMEM/cluster retains unnormalized O plus
             # max/sum state.
+            # Fused GMEM/CGA divides FP8-Q partials by the E4M3 P quantization
+            # scale before narrowing; other fused partials remain unnormalized.
             logical_h_k_idx, logical_b_idx = _logical_head_batch(
                 stage_info, self.h_k_idx, self.b_idx
             )
@@ -3536,11 +3542,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-            if cutlass.const_expr(
-                cfg.use_separate_reduction_kernel
-                or cfg.use_fp8_qkv
-                or cfg.v_dtype_bytes == 1
-            ):
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_pv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
                     norm_scale = Float32(1.0 / 448.0)
                     if cutlass.const_expr(cfg.use_separate_reduction_kernel):
@@ -3556,34 +3558,38 @@ class TmemCorrResource(DecodeGenResourceBase):
             for pair_idx in cutlass.range_constexpr(output_pair_regs):
                 # Separate reduction includes this split's reciprocal sum;
                 # fused reduction delays normalization until the final merge.
+                # FP8-P fused reduction removes the 448x P quantization scale
+                # so the unnormalized numerator fits the 16-bit scratch.
                 scale_base = ((pair_idx % (2 * q_repeats)) // 2) * 2
                 reg_base = pair_idx * 2
                 partial_scale0 = (
                     (final_scale0[scale_base], final_scale0[scale_base + 1])
                     if cutlass.const_expr(
-                        cfg.use_separate_reduction_kernel
-                        or cfg.use_fp8_qkv
-                        or cfg.v_dtype_bytes == 1
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_pv
                     )
                     else (exp_scale0[scale_base], exp_scale0[scale_base + 1])
                 )
                 partial_scale1 = (
                     (final_scale1[scale_base], final_scale1[scale_base + 1])
                     if cutlass.const_expr(
-                        cfg.use_separate_reduction_kernel
-                        or cfg.use_fp8_qkv
-                        or cfg.v_dtype_bytes == 1
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_pv
                     )
                     else (exp_scale1[scale_base], exp_scale1[scale_base + 1])
                 )
-                partial_pair = ffma2(
-                    partial_scale0,
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        partial_scale1,
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    partial_pair = fmul2(
+                        partial_scale0,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    partial_pair = ffma2(
+                        partial_scale0,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            partial_scale1,
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                        ),
+                    )
                 if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                     regs_partial_o[pair_idx] = self._pack_separate_partial_o_pair(
                         partial_pair[0], partial_pair[1]
@@ -3698,28 +3704,40 @@ class TmemCorrResource(DecodeGenResourceBase):
                 scale_base1 = ((pair_idx1 % (2 * q_repeats)) // 2) * 2
                 reg_base0 = pair_idx0 * 2
                 reg_base1 = pair_idx1 * 2
-                final_pair0 = ffma2(
-                    (final_scale0[scale_base0], final_scale0[scale_base0 + 1]),
-                    (o0_vals[reg_base0], o0_vals[reg_base0 + 1]),
-                    fmul2(
-                        (
-                            final_scale1[scale_base0],
-                            final_scale1[scale_base0 + 1],
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair0 = fmul2(
+                        (final_scale0[scale_base0], final_scale0[scale_base0 + 1]),
+                        (o0_vals[reg_base0], o0_vals[reg_base0 + 1]),
+                    )
+                else:
+                    final_pair0 = ffma2(
+                        (final_scale0[scale_base0], final_scale0[scale_base0 + 1]),
+                        (o0_vals[reg_base0], o0_vals[reg_base0 + 1]),
+                        fmul2(
+                            (
+                                final_scale1[scale_base0],
+                                final_scale1[scale_base0 + 1],
+                            ),
+                            (o1_vals[reg_base0], o1_vals[reg_base0 + 1]),
                         ),
-                        (o1_vals[reg_base0], o1_vals[reg_base0 + 1]),
-                    ),
-                )
-                final_pair1 = ffma2(
-                    (final_scale0[scale_base1], final_scale0[scale_base1 + 1]),
-                    (o0_vals[reg_base1], o0_vals[reg_base1 + 1]),
-                    fmul2(
-                        (
-                            final_scale1[scale_base1],
-                            final_scale1[scale_base1 + 1],
+                    )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair1 = fmul2(
+                        (final_scale0[scale_base1], final_scale0[scale_base1 + 1]),
+                        (o0_vals[reg_base1], o0_vals[reg_base1 + 1]),
+                    )
+                else:
+                    final_pair1 = ffma2(
+                        (final_scale0[scale_base1], final_scale0[scale_base1 + 1]),
+                        (o0_vals[reg_base1], o0_vals[reg_base1 + 1]),
+                        fmul2(
+                            (
+                                final_scale1[scale_base1],
+                                final_scale1[scale_base1 + 1],
+                            ),
+                            (o1_vals[reg_base1], o1_vals[reg_base1 + 1]),
                         ),
-                        (o1_vals[reg_base1], o1_vals[reg_base1 + 1]),
-                    ),
-                )
+                    )
                 # bmm2_scale is already folded into ``final_scale*`` above.
                 regs_o[packed_idx] = _pack_float4_to_fp8_e4m3(
                     final_pair0[0],
@@ -3733,17 +3751,23 @@ class TmemCorrResource(DecodeGenResourceBase):
                 # to the final output dtype.
                 scale_base = ((pair_idx % (2 * q_repeats)) // 2) * 2
                 reg_base = pair_idx * 2
-                final_pair = ffma2(
-                    (final_scale0[scale_base], final_scale0[scale_base + 1]),
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        (
-                            final_scale1[scale_base],
-                            final_scale1[scale_base + 1],
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair = fmul2(
+                        (final_scale0[scale_base], final_scale0[scale_base + 1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    final_pair = ffma2(
+                        (final_scale0[scale_base], final_scale0[scale_base + 1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            (
+                                final_scale1[scale_base],
+                                final_scale1[scale_base + 1],
+                            ),
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
                         ),
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                    )
                 if cutlass.const_expr(cfg.use_bf16_output):
                     regs_o[pair_idx] = _pack_float2_to_bf16(
                         final_pair[0], final_pair[1]
@@ -3899,14 +3923,20 @@ class TmemCorrResource(DecodeGenResourceBase):
             final_scale0[scale_idx] = Float32(0.0)
             final_scale1[scale_idx] = Float32(0.0)
 
-        final_sums = ffma2(
-            (exp_scale0[0], exp_scale0[1]),
-            (inst0_sum_arr[0], inst0_sum_arr[1]),
-            fmul2(
-                (exp_scale1[0], exp_scale1[1]),
-                (inst1_sum_arr[0], inst1_sum_arr[1]),
-            ),
-        )
+        if cutlass.const_expr(cfg.num_insts_kv == 1):
+            final_sums = fmul2(
+                (exp_scale0[0], exp_scale0[1]),
+                (inst0_sum_arr[0], inst0_sum_arr[1]),
+            )
+        else:
+            final_sums = ffma2(
+                (exp_scale0[0], exp_scale0[1]),
+                (inst0_sum_arr[0], inst0_sum_arr[1]),
+                fmul2(
+                    (exp_scale1[0], exp_scale1[1]),
+                    (inst1_sum_arr[0], inst1_sum_arr[1]),
+                ),
+            )
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             final_sum[scale_idx] = final_sums[scale_idx]
 
@@ -3982,9 +4012,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
         )
-        base_addr1 = self._swaps_o_stage_base_addr(
-            tmem_row_base, o_base_col, tail_o_stage_idx_1
-        )
+        base_addr1 = base_addr0
+        if cutlass.const_expr(cfg.num_insts_kv != 1):
+            base_addr1 = self._swaps_o_stage_base_addr(
+                tmem_row_base, o_base_col, tail_o_stage_idx_1
+            )
         output_pair_regs = cfg.num_fp16_output_regs
         output_f32_regs = output_pair_regs * 2
         num_o_chunks = cfg.headdim // 64
@@ -4020,11 +4052,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-            if cutlass.const_expr(
-                cfg.use_separate_reduction_kernel
-                or cfg.use_fp8_qkv
-                or cfg.v_dtype_bytes == 1
-            ):
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_pv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
                     norm_scale = Float32(1.0 / 448.0)
                     if cutlass.const_expr(cfg.use_separate_reduction_kernel):
@@ -4036,6 +4064,8 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             # Store normalized 16-bit O for the standalone reducer, or preserve
             # unnormalized 16-bit O for fused GMEM/cluster reduction.
+            # FP8-P fused reduction removes the 448x P quantization scale before
+            # storing the unnormalized O numerator in the 16-bit scratch.
             regs_partial_o = cutlass.Array(
                 Int32,
                 cfg.num_fp16_output_regs,
@@ -4044,31 +4074,33 @@ class TmemCorrResource(DecodeGenResourceBase):
             partial_scale0_pair = (
                 (final_scale0[0], final_scale0[1])
                 if cutlass.const_expr(
-                    cfg.use_separate_reduction_kernel
-                    or cfg.use_fp8_qkv
-                    or cfg.v_dtype_bytes == 1
+                    cfg.use_separate_reduction_kernel or cfg.use_fp8_pv
                 )
                 else (exp_scale0[0], exp_scale0[1])
             )
             partial_scale1_pair = (
                 (final_scale1[0], final_scale1[1])
                 if cutlass.const_expr(
-                    cfg.use_separate_reduction_kernel
-                    or cfg.use_fp8_qkv
-                    or cfg.v_dtype_bytes == 1
+                    cfg.use_separate_reduction_kernel or cfg.use_fp8_pv
                 )
                 else (exp_scale1[0], exp_scale1[1])
             )
             for reg_idx in cutlass.range_constexpr(cfg.num_fp16_output_regs):
                 reg_base = reg_idx * 2
-                partial_pair = ffma2(
-                    partial_scale0_pair,
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        partial_scale1_pair,
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    partial_pair = fmul2(
+                        partial_scale0_pair,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    partial_pair = ffma2(
+                        partial_scale0_pair,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            partial_scale1_pair,
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                        ),
+                    )
                 if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                     regs_partial_o[reg_idx] = self._pack_separate_partial_o_pair(
                         partial_pair[0], partial_pair[1]
@@ -4180,22 +4212,34 @@ class TmemCorrResource(DecodeGenResourceBase):
                 pair_idx1 = pair_idx0 + 1
                 src_idx0 = pair_idx0 * 2
                 src_idx1 = pair_idx1 * 2
-                final_pair0 = ffma2(
-                    (final_scale0[0], final_scale0[1]),
-                    (o0_vals[src_idx0], o0_vals[src_idx0 + 1]),
-                    fmul2(
-                        (final_scale1[0], final_scale1[1]),
-                        (o1_vals[src_idx0], o1_vals[src_idx0 + 1]),
-                    ),
-                )
-                final_pair1 = ffma2(
-                    (final_scale0[0], final_scale0[1]),
-                    (o0_vals[src_idx1], o0_vals[src_idx1 + 1]),
-                    fmul2(
-                        (final_scale1[0], final_scale1[1]),
-                        (o1_vals[src_idx1], o1_vals[src_idx1 + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair0 = fmul2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx0], o0_vals[src_idx0 + 1]),
+                    )
+                else:
+                    final_pair0 = ffma2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx0], o0_vals[src_idx0 + 1]),
+                        fmul2(
+                            (final_scale1[0], final_scale1[1]),
+                            (o1_vals[src_idx0], o1_vals[src_idx0 + 1]),
+                        ),
+                    )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair1 = fmul2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx1], o0_vals[src_idx1 + 1]),
+                    )
+                else:
+                    final_pair1 = ffma2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx1], o0_vals[src_idx1 + 1]),
+                        fmul2(
+                            (final_scale1[0], final_scale1[1]),
+                            (o1_vals[src_idx1], o1_vals[src_idx1 + 1]),
+                        ),
+                    )
                 regs_o[packed_idx] = _pack_float4_to_fp8_e4m3(
                     final_pair0[0],
                     final_pair0[1],
@@ -4205,14 +4249,20 @@ class TmemCorrResource(DecodeGenResourceBase):
         else:
             for reg_idx in cutlass.range_constexpr(cfg.num_fp16_output_regs):
                 reg_base = reg_idx * 2
-                final_pair = ffma2(
-                    (final_scale0[0], final_scale0[1]),
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        (final_scale1[0], final_scale1[1]),
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair = fmul2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    final_pair = ffma2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            (final_scale1[0], final_scale1[1]),
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                        ),
+                    )
                 if cutlass.const_expr(cfg.use_bf16_output):
                     regs_o[reg_idx] = _pack_float2_to_bf16(final_pair[0], final_pair[1])
                 else:
@@ -4557,6 +4607,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
         o_base_col = self.tmem_o_ref._alloc.offset
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+
+        if cutlass.const_expr(not self._owns_final_epilogue()):
+            return
 
         if cutlass.const_expr(cfg.use_keeps_mma_ab):
             # KeepsMmaAb finalization is owned by the last active K/V instance.

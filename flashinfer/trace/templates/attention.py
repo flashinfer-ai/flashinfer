@@ -906,9 +906,31 @@ def _fmha_q_schema(q_mode: str):
     )
 
 
+class _FmhaDecodeTraceTemplatePatch(TraceTemplate):
+    """Preserve unpacked decode names while distinguishing packed NVFP4."""
+
+    def definition_name(self, axis_values: dict[str, int]) -> str:
+        name = super().definition_name(axis_values)
+        head_dim = axis_values.get("head_dim")
+        storage_head_dim = axis_values.get("kv_storage_head_dim")
+        if (
+            head_dim is not None
+            and storage_head_dim is not None
+            and storage_head_dim * 2 == head_dim
+        ):
+            return f"{name}_nvfp4"
+        return name
+
+
 def _add_fmha_cache_schema(
     inputs, axes, *, cache_param: str, combined: bool, encoded_page_size: int = 0
 ):
+    axes["kv_storage_head_dim"] = Const(
+        abbrev="", description="Stored K/V width; D/2 for packed NVFP4."
+    )
+    axes["kv_scale_groups"] = Var(
+        description="NVFP4 scale groups; one per 16 logical values."
+    )
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     if encoded_page_size:
         axes["storage_page_size"] = axes["page_size"]
@@ -927,17 +949,17 @@ def _add_fmha_cache_schema(
                 "kv_planes",
                 "num_kv_heads",
                 storage_axis,
-                "head_dim",
+                "kv_storage_head_dim",
             ]
         )
         return
     inputs["k_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", storage_axis, "head_dim"],
+        ["num_pages", "num_kv_heads", storage_axis, "kv_storage_head_dim"],
         param=cache_param,
         tuple_idx=0,
     )
     inputs["v_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", storage_axis, "head_dim"],
+        ["num_pages", "num_kv_heads", storage_axis, "kv_storage_head_dim"],
         param=cache_param,
         tuple_idx=1,
     )
@@ -1028,6 +1050,7 @@ def _make_attention_ts_decode_trace(
     *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: int = 0
 ):
     cache_form = "combined" if combined else "tuple"
+    storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
@@ -1064,6 +1087,20 @@ def _make_attention_ts_decode_trace(
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "seq_len_q": Scalar("int32", optional=True),
             "max_seq_len_q": Scalar("int32", optional=True),
             "mask_type": Scalar("string", optional=True),
@@ -1084,6 +1121,8 @@ def _make_attention_ts_decode_trace(
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (4, 8, 16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         *(
             ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
             if encoded_page_size
@@ -1110,7 +1149,7 @@ def _make_attention_ts_decode_trace(
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
@@ -1187,6 +1226,7 @@ def _make_prims_ts_decode_wrapper_trace(
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
     cache_form = "combined" if combined else "tuple"
+    storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
@@ -1275,6 +1315,20 @@ def _make_prims_ts_decode_wrapper_trace(
                 optional=q_mode != _Q_PACKED,
                 description="Cumulative Q offsets required by a packed-Q run.",
             ),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
             "validate": Scalar(
@@ -1287,6 +1341,8 @@ def _make_prims_ts_decode_wrapper_trace(
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (4, 8, 16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         *(
             ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
             if encoded_page_size
@@ -1311,7 +1367,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"

@@ -1181,6 +1181,7 @@ def test_attention_ts_trace_semantic_and_storage_pages(
     for definition in definitions:
         assert ("_encoded_page" in definition["name"]) == encoded
         assert definition["axes"]["page_size"]["value"] == semantic_page_size
+        assert definition["axes"]["kv_storage_head_dim"]["value"] == head_dim
         if encoded:
             assert definition["axes"]["storage_page_size"]["value"] == storage_page_size
             assert "optional" not in definition["inputs"]["semantic_page_size"]
@@ -1191,11 +1192,14 @@ def test_attention_ts_trace_semantic_and_storage_pages(
             *(["kv_planes"] if combined else []),
             "num_kv_heads",
             "storage_page_size" if encoded else "page_size",
-            "head_dim",
+            "kv_storage_head_dim",
         ]
-        for name, spec in definition["inputs"].items():
-            if "cache" in name:
-                assert spec["shape"] == shape
+        cache_names = (
+            ("paged_kv_cache", "kv_cache") if combined else ("k_cache", "v_cache")
+        )
+        for name in cache_names:
+            if name in definition["inputs"]:
+                assert definition["inputs"][name]["shape"] == shape
 
     wrapper = BatchDecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(

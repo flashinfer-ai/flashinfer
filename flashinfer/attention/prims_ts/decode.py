@@ -20,7 +20,7 @@ import functools
 import math
 import numbers
 import struct
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
 
@@ -34,6 +34,7 @@ from . import _q_token_kv_block_sparse_policy as _sparse_policy
 from ._block_sparse.common import _num_sparse_pattern_heads
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+PagedKVScaleFactors = tuple[torch.Tensor, torch.Tensor]
 
 if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
@@ -142,6 +143,8 @@ class _DecodeRuntime:
     q: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
+    k_sf_cache: torch.Tensor
+    v_sf_cache: torch.Tensor
     out: torch.Tensor
     num_physical_pages: int
     k_page_stride: int
@@ -663,13 +666,15 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
+        torch.uint8: "float4_e2m1fn",
     }
     try:
         return keys[dtype]
     except KeyError as error:
         raise NotImplementedError(
             "attention-ts decode supports torch.float16, torch.bfloat16, "
-            f"and torch.float8_e4m3fn; got {dtype}"
+            "torch.float8_e4m3fn, and packed NVFP4 K/V in torch.uint8; "
+            f"got {dtype}"
         ) from error
 
 
@@ -685,24 +690,28 @@ def _validate_dtype_pair(
     _dtype_key(k_dtype)
     _dtype_key(v_dtype)
     _dtype_key(output_dtype)
-    if k_dtype != q_dtype:
-        raise NotImplementedError(
-            "attention-ts decode requires Q and K to use the same dtype; "
-            f"got Q {q_dtype} and K {k_dtype}"
-        )
-    # V may keep its own dtype only for the supported QK-BF16/PV-FP8 path.
-    if v_dtype != q_dtype and not (
-        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
-    ):
-        raise NotImplementedError(
-            "attention-ts decode requires Q, K, and V to use the same dtype "
-            f"except for QK-BF16/PV-FP8; got Q {q_dtype} and V {v_dtype}"
-        )
+    matching_kv = k_dtype == v_dtype
     supported = (
-        (q_dtype == torch.float16 and output_dtype == torch.float16)
-        or (q_dtype == torch.bfloat16 and output_dtype == torch.bfloat16)
+        (
+            q_dtype == torch.float16
+            and k_dtype == v_dtype == torch.float16
+            and output_dtype == torch.float16
+        )
+        or (
+            q_dtype == torch.bfloat16
+            and output_dtype == torch.bfloat16
+            and (
+                (
+                    matching_kv
+                    and k_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+                )
+                or (k_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn)
+            )
+        )
         or (
             q_dtype == torch.float8_e4m3fn
+            and matching_kv
+            and k_dtype in (torch.float8_e4m3fn, torch.uint8)
             and output_dtype
             in (
                 (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -715,12 +724,34 @@ def _validate_dtype_pair(
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
             + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; got "
+                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
                 if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; got "
+                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
             )
-            + f"{q_dtype}->{output_dtype}"
+            + "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
+            + "and BF16 Q/K + FP8 V; got "
+            + f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
         )
+
+
+def _resolve_kv_dtypes(
+    q_dtype: torch.dtype,
+    k_dtype: Optional[torch.dtype],
+    v_dtype: Optional[torch.dtype],
+    kv_dtype: Optional[torch.dtype],
+) -> tuple[torch.dtype, torch.dtype]:
+    """Resolve the common-KV compatibility alias without hiding disagreement."""
+    if kv_dtype is not None:
+        if (k_dtype is not None and k_dtype != kv_dtype) or (
+            v_dtype is not None and v_dtype != kv_dtype
+        ):
+            raise ValueError("explicit K/V dtypes must agree with the common KV dtype")
+        k_dtype = v_dtype = kv_dtype
+    if k_dtype is None:
+        k_dtype = q_dtype
+    if v_dtype is None:
+        v_dtype = k_dtype
+    return k_dtype, v_dtype
 
 
 def _device_index(device: torch.device) -> int:
@@ -937,6 +968,7 @@ def _normalize_paged_kv_cache(
     paged_kv_cache: PagedKVCache,
     *,
     expected_device: torch.device,
+    logical_head_dim: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int, int, int]:
     """Return compact HND views for block-sparse and legacy paged paths."""
 
@@ -945,9 +977,65 @@ def _normalize_paged_kv_cache(
         expected_device=expected_device,
     )
     k_cache, v_cache = views[:2]
+    inferred_head_dim = views[5]
+    if logical_head_dim is not None and inferred_head_dim != logical_head_dim:
+        raise ValueError(
+            "paged_kv_cache storage head dimension does not match the logical "
+            f"head dimension {logical_head_dim}: got {int(k_cache.shape[-1])}"
+        )
     k_page_stride = _validate_hnd_inner_strides(k_cache, "K cache")
     v_page_stride = _validate_hnd_inner_strides(v_cache, "V cache")
     return (*views, k_page_stride, v_page_stride)
+
+
+def _normalize_paged_kv_scale_factors(
+    kv_scale_factors: Optional[PagedKVScaleFactors],
+    *,
+    k_cache: torch.Tensor,
+    logical_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate NVFP4 scale tensors or create homogeneous-mode placeholders."""
+
+    if k_cache.dtype != torch.uint8:
+        if kv_scale_factors is not None:
+            raise ValueError(
+                "kv_scale_factors are accepted only with packed NVFP4 torch.uint8 K/V"
+            )
+        placeholder = k_cache[0, 0, 0, :1].view(torch.uint8)[:1]
+        return placeholder, placeholder
+    if kv_scale_factors is None:
+        raise ValueError(
+            "packed NVFP4 torch.uint8 K/V requires kv_scale_factors=(K_SF, V_SF)"
+        )
+    if not isinstance(kv_scale_factors, tuple) or len(kv_scale_factors) != 2:
+        raise TypeError("kv_scale_factors must be a (K_SF, V_SF) tensor tuple")
+    k_sf_cache, v_sf_cache = kv_scale_factors
+    if not isinstance(k_sf_cache, torch.Tensor) or not isinstance(
+        v_sf_cache, torch.Tensor
+    ):
+        raise TypeError("kv_scale_factors tuple members must be torch.Tensor")
+    expected_shape = (*k_cache.shape[:-1], logical_head_dim // 16)
+    for scale, name in (
+        (k_sf_cache, "K scale factors"),
+        (v_sf_cache, "V scale factors"),
+    ):
+        if tuple(scale.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(scale.shape)}"
+            )
+        if scale.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"{name} must have dtype torch.float8_e4m3fn, got {scale.dtype}"
+            )
+        if scale.device != k_cache.device:
+            raise ValueError(f"{name} must be on {k_cache.device}, got {scale.device}")
+        _validate_exact_compact_strides(
+            scale,
+            name,
+            "[pages, Hkv, page_size, D/16]",
+        )
+        _validate_16byte_alignment(scale, name)
+    return k_sf_cache, v_sf_cache
 
 
 def _validate_block_tables(
@@ -1190,6 +1278,7 @@ def _resolve_decode_launch_spec(
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "float4_e2m1fn": cutlass.Float4E2M1FN,
     }
     q_dtype = dtype_map[q_dtype_key]
     k_dtype = dtype_map[k_dtype_key]
@@ -1459,12 +1548,15 @@ def _get_compiled_decode(
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "float4_e2m1fn": cutlass.Float4E2M1FN,
     }
     q_dtype = dtype_map[q_dtype_key]
     k_dtype = dtype_map[k_dtype_key]
     v_dtype = dtype_map[v_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     cfg = FmhaDecodeConfig(**dict(compile_spec.config_items))
+    k_storage_dtype = cutlass.Uint8 if k_dtype == cutlass.Float4E2M1FN else k_dtype
+    v_storage_dtype = cutlass.Uint8 if v_dtype == cutlass.Float4E2M1FN else v_dtype
     storage_page_size = int(cfg.effective_storage_tokens_per_page)
     partial_dtype = output_dtype
     if cfg.use_separate_reduction_kernel and output_dtype in (
@@ -1484,6 +1576,8 @@ def _get_compiled_decode(
         q: cute.Tensor,
         k_cache: cute.Tensor,
         v_cache: cute.Tensor,
+        k_sf_cache: cute.Tensor,
+        v_sf_cache: cute.Tensor,
         out: cute.Tensor,
         seq_lens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
@@ -1567,6 +1661,8 @@ def _get_compiled_decode(
             q.iterator,
             k_cache.iterator,
             v_cache.iterator,
+            k_sf_cache.iterator,
+            v_sf_cache.iterator,
             out.iterator,
             lengths_iter,
             q_offsets_iter,
@@ -1697,9 +1793,11 @@ def _get_compiled_decode(
         stride_order=tuple(reversed(range(len(q_shape)))),
         assumed_align=16,
     )
+    k_storage_head_dim = head_dim // 2 if k_dtype == cutlass.Float4E2M1FN else head_dim
+    v_storage_head_dim = head_dim // 2 if v_dtype == cutlass.Float4E2M1FN else head_dim
     k_fake = cute.runtime.make_fake_tensor(
-        k_dtype,
-        (physical_pages, num_kv_heads, storage_page_size, head_dim),
+        k_storage_dtype,
+        (physical_pages, num_kv_heads, storage_page_size, k_storage_head_dim),
         stride=(
             k_outer_stride,
             k_head_stride,
@@ -1709,8 +1807,8 @@ def _get_compiled_decode(
         assumed_align=16,
     )
     v_fake = cute.runtime.make_fake_tensor(
-        v_dtype,
-        (physical_pages, num_kv_heads, storage_page_size, head_dim),
+        v_storage_dtype,
+        (physical_pages, num_kv_heads, storage_page_size, v_storage_head_dim),
         stride=(
             v_outer_stride,
             v_head_stride,
@@ -1768,6 +1866,13 @@ def _get_compiled_decode(
     partial_stats_fake = fake_compact(Float32, partial_stats_shape, 16)
     counter_fake = fake_compact(Int32, counter_shape, 4)
     attention_sinks_fake = fake_compact(Float32, (1,), 4)
+    if cfg.use_nvfp4_kv:
+        sf_shape = (physical_pages, num_kv_heads, storage_page_size, head_dim // 16)
+        k_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
+        v_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
+    else:
+        k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
+        v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     direct_q1_fake: tuple = ()
     if direct_q1_spec is not None:
@@ -1807,6 +1912,8 @@ def _get_compiled_decode(
             q_fake,
             k_fake,
             v_fake,
+            k_sf_fake,
+            v_sf_fake,
             out_fake,
             seq_lens_fake,
             cu_seqlens_q_fake,
@@ -1879,6 +1986,7 @@ def get_prims_ts_batch_decode_workspace_size(
     q_dtype: torch.dtype = torch.float16,
     k_dtype: Optional[torch.dtype] = None,
     v_dtype: Optional[torch.dtype] = None,
+    kv_dtype: Optional[torch.dtype] = None,
     out_dtype: Optional[torch.dtype] = None,
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
@@ -1907,7 +2015,8 @@ def get_prims_ts_batch_decode_workspace_size(
     and no larger than the bound. If ``device`` is omitted, it is inferred from
     ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
     ``v_dtype`` to ``k_dtype``; pass ``v_dtype=torch.float8_e4m3fn`` with
-    BF16 Q/K to size the QK-BF16/PV-FP8 launch.
+    BF16 Q/K to size the QK-BF16/PV-FP8 launch. ``kv_dtype`` is a
+    compatibility alias for both K and V and must agree with explicit dtypes.
 
     ``split_kv`` permits automatic split fanout when True (default), or forces
     nonsplit execution when False. It is independent of Q layout and must
@@ -1939,10 +2048,7 @@ def get_prims_ts_batch_decode_workspace_size(
     _validate_layout(kv_layout)
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
-    if k_dtype is None:
-        k_dtype = q_dtype
-    if v_dtype is None:
-        v_dtype = k_dtype
+    k_dtype, v_dtype = _resolve_kv_dtypes(q_dtype, k_dtype, v_dtype, kv_dtype)
     if out_dtype is None:
         out_dtype = q_dtype
     _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
@@ -1988,6 +2094,7 @@ def get_prims_ts_batch_decode_workspace_size(
 def _prepare_decode_runtime(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
+    kv_scale_factors: Optional[PagedKVScaleFactors],
     *,
     device: torch.device,
     batch_size: int,
@@ -2042,6 +2149,11 @@ def _prepare_decode_runtime(
             f"K/V dtype must match the launch (K {k_dtype}, V {v_dtype}), got K "
             f"{k_cache.dtype} and V {v_cache.dtype}"
         )
+    k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
+        kv_scale_factors,
+        k_cache=k_cache,
+        logical_head_dim=head_dim,
+    )
     effective_bmm1_scale = _validate_scale(
         1.0 / math.sqrt(head_dim) if bmm1_scale is None else bmm1_scale,
         "bmm1_scale",
@@ -2069,6 +2181,8 @@ def _prepare_decode_runtime(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
+        k_sf_cache=k_sf_cache,
+        v_sf_cache=v_sf_cache,
         out=out,
         num_physical_pages=normalized_cache.num_physical_pages,
         k_page_stride=normalized_cache.k_page_stride,
@@ -2099,6 +2213,8 @@ def _launch_decode(
         runtime.q,
         runtime.k_cache,
         runtime.v_cache,
+        runtime.k_sf_cache,
+        runtime.v_sf_cache,
         runtime.out,
         seq_lens,
         q_offsets,
@@ -2186,6 +2302,7 @@ def _normalize_plan_seq_lens(
 def _prepare_decode_runtime_unchecked(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
+    kv_scale_factors: Optional[PagedKVScaleFactors],
     *,
     output_dtype: torch.dtype,
     bmm1_scale: Optional[float],
@@ -2199,6 +2316,11 @@ def _prepare_decode_runtime_unchecked(
         v_cache = paged_kv_cache[:, 1]
     else:
         k_cache, v_cache = paged_kv_cache
+    if k_cache.dtype == torch.uint8:
+        k_sf_cache, v_sf_cache = cast(PagedKVScaleFactors, kv_scale_factors)
+    else:
+        placeholder = k_cache[0, 0, 0, :1].view(torch.uint8)[:1]
+        k_sf_cache, v_sf_cache = placeholder, placeholder
     if out is None:
         out = torch.empty(
             q.shape,
@@ -2209,6 +2331,8 @@ def _prepare_decode_runtime_unchecked(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
+        k_sf_cache=k_sf_cache,
+        v_sf_cache=v_sf_cache,
         out=out,
         num_physical_pages=int(k_cache.shape[0]),
         k_page_stride=int(k_cache.stride(0)),
@@ -2329,7 +2453,7 @@ class _NativePagedKVCache:
 class PrimsTSBatchDecodePlan:
     """Validated dense-page-table PrimTS state for framework hot paths.
 
-    The plan retains the K/V cache, dense block-table storage, compiled
+    The plan retains the K/V cache and scale tensors, dense block-table storage, compiled
     callables, and typed workspace views validated at construction. Block-table
     and sequence-length values may change between completed launches, which is
     the contract needed by QToken-KvBlock-Sparse-Attention metadata builders. Query and output storage may
@@ -2353,6 +2477,8 @@ class PrimsTSBatchDecodePlan:
     _output_dtype: torch.dtype
     _head_dim: int
     _cache: _NativePagedKVCache
+    _k_sf_cache: torch.Tensor
+    _v_sf_cache: torch.Tensor
     _seq_lens: torch.Tensor
     _qo_indptr: Optional[torch.Tensor]
     _block_table: torch.Tensor
@@ -2420,6 +2546,8 @@ class PrimsTSBatchDecodePlan:
             query,
             self._cache.k_cache,
             self._cache.v_cache,
+            self._k_sf_cache,
+            self._v_sf_cache,
             out,
             self._seq_lens,
             q_offsets,
@@ -2526,7 +2654,7 @@ def _normalize_paged_kv_cache_views(
     *,
     expected_device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int]:
-    """Return structurally validated zero-copy logical HND K/V views."""
+    """Return validated zero-copy HND views and the logical head dimension."""
 
     if isinstance(paged_kv_cache, torch.Tensor):
         if paged_kv_cache.ndim != 5 or paged_kv_cache.shape[1] != 2:
@@ -2568,9 +2696,13 @@ def _normalize_paged_kv_cache_views(
     if k_cache.device != v_cache.device:
         raise ValueError("K and V cache views must be on the same device")
 
-    num_pages, num_kv_heads, page_size, head_dim = map(int, k_cache.shape)
-    if min(num_pages, num_kv_heads, page_size, head_dim) <= 0:
+    num_pages, num_kv_heads, page_size, storage_head_dim = map(int, k_cache.shape)
+    if min(num_pages, num_kv_heads, page_size, storage_head_dim) <= 0:
         raise ValueError("paged_kv_cache dimensions must be positive")
+    # This API reserves uint8 K/V storage for two packed NVFP4 values per byte.
+    head_dim = (
+        storage_head_dim * 2 if k_cache.dtype == torch.uint8 else storage_head_dim
+    )
     return (
         k_cache,
         v_cache,
@@ -3217,6 +3349,7 @@ def _prepare_prims_ts_batch_decode_plan(
     window_left: int,
     kv_layout: Literal["HND"],
     page_size: Optional[int],
+    kv_scale_factors: Optional[PagedKVScaleFactors] = None,
     q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
     use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
@@ -3270,6 +3403,11 @@ def _prepare_prims_ts_batch_decode_plan(
     num_kv_heads = normalized_cache.num_kv_heads
     storage_page_size = normalized_cache.storage_page_size
     head_dim = normalized_cache.head_dim
+    if int(query.shape[-1]) != head_dim:
+        raise ValueError(
+            "paged_kv_cache logical head dimension must match the query: "
+            f"expected {int(query.shape[-1])}, got {head_dim}"
+        )
     num_qo_heads = int(query.shape[-2])
     _validate_head_geometry(num_qo_heads, num_kv_heads)
     page_size = _validate_page_size(
@@ -3296,6 +3434,11 @@ def _prepare_prims_ts_batch_decode_plan(
         v_cache.dtype,
         output_dtype,
         allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
+    )
+    k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
+        kv_scale_factors,
+        k_cache=k_cache,
+        logical_head_dim=head_dim,
     )
     resolved_device, device_index = _resolve_cuda_device(query.device)
     _validate_runtime_device(resolved_device)
@@ -3420,6 +3563,8 @@ def _prepare_prims_ts_batch_decode_plan(
         _output_dtype=output_dtype,
         _head_dim=head_dim,
         _cache=normalized_cache,
+        _k_sf_cache=k_sf_cache,
+        _v_sf_cache=v_sf_cache,
         _seq_lens=seq_lens,
         _qo_indptr=qo_indptr,
         _block_table=block_table,
@@ -3442,6 +3587,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     max_seq_len: int,
     *,
     out: torch.Tensor,
+    kv_scale_factors: Optional[PagedKVScaleFactors] = None,
     seq_len_q: int = 1,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
@@ -3480,6 +3626,10 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         Static maximum K/V length used for policy selection and JIT caching.
     out : torch.Tensor
         Caller-owned output tensor whose storage remains stable across replays.
+    kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
+        Required for packed NVFP4 K/V stored as uint8. K and V scales are
+        FP8 tensors with width ``D / 16``; V scales use the TRTLLM-GEN
+        4-token interleaved layout. The plan retains these tensors.
     seq_len_q : int
         Fixed query length when ``qo_indptr`` is omitted.
     qo_indptr : torch.Tensor, optional
@@ -3525,6 +3675,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         window_left=window_left,
         kv_layout=kv_layout,
         page_size=page_size,
+        kv_scale_factors=kv_scale_factors,
         split_kv=split_kv,
         use_q_token_kv_block_sparse_route=False,
     )
@@ -3586,6 +3737,7 @@ class BatchDecodePagedTSWrapper:
         q_data_type: torch.dtype = torch.float16,
         k_data_type: Optional[torch.dtype] = None,
         v_data_type: Optional[torch.dtype] = None,
+        kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
@@ -3651,6 +3803,10 @@ class BatchDecodePagedTSWrapper:
             V dtype used to compile the plan. Defaults to ``k_data_type``;
             ``torch.float8_e4m3fn`` with BF16 Q/K selects the QK-BF16/PV-FP8
             path and requires separate ``(K, V)`` cache tensors.
+        kv_data_type : torch.dtype, optional
+            Compatibility alias setting both K and V storage dtypes. Explicit
+            K/V dtypes must agree with it. Use ``torch.uint8`` for packed
+            NVFP4; ``head_dim`` stays logical and runs supply scale tensors.
         o_data_type : torch.dtype, optional
             Output dtype used to compile the plan. Defaults to
             ``q_data_type``.
@@ -3683,10 +3839,9 @@ class BatchDecodePagedTSWrapper:
             layout. Newly allocated scratch is always initialized.
         """
 
-        if k_data_type is None:
-            k_data_type = q_data_type
-        if v_data_type is None:
-            v_data_type = k_data_type
+        k_data_type, v_data_type = _resolve_kv_dtypes(
+            q_data_type, k_data_type, v_data_type, kv_data_type
+        )
         if o_data_type is None:
             o_data_type = q_data_type
         seq_len_q = max_seq_len_q
@@ -3899,6 +4054,7 @@ class BatchDecodePagedTSWrapper:
         seq_lens: Optional[torch.Tensor],
         block_tables: torch.Tensor,
         *,
+        kv_scale_factors: Optional[PagedKVScaleFactors] = None,
         qo_indptr: Optional[torch.Tensor] = None,
         bmm1_scale: Optional[float] = None,
         bmm2_scale: float = 1.0,
@@ -3939,6 +4095,11 @@ class BatchDecodePagedTSWrapper:
             Per-run int32 CUDA physical page IDs with shape ``[B, C]``. Entries
             must be contiguous within each row; the row stride may be any value
             at least ``C``. Inactive tail entries are ignored.
+        kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
+            Required for packed NVFP4 K/V. Compact FP8 ``(K_SF, V_SF)`` tensors
+            have shape ``[pages, Hkv, storage_page_size, D/16]``; K scales are token-major
+            and V scales use the 4-token interleaved layout. Omit for other
+            dtypes. Scale tensors must not overlap output or workspace storage.
         qo_indptr : torch.Tensor, optional
             Per-run cumulative query offsets with shape ``[B + 1]``. Required for
             a packed-query plan and rejected for a fixed-query plan.
@@ -4015,6 +4176,7 @@ class BatchDecodePagedTSWrapper:
             runtime = _prepare_decode_runtime(
                 q,
                 paged_kv_cache,
+                kv_scale_factors,
                 device=state.device,
                 batch_size=state.batch_size,
                 seq_len_q=state.seq_len_q,
@@ -4048,6 +4210,7 @@ class BatchDecodePagedTSWrapper:
             runtime = _prepare_decode_runtime_unchecked(
                 q,
                 paged_kv_cache,
+                kv_scale_factors,
                 output_dtype=state.output_dtype,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
@@ -4072,6 +4235,7 @@ def batch_decode_with_paged_kv_cache(
     block_tables: torch.Tensor,
     seq_lens_kv: torch.Tensor,
     *,
+    kv_scale_factors: Optional[PagedKVScaleFactors] = None,
     seq_len_q: int = 1,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
@@ -4113,6 +4277,10 @@ def batch_decode_with_paged_kv_cache(
         them, but each row must be contiguous.
     seq_lens_kv : torch.Tensor
         Per-request K/V sequence lengths with shape ``[B]``.
+    kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
+        Required for packed NVFP4 K/V. Compact FP8 ``(K_SF, V_SF)`` tensors
+        have shape ``[pages, Hkv, storage_page_size, D/16]``; K scales are token-major
+        and V scales use the 4-token interleaved layout. Omit for other dtypes.
     seq_len_q : int
         Fixed query length when ``qo_indptr`` is omitted. In packed-query mode,
         a non-default value is a backward-compatible alias for
@@ -4238,7 +4406,10 @@ def batch_decode_with_paged_kv_cache(
             if isinstance(paged_kv_cache, torch.Tensor)
             else paged_kv_cache[1]
         )
-        num_kv_heads, storage_page_size, head_dim = map(int, k_cache.shape[1:])
+        num_kv_heads, storage_page_size, storage_head_dim = map(int, k_cache.shape[1:])
+        head_dim = (
+            storage_head_dim * 2 if k_cache.dtype == torch.uint8 else storage_head_dim
+        )
 
     page_size = storage_page_size if page_size is None else page_size
     num_qo_heads = int(q.shape[-2])
@@ -4332,6 +4503,7 @@ def batch_decode_with_paged_kv_cache(
         paged_kv_cache,
         None if seq_lens_host is not None else seq_lens_kv,
         block_tables,
+        kv_scale_factors=kv_scale_factors,
         qo_indptr=qo_indptr,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
