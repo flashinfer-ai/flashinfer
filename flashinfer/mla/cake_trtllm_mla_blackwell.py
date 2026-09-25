@@ -1258,12 +1258,12 @@ def trtllm_mla_blackwell_decode(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor],
     sparse_mla_top_k_lens: Optional[torch.Tensor],
     enable_dcp: bool,
-    backend: Literal["trtllm-mla-blackwell"] = "trtllm-mla-blackwell",
+    backend: Literal["cake"] = "cake",
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Dispatch the qualified SM100a/SM103a MLA semantic envelope."""
 
-    if backend != "trtllm-mla-blackwell":
-        raise ValueError(f"backend must be 'trtllm-mla-blackwell', got {backend!r}")
+    if backend != "cake":
+        raise ValueError(f"backend must be 'cake', got {backend!r}")
     if not isinstance(query, torch.Tensor):
         raise TypeError("query must be a torch.Tensor")
     if not query.is_cuda:

@@ -3440,7 +3440,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         requires ``1.0``.
     sinks : Optional[List[torch.Tensor]]
         Additional value per head in the denominator of the softmax.
-        Supported by ``trtllm-mla-blackwell``, ``trtllm-gen``, ``cute-dsl``, and ``sparse``.
+        Supported by ``cake``, ``trtllm-gen``, ``cute-dsl``, and ``sparse``.
         On ``cute-dsl`` this requires the modular implementation;
         ``cute_dsl_impl="auto"`` (the default) promotes to modular
         automatically, and ``cute_dsl_impl="monolithic"`` with sinks set raises
@@ -3456,9 +3456,9 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         backends; ignored by ``cute-dsl``.
     backend : str = "auto"
         Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
-        ``"trtllm-mla-blackwell"``, ``"trtllm-gen"``, ``"cute-dsl"``, and
+        ``"cake"``, ``"trtllm-gen"``, ``"cute-dsl"``, and
         ``"sparse"``.
-        ``"trtllm-mla-blackwell"`` explicitly selects the source-level Blackwell semantic
+        ``"cake"`` explicitly selects the source-level Blackwell semantic
         dispatcher. It covers its qualified BF16/FP8 dense, sparse, compact-Q,
         sink, LSE, and caller-owned-output envelope and is never selected
         automatically. ``"auto"``
@@ -3490,7 +3490,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         passing ``True`` to other backends raises ``ValueError``.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
-        ``trtllm-mla-blackwell``, ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must
+        ``cake``, ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must
         have dtype ``torch.float32``. Accepted shapes:
 
         * ``[batch_size * q_len_per_request, num_qo_heads]`` (TRTLLM-GEN
@@ -3503,7 +3503,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         If ``return_lse`` is True and this is None, a buffer will be
         allocated by the backend.
     return_lse : bool = False
-        Whether to return LSE values. Supported by ``trtllm-mla-blackwell``, ``trtllm-gen``,
+        Whether to return LSE values. Supported by ``cake``, ``trtllm-gen``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
         supported only by monolithic CuTeDSL.
@@ -3687,7 +3687,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
 
-    if backend == "trtllm-mla-blackwell":
+    if backend == "cake":
         from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
         return trtllm_mla_blackwell_decode(
@@ -3714,7 +3714,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             enable_dcp=enable_dcp,
-            backend="trtllm-mla-blackwell",
+            backend="cake",
         )
 
     if backend == "auto":

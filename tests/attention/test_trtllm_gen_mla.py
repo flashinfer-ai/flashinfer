@@ -2013,7 +2013,7 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         max_seq_len=max_seq_len,
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
-        backend="trtllm-mla-blackwell",
+        backend="cake",
     )
     reference = trtllm_mla_blackwell_reference(
         query,
