@@ -162,6 +162,10 @@ SWAP_DEP_PREFETCH = os.environ.get("SWAPAB_DEP_PREFETCH", "1") != "0"
 # items while the row's valid items fit half the SMs (device-side decision);
 # the finalize reduce-add makes the partials additive. 1 disables.
 SWAP_GEMM2_SPLIT_K = int(os.environ.get("SWAPAB_GEMM2_SPLIT_K", "2"))
+# Plain-chain GEMM1 (SiTU): pairs of CTAs (a 2-CTA cluster) split each weight
+# tile's K while the row's valid items fit half the SMs; the peer's partial
+# accumulator crosses over DSMEM before the activation epilogue. 0 disables.
+SWAP_GEMM1_CLUSTER_SPLIT = os.environ.get("SWAPAB_GEMM1_CLUSTER_SPLIT", "1") != "0"
 # N tile of the wide dense GEMM1 by token count: with few wide groups the
 # 128-wide tile doubles the streaming CTAs (B300 TP8 empty: T=128 65 -> 57 us,
 # T=512 140 -> 134), from T=1024 the 256-wide tile is back ahead (236 vs 242).
@@ -1049,6 +1053,12 @@ class Mxfp4MoESwapAbPlan:
                 pdl_trigger_after_wait=pdl and self._dep_prefetch,
                 weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
+                cluster_split_k=SWAP_GEMM1_CLUSTER_SPLIT
+                and self._dep_prefetch
+                # Only a rank with remote experts can see a single active
+                # local group (top_k routes per token all land locally
+                # otherwise), so the cluster launch pays off only there.
+                and w.num_local_experts < w.num_experts,
                 **{
                     "num_non_exiting_tiles": b["out_num_non_exiting_tiles"],
                     **gemm1_lists,

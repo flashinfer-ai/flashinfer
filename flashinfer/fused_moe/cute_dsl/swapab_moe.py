@@ -371,6 +371,7 @@ def _get_compiled_swapab_kernel(
     pdl_trigger_after_wait: bool = False,
     split_k: int = 1,
     split_max_items: int = 0,
+    cluster_split: bool = False,
 ):
     import os
     import sys
@@ -414,6 +415,7 @@ def _get_compiled_swapab_kernel(
         pdl_trigger_after_wait,
         split_k,
         split_max_items,
+        cluster_split,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -442,6 +444,7 @@ def _get_compiled_swapab_kernel(
             pdl_trigger_after_wait=pdl_trigger_after_wait,
             split_k=split_k,
             split_max_items=split_max_items,
+            cluster_split=cluster_split,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -487,6 +490,7 @@ def swapab_gemm1_situ(
     pdl_trigger_early: bool = False,
     late_dep_wait: bool = False,
     pdl_trigger_after_wait: bool = False,
+    cluster_split_k: bool = False,
 ) -> None:
     """GEMM1 (up/gate) + SiTU + MXFP8 requantization on the swap path.
 
@@ -525,6 +529,23 @@ def swapab_gemm1_situ(
     use_linear_beta = linear_beta is not None
     if k_blocks_per_stage is None:
         k_blocks_per_stage = gemm1_k_blocks_per_stage(n_tile)
+    # Cluster split-K (pairs of CTAs share one item's K range): needs an even
+    # stage count and a narrow tile; the CTA budget is an even number of CTAs
+    # (whole clusters) and the kernel splits only while the valid items fit
+    # half of it.
+    split_k = 1
+    split_max_items = 0
+    cluster_split = False
+    if (
+        cluster_split_k
+        and n_tile <= 16
+        and (k // (k_blocks_per_stage * 32)) % 2 == 0
+        and swap_m_group(n_tile, gemm2=False) == 1
+    ):
+        max_active_clusters = 2 * get_max_active_clusters(2)
+        split_k = 2
+        split_max_items = max_active_clusters // 2
+        cluster_split = True
     args = (
         _gmem_ptr(
             cutlass.Float4E2M1FN,
@@ -584,6 +605,9 @@ def swapab_gemm1_situ(
         pdl_trigger_early=pdl_trigger_early,
         late_dep_wait=late_dep_wait,
         pdl_trigger_after_wait=pdl_trigger_after_wait,
+        split_k=split_k,
+        split_max_items=split_max_items,
+        cluster_split=cluster_split,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)

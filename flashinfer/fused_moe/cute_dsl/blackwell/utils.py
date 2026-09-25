@@ -309,3 +309,59 @@ def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def mapa_shared_cluster_u32(smem_ptr, cta_rank_i32, loc=None, ip=None):
+    """Shared-memory address of ``smem_ptr``'s slot in cluster CTA ``cta_rank``."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+                cta_rank_i32.ir_value(loc=loc, ip=ip),
+            ],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def st_async_f32_cluster(remote_addr_i32, v_f32, remote_mbar_i32, loc=None, ip=None):
+    """``st.async`` of one F32 into a peer CTA's shared memory; the peer's
+    mbarrier at ``remote_mbar`` receives ``complete_tx`` of 4 bytes."""
+    llvm.inline_asm(
+        None,
+        [
+            remote_addr_i32.ir_value(loc=loc, ip=ip),
+            v_f32.ir_value(loc=loc, ip=ip),
+            remote_mbar_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
+        "r,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbarrier_arrive_cluster(remote_mbar_i32, loc=None, ip=None):
+    """Release-arrive on a peer CTA's mbarrier (cluster scope)."""
+    llvm.inline_asm(
+        None,
+        [remote_mbar_i32.ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [$0];",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
