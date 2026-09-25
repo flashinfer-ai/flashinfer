@@ -7586,9 +7586,10 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
         """TunableRunner for CuTe DSL low-latency block-scaled dense GEMM.
 
         Tactics are tuples:
-            (cta_k, num_ab_stage, num_sfb_tmem_stage, split_k)
+            (cta_tile_shape_mnk, num_ab_stage, num_sfb_tmem_stage, split_k)
         where:
-            - cta_k: number of threads per CTA
+            - cta_tile_shape_mnk: (M, N, K) tile one CTA loads and stores; M may
+              be below the 128-row MMA
             - num_ab_stage: number of stages in the AB stage
             - num_sfb_tmem_stage: number of stages in the SFB stage
             - split_k: whether to split the K dimension
@@ -7608,7 +7609,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> list[tuple[int, int, int, int]]:
+        ) -> list[tuple[tuple[int, int, int], int, int, int]]:
             return valid_tactics(*prepare_inputs(inputs))
 
         def forward(
@@ -7646,11 +7647,17 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                         f"implement problem {problem_mnkl}"
                     )
                 tactic = tactics[0]
-            elif tactic not in tactics:
-                raise ValueError(f"Invalid low-latency GEMM tactic: {tactic}")
+            else:
+                # Autotune caches written before CTA-M was tunable hold flat
+                # (cta_k, ...) tactics, which all used 128x8 tiles
+                if isinstance(tactic[0], int):
+                    tactic = ((128, 8, tactic[0]), *tactic[1:])
+                if tactic not in tactics:
+                    raise ValueError(f"Invalid low-latency GEMM tactic: {tactic}")
 
             m, n, _, batch_size = problem_mnkl
-            cta_k, num_ab_stage, num_sfb_tmem_stage, split_k = tactic
+            cta_tile_shape_mnk, num_ab_stage, num_sfb_tmem_stage, split_k = tactic
+            cta_k = cta_tile_shape_mnk[2]
             is_kernel_output = (
                 batch_size == 1
                 and out.dtype == out_dtype
@@ -7744,7 +7751,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 dummy_mnkl = tuple(cutlass.Int32(x) for x in (128, 8, cta_k, 1))
                 gemm = LowLatencyBlockscaledGemmKernel(
                     acc_dtype=cutlass.Float32,
-                    mma_tiler_mnk=(128, 8, cta_k),
+                    cta_tile_shape_mnk=cta_tile_shape_mnk,
                     num_ab_stage=num_ab_stage,
                     num_sfb_tmem_stage=num_sfb_tmem_stage,
                     sf_vec_size=sf_vec_size,

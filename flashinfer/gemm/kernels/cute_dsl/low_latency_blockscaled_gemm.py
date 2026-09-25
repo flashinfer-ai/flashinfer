@@ -49,13 +49,13 @@ Default config: CTA_M=128, CTA_N=8, CTA_K=256, DMA_Stage=8
   SF=Float8E4M3FN, sf_vec_size=16
   UmmaMajorA=Major::K, UmmaMajorB=Major::K
 
-Warp assignment (384 threads, 12 warps):
+Warp assignment (256 threads, or 384 with register SFB staging):
   Warp 0: DMA_A - loads A tiles and scale factors
   Warp 1: DMA_B - loads B tiles and scale factors
   Warp 2: MMA - performs the block-scaled matrix multiply
-  Warps 3-6: SFB - stage B scale factors in TMEM for the register-mediated path
-  Warp 7: unused
-  Warps 8-11: EPILOG - copy accumulators to registers, reduce split-K, and store C
+  Warp 3: unused
+  Warps 4-7: EPILOG - copy accumulators to registers, reduce split-K, and store C
+  Warps 8-11: SFB - stage B scale factors in TMEM (register path only)
 """
 
 import argparse
@@ -68,7 +68,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.testing
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
+from cutlass.cute.runtime import make_fake_stream, make_ptr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
@@ -99,6 +99,7 @@ class WorkTileInfo(NamedTuple):
 
 _MAX_AB_STAGES = 12
 _SUPPORTED_SPLIT_K = (1, 2, 4, 8)
+_SUPPORTED_CTA_M = (128, 64)
 _SMEM_CAPACITY_BYTES = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
 
 
@@ -114,6 +115,7 @@ def _smem_bytes(
     num_ab_stage: int,
     num_sfb_tmem_stage: int,
     split_k: int,
+    sfb_tmem_store: bool = False,
 ) -> int:
     """Mirror the kernel's shared-memory allocator closely enough for tactics."""
     mailbox_elems = max(split_k - 1, 0) * 128 * (8 // split_k)
@@ -134,9 +136,9 @@ def _smem_bytes(
     buffer_sizes = (
         128 * cta_k * a_smem_width // 8 * num_ab_stage,
         8 * cta_k * b_smem_width // 8 * num_ab_stage,
-        128 * sf_k * num_ab_stage,
-        8 * sf_k * num_ab_stage,
-        128 * sf_k * num_ab_stage,
+        128 * sf_k * num_ab_stage,  # SFA
+        # SFB: compact rows for register staging, one 128-row atom for direct copy
+        (8 if sfb_tmem_store else 128) * sf_k * num_ab_stage,
     )
     for size in buffer_sizes:
         cursor = _align_up(cursor, 128) + size
@@ -150,10 +152,10 @@ def autotune_tactics(
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     c_dtype: Type[cutlass.Numeric],
-) -> list[tuple[int, int, int, int]]:
+) -> list[tuple[tuple[int, int, int], int, int, int]]:
     """Enumerate every distinct direct-SFB specialization for a problem.
 
-    A tactic is ``(cta_k, ab_stages, sfb_tmem_stages, split_k)``.  The public
+    A tactic is ``(cta_tile_shape_mnk, ab_stages, sfb_tmem_stages, split_k)``.  The public
     dispatch paths use the direct SMEM-to-TMEM SFB copy, where the SFB TMEM
     stage count is not consumed by the mainloop, so it is canonically one.
     CTA-K covers every MMA-K multiple that divides K, AB stages cover the full
@@ -162,35 +164,37 @@ def autotune_tactics(
     _, _, k, _ = problem_sizes_mnkl
     mma_k = 64 if a_dtype.width == b_dtype.width == 4 else 32
     tactics = []
-    for cta_k in range(mma_k, k + 1, mma_k):
-        if k % cta_k:
-            continue
-        for num_ab_stage in range(1, _MAX_AB_STAGES + 1):
-            for split_k in _SUPPORTED_SPLIT_K:
-                tactic = (cta_k, num_ab_stage, 1, split_k)
-                if LowLatencyBlockscaledGemmKernel.can_implement(
-                    problem_sizes_mnkl,
-                    a_dtype,
-                    b_dtype,
-                    sf_dtype,
-                    sf_vec_size,
-                    c_dtype,
-                    mma_tiler_mnk=(128, 8, cta_k),
-                    num_ab_stage=num_ab_stage,
-                    num_sfb_tmem_stage=1,
-                    split_k=split_k,
-                ):
-                    tactics.append(tactic)
+    for cta_m in _SUPPORTED_CTA_M:
+        for cta_k in range(mma_k, k + 1, mma_k):
+            if k % cta_k:
+                continue
+            for num_ab_stage in range(1, _MAX_AB_STAGES + 1):
+                for split_k in _SUPPORTED_SPLIT_K:
+                    tactic = ((cta_m, 8, cta_k), num_ab_stage, 1, split_k)
+                    if LowLatencyBlockscaledGemmKernel.can_implement(
+                        problem_sizes_mnkl,
+                        a_dtype,
+                        b_dtype,
+                        sf_dtype,
+                        sf_vec_size,
+                        c_dtype,
+                        cta_tile_shape_mnk=tactic[0],
+                        num_ab_stage=num_ab_stage,
+                        num_sfb_tmem_stage=1,
+                        split_k=split_k,
+                    ):
+                        tactics.append(tactic)
 
     default_cta_k = 4 * mma_k
     return sorted(
         tactics,
         key=lambda tactic: (
-            tactic != (default_cta_k, 8, 1, 1),
-            abs(tactic[0] - default_cta_k),
+            tactic != ((128, 8, default_cta_k), 8, 1, 1),
+            tactic[0][0] != 128,
+            abs(tactic[0][2] - default_cta_k),
             abs(tactic[1] - 8),
             tactic[3],
-            tactic[0],
+            tactic[0][2],
             tactic[1],
         ),
     )
@@ -199,15 +203,15 @@ def autotune_tactics(
 class LowLatencyBlockscaledGemmKernel:
     """Low-latency, warp-specialized Blackwell block-scaled GEMM.
 
-    The 12 warps are assigned to two TMA load roles, one MMA role, four
-    optional scale-factor producer roles, four epilogue roles, and one unused
-    warp.
+    The warps are assigned to two TMA load roles, one MMA role, one unused
+    warp, four epilogue roles, and four optional scale-factor producer roles.
     """
 
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        mma_tiler_mnk: tuple[int, int, int] = (128, 8, 256),
+        mma_tiler_mn: Tuple[int, int] = (128, 8),
+        cta_tile_shape_mnk: Tuple[int, int, int] = (128, 8, 256),
         num_ab_stage: int = 8,
         num_sfb_tmem_stage: int = 4,
         sf_vec_size: int = 16,
@@ -222,8 +226,10 @@ class LowLatencyBlockscaledGemmKernel:
 
         :param acc_dtype: Data type for the MMA accumulator (split-K requires Float32).
         :type acc_dtype: Type[cutlass.Numeric]
-        :param mma_tiler_mnk: CTA tile shape (M, N, K).
-        :type mma_tiler_mnk: tuple[int, int, int]
+        :param mma_tiler_mn: (M, N) shape of the MMA instruction tiler.
+        :type mma_tiler_mn: Tuple[int, int]
+        :param cta_tile_shape_mnk: (M, N, K) output tile of one CTA.
+        :type cta_tile_shape_mnk: Tuple[int, int, int]
         :param num_ab_stage: Number of A/B SMEM pipeline stages.
         :type num_ab_stage: int
         :param num_sfb_tmem_stage: Number of staged SFB TMEM buffers.
@@ -250,11 +256,21 @@ class LowLatencyBlockscaledGemmKernel:
                 "SM100 block-scaled MMA produces Float32 accumulators"
             )
 
-        cta_m, cta_n, cta_k = mma_tiler_mnk
+        if mma_tiler_mn[0] != 128:
+            raise ValueError(
+                "block-scaled tcgen05.mma with cta_group::1 requires M=128"
+            )
+        if (
+            cta_tile_shape_mnk[1] != mma_tiler_mn[1]
+            or mma_tiler_mn[0] % cta_tile_shape_mnk[0]
+        ):
+            raise ValueError(
+                f"cta_tile_shape_mnk={cta_tile_shape_mnk} must match the MMA N and "
+                f"divide the MMA M of mma_tiler_mn={mma_tiler_mn}"
+            )
         self.acc_dtype = acc_dtype
-        self.cta_m = cta_m
-        self.cta_n = cta_n
-        self.cta_k = cta_k
+        self.cta_tile_shape_mnk = tuple(cta_tile_shape_mnk)
+        self.mma_tiler = (*mma_tiler_mn, cta_tile_shape_mnk[2])
         self.num_ab_stage = num_ab_stage
         self.num_sfb_tmem_stage = num_sfb_tmem_stage
         self.sf_vec_size = sf_vec_size
@@ -266,7 +282,7 @@ class LowLatencyBlockscaledGemmKernel:
         self.use_bias = use_bias
 
         # Size the distributed shared memory mailbox used by split-K
-        self._mailbox_elems_per_thread = (cta_m * cta_n) // 128
+        self._mailbox_elems_per_thread = (self.mma_tiler[0] * self.mma_tiler[1]) // 128
         self._shard_elems_per_thread = self._mailbox_elems_per_thread // max(split_k, 1)
         if split_k > 1 and self._mailbox_elems_per_thread % split_k != 0:
             raise ValueError(
@@ -280,14 +296,15 @@ class LowLatencyBlockscaledGemmKernel:
         self._mailbox_tx_total = max(split_k - 1, 0) * self._mailbox_tx_per_sender
 
         # Fixed configuration
-        self.threads_per_cta = 384  # 12 warps (3 active + 4 SFB + 1 unused + 4 epilog)
+        # 8 warps (3 active + 1 unused + 4 epilog), plus 4 SFB warps when staging
+        # SFB through registers
+        self.threads_per_cta = 384 if sfb_tmem_store else 256
         self.use_2cta_instrs = False  # 1 SM mode
         self.cluster_shape_mn = (1, 1)  # No multicast, 1x1 cluster
         self.cta_group = tcgen05.CtaGroup.ONE
 
     def _setup_attributes(self):
         """Set up derived config."""
-        mma_tiler_mn = (self.cta_m, self.cta_n)
 
         # Build the block-scaled MMA atom
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -298,13 +315,13 @@ class LowLatencyBlockscaledGemmKernel:
             self.sf_dtype,
             self.sf_vec_size,
             self.cta_group,
-            mma_tiler_mn,
+            self.mma_tiler[:2],
         )
         assert self.cta_group == tcgen05.CtaGroup.ONE
 
         # Number of MMA instructions along the CTA K tile
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        self.mma_inst_tile_k = self.cta_k // mma_inst_shape_k
+        self.mma_inst_tile_k = self.cta_tile_shape_mnk[2] // mma_inst_shape_k
 
         # Shared SFB layout constants used by the SFB and MMA warps
         self._sf_atom_mn = 32
@@ -312,7 +329,7 @@ class LowLatencyBlockscaledGemmKernel:
         self._num_n_atoms = 2  # two columns for register-mediated SFB staging
         self._sfb_lane_stride = 1 << 18
         self._num_sfa_tmem_cols = (
-            self.cta_m // self._sf_atom_mn
+            self.mma_tiler[0] // self._sf_atom_mn
         ) * self.mma_inst_tile_k
         if cutlass.const_expr(self.sfb_tmem_store):
             self._sfb_tmem_cols_per_stage = self.mma_inst_tile_k * self._num_n_atoms
@@ -321,13 +338,13 @@ class LowLatencyBlockscaledGemmKernel:
 
         # Keep the accumulator and staged scale factors within half of TMEM
         total_tmem_cols = (
-            self.cta_n  # accumulator
+            self.cta_tile_shape_mnk[1]  # accumulator
             + self._num_sfa_tmem_cols  # SFA
             + self._sfb_tmem_cols_per_stage * self.num_sfb_tmem_stage  # SFB (staged)
         )
         assert total_tmem_cols <= 256, (
             f"TMEM column budget exceeded: {total_tmem_cols} > 256 "
-            f"(acc={self.cta_n}, sfa={self._num_sfa_tmem_cols}, "
+            f"(acc={self.cta_tile_shape_mnk[1]}, sfa={self._num_sfa_tmem_cols}, "
             f"sfb={self._sfb_tmem_cols_per_stage}*{self.num_sfb_tmem_stage}="
             f"{self._sfb_tmem_cols_per_stage * self.num_sfb_tmem_stage})"
         )
@@ -342,14 +359,40 @@ class LowLatencyBlockscaledGemmKernel:
         # sA_layout: ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
-            (self.cta_m, self.cta_n, self.cta_k),
+            self.mma_tiler,
             self.smem_alloc_a_dtype,
             self.num_ab_stage,
+        )
+        # (M, K, DMA_Stage)
+        a_outer = self.a_smem_layout_staged.outer
+        self.a_mk_layout_staged = cute.make_layout(
+            (
+                a_outer.shape[0][0],
+                (a_outer.shape[0][1], a_outer.shape[2]),
+                a_outer.shape[3],
+            ),
+            stride=(
+                a_outer.stride[0][0],
+                (a_outer.stride[0][1], a_outer.stride[2]),
+                a_outer.stride[3],
+            ),
+        )
+        # One stage of the rows a CTA loads, for the A TMA atom
+        self.a_load_smem_layout = cute.make_composed_layout(
+            self.a_smem_layout_staged.inner,
+            0,
+            cute.make_layout(
+                (self.cta_tile_shape_mnk[0], self.a_mk_layout_staged.shape[1]),
+                stride=(
+                    self.a_mk_layout_staged.stride[0],
+                    self.a_mk_layout_staged.stride[1],
+                ),
+            ),
         )
         # sB_layout: ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma,
-            (self.cta_m, self.cta_n, self.cta_k),
+            self.mma_tiler,
             self.smem_alloc_b_dtype,
             self.num_ab_stage,
         )
@@ -357,19 +400,23 @@ class LowLatencyBlockscaledGemmKernel:
         # SFA SMEM layout: ((Atom_M, Atom_K), MMA_M, MMA_K, STAGE)
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
-            (self.cta_m, self.cta_n, self.cta_k),
+            self.mma_tiler,
             self.sf_vec_size,
             self.num_ab_stage,
         )
         # Compact layout for register-mediated SFB staging
-        sfb_n = self.cta_n
-        sfb_k = self.cta_k // self.sf_vec_size
+        sfb_n = self.cta_tile_shape_mnk[1]
+        sfb_k = self.cta_tile_shape_mnk[2] // self.sf_vec_size
         self._sfb_smem_layout_flat = cute.make_layout(
             (sfb_n, sfb_k, self.num_ab_stage),
             stride=(sfb_k, 1, sfb_n * sfb_k),
         )
         # Padded layout for direct SFB staging
-        self._mma_tiler_sfb = (self.cta_m, cute.round_up(self.cta_n, 128), self.cta_k)
+        self.mma_tiler_sfb = (
+            self.mma_tiler[0],
+            cute.round_up(self.cta_tile_shape_mnk[1], 128),
+            self.cta_tile_shape_mnk[2],
+        )
         self._tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -378,13 +425,23 @@ class LowLatencyBlockscaledGemmKernel:
             self.sf_dtype,
             self.sf_vec_size,
             tcgen05.CtaGroup.ONE,
-            (self.cta_m, cute.round_up(self.cta_n, 128)),
+            (self.mma_tiler[0], cute.round_up(self.cta_tile_shape_mnk[1], 128)),
         )
         self._sfb_smem_layout_padded = blockscaled_utils.make_smem_layout_sfb(
             self._tiled_mma_sfb,
-            self._mma_tiler_sfb,
+            self.mma_tiler_sfb,
             self.sf_vec_size,
             self.num_ab_stage,
+        )
+        # Bytes of the padded SFB buffer that TMA fills: lanes 0-7 (the first
+        # 128 B) of each 512 B SF atom, per stage
+        sfb_atoms = self.cta_tile_shape_mnk[2] // (self.sf_vec_size * 4)
+        assert (
+            cute.cosize(self._sfb_smem_layout_padded)
+            == 512 * sfb_atoms * self.num_ab_stage
+        ), "padded SFB SMEM must be contiguous 512 B SF atoms"
+        self._sfb_tma_smem_layout_staged = cute.make_layout(
+            (128, sfb_atoms, self.num_ab_stage), stride=(1, 512, 512 * sfb_atoms)
         )
         if cutlass.const_expr(self.sfb_tmem_store):
             self.sfb_smem_layout_staged = self._sfb_smem_layout_flat
@@ -392,9 +449,17 @@ class LowLatencyBlockscaledGemmKernel:
             self.sfb_smem_layout_staged = self._sfb_smem_layout_padded
 
         # Accumulator shape for TMEM allocation size calculation
-        acc_shape = tiled_mma.partition_shape_C((self.cta_m, self.cta_n))
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
         self.num_tmem_alloc_cols = cutlass.utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        # Allocate only the columns used (power of two, at least 32), as TGV does,
+        # instead of half of TMEM
+        tmem_cols_used = (
+            self.mma_tiler[1]
+            + self._num_sfa_tmem_cols
+            + self._sfb_tmem_cols_per_stage * self.num_sfb_tmem_stage
+        )
+        self.num_tmem_cols = max(32, 1 << (tmem_cols_used - 1).bit_length())
 
     @cute.jit
     def __call__(
@@ -487,15 +552,19 @@ class LowLatencyBlockscaledGemmKernel:
                 ),
             )
         else:
-            # Give each CTA N tile a separate 128-row SFB atom
-            n_padded_sfb = cute.ceil_div(n, self.cta_n) * cute.round_up(self.cta_n, 128)
-            b_shape_for_sfb = cute.make_ordered_layout(
-                (n_padded_sfb, k, l), order=(1, 0, 2)
-            ).shape
+            # Each CTA N tile owns one 128-row SF atom (512 B) per four scale
+            sfb_k_atoms = cute.assume(k // (self.sf_vec_size * 4), 1)
+            sfb_n_tiles = cute.ceil_div(n, self.cta_tile_shape_mnk[1])
             sfb = cute.make_tensor(
                 sfb_ptr,
-                blockscaled_utils.tile_atom_to_shape_SF(
-                    b_shape_for_sfb, self.sf_vec_size
+                cute.make_layout(
+                    (128, sfb_k_atoms, sfb_n_tiles, l),
+                    stride=(
+                        1,
+                        512,
+                        512 * sfb_k_atoms,
+                        512 * sfb_k_atoms * sfb_n_tiles,
+                    ),
                 ),
             )
         self._setup_attributes()
@@ -507,24 +576,40 @@ class LowLatencyBlockscaledGemmKernel:
             self.sf_dtype,
             self.sf_vec_size,
             self.cta_group,
-            (self.cta_m, self.cta_n),
+            self.mma_tiler[:2],
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
-        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a,
-            a_smem_layout,
-            (self.cta_m, self.cta_n, self.cta_k),
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=self.smem_alloc_a_dtype
+        a_internal_type = (
+            self.smem_alloc_a_dtype
             if self.mxf8f6f4 and self.a_dtype.width < 8
-            else None,
+            else None
         )
+        if cutlass.const_expr(self.cta_tile_shape_mnk[0] == self.mma_tiler[0]):
+            a_smem_layout = cute.slice_(
+                self.a_smem_layout_staged, (None, None, None, 0)
+            )
+            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+                a_op,
+                a,
+                a_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=a_internal_type,
+            )
+        else:
+            # Load only this CTA's rows; the MMA still consumes a 128-row tile
+            a_smem_layout = self.a_load_smem_layout
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                a_op,
+                a,
+                a_smem_layout,
+                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
+                internal_type=a_internal_type,
+            )
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
@@ -533,7 +618,7 @@ class LowLatencyBlockscaledGemmKernel:
             b_op,
             b,
             b_smem_layout,
-            (self.cta_m, self.cta_n, self.cta_k),
+            self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
             internal_type=self.smem_alloc_b_dtype
@@ -550,52 +635,45 @@ class LowLatencyBlockscaledGemmKernel:
             sfa_op,
             sfa,
             sfa_smem_layout,
-            (self.cta_m, self.cta_n, self.cta_k),
+            self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
             internal_type=cutlass.Int16,
         )
         if cutlass.const_expr(self.sfb_tmem_store):
             sfb_smem_layout = cute.slice_(self._sfb_smem_layout_flat, (None, None, 0))
-            sfb_k = self.cta_k // self.sf_vec_size
+            sfb_k = self.cta_tile_shape_mnk[2] // self.sf_vec_size
             sfb_tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
             tma_atom_sfb, tma_tensor_sfb = cpasync.make_tiled_tma_atom(
                 sfb_tma_op,
                 sfb,
                 sfb_smem_layout,
-                (self.cta_n, sfb_k),
+                (self.cta_tile_shape_mnk[1], sfb_k),
             )
         else:
-            sfb_op = sm100_utils.cluster_shape_to_tma_atom_B(
-                self.cluster_shape_mn, self._tiled_mma_sfb.thr_id
-            )
             sfb_smem_layout = cute.slice_(
-                self._sfb_smem_layout_padded, (None, None, None, 0)
+                self._sfb_tma_smem_layout_staged, (None, None, 0)
             )
-            tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
-                sfb_op,
+            tma_atom_sfb, tma_tensor_sfb = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
                 sfb,
                 sfb_smem_layout,
-                self._mma_tiler_sfb,
-                self._tiled_mma_sfb,
-                self.cluster_layout_vmnk.shape,
-                internal_type=cutlass.Int16,
+                sfb_smem_layout.shape,
             )
         # Count input bytes before unpacking mixed-width operands
-        a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
+        a_copy_size = cute.size(a_smem_layout) * self.a_dtype.width // 8
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
-        sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
+        sfb_copy_size = cute.size(sfb_smem_layout) * self.sf_dtype.width // 8
         self.tma_bytes_a = (a_copy_size + sfa_copy_size) * atom_thr_size
         self.tma_bytes_b = (b_copy_size + sfb_copy_size) * atom_thr_size
         grid = (
-            cute.ceil_div(c.layout.shape[0], self.cta_m),
-            cute.ceil_div(c.layout.shape[1], self.cta_n),
+            cute.ceil_div(c.layout.shape[0], self.cta_tile_shape_mnk[0]),
+            cute.ceil_div(c.layout.shape[1], self.cta_tile_shape_mnk[1]),
             c.layout.shape[2] * self.split_k,
         )
         self.kernel(
             tiled_mma,
-            self._tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a,
             tma_atom_b,
@@ -609,10 +687,12 @@ class LowLatencyBlockscaledGemmKernel:
             bias,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
+            self.a_mk_layout_staged,
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self._sfb_smem_layout_flat,
             self._sfb_smem_layout_padded,
+            self._sfb_tma_smem_layout_staged,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -642,7 +722,7 @@ class LowLatencyBlockscaledGemmKernel:
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         c_dtype: Type[cutlass.Numeric],
-        mma_tiler_mnk: tuple[int, int, int | None] = (128, 8, None),
+        cta_tile_shape_mnk: tuple[int, int, int | None] = (128, 8, None),
         num_ab_stage: int = 8,
         num_sfb_tmem_stage: int = 4,
         split_k: int = 1,
@@ -679,13 +759,17 @@ class LowLatencyBlockscaledGemmKernel:
         if min(m, n, k, l) <= 0:
             return False
 
-        cta_m, cta_n, cta_k = mma_tiler_mnk
+        cta_m, cta_n, cta_k = cta_tile_shape_mnk
         mma_k = 64 if a_dtype.width == 4 and b_dtype.width == 4 else 32
         if cta_k is None:
             cta_k = 4 * mma_k
-        if (cta_m, cta_n) != (128, 8) or cta_k <= 0 or k % cta_k != 0:
+        if cta_m not in _SUPPORTED_CTA_M or cta_n != 8 or cta_k <= 0 or k % cta_k != 0:
             return False
         if cta_k % mma_k != 0:
+            return False
+        # Register-mediated SFB TMA-loads compact rows of K / sf_vec_size bytes;
+        # TMA needs 16 B multiples for both the inner box and the row stride
+        if sfb_tmem_store and (cta_k % (16 * sf_vec_size) or k % (16 * sf_vec_size)):
             return False
         # MX block-scaled TMA layouts are built from four 32-wide MMA-K atoms.
         # Smaller/non-128-multiple tiles fail the DSL's CTA V-map equivalence.
@@ -699,17 +783,17 @@ class LowLatencyBlockscaledGemmKernel:
         ):
             return False
 
-        output_values_per_thread = (cta_m * cta_n) // 128
-        if cta_m * cta_n % 128 != 0:
-            return False
+        # Each of the 128 epilogue threads holds one accumulator row of the
+        # 128-row MMA tile, whatever the CTA-M
+        output_values_per_thread = cta_n
         if output_values_per_thread % split_k != 0:
             return False
 
         mma_tiles_k = cta_k // mma_k
-        sfa_columns = (cta_m // 32) * mma_tiles_k
+        sfa_columns = (128 // 32) * mma_tiles_k
         sfb_columns_per_stage = mma_tiles_k * (2 if sfb_tmem_store else 4)
         tmem_columns = cta_n + sfa_columns + sfb_columns_per_stage * num_sfb_tmem_stage
-        if cta_m % 32 != 0 or tmem_columns > 256:
+        if tmem_columns > 256:
             return False
         return (
             _smem_bytes(
@@ -720,6 +804,7 @@ class LowLatencyBlockscaledGemmKernel:
                 num_ab_stage,
                 num_sfb_tmem_stage,
                 split_k,
+                sfb_tmem_store,
             )
             <= _SMEM_CAPACITY_BYTES
         )
@@ -728,7 +813,6 @@ class LowLatencyBlockscaledGemmKernel:
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
-        tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,  # (Gemm_M, Gemm_K, Gemm_L) — TMA coordinate tensor for A
         tma_atom_b: cute.CopyAtom,
@@ -742,15 +826,17 @@ class LowLatencyBlockscaledGemmKernel:
         mBias_mnl: Optional[cute.Tensor],  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
+        a_mk_layout_staged: cute.Layout,  # (Mma_M, K, DMA_Stage) view of sA
         b_smem_layout_staged: cute.ComposedLayout,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_flat_staged: cute.Layout,  # compact 3D SFB layout
         sfb_smem_layout_padded_staged: cute.Layout,  # padded 4D SFB layout
+        sfb_tma_smem_layout_staged: cute.Layout,  # bytes of the padded layout TMA fills
     ):
         """GPU device kernel: SMEM alloc, barrier init, warp dispatch.
 
-        384 threads, 12 warps: 0=DMA_A, 1=DMA_B, 2=MMA, 3-6=SFB
-        (register-mediated path only), 7=unused, 8-11=EPILOG. Tensor
+        Warps: 0=DMA_A, 1=DMA_B, 2=MMA, 3=unused, 4-7=EPILOG, 8-11=SFB
+        (register-mediated path only). Tensor
         partitioning is done inside the warp functions.
         """
         warp_idx = cute.arch.warp_idx()
@@ -770,7 +856,9 @@ class LowLatencyBlockscaledGemmKernel:
         _, _, l_idx = cute.arch.cluster_idx()
 
         # Assign this CTA its split-K range
-        total_k_tiles = cute.ceil_div(cute.size(mA_mkl, mode=[1]), self.cta_k)
+        total_k_tiles = cute.ceil_div(
+            cute.size(mA_mkl, mode=[1]), self.cta_tile_shape_mnk[2]
+        )
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         k_tiles_per_split = cute.ceil_div(total_k_tiles, self.split_k)
         k_start = split_rank * k_tiles_per_split
@@ -880,14 +968,14 @@ class LowLatencyBlockscaledGemmKernel:
                 if self.split_k > 1:
                     cute.arch.mbarrier_init(mailbox_mbar, 1)
 
-        # Publish barrier initialization to every warp
+        # Publish barrier initialization within the CTA
         cluster_layout = (
             cute.make_layout((*self.cluster_shape_mn, self.split_k))
             if self.split_k > 1
             else None
         )
         pipeline_init_arrive(cluster_shape_mn=cluster_layout, is_relaxed=True)
-        pipeline_init_wait(cluster_shape_mn=cluster_layout)
+        pipeline_init_wait()
 
         # SMEM Tensor Allocation
         # sA: ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage) with swizzle
@@ -910,15 +998,12 @@ class LowLatencyBlockscaledGemmKernel:
             layout=sfa_smem_layout_staged,
             byte_alignment=128,
         )
-        # Allocate both SFB layouts to keep the configurations type-compatible
-        sSFB_flat = smem.allocate_tensor(
+        # Allocate SFB layout
+        sSFB = smem.allocate_tensor(
             element_type=self.sf_dtype,
-            layout=sfb_smem_layout_flat_staged,
-            byte_alignment=128,
-        )
-        sSFB_padded = smem.allocate_tensor(
-            element_type=self.sf_dtype,
-            layout=sfb_smem_layout_padded_staged,
+            layout=sfb_smem_layout_flat_staged
+            if cutlass.const_expr(self.sfb_tmem_store)
+            else sfb_smem_layout_padded_staged,
             byte_alignment=128,
         )
 
@@ -927,9 +1012,10 @@ class LowLatencyBlockscaledGemmKernel:
         #   Warp 0 (threads 0-31):      TMA load A
         #   Warp 1 (threads 32-63):     TMA load B
         #   Warp 2 (threads 64-95):     MMA   — performs block-scaled MMA
-        #   Warps 3-6 (threads 96-223): SFB producers
-        #   Warp 7 (threads 224-255):   unused
-        #   Warps 8-11 (threads 256-383): epilogue
+        #   Warp 3 (threads 96-127):    unused
+        #   Warps 4-7 (threads 128-255): epilogue; warp_idx % 4 selects the TMEM
+        #                                subpartition each warp may access
+        #   Warps 8-11 (threads 256-383): SFB producers (register-mediated path)
         if warp_idx == 0:
             self.dma_a_warp(
                 ab_full_bar,
@@ -937,6 +1023,7 @@ class LowLatencyBlockscaledGemmKernel:
                 tma_atom_a,
                 mA_mkl,
                 sA,
+                cute.make_tensor(sA.iterator, a_mk_layout_staged),
                 tma_atom_sfa,
                 sfa,
                 sSFA,
@@ -948,7 +1035,6 @@ class LowLatencyBlockscaledGemmKernel:
                 k_tile_count,
             )
         elif warp_idx == 1:
-            sSFB = sSFB_flat if cutlass.const_expr(self.sfb_tmem_store) else sSFB_padded
             self.dma_b_warp(
                 ab_full_bar,
                 ab_empty_bar,
@@ -959,8 +1045,8 @@ class LowLatencyBlockscaledGemmKernel:
                 tma_atom_sfb,
                 mSFB_nkl,
                 sSFB,
+                sfb_tma_smem_layout_staged,
                 tiled_mma,
-                tiled_mma_sfb,
                 cluster_layout_vmnk,
                 block_in_cluster_coord_vmnk,
                 mma_tile_coord_v,
@@ -979,14 +1065,14 @@ class LowLatencyBlockscaledGemmKernel:
                 sA,
                 sB,
                 sSFA,
-                sSFB_padded,
+                sSFB,
                 sfa_smem_layout_staged,
                 sfb_smem_layout_padded_staged,
                 tmem_base_smem_ptr,
                 k_tile_count,
             )
-        elif warp_idx >= 8:
-            epi_tid = tidx - 256
+        elif warp_idx >= 4 and warp_idx < 8:
+            epi_tid = tidx - 128
             self.epilog_warp(
                 tma_epilog_full_bar,
                 mma_epilog_full_bar,
@@ -1005,21 +1091,18 @@ class LowLatencyBlockscaledGemmKernel:
                 k_tile_count,
             )
 
-        # Register-mediated path only: warps 3-6 stage SFB into TMEM (idle on direct copy)
+        # Register-mediated path only: warps 8-11 stage SFB into TMEM
         if cutlass.const_expr(self.sfb_tmem_store):
-            if warp_idx >= 3 and warp_idx <= 6:
+            if warp_idx >= 8:
                 self.sfb_warp(
                     ab_full_bar,
                     sfb_full_bar,
                     sfb_empty_bar,
                     tmem_alloc_result_bar,
                     tmem_base_smem_ptr,
-                    sSFB_flat,
+                    sSFB,
                     k_tile_count,
                 )
-
-        # Final sync
-        cute.arch.barrier()
         return
 
     @cute.jit
@@ -1030,6 +1113,7 @@ class LowLatencyBlockscaledGemmKernel:
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,  # (Gemm_M, Gemm_K, Gemm_L) — TMA coordinate tensor
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
+        sA_mk: cute.Tensor,  # (Mma_M, K, DMA_Stage) view of sA
         tma_atom_sfa: cute.CopyAtom,
         mSFA_mkl: cute.Tensor,
         sSFA: cute.Tensor,
@@ -1043,40 +1127,75 @@ class LowLatencyBlockscaledGemmKernel:
         """DMA_A warp: loads A tiles via TMA."""
         DMA_Stage = self.num_ab_stage
 
-        # Tile mA_mkl (Gemm_M, Gemm_K, Gemm_L) into CTA-level tiles
-        # gA_mkl: (CTA_M, CTA_K, Tiles_M, Tiles_K, Gemm_L) — all tiles
-        gA_mkl = cute.local_tile(mA_mkl, (self.cta_m, self.cta_k), (None, None, None))
         # In 1SM mode, tiled_mma has one partition
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        # tCgA: ((Mma_M, Mma_K), NumMma_M, NumMma_K, Tiles_M, Tiles_K, Gemm_L)
-        tCgA = thr_mma.partition_A(gA_mkl)
-
-        # A tiles multicast along the cluster N dimension. group_modes folds the
-        # MMA modes into one TMA transfer; a 1x1 cluster reduces to a local copy
+        # 128-row MMA tile (and SFA atom) containing this CTA's rows
+        mma_rows_per_cta = self.mma_tiler[0] // self.cta_tile_shape_mnk[0]
+        mma_m_idx = work_tile_info.M_idx // mma_rows_per_cta
+        # A tiles multicast along the cluster N dimension; a 1x1 cluster
+        # reduces to a local copy
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_a,
-            block_in_cluster_coord_vmnk[2],  # this CTA's N coord within cluster
-            a_cta_layout,
-            cute.group_modes(
-                sA, 0, 3
-            ),  # (((Mma_M, Mma_K), NumMma_M, NumMma_K), DMA_Stage)
-            cute.group_modes(
-                tCgA, 0, 3
-            ),  # (((Mma_M, Mma_K), NumMma_M, NumMma_K), Tiles_M, Tiles_K, Gemm_L)
-        )
-        # tAsA: ((TMA, NumTma_K), DMA_Stage) — SMEM destination for each pipeline stage
-        # tAgA: ((TMA, NumTma_K), Tiles_M, Tiles_K, Gemm_L) — GMEM source tiles
+        if cutlass.const_expr(self.cta_tile_shape_mnk[0] == self.mma_tiler[0]):
+            # Tile mA_mkl (Gemm_M, Gemm_K, Gemm_L) into CTA-level tiles
+            # gA_mkl: (CTA_M, CTA_K, Tiles_M, Tiles_K, Gemm_L) — all tiles
+            gA_mkl = cute.local_tile(
+                mA_mkl,
+                (self.mma_tiler[0], self.cta_tile_shape_mnk[2]),
+                (None, None, None),
+            )
+            # tCgA: ((Mma_M, Mma_K), NumMma_M, NumMma_K, Tiles_M, Tiles_K, Gemm_L)
+            tCgA = thr_mma.partition_A(gA_mkl)
 
-        # Slice to this CTA's M tile and batch index, keep K tiles and TMA modes free
-        # tAgA after slice: ((TMA, NumTma_K), Tiles_K)
-        tAgA = tAgA[(None, work_tile_info.M_idx, None, work_tile_info.L_idx)]
+            # group_modes folds the MMA modes into one TMA transfer
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                block_in_cluster_coord_vmnk[2],  # this CTA's N coord within cluster
+                a_cta_layout,
+                cute.group_modes(
+                    sA, 0, 3
+                ),  # (((Mma_M, Mma_K), NumMma_M, NumMma_K), DMA_Stage)
+                cute.group_modes(
+                    tCgA, 0, 3
+                ),  # (((Mma_M, Mma_K), NumMma_M, NumMma_K), Tiles_M, Tiles_K, Gemm_L)
+            )
+            # tAsA: ((TMA, NumTma_K), DMA_Stage) — SMEM destination for each pipeline stage
+            # tAgA: ((TMA, NumTma_K), Tiles_M, Tiles_K, Gemm_L) — GMEM source tiles
+
+            # Slice to this CTA's M tile and batch index, keep K tiles and TMA modes free
+            # tAgA after slice: ((TMA, NumTma_K), Tiles_K)
+            tAgA = tAgA[(None, work_tile_info.M_idx, None, work_tile_info.L_idx)]
+        else:
+            # Place this CTA's rows at their offset within the 128-row tile so
+            # each row lines up with its SFA entry and TMEM lane
+            row_block = work_tile_info.M_idx % mma_rows_per_cta
+            sA_load = cute.local_tile(
+                sA_mk,
+                (self.cta_tile_shape_mnk[0], cute.size(sA_mk, mode=[1])),
+                (row_block, 0, None),
+            )
+            gA_mkl = cute.local_tile(
+                mA_mkl,
+                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
+                (None, None, None),
+            )
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA_load, 0, 2),  # ((CTA_M, CTA_K), DMA_Stage)
+                cute.group_modes(
+                    gA_mkl, 0, 2
+                ),  # ((CTA_M, CTA_K), Tiles_M, Tiles_K, Gemm_L)
+            )
+            tAgA = tAgA[(None, work_tile_info.M_idx, None, work_tile_info.L_idx)]
 
         # SFA partition (same cta_layout as A — SFA multicasts along N)
         gSFA_mkl = cute.local_tile(
-            mSFA_mkl, (self.cta_m, self.cta_k), (None, None, None)
+            mSFA_mkl,
+            (self.mma_tiler[0], self.cta_tile_shape_mnk[2]),
+            (None, None, None),
         )
         tCgSFA = thr_mma.partition_A(gSFA_mkl)
         tAsSFA, tAgSFA = cpasync.tma_partition(
@@ -1088,7 +1207,7 @@ class LowLatencyBlockscaledGemmKernel:
         )
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
-        tAgSFA = tAgSFA[(None, work_tile_info.M_idx, None, work_tile_info.L_idx)]
+        tAgSFA = tAgSFA[(None, mma_m_idx, None, work_tile_info.L_idx)]
 
         # Empty barriers start at phase 0, so the producer starts at phase 1
         ab_state = make_pipeline_state(PipelineUserType.Producer, DMA_Stage)
@@ -1130,11 +1249,6 @@ class LowLatencyBlockscaledGemmKernel:
         if self.use_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
-        # Producer tail: keep shared memory alive until MMA releases every stage
-        for _k_tile in cutlass.range(DMA_Stage, unroll=1):
-            cute.arch.mbarrier_wait(ab_empty_bar + ab_state.index, ab_state.phase)
-            ab_state.advance()
-
     @cute.jit
     def dma_b_warp(
         self,
@@ -1147,8 +1261,8 @@ class LowLatencyBlockscaledGemmKernel:
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,  # SFB TMA coordinate tensor
         sSFB: cute.Tensor,  # SFB SMEM tensor (flat or padded, matching the path)
+        sfb_tma_smem_layout_staged: cute.Layout,  # direct path: bytes TMA fills
         tiled_mma: cute.TiledMma,
-        tiled_mma_sfb: cute.TiledMma,  # only used by the direct-copy (padded) SFB path
         cluster_layout_vmnk: cute.Layout,
         block_in_cluster_coord_vmnk: Tuple,
         mma_tile_coord_v: cutlass.Int32,
@@ -1163,7 +1277,11 @@ class LowLatencyBlockscaledGemmKernel:
 
         # Tile mB_nkl (Gemm_N, Gemm_K, Gemm_L) into CTA-level tiles
         # gB_nkl: (CTA_N, CTA_K, Tiles_N, Tiles_K, Gemm_L)
-        gB_nkl = cute.local_tile(mB_nkl, (self.cta_n, self.cta_k), (None, None, None))
+        gB_nkl = cute.local_tile(
+            mB_nkl,
+            (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2]),
+            (None, None, None),
+        )
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # tCgB: ((Mma_N, Mma_K), NumMma_N, NumMma_K, Tiles_N, Tiles_K, Gemm_L)
         tCgB = thr_mma.partition_B(gB_nkl)
@@ -1187,9 +1305,9 @@ class LowLatencyBlockscaledGemmKernel:
 
         if cutlass.const_expr(self.sfb_tmem_store):
             # Register-mediated path: flat packed SFB layout, partitioned directly
-            sfb_k = self.cta_k // self.sf_vec_size
+            sfb_k = self.cta_tile_shape_mnk[2] // self.sf_vec_size
             gSFB_nkl = cute.local_tile(
-                mSFB_nkl, (self.cta_n, sfb_k), (None, None, None)
+                mSFB_nkl, (self.cta_tile_shape_mnk[1], sfb_k), (None, None, None)
             )
             tBsSFB, tBgSFB = cpasync.tma_partition(
                 tma_atom_sfb,
@@ -1198,24 +1316,23 @@ class LowLatencyBlockscaledGemmKernel:
                 cute.group_modes(sSFB, 0, 2),
                 cute.group_modes(gSFB_nkl, 0, 2),
             )
+            tBgSFB = tBgSFB[(None, work_tile_info.N_idx, None, work_tile_info.L_idx)]
         else:
-            # Direct-copy path: padded SFB partitioned like B via tiled_mma_sfb
-            n_padded = cute.round_up(self.cta_n, 128)
-            gSFB_nkl = cute.local_tile(
-                mSFB_nkl, (n_padded, self.cta_k), (None, None, None)
-            )
-            thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
-            tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
+            # Direct-copy path: lanes 0-7 (first 128 B) of each padded SF atom.
+            # gSFB: (128, SF_Atoms, Tiles_K, Tiles_N, Gemm_L)
+            sfb_tile = cute.slice_(sfb_tma_smem_layout_staged, (None, None, 0)).shape
+            gSFB = cute.local_tile(mSFB_nkl, sfb_tile, (0, None, None, None))
             tBsSFB, tBgSFB = cpasync.tma_partition(
                 tma_atom_sfb,
-                block_in_cluster_coord_vmnk[1],
-                b_cta_layout,
-                cute.group_modes(sSFB, 0, 3),
-                cute.group_modes(tCgSFB, 0, 3),
+                0,
+                cute.make_layout(1),
+                cute.group_modes(
+                    cute.make_tensor(sSFB.iterator, sfb_tma_smem_layout_staged), 0, 2
+                ),  # ((128, SF_Atoms), DMA_Stage)
+                cute.group_modes(gSFB, 0, 2),
             )
-            tBsSFB = cute.filter_zeros(tBsSFB)
-            tBgSFB = cute.filter_zeros(tBgSFB)
-        tBgSFB = tBgSFB[(None, work_tile_info.N_idx, None, work_tile_info.L_idx)]
+            # tBgSFB: (TMA, Tiles_K) after slicing this CTA's N tile and batch
+            tBgSFB = tBgSFB[(None, None, work_tile_info.N_idx, work_tile_info.L_idx)]
 
         # PDL: wait on dependent grids only for B (the activation tensor)
         if self.use_pdl:
@@ -1247,11 +1364,6 @@ class LowLatencyBlockscaledGemmKernel:
         # Release bias loads after the B-load warp satisfies the PDL dependency
         if cutlass.const_expr(self.use_bias):
             cute.arch.mbarrier_arrive(tma_epilog_full_bar)
-
-        # Producer tail: keep shared memory alive until MMA releases every stage
-        for _k_tile in cutlass.range(DMA_Stage, unroll=1):
-            cute.arch.mbarrier_wait(ab_empty_bar + ab_state.index, ab_state.phase)
-            ab_state.advance()
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -1299,7 +1411,8 @@ class LowLatencyBlockscaledGemmKernel:
             tmem_base_smem_ptr,
         )
         sfb_tmem_ptr = cute.recast_ptr(
-            tmem_ptr + self._num_sfa_tmem_cols + self.cta_n, dtype=self.sf_dtype
+            tmem_ptr + self._num_sfa_tmem_cols + self.cta_tile_shape_mnk[1],
+            dtype=self.sf_dtype,
         )
 
         # staged TMEM layout: add SFB_Stage as outermost mode
@@ -1353,10 +1466,10 @@ class LowLatencyBlockscaledGemmKernel:
             # Load SFB from shared memory into registers
             sSFB_stage = sSFB[(None, None, ab_observer.index)]
             smem_row = tidx_in_warp
-            if smem_row >= self.cta_n:
+            if smem_row >= self.cta_tile_shape_mnk[1]:
                 smem_row = cutlass.Int32(0)
             for i in cutlass.range(cute.size(rSFB)):
-                rSFB[i] = sSFB_stage[smem_row + i * self.cta_n]
+                rSFB[i] = sSFB_stage[smem_row + i * self.cta_tile_shape_mnk[1]]
 
             # Wait until MMA releases this SFB stage
             cute.arch.mbarrier_wait(sfb_empty_bar + sfb_state.index, sfb_state.phase)
@@ -1410,11 +1523,10 @@ class LowLatencyBlockscaledGemmKernel:
 
         # Build the accumulator layout before attaching its TMEM base pointer
         # acc_shape / tCtAcc: ((Mma_M, Mma_N), NumMma_M, NumMma_N)
-        acc_shape = tiled_mma.partition_shape_C((self.cta_m, self.cta_n))
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
 
-        # Reserve half of TMEM so the next CTA can overlap allocation
-        num_tmem_cols = 256  # SM100_TMEM_CAPACITY_COLUMNS / 2
+        num_tmem_cols = self.num_tmem_cols
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_smem_ptr)
 
         # All 32 MMA threads publish the allocation without waiting
@@ -1432,7 +1544,9 @@ class LowLatencyBlockscaledGemmKernel:
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
         # SFA/SFB TMEM tensors and S2T copy partition
-        sfa_tmem_ptr = cute.recast_ptr(tmem_ptr + self.cta_n, dtype=self.sf_dtype)
+        sfa_tmem_ptr = cute.recast_ptr(
+            tmem_ptr + self.cta_tile_shape_mnk[1], dtype=self.sf_dtype
+        )
         sfa_mem_single = cute.slice_(sfa_smem_layout_staged, (None, None, None, 0))
         tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma, tiled_mma.shape_mnk, self.sf_vec_size, sfa_mem_single
@@ -1440,7 +1554,8 @@ class LowLatencyBlockscaledGemmKernel:
         tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
 
         sfb_tmem_ptr = cute.recast_ptr(
-            tmem_ptr + self._num_sfa_tmem_cols + self.cta_n, dtype=self.sf_dtype
+            tmem_ptr + self._num_sfa_tmem_cols + self.cta_tile_shape_mnk[1],
+            dtype=self.sf_dtype,
         )
 
         # SFA: SMEM-to-TMEM copy
@@ -1638,16 +1753,22 @@ class LowLatencyBlockscaledGemmKernel:
     ):
         """EPILOG warp: TMEM -> RMEM -> type convert -> GMEM."""
 
+        # The accumulator covers a 128-row MMA tile; this CTA owns cta_m of its rows
+        mma_m_idx = work_tile_info.M_idx // (
+            self.mma_tiler[0] // self.cta_tile_shape_mnk[0]
+        )
+        row_start = work_tile_info.M_idx * self.cta_tile_shape_mnk[0]
+
         # Get this CTA's output tile
         # gC_mnl: (CTA_M, CTA_N, Tiles_M, Tiles_N, Gemm_L)
-        gC_mnl = cute.local_tile(mC_mnl, (self.cta_m, self.cta_n), (None, None, None))
+        gC_mnl = cute.local_tile(mC_mnl, self.mma_tiler[:2], (None, None, None))
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # tCgC: ((Mma_M, Mma_N), NumMma_M, NumMma_N, Tiles_M, Tiles_N, Gemm_L)
         tCgC = thr_mma.partition_C(gC_mnl)
 
         # Recreate the MMA accumulator layout; attach its TMEM base pointer below
         # acc_shape / tCtAcc_fake: ((Mma_M, Mma_N), NumMma_M, NumMma_N)
-        acc_shape = tiled_mma.partition_shape_C((self.cta_m, self.cta_n))
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
 
         # All 128 epilogue threads arrive, then wait for MMA to publish TMEM
@@ -1665,18 +1786,18 @@ class LowLatencyBlockscaledGemmKernel:
 
         # Select the tensor-to-register copy atom for this CTA
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
-            (self.cta_m, self.cta_n, self.cta_k),
+            self.mma_tiler,
             self.c_layout,
             self.c_dtype,
             self.acc_dtype,
-            (self.cta_m, self.cta_n),
+            self.mma_tiler[:2],
             self.use_2cta_instrs,
         )
 
         tiled_copy_t2r = tcgen05.make_tmem_copy(
             copy_atom_t2r, tCtAcc[((None, None), 0, 0)]
         )
-        # Epilogue tid is 0-127 (threads 256-383 offset by 256)
+        # Epilogue tid is 0-127 (threads 128-255 offset by 128)
         thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
         # tD describes the per-thread tensor-to-register partition
@@ -1704,7 +1825,7 @@ class LowLatencyBlockscaledGemmKernel:
                 None,
                 None,
                 None,
-                work_tile_info.M_idx,
+                mma_m_idx,
                 work_tile_info.N_idx,
                 work_tile_info.L_idx,
             )
@@ -1713,7 +1834,7 @@ class LowLatencyBlockscaledGemmKernel:
         # Direct stores need explicit bounds checks; TMA loads handle OOB coordinates
         coordC = cute.make_identity_tensor(mC_mnl.shape)  # (M, N, L) -> (m, n, l)
         # Create the local tile of coordC, same tiling as gC
-        gCcoord = cute.local_tile(coordC, (self.cta_m, self.cta_n), (None, None, None))
+        gCcoord = cute.local_tile(coordC, self.mma_tiler[:2], (None, None, None))
         # tCcC: ((Mma_M, Mma_N), NumMma_M, NumMma_N, Tiles_M, Tiles_N, Gemm_L)
         tCcC = thr_mma.partition_C(gCcoord)
         # tDcC: (CpyD, NumCpy_M, NumCpy_N, Tiles_M, Tiles_N, Gemm_L)
@@ -1725,7 +1846,7 @@ class LowLatencyBlockscaledGemmKernel:
                 None,
                 None,
                 None,
-                work_tile_info.M_idx,
+                mma_m_idx,
                 work_tile_info.N_idx,
                 work_tile_info.L_idx,
             )
@@ -1737,6 +1858,12 @@ class LowLatencyBlockscaledGemmKernel:
         )  # (CpyD, NumCpy_M, NumCpy_N)
         for i in range(cute.size(tDpredC)):
             tDpredC[i] = cute.elem_less(tDcC[i], mC_mnl.shape)
+            if cutlass.const_expr(self.cta_tile_shape_mnk[0] != self.mma_tiler[0]):
+                # Rows outside this CTA's range hold garbage or belong to
+                # another CTA
+                row = tDcC[i][0]
+                if row < row_start or row >= row_start + self.cta_tile_shape_mnk[0]:
+                    tDpredC[i] = cutlass.Boolean(False)
 
         if cutlass.const_expr(self.use_scale):
             scale_value = mScale[0].to(self.acc_dtype)
@@ -1744,7 +1871,7 @@ class LowLatencyBlockscaledGemmKernel:
         # Use C's register mapping for the M-broadcast bias
         if cutlass.const_expr(self.use_bias):
             gBias_mnl = cute.local_tile(
-                mBias_mnl, (self.cta_m, self.cta_n), (None, None, None)
+                mBias_mnl, self.mma_tiler[:2], (None, None, None)
             )
             tCgBias = thr_mma.partition_C(gBias_mnl)
             tDgBias = thr_copy_t2r.partition_D(
@@ -1755,7 +1882,7 @@ class LowLatencyBlockscaledGemmKernel:
                     None,
                     None,
                     None,
-                    work_tile_info.M_idx,
+                    mma_m_idx,
                     work_tile_info.N_idx,
                     work_tile_info.L_idx,
                 )
@@ -1811,6 +1938,8 @@ class LowLatencyBlockscaledGemmKernel:
 
             # Complete tensor memory loads before the distributed scatter
             cute.arch.barrier(barrier_id=15, number_of_threads=128)
+            # Peers' mailbox barriers are initialized (prologue cluster arrive)
+            cute.arch.cluster_wait()
 
             for peer in range(self.split_k):
                 if peer != split_rank:
@@ -2034,11 +2163,21 @@ def make_blockscaled_tensors(
     return a, b, sfa_reordered, sfb_reordered, c, sfa_simple, sfb_simple
 
 
+_TORCH_TO_CUTLASS_DTYPE = {
+    torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
+    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+    torch.float32: cutlass.Float32,
+}
+
+
 def _gmem_ptr_from_torch(tensor: torch.Tensor, assumed_align: int) -> cute.Pointer:
     """Create a CuTe pointer whose element type comes from the torch tensor."""
-    element_type = from_dlpack(tensor).element_type
     return make_ptr(
-        element_type,
+        _TORCH_TO_CUTLASS_DTYPE[tensor.dtype],
         tensor.data_ptr(),
         cutlass.AddressSpace.gmem,
         assumed_align=assumed_align,
@@ -2111,7 +2250,7 @@ def run(
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     c_dtype: Type[cutlass.Numeric],
-    mma_tiler_mnk: tuple[int, int, int | None],
+    cta_tile_shape_mnk: tuple[int, int, int | None],
     num_ab_stage: int,
     num_sfb_tmem_stage: int,
     use_pdl: bool,
@@ -2150,7 +2289,7 @@ def run(
     :rtype: float | None
     """
     m, n, k, l = problem_sizes_mnkl
-    cta_m, cta_n, cta_k = mma_tiler_mnk
+    cta_m, cta_n, cta_k = cta_tile_shape_mnk
 
     # Reject unsupported configurations
     if not LowLatencyBlockscaledGemmKernel.can_implement(
@@ -2160,7 +2299,7 @@ def run(
         sf_dtype,
         sf_vec_size,
         c_dtype,
-        mma_tiler_mnk,
+        cta_tile_shape_mnk,
         num_ab_stage,
         num_sfb_tmem_stage,
         split_k,
@@ -2202,7 +2341,7 @@ def run(
         f"SF Vec size: {sf_vec_size}"
     )
     print(f"C dtype: {c_dtype}")
-    print(f"Mma Tiler (M, N, K): {(cta_m, cta_n, cta_k)}")
+    print(f"CTA tile (M, N, K): {(cta_m, cta_n, cta_k)}")
     print(f"AB stages: {num_ab_stage}, SFB TMEM stages: {num_sfb_tmem_stage}")
     print(
         f"PDL: {use_pdl}, Split-K: {split_k}, SFB TMEM store: {sfb_tmem_store}, "
@@ -2251,7 +2390,7 @@ def run(
     print("Compiling DSL kernel...")
     gemm = LowLatencyBlockscaledGemmKernel(
         acc_dtype=cutlass.Float32,
-        mma_tiler_mnk=(cta_m, cta_n, cta_k),
+        cta_tile_shape_mnk=(cta_m, cta_n, cta_k),
         num_ab_stage=num_ab_stage,
         num_sfb_tmem_stage=num_sfb_tmem_stage,
         sf_vec_size=sf_vec_size,
@@ -2457,7 +2596,7 @@ if __name__ == "__main__":
         help="Cycle through enough workspaces to keep the L2 cache cold",
     )
     parser.add_argument(
-        "--mma_tiler_mnk",
+        "--cta_tile_shape_mnk",
         type=parse_comma_separated_ints,
         default=(128, 8, None),
         help="CTA tile shape as 'M,N' (K dtype-derived) or 'M,N,K', e.g. 128,8 or 128,8,256",
@@ -2503,15 +2642,15 @@ if __name__ == "__main__":
     if len(args.problem_sizes_mnkl) != 4:
         parser.error("--problem_sizes_mnkl must contain exactly 4 values (M, N, K, L)")
 
-    if len(args.mma_tiler_mnk) not in (2, 3):
+    if len(args.cta_tile_shape_mnk) not in (2, 3):
         parser.error(
-            "--mma_tiler_mnk must contain 2 (M,N; K dtype-derived) or 3 (M,N,K) values"
+            "--cta_tile_shape_mnk must contain 2 (M,N; K dtype-derived) or 3 (M,N,K) values"
         )
     # 2 values -> K is derived from the dtypes (None sentinel)
-    mma_tiler_mnk = (
-        args.mma_tiler_mnk
-        if len(args.mma_tiler_mnk) == 3
-        else (*args.mma_tiler_mnk, None)
+    cta_tile_shape_mnk = (
+        args.cta_tile_shape_mnk
+        if len(args.cta_tile_shape_mnk) == 3
+        else (*args.cta_tile_shape_mnk, None)
     )
 
     run(
@@ -2521,7 +2660,7 @@ if __name__ == "__main__":
         sf_dtype=args.sf_dtype,
         c_dtype=args.c_dtype,
         sf_vec_size=args.sf_vec_size,
-        mma_tiler_mnk=mma_tiler_mnk,
+        cta_tile_shape_mnk=cta_tile_shape_mnk,
         num_ab_stage=args.stages,
         num_sfb_tmem_stage=args.num_sfb_tmem_stage,
         use_pdl=args.use_pdl,
