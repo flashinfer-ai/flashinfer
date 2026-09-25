@@ -16,6 +16,9 @@ from .minimax_h3_fc1_swiglu import (
 from .cake_minimax_h3_sm120_quant_varlen_attention import (
     minimax_h3_sm120_varlen_attention_fp8,
 )
+from .cake_minimax_h3_sm120_nvfp4_varlen_attention import (
+    minimax_h3_sm120_varlen_attention_nvfp4,
+)
 from .cake_minimax_h3_sm120_quant_pre_attention import (
     MiniMaxH3PreAttentionOutput,
     minimax_h3_fp8_pre_attention,
@@ -68,6 +71,7 @@ __all__ = [
     "quantize_minimax_h3_qkv_weight_fp8",
     "quantize_minimax_h3_qkv_weight_nvfp4",
     "minimax_h3_sm120_varlen_attention_fp8",
+    "minimax_h3_sm120_varlen_attention_nvfp4",
     "PreparedMiniMaxH3QkvQuantizePack",
     "minimax_h3_qkv_quantize_pack",
     "prepare_minimax_h3_qkv_quantize_pack",
