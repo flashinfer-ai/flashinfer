@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from benchmarks.bench_trtllm_moe_da import BenchmarkShape, _benchmark_precision
+from benchmarks.bench_moe_da import BenchmarkShape, _benchmark_precision
 from flashinfer.utils import get_compute_capability
 
 
@@ -21,6 +21,7 @@ PRODUCTION_PRECISIONS = (
     "mxfp8",
     "mxint4",
 )
+_COUNTERBALANCED_GRAPH_ITERATIONS = 2
 
 
 def require_sm100() -> None:
@@ -81,7 +82,7 @@ def run_matched_public_graphs(
         cache,
         tune,
         0,
-        1,
+        _COUNTERBALANCED_GRAPH_ITERATIONS,
     )
     # Validate numerical, timing, policy, and topology fields exposed to benchmark users.
     assert len(rows) == len(distributions)

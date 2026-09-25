@@ -15,6 +15,7 @@
  */
 #include <algorithm>
 
+#include "flashinfer/fused_moe/da_config.cuh"
 #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 
@@ -180,7 +181,8 @@ namespace {
 constexpr int32_t kExpertTier256 = 256;
 constexpr int32_t kExpertTier384 = 384;
 constexpr int32_t kExpertTier512 = 512;
-constexpr int32_t kMaxSupportedTopK = 8;
+constexpr int32_t kExpertTier1024 = flashinfer::da_moe::kDAMaxExperts;
+constexpr int32_t kStandardMaxTopK = 8;
 
 /// Return the compiled expert tier covering one routing problem, or zero when unsupported.
 int32_t getMaxNumExpertsTier(int32_t numExperts) {
@@ -195,6 +197,9 @@ int32_t getMaxNumExpertsTier(int32_t numExperts) {
   }
   if (numExperts <= kExpertTier512) {
     return kExpertTier512;
+  }
+  if (numExperts <= kExpertTier1024) {
+    return kExpertTier1024;
   }
   FLASHINFER_WARN("Unsupported numExperts");
   return 0;
@@ -233,11 +238,12 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
   }
-  // Preserve the ordinary routing permutation implementation within each independent tile slice.
+  // Request extended capacity from the existing device routine; ordinary callers retain its
+  // default cluster-sized capacity and generated implementation.
   routingPermutation<KernelParams, OutputT, KernelParams::MaxNumExperts,
                      KernelParams::MaxNumExperts / WarpSize, KernelParams::MaxNumTopExperts,
-                     /*LoadExpertIdxFromGlobal=*/true, ExpertId>(params, nullptr, warpIdx,
-                                                                 clusterBlockRank, args.expertIds);
+                     /*LoadExpertIdxFromGlobal=*/true, ExpertId, kMaxTokensMultiTileCluster>(
+      params, nullptr, warpIdx, clusterBlockRank, args.expertIds);
 }
 #else
 __global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams, ExpertId>) {
@@ -279,42 +285,55 @@ void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t numBlock
 }
 
 /// Launch one expert-count tier for either supported precomputed weight type.
-template <int MaxNumExperts, typename ExpertId>
+template <int MaxNumExperts, int MaxNumTopExperts, typename ExpertId>
 void launchMultiTileClusterTier(Data* data, int32_t numTiles, int32_t numBlocks, int32_t numThreads,
                                 int32_t smemSize, void* stream) {
   if (data[0].mDtypeOutput == tg::Dtype::Bfloat16) {
-    using Params = KernelParams<__nv_bfloat16, MaxNumExperts, kMaxSupportedTopK>;
+    using Params = KernelParams<__nv_bfloat16, MaxNumExperts, MaxNumTopExperts>;
     launchMultiTileClusterKernel<Params, ExpertId>(data, numTiles, numBlocks, numThreads, smemSize,
                                                    stream);
   } else {
-    using Params = KernelParams<float, MaxNumExperts, kMaxSupportedTopK>;
+    using Params = KernelParams<float, MaxNumExperts, MaxNumTopExperts>;
     launchMultiTileClusterKernel<Params, ExpertId>(data, numTiles, numBlocks, numThreads, smemSize,
                                                    stream);
   }
 }
 
 /// Launch one expert tier with the exact precomputed expert-ID storage type.
-template <int MaxNumExperts>
+template <int MaxNumExperts, int MaxNumTopExperts>
 void launchMultiTileClusterExpertIds(Data* data, int32_t numTiles, int32_t numBlocks,
                                      int32_t numThreads, int32_t smemSize, void* stream) {
   if (data[0].mExpertIdType == ExpertIdType::Int16) {
-    launchMultiTileClusterTier<MaxNumExperts, int16_t>(data, numTiles, numBlocks, numThreads,
-                                                       smemSize, stream);
+    launchMultiTileClusterTier<MaxNumExperts, MaxNumTopExperts, int16_t>(
+        data, numTiles, numBlocks, numThreads, smemSize, stream);
   } else {
-    launchMultiTileClusterTier<MaxNumExperts, int32_t>(data, numTiles, numBlocks, numThreads,
-                                                       smemSize, stream);
+    launchMultiTileClusterTier<MaxNumExperts, MaxNumTopExperts, int32_t>(
+        data, numTiles, numBlocks, numThreads, smemSize, stream);
+  }
+}
+
+/// Preserve the narrower specialization for the established top-k <= 8 domain.
+template <int MaxNumExperts>
+void launchMultiTileClusterTopK(Data* data, int32_t numTiles, int32_t numBlocks, int32_t numThreads,
+                                int32_t smemSize, void* stream) {
+  if (data[0].mTopK <= kStandardMaxTopK) {
+    launchMultiTileClusterExpertIds<MaxNumExperts, kStandardMaxTopK>(data, numTiles, numBlocks,
+                                                                     numThreads, smemSize, stream);
+  } else {
+    launchMultiTileClusterExpertIds<MaxNumExperts, flashinfer::da_moe::kDAMaxTopK>(
+        data, numTiles, numBlocks, numThreads, smemSize, stream);
   }
 }
 
 /// Dispatch the common expert tiers used by fused multi-tile precomputed routing.
 void launchMultiTileCluster(Data* data, int32_t numTiles, int32_t numBlocks, int32_t numThreads,
                             int32_t smemSize, void* stream) {
-  FLASHINFER_CHECK(data[0].mNumExperts <= kExpertTier512,
+  FLASHINFER_CHECK(data[0].mNumExperts <= kExpertTier1024,
                    "multi-tile precomputed routing currently supports numExperts <= ",
-                   kExpertTier512, ", got ", data[0].mNumExperts);
-  FLASHINFER_CHECK(data[0].mTopK <= kMaxSupportedTopK,
-                   "multi-tile precomputed routing currently supports topK <= ", kMaxSupportedTopK,
-                   ", got ", data[0].mTopK);
+                   kExpertTier1024, ", got ", data[0].mNumExperts);
+  FLASHINFER_CHECK(data[0].mTopK <= flashinfer::da_moe::kDAMaxTopK,
+                   "multi-tile precomputed routing currently supports topK <= ",
+                   flashinfer::da_moe::kDAMaxTopK, ", got ", data[0].mTopK);
   FLASHINFER_CHECK(
       data[0].mDtypeOutput == tg::Dtype::Bfloat16 || data[0].mDtypeOutput == tg::Dtype::Fp32,
       "multi-tile precomputed routing supports BF16 or FP32 weights");
@@ -322,25 +341,30 @@ void launchMultiTileCluster(Data* data, int32_t numTiles, int32_t numBlocks, int
                    "multi-tile precomputed routing captures as a normal graph node");
 
   if (data[0].mNumExperts <= topk::MaxNumExpertsUnit) {
-    launchMultiTileClusterExpertIds<topk::MaxNumExpertsUnit>(data, numTiles, numBlocks, numThreads,
-                                                             smemSize, stream);
+    launchMultiTileClusterTopK<topk::MaxNumExpertsUnit>(data, numTiles, numBlocks, numThreads,
+                                                        smemSize, stream);
   } else if (data[0].mNumExperts <= kExpertTier256) {
-    launchMultiTileClusterExpertIds<kExpertTier256>(data, numTiles, numBlocks, numThreads, smemSize,
-                                                    stream);
+    launchMultiTileClusterTopK<kExpertTier256>(data, numTiles, numBlocks, numThreads, smemSize,
+                                               stream);
   } else if (data[0].mNumExperts <= kExpertTier384) {
-    launchMultiTileClusterExpertIds<kExpertTier384>(data, numTiles, numBlocks, numThreads, smemSize,
-                                                    stream);
+    launchMultiTileClusterTopK<kExpertTier384>(data, numTiles, numBlocks, numThreads, smemSize,
+                                               stream);
+  } else if (data[0].mNumExperts <= kExpertTier512) {
+    launchMultiTileClusterTopK<kExpertTier512>(data, numTiles, numBlocks, numThreads, smemSize,
+                                               stream);
   } else {
-    launchMultiTileClusterExpertIds<kExpertTier512>(data, numTiles, numBlocks, numThreads, smemSize,
-                                                    stream);
+    launchMultiTileClusterTopK<kExpertTier1024>(data, numTiles, numBlocks, numThreads, smemSize,
+                                                stream);
   }
 }
 
 }  // namespace
 
-/// Return the token bound implied by the eight-block cluster and expert-count specialization.
+/// Return the graph-stable token capacity implemented by the two-phase cluster decomposition.
 int32_t maxTokensMultiTileCluster(int32_t numExperts) {
-  return NumBlocksPerCluster * getMaxNumExpertsTier(numExperts);
+  FLASHINFER_CHECK(getMaxNumExpertsTier(numExperts) > 0,
+                   "fused multi-tile routing requires numExperts <= ", kExpertTier1024);
+  return kMaxTokensMultiTileCluster;
 }
 
 /// Validate the common precomputed-routing shape and launch every tile as one fused kernel.
@@ -353,11 +377,13 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
   Data const& first = data[0];
   int32_t const maxTokens = maxTokensMultiTileCluster(first.mNumExperts);
   FLASHINFER_CHECK(first.mNumTokens <= maxTokens, "runMultiTileCluster supports up to ", maxTokens,
-                   " tokens (NumBlocksPerCluster * MaxNumExperts), got ", first.mNumTokens);
+                   " tokens, got ", first.mNumTokens);
   FLASHINFER_CHECK(first.mPtrTopKPacked != nullptr || first.mPtrPrecomputedExpertIds != nullptr,
                    "runMultiTileCluster requires precomputed top-k ids");
   FLASHINFER_CHECK(first.mPtrPermutedIdxSize != nullptr,
                    "runMultiTileCluster requires routing metadata output buffers");
+  FLASHINFER_CHECK(first.mPtrExpandedIdxToPermutedIdx != nullptr,
+                   "runMultiTileCluster requires expanded-index scratch/output storage");
   FLASHINFER_CHECK(first.mTileTokensDim > 0,
                    "multi-tile routing entries must have positive tile sizes");
 

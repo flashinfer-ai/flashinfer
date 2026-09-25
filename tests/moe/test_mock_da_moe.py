@@ -182,7 +182,10 @@ def run_mock_da_moe(args: argparse.Namespace) -> dict[str, object]:
     runner = MockDAMoERunner(
         num_experts=args.num_experts,
         dtype=dtype,
-        tuning_config=TuningConfig(use_cuda_graph=not args.no_cuda_graph),
+        tuning_config=TuningConfig(
+            use_cuda_graph=not args.no_cuda_graph,
+            use_cold_l2_cache=True,
+        ),
     )
     inputs = runner.moe_runner.allocate_inputs(
         args.num_tokens, args.hidden_size, args.top_k
@@ -216,6 +219,7 @@ def run_mock_da_moe(args: argparse.Namespace) -> dict[str, object]:
             "published_body_tactics": [body.tactic for body in plan.bodies],
             "resources_prepared": runner.dispatcher.resources is not None,
             "uses_fixed_candidate_cuda_graphs": not args.no_cuda_graph,
+            "profile_diagnostics": runner.last_profile_diagnostics,
         },
     }
 
@@ -319,6 +323,16 @@ def test_mock_da_moe_cuda_graph_reference_design() -> None:
     )
 
     assert report["phase_sequence"] == ["autotune_warmup", "capture", "replay"]
+    warmup = report["autotune_warmup"]
+    assert isinstance(warmup, dict)
+    profile = warmup["profile_diagnostics"]
+    assert isinstance(profile, dict)
+    assert profile["sample_count"] == 2
+    assert profile["measurement_count"] == 6
+    assert profile["replica_count"] == 1
+    assert profile["uses_cold_l2_cache"] is False
+    assert len(profile["fixed_pointer_schedule"]) == profile["replica_count"]
+
     capture = report["capture"]
     assert isinstance(capture, dict)
     topology = capture["topology"]
@@ -387,6 +401,96 @@ def test_mock_da_moe_cuda_graph_reference_design() -> None:
         "leased_workspace_lanes": 0,
     }
     assert lifecycle["released_idle_resources"] == 1
+
+
+def test_selector_ignores_retained_nonlocal_assignments() -> None:
+    """Changing only remote expert IDs must not change the selected DA body."""
+    runner = MockDAMoERunner(
+        num_experts=8,
+        local_expert_offset=2,
+        num_local_experts=3,
+    )
+    inputs = runner.moe_runner.allocate_inputs(8, 16, 2)
+    spread = torch.tensor(
+        [[2, 3], [3, 4], [4, 2], [2, 3]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    concentrated = torch.full_like(spread, 2)
+    runner.publish_plan([spread, concentrated], [0, 1])
+
+    first = torch.tensor(
+        [[2, 0], [2, 1], [2, 5], [2, 6]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    second = torch.tensor(
+        [[2, 7], [2, 6], [2, 1], [2, 0]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    no_local_work = torch.tensor(
+        [[0, 1], [5, 6], [6, 7], [0, 7]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    inputs.expert_ids.copy_(first)
+    runner.prepare(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs.as_list(), tactic=0)
+    lease = runner.acquire_graph_lease(graph)
+
+    try:
+        selected = []
+        for expert_ids in (first, second, no_local_work):
+            inputs.expert_ids.copy_(expert_ids)
+            graph.replay()
+            torch.cuda.synchronize()
+            selected.append(int(runner.selected_body_tensor().item()))
+        assert selected == [1, 1, 0]
+    finally:
+        graph.reset()
+        lease.release()
+
+
+def test_selector_supports_1024_experts_and_topk32() -> None:
+    """The compiled selector must distinguish spectra at both DA capacity bounds."""
+    local_expert_offset = 480
+    num_local_experts = 64
+    runner = MockDAMoERunner(
+        num_experts=1024,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+    )
+    inputs = runner.moe_runner.allocate_inputs(64, 16, 32)
+    spread = (
+        torch.arange(inputs.expert_ids.numel(), device="cuda", dtype=torch.int32)
+        .remainder(num_local_experts)
+        .add(local_expert_offset)
+        .view_as(inputs.expert_ids)
+    )
+    concentrated = torch.full_like(spread, local_expert_offset)
+    runner.publish_plan([spread, concentrated], [0, 1])
+
+    inputs.expert_ids.copy_(spread)
+    runner.prepare(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs.as_list(), tactic=0)
+    lease = runner.acquire_graph_lease(graph)
+
+    try:
+        selected = []
+        for expert_ids in (spread, concentrated):
+            inputs.expert_ids.copy_(expert_ids)
+            graph.replay()
+            torch.cuda.synchronize()
+            selected.append(int(runner.selected_body_tensor().item()))
+        assert selected == [0, 1]
+    finally:
+        graph.reset()
+        lease.release()
 
 
 if __name__ == "__main__":

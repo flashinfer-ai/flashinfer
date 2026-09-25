@@ -266,7 +266,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
             inputs_pre_hook=self._profile_routing_pre_hook,
             use_cold_l2_cache=True,
             value_aware_input_indices=(1, 2),
-            profile_arena_input_indices=(0, 1, 2, 5),
+            profile_replica_input_indices=(0, 1, 2, 5),
             # Graph replay excludes host launch overhead from short-kernel
             # measurements.
             use_cuda_graph=True,

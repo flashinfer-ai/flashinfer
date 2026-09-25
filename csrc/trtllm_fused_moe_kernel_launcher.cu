@@ -715,7 +715,8 @@ inline RoutingInputMode validateMultiTileRoutingInputs(
   TVM_FFI_ICHECK_GT(topk_ids.size(0), 0) << "topk_ids must contain at least one token.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
   TVM_FFI_ICHECK_GT(top_k, 0) << "top_k must be positive.";
-  TVM_FFI_ICHECK_LE(top_k, 8) << "fused multi-tile routing supports top_k <= 8.";
+  TVM_FFI_ICHECK_LE(top_k, da_moe::kDAMaxTopK)
+      << "fused multi-tile routing supports top_k <= " << da_moe::kDAMaxTopK << ".";
   TVM_FFI_ICHECK_GE(num_experts, top_k) << "num_experts must be at least top_k.";
   TVM_FFI_ICHECK_LE(num_experts, da_moe::kDAMaxExperts)
       << "fused multi-tile routing supports num_experts <= " << da_moe::kDAMaxExperts << ".";
@@ -6249,33 +6250,25 @@ Array<Tensor> trtllm_moe_allocate_canonical_routing(TensorView routing_logits, i
 }
 
 /** Launch the real TRTLLM router once and retain both conventional and replay outputs. */
-void trtllm_moe_canonicalize_routing(
-    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
-    Array<Tensor> canonical, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool use_routing_scales_on_input, bool use_deep_seek_fp8,
-    bool norm_topk_prob, bool enable_pdl, int64_t tile_tokens_dim) {
+void trtllm_moe_canonicalize_routing(TensorView routing_logits, Optional<TensorView> routing_bias,
+                                     int64_t dtype_act, Array<Tensor> canonical, int64_t top_k,
+                                     Optional<int64_t> n_group, Optional<int64_t> topk_group,
+                                     int64_t local_expert_offset, int64_t local_num_experts,
+                                     Optional<double> routed_scaling_factor,
+                                     int64_t routing_method_type, bool use_routing_scales_on_input,
+                                     bool use_deep_seek_fp8, bool norm_topk_prob, bool enable_pdl,
+                                     int64_t tile_tokens_dim) {
   // Decode the public tensor array once and retain named fields through routing.
   ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
   CanonicalRoutingBuffers const buffers = CanonicalRoutingBuffers::from_ffi(canonical);
   int64_t const num_tokens = routing_logits.size(0);
   int64_t const num_experts = routing_logits.size(1);
-  TVM_FFI_ICHECK_EQ(hidden_states.size(0), num_tokens)
-      << "hidden_states and routing_logits must have the same token count.";
   TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset + local_num_experts <= num_experts)
       << "the local expert range must lie within routing_logits.";
 
-  btg::Dtype dtype_elt;
-  if (hidden_states.dtype() == dl_float16) {
-    dtype_elt = btg::Dtype::Fp16;
-  } else if (hidden_states.dtype() == dl_bfloat16) {
-    dtype_elt = btg::Dtype::Bfloat16;
-  } else if (hidden_states.dtype() == dl_float8_e4m3fn) {
-    dtype_elt = btg::Dtype::E4m3;
-  } else {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "Unsupported activation dtype for canonical routing.";
-  }
+  // Logical block-scaled activation types cannot be recovered from their uint8 storage. The
+  // ordinary backend therefore passes the exact Dtype enum already used by its routed body.
+  btg::Dtype const dtype_elt = static_cast<btg::Dtype>(dtype_act);
   btg::Dtype const routing_bias_dtype =
       routing_bias.has_value() && routing_bias.value().dtype() == dl_float32 ? btg::Dtype::Fp32
                                                                              : btg::Dtype::Bfloat16;
@@ -6447,30 +6440,42 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
                                                     cudaGraphCondAssignDefault));
   int64_t const assignment_numel = topk_ids.numel();
   bool const packed_ids = input_mode == RoutingInputMode::PackedPrecomputed;
-  if (packed_ids) {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, true>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
-  } else if (topk_ids.dtype() == dl_int16) {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
+  auto launch_selector_for_max_experts = [&](auto max_experts_tag) {
+    constexpr int kMaxExperts = decltype(max_experts_tag)::value;
+    if (packed_ids) {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, true>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    } else if (topk_ids.dtype() == dl_int16) {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    } else {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, false>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    }
+  };
+  constexpr int kMaxExpertsWithTwoBinsPerThread = 2 * da_moe::kDASelectorBlockThreads;
+  if (num_experts <= kMaxExpertsWithTwoBinsPerThread) {
+    launch_selector_for_max_experts(std::integral_constant<int, kMaxExpertsWithTwoBinsPerThread>{});
   } else {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
+    launch_selector_for_max_experts(std::integral_constant<int, da_moe::kDAMaxExperts>{});
   }
   CHECK_CUDA_ERROR(cudaPeekAtLastError());
   da_moe::ActiveCaptureContext after_selector{};

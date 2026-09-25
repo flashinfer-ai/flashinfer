@@ -34,10 +34,16 @@ pattern for their own name functions.
 
 import inspect
 import re
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("cutlass")
+
+import cutlass.cute as cute  # noqa: E402
+
+from flashinfer.jit import cute_dsl_core  # noqa: E402
 
 from flashinfer.gemm.gemm_svdquant import (  # noqa: E402
     _sm120_nvfp4_svdquant_runner,
@@ -93,6 +99,69 @@ SVDQUANT_NAME_BASELINE = {
     "enable_pdl": False,
     "enable_iket": False,
 }
+
+
+@pytest.mark.parametrize(
+    ("load_symbol", "native_function_prefix"),
+    ((None, "native_entry"), ("native_entry", None)),
+)
+def test_native_cute_dsl_cache_requires_symbol_contract(
+    monkeypatch, tmp_path, load_symbol, native_function_prefix
+):
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+
+    with pytest.raises(ValueError, match="load symbol and function prefix"):
+        cute_dsl_core.JitSpecCuteDsl(
+            "native_contract",
+            "kernel",
+            lambda: None,
+            "source-hash",
+            enable_tvm_ffi=False,
+            load_symbol=load_symbol,
+            native_function_prefix=native_function_prefix,
+        )
+
+
+def test_native_cute_dsl_cache_reloads_without_recompiling(monkeypatch, tmp_path):
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    source = tmp_path / "native_kernel.py"
+    source.write_text("# cache fingerprint\n")
+    compile_calls = []
+    load_calls = []
+    loaded_kernel = object()
+
+    class CompiledKernel:
+        def dump_to_object(self, function_prefix):
+            assert function_prefix == "native_entry"
+            return b"native-cute-object"
+
+    def compile_kernel():
+        compile_calls.append(None)
+        return CompiledKernel()
+
+    def load_module(path, *, enable_tvm_ffi):
+        assert enable_tvm_ffi is False
+        assert Path(path).read_bytes() == b"native-cute-object"
+        load_calls.append(path)
+        return SimpleNamespace(native_entry=loaded_kernel)
+
+    monkeypatch.setattr(cute.runtime, "load_module", load_module)
+    kwargs = dict(
+        module_name="native_contract",
+        kernel_name="kernel",
+        compile_fn=compile_kernel,
+        extra_key_files=(str(source),),
+        enable_tvm_ffi=False,
+        load_symbol="native_entry",
+        native_function_prefix="native_entry",
+    )
+
+    assert cute_dsl_core.build_and_load_cute_dsl_kernel(**kwargs) is loaded_kernel
+    assert cute_dsl_core.build_and_load_cute_dsl_kernel(**kwargs) is loaded_kernel
+    assert len(compile_calls) == 1
+    assert len(load_calls) == 2
 
 
 @pytest.mark.parametrize("getter", NVFP4_KERNEL_GETTERS)
