@@ -69,6 +69,69 @@ def pack_mxfp8_dispatch_payload(x: torch.Tensor) -> torch.Tensor:
     return packed.view(torch.bfloat16)
 
 
+def _mask_padding_rows_nonlocal(
+    selected_experts: torch.Tensor,
+    final_scales: torch.Tensor,
+    recv_count: torch.Tensor,
+    *,
+    num_local_experts: int,
+    cap: int,
+    local_expert_offset: int,
+    num_experts: Optional[int],
+):
+    """Mask padded rows by marking them as belonging to an expert this rank does not own.
+
+    Only the first recv_count[e] rows of each expert's block hold real tokens, the rest is padding. The
+    routing kernel behind moe_sort only counts an expert into its histogram when that expert is local, so pointing a padding row at
+    a remote expert drops it from the tile count, from ``permutedIdxSize``, and from
+    every stage bounded by them - the permute/gather, both GEMMs, the activation and
+    the finalize.
+
+    Returns the inputs unchanged when there is no remote expert to point at.
+    """
+    if num_experts is None or num_local_experts >= num_experts:
+        return selected_experts, final_scales
+
+    expected = (num_local_experts,)
+    if tuple(recv_count.shape) != expected:
+        raise ValueError(
+            f"recv_count must have shape {list(expected)}, got {list(recv_count.shape)}"
+        )
+
+    device = selected_experts.device
+    m = selected_experts.shape[0]
+    remote_id = (
+        local_expert_offset + num_local_experts
+    ) % num_experts  # First expert past this ranks block
+
+    if m != num_local_experts * cap:
+        raise ValueError(
+            f"EXPERT_MAJOR pack must be num_local_experts * cap rows "
+            f"({num_local_experts} * {cap} = {num_local_experts * cap}), got {m}"
+        )
+
+    # Row r of the pack is position r % cap of expert r // cap, so the mask is just
+    # a broadcast compare against recv_count once the rows are viewed as
+    # [num_local_experts, cap]. Doing it that way instead of with arange(m) plus
+    # remainder / floor_divide / gather matters: this runs on a step whose GPU is
+    # not saturated at small per-expert GEMMs, so each extra kernel launch lands on
+    # the critical path. Profiling the arithmetic version showed the masking added
+    # ~13 launches for ~25us of actual work, which is what made the change a
+    # wall-clock loss on small-MoE shapes even though it cut total GPU work.
+    # Scalar `other` in torch.where avoids materialising full_like / zeros_like.
+    # No-op (returns self, no kernel) when recv_count is already on this device,
+    # which it is on the dispatch path; kept so a host-side caller cannot fault.
+    # Deliberately no dtype cast: comparing in recv_count's own dtype avoids an
+    # int32 -> int64 copy that the previous version paid on every call.
+    recv_count = recv_count.to(device)
+    col = torch.arange(cap, device=device, dtype=recv_count.dtype)
+    is_real = (col.unsqueeze(0) < recv_count.unsqueeze(1)).reshape(m, 1)
+
+    selected_experts = torch.where(is_real, selected_experts, remote_id)
+    final_scales = torch.where(is_real, final_scales, 0.0)
+    return selected_experts, final_scales
+
+
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
@@ -78,6 +141,8 @@ def build_activation_pack(
     global_scale: Optional[torch.Tensor] = None,
     mxfp8_dispatch: bool = False,
     hidden_size: Optional[int] = None,
+    recv_count: Optional[torch.Tensor] = None,
+    num_experts: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
 
@@ -115,6 +180,17 @@ def build_activation_pack(
         row_expert.repeat_interleave(cap).reshape(m, 1) + local_expert_offset
     )
     final_scales = torch.ones(m, 1, dtype=torch.float32, device=device)
+
+    if recv_count is not None:
+        selected_experts, final_scales = _mask_padding_rows_nonlocal(
+            selected_experts,
+            final_scales,
+            recv_count,
+            num_local_experts=num_local_experts,
+            cap=cap,
+            local_expert_offset=local_expert_offset,
+            num_experts=num_experts,
+        )
 
     return _quantize_and_pack(
         flat,
