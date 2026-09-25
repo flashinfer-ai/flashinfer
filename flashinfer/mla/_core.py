@@ -1183,7 +1183,7 @@ def _resolve_dsv4_sparse_mla_backend(
     ] = "auto",
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
-    is_sm100_family = cc in ((10, 0), (10, 3))
+    is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1191,7 +1191,7 @@ def _resolve_dsv4_sparse_mla_backend(
         if is_sm100_family:
             return "trtllm-gen"
         raise ValueError(
-            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103/SM107 via "
             f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse", "cake"):
@@ -1201,12 +1201,14 @@ def _resolve_dsv4_sparse_mla_backend(
         )
     if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
         raise ValueError(
-            f"backend={requested_backend!r} requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
     if requested_backend == "cake" and not is_sm100_family:
-        raise ValueError(f"backend='cake' requires SM100/SM103, got SM{cc[0]}{cc[1]}")
+        raise ValueError(
+            f"backend='cake' requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
+        )
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
 

@@ -175,7 +175,7 @@ def _make_cake_tensors(
 def _require_cake_concat_mla_k() -> None:
     if not torch.cuda.is_available():
         pytest.skip("Cake concat MLA K requires CUDA")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Cake concat MLA K requires SM100 or SM103")
 
 
