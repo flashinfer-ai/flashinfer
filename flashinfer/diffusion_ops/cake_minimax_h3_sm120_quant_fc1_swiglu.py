@@ -186,6 +186,7 @@ def _check_fc1_weight(fc1_weight: torch.Tensor) -> None:
         raise ValueError("fc1_weight must be a CUDA tensor")
 
 
+@flashinfer_api
 def prepare_minimax_h3_fc1_weight_fp8(
     fc1_weight: torch.Tensor, chunk_rows: int = 2048
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -498,7 +499,6 @@ def minimax_h3_fc1_swiglu_fp8(
 
 
 @supported_compute_capability([120])
-@flashinfer_api
 def _minimax_h3_fc1_swiglu_nvfp4_sm120(
     x: torch.Tensor,
     x_norm_weight: torch.Tensor,
