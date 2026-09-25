@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_varlen_attention import (
     gen_minimax_h3_sm120_quant_varlen_attention_module,
 )
@@ -316,6 +317,7 @@ def _check_thd(name: str, tensor: torch.Tensor, tokens: int, heads: int) -> None
         raise ValueError(f"{name} must be a contiguous CUDA tensor")
 
 
+@flashinfer_api
 def minimax_h3_sm120_varlen_attention_fp8(
     q: torch.Tensor,
     k: torch.Tensor,
