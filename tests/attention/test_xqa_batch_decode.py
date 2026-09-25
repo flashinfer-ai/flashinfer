@@ -395,20 +395,25 @@ def generate_spec_dec_mask(
 )
 @parametrize_product(
     {
-        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size,head_dim": [
-            (4, 4, 64, 4, 2, 128),
-            (4, 2, 16, 2, 4, 128),
-            (4, 3, 32, 2, 6, 128),
-            (4, 1, 16, 2, 1, 128),
-            (4, 1, 32, 2, 5, 128),
-            (128, 1, 64, 2, 6, 128),
-            (256, 1, 64, 4, 8, 128),
-            (4, 1, 32, 2, 16, 128),
-            (4, 4, 32, 2, 16, 128),
-            (4, 1, 32, 2, 4, 512),
-            (4, 1, 32, 2, 5, 512),
-            (16, 1, 64, 2, 8, 512),
-            (4, 1, 16, 2, 16, 512),
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size,head_dim,spec_dec_mask_mode": [
+            (*shape, mask_mode)
+            for shape in [
+                (4, 4, 64, 4, 2, 128),
+                (4, 2, 16, 2, 4, 128),
+                (4, 3, 32, 2, 6, 128),
+                (4, 1, 16, 2, 1, 128),
+                (4, 1, 32, 2, 5, 128),
+                (128, 1, 64, 2, 6, 128),
+                (256, 1, 64, 4, 8, 128),
+                (4, 1, 32, 2, 16, 128),
+                (4, 4, 32, 2, 16, 128),
+                (4, 1, 32, 2, 4, 512),
+                (4, 1, 32, 2, 5, 512),
+                (16, 1, 64, 2, 8, 512),
+                (4, 1, 16, 2, 16, 512),
+            ]
+            for mask_mode in ["causal", "full"]
+            if shape[1] > 1 or mask_mode == "causal"
         ],
         "window_left": [-1, 127],
         "q_dtype,kv_dtype,o_dtype": [
@@ -423,7 +428,6 @@ def generate_spec_dec_mask(
         "enable_sink": [True, False],
         "max_in_kv_len": [110],
         "kv_layout": ["NHD", "HND"],
-        "spec_dec_mask_mode": ["causal", "full"],
     },
     regular=pairwise_product_cases,
 )
@@ -445,9 +449,6 @@ def test_xqa_batch_decode(
     spec_dec_mask_mode,
 ):
     """Test xqa_batch_decode_with_kv_cache across layouts and mask modes."""
-    if q_len_per_req == 1 and spec_dec_mask_mode == "full":
-        pytest.skip("Mask is unused for q_len_per_req == 1")
-
     # Set up test parameters
     torch.manual_seed(0)
 
