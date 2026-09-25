@@ -50,7 +50,7 @@ from flashinfer.attention.prims_ts._block_sparse.prepared import (
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="PrimTS block-sparse attention requires SM100 or SM103",
 )
 
