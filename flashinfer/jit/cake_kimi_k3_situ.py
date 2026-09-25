@@ -6049,7 +6049,7 @@ PROGRAMS = {'module:cake_kimi_k3_nvfp4_situ_routed_moe_05d37b6417f502ba1539:kern
                                                                                                'csrc/fused_moe/cake_kimi_k3_situ/sm_100a/cake_kimi_k3_nvfp4_situ_routed_moe_seq_ff5f7f21c641e3891dc6_binding.cu']}}
 ROUTES = {('sm_100a', 'm1'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_6146b57a506c58a7885a:sequence',
  ('sm_100a', 'n8_feature'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_4fcb0d0fb0b6f2df8e19:sequence',
- ('sm_100a', 'm64_claim8'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_ff5f7f21c641e3891dc6:sequence',
+ ('sm_100a', 'm64_claim8'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_f65e7680b29230de8a72:sequence',
  ('sm_100a', 'mid_work5fd'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_cd8e4f84b7b9390638c6:sequence',
  ('sm_100a', 'n32_claim8'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_9313596a5fe21c59abbb:sequence',
  ('sm_100a', 'm256_c12'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_f65e7680b29230de8a72:sequence',
