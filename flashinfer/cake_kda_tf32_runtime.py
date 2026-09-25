@@ -474,9 +474,30 @@ def _affine_split_part_count(
 
 
 def _affine_window_budget(
-    num_sequences: int, num_heads: int, sm_count: int, waves: int
+    num_sequences: int,
+    num_heads: int,
+    sm_count: int,
+    waves: int,
+    *,
+    unsplittable: int = 0,
 ) -> int:
-    return max(num_sequences, sm_count // num_heads * waves)
+    """Windows the composite may plan for one call.
+
+    ``waves`` waves of ``sm_count // num_heads`` windows per head are shared by
+    the sequences that can split; every sequence that cannot (``unsplittable``,
+    target of one window) still gets its window on top of that budget.  Its
+    CTAs run a chain of at most ``2 * AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks and
+    free their SMs long before a resident wave of long windows ends, so they
+    never extend a wave; charging them against the budget only shortened the
+    long sequences' window count (2x(8128+64) H16 on 148 SMs: 7 windows for
+    two 254-chunk sequences, 86-chunk windows, instead of 9 and 64).
+    """
+    return max(num_sequences, sm_count // num_heads * waves + unsplittable)
+
+
+def _affine_unsplittable(targets: list[int]) -> int:
+    """Sequences whose window target is one: they cannot split and do not draw on the wave budget."""
+    return sum(1 for target in targets if target <= 1)
 
 
 def _affine_bf16_composite_estimate_us(
@@ -503,7 +524,13 @@ def _affine_bf16_composite_estimate_us(
     counts = _affine_window_counts(
         chunk_counts,
         targets,
-        _affine_window_budget(len(chunk_counts), num_heads, sm_count, waves),
+        _affine_window_budget(
+            len(chunk_counts),
+            num_heads,
+            sm_count,
+            waves,
+            unsplittable=_affine_unsplittable(targets),
+        ),
     )
     if sum(counts) <= len(chunk_counts):
         return None
@@ -530,8 +557,11 @@ def _affine_bf16_waves(
     composite by ``AFFINE_MULTI_WAVE_MIN_GAIN``: the model's error on the
     two-wave B200 lanes is up to 15 %, so smaller modelled gains are noise
     (H16 2x8192 927 vs 984 modelled, 933 vs 924 measured; H12 2x(8128+64) 757
-    vs 813 modelled, 777 vs 772 measured), while the one case it accepts,
-    H16 2x(8128+64) 984 vs 1296, measured 985 vs the 1056 sequential body.
+    vs 813 modelled, 777 vs 772 measured).  With unsplittable sequences kept
+    out of the wave budget (``_affine_window_budget``), 2x(8128+64) plans the
+    same windows as 2x8192 (H16: 5+4 windows of 64 chunks, 984 modelled) and
+    stays on one wave; the earlier 7-window plan (86-chunk windows, 1296) was
+    the only case the two-wave rule accepted (measured 985 vs 1125 one wave).
     ``composite_us`` is ``None`` when the architecture/gate has no model or no
     wave count splits anything (the caller then keeps one wave).
     """
@@ -643,11 +673,15 @@ def _affine_split_windows(
             gate_kind="unbounded_softplus" if unbounded_softplus else "lower_bound",
             gpu_arch=gpu_arch,
         )
-        window_budget = _affine_window_budget(
-            len(sequence_lengths), num_heads, sm_count, waves
-        )
         targets = _affine_bf16_window_targets(
             chunk_counts, num_heads=num_heads, sm_count=sm_count, waves=waves
+        )
+        window_budget = _affine_window_budget(
+            len(sequence_lengths),
+            num_heads,
+            sm_count,
+            waves,
+            unsplittable=_affine_unsplittable(targets),
         )
     else:
         window_budget = _affine_window_budget(
