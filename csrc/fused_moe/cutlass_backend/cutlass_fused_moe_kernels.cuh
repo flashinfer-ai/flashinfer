@@ -2922,7 +2922,8 @@ void dequantFP8(OutputType* output, InputType const* input, int64_t const* num_v
 }
 
 template <class T, class WeightType, class OutputType>
-std::unique_ptr<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface>
+std::unique_ptr<kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<
+    __nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>
 makeDeepSeekBlockScaleGemmRunnerIfSupported() {
   // This runner is only for the DeepSeek BF16 activation x FP8 weight
   // block-scale path.  Mixed W4/MXFP4 paths still instantiate CutlassMoeFCRunner
@@ -3285,6 +3286,11 @@ void CutlassMoeFCRunner<
     auto* blockscale_gemm_runner = getDeepSeekBlockScaleGemmRunner();
     TLLM_CHECK(blockscale_gemm_runner != nullptr);
     blockscale_gemm_runner->configureWorkspace(getWsPtr(char{}, "deepseek_fc_workspace"));
+    TLLM_CHECK(num_experts_per_node > 0 && parallelism_config.ep_size > 0);
+    // Estimate rows per physical expert after sizing the worst-case workspace.
+    auto const total_experts = int64_t{num_experts_per_node} * parallelism_config.ep_size;
+    blockscale_gemm_runner->setExpectedM(std::max(
+        int64_t{1}, tensorrt_llm::common::ceilDiv(num_rows * experts_per_token, total_experts)));
   }
 
   if (use_awq) {
@@ -3294,7 +3300,8 @@ void CutlassMoeFCRunner<
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode, class Enable>
-kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface*
+kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3,
+                                                             __nv_bfloat16>*
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode,
                    Enable>::getDeepSeekBlockScaleGemmRunner() const {
   TLLM_CHECK_WITH_INFO(
