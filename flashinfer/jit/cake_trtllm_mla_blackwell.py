@@ -223,7 +223,10 @@ def _source_catalog() -> Mapping[str, object]:
                 kind="host_source",
             )
             host_path = str(host["path"])
-            if host_path != f"host/{target}/cake_{domain}.cpp" or host_path in source_paths:
+            if (
+                host_path != f"host/{target}/cake_{domain}.cpp"
+                or host_path in source_paths
+            ):
                 raise RuntimeError("TRT-LLM MLA catalog host source paths are invalid")
             source_paths.add(host_path)
             devices = devices_by_target[target]
