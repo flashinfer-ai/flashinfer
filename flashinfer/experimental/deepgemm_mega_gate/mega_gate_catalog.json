@@ -1,1369 +1,2747 @@
 {
-  "arch": "sm_103a",
-  "programs": {
-    "cake_mega_gate_sm103a_3146be4fd8efbc18dbd1_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "5d08c6a7818f2d2df4ad7d5dcc424a88408c5f27c96bf39e2ad90296994b6a31",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_3146be4fd8efbc18dbd1",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_3146be4fd8efbc18dbd1_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_3146be4fd8efbc18dbd1_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
+  "schema": "mega_gate.v2",
+  "arches": {
+    "sm_100a": {
+      "programs": {
+        "deepgemm_mega_gate_sm100a_0849ef5752e068a57307_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "0ab0a0de2a177e61c5c19cc15b39987409d09d18e7e6b97e79eb17408b80cafd",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_0849ef5752e068a57307",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_0849ef5752e068a57307_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_0849ef5752e068a57307_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_0978c18e452c0cbbdaab_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "49927076b04dc6466a162d77b677fb8d45462c6c0f2841ff6ad89b0e32dadff9",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_0978c18e452c0cbbdaab",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_0978c18e452c0cbbdaab_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_0978c18e452c0cbbdaab_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_1190af88dfda11694cbb_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "8f3a43db986b6bd0bb1761ef198c46240f0445e7bb90c58dd69d3d2c7a9eb38b",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_1190af88dfda11694cbb",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_1190af88dfda11694cbb_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_1190af88dfda11694cbb_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_8d1bc4d2251ac5df5559_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "818f51b159c82f9bd43bf74ff77b07bae0df82eb1260c33b3f505278515cd286",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_8d1bc4d2251ac5df5559",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_8d1bc4d2251ac5df5559_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_8d1bc4d2251ac5df5559_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_8dbb941d286e47690fc5_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "5fab10a801e18015caf94650cdf9e2d9547650631333c5807b7e2087f95a3984",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_8dbb941d286e47690fc5",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_8dbb941d286e47690fc5_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_8dbb941d286e47690fc5_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_8eeb1dfe48d580680729_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "74be50bb8bbe062b28b4a2658c4cac001a57f8af47193145e1cc918a439795d8",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_8eeb1dfe48d580680729",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_8eeb1dfe48d580680729_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_8eeb1dfe48d580680729_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_bd2de88b9d34acaf8e15_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "b50f20006f6edaafc82644411a9449f7e08722fd6af102e84c0b44830747f6b1",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "name": "deepgemm_mega_gate_sm100a_bd2de88b9d34acaf8e15",
+          "prepared_descriptor_lifetime": "exclusive_workspace_owning_tensor_closure",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_bd2de88b9d34acaf8e15_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_bd2de88b9d34acaf8e15_binding.cu"
+          ],
+          "tma_workspace_bytes": 256
+        },
+        "deepgemm_mega_gate_sm100a_c074b8b07ad295fe7249_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "dcc03cf8eb67e95ba5c18c1e7742e1c9d178ab158bf6813a02c7e047dd38a299",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_c074b8b07ad295fe7249",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_c074b8b07ad295fe7249_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_c074b8b07ad295fe7249_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_eeebedd8bb07b93b1330_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "3a3c1fa367672ae4bf3dc268d2218dd0f7f9202f9968c0e166551917a1db5a05",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "name": "deepgemm_mega_gate_sm100a_eeebedd8bb07b93b1330",
+          "prepared_descriptor_lifetime": "exclusive_workspace_owning_tensor_closure",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_eeebedd8bb07b93b1330_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_eeebedd8bb07b93b1330_binding.cu"
+          ],
+          "tma_workspace_bytes": 256
+        },
+        "deepgemm_mega_gate_sm100a_f80afee6a7f3fa39a483_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "da758b1e98b8bf9e761953eee54fee8664e32d45c470e4fac0fd03c1550f26d1",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_f80afee6a7f3fa39a483",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_f80afee6a7f3fa39a483_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_f80afee6a7f3fa39a483_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm100a_f8331e8ae575eae5542b_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "015840f68e83e5ee651cae1f32f274dd4cf9e0a19963bb33959862abb476be55",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm100a_f8331e8ae575eae5542b",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_f8331e8ae575eae5542b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_f8331e8ae575eae5542b_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        }
+      },
+      "routes": {
+        "1024:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 6,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 4,
+            "num_stages": 11,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_1190af88dfda11694cbb_kernel"
+        },
+        "128:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 32,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 4,
+            "num_launch_sms": 96,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 11,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_0978c18e452c0cbbdaab_kernel"
+        },
+        "16:5120:384:6:148:sqrtsoftplus:True:False:False:False:False:False:True:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_c074b8b07ad295fe7249_kernel"
+        },
+        "16:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_f8331e8ae575eae5542b_kernel"
+        },
+        "16:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:True:True": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 1,
+            "num_stages": 12,
+            "num_workers": 8
+          },
+          "program": "deepgemm_mega_gate_sm100a_8eeb1dfe48d580680729_kernel"
+        },
+        "1:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_f80afee6a7f3fa39a483_kernel"
+        },
+        "2048:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 6,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 2,
+            "num_stages": 11,
+            "num_workers": 12
+          },
+          "program": "deepgemm_mega_gate_sm100a_0849ef5752e068a57307_kernel"
+        },
+        "3:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_8dbb941d286e47690fc5_kernel"
+        },
+        "4096:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 7,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 2,
+            "num_stages": 11,
+            "num_workers": 12
+          },
+          "program": "deepgemm_mega_gate_sm100a_eeebedd8bb07b93b1330_kernel"
+        },
+        "512:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 96,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 6,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 7,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm100a_8d1bc4d2251ac5df5559_kernel"
+        },
+        "8192:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 7,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 1,
+            "num_stages": 11,
+            "num_workers": 24
+          },
+          "program": "deepgemm_mega_gate_sm100a_bd2de88b9d34acaf8e15_kernel"
+        }
+      }
     },
-    "cake_mega_gate_sm103a_41e8ea4e3e40fde7eb85_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "09590da5243b120f901828af4c9a50a50afdb45a6d58957a9ef431d3170743bd",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_41e8ea4e3e40fde7eb85",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_41e8ea4e3e40fde7eb85_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_41e8ea4e3e40fde7eb85_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_4270d5d1b7e27d6b4068_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "c40481d310df113e435266722da1fc8e4207f31215786879c868f7ee35b0e46e",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_4270d5d1b7e27d6b4068",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_4270d5d1b7e27d6b4068_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_4270d5d1b7e27d6b4068_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_499faf1b3647fcacdb1e_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "d4f40e2310a79a6e774de40856f3ecf25ec58944bdf055b27310a229f86925c3",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_499faf1b3647fcacdb1e",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_499faf1b3647fcacdb1e_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_499faf1b3647fcacdb1e_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_608178f267c22cb93f02_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "workspace",
-          "tma_descriptor_workspace"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "cfd1c62f307a8b75102732d39472c3b7f18876d9dd8391acfec3facc4a2088a5",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_608178f267c22cb93f02",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_608178f267c22cb93f02_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_608178f267c22cb93f02_cached_binding.cu"
-      ],
-      "tma_workspace_bytes": 256
-    },
-    "cake_mega_gate_sm103a_757f79737136dfd045f6_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "398e708f1502c2e279b44fcfe96d6fb3880186037657bba80dc380993f76baae",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_757f79737136dfd045f6",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_757f79737136dfd045f6_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_757f79737136dfd045f6_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_873d83393c1893702fe4_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "workspace",
-          "tma_descriptor_workspace"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "ea3b474f238778d8d422cdcb19af7a4188e932a2b667db8ae3befe7f552153e4",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_873d83393c1893702fe4",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_873d83393c1893702fe4_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_873d83393c1893702fe4_cached_binding.cu"
-      ],
-      "tma_workspace_bytes": 256
-    },
-    "cake_mega_gate_sm103a_a1360052eb38ccd9c9c1_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "0461fb864ee0b6a104de663d34cd629ee7752645053661c7daf7c8a365dbcf2a",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_a1360052eb38ccd9c9c1",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_a1360052eb38ccd9c9c1_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_a1360052eb38ccd9c9c1_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_b6726160604650afa858_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "9ef1df14d5bd617b8a4a02552aeec56d9d35ac0e5ddd849cd97149776960ee1e",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_b6726160604650afa858",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_b6726160604650afa858_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_b6726160604650afa858_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_b67813770a9acd7a0700_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "268db38fb85543fb49dbd182fe3d7e0d5bb59816da9a94ae74e535eb6b29bb7c",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_b67813770a9acd7a0700",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_b67813770a9acd7a0700_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_b67813770a9acd7a0700_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "cake_mega_gate_sm103a_ca74b0e9c9c939bd205e_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "X"
-        ],
-        [
-          "tma_buffer",
-          "W"
-        ],
-        [
-          "buffer",
-          "bias"
-        ],
-        [
-          "buffer",
-          "image_bias"
-        ],
-        [
-          "buffer",
-          "image_mask"
-        ],
-        [
-          "buffer",
-          "mask"
-        ],
-        [
-          "buffer",
-          "physical_map"
-        ],
-        [
-          "buffer",
-          "logical_count"
-        ],
-        [
-          "buffer",
-          "topk_idx"
-        ],
-        [
-          "buffer",
-          "unmapped_idx"
-        ],
-        [
-          "buffer",
-          "topk_weights"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "score_barriers"
-        ],
-        [
-          "buffer",
-          "fixed_mask"
-        ],
-        [
-          "buffer",
-          "random_mask"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "num_shared"
-        ],
-        [
-          "parameter",
-          "map_width"
-        ],
-        [
-          "parameter",
-          "ep_rank"
-        ],
-        [
-          "parameter",
-          "routed_scale"
-        ],
-        [
-          "parameter",
-          "unmapped_stride"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "13662381b68124a685ce8dab33af6d92d5ef14d0b6c22cb859fbfa7e5325d817",
-      "compile_flags": [],
-      "ffi_entry": "run",
-      "name": "cake_mega_gate_sm103a_ca74b0e9c9c939bd205e",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_ca74b0e9c9c939bd205e_kernel.cu",
-        "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/cake_mega_gate_sm103a_ca74b0e9c9c939bd205e_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
+    "sm_103a": {
+      "programs": {
+        "deepgemm_mega_gate_sm103a_03760b12370ab0755fd0_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "99fd417f72e0267393b22ea39083eb3af85bd198783829d8c715905602d6c33f",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_03760b12370ab0755fd0",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_03760b12370ab0755fd0_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_03760b12370ab0755fd0_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_081cc5b0c2494e60c7ab_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "b8c760b691e755d11bd4d5d4183cad6b3cde4a159983700a4d5a50fd7d8fe4af",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_081cc5b0c2494e60c7ab",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_081cc5b0c2494e60c7ab_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_081cc5b0c2494e60c7ab_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_0a401f4f5b578bb8de6b_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "25f3962a46c235ee1e8ca9498399c38d0f4184c4db3adfa86197d8a0b29536b9",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_0a401f4f5b578bb8de6b",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_0a401f4f5b578bb8de6b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_0a401f4f5b578bb8de6b_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_279b639a634d85db244b_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "ae54f9f859eac4da1a788d8cab5655999132faa4d5b9ca77cc6d227ad1a329a7",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_279b639a634d85db244b",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_279b639a634d85db244b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_279b639a634d85db244b_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_3a974ee401b74a50e14b_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "fbeb41ecb34a6bd6e526ca2cb63a734501543036a857eabd60af3310b5131e6c",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "name": "deepgemm_mega_gate_sm103a_3a974ee401b74a50e14b",
+          "prepared_descriptor_lifetime": "exclusive_workspace_owning_tensor_closure",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_3a974ee401b74a50e14b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_3a974ee401b74a50e14b_binding.cu"
+          ],
+          "tma_workspace_bytes": 256
+        },
+        "deepgemm_mega_gate_sm103a_5874492a71fc0fdd9c2e_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "ef0b584129b5c90e9f6355898cdc5973e816b6a1cb1620b857ac41a444ef317c",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_5874492a71fc0fdd9c2e",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_5874492a71fc0fdd9c2e_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_5874492a71fc0fdd9c2e_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_82e43d4c996f490ee988_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "f2236c3d78d56bbe00736004a9e5786bc5d0cc4abf41f1da08b911c60f3ee847",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "name": "deepgemm_mega_gate_sm103a_82e43d4c996f490ee988",
+          "prepared_descriptor_lifetime": "exclusive_workspace_owning_tensor_closure",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_82e43d4c996f490ee988_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_82e43d4c996f490ee988_binding.cu"
+          ],
+          "tma_workspace_bytes": 256
+        },
+        "deepgemm_mega_gate_sm103a_9080c6640e6ac0ad2872_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "e0816af3a4171723f39e17543c85f51e12fe3fbf8c1714e038b906cee4a4e692",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_9080c6640e6ac0ad2872",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_9080c6640e6ac0ad2872_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_9080c6640e6ac0ad2872_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_a1a98f61613a39da2536_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "135b26bed1cb9bc63d0396a6ec6921a87b76f6214b34912ef8ed38b4ef2f613a",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_a1a98f61613a39da2536",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_a1a98f61613a39da2536_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_a1a98f61613a39da2536_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_acbb10091c0ba56d92ee_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "66fab9cad9836a0837a95608b15026a43ac72e539a17386787dd34b072c4c77d",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_acbb10091c0ba56d92ee",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_acbb10091c0ba56d92ee_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_acbb10091c0ba56d92ee_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_gate_sm103a_d3e6b46a5faa3363dddd_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "X"
+            ],
+            [
+              "tma_buffer",
+              "W"
+            ],
+            [
+              "buffer",
+              "bias"
+            ],
+            [
+              "buffer",
+              "image_bias"
+            ],
+            [
+              "buffer",
+              "image_mask"
+            ],
+            [
+              "buffer",
+              "mask"
+            ],
+            [
+              "buffer",
+              "physical_map"
+            ],
+            [
+              "buffer",
+              "logical_count"
+            ],
+            [
+              "buffer",
+              "topk_idx"
+            ],
+            [
+              "buffer",
+              "unmapped_idx"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "score_barriers"
+            ],
+            [
+              "buffer",
+              "fixed_mask"
+            ],
+            [
+              "buffer",
+              "random_mask"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "num_shared"
+            ],
+            [
+              "parameter",
+              "map_width"
+            ],
+            [
+              "parameter",
+              "ep_rank"
+            ],
+            [
+              "parameter",
+              "routed_scale"
+            ],
+            [
+              "parameter",
+              "unmapped_stride"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "8a2e2d6469279d6a932b356c0df902492d084574f409ef4864eee57571317212",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_gate_sm103a_d3e6b46a5faa3363dddd",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_d3e6b46a5faa3363dddd_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_d3e6b46a5faa3363dddd_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        }
+      },
+      "routes": {
+        "1024:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 6,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 4,
+            "num_stages": 11,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_03760b12370ab0755fd0_kernel"
+        },
+        "128:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 32,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 4,
+            "num_launch_sms": 96,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 11,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_279b639a634d85db244b_kernel"
+        },
+        "16:5120:384:6:152:sqrtsoftplus:True:False:False:False:False:False:True:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_081cc5b0c2494e60c7ab_kernel"
+        },
+        "16:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_a1a98f61613a39da2536_kernel"
+        },
+        "16:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:True:True": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 1,
+            "num_stages": 12,
+            "num_workers": 8
+          },
+          "program": "deepgemm_mega_gate_sm103a_9080c6640e6ac0ad2872_kernel"
+        },
+        "1:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_0a401f4f5b578bb8de6b_kernel"
+        },
+        "2048:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 6,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 2,
+            "num_stages": 11,
+            "num_workers": 12
+          },
+          "program": "deepgemm_mega_gate_sm103a_5874492a71fc0fdd9c2e_kernel"
+        },
+        "3:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 16,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 2,
+            "num_launch_sms": 24,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 12,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_d3e6b46a5faa3363dddd_kernel"
+        },
+        "4096:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 7,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 2,
+            "num_split_k": 2,
+            "num_stages": 11,
+            "num_workers": 12
+          },
+          "program": "deepgemm_mega_gate_sm103a_82e43d4c996f490ee988_kernel"
+        },
+        "512:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 96,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 6,
+            "num_launch_sms": 144,
+            "num_mma_ctas": 1,
+            "num_split_k": 8,
+            "num_stages": 7,
+            "num_workers": 6
+          },
+          "program": "deepgemm_mega_gate_sm103a_acbb10091c0ba56d92ee_kernel"
+        },
+        "8192:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
+          "config": {
+            "block_tokens": 176,
+            "num_expert_groups": 3,
+            "num_gate_warpgroups": 7,
+            "num_launch_sms": 150,
+            "num_mma_ctas": 2,
+            "num_split_k": 1,
+            "num_stages": 11,
+            "num_workers": 25
+          },
+          "program": "deepgemm_mega_gate_sm103a_3a974ee401b74a50e14b_kernel"
+        }
+      }
     }
-  },
-  "routes": {
-    "1024:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 176,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 6,
-        "num_launch_sms": 144,
-        "num_mma_ctas": 2,
-        "num_split_k": 4,
-        "num_stages": 11,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_ca74b0e9c9c939bd205e_kernel"
-    },
-    "128:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 32,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 4,
-        "num_launch_sms": 96,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_stages": 11,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_499faf1b3647fcacdb1e_kernel"
-    },
-    "16:5120:384:6:152:sqrtsoftplus:True:False:False:False:False:False:True:False": {
-      "config": {
-        "block_tokens": 16,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 2,
-        "num_launch_sms": 24,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_stages": 12,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_b67813770a9acd7a0700_kernel"
-    },
-    "16:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 16,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 2,
-        "num_launch_sms": 24,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_stages": 12,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_757f79737136dfd045f6_kernel"
-    },
-    "16:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:True:True": {
-      "config": {
-        "block_tokens": 16,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 2,
-        "num_launch_sms": 24,
-        "num_mma_ctas": 1,
-        "num_split_k": 1,
-        "num_stages": 12,
-        "num_workers": 8
-      },
-      "program": "cake_mega_gate_sm103a_41e8ea4e3e40fde7eb85_kernel"
-    },
-    "1:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 16,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 2,
-        "num_launch_sms": 24,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_stages": 12,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_4270d5d1b7e27d6b4068_kernel"
-    },
-    "2048:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 176,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 6,
-        "num_launch_sms": 144,
-        "num_mma_ctas": 2,
-        "num_split_k": 2,
-        "num_stages": 11,
-        "num_workers": 12
-      },
-      "program": "cake_mega_gate_sm103a_b6726160604650afa858_kernel"
-    },
-    "3:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 16,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 2,
-        "num_launch_sms": 24,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_stages": 12,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_3146be4fd8efbc18dbd1_kernel"
-    },
-    "4096:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 176,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 7,
-        "num_launch_sms": 144,
-        "num_mma_ctas": 2,
-        "num_split_k": 2,
-        "num_stages": 11,
-        "num_workers": 12
-      },
-      "program": "cake_mega_gate_sm103a_873d83393c1893702fe4_kernel"
-    },
-    "512:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 96,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 6,
-        "num_launch_sms": 144,
-        "num_mma_ctas": 1,
-        "num_split_k": 8,
-        "num_stages": 7,
-        "num_workers": 6
-      },
-      "program": "cake_mega_gate_sm103a_a1360052eb38ccd9c9c1_kernel"
-    },
-    "8192:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
-      "config": {
-        "block_tokens": 176,
-        "num_expert_groups": 3,
-        "num_gate_warpgroups": 7,
-        "num_launch_sms": 150,
-        "num_mma_ctas": 2,
-        "num_split_k": 1,
-        "num_stages": 11,
-        "num_workers": 25
-      },
-      "program": "cake_mega_gate_sm103a_608178f267c22cb93f02_kernel"
-    }
-  },
-  "schema": "mega_gate.v1"
+  }
 }

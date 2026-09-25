@@ -1,4 +1,4 @@
-"""Prepared mixed FP8×FP4 GEMM on prepacked user tensors; minimum SM103a."""
+"""Prepared mixed FP8×FP4 GEMM on prepacked user tensors; SM100a or SM103a."""
 
 import torch
 from flashinfer.fp8_fp4_gemm import prepare_fp8_fp4_gemm

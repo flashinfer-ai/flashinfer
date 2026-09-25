@@ -2,7 +2,23 @@
 
 import pytest
 import torch
+from flashinfer.experimental.deepgemm_mega_gate import mega_gate as _runtime
 from flashinfer.mega_gate import prepare_mega_gate
+
+
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -22,10 +38,7 @@ from flashinfer.mega_gate import prepare_mega_gate
     ],
 )
 def test_routing_values_stream_and_replay(M, deterministic, physical):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("SM103a required")
-    if torch.cuda.get_device_properties(0).multi_processor_count != 152:
-        pytest.skip("The exported schedule requires 152 SMs")
+    _skip_unless_exported()
     K, E, topk = 5120, 384, 6
     x = torch.ones((M, K), dtype=torch.bfloat16, device="cuda")
     weight = torch.zeros((E, K), dtype=torch.bfloat16, device="cuda")

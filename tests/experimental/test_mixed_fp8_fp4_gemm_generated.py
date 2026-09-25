@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from flashinfer.experimental.deepgemm_mixed_gemm import mixed_gemm as _runtime
 from flashinfer.fp8_fp4_gemm import prepare_fp8_fp4_gemm
 
 _CASES = [
@@ -18,34 +19,60 @@ _CASES += [
 ]
 
 
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
+    return arch
+
+
+def _route_config(arch, m, n, k, variant, block_n, gran_k_a):
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    key = _runtime.route_key(
+        dict(
+            M=m,
+            N=n,
+            K=k,
+            num_sms=sms,
+            variant=variant,
+            block_n=block_n,
+            gran_k_a=gran_k_a,
+        )
+    )
+    return _runtime._catalog()["arches"][arch]["routes"][key]["config"]
+
+
 @pytest.mark.parametrize("m,n,k,variant,block_n,gran_k_a", _CASES)
 def test_mixed_values_packing_stream_replay(m, n, k, variant, block_n, gran_k_a):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("SM103a required")
-    if torch.cuda.get_device_properties(0).multi_processor_count != 152:
-        pytest.skip("The exported schedules require 152 SMs")
-    a = torch.full((m, k), 0x38, dtype=torch.uint8, device="cuda").view(
+    arch = _skip_unless_exported()
+    # The catalogued route fixes the physical A/output rows and the packed scale
+    # geometry (source-selected routes bind logical M; generic routes pad to 256).
+    cfg = _route_config(arch, m, n, k, variant, block_n, gran_k_a)
+    a = torch.full((cfg["input_m"], k), 0x38, dtype=torch.uint8, device="cuda").view(
         torch.float8_e4m3fn
     )
     b = torch.full((n, k // 2), 0x22, dtype=torch.uint8, device="cuda")
-    # Constant scale1 has exponent127. BK256 repeats gran128 scale bytes;
-    # native packing keeps one byte per declared granularity.
-    scale_gran = 32 if variant == "bk256_s4" else gran_k_a
+    # Constant scale1 has exponent127 in every packed byte, whichever layout the
+    # route declares (native per-granularity bytes or the BK256 broadcast words).
     sfa = torch.full(
-        ((k + 4 * scale_gran - 1) // (4 * scale_gran), (m + 3) // 4 * 4),
-        0x7F7F7F7F,
-        dtype=torch.int32,
-        device="cuda",
+        (cfg["sfa_words"], cfg["sfa_mn"]), 0x7F7F7F7F, dtype=torch.int32, device="cuda"
     )
     sfb = torch.full(
-        ((k + 127) // 128, (n + 3) // 4 * 4),
-        0x7F7F7F7F,
-        dtype=torch.int32,
-        device="cuda",
+        (cfg["sfb_words"], cfg["sfb_mn"]), 0x7F7F7F7F, dtype=torch.int32, device="cuda"
     )
     plan = prepare_fp8_fp4_gemm(
         a, b, sfa, sfb, m=m, variant=variant, block_n=block_n, gran_k_a=gran_k_a
     )
+    assert tuple(plan.output.shape) == (m, n)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):

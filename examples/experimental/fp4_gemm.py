@@ -1,4 +1,4 @@
-"""Native packed FP4 GEMM on SM103a; no quantization occurs in plan.run()."""
+"""Native packed FP4 GEMM on SM100a/SM103a; no quantization occurs in plan.run()."""
 
 import torch
 from flashinfer.fp4_gemm import prepare_fp4_gemm

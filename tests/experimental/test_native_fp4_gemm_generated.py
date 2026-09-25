@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from flashinfer.experimental.deepgemm_fp4_gemm import fp4_gemm as _runtime
 from flashinfer.fp4_gemm import prepare_fp4_gemm
 
 _MODEL = [
@@ -19,12 +20,24 @@ _CASES += [
 ]
 
 
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
+
+
 @pytest.mark.parametrize("m,n,k,num_stages,alpha", _CASES)
 def test_fp4_values_alpha_stream_replay(m, n, k, num_stages, alpha):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("SM103a required")
-    if torch.cuda.get_device_properties(0).multi_processor_count != 152:
-        pytest.skip("The exported schedules require 152 SMs")
+    _skip_unless_exported()
     a = torch.full((m, k // 2), 0x22, dtype=torch.uint8, device="cuda")
     b = torch.full((n, k // 2), 0x22, dtype=torch.uint8, device="cuda")
     sfa = torch.full((k // 128, m), 0x7F7F7F7F, dtype=torch.int32, device="cuda")

@@ -1,4 +1,4 @@
-"""Prepared v3 full pipeline and grouped FP4 compute surfaces on SM103a."""
+"""Prepared v3 full pipeline and grouped FP4 compute surfaces on SM100a/SM103a."""
 
 import functools
 import json
@@ -6,24 +6,57 @@ from pathlib import Path
 from .preparation import prepare_pipeline_bindings, build_tile_lists
 
 
+_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
 @functools.cache
-def catalog():
+def _catalog():
     return json.loads(Path(__file__).with_name("catalog.json").read_text())
 
 
-@functools.cache
-def load_program(name):
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec, sm103a_nvcc_flags
+def device_arch(device):
+    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+    import torch
 
-    record = catalog()["programs"][name]
+    device = torch.device(device)
+    catalogued = sorted(_catalog()["arches"])
+    if device.type != "cuda":
+        raise RuntimeError("Generated MegaMoE v3 requires a CUDA device")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    arch = _ARCHES.get(capability)
+    if arch is None or arch not in catalogued:
+        raise RuntimeError(
+            f"Generated MegaMoE v3 has no exported programs for compute capability "
+            f"{capability}; catalogued architectures: {catalogued}"
+        )
+    return arch
+
+
+def supported_num_sms(arch):
+    """SM counts with catalogued routes for ``arch``."""
+    routes = _catalog()["arches"][arch]["routes"].values()
+    return sorted({route["num_sms"] for route in routes})
+
+
+def _nvcc_flags(arch):
+    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
+
+    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
+
+
+@functools.cache
+def load_program(arch, name):
+    from flashinfer.jit import env
+    from flashinfer.jit.core import gen_jit_spec
+
+    record = _catalog()["arches"][arch]["programs"][name]
     spec = gen_jit_spec(
         name=name,
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
         extra_cuda_cflags=[
-            *sm103a_nvcc_flags,
+            *_nvcc_flags(arch),
             *record["compile_flags"],
             "--device-entity-has-hidden-visibility=false",
         ],
@@ -60,11 +93,35 @@ def key(surface, args):
     )
 
 
+def _route(arch, surface, args):
+    """Catalogued ``arch`` route for ``surface``/``args``; unknown routes raise."""
+    try:
+        return _catalog()["arches"][arch]["routes"][key(surface, args)]
+    except KeyError as error:
+        raise RuntimeError(
+            f"No exported {arch} {surface} schedule for {args}"
+        ) from error
+
+
+def _route_arch(route, device):
+    """Architecture of ``device``; it must carry the SM count ``route`` was generated for."""
+    import torch
+
+    arch = device_arch(device)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if sms != route["num_sms"]:
+        raise RuntimeError(
+            f"The exported {arch} {route['metadata']['surface']} schedule was generated "
+            f"for {route['num_sms']} physical SMs; this device has {sms}"
+        )
+    return arch
+
+
 class _Stage:
-    def __init__(self, program, bindings):
+    def __init__(self, arch, program, bindings):
         import torch
 
-        module, record = load_program(program)
+        module, record = load_program(arch, program)
         self.bindings = dict(bindings)
         grid = self.bindings.pop("grid")
         self.bindings.update(grid_x=grid[0], grid_y=grid[1], grid_z=grid[2])
@@ -128,18 +185,12 @@ class V3Plan:
             for v in b.values()
             if isinstance(v, torch.Tensor)
         )
-        if (
-            t.device.type != "cuda"
-            or torch.cuda.get_device_capability(t.device) != (10, 3)
-            or torch.cuda.get_device_properties(t.device).multi_processor_count != 152
-        ):
-            raise RuntimeError(
-                "This generated catalog requires SM103a with 152 physical SMs"
-            )
+        self.arch = _route_arch(route, t.device)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         self.stages = tuple(
-            _Stage(s["program"], stage_bindings[s["name"]]) for s in route["stages"]
+            _Stage(self.arch, s["program"], stage_bindings[s["name"]])
+            for s in route["stages"]
         )
         self.owners = owners
 
@@ -171,7 +222,15 @@ def bind_prepared(
     owners=(),
 ):
     """Bind explicit packed tensors to a catalog route with its original lifecycle."""
-    route = catalog()["routes"][key(surface, args)]
+    import torch
+
+    t = next(
+        v
+        for b in stage_bindings.values()
+        for v in b.values()
+        if isinstance(v, torch.Tensor)
+    )
+    route = _route(device_arch(t.device), surface, args)
     main = stage_bindings[route["stages"][-1]["name"]]
     if tuple(main["grid"]) != tuple(route["metadata"]["grid"]):
         raise ValueError("No exported scheduling specialization for this prepared grid")
@@ -195,7 +254,10 @@ def prepare_pipeline(inputs):
     logical halves; preparation applies the selected 8-way interleave and
     source-schedule scale permutation. No upstream library is imported.
     """
-    data = prepare_pipeline_bindings(inputs)
+    device = inputs["x_fp8_packed"].device
+    route = _route(device_arch(device), "pipeline", inputs)
+    # The persistent grid derives from the SM count the route was generated for.
+    data = prepare_pipeline_bindings(inputs, route["num_sms"])
     return bind_prepared(
         "pipeline",
         inputs,
@@ -228,7 +290,7 @@ def prepare_grouped_l2(
     args = dict(
         num_experts=e, per_expert_M=list(per_expert_M), hidden=n, intermediate=k
     )
-    route = catalog()["routes"][key("grouped_l2", args)]
+    route = _route(device_arch(A.device), "grouped_l2", args)
     tiles = te.numel()
     main = dict(
         grid=tuple(route["metadata"]["grid"]),

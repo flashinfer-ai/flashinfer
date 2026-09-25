@@ -1,4 +1,4 @@
-"""Run the explicit experimental fused mHC API on a supported SM103a GPU."""
+"""Run the explicit experimental fused mHC API on a supported SM100a/SM103a GPU."""
 
 import torch
 from flashinfer.mega_mhc import prepare_mega_mhc

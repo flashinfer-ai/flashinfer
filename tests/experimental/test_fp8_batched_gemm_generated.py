@@ -2,18 +2,31 @@
 
 import pytest
 import torch
+from flashinfer.experimental.deepgemm_batched_gemm import batched_gemm as _runtime
 from flashinfer.fp8_batched_gemm import prepare_fp8_batched_gemm
 
 _CASES = [(t, True, None) for t in (1, 4, 16, 128, 512, 4096)]
 _CASES += [(t, False, alpha) for t in (4, 128) for alpha in (None, 0.5)]
 
 
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
+
+
 @pytest.mark.parametrize("tokens,fp8,alpha", _CASES)
 def test_projection_values_scales_current_stream_graph(tokens, fp8, alpha):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("SM103a required")
-    if torch.cuda.get_device_properties(0).multi_processor_count != 152:
-        pytest.skip("The exported schedules require 152 SMs")
+    _skip_unless_exported()
     heads, inner, width = 8, 4096, 1024
     aq = torch.ones((tokens, heads, inner), dtype=torch.float8_e4m3fn, device="cuda")
     bq = torch.full(

@@ -1,18 +1,30 @@
-"""Exercise the prepared source export without the source compiler installed."""
+"""Exercise the prepared FP8 1D1D PTX source export without the source compiler installed."""
 
 import pytest
 import torch
+from flashinfer.experimental.deepgemm_fp8_gemm import prepare_fp8_gemm_1d1d
+from flashinfer.experimental.deepgemm_fp8_gemm import runtime as _runtime
+
+
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} programs cover {_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
+    return arch
 
 
 @pytest.mark.parametrize("accumulate", [False, True])
 def test_fp8_prepared_output_and_accumulator(tmp_path, accumulate):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    prop = torch.cuda.get_device_properties(0)
-    if (prop.major, prop.minor, prop.multi_processor_count) != (10, 3, 152):
-        pytest.skip("This specialization requires sm_103a with 152 SMs")
-    from flashinfer.experimental.deepgemm_fp8_gemm import prepare_fp8_gemm_1d1d
-
+    _skip_unless_exported()
     a = (
         torch.ones((4096, 4096), device="cuda", dtype=torch.bfloat16)
         .to(torch.float8_e4m3fn)
@@ -43,3 +55,18 @@ def test_fp8_prepared_output_and_accumulator(tmp_path, accumulate):
     if accumulate:
         plan.run()
         torch.testing.assert_close(out, torch.full_like(out, 8192.25), atol=0, rtol=0)
+    # The prepared submission replays on a non-default stream and inside a CUDA graph.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        out.fill_(0.25 if accumulate else 0)
+        plan.run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            plan.run()
+        out.fill_(0.25 if accumulate else 0)
+        graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(
+        out, torch.full_like(out, 4096.25 if accumulate else 4096), atol=0, rtol=0
+    )

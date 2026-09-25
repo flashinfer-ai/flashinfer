@@ -101,7 +101,8 @@ def build_tile_lists(per_expert_M, num_experts: int):
     )
 
 
-def prepare_pipeline_bindings(inputs):
+def prepare_pipeline_bindings(inputs, num_sms):
+    """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route."""
     pr432_optimizations = True
     capture_l1 = False
     import torch
@@ -153,7 +154,7 @@ def prepare_pipeline_bindings(inputs):
     token_to_permuted = torch.full((T * TK,), -1, dtype=torch.int32, device="cuda")
     meta_token = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
     meta_slot = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = int(num_sms)
     num_tiles = max(total_m_tiles * grid_n1, total_m_tiles * grid_n2)
     persistent_grid = max(CTA_GROUP, min(num_sms - num_sms % CTA_GROUP, num_tiles))
     if persistent_grid % CTA_GROUP != 0:

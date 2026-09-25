@@ -1,7 +1,7 @@
 # Batched FP8 projections
 
 `from flashinfer.fp8_batched_gemm import prepare_fp8_batched_gemm` prepares
-`A[T,H,K] @ B[H,N,K] -> D[T,H,N]` on SM103a with 148 SMs. Inputs use FP8 E4M3
+`A[T,H,K] @ B[H,N,K] -> D[T,H,N]` on SM100a (148 SMs) and SM103a (152 SMs). Inputs use FP8 E4M3
 values and FP32 positive power-of-two scales: A scales are `[T,H,K/128]`, and
 B scales are `[H,N/128,K/128]`. The prepared call returns a plan; `plan.run()`
 submits the projection on the current PyTorch stream.

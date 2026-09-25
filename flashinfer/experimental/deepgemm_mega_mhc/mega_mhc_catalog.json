@@ -1,2120 +1,4241 @@
 {
-  "arch": "sm_103a",
-  "programs": {
-    "deepgemm_mega_mhc_sm103a_034e786a55eb38283be7_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "98f37d967fc03dc59473fa597c51a12626613b7257383213206f38a1b6d7804d",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_034e786a55eb38283be7",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_034e786a55eb38283be7_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_034e786a55eb38283be7_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
+  "schema": "mega_mhc.v2",
+  "arches": {
+    "sm_100a": {
+      "programs": {
+        "deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "8a30b1abcc15bf5ba8484cb138ac51e176c77c3d6028edcb60c3bc2fa3cd262e",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_579a097cc569341d21ca_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "56b902066420bd7f5997cb73664d35df0c4836e25b1730ecb135ff97f4effcac",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_579a097cc569341d21ca",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_579a097cc569341d21ca_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_579a097cc569341d21ca_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_59e35d18d241788a3d84_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "0fe8b35c154837c5eb068963233c71cf9baeaa45055cd7673d9d8ea04f1e245d",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_59e35d18d241788a3d84",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_59e35d18d241788a3d84_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_59e35d18d241788a3d84_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_5d32655fe23e975d07b9_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "8336ae9d2b4ff200142e48416bd45221099ef4d299b218abd29bb8ed8492d35e",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_5d32655fe23e975d07b9",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_5d32655fe23e975d07b9_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_5d32655fe23e975d07b9_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_602d79a73c7b7c110cd4_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "95e1afc44383344af6ea9a1314dc3dea98c5ef1e7889ee3deaa972909ecb71d9",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_602d79a73c7b7c110cd4",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_602d79a73c7b7c110cd4_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_602d79a73c7b7c110cd4_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "b36eac1db2c608c905cbf83f9580bc913d6f027a314879b4f7c74634bcf2ed60",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_639e4564284b29a53256_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "9f40747f5522d7c5d0a12b1b9cbfb0ed0508d7ff53ada655d9261d8266a81a5d",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_639e4564284b29a53256",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_639e4564284b29a53256_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_639e4564284b29a53256_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_65e35f702bff3a30474e_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "6f9f6f59ea21e789c513239978e63e564cf05917fd140c571d09565690d9d072",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_65e35f702bff3a30474e",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_65e35f702bff3a30474e_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_65e35f702bff3a30474e_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_748a6ed023fcd55b7dc7_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "9bcbd6c4c3d3722bf26805ba04ff37a8cdac4e295b5ce444e39c4d482a7a848f",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_748a6ed023fcd55b7dc7",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_748a6ed023fcd55b7dc7_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_748a6ed023fcd55b7dc7_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_85e8740cb428d59896ac_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "1fd059e40e158acac1922b20f4f809f4618da2d7acfa64bfe0d35f0e99536681",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_85e8740cb428d59896ac",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_85e8740cb428d59896ac_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_85e8740cb428d59896ac_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "8c2a5e33bccbe8d9ba2cd53521baf4081dc1b681c95ea3146b57c774688caff4",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm100a_bb271fd23f4d6386d83d_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "983148acd4f72fd46a2969b7bb05d0b3cbc1b1993959ec10dad134641b60eb0d",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm100a_bb271fd23f4d6386d83d",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_bb271fd23f4d6386d83d_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_100a/deepgemm_mega_mhc_sm100a_bb271fd23f4d6386d83d_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        }
+      },
+      "routes": {
+        "1025:5120:148:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_65e35f702bff3a30474e_kernel"
+        },
+        "1025:5120:148:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_748a6ed023fcd55b7dc7_kernel"
+        },
+        "1025:5120:148:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_85e8740cb428d59896ac_kernel"
+        },
+        "1025:5120:148:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_59e35d18d241788a3d84_kernel"
+        },
+        "1:5120:148:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_579a097cc569341d21ca_kernel"
+        },
+        "1:5120:148:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8_kernel"
+        },
+        "1:5120:148:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c_kernel"
+        },
+        "1:5120:148:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63_kernel"
+        },
+        "200:5120:148:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm100a_5d32655fe23e975d07b9_kernel"
+        },
+        "200:5120:148:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm100a_602d79a73c7b7c110cd4_kernel"
+        },
+        "200:5120:148:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm100a_639e4564284b29a53256_kernel"
+        },
+        "200:5120:148:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm100a_bb271fd23f4d6386d83d_kernel"
+        },
+        "4096:5120:148:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_65e35f702bff3a30474e_kernel"
+        },
+        "4096:5120:148:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_748a6ed023fcd55b7dc7_kernel"
+        },
+        "4096:5120:148:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_85e8740cb428d59896ac_kernel"
+        },
+        "4096:5120:148:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm100a_59e35d18d241788a3d84_kernel"
+        },
+        "64:5120:148:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_579a097cc569341d21ca_kernel"
+        },
+        "64:5120:148:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8_kernel"
+        },
+        "64:5120:148:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c_kernel"
+        },
+        "64:5120:148:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63_kernel"
+        },
+        "65:5120:148:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_579a097cc569341d21ca_kernel"
+        },
+        "65:5120:148:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_3c6f68b159490f2b63e8_kernel"
+        },
+        "65:5120:148:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_6043fcc7abee386ea75c_kernel"
+        },
+        "65:5120:148:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 148,
+            "num_sms": 148,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm100a_8947c8d4ad8b836c8a63_kernel"
+        }
+      }
     },
-    "deepgemm_mega_mhc_sm103a_828564db106c31c47442_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "09b056d26b3d50ac7eb3929c952cd1f05afbecffe47c287168ada9efb1d7f647",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_828564db106c31c47442",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_828564db106c31c47442_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_828564db106c31c47442_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "5637bfd6b1a48f83addca0d0b4c33cfe22eedac22b7f6beee59ab945cf796563",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_92cabd19e1b11f84bb0a_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "774e2d3a62da47a13819a9294e438944b337446caa6472da2efe6c2e26d51622",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_92cabd19e1b11f84bb0a",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_92cabd19e1b11f84bb0a_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_92cabd19e1b11f84bb0a_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_94c074507149d770cbad_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "2604c26b230356a650673247736cd6c67760780b4c414b652d8326274c3866cf",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_94c074507149d770cbad",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_94c074507149d770cbad_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_94c074507149d770cbad_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "423d7ebbf258618fa05b50e845518bc9cf5673630a4035a691a57bf48e47ea58",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_a6faa6cefe49f7e4b2c0_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "d06717e884ebf243c47075704cf3d8a869740d52615dffe0768a6f6f66c96e8b",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_a6faa6cefe49f7e4b2c0",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_a6faa6cefe49f7e4b2c0_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_a6faa6cefe49f7e4b2c0_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_c898eac29c18923be158_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "b1b3f9820984e57b3ec1013101b9bc5663676af9deaa8bf544b25a48e13bbeb4",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_c898eac29c18923be158",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_c898eac29c18923be158_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_c898eac29c18923be158_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "8b52b7209e6e6092f4a5c815e6a4fd0ded289b9649c95296562885ffa97bd7a1",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_dda174f11ee6ed2d2079_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "819ec27c3b5521f97ae756c98e21248c24ef1d9e233e1c7537822398fffae33b",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_dda174f11ee6ed2d2079",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_dda174f11ee6ed2d2079_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_dda174f11ee6ed2d2079_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_e8a02b0e951c6f858ec6_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "73bc2dbcd0ba62ca25cacb414655642baae7ddd62b3d24eba02e7458a0c35de5",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_e8a02b0e951c6f858ec6",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_e8a02b0e951c6f858ec6_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_e8a02b0e951c6f858ec6_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
-    },
-    "deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831_kernel": {
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "residual_map"
-        ],
-        [
-          "tma_buffer",
-          "x_map"
-        ],
-        [
-          "tma_buffer",
-          "fn_map"
-        ],
-        [
-          "tma_buffer",
-          "post_map"
-        ],
-        [
-          "tma_buffer",
-          "comb_map"
-        ],
-        [
-          "tma_buffer",
-          "prev_map"
-        ],
-        [
-          "tma_buffer",
-          "new_residual_map"
-        ],
-        [
-          "tma_buffer",
-          "y_map"
-        ],
-        [
-          "buffer",
-          "mix_scales"
-        ],
-        [
-          "buffer",
-          "mix_bases"
-        ],
-        [
-          "buffer",
-          "new_prev_mix"
-        ],
-        [
-          "buffer",
-          "new_post_mix"
-        ],
-        [
-          "buffer",
-          "new_comb_res_mix"
-        ],
-        [
-          "buffer",
-          "rmsnorm_weight"
-        ],
-        [
-          "buffer",
-          "new_residual"
-        ],
-        [
-          "buffer",
-          "y_bf16"
-        ],
-        [
-          "buffer",
-          "y_fp8"
-        ],
-        [
-          "buffer",
-          "y_primary_sf"
-        ],
-        [
-          "buffer",
-          "y_shared_sf"
-        ],
-        [
-          "buffer",
-          "scratch"
-        ],
-        [
-          "buffer",
-          "split_barriers"
-        ],
-        [
-          "buffer",
-          "launch_epochs"
-        ],
-        [
-          "parameter",
-          "num_tokens"
-        ],
-        [
-          "parameter",
-          "hc_norm_eps"
-        ],
-        [
-          "parameter",
-          "hc_pre_eps"
-        ],
-        [
-          "parameter",
-          "hc_post_scale"
-        ],
-        [
-          "parameter",
-          "sinkhorn_eps"
-        ],
-        [
-          "parameter",
-          "num_sinkhorn_iters"
-        ],
-        [
-          "parameter",
-          "rmsnorm_eps"
-        ],
-        [
-          "parameter",
-          "rmsnorm_scale"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_token"
-        ],
-        [
-          "parameter",
-          "primary_sf_stride_word"
-        ],
-        [
-          "parameter",
-          "shared_sf_stride_word"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": "35805beefdc101d0b92edb45656249d1fee535d99589a4d64b498a8b04cf3937",
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "ffi_entry": "run",
-      "name": "deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831_kernel.cu",
-        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831_binding.cu"
-      ],
-      "tma_workspace_bytes": 0
+    "sm_103a": {
+      "programs": {
+        "deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "9e82d88dd3a8e4e2c027fce3e962462919942ab87df14b57492ade89db80e902",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_408c9c4f22457cab0849_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "ca0bcc2dffebbe474d55f84947a471ebd0d0cab6d6d86112adb348464a6c5f6d",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_408c9c4f22457cab0849",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_408c9c4f22457cab0849_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_408c9c4f22457cab0849_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "c79a51366dc3f796101f0d9a311841fbf527d91eb9cdcd29c04881bfe37188d2",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_50eb10dcc5a0537189d0_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "723934e09d7bece6c75d4fcfde9bf53f5f19968dbe2cf1907eb6463fe12d0bab",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_50eb10dcc5a0537189d0",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_50eb10dcc5a0537189d0_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_50eb10dcc5a0537189d0_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_55b509cfe114bb23d3b8_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "2b7cda83468b814cd7326739a2eaba9b531236d6368ace16f7e8fcc12793c6bb",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_55b509cfe114bb23d3b8",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_55b509cfe114bb23d3b8_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_55b509cfe114bb23d3b8_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_5c017af537fe1f8b9a69_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "5fdcad12e608cd57ace1cc9d1665ac98e714604c0107a09512caff9edd3bb742",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_5c017af537fe1f8b9a69",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_5c017af537fe1f8b9a69_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_5c017af537fe1f8b9a69_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_81c321c7701da05911fc_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "a6ccb8e715cc20054f4899e63a5a72d88d9a9b5d8d64140a21b21d276b6a48ff",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_81c321c7701da05911fc",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_81c321c7701da05911fc_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_81c321c7701da05911fc_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "f24908b72d660cf59d29c55656d531f0f8b960e5ad9c21d66d84121d08e07dff",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_83ae725b6d136ad6607b_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "e3f34b955d67db5682f94ba19852eb7c5160763084b4af7630d5ef5f29a36804",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_83ae725b6d136ad6607b",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_83ae725b6d136ad6607b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_83ae725b6d136ad6607b_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_884bca976c320ee18337_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "aa693fe9ff56e0c83c08c22b7cc63c1288d5e512ba79feb03f8c29db1d8a8567",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_884bca976c320ee18337",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_884bca976c320ee18337_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_884bca976c320ee18337_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_d82d13ab8c961e3c7e56_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "ffc5b0c63470b2f9f3de94c419cd12635bd18e516eb0c42e52ac89f3b820abca",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_d82d13ab8c961e3c7e56",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_d82d13ab8c961e3c7e56_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_d82d13ab8c961e3c7e56_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_mega_mhc_sm103a_f925869fd0bae2a1647a_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "residual_map"
+            ],
+            [
+              "tma_buffer",
+              "x_map"
+            ],
+            [
+              "tma_buffer",
+              "fn_map"
+            ],
+            [
+              "tma_buffer",
+              "post_map"
+            ],
+            [
+              "tma_buffer",
+              "comb_map"
+            ],
+            [
+              "tma_buffer",
+              "prev_map"
+            ],
+            [
+              "tma_buffer",
+              "new_residual_map"
+            ],
+            [
+              "tma_buffer",
+              "y_map"
+            ],
+            [
+              "buffer",
+              "mix_scales"
+            ],
+            [
+              "buffer",
+              "mix_bases"
+            ],
+            [
+              "buffer",
+              "new_prev_mix"
+            ],
+            [
+              "buffer",
+              "new_post_mix"
+            ],
+            [
+              "buffer",
+              "new_comb_res_mix"
+            ],
+            [
+              "buffer",
+              "rmsnorm_weight"
+            ],
+            [
+              "buffer",
+              "new_residual"
+            ],
+            [
+              "buffer",
+              "y_bf16"
+            ],
+            [
+              "buffer",
+              "y_fp8"
+            ],
+            [
+              "buffer",
+              "y_primary_sf"
+            ],
+            [
+              "buffer",
+              "y_shared_sf"
+            ],
+            [
+              "buffer",
+              "scratch"
+            ],
+            [
+              "buffer",
+              "split_barriers"
+            ],
+            [
+              "buffer",
+              "launch_epochs"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "hc_norm_eps"
+            ],
+            [
+              "parameter",
+              "hc_pre_eps"
+            ],
+            [
+              "parameter",
+              "hc_post_scale"
+            ],
+            [
+              "parameter",
+              "sinkhorn_eps"
+            ],
+            [
+              "parameter",
+              "num_sinkhorn_iters"
+            ],
+            [
+              "parameter",
+              "rmsnorm_eps"
+            ],
+            [
+              "parameter",
+              "rmsnorm_scale"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_token"
+            ],
+            [
+              "parameter",
+              "primary_sf_stride_word"
+            ],
+            [
+              "parameter",
+              "shared_sf_stride_word"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "c5f21e2f29a3a8957347d27b725a8cbb2729f0c829dac0de2a32c9a94cdcb2ac",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "name": "deepgemm_mega_mhc_sm103a_f925869fd0bae2a1647a",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_f925869fd0bae2a1647a_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/deepgemm_mega_mhc_sm103a_f925869fd0bae2a1647a_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        }
+      },
+      "routes": {
+        "1025:5120:152:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_55b509cfe114bb23d3b8_kernel"
+        },
+        "1025:5120:152:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_50eb10dcc5a0537189d0_kernel"
+        },
+        "1025:5120:152:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_83ae725b6d136ad6607b_kernel"
+        },
+        "1025:5120:152:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_d82d13ab8c961e3c7e56_kernel"
+        },
+        "1:5120:152:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b_kernel"
+        },
+        "1:5120:152:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227_kernel"
+        },
+        "1:5120:152:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 40,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_81c321c7701da05911fc_kernel"
+        },
+        "1:5120:152:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 40,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9_kernel"
+        },
+        "200:5120:152:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm103a_f925869fd0bae2a1647a_kernel"
+        },
+        "200:5120:152:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm103a_408c9c4f22457cab0849_kernel"
+        },
+        "200:5120:152:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm103a_5c017af537fe1f8b9a69_kernel"
+        },
+        "200:5120:152:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 27
+          },
+          "program": "deepgemm_mega_mhc_sm103a_884bca976c320ee18337_kernel"
+        },
+        "4096:5120:152:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_55b509cfe114bb23d3b8_kernel"
+        },
+        "4096:5120:152:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_50eb10dcc5a0537189d0_kernel"
+        },
+        "4096:5120:152:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_83ae725b6d136ad6607b_kernel"
+        },
+        "4096:5120:152:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 16
+          },
+          "program": "deepgemm_mega_mhc_sm103a_d82d13ab8c961e3c7e56_kernel"
+        },
+        "64:5120:152:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b_kernel"
+        },
+        "64:5120:152:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227_kernel"
+        },
+        "64:5120:152:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 80,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_81c321c7701da05911fc_kernel"
+        },
+        "64:5120:152:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 80,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9_kernel"
+        },
+        "65:5120:152:False:True:0:False": {
+          "config": {
+            "num_launch_sms": 80,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_829e3f2a415a5bb55f3b_kernel"
+        },
+        "65:5120:152:False:True:224:False": {
+          "config": {
+            "num_launch_sms": 152,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_47b3d0e98b050c2dc227_kernel"
+        },
+        "65:5120:152:True:True:0:False": {
+          "config": {
+            "num_launch_sms": 83,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_81c321c7701da05911fc_kernel"
+        },
+        "65:5120:152:True:True:224:False": {
+          "config": {
+            "num_launch_sms": 83,
+            "num_sms": 152,
+            "num_splits": 40
+          },
+          "program": "deepgemm_mega_mhc_sm103a_239b3cb421cf3700f0b9_kernel"
+        }
+      }
     }
-  },
-  "routes": {
-    "1025:5120:152:False:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831_kernel"
-    },
-    "1025:5120:152:False:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_a6faa6cefe49f7e4b2c0_kernel"
-    },
-    "1025:5120:152:True:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_dda174f11ee6ed2d2079_kernel"
-    },
-    "1025:5120:152:True:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_034e786a55eb38283be7_kernel"
-    },
-    "1:5120:152:False:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f_kernel"
-    },
-    "1:5120:152:False:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_c898eac29c18923be158_kernel"
-    },
-    "1:5120:152:True:True:0:False": {
-      "config": {
-        "num_launch_sms": 40,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e_kernel"
-    },
-    "1:5120:152:True:True:224:False": {
-      "config": {
-        "num_launch_sms": 40,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8_kernel"
-    },
-    "200:5120:152:False:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 27
-      },
-      "program": "deepgemm_mega_mhc_sm103a_e8a02b0e951c6f858ec6_kernel"
-    },
-    "200:5120:152:False:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 27
-      },
-      "program": "deepgemm_mega_mhc_sm103a_828564db106c31c47442_kernel"
-    },
-    "200:5120:152:True:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 27
-      },
-      "program": "deepgemm_mega_mhc_sm103a_94c074507149d770cbad_kernel"
-    },
-    "200:5120:152:True:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 27
-      },
-      "program": "deepgemm_mega_mhc_sm103a_92cabd19e1b11f84bb0a_kernel"
-    },
-    "4096:5120:152:False:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_fff0e329c85d851ce831_kernel"
-    },
-    "4096:5120:152:False:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_a6faa6cefe49f7e4b2c0_kernel"
-    },
-    "4096:5120:152:True:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_dda174f11ee6ed2d2079_kernel"
-    },
-    "4096:5120:152:True:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 16
-      },
-      "program": "deepgemm_mega_mhc_sm103a_034e786a55eb38283be7_kernel"
-    },
-    "64:5120:152:False:True:0:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f_kernel"
-    },
-    "64:5120:152:False:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_c898eac29c18923be158_kernel"
-    },
-    "64:5120:152:True:True:0:False": {
-      "config": {
-        "num_launch_sms": 80,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e_kernel"
-    },
-    "64:5120:152:True:True:224:False": {
-      "config": {
-        "num_launch_sms": 80,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8_kernel"
-    },
-    "65:5120:152:False:True:0:False": {
-      "config": {
-        "num_launch_sms": 80,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_97d3f486fb2807a6c93f_kernel"
-    },
-    "65:5120:152:False:True:224:False": {
-      "config": {
-        "num_launch_sms": 152,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_c898eac29c18923be158_kernel"
-    },
-    "65:5120:152:True:True:0:False": {
-      "config": {
-        "num_launch_sms": 83,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_8baa8fbaeb942aedda7e_kernel"
-    },
-    "65:5120:152:True:True:224:False": {
-      "config": {
-        "num_launch_sms": 83,
-        "num_sms": 152,
-        "num_splits": 40
-      },
-      "program": "deepgemm_mega_mhc_sm103a_dbfce2ef3f13c4b058c8_kernel"
-    }
-  },
-  "schema": "mega_mhc.v1"
+  }
 }

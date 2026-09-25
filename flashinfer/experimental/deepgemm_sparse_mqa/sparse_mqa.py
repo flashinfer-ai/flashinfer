@@ -1,4 +1,4 @@
-"""Prepared compressed sparse MQA metadata and logits on SM103a.
+"""Prepared compressed sparse MQA metadata and logits on SM100a/SM103a.
 
 Production runtime has no source compiler, quantizer or native oracle dependency.
 Plans bind user tensors once; run() submits on the current PyTorch stream.
@@ -11,24 +11,57 @@ import json
 from pathlib import Path
 
 
+_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
 @functools.cache
 def _catalog():
     return json.loads(Path(__file__).with_name("sparse_mqa_catalog.json").read_text())
 
 
-@functools.cache
-def load_program(name):
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec, sm103a_nvcc_flags
+def device_arch(device):
+    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+    import torch
 
-    record = _catalog()["programs"][name]
+    device = torch.device(device)
+    catalogued = sorted(_catalog()["arches"])
+    if device.type != "cuda":
+        raise RuntimeError("Sparse MQA requires a CUDA device")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    arch = _ARCHES.get(capability)
+    if arch is None or arch not in catalogued:
+        raise RuntimeError(
+            f"Sparse MQA has no exported programs for compute capability "
+            f"{capability}; catalogued architectures: {catalogued}"
+        )
+    return arch
+
+
+def supported_num_sms(arch):
+    """SM counts with catalogued routes for ``arch`` (the last route-key field)."""
+    routes = _catalog()["arches"][arch]["routes"]
+    return sorted({int(key.rsplit(":", 1)[1]) for key in routes})
+
+
+def _nvcc_flags(arch):
+    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
+
+    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
+
+
+@functools.cache
+def load_program(arch, name):
+    from flashinfer.jit import env
+    from flashinfer.jit.core import gen_jit_spec
+
+    record = _catalog()["arches"][arch]["programs"][name]
     spec = gen_jit_spec(
         name=name,
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
         extra_cuda_cflags=[
-            *sm103a_nvcc_flags,
+            *_nvcc_flags(arch),
             *record["compile_flags"],
             "--device-entity-has-hidden-visibility=false",
         ],
@@ -66,6 +99,21 @@ def metadata_size_bytes(queries, capacity, *, fmt, sparse_block_kv, paged, num_s
     )
     entries = ceildiv(splits, num_sms) * num_sms
     return 16 + splits * (16 + blocks_per_split * 8) + entries * 16
+
+
+def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
+    """Return the int32 word count of the metadata kernel workspace.
+
+    Words 0/32/64 are the split, paged-claim and finished-CTA counters, then two
+    words of split info per query. Contiguous routes append one 64-bit owner
+    record (q-block base, split-range end) per possible split.
+    """
+    words = 96 + queries * 2
+    if not paged:
+        blocks_per_split = (640 if fmt == "mxfp4" else 512) // sparse_block_kv
+        ceildiv = lambda a, b: (a + b - 1) // b
+        words += 2 * ceildiv(queries, 2) * ceildiv(2 * capacity, blocks_per_split)
+    return words
 
 
 def metadata_bindings(
@@ -133,8 +181,8 @@ def logits_bindings(
     )
 
 
-def _submission(program, bindings, *, stage=None):
-    module, record = load_program(program)
+def _submission(arch, program, bindings, *, stage=None):
+    module, record = load_program(arch, program)
     arguments = []
     for kind, key in record["arg_plan"]:
         if kind == "workspace":
@@ -163,8 +211,9 @@ class SparseMetadataPlan:
     padding in unused slots. Contiguous inputs use starts/ends int32[Q] and
     num_kv_tokens. Paged inputs use context_lens and request_indices int32[Q],
     plus a per-query block table int32[Q,pages]. Packed metadata is uint8; a
-    caller-provided int32 workspace of 96+2*Q words must initially be zero.
-    The metadata kernel restores its three counters after each submission.
+    caller-provided int32 workspace of metadata_workspace_words() entries must
+    initially be zero. The metadata kernel restores its three counters after
+    each submission.
 
     run() returns the same metadata tensor. Split allocation order may vary;
     unused bytes and scheduler ordering are not a canonical serialization.
@@ -190,10 +239,7 @@ class SparseMetadataPlan:
     ):
         import torch
 
-        if sparse_indices.device.type != "cuda" or torch.cuda.get_device_capability(
-            sparse_indices.device
-        ) != (10, 3):
-            raise RuntimeError("Sparse MQA requires the validated SM103a target")
+        arch = device_arch(sparse_indices.device)
         if sparse_indices.dtype != torch.int32 or sparse_indices.ndim != 2:
             raise ValueError("sparse_indices must be int32[Q,capacity]")
         queries, capacity = sparse_indices.shape
@@ -216,6 +262,7 @@ class SparseMetadataPlan:
                 raise ValueError("paged block_table must be int32[Q,pages]")
         elif num_kv_tokens <= 0:
             raise ValueError("contiguous metadata requires positive num_kv_tokens")
+        self.arch = arch
         self.num_sms = torch.cuda.get_device_properties(
             sparse_indices.device
         ).multi_processor_count
@@ -229,10 +276,10 @@ class SparseMetadataPlan:
             num_sms=self.num_sms,
         )
         try:
-            self.route = _catalog()["routes"][route_key(self.config)]
+            self.route = _catalog()["arches"][arch]["routes"][route_key(self.config)]
         except KeyError as error:
             raise NotImplementedError(
-                f"No exported sparse physical schedule for {self.config}"
+                f"No exported {arch} sparse physical schedule for {self.config}"
             ) from error
         size = metadata_size_bytes(
             queries,
@@ -242,22 +289,25 @@ class SparseMetadataPlan:
             paged=paged,
             num_sms=self.num_sms,
         )
+        words = metadata_workspace_words(
+            queries, capacity, fmt=fmt, sparse_block_kv=sparse_block_kv, paged=paged
+        )
         if metadata is None:
             metadata = torch.empty(
                 size, dtype=torch.uint8, device=sparse_indices.device
             )
         if workspace is None:
             workspace = torch.zeros(
-                96 + queries * 2, dtype=torch.int32, device=sparse_indices.device
+                words, dtype=torch.int32, device=sparse_indices.device
             )
         if metadata.dtype != torch.uint8 or tuple(metadata.shape) != (size,):
             raise ValueError(
                 "metadata must be a uint8 vector with the required packed extent"
             )
-        if workspace.dtype != torch.int32 or tuple(workspace.shape) != (
-            96 + queries * 2,
-        ):
-            raise ValueError("workspace must be an int32 vector with 96+2*Q words")
+        if workspace.dtype != torch.int32 or tuple(workspace.shape) != (words,):
+            raise ValueError(
+                "workspace must be an int32 vector with metadata_workspace_words() entries"
+            )
         self._retained = (
             sparse_indices,
             starts,
@@ -285,7 +335,7 @@ class SparseMetadataPlan:
             stage for stage in self.route["stages"] if stage["name"] == "metadata"
         )
         self._submission, self._program = _submission(
-            stage["program"], {"metadata": self.bindings}, stage="metadata"
+            arch, stage["program"], {"metadata": self.bindings}, stage="metadata"
         )
         self.metadata, self.workspace = metadata, workspace
         self.queries, self.capacity = queries, capacity
@@ -400,7 +450,9 @@ class SparseMqaPlan:
             else [(stage["name"], stage["program"]) for stage in route["stages"]]
         )
         for name, program in selections:
-            submit, loaded = _submission(program, bindings, stage=name)
+            submit, loaded = _submission(
+                metadata_plan.arch, program, bindings, stage=name
+            )
             self._submissions.append(submit)
             self._programs.append(loaded)
         self.metadata_plan, self.output = metadata_plan, output

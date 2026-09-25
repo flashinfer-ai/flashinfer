@@ -1,4 +1,4 @@
-"""Prepared single-rank fused MegaMoE using packed FP4/FP8 weights on SM103a."""
+"""Prepared single-rank fused MegaMoE using packed FP4/FP8 weights on SM100a/SM103a."""
 
 from __future__ import annotations
 import functools
@@ -8,9 +8,42 @@ from types import SimpleNamespace
 from .bindings import make_bindings
 
 
+_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
 @functools.cache
-def catalog():
+def _catalog():
     return json.loads(Path(__file__).with_name("catalog.json").read_text())
+
+
+def device_arch(device):
+    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+    import torch
+
+    device = torch.device(device)
+    catalogued = sorted(_catalog()["arches"])
+    if device.type != "cuda":
+        raise RuntimeError("Generated MegaMoE requires a CUDA device")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    arch = _ARCHES.get(capability)
+    if arch is None or arch not in catalogued:
+        raise RuntimeError(
+            f"Generated MegaMoE has no exported programs for compute capability "
+            f"{capability}; catalogued architectures: {catalogued}"
+        )
+    return arch
+
+
+def supported_num_sms(arch):
+    """SM counts with catalogued routes for ``arch``."""
+    routes = _catalog()["arches"][arch]["routes"].values()
+    return sorted({route["num_sms"] for route in routes})
+
+
+def _nvcc_flags(arch):
+    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
+
+    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
 def route_key(args):
@@ -30,18 +63,18 @@ def route_key(args):
 
 
 @functools.cache
-def load_program(name):
+def load_program(arch, name):
     from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec, sm103a_nvcc_flags
+    from flashinfer.jit.core import gen_jit_spec
 
-    record = catalog()["programs"][name]
+    record = _catalog()["arches"][arch]["programs"][name]
     spec = gen_jit_spec(
         name=name,
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
         extra_cuda_cflags=[
-            *sm103a_nvcc_flags,
+            *_nvcc_flags(arch),
             *record["compile_flags"],
             "--device-entity-has-hidden-visibility=false",
         ],
@@ -97,14 +130,13 @@ class MegaMoEPlan:
     ):
         import torch
 
-        if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) != (
-            10,
-            3,
-        ):
-            raise RuntimeError("This exported catalog requires SM103a")
+        arch = device_arch(x.device)
         actual_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        if actual_sms != 152:
-            raise RuntimeError("This exported catalog requires 152 physical SMs")
+        if actual_sms not in supported_num_sms(arch):
+            raise RuntimeError(
+                f"The exported {arch} catalog covers {supported_num_sms(arch)} "
+                f"physical SMs; this device has {actual_sms}"
+            )
         t, h = x.shape
         tk = topk_idx.shape[1]
         sms = actual_sms if num_sms is None else int(num_sms)
@@ -120,7 +152,12 @@ class MegaMoEPlan:
             activation_clamp=activation_clamp,
             fast_math=fast_math,
         )
-        route = catalog()["routes"][route_key(args)]
+        try:
+            route = _catalog()["arches"][arch]["routes"][route_key(args)]
+        except KeyError as error:
+            raise RuntimeError(
+                f"No exported {arch} MegaMoE schedule for {args}"
+            ) from error
         record = route["layout"]
         config = SimpleNamespace(**record["config"])
         if workspace is None:
@@ -154,6 +191,7 @@ class MegaMoEPlan:
             or not out.is_contiguous()
         ):
             raise ValueError("Output must be contiguous BF16[T,H] on the input device")
+        self.arch = arch
         self.route, self.workspace, self.views, self.output, self.config = (
             route,
             workspace,
@@ -189,7 +227,7 @@ class MegaMoEPlan:
         layout = SimpleNamespace(config=config, num_sms=sms)
         self.bindings = make_bindings(layout, views, weights, out)
         self.bindings.update(grid_x=sms, grid_y=1, grid_z=1)
-        module, program = load_program(route["program"])
+        module, program = load_program(arch, route["program"])
         size = program["tma_workspace_bytes"]
         private_descriptors = descriptor_workspace is None
         if size:

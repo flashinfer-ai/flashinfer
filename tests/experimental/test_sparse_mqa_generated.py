@@ -8,7 +8,23 @@ Copyright (c) 2025 DeepSeek; upstream-derived portions are MIT licensed.
 import pytest
 import torch
 
+from flashinfer.experimental.deepgemm_sparse_mqa import sparse_mqa as _runtime
 from flashinfer.sparse_mqa import prepare_sparse_mqa_logits, prepare_sparse_mqa_metadata
+
+
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
 
 
 def analytical_case(fmt, paged):
@@ -135,8 +151,7 @@ def consume_native(case, metadata):
 @pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
 @pytest.mark.parametrize("paged", [False, True])
 def test_sparse_metadata_stream_and_replay(fmt, paged):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("SM103a required")
+    _skip_unless_exported()
     deep_gemm = pytest.importorskip("deep_gemm")
     case = analytical_case(fmt, paged)
     metadata = prepare_sparse_mqa_metadata(case["sparse"], **case["kwargs"])

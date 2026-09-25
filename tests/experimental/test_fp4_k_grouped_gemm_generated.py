@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from flashinfer.experimental.deepgemm_kgroup_gemm import kgroup_gemm as _runtime
 from flashinfer.fp4_k_grouped_gemm import prepare_fp4_k_grouped_gemm
 
 _CASES = [
@@ -109,11 +110,19 @@ _CASES = [
 ]
 
 
-def require_target():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("SM103a required")
-    if torch.cuda.get_device_properties(0).multi_processor_count != 152:
-        pytest.skip("The exported nonempty schedules require152 SMs")
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        arch = _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} nonempty schedules cover "
+            f"{_runtime.supported_num_sms(arch)} SMs, this device has {sms}"
+        )
 
 
 def fixture(case):
@@ -153,7 +162,7 @@ def fixture(case):
 
 @pytest.mark.parametrize("case", _CASES)
 def test_grouped_values_stream_changed_input_replay(case):
-    require_target()
+    _skip_unless_exported()
     a, positive, initial, plan = fixture(case)
     negative = (
         positive | 0x88
@@ -188,7 +197,7 @@ def test_grouped_values_stream_changed_input_replay(case):
 )
 @pytest.mark.parametrize("psum", [False, True])
 def test_all_empty_zero_or_preserve_graph(dtype, accumulate, psum):
-    require_target()
+    _skip_unless_exported()
     case = dict(
         m=256,
         N=128,
