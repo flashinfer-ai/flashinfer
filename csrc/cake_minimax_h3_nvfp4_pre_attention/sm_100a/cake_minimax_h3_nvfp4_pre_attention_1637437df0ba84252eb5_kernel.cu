@@ -564,7 +564,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_nvfp4_pre_attention_3279684d0408e27a8db4(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+kernel_cake_minimax_h3_nvfp4_pre_attention_1637437df0ba84252eb5(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1055,6 +1055,8 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_3279684d0408e27a8db4(CakeTensorMap co
                             normalized[b_1 * 8 + j_3] = __as_u32(_bf16x2_1);
                         }
                     }
+                    int _min_0 = ((token) < (M - 1) ? (token) : (M - 1));
+                    int rope_token = _min_0;
                     #pragma unroll
                     for (int b_2 = 0; b_2 < 3; b_2++) {
                         unsigned int cos_words[8];
@@ -1062,7 +1064,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_3279684d0408e27a8db4(CakeTensorMap co
                         #pragma unroll
                         for (int h_1 = 0; h_1 < 2; h_1++) {
                             {
-                                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(rope_cos_sin + token * 96 + b_2 * 16 + h_1 * 8);
+                                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(rope_cos_sin + rope_token * 96 + b_2 * 16 + h_1 * 8);
                                 uint4* _vdst_1 = reinterpret_cast<uint4*>(&cos_words[4 * h_1]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1070,7 +1072,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_3279684d0408e27a8db4(CakeTensorMap co
                                 }
                             }
                             {
-                                const uint4* _vptr_2 = reinterpret_cast<const uint4*>(rope_cos_sin + token * 96 + 48 + b_2 * 16 + h_1 * 8);
+                                const uint4* _vptr_2 = reinterpret_cast<const uint4*>(rope_cos_sin + rope_token * 96 + 48 + b_2 * 16 + h_1 * 8);
                                 uint4* _vdst_2 = reinterpret_cast<uint4*>(&sin_words[4 * h_1]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1204,8 +1206,8 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_3279684d0408e27a8db4(CakeTensorMap co
                             asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_5));
                             float sf_rounded = _fp8_rt_0;
                             float _rcp_2 = approx_rcp(sf_rounded * global_scale_rcp);
-                            float _min_0 = fminf(_rcp_2, 3.4028234663852886e+38f);
-                            float output_scale = _min_0;
+                            float _min_1 = fminf(_rcp_2, 3.4028234663852886e+38f);
+                            float output_scale = _min_1;
                             float2 _f2_10 = make_float2(output_scale, output_scale);
                             #pragma unroll
                             for (int j_8 = 0; j_8 < 8; j_8++) {
@@ -1312,8 +1314,8 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_3279684d0408e27a8db4(CakeTensorMap co
                             asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_6));
                             float sf_rounded_1 = _fp8_rt_1;
                             float _rcp_4 = approx_rcp(sf_rounded_1 * global_scale_rcp);
-                            float _min_1 = fminf(_rcp_4, 3.4028234663852886e+38f);
-                            float output_scale_1 = _min_1;
+                            float _min_2 = fminf(_rcp_4, 3.4028234663852886e+38f);
+                            float output_scale_1 = _min_2;
                             float2 _f2_12 = make_float2(output_scale_1, output_scale_1);
                             #pragma unroll
                             for (int j_11 = 0; j_11 < 8; j_11++) {
