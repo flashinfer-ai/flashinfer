@@ -2905,7 +2905,7 @@ def test_unified_moe_fuzz(cfg):
             device=dev,
             activation=_activation_for(cfg),
         )
-        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # FP8BlockConfig distinguishes DeepSeekFp8/MXFP8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["quant"] = _quant_config_for_handler(handler)
@@ -3052,7 +3052,7 @@ def test_unified_moe_fuzz(cfg):
     def run(runner, poison=False):
         inputs = runner.pack_inputs(act_pack, weight_pack)
         # Deterministically initialize the kernel-owned output buffer (a `new_empty` in the runner's
-        # pack_inputs; cute_dsl idx 11, trtllm the `output=`), located by dtype+shape: clean=zeros,
+        # pack_inputs; cute_dsl idx 13, trtllm the `output=`), located by dtype+shape: clean=zeros,
         # poison=seeded garbage+NaN/Inf. Both are bit-reproducible from cfg.seed, so any failure --
         # including a partial-write that depends on the buffer -- reproduces exactly.
         act_ptrs = {
@@ -3304,7 +3304,7 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
-        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # FP8BlockConfig distinguishes DeepSeekFp8/MXFP8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if B in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["quant"] = _quant_config_for_handler(handler)

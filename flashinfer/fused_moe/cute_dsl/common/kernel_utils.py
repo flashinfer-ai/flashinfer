@@ -235,6 +235,8 @@ def situ_f32(
     # cannot strength-reduce (1/25.0 is inexact) nor hoist (varying numerator).
     if isinstance(beta, (float, int)):
         inv_beta = cutlass.Float32(f32_reciprocal(beta))
+    elif fastmath:
+        inv_beta = cute.arch.rcp_approx(beta_f32)
     else:
         inv_beta = cutlass.Float32(1.0) / beta_f32
     return (

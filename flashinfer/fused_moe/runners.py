@@ -4864,6 +4864,7 @@ class CuteDslRunner(MoERunner):
         self.config = config
         self.device = torch.device(device)
         self._inner: Any = None
+        self._weight_interleave: Optional[int] = None
         self.tuning_config = TuningConfig()
 
     def _build(self) -> None:
@@ -4895,11 +4896,7 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                quant_mode=(
-                    "w4a8"
-                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-                    else "w4a4"
-                ),
+                quant=self.config.quant,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -4929,6 +4926,7 @@ class CuteDslRunner(MoERunner):
         return super()._cache_key_extras() + (
             bool(self._inner.use_fused_finalize),
             bool(self._inner.enable_pdl),
+            getattr(self, "_weight_interleave", None) or 64,
         )
 
     def forward(
@@ -4948,8 +4946,9 @@ class CuteDslRunner(MoERunner):
     ) -> List[torch.Tensor]:
         """Translate packs into the selected CuTe DSL runner's input list.
 
-        Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
-        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
+        Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha, w1_bias,
+        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, w2_bias, and
+        weight_interleave.
         The W4A4 per-token path inserts ``per_token_scale`` before the trailing
         ``moe_output`` buffer. W4A16 uses its own compact input layout. Both
         tuning configurations include the output buffer so profiling can replace
@@ -4966,6 +4965,42 @@ class CuteDslRunner(MoERunner):
                 "(only PackedPrecomputed is wired; CuteDSL has no in-kernel router)."
             )
         v = weights.get_view(self.backend_key)
+        weight_interleave = v.get("weight_interleave")
+        from .cute_dsl.moe_utils import (
+            normalize_cute_dsl_moe_weight_interleave,
+            warn_deprecated_cute_dsl_moe_weight_interleave,
+        )
+
+        weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+            weight_interleave, swap_ab=False
+        )
+        is_w4a16 = self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
+        bound_interleave = getattr(self, "_weight_interleave", None)
+        if bound_interleave is None:
+            if is_w4a16 and weight_interleave != 64:
+                raise ValueError("CuTe-DSL W4A16 requires weight_interleave=64")
+            device = getattr(self, "device", torch.device("cpu"))
+            if (
+                weight_interleave == 16
+                and device.type == "cuda"
+                and torch.cuda.is_available()
+            ):
+                from ..utils import get_compute_capability
+
+                if get_compute_capability(device) == (10, 7):
+                    raise ValueError("weight_interleave=16 is not supported on SM107")
+            if not is_w4a16:
+                warn_deprecated_cute_dsl_moe_weight_interleave(
+                    weight_interleave, device
+                )
+                self._inner.weight_interleave = weight_interleave
+            self._weight_interleave = weight_interleave
+        elif bound_interleave != weight_interleave:
+            raise ValueError(
+                f"CuteDslRunner is already bound to weight_interleave="
+                f"{bound_interleave}; got a weight view tagged "
+                f"weight_interleave={weight_interleave}"
+            )
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
@@ -5013,10 +5048,12 @@ class CuteDslRunner(MoERunner):
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
+                v.get("w1_bias"),
                 None if is_mxfp4 else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
+                v.get("w2_bias"),
                 moe_output,
             ]
         elif (
@@ -5037,10 +5074,12 @@ class CuteDslRunner(MoERunner):
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
+                v.get("w1_bias"),
                 v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
+                v.get("w2_bias"),
                 act.per_token_scale,
                 moe_output,
             ]

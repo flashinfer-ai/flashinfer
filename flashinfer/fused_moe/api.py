@@ -1697,10 +1697,14 @@ class CuteDslConfig:
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
+        weight_interleave: int = 64,
         device=None,
+        w1_bias=None,
+        w2_bias=None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
+        The view records ``weight_interleave`` for validation by the runner.
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
         Defaults to NVFP4×NVFP4.
@@ -1715,7 +1719,10 @@ class CuteDslConfig:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=activation,
+            weight_interleave=weight_interleave,
             device=device,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
         )
 
     def __repr__(self) -> str:
@@ -2351,14 +2358,14 @@ class MoEWeightPack:
     want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "
