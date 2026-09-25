@@ -116,6 +116,7 @@ top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
+trtllm_batch_decode_mla_sparse_h64_d_qk576_ckv512_kpe64_nope192_ps32_topk2048.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
 trtllm_bf16_routed_moe_topk2_e8_h1024.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
@@ -2793,3 +2794,33 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+
+# cuDNN token-sparse MLA: GLM geometry, physical token IDs, auto at 128 rows.
+def example_cudnn_sparse_mla():
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.mla._cudnn_sparse import _get_sparse_attention_forward
+    from flashinfer.trace.templates.attention import (
+        trtllm_batch_decode_mla_sparse_trace,
+    )
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        return
+    if _get_sparse_attention_forward() is None:
+        return
+    inputs = trtllm_batch_decode_mla_sparse_trace.init(
+        batch_size=128,
+        q_len_per_request=1,
+        num_heads=64,
+        qk_nope_head_dim=192,
+        num_pages=128,
+        page_size=32,
+        sparse_mla_top_k=2048,
+        workspace_size=32 << 20,
+    )
+    inputs["workspace_buffer"].zero_()
+    inputs["bmm1_scale"] = 1 / 16
+    trtllm_batch_decode_with_kv_cache_mla(**inputs, backend="auto")
+
+
+example_cudnn_sparse_mla()

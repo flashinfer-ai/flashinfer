@@ -3363,10 +3363,11 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
+    r"""Run MLA with TRTLLM-GEN, cuDNN DSA, CuteDSL, XQA, or sparse kernels.
 
-    With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
-    when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
+    With ``backend="auto"``, SM100/SM103 devices prefer cuDNN DSA for eligible
+    BF16 H64 sparse MLA calls with at least 128 total query rows, falling back
+    to TRTLLM-GEN for other sparse calls. SM120/SM121 devices use the packed sparse
     backend for ``sparse_mla_top_k > 0`` and XQA for dense decode.
 
     Parameters
@@ -3375,12 +3376,12 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         Query tensor with shape
         ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` where
         ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. When
-        ``cum_seq_lens_q`` is provided, TRTLLM-GEN and monolithic CuTeDSL
+        ``cum_seq_lens_q`` is provided, TRTLLM-GEN, cuDNN, and monolithic CuTeDSL
         instead accept compact ``[total_q, num_heads, head_dim_qk]`` input.
         For the SM120/SM121 sparse backend, this must be BF16 with
         ``head_dim_qk == 576`` for v32/GLM_NSA or ``512`` for GLM-5.3 NoPE.
     kv_cache : torch.Tensor
-        For TRTLLM-GEN, CuteDSL, and XQA, the paged KV cache is
+        For TRTLLM-GEN, cuDNN, CuteDSL, and XQA, the paged KV cache is
         ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or
         ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]`` and uses
         the query-compatible dense dtype. For the SM120/SM121 v32/GLM sparse
@@ -3391,6 +3392,9 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     workspace_buffer : torch.Tensor
         Pre-allocated workspace buffer. Must be zero-initialized on first use
         by kernels that use semaphore state.
+        cuDNN requires at least ``total_q * num_heads * 8`` bytes for statistics
+        (half as much when LSE storage is supplied or requested). Use independent
+        workspaces for overlapping streams or CUDA graph replays.
     qk_nope_head_dim : int
         Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
         ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
@@ -3403,10 +3407,15 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         no-RoPE TRTLLM-GEN path (``kv_lora_rank=512``) uses ``0``.
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
-        SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
+        SM100/SM103 sparse MLA, it holds int32 physical token indices with
+        shape ``[batch_size, q_len_per_request, sparse_mla_top_k]``.
         When ``cum_seq_lens_q`` is provided with sparse MLA, pass compact
         sparse rows in flattened query-token order with shape
         ``[total_q, sparse_mla_top_k]``.
+        cuDNN consumes these same physical token indices. Causality and request
+        boundaries must already be encoded in the selected rows; ``-1`` entries
+        are masked. Contiguous, token-major BF16 page pools are viewed without
+        copying. cuDNN pads the selected-list width to a multiple of 64 internally.
         For SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
         have shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with
         int32 physical token indices.
@@ -3415,17 +3424,21 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     seq_lens : Optional[torch.Tensor]
         Per-request physical KV sequence lengths for dense and TRTLLM-GEN
         paths. With DCP these are rank-local lengths and continue to control
-        paging, memory bounds, and split-KV. For
+        paging, memory bounds, and split-KV. For QK576, cuDNN also bounds the
+        active selected-list prefix by each query's causal sequence length
+        unless explicit ``sparse_mla_top_k_lens`` are supplied. This limits
+        selected-list slots, not the numerical values of physical token IDs.
+        QK512 uses the explicit per-query top-k lengths instead. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
     max_seq_len : int
         Maximum physical KV sequence length used for dense/TRTLLM-GEN
         scheduling. With DCP this is the maximum rank-local length.
-        Ignored by the SM120/SM121 sparse v32/GLM backend.
+        Ignored by cuDNN and the SM120/SM121 sparse v32/GLM backend.
     sparse_mla_top_k : int
         Enables sparse MLA when greater than zero. On SM100/SM103 this selects
-        the TRTLLM-GEN sparse page-table path. On SM120/SM121 with
+        token-sparse MLA through TRTLLM-GEN or eligible cuDNN DSA. On SM120/SM121 with
         ``backend="auto"`` or ``backend="sparse"``, this is the width of the
         packed v32/GLM sparse index matrix. The TRTLLM-GEN backend supports
         dense query input or flattened query input plus ``cum_seq_lens_q``.
@@ -3433,10 +3446,10 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         Output tensor. If not provided, it is allocated internally.
     bmm1_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM1. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
+        cuDNN, CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
     bmm2_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM2. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL and XQA require a float. SM120/SM121 sparse v32/GLM requires
+        CuteDSL and XQA require a float. cuDNN and SM120/SM121 sparse v32/GLM require
         ``1.0``.
     sinks : Optional[List[torch.Tensor]]
         Additional value per head in the denominator of the softmax.
@@ -3453,14 +3466,24 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     enable_pdl : Optional[bool]
         Programmatic Dependent Launch toggle.  When ``None`` (default), auto-detects
         support from the query device.  Honoured by the ``trtllm-gen`` and ``xqa``
-        backends; ignored by ``cute-dsl``.
+        backends; ignored by ``cute-dsl``. cuDNN accepts ``None`` or ``False``
+        and does not enable PDL. Explicit ``True`` excludes cuDNN from auto.
     backend : str = "auto"
         Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
-        ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``. ``"auto"``
-        chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
+        ``"trtllm-gen"``, ``"cudnn"``, ``"cute-dsl"``, and ``"sparse"``.
+        cuDNN sparse MLA requires SM100/SM103, H64, BF16 Q/KV, latent rank 512,
+        QK dimension 512 or 576, contiguous aligned packed Q/KV, scalar scales,
+        and ``bmm2_scale=1``. Sinks, PDL, skip-softmax, DCP, and TRTLLM counter
+        buffers are unsupported. Requires ``nvidia-cudnn-frontend>=1.29.0``
+        with CuTe DSL support. Warm up each configuration outside CUDA graph
+        capture. ``"auto"`` prefers cuDNN for eligible sparse calls with
+        ``batch_size * q_len_per_request >= 128`` (or ``total_q >= 128`` for
+        compact Q), and retains TRTLLM-GEN otherwise. Missing cuDNN support
+        does not prevent fallback. This rule counts query rows, so it applies
+        to both prefill and batched decode. ``"auto"`` chooses
         ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
         SM120/SM121 dense decode uses ``"xqa"``.
-        For compact variable Q on SM100/SM103, ``"auto"`` keeps TRTLLM-GEN
+        For other compact variable Q on SM100/SM103, ``"auto"`` keeps TRTLLM-GEN
         when it supports the call and uses monolithic CuTeDSL for TRT gaps or
         LSE output.
         The ``cute-dsl`` backend has monolithic and modular implementations
@@ -3485,7 +3508,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         passing ``True`` to other backends raises ``ValueError``.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
-        ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must have
+        ``trtllm-gen``, ``cudnn``, ``cute-dsl``, and ``sparse`` backends. Must have
         dtype ``torch.float32``. Accepted shapes:
 
         * ``[batch_size * q_len_per_request, num_qo_heads]`` (TRTLLM-GEN
@@ -3493,22 +3516,23 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
           also accepted by cute-dsl), or
         * ``[total_q, num_qo_heads]`` for compact variable Q with monolithic
-          CuTeDSL.
+          CuTeDSL or cuDNN. cuDNN also accepts both fixed-Q shapes above.
 
         If ``return_lse`` is True and this is None, a buffer will be
         allocated by the backend.
     return_lse : bool = False
-        Whether to return LSE values. Supported by ``trtllm-gen``,
+        Whether to return LSE values. Supported by ``trtllm-gen``, ``cudnn``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
-        supported only by monolithic CuTeDSL.
+        supported by monolithic CuTeDSL and cuDNN.
     return_lse_base : Optional[Literal["basee", "base2"]] = None
         Logarithm base of LSE values, including values written to a supplied
-        ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``
+        ``lse`` buffer. Supported by ``trtllm-gen``, ``cudnn``, ``cute-dsl``, and ``sparse``
         backends. ``"basee"`` selects natural-log units and ``"base2"`` selects
         base-2 units. ``None`` preserves each backend's historical default:
-        base-2 for ``trtllm-gen`` and ``sparse``, and natural-log for monolithic
-        ``cute-dsl``. Select an explicit base for stable units under
+        base-2 for ``trtllm-gen``, ``cudnn``, and ``sparse``, and natural-log for monolithic
+        ``cute-dsl``. Under ``"auto"``, cuDNN preserves the previous natural-log
+        default for compact queries requesting LSE. Select an explicit base for stable units under
         ``backend="auto"``. This option does not enable LSE output; use
         ``return_lse=True`` to request it. Other values raise
         :class:`ValueError`.
@@ -3560,6 +3584,10 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         final request.
     sparse_mla_top_k_lens : Optional[torch.Tensor] = None
         Flattened active sparse top-k lengths, one INT32 value per query token.
+        Optional for cuDNN at either QK dimension; when omitted at QK576,
+        ``seq_lens`` supplies causal per-query selected-list bounds. Otherwise
+        all nonnegative in-bounds indices are selected. cuDNN permits empty rows (zero output,
+        positive-infinity LSE).
         Required by the native ``kv_lora_rank=512, qk_rope_head_dim=0``
         TRTLLM-GEN kernel. Sparse indices must be packed before any ``-1``
         padding. Zero-length rows are unsupported; padded query rows should
@@ -3640,24 +3668,6 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         kv_lora_rank == nope_mla_dimensions.kv_lora_rank
         and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
     )
-    if sparse_mla_top_k_lens is not None:
-        if not is_nope_mla:
-            raise ValueError(
-                "sparse_mla_top_k_lens is currently only supported by the "
-                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
-            )
-        expected_num_query_tokens = (
-            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
-        )
-        check_shape_dtype_device(
-            sparse_mla_top_k_lens,
-            (expected_num_query_tokens,),
-            torch.int32,
-            query.device,
-            "sparse_mla_top_k_lens",
-        )
-        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
-
     if kv_cache.dtype == torch.uint8 and sparse_mla_top_k <= 0:
         raise NotImplementedError(
             "Dense MLA decode does not support packed uint8 KV caches yet: no "
@@ -3681,6 +3691,56 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     check_trtllm_gen_sm107_only_feature(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
+
+    if backend == "cudnn" or (backend == "auto" and sparse_mla_top_k > 0):
+        from ._cudnn_sparse import try_cudnn_sparse_mla
+
+        result = try_cudnn_sparse_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            sparse_mla_top_k=sparse_mla_top_k,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=enable_pdl,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            lse=lse,
+            return_lse=return_lse,
+            return_lse_base=return_lse_base,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            use_fp16_softmax=use_fp16_softmax,
+            required=backend == "cudnn",
+        )
+        if result is not None:
+            return result
+
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla:
+            raise ValueError(
+                "sparse_mla_top_k_lens requires the native qk_rope_head_dim=0 "
+                "TRTLLM-GEN path or backend='cudnn'"
+            )
+        expected_num_query_tokens = (
+            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
 
     if backend == "auto":
         cc = get_compute_capability(query.device)

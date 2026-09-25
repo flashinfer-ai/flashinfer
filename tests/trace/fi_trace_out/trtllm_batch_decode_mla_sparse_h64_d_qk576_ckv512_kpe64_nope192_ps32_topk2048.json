@@ -1,0 +1,167 @@
+{
+  "name": "trtllm_batch_decode_mla_sparse_h64_d_qk576_ckv512_kpe64_nope192_ps32_topk2048",
+  "description": "Sparse MLA paged attention (TRTLLM-GEN or eligible cuDNN DSA) with top-k token selection (DSV3.2 / GLM-5). Selected when sparse_mla_top_k > 0. block_tables contains physical token indices of shape [num_seqs, q_len_per_request, sparse_mla_top_k] rather than the dense [batch_size, max_pages_per_seq] layout. The trace and reference currently model only the attention output, not the optional LSE output.",
+  "op_type": "mla_paged",
+  "tags": [
+    "fi_api:flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+    "status:verified",
+    "stage:decode",
+    "backend:trtllm",
+    "backend:cudnn",
+    "mla",
+    "sparse"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "q_len_per_request": {
+      "type": "var",
+      "description": "Query length per request (MTP depth)."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 64
+    },
+    "head_dim_qk": {
+      "type": "const",
+      "value": 576
+    },
+    "kv_lora_rank": {
+      "type": "const",
+      "value": 512
+    },
+    "qk_rope_head_dim": {
+      "type": "const",
+      "value": 64
+    },
+    "qk_nope_head_dim": {
+      "type": "const",
+      "value": 192
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "kv_pad_dim": {
+      "type": "const",
+      "value": 1,
+      "description": "Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 32
+    },
+    "sparse_mla_top_k": {
+      "type": "const",
+      "value": 2048,
+      "description": "Number of top-k token slots selected per query token."
+    },
+    "workspace_size": {
+      "type": "var",
+      "description": "Workspace buffer length in bytes."
+    }
+  },
+  "inputs": {
+    "query": {
+      "shape": [
+        "batch_size",
+        "q_len_per_request",
+        "num_heads",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16",
+      "description": "Concatenated [Q_nope, Q_pe] query."
+    },
+    "kv_cache": {
+      "shape": [
+        "num_pages",
+        "kv_pad_dim",
+        "page_size",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16",
+      "description": "Paged KV cache [ckv \u2016 kpe], rank-4 layout."
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "uint8",
+      "description": "Workspace scratch (flat byte buffer)."
+    },
+    "qk_nope_head_dim": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "kv_lora_rank": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "qk_rope_head_dim": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "q_len_per_request",
+        "sparse_mla_top_k"
+      ],
+      "dtype": "int32",
+      "description": "Sparse top-k token index: for each (sequence, query token), physical rows of the flattened KV pool selected by the indexer."
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    },
+    "max_seq_len": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "sparse_mla_top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of top-k token slots selected per query token; >0 selects this template."
+    },
+    "bmm1_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Fused scale applied after Q @ K^T (includes 1/sqrt(head_dim_qk))."
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale applied after softmax @ V."
+    },
+    "skip_softmax_threshold_scale_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Threshold for skip-softmax sparsity (kernel rejects this kwarg when sparse_mla_top_k>0; documented for completeness)."
+    },
+    "return_lse_base": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true,
+      "description": "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None preserves the backend's historical default. Does not affect attention output."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "q_len_per_request",
+        "num_heads",
+        "kv_lora_rank"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _trtllm_batch_decode_mla_sparse_reference(\n    query,\n    kv_cache,\n    workspace_buffer,\n    qk_nope_head_dim,\n    kv_lora_rank,\n    qk_rope_head_dim,\n    block_tables,\n    seq_lens,\n    max_seq_len,\n    sparse_mla_top_k,\n    **kwargs,\n):\n    \"\"\"Reference for sparse top-k token MLA decode.\n\n    This reference models only the attention output, not optional LSE output.\n    ``return_lse_base`` is accepted in kwargs and does not affect it.\n    \"\"\"\n    del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k\n    batch_size, q_len, num_heads, head_dim_qk = query.shape\n    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim\n    bmm1_scale = kwargs.get(\"bmm1_scale\", 1.0)\n    if isinstance(bmm1_scale, torch.Tensor):\n        bmm1_scale = float(bmm1_scale.item())\n    bmm2_scale = kwargs.get(\"bmm2_scale\", 1.0)\n    if isinstance(bmm2_scale, torch.Tensor):\n        bmm2_scale = float(bmm2_scale.item())\n    if kv_cache.dim() == 4:\n        kv_cache = kv_cache.squeeze(1)\n    kv_flat = kv_cache.reshape(-1, head_dim_qk).to(torch.float32)\n    topk_lengths = kwargs.get(\"sparse_mla_top_k_lens\")\n    if topk_lengths is not None:\n        topk_lengths = topk_lengths.reshape(batch_size, q_len)\n    output = torch.zeros(\n        (batch_size, q_len, num_heads, kv_lora_rank),\n        dtype=query.dtype,\n        device=query.device,\n    )\n    for b in range(batch_size):\n        for t in range(q_len):\n            tokens = block_tables[b, t].to(torch.long)\n            valid = (tokens >= 0) & (tokens < kv_flat.shape[0])\n            if topk_lengths is not None:\n                valid &= (\n                    torch.arange(tokens.numel(), device=query.device)\n                    < topk_lengths[b, t]\n                )\n            tokens = tokens[valid]\n            if tokens.numel() == 0:\n                continue\n            flat = kv_flat[tokens]\n            kn = flat[:, :kv_lora_rank]\n            kp = flat[:, kv_lora_rank:]\n            q = query[b, t].to(torch.float32)\n            qn = q[:, :kv_lora_rank]\n            qp = q[:, kv_lora_rank:]\n            logits = (qn @ kn.T + qp @ kp.T) * bmm1_scale\n            attn = torch.softmax(logits, dim=-1)\n            output[b, t] = (attn @ kn * bmm2_scale).to(query.dtype)\n    return output\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
+  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _trtllm_batch_decode_mla_sparse_init(\n    *,\n    batch_size: int,\n    q_len_per_request: int,\n    num_heads: int = 128,\n    head_dim_qk: int = 576,\n    kv_lora_rank: int = 512,\n    qk_rope_head_dim: int = 64,\n    qk_nope_head_dim: int = 512,\n    num_pages: int,\n    kv_pad_dim: int = 1,\n    page_size: int = 64,\n    sparse_mla_top_k: int = 2048,\n    workspace_size: int = 256 << 20,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n    seed: int = 0,\n):\n    \"\"\"Build inputs for sparse top-k ``trtllm_batch_decode_with_kv_cache_mla``.\"\"\"\n    torch.manual_seed(seed)\n    num_pages = max(num_pages, 1)\n    query = (\n        torch.randn(\n            batch_size,\n            q_len_per_request,\n            num_heads,\n            head_dim_qk,\n            dtype=torch.float32,\n            device=device,\n        )\n        / 4.0\n    ).to(dtype)\n    kv_cache = (\n        torch.randn(\n            num_pages,\n            kv_pad_dim,\n            page_size,\n            head_dim_qk,\n            dtype=torch.float32,\n            device=device,\n        )\n        / 4.0\n    ).to(dtype)\n    token_ids = torch.arange(sparse_mla_top_k, dtype=torch.int32, device=device) % (\n        num_pages * page_size\n    )\n    block_tables = (\n        token_ids.view(1, 1, sparse_mla_top_k)\n        .expand(batch_size, q_len_per_request, sparse_mla_top_k)\n        .contiguous()\n    )\n    seq_len = page_size * min(num_pages, sparse_mla_top_k)\n    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)\n    workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)\n    return {\n        \"query\": query,\n        \"kv_cache\": kv_cache,\n        \"workspace_buffer\": workspace_buffer,\n        \"qk_nope_head_dim\": int(qk_nope_head_dim),\n        \"kv_lora_rank\": int(kv_lora_rank),\n        \"qk_rope_head_dim\": int(qk_rope_head_dim),\n        \"block_tables\": block_tables,\n        \"seq_lens\": seq_lens,\n        \"max_seq_len\": int(seq_len),\n        \"sparse_mla_top_k\": int(sparse_mla_top_k),\n        \"bmm1_scale\": 1.0 / math.sqrt(head_dim_qk),\n        \"bmm2_scale\": 1.0,\n        \"is_var_seq\": False,\n    }\n"
+}
