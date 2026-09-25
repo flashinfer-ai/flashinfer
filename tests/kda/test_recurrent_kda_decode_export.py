@@ -63,7 +63,7 @@ def flash_kda_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
             "frozen FlashKDA decode tests require exact CC 10.0 "
             "(SM100a; B200/GB200) or CC 10.3 (SM103a; B300/GB300)"
@@ -1008,6 +1008,8 @@ class _RecorderModule:
         ((10, 3), "12.9", _VARIANT_PREFIX + "4", "sm100f"),
         ((10, 3), "12.9", "d128_t1_precomputed_direct_split16", "sm103a"),
         ((10, 3), "13.0", "d128_t1_precomputed_direct_split8", "sm103a"),
+        ((10, 7), "13.0", _VARIANT_PREFIX + "4", "sm100f"),
+        ((10, 7), "13.0", "d128_t1_precomputed_direct_split16", "sm100f"),
     ],
 )
 def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
@@ -2961,11 +2963,12 @@ def test_frozen_decode_cuda_graph_on_non_default_stream(flash_kda_device, monkey
     with torch.cuda.graph(graph, stream=capture_stream):
         captured_output, captured_state = recurrent_kda(**graph_kwargs, backend="cake")
 
-    expected_variant = _VARIANT_PREFIX + "2"
-    assert [variant for variant, _stream in frozen_calls] == [
-        expected_variant,
-        expected_variant,
-    ]
+    # The value split is a per-architecture policy of the SM count (split2 on
+    # B200/GB300); the contract under test is that capture replays exactly the
+    # variant the eager call selected, on the capture stream.
+    variants = [variant for variant, _stream in frozen_calls]
+    assert len(variants) == 2 and variants[0] == variants[1], variants
+    assert variants[0].startswith(_VARIANT_PREFIX), variants
     assert all(
         stream == int(capture_stream.cuda_stream) for _variant, stream in frozen_calls
     )

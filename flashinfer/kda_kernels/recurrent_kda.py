@@ -65,13 +65,14 @@ from ..jit.cpp_ext import is_cuda_version_at_least
 from .packed_kda_decode_cute import launch_unpacked_kda_decode_cute
 from ..utils import get_compute_capability
 
-FlashKDADecodeDeviceArch = Literal["sm100a", "sm103a"]
+FlashKDADecodeDeviceArch = Literal["sm100a", "sm103a", "sm107a"]
 
 _FLASH_KDA_DECODE_ARCH_BY_COMPUTE_CAPABILITY: dict[
     tuple[int, int], FlashKDADecodeDeviceArch
 ] = {
     (10, 0): "sm100a",
     (10, 3): "sm103a",
+    (10, 7): "sm107a",
 }
 
 # ==============================================================================
@@ -1397,6 +1398,8 @@ _FLASH_KDA_DECODE_VALUE_SPLIT_SELECTOR_BY_ARCH: dict[
 ] = {
     "sm100a": _select_flash_kda_decode_value_split_current,
     "sm103a": _select_flash_kda_decode_value_split_sm103a,
+    # SM107 has no measured split curve yet; the SM103 policy is the closest.
+    "sm107a": _select_flash_kda_decode_value_split_sm103a,
 }
 
 
@@ -1698,8 +1701,8 @@ def _run_flash_kda_decode(
     compute_capability = get_compute_capability(q.device)
     if compute_capability not in _FLASH_KDA_DECODE_ARCH_BY_COMPUTE_CAPABILITY:
         raise RuntimeError(
-            "frozen recurrent-KDA decode requires exact compute capability "
-            "10.0 (SM100a) or 10.3 (SM103a); got "
+            "frozen recurrent-KDA decode requires compute capability "
+            "10.0 (SM100a), 10.3 (SM103a) or 10.7 (SM107a); got "
             f"{compute_capability[0]}.{compute_capability[1]}"
         )
     if compute_capability == (10, 0):
@@ -1712,6 +1715,15 @@ def _run_flash_kda_decode(
                 "frozen recurrent-KDA decode on compute capability 10.0 "
                 "requires CUDA 12.8 or newer"
             )
+    elif compute_capability == (10, 7):
+        # Rubin runs every frozen decode variant through the sm_100f family
+        # target; the generated bindings accept minor 7 under TARGET_FAMILY.
+        if not is_cuda_version_at_least("13.0"):
+            raise RuntimeError(
+                "frozen recurrent-KDA decode on compute capability 10.7 "
+                "requires CUDA 13.0 or newer"
+            )
+        target = "sm100f"
     else:
         if not is_cuda_version_at_least("12.9"):
             raise RuntimeError(
