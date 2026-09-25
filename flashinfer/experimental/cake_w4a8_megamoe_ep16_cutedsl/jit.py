@@ -83,9 +83,16 @@ def make_spec():
     source_hash = hashlib.sha256(
         b"".join((source_dir / name).read_bytes() for name in names)
     ).hexdigest()
-    return ImageSpec(
-        "cake_w4a8_megamoe_ep16_cutedsl", "unified", compile_program, source_hash
+
+    def compile_with_image():
+        artifact_dir = spec.module_dir / "compiler-artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return compile_program(artifact_dir=artifact_dir)
+
+    spec = ImageSpec(
+        "cake_w4a8_megamoe_ep16_cutedsl", "unified", compile_with_image, source_hash
     )
+    return spec
 
 
 def load_module(group):

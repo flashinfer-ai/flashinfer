@@ -59,5 +59,6 @@ Run `examples/cake_w4a8_megamoe_ep16_cutedsl.py` using `torchrun` across the
 `tests/experimental/test_cake_w4a8_megamoe_ep16_cutedsl.py` and compare against
 DeepGEMM at `atol = rtol = 1e-2`, with relative L2 below 0.02. They include
 repeated forwards, duplicate routes, empty input, 17-token extreme values and
-384-token all-hot routing. Export validation and measured performance are
-pending; no results from another executable are claimed here.
+384-token all-hot routing. Performance comparisons must include the complete
+forward and identify the dependency revisions, graph/eager modes, compiled
+image and timing reduction used for every arm.

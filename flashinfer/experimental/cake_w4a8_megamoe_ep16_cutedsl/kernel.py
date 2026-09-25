@@ -3151,7 +3151,9 @@ def launch_w4a8_full_m32_fused_input(caller_x: cute.Tensor, caller_rw: cute.Tens
         stream=stream,
     )
 
-def compile_program():
+def compile_program(*, artifact_dir):
+    from shlex import quote
+
     return cute.compile(launch_w4a8_full_m32_fused_input,
         make_fake_tensor(cutlass.BFloat16, (cute.sym_int64(symbol='caller_x'),), (1,), assumed_align=2),
         make_fake_tensor(cutlass.Float32, (cute.sym_int64(symbol='caller_rw'),), (1,), assumed_align=4),
@@ -3287,5 +3289,5 @@ def compile_program():
         cutlass.Int32(1),
         cutlass.Int32(1),
         make_fake_stream(use_tvm_ffi_env_stream=True),
-        options='--enable-tvm-ffi --ptxas-options=--opt-level=2 --gpu-arch=sm_103a',
+        options='--enable-tvm-ffi --ptxas-options=--opt-level=2 --gpu-arch=sm_103a --keep-cubin --dump-dir=' + quote(str(artifact_dir)),
     )

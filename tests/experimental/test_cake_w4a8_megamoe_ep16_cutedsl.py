@@ -12,7 +12,10 @@
 """Run with torchrun on 16 mutually NVLink-accessible SM103a/152-SM GPUs."""
 
 import os
+import subprocess
+import sys
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
@@ -82,6 +85,54 @@ def environment():
     dist.barrier()
     if owned:
         dist.destroy_process_group()
+
+
+def test_cold_jit_cache(environment, tmp_path):
+    """First setup must persist its device image without debug environment flags."""
+    import flashinfer
+
+    result = [None]
+    if dist.get_rank() == 0:
+        code = """
+import hashlib
+import torch
+from flashinfer.experimental.cake_w4a8_megamoe_ep16_cutedsl import jit
+torch.cuda.set_device(0)
+spec = jit.make_spec()
+assert not spec.object_path.exists() and not spec.cubin_path.exists()
+spec.build_and_load()
+image = spec.cubin_path.read_bytes()
+assert image.startswith(b'\\x7fELF')
+assert spec.object_path.read_bytes().count(image) == 1
+assert jit.make_spec().try_load() is not None
+print('COLD_IMAGE=' + hashlib.sha256(image).hexdigest())
+"""
+        env = dict(os.environ)
+        env.pop("CUTE_DSL_KEEP", None)
+        env.pop("CUTE_DSL_DUMP_DIR", None)
+        env["FLASHINFER_WORKSPACE_BASE"] = str(tmp_path / "cold-jit")
+        source_root = str(Path(flashinfer.__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = source_root + os.pathsep + env.get("PYTHONPATH", "")
+        command = [sys.executable, *(["-S"] if sys.flags.no_site else []), "-c", code]
+        try:
+            child = subprocess.run(
+                command, env=env, capture_output=True, text=True, timeout=180
+            )
+            hashes = [
+                line.removeprefix("COLD_IMAGE=")
+                for line in child.stdout.splitlines()
+                if line.startswith("COLD_IMAGE=")
+            ]
+            result[0] = dict(
+                passed=child.returncode == 0 and len(hashes) == 1,
+                hashes=hashes,
+                diagnostic=child.stdout + child.stderr,
+            )
+        except Exception as error:
+            result[0] = dict(passed=False, diagnostic=str(error))
+    dist.broadcast_object_list(result, src=0)
+    assert result[0]["passed"], result[0]["diagnostic"]
+    environment[3].append(result[0]["hashes"][0])
 
 
 @pytest.mark.parametrize(
