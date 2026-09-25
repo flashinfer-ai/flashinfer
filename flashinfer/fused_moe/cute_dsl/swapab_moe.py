@@ -369,6 +369,8 @@ def _get_compiled_swapab_kernel(
     pdl_trigger_early: bool = False,
     late_dep_wait: bool = False,
     pdl_trigger_after_wait: bool = False,
+    split_k: int = 1,
+    split_max_items: int = 0,
 ):
     import os
     import sys
@@ -410,6 +412,8 @@ def _get_compiled_swapab_kernel(
         pdl_trigger_early,
         late_dep_wait,
         pdl_trigger_after_wait,
+        split_k,
+        split_max_items,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -436,6 +440,8 @@ def _get_compiled_swapab_kernel(
             pdl_trigger_early=pdl_trigger_early,
             late_dep_wait=late_dep_wait,
             pdl_trigger_after_wait=pdl_trigger_after_wait,
+            split_k=split_k,
+            split_max_items=split_max_items,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -611,6 +617,7 @@ def swapab_gemm2(
     pdl_trigger_early: bool = False,
     late_dep_wait: bool = False,
     pdl_trigger_after_wait: bool = False,
+    split_k: int = 1,
 ) -> None:
     """GEMM2 (down) on the swap path.
 
@@ -653,6 +660,12 @@ def swapab_gemm2(
     wide_out = (not finalize) and out.shape[0] * out.shape[1] >= 1 << 31
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(1)
+    # Split-K only for the additive finalize epilogue and an evenly divisible
+    # stage count; the kernel splits at run time only while the valid work
+    # items fit ``max_active_clusters // split_k`` CTAs.
+    if split_k > 1 and (not finalize or (k // (k_blocks_per_stage * 32)) % split_k):
+        split_k = 1
+    split_max_items = max_active_clusters // split_k if split_k > 1 else 0
     args = (
         _gmem_ptr(
             cutlass.Float4E2M1FN,
@@ -712,6 +725,8 @@ def swapab_gemm2(
         pdl_trigger_early=pdl_trigger_early,
         late_dep_wait=late_dep_wait,
         pdl_trigger_after_wait=pdl_trigger_after_wait,
+        split_k=split_k,
+        split_max_items=split_max_items,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)

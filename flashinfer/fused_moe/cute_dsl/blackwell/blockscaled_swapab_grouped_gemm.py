@@ -115,6 +115,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         pdl_trigger_early: bool = False,
         late_dep_wait: bool = False,
         pdl_trigger_after_wait: bool = False,
+        split_k: int = 1,
+        split_max_items: int = 0,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
@@ -151,6 +153,18 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # predecessor to trigger no earlier than after its own dependency wait
         # (``pdl_trigger_after_wait`` on it).
         self.late_dep_wait = bool(late_dep_wait)
+        # Device-side adaptive split-K (finalize epilogue only: its
+        # ``red.global.add`` output makes K partials additive). Work items are
+        # (m_chunk * split_k + split, row_group); the scheduler warp publishes
+        # each item's K range and splits only while the valid items
+        # (num_valid_groups * m_chunks) fit ``split_max_items`` CTAs, so a row
+        # with more tiles than SMs keeps whole-K items (split > 0 skipped).
+        self.split_k = int(split_k)
+        self.split_max_items = int(split_max_items)
+        if self.split_k not in (1, 2, 3, 4):
+            raise ValueError("split_k must be 1..4")
+        if self.split_k > 1 and epilogue_kind != "finalize":
+            raise ValueError("split_k > 1 requires the finalize epilogue")
         self.pdl_trigger_after_wait = bool(pdl_trigger_after_wait)
         if self.pdl_trigger_early and self.pdl_trigger_after_wait:
             raise ValueError("pdl_trigger_early and pdl_trigger_after_wait are exclusive")
@@ -382,7 +396,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
     def _ring_smem_bytes(self) -> int:
         """Tile-info ring plus the scheduler-filled metadata ring (sTok/sScale)."""
         meta_stages = self.num_tile_stages if self.meta_in_sched else 1
-        return 5 * 4 * self.num_tile_stages + (2 * self.n_tile + 1) * 4 * meta_stages
+        return 7 * 4 * self.num_tile_stages + (2 * self.n_tile + 1) * 4 * meta_stages
 
     def epilogue_smem_bytes(self) -> int:
         # SharedStorage carries the SiTU gate exchange (64 x n F32) for every
@@ -635,7 +649,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Work items are (weight M-tile chunk, row group).
         num_m_chunks = cute.ceil_div(num_m_tiles, self.m_group)
         self.tile_sched_params, grid = self._compute_grid(
-            num_m_chunks, num_row_groups, max_active_clusters
+            num_m_chunks * self.split_k, num_row_groups, max_active_clusters
         )
 
         self.buffer_align_bytes = 1024
@@ -651,7 +665,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         @cute.struct
         class SharedStorage:
             sInfo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 5 * self.num_tile_stage], 1
+                cute.struct.MemRange[cutlass.Int32, 7 * self.num_tile_stage], 1
             ]
             # Per-tile epilogue metadata filled by the scheduler warp: output
             # row per column, route weight per column and the expert alpha
@@ -968,7 +982,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         sExch = storage.sExch.get_tensor(exch_smem_layout)
-        info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
+        info_layout = cute.make_layout((7, self.num_tile_stage), stride=(1, 7))
         sInfo = storage.sInfo.get_tensor(info_layout)
         sTok = storage.sTok.get_tensor(
             cute.make_layout((n_tile, self.num_meta_stage), stride=(1, n_tile))
@@ -1080,17 +1094,44 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             if cutlass.const_expr(self.pdl_trigger_after_wait):
                 griddepcontrol_launch_dependents()
         num_valid_groups = num_non_exiting_tiles[0]
+        # Split-K decision (grid-uniform): valid work items vs the CTA budget.
+        sk_cnt_split = k_tile_cnt // self.split_k
+        sk_do_split = cutlass.Boolean(0)
+        sk_m_chunks = (num_m_tiles + m_group - 1) // m_group
+        if cutlass.const_expr(self.split_k > 1):
+            sk_do_split = (num_valid_groups * sk_m_chunks) <= cutlass.Int32(
+                self.split_max_items
+            )
 
         # First tile before the CTA-wide sync so consumers can start immediately.
         if warp_idx == self.sched_warp_id:
             if work_tile.is_valid_tile:
                 cur = work_tile.tile_idx
-                if cur[1] < num_valid_groups:
+                if cutlass.const_expr(self.split_k > 1):
+                    # Linear item index over the (m_chunks * split_k, groups) raster.
+                    # Unsplit: items 0..m_chunks*valid_groups-1 keep the original
+                    # (chunk, group) raster (no idle CTAs); split: split is fastest.
+                    sk_lin = cur[1] * (sk_m_chunks * self.split_k) + cur[0]
+                    sk_group = sk_lin // sk_m_chunks
+                    sk_chunk = sk_lin - sk_group * sk_m_chunks
+                    sk_cnt = k_tile_cnt
+                    sk_begin = cutlass.Int32(0)
+                    if sk_do_split:
+                        sk_group = cur[1]
+                        sk_chunk = cur[0] // self.split_k
+                        sk_cnt = sk_cnt_split
+                        sk_begin = (cur[0] - sk_chunk * self.split_k) * sk_cnt_split
+                else:
+                    sk_group = cur[1]
+                    sk_chunk = cur[0]
+                    sk_cnt = k_tile_cnt
+                    sk_begin = cutlass.Int32(0)
+                if sk_group < num_valid_groups:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                    sched_row_group = cur[1]
-                    sched_lookup = cur[1]
+                    sched_row_group = sk_group
+                    sched_lookup = sk_group
                     if cutlass.const_expr(tile_idx_to_row_group is not None):
-                        sched_row_group = tile_idx_to_row_group[cur[1]]
+                        sched_row_group = tile_idx_to_row_group[sk_group]
                         sched_lookup = sched_row_group // self.row_group_ratio
                     expert_idx = tile_idx_to_expert_idx[sched_lookup]
                     mn_limit = tile_idx_to_mn_limit[sched_lookup]
@@ -1137,11 +1178,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         )
                                         sTok[(meta_col, meta_stage)] = meta_prow
                     with cute.arch.elect_one():
-                        sInfo[(0, tile_info_producer_state.index)] = cur[0]
+                        sInfo[(0, tile_info_producer_state.index)] = sk_chunk
                         sInfo[(1, tile_info_producer_state.index)] = sched_row_group
                         sInfo[(2, tile_info_producer_state.index)] = expert_idx
                         sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(1)
                         sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                        sInfo[(5, tile_info_producer_state.index)] = sk_begin
+                        sInfo[(6, tile_info_producer_state.index)] = sk_cnt
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.sched_sync_barrier.arrive_and_wait()
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1177,12 +1220,31 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             is_continue = cutlass.Boolean(1)
             while work_tile.is_valid_tile and is_continue:
                 cur = work_tile.tile_idx
-                if cur[1] < num_valid_groups:
+                if cutlass.const_expr(self.split_k > 1):
+                    # Linear item index over the (m_chunks * split_k, groups) raster.
+                    # Unsplit: items 0..m_chunks*valid_groups-1 keep the original
+                    # (chunk, group) raster (no idle CTAs); split: split is fastest.
+                    sk_lin = cur[1] * (sk_m_chunks * self.split_k) + cur[0]
+                    sk_group = sk_lin // sk_m_chunks
+                    sk_chunk = sk_lin - sk_group * sk_m_chunks
+                    sk_cnt = k_tile_cnt
+                    sk_begin = cutlass.Int32(0)
+                    if sk_do_split:
+                        sk_group = cur[1]
+                        sk_chunk = cur[0] // self.split_k
+                        sk_cnt = sk_cnt_split
+                        sk_begin = (cur[0] - sk_chunk * self.split_k) * sk_cnt_split
+                else:
+                    sk_group = cur[1]
+                    sk_chunk = cur[0]
+                    sk_cnt = k_tile_cnt
+                    sk_begin = cutlass.Int32(0)
+                if sk_group < num_valid_groups:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                    sched_row_group = cur[1]
-                    sched_lookup = cur[1]
+                    sched_row_group = sk_group
+                    sched_lookup = sk_group
                     if cutlass.const_expr(tile_idx_to_row_group is not None):
-                        sched_row_group = tile_idx_to_row_group[cur[1]]
+                        sched_row_group = tile_idx_to_row_group[sk_group]
                         sched_lookup = sched_row_group // self.row_group_ratio
                     expert_idx = tile_idx_to_expert_idx[sched_lookup]
                     mn_limit = tile_idx_to_mn_limit[sched_lookup]
@@ -1229,11 +1291,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         )
                                         sTok[(meta_col, meta_stage)] = meta_prow
                     with cute.arch.elect_one():
-                        sInfo[(0, tile_info_producer_state.index)] = cur[0]
+                        sInfo[(0, tile_info_producer_state.index)] = sk_chunk
                         sInfo[(1, tile_info_producer_state.index)] = sched_row_group
                         sInfo[(2, tile_info_producer_state.index)] = expert_idx
                         sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(1)
                         sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                        sInfo[(5, tile_info_producer_state.index)] = sk_begin
+                        sInfo[(6, tile_info_producer_state.index)] = sk_cnt
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.sched_sync_barrier.arrive_and_wait()
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1250,6 +1314,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 sInfo[(2, tile_info_producer_state.index)] = cutlass.Int32(-1)
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(4, tile_info_producer_state.index)] = cutlass.Int32(0)
+                sInfo[(5, tile_info_producer_state.index)] = cutlass.Int32(0)
+                sInfo[(6, tile_info_producer_state.index)] = cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
             self.sched_sync_barrier.arrive_and_wait()
             tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1266,9 +1332,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((7,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for i in cutlass.range_constexpr(5):
+            for i in cutlass.range_constexpr(7):
                 tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy("async.shared", space="cta")
@@ -1309,11 +1375,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
-                if ab_producer_state.count < k_tile_cnt:
+                if ab_producer_state.count < tile_info[6]:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                         ab_producer_state
                     )
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
+                for k_tile in cutlass.range(0, tile_info[6], 1, unroll=1):  # noqa: B007
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -1332,8 +1398,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         else:
                             tAgA_sj = tAgA_s3
                             tAgSFA_sj = tAgSFA_s3
-                        tAgA_k = tAgA_sj[(None, ab_producer_state.count)]
-                        tAgSFA_k = tAgSFA_sj[(None, ab_producer_state.count)]
+                        tAgA_k = tAgA_sj[(None, tile_info[5] + ab_producer_state.count)]
+                        tAgSFA_k = tAgSFA_sj[(None, tile_info[5] + ab_producer_state.count)]
                         tAsA_pipe = tAsA[(None, slot_t)]
                         tAsSFA_pipe = tAsSFA[(None, slot_t)]
                         if cutlass.const_expr(self.weight_l2_hint is not None):
@@ -1365,7 +1431,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     if cutlass.const_expr(self.row_tma):
                         tBsB_pipe = tBsB[(None, ab_producer_state.index)]
                         if cutlass.const_expr(self.gather_rows):
-                            b_crd = (None, (row_group, ab_producer_state.count))
+                            b_crd = (None, (row_group, tile_info[5] + ab_producer_state.count))
                             cute.copy(
                                 tma_atom_b,
                                 [tBgB[b_crd], tBgI[b_crd]],
@@ -1375,19 +1441,19 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         else:
                             cute.copy(
                                 tma_atom_b,
-                                tBgB_slice[(None, ab_producer_state.count)],
+                                tBgB_slice[(None, tile_info[5] + ab_producer_state.count)],
                                 tBsB_pipe,
                                 tma_bar_ptr=tma_bar,
                             )
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if ab_producer_state.count < k_tile_cnt:
+                    if ab_producer_state.count < tile_info[6]:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                             ab_producer_state
                         )
 
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for i in cutlass.range_constexpr(5):
+                for i in cutlass.range_constexpr(7):
                     tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -1410,9 +1476,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((7,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for i in cutlass.range_constexpr(5):
+            for i in cutlass.range_constexpr(7):
                 tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy("async.shared", space="cta")
@@ -1508,10 +1574,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     sf_dst[i] = lane_g * 16 + q * 4
 
                 b_producer_state.reset_count()
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
+                for k_tile in cutlass.range(0, tile_info[6], 1, unroll=1):  # noqa: B007
                     b_pipeline.producer_acquire(b_producer_state)
                     stage = b_producer_state.index
-                    k0 = b_producer_state.count * k_stage
+                    k0 = (tile_info[5] + b_producer_state.count) * k_stage
                     sB_stage = sB.iterator + stage * b_bytes_per_stage
                     sSFB_stage = sSFB.iterator + stage * sf_bytes_per_stage
                     if cutlass.const_expr(self.perf_probe != 3):
@@ -1542,13 +1608,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     # 512-byte SF atom per 128-wide K atom.
                                     sf_src_off = cute.assume(
                                         sf_src[i]
-                                        + (b_producer_state.count * n_kt + kt) * 512,
+                                        + ((tile_info[5] + b_producer_state.count) * n_kt + kt) * 512,
                                         divby=4,
                                     )
                                 else:
                                     sf_src_off = cute.assume(
                                         sf_src[i] * sf_cols
-                                        + b_producer_state.count
+                                        + (tile_info[5] + b_producer_state.count)
                                         * self.k_blocks_per_stage
                                         + kt * 4,
                                         divby=4,
@@ -1569,7 +1635,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     b_producer_state.advance()
 
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for i in cutlass.range_constexpr(5):
+                for i in cutlass.range_constexpr(7):
                     tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -1675,9 +1741,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((7,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for i in cutlass.range_constexpr(5):
+            for i in cutlass.range_constexpr(7):
                 tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy("async.shared", space="cta")
@@ -1687,7 +1753,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             while is_valid_tile:
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt:
+                if ab_consumer_state.count < tile_info[6]:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(
                         ab_consumer_state
                     )
@@ -1770,11 +1836,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 b_pipeline.consumer_release(b_consumer_state)
                 b_consumer_state.advance()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt:
+                if ab_consumer_state.count < tile_info[6]:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(
                         ab_consumer_state
                     )
-                for k_tile in cutlass.range(1, k_tile_cnt, 1):  # noqa: B007
+                for k_tile in cutlass.range(1, tile_info[6], 1):  # noqa: B007
                     ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
                     b_pipeline.consumer_wait(b_consumer_state)
                     # cp.async (generic proxy) writes -> tcgen05 (async proxy) reads
@@ -1847,7 +1913,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     b_pipeline.consumer_release(b_consumer_state)
                     b_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_tile_cnt:
+                    if ab_consumer_state.count < tile_info[6]:
                         peek_ab_full_status = ab_pipeline.consumer_try_wait(
                             ab_consumer_state
                         )
@@ -1856,7 +1922,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 acc_producer_state.advance()
 
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for i in cutlass.range_constexpr(5):
+                for i in cutlass.range_constexpr(7):
                     tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -1896,7 +1962,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((7,), cutlass.Int32)
             cur_tok = cute.make_rmem_tensor((n_tile,), cutlass.Int32)
             cur_scale = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
             meta_alpha = cute.make_rmem_tensor((1,), cutlass.Float32)
@@ -1907,7 +1973,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             pf_tok = cute.make_rmem_tensor((n_tile,), cutlass.Int32)
             pf_scale = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for i in cutlass.range_constexpr(5):
+            for i in cutlass.range_constexpr(7):
                 tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
             if cutlass.const_expr(self.meta_in_sched):
                 meta_alpha[0] = sScale[(n_tile, tile_info_consumer_state.index)]
@@ -1964,7 +2030,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     # Peek the next tile and start its metadata loads now so
                     # they overlap this tile's accumulator wait and stores.
                     tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                    for i in cutlass.range_constexpr(5):
+                    for i in cutlass.range_constexpr(7):
                         tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
                     cute.arch.fence_proxy("async.shared", space="cta")
                     tile_info_pipeline.consumer_release(tile_info_consumer_state)
@@ -2180,7 +2246,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         tile_info_pipeline.consumer_release(tile_info_consumer_state)
                         tile_info_consumer_state.advance()
                     tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                    for i in cutlass.range_constexpr(5):
+                    for i in cutlass.range_constexpr(7):
                         tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
                     meta_alpha[0] = sScale[(n_tile, tile_info_consumer_state.index)]
                     if cutlass.const_expr(not self.is_situ and not hold_meta):

@@ -158,6 +158,10 @@ SWAP_SPLIT_EARLY_TRIGGER = os.environ.get("SWAPAB_SPLIT_EARLY_TRIGGER", "1") != 
 # take the SMs GEMM1's tile-less CTAs leave and stream their weight stages
 # while GEMM1 runs. SWAPAB_DEP_PREFETCH=0 disables.
 SWAP_DEP_PREFETCH = os.environ.get("SWAPAB_DEP_PREFETCH", "1") != "0"
+# Plain-chain GEMM2 (finalize): split each weight tile's K over this many work
+# items while the row's valid items fit half the SMs (device-side decision);
+# the finalize reduce-add makes the partials additive. 1 disables.
+SWAP_GEMM2_SPLIT_K = int(os.environ.get("SWAPAB_GEMM2_SPLIT_K", "2"))
 # N tile of the wide dense GEMM1 by token count: with few wide groups the
 # 128-wide tile doubles the streaming CTAs (B300 TP8 empty: T=128 65 -> 57 us,
 # T=512 140 -> 134), from T=1024 the 256-wide tile is back ahead (236 vs 242).
@@ -1351,6 +1355,7 @@ class Mxfp4MoESwapAbPlan:
                 _prepared_launches=launches,
                 m_group=gemm2_m_group,
                 late_dep_wait=self._pdl and self._dep_prefetch,
+                split_k=SWAP_GEMM2_SPLIT_K if self._dep_prefetch else 1,
                 **gemm2_lists,
             )
 
