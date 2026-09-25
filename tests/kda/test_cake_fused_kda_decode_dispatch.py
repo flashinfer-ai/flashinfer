@@ -185,7 +185,7 @@ def test_cake_targets_share_sources_but_have_distinct_build_identities():
     sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
-    assert len(sm100_variants) == len(sm103_variants) == 46
+    assert len(sm100_variants) == len(sm103_variants) == 48
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
         assert replace(sm100, target="sm103a") == sm103
         assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
@@ -374,6 +374,11 @@ _H8_ROUTES = (
     ("bfloat16", "positive_unique", 55, "compact_async_bf16"),
     ("bfloat16", "positive_unique", 56, "compact_async_bf16"),
     ("bfloat16", "positive_unique", 63, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 64, "stream_bf16"),
+    ("bfloat16", "positive_unique", 65, "stream_bf16"),
+    ("bfloat16", "positive_unique", 147, "stream_bf16"),
+    ("bfloat16", "positive_unique", 148, "stream_bf16"),
+    ("bfloat16", "positive_unique", 4096, "stream_bf16"),
     ("bfloat16", "unique_or_null", 1, "wide512_bf16"),
     ("bfloat16", "unique_or_null", 18, "wide512_bf16"),
     ("bfloat16", "unique_or_null", 19, "compact_async_bf16"),
@@ -478,7 +483,10 @@ def test_registered_sources_match_their_launch_contract():
     # the registry's launch record and ABI kind describe the frozen kernel.
     for variant in cake_jit.get_cake_fused_kda_decode_variants():
         text = variant.body_path.read_text(encoding="utf-8")
-        assert text.count('extern "C" {') == 1, variant.name
+        # Exporter revisions differ in how many nested linkage blocks wrap the
+        # kernel; every opened block must be closed.
+        assert text.count('extern "C" {') >= 1, variant.name
+        assert text.count('extern "C" {') == text.count('} // extern "C"'), variant.name
         launch_bounds = re.findall(r"__launch_bounds__\(([^)]*)\)", text)
         assert len(launch_bounds) == 1, variant.name
         assert int(launch_bounds[0].split(",")[0]) == variant.threads, variant.name
@@ -526,6 +534,38 @@ def test_registered_sources_match_their_launch_contract():
         ) in binding
 
 
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("name", ("stream_bf16", "stream_bf16_wide_slot_offsets"))
+def test_persistent_stream_variants_render_the_persistent_grid_binding(target, name):
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
+    assert variant.abi_kind == "persistent_rows"
+    assert variant.state_dtype == "bfloat16"
+    assert variant.threads == 256
+    assert variant.dynamic_smem_bytes == 70272
+    assert variant.extra_cuda_cflags == ("--use_fast_math",)
+    assert variant.slot_offset_bits == (
+        64 if name.endswith("_wide_slot_offsets") else 32
+    )
+    assert variant.kernel_symbol == f"kernel_cake_fused_kda_decode_{name}"
+    assert [
+        (rule.heads, rule.minimum_rows, rule.maximum_rows, rule.state_indices_modes)
+        for rule in variant.eligibility
+    ] == [((8,), 64, None, ("positive_unique",))]
+    declaration = cake_jit._kernel_declaration(variant)
+    assert "int H,\n    int rows,\n    int use_lower_bound" in declaration
+    binding = cake_jit._render_binding(variant)
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS 1" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID 1" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 1" in binding
+    # Every other ABI kind keeps the per-(head, row) or per-row launch.
+    for other in cake_jit.get_cake_fused_kda_decode_variants(target):
+        if other.abi_kind != "persistent_rows":
+            assert (
+                "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID 0"
+                in cake_jit._render_binding(other)
+            )
+
+
 def test_persistent_rows_abi_extends_the_standard_argument_plan():
     standard = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["standard"]
     persistent = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["persistent_rows"]
@@ -542,6 +582,8 @@ def test_persistent_rows_abi_extends_the_standard_argument_plan():
         ("wide512_f32_wide_slot_offsets", False),
         ("compact_async_f32_wide_slot_offsets", True),
         ("compact_async_pr_eval_h96_f32_wide_slot_offsets", True),
+        ("stream_bf16", False),
+        ("stream_bf16_wide_slot_offsets", False),
     ),
 )
 def test_cake_jit_spec_uses_exact_target_flags(

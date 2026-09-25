@@ -565,6 +565,70 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
             },
         ),
     },
+    # Persistent BF16 streaming family (Kimi-K3 TP12, H=8, rows >= 64): one
+    # 256-thread CTA walks a grid-strided (row, head) item sequence with a
+    # two-slot cp.async SMEM ring; the binding sizes the grid from the
+    # launching device's resident-CTA capacity (three CTAs per SM).
+    {
+        "name": "stream_bf16_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_stream_bf16_wide_slot_offsets.cu",
+        "source_sha256": "74a80422cc40e875d54284d9809e7857270141c7c93ef5c0f52de44a1a9306d5",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_stream_bf16_wide_slot_offsets",
+        "abi_kind": "persistent_rows",
+        "state_dtype": "bfloat16",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 256,
+        "dynamic_smem_bytes": 70272,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "stream_bf16",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_stream_bf16.cu",
+        "source_sha256": "c7efeb6e46f58ac5f7fd1b108ccc1b530132d467524e357decaa29d4e183111b",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_stream_bf16",
+        "abi_kind": "persistent_rows",
+        "state_dtype": "bfloat16",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 256,
+        "dynamic_smem_bytes": 70272,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
     {
         "name": "wide512_positive_f32_wide_slot_offsets",
         "target": "sm100a",
