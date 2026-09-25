@@ -7518,6 +7518,7 @@ class KDAPrefillPlanCache:
         """
         import torch
         from .cake_kda_tf32_runtime import (
+            AFFINE_DEFERRED_PARTS,
             REBIND_INPUT_NAMES,
             rebind_prepared_launch,
             rebind_signature_and_facts,
@@ -7561,7 +7562,13 @@ class KDAPrefillPlanCache:
                 )
             # The rebind marks the launches whose descriptor sources moved.
             rebind_prepared_launch(
-                owner, plan, inputs, signature=key[0], changed=changed
+                owner,
+                plan,
+                inputs,
+                signature=key[0],
+                changed=changed,
+                addresses=facts,
+                defer_parts=AFFINE_DEFERRED_PARTS if hasattr(owner, "_main") else (),
             )
             self._facts[key] = facts
         if torch.cuda.is_current_stream_capturing():
@@ -7675,8 +7682,14 @@ def _prepare_kda_prefill(
                 checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
                 in_place_state=initial_state is final_state,
             )
-            with torch.cuda.device(q.device):
+            # ``torch.cuda.device`` costs several microseconds per entry; the
+            # hit path only needs it when another device is current.
+            device_index = q.get_device()
+            if torch.cuda.current_device() == device_index:
                 cached = plan_cache.get(cache_inputs, **cache_scalars)
+            else:
+                with torch.cuda.device(device_index):
+                    cached = plan_cache.get(cache_inputs, **cache_scalars)
             if cached is not None:
                 return cached
 

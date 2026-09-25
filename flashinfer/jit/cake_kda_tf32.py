@@ -12235,6 +12235,10 @@ def prepare_descriptors(prepared):
     import tvm_ffi
 
     owner = getattr(prepared, "_impl", prepared)
+    if hasattr(owner, "_main"):
+        from ..cake_kda_tf32_runtime import flush_deferred_rebind
+
+        flush_deferred_rebind(owner)
     with tvm_ffi.use_torch_stream():
         if hasattr(owner, "_main"):
             for child in (owner._main, owner._map, owner._correction):

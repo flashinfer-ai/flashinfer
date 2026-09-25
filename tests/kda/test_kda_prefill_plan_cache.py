@@ -214,6 +214,30 @@ def test_hit_with_a_fresh_output_only_repoints_the_output_and_stays_bitwise():
     _assert_same(got, _snapshot(d))
 
 
+def test_deferred_part_rebinds_flush_before_another_hit_and_land_in_the_newest_output():
+    """A composite hit defers its map/correction rebinds past the first chain kernel.
+
+    A second hit before any launch must flush the pending set first, and the
+    launch must land in the newest output only; the result stays bitwise.
+    """
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192, 8192], 16, seed=23)
+    pool = d["pool"].clone()
+    miss = _run(d, cache)
+    assert "affine" in str(miss.schedule)
+    skipped = dict(d, out=torch.zeros_like(d["out"]))
+    _prepare(skipped, cache)  # hit: map/correction rebinds pending, never launched
+    newest = dict(d, out=torch.zeros_like(d["out"]))
+    call = _prepare(newest, cache)  # hit: flushes the pending set, defers its own
+    call.launch()
+    assert (cache.misses, cache.hits) == (1, 2)
+    assert not skipped["out"].any(), "a skipped binding received output rows"
+    got = _snapshot(newest)
+    newest["pool"].copy_(pool)
+    _run(newest)
+    _assert_same(got, _snapshot(newest))
+
+
 def test_split_sequence_affine_route_caches_and_rebinds():
     # A long bounded-gate sequence without a checkpoint request takes the
     # affine split route.  Its main/map/correction part launches and the

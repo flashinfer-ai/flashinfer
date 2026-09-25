@@ -4160,9 +4160,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.launch(grid=self.grid, **self.args)
 
     def _launch_uncaptured(self) -> None:
-        import tvm_ffi
-
-        with tvm_ffi.use_torch_stream():
+        with _ffi_stream_context(self._launch_device):
             self._launch_in_stream()
 
     def launch(self) -> None:
@@ -4958,7 +4956,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
 
     def _launch_uncaptured(self) -> None:
         import torch
-        import tvm_ffi
 
         if self._descriptors_stale:
             # A plan-cache hit under CUDA-graph capture marks the composite;
@@ -4968,7 +4965,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 if sub is not None:
                     sub._descriptors_stale = True
             self._descriptors_stale = False
-        with tvm_ffi.use_torch_stream():
+        with _ffi_stream_context(self._launch_device):
             for destination, source in self._affine_input_refreshes:
                 destination.copy_(source)
             if self._fused_epilogue is not None:
@@ -5000,6 +4997,9 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     starts.add_(self._part_local_rows)
             # The parts share this stream context (no re-entry per part).
             self._main._launch_in_stream()
+            # The map/correction rebinds of a plan-cache hit were deferred
+            # past the first chain kernel; apply them while it runs.
+            flush_deferred_rebind(self)
             if self._fused_epilogue is None:
                 # The int64 index copy is only consumed by the final-state
                 # scatter, so it follows the first chain kernel.
@@ -5398,6 +5398,33 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     )
 
 
+_TVM_DEVICES: dict[int, Any] = {}
+
+
+def _ffi_stream_context(device):
+    """FFI stream context on the current torch stream of ``device``.
+
+    ``tvm_ffi.use_torch_stream()`` builds a ``torch.cuda.Stream`` and parses a
+    device string on every entry; on the plan-cache hit path that sits before
+    the first chain kernel.  The raw current-stream handle and a cached FFI
+    device give the same context for a fraction of the cost (a CUDA-graph
+    capture stream is the current stream as well).
+    """
+    import torch
+    import tvm_ffi
+
+    raw_stream_of = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream_of is None:
+        return tvm_ffi.use_torch_stream()
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    ffi_device = _TVM_DEVICES.get(index)
+    if ffi_device is None:
+        ffi_device = _TVM_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(ffi_device, raw_stream_of(index))
+
+
 REBIND_INPUT_NAMES = (
     "q",
     "k",
@@ -5448,6 +5475,11 @@ def rebind_signature_and_facts(inputs: dict) -> tuple[tuple, tuple]:
     in-place pool, packed ``q``/``k``/``v`` slices of one projection buffer,
     ...).  The facts add the full address per tensor: equal facts mean a
     launch bound to the previous call already points at these tensors.
+
+    This runs on every plan-cache hit before the first chain kernel, so it
+    touches each tensor through the cheapest accessors only: ``torch.Size``
+    is kept as the shape (it hashes and compares as a tuple), the element
+    size comes from the dtype and the device index from ``get_device()``.
     """
     storage_groups: dict[int, int] = {}
     facts: list[Optional[tuple]] = []
@@ -5461,11 +5493,11 @@ def rebind_signature_and_facts(inputs: dict) -> tuple[tuple, tuple]:
             addresses.append(None)
             continue
         pointer = tensor.data_ptr()
-        shape = tuple(tensor.shape)
-        stride = tuple(tensor.stride())
+        shape = tensor.shape
+        stride = tensor.stride()
         dtype = tensor.dtype
-        facts.append((shape, stride, dtype, pointer & 0xFF, tensor.device.index))
-        base = pointer - tensor.storage_offset() * tensor.element_size()
+        facts.append((shape, stride, dtype, pointer & 0xFF, tensor.get_device()))
+        base = pointer - tensor.storage_offset() * dtype.itemsize
         aliases.append(storage_groups.setdefault(base, len(storage_groups)))
         addresses.append((pointer, shape, stride, dtype))
     return (tuple(facts), tuple(aliases)), tuple(addresses)
@@ -5539,6 +5571,8 @@ class RebindPlan:
 # few caller-aliasing attributes of their own; their containers are addressed
 # as "<sub launch>.<container>" so one rebind plan covers the whole DAG.
 AFFINE_SUB_LAUNCHES = ("_main", "_map", "_correction")
+# Parts whose plan-cache rebinds may be applied after the first chain kernel.
+AFFINE_DEFERRED_PARTS = ("_map", "_correction")
 AFFINE_REBIND_ATTRIBUTES = (
     "_state_indices",
     "_initial_pool",
@@ -5697,6 +5731,8 @@ def rebind_prepared_launch(
     *,
     signature: tuple | None = None,
     changed: frozenset | None = None,
+    addresses: tuple | None = None,
+    defer_parts: tuple[str, ...] = (),
 ) -> bool:
     """Point a prepared launch at new caller tensors with the recorded layout.
 
@@ -5710,13 +5746,95 @@ def rebind_prepared_launch(
     tensors whose address differs from the previous binding of this plan;
     when given, views and addresses of the other inputs are left in place
     (their tensors still hold the recorded addresses and layouts).
+    ``addresses`` is the per-input ``(pointer, shape, stride, dtype)`` tuple
+    from :func:`rebind_signature_and_facts` for these inputs; with it the
+    rebind never re-reads tensor metadata.  ``defer_parts`` names composite
+    sub launches (``"_map"``, ``"_correction"``) whose specs are recorded on
+    ``impl`` and applied by the composite after its first chain kernel is
+    in flight (:func:`flush_deferred_rebind`), keeping them off the host
+    critical path; a pending deferred set is flushed before a new rebind.
     """
-    import torch
-
     if signature is None:
         signature = rebind_signature(inputs)
     if signature != plan.signature:
         raise ValueError("prepared launch signature does not match the new inputs")
+    flush_deferred_rebind(impl)
+    if addresses is None:
+        addresses = rebind_signature_and_facts(inputs)[1]
+    address_by_input = dict(zip(REBIND_INPUT_NAMES, addresses, strict=True))
+    view_specs, address_specs = plan.specs_for(changed)
+    if defer_parts:
+        prefixes = tuple(f"{name}." for name in defer_parts)
+        now_views = []
+        later_views = []
+        for spec in view_specs:
+            (later_views if spec.container.startswith(prefixes) else now_views).append(
+                spec
+            )
+        now_addresses = []
+        later_addresses = []
+        for spec in address_specs:
+            (
+                later_addresses
+                if spec.container.startswith(prefixes)
+                else now_addresses
+            ).append(spec)
+        view_specs, address_specs = now_views, now_addresses
+    else:
+        later_views = later_addresses = []
+    tma_moved = _apply_rebind_specs(
+        impl, view_specs, address_specs, inputs, address_by_input, changed
+    )
+    new_inputs = tuple(
+        inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
+    )
+    impl._keepalive = plan.owned_keepalive + new_inputs
+    deferred_owned = {}
+    for sub_name, owned in plan.sub_owned_keepalive.items():
+        if sub_name in defer_parts:
+            deferred_owned[sub_name] = owned + new_inputs
+            continue
+        sub = getattr(impl, sub_name, None)
+        if sub is not None:
+            sub._keepalive = owned + new_inputs
+    if later_views or later_addresses or deferred_owned:
+        for spec in later_views:
+            if (
+                isinstance(spec.key, str)
+                and spec.key.endswith("_tma")
+                and (changed is None or spec.input_name in changed)
+            ):
+                tma_moved = True
+        impl._deferred_rebind = (
+            tuple(later_views),
+            tuple(later_addresses),
+            inputs,
+            address_by_input,
+            changed,
+            deferred_owned,
+        )
+    return tma_moved
+
+
+def flush_deferred_rebind(impl) -> None:
+    """Apply the composite part rebinds recorded by ``defer_parts`` (no-op otherwise)."""
+    pending = impl.__dict__.pop("_deferred_rebind", None)
+    if pending is None:
+        return
+    views, addresses, inputs, address_by_input, changed, deferred_owned = pending
+    _apply_rebind_specs(impl, views, addresses, inputs, address_by_input, changed)
+    for sub_name, keepalive in deferred_owned.items():
+        sub = getattr(impl, sub_name, None)
+        if sub is not None:
+            sub._keepalive = keepalive
+
+
+def _apply_rebind_specs(
+    impl, view_specs, address_specs, inputs: dict, address_by_input: dict, changed
+) -> bool:
+    """Re-point the given view/address specs; mark owners whose TMA sources moved."""
+    import torch
+
     containers = _rebind_containers(impl)
     tma_moved = False
     resolved: dict[tuple, Any] = {}
@@ -5733,20 +5851,19 @@ def rebind_prepared_launch(
         if tensor is not None:
             return tensor
         source = inputs[spec.input_name]
+        _, shape, stride, dtype = address_by_input[spec.input_name]
         if (
             spec.byte_offset == 0
-            and source.dtype == spec.dtype
-            and tuple(source.shape) == spec.shape
-            and tuple(source.stride()) == spec.stride
+            and dtype == spec.dtype
+            and shape == spec.shape
+            and stride == spec.stride
         ):
             tensor = source
-        elif (
-            source.dtype == spec.dtype and spec.byte_offset % source.element_size() == 0
-        ):
+        elif dtype == spec.dtype and spec.byte_offset % dtype.itemsize == 0:
             tensor = source.as_strided(
                 spec.shape,
                 spec.stride,
-                source.storage_offset() + spec.byte_offset // source.element_size(),
+                source.storage_offset() + spec.byte_offset // dtype.itemsize,
             )
         else:
             tensor = torch.empty(0, dtype=spec.dtype, device=source.device)
@@ -5764,29 +5881,29 @@ def rebind_prepared_launch(
 
     stale_owners: list = []
     touched: set[str] = set()
-    view_specs, address_specs = plan.specs_for(changed)
     for spec in view_specs:
         touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
-        if (
-            isinstance(spec.key, str)
-            and spec.key.endswith("_tma")
-            and container[spec.key].data_ptr() != replacement.data_ptr()
-        ):
-            tma_moved = True
-            owner, _ = _rebind_owner(impl, spec.container)
-            if owner not in stale_owners:
-                stale_owners.append(owner)
+        if isinstance(spec.key, str) and spec.key.endswith("_tma"):
+            # With ``changed`` the moved inputs are known; otherwise compare
+            # the recorded pointer with the previous binding.
+            moved = (
+                spec.input_name in changed
+                if changed is not None
+                else container[spec.key].data_ptr() != replacement.data_ptr()
+            )
+            if moved:
+                tma_moved = True
+                owner, _ = _rebind_owner(impl, spec.container)
+                if owner not in stale_owners:
+                    stale_owners.append(owner)
         container[spec.key] = replacement
     for address in address_specs:
         touched.add(address.container)
         containers[address.container][address.key] = (
-            inputs[address.input_name].data_ptr() + address.byte_offset
+            address_by_input[address.input_name][0] + address.byte_offset
         )
-    new_inputs = tuple(
-        inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
-    )
     for container_name in touched:
         container = containers[container_name]
         owner, base = _rebind_owner(impl, container_name)
@@ -5803,16 +5920,11 @@ def rebind_prepared_launch(
         elif base == "attributes":
             for name, value in container.items():
                 setattr(owner, name, value)
-    for sub_name, owned in plan.sub_owned_keepalive.items():
-        sub = getattr(impl, sub_name, None)
-        if sub is not None:
-            sub._keepalive = owned + new_inputs
     for owner in stale_owners:
         # Only the launches whose descriptor sources moved re-encode, inside
         # their launch stream context (see _launch_uncaptured); a composite
         # whose parts moved does not re-encode the untouched parts.
         owner._descriptors_stale = True
-    impl._keepalive = plan.owned_keepalive + new_inputs
     return tma_moved
 
 
