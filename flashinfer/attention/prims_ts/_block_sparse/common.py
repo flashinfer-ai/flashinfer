@@ -14,6 +14,8 @@
 
 """Dependency-neutral semantic contract for PrimTS block-sparse attention."""
 
+from collections.abc import Iterable
+
 _FINE_KV_BLOCK_SIZES = (8, 16, 32)
 _PREPARED_KV_ROUTE_SIZE = 128
 _MAX_KV_ATOM_SIZE = 64
@@ -44,6 +46,19 @@ def _validate_contiguous_route_mode(
         raise ValueError("sparse_format must be 'bsr' or 'bitmask'")
     if type(use_proxy_routes) is not bool:
         raise TypeError("use_proxy_routes must be a bool")
+
+
+def _validate_dense_contiguous_plan_inputs(
+    inputs: Iterable[tuple[str, object, object]],
+) -> None:
+    """Reject block-sparse-only inputs given to a dense contiguous plan.
+
+    Each entry is ``(name, value, unused value)``.
+    """
+
+    for name, value, unused in inputs:
+        if value != unused:
+            raise ValueError(f"{name} is unsupported by a dense contiguous plan")
 
 
 def _validate_sparse_q_block_size(value: object) -> int:

@@ -55,6 +55,7 @@ from ..fmha_decode_constants import (
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
+    SWIZZLE_128B_ROW_BYTES,
 )
 from ...stage import FmhaStage
 from ...tensor_map import transform_ragged_coords
@@ -362,7 +363,7 @@ class SmemQResource(DecodeGenResourceBase):
             )
             leading_byte_offset = q_leading_bytes
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.qk_mma_dtype.width == 8):
                 q_head_dim_stage = self.cfg.head_dim_kv_stage
                 q_tile_bytes = Int32(
                     self.cfg.tile_size_q * q_head_dim_stage * self.cfg.q_dtype_bytes
@@ -509,7 +510,7 @@ class SmemQResource(DecodeGenResourceBase):
         # barrier attached to stage_info protects this stage until QK consumes it.
         stage_elems = cfg.smem_q_tile_elements
         stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.qk_mma_dtype.width == 8):
             if _is_load_task_warp_leader(cfg):
                 if cutlass.const_expr(cfg.num_head_dim_stages_kv == 1):
                     # FP8 with one head-dim stage is one tensor copy into the
@@ -898,7 +899,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
             kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
-            chunk_hd = min(head_dim_stage, 64)
+            # One chunk is one swizzled 128-byte row, the TensorMap inner box.
+            chunk_hd = min(head_dim_stage, cfg.kv_swizzle_row_elems)
             num_chunks = head_dim_stage // chunk_hd
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
             if cutlass.const_expr(cfg.use_paged_kv):
@@ -1243,8 +1245,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 chunk_hd = min(head_dim_stage, 64)
                 num_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
+                # Keep the Array type stable across the elected-lane control-flow join.
+                stage_base = self._stage_base(stage_info)
                 if prims.elect_sync():
-                    stage_base = self._stage_base(stage_info)
                     for chunk_idx in cutlass.range_constexpr(num_chunks):
                         local_head_dim_offset = chunk_idx * chunk_hd
                         global_head_dim_offset = (
@@ -2286,9 +2289,10 @@ class SmemKvResource(DecodeGenResourceBase):
             if self.pipeline_config is not None
             else self.cfg.kv_stages
         )
-        # The shared ring has one allocation for both operands, so it cannot
-        # yet express differing K/V byte-widths.
-        assert self.cfg.k_dtype == self.cfg.v_dtype
+        # The shared ring has one allocation for both operands, so K and V
+        # must have one byte width; their element types may differ (Int8 K
+        # with E4M3 V), each operand's descriptor carries its own type.
+        assert self.cfg.k_dtype_bytes == self.cfg.v_dtype_bytes
         self._smem_base_kv = _placeholder_smem_array(
             self.cfg.k_dtype,
             self.cfg.smem_kv_tile_elements * num_stages,
@@ -2322,10 +2326,9 @@ class SmemKvResource(DecodeGenResourceBase):
         """Bind the shared K/V ring and build K/V base descriptors."""
         if cutlass.const_expr(context is not None and context.smem_base is not None):
             # Bind the shared K/V SMEM ring. K and V descriptors use the same
-            # allocation but may differ in leading-byte offset. The ring
-            # cannot yet express differing K/V byte-widths; this assumes
-            # k_dtype == v_dtype.
-            assert self.cfg.k_dtype == self.cfg.v_dtype
+            # allocation but may differ in leading-byte offset. The ring holds
+            # one byte width for both operands.
+            assert self.cfg.k_dtype_bytes == self.cfg.v_dtype_bytes
             num_stages = (
                 self.pipeline_config.num_stages
                 if self.pipeline_config is not None
@@ -2350,7 +2353,9 @@ class SmemKvResource(DecodeGenResourceBase):
                 * self.cfg.kv_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(
+                self.cfg.k_dtype_bytes == 1 and self.cfg.v_dtype_bytes == 1
+            ):
                 k_leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(
@@ -2359,11 +2364,16 @@ class SmemKvResource(DecodeGenResourceBase):
                 )
             v_leading_byte_offset = k_leading_byte_offset
             if cutlass.const_expr(self.cfg.tile_size_kv == 256):
-                # K spans the complete KV256 row between D64 halves. V is
-                # staged as four semantic KV64 blocks, each with D/64 adjacent
-                # D64 halves, so its MMA-K leading step is one KV64 block.
-                v_leading_byte_offset = Int32(64 * 64 * self.cfg.kv_dtype_bytes)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv or self.cfg.headdim == 64):
+                # K spans the complete KV256 row between head-dim chunks. V
+                # is staged as four semantic KV64 blocks, each holding its
+                # 128-byte head-dim chunks side by side, so the MMA-N leading
+                # step is one KV64 block of 64 swizzled 128-byte rows for
+                # every element width.
+                v_leading_byte_offset = Int32(64 * SWIZZLE_128B_ROW_BYTES)
+            elif cutlass.const_expr(
+                (self.cfg.k_dtype_bytes == 1 and self.cfg.v_dtype_bytes == 1)
+                or self.cfg.headdim == 64
+            ):
                 v_leading_byte_offset = Int32(0)
             # Descriptor bases are advanced per stage at consumption time; the
             # swizzle parameters are invariant for the resource.
@@ -2547,7 +2557,7 @@ class SmemKvResource(DecodeGenResourceBase):
             # runtime-resolved tile_idx so the right per-tile slice is
             # selected from the shared window.
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.k_dtype_bytes == 1 and cfg.v_dtype_bytes == 1):
                 # FP8 pages are contiguous across the staged head dimension.
                 fp8_stage_base = self._stage_base(stage_info)
                 if cutlass.const_expr(cached_page_ids is None):
@@ -2676,7 +2686,7 @@ class SmemKvResource(DecodeGenResourceBase):
                                 ),
                                 stage_info.barrier,
                             )
-        elif cutlass.const_expr(cfg.use_fp8_qkv):
+        elif cutlass.const_expr(cfg.k_dtype_bytes == 1 and cfg.v_dtype_bytes == 1):
             # Dense FP8 path: one tensor TMA loads the staged K or V tile.
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
@@ -2701,8 +2711,9 @@ class SmemKvResource(DecodeGenResourceBase):
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
+            # Keep the Array type stable across the elected-lane control-flow join.
+            stage_base = self._stage_base(stage_info)
             if prims.elect_sync():
-                stage_base = self._stage_base(stage_info)
                 for chunk_idx in cutlass.range_constexpr(num_chunks):
                     local_head_dim_offset = chunk_idx * chunk_hd
                     global_head_dim_offset = (
@@ -2737,12 +2748,15 @@ class SmemKvResource(DecodeGenResourceBase):
 
         The public decode TensorMaps expose KV64 (or one smaller page)
         fragments. K places semantic KV64 blocks in physical order
-        ``(0, 2, 1, 3)`` while V keeps semantic block order with adjacent D64
-        halves. Dense and paged profiles derive those fragments from one
-        contiguous tile; block-sparse profiles consume four prepared KV64
-        origins retained by the instruction-local metadata resource.
+        ``(0, 2, 1, 3)`` while V keeps semantic block order with adjacent
+        head-dim chunks. A chunk is one swizzled 128-byte row: 64 two-byte or
+        128 one-byte elements. Dense and paged profiles derive those fragments
+        from one contiguous tile; block-sparse profiles consume four prepared
+        KV64 origins retained by the instruction-local metadata resource.
         """
         cfg = self.cfg
+        chunk_hd = min(cfg.headdim, cfg.kv_swizzle_row_elems)
+        num_chunks = cfg.headdim // chunk_hd
         grouped_tile_idx = Int32(0)
         if cutlass.const_expr(not cfg.use_block_sparse):
             grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
@@ -2802,14 +2816,16 @@ class SmemKvResource(DecodeGenResourceBase):
                     physical_block = KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM[
                         semantic_block
                     ]
-                for dim_half in cutlass.range_constexpr(2):
+                for dim_chunk in cutlass.range_constexpr(num_chunks):
                     if cutlass.const_expr(kv_kind == KV_KIND_K):
                         block_base = (
-                            dim_half * cfg.tile_size_kv * 64 + physical_block * 64 * 64
+                            dim_chunk * cfg.tile_size_kv * chunk_hd
+                            + physical_block * 64 * chunk_hd
                         )
                     else:
                         block_base = (
-                            semantic_block * cfg.headdim * 64 + dim_half * 64 * 64
+                            semantic_block * cfg.headdim * 64
+                            + dim_chunk * 64 * chunk_hd
                         )
 
                     if cutlass.const_expr(cfg.use_block_sparse):
@@ -2817,7 +2833,7 @@ class SmemKvResource(DecodeGenResourceBase):
                             stage_base.subview(block_base),
                             route_tma_desc,
                             (
-                                Int32(dim_half * 64),
+                                Int32(dim_chunk * chunk_hd),
                                 token_coord,
                                 logical_h_k_idx,
                                 storage_coord,
@@ -2838,12 +2854,14 @@ class SmemKvResource(DecodeGenResourceBase):
                             token_offset, physical_page = _decode_native_page_locator(
                                 cfg, page_locator
                             )
-                            smem_offset = block_base + fragment * fragment_tokens * 64
+                            smem_offset = (
+                                block_base + fragment * fragment_tokens * chunk_hd
+                            )
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 stage_base.subview(smem_offset),
                                 tma_desc,
                                 (
-                                    Int32(dim_half * 64),
+                                    Int32(dim_chunk * chunk_hd),
                                     token_offset + Int32(token_in_page),
                                     logical_h_k_idx,
                                     physical_page,
@@ -2856,7 +2874,7 @@ class SmemKvResource(DecodeGenResourceBase):
                             stage_base.subview(block_base),
                             tma_desc,
                             (
-                                Int32(dim_half * 64),
+                                Int32(dim_chunk * chunk_hd),
                                 tile_offset + Int32(semantic_block * 64),
                                 logical_h_k_idx,
                                 logical_b_idx,

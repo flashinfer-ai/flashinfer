@@ -348,7 +348,9 @@ plan-owned length storage and requires graph recapture.
   this API.
 - Attention sinks and custom masks are not exposed.
 - Q and K must share one dtype; the only mixed combination is
-  `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
+  `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V. 8-bit Q/K/V with
+  dequantization scales run only through `BlockSparseTSWrapper`; see
+  [Sage attention](../../README.md#sage-attention).
 - Effective K/V lengths must be positive and no greater than the static plan
   bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks

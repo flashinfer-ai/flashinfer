@@ -23,7 +23,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
-| Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
+| Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
@@ -248,10 +248,170 @@ and KeepsAB/SWAPAB geometry. Proxy routes currently require
 are owned by `(batch, pattern head, Q block)`. Both block-sparse APIs default
 to `share_pattern_across_kv_heads=False`; True uses a singleton pattern-head
 axis shared by all KV heads. K/V and proxy summaries retain their physical
-head axis in either mode. A proxy run supplies one K arithmetic mean and one V sum per
-semantic KV block. The final partial block uses only its structural tokens.
+head axis in either mode. A proxy run supplies one K arithmetic mean and one V
+arithmetic mean per semantic KV block; the final partial block averages only
+its structural tokens, and each proxy block counts as that many tokens in the
+softmax.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
 proxy summaries or their represented mass.
+
+`BlockSparseTSWrapper.plan(..., use_block_sparse=False)` and
+`block_sparse_attention(..., use_block_sparse=False)` run dense attention over
+the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
+owns no route workspace, and its `run` takes Q/K/V only.
+
+## Sage attention
+
+Sage attention runs the contiguous decode kernel on 8-bit Q, K and V with
+dequantization scales, in the dense and block-sparse modes of
+`BlockSparseTSWrapper` and `block_sparse_attention`. The plan fixes the recipe
+with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
+`sage=SageAttentionParams(...)`:
+
+```text
+S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
+P       = softmax_row(S), quantized to E4M3 as 448 * p
+O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (448 * l[r])  (+ v_mean[d])
+```
+
+FlashInfer does not quantize: the 8-bit tensors and scales come from the
+caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
+mean back after normalization, for callers that quantized `V - v_mean`. Every
+scale must be finite and positive; the kernel does not check the values.
+
+| Input | Supported values |
+| --- | --- |
+| Q/K dtype | Matching `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
+| V dtype (`v_data_type`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
+| Output dtype | `torch.bfloat16` (default) or `torch.float16` |
+| `q_block_size` | Power of two no larger than the Q tile; default 1 |
+| `k_block_size` | 1, 4, 16, 32, 64, 128 or 256; default 16 |
+| `k_summary_block_size` | K block size of proxy summary scales; default `k_block_size` |
+| `v_mean` | Whether every run supplies `v_mean`; default `False` |
+| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) |
+
+The block-size fields belong to `SageAttentionConfig`; the defaults are
+TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
+plans. The paged block-sparse APIs do not support Sage attention.
+
+### Scale tensors
+
+All scales are contiguous, 16-byte-aligned `torch.float32` tensors on the run
+device; a validating `run()` checks them against the plan. Q and K scales use
+the trtllm-gen flat layout: within one head, sequence `b` of `[B, S, H, D]`
+starts at slot `b * S // blk + b` and token `t` uses slot `t // blk` inside
+it, so one head owns `flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1`
+slots.
+
+| Field | Shape |
+| --- | --- |
+| `q_scale` | `[Hq, flat_scale_numel(B, Sq, q_block_size)]` |
+| `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` |
+| `v_scale` | `[Hkv, D]` |
+| `v_mean` | `[Hkv, D]`; exactly when the recipe sets `v_mean=True` |
+| `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
+
+With proxy routes, `k_summary` holds the per-block K means in the K dtype,
+quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
+`k_summary_block_size`; `k_summary_scale` holds its scales. `v_summary` holds
+the per-block V means in E4M3 and shares `v_scale` (built from `V - v_mean`
+when a mean is used).
+
+On B200 both recipes run faster than BF16 on the same plan; the gain depends
+on the shape, and K blocks of 4 and 1 tokens cost more than 16-token blocks.
+
+### Example
+
+```python
+import torch
+from flashinfer.attention.prims_ts import (
+    BlockSparseTSWrapper,
+    SageAttentionConfig,
+    SageAttentionParams,
+)
+from flashinfer.attention.prims_ts.sage import flat_scale_numel
+
+device = torch.device("cuda")
+B, Sq, Skv, Hq, Hkv, D = 2, 128, 1000, 4, 4, 128
+fp8 = torch.float8_e4m3fn
+
+# q_block_size=64 and kv_block_size=64 select the Q64/KV256 tile.
+wrapper = BlockSparseTSWrapper()
+wrapper.plan(
+    B, Sq, Skv, Hq, Hkv, D, 64, 64,
+    device=device,
+    use_block_sparse=False,
+    q_data_type=fp8,
+    kv_data_type=fp8,
+    sage_config=SageAttentionConfig(q_block_size=1, k_block_size=16),
+)
+
+# The quantizer (for example sageQuant) produces the tensors and scales.
+q = torch.randn(B, Sq, Hq, D, device=device).to(fp8)
+k = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
+v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
+scales = SageAttentionParams(
+    q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
+    k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
+    v_scale=torch.rand(Hkv, D, device=device),
+)
+out = wrapper.run(q, k, v, sage=scales)  # [B, Sq, Hq, D] bfloat16
+```
+
+Continuing the example, a block-sparse INT8 plan with proxy routes names its
+E4M3 V; each Q block attends exactly to the selected KV blocks, and the other
+blocks enter through their per-block summaries:
+
+```python
+wrapper.plan(
+    B, Sq, Skv, Hq, Hkv, D, 64, 64,
+    device=device,
+    max_blocks_per_row=8,
+    use_proxy_routes=True,
+    q_data_type=torch.int8,
+    kv_data_type=torch.int8,
+    v_data_type=fp8,
+    sage_config=SageAttentionConfig(),
+)
+
+num_q_blocks, num_kv_blocks = -(-Sq // 64), -(-Skv // 64)
+i8 = dict(low=-127, high=128, dtype=torch.int8, device=device)
+q = torch.randint(size=(B, Sq, Hq, D), **i8)
+k = torch.randint(size=(B, Skv, Hkv, D), **i8)
+v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
+k_summary = torch.randint(size=(B, num_kv_blocks, Hkv, D), **i8)
+v_summary = torch.randn(B, num_kv_blocks, Hkv, D, device=device).to(fp8)
+
+# BSR routes: every Q block of every (batch, KV head) row selects the same
+# KV blocks; block_indptr holds offsets into the flat block_indices.
+selected = torch.tensor([0, 1, num_kv_blocks - 1], dtype=torch.int32, device=device)
+rows = B * Hkv * num_q_blocks
+block_indices = selected.repeat(rows)
+block_indptr = (
+    torch.arange(B * Hkv, dtype=torch.int32, device=device).view(B, Hkv, 1)
+    * num_q_blocks
+    + torch.arange(num_q_blocks + 1, dtype=torch.int32, device=device)
+) * selected.numel()
+
+scales = SageAttentionParams(
+    q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
+    k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
+    v_scale=torch.rand(Hkv, D, device=device),
+    k_summary_scale=torch.rand(
+        Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
+    ),
+)
+out = wrapper.run(
+    q, k, v, block_indptr, block_indices,
+    k_summary=k_summary,
+    v_summary=v_summary,
+    sage=scales,
+)
+```
+
+`block_sparse_attention(..., sage=...)` runs the same launches in one shot;
+its recipe is `sage_config` or, when omitted, the default recipe with a V mean
+exactly when `sage.v_mean` is set.
 
 ## Validation
 
@@ -265,5 +425,6 @@ pytest -q \
   tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
-  tests/attention/test_attention_ts_mla_decode.py
+  tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_attention_ts_sage.py
 ```
