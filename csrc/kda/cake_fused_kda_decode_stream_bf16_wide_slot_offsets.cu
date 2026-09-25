@@ -23,7 +23,7 @@ typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "FlashInfer requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) FlashInferTensorMap { uint64_t opaque[16]; };
@@ -596,8 +596,6 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-extern "C" {
-
 __global__ __launch_bounds__(256, 3) void
 kernel_cake_fused_kda_decode_stream_bf16_wide_slot_offsets(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int rows, int use_lower_bound, float lower_bound_log2, float norm_eps)
 {
@@ -720,7 +718,8 @@ kernel_cake_fused_kda_decode_stream_bf16_wide_slot_offsets(__nv_bfloat16* __rest
     for (int item_step = 0; item_step < item_count; item_step++) {
         int item = first_item + item_step * grid_size;
         int parity = item_step % 2;
-        int stage_byte = sStage_addr + (unsigned int)(parity * 32768) + (unsigned int)lane_stage_byte;
+        int slot_idx = item_step % 2;
+        int stage_byte = sStage_addr + (unsigned int)(slot_idx * 32768) + (unsigned int)lane_stage_byte;
         int next_item = item + grid_size;
         int has_next = ((next_item < total_items) ? 1 : 0);
         int next_row = row;
@@ -835,19 +834,25 @@ kernel_cake_fused_kda_decode_stream_bf16_wide_slot_offsets(__nv_bfloat16* __rest
                 sBeta[0] = _tanh_approx_6 * 0.5f + 0.5f;
             }
         }
-        if (has_next != 0) {
-            long long next_base = (long long)next_slot * (long long)state_slot_stride + (long long)(next_head * 128 * 128) + (long long)(state_owner_row_base * 128) + (long long)k_start;
-            int next_stage_byte = sStage_addr + (unsigned int)((1 - parity) * 32768) + (unsigned int)lane_stage_byte;
+        int has_pf = has_next;
+        int pf_row = next_row;
+        int pf_head = next_head;
+        int pf_slot = next_slot;
+        int pf_slot_idx = 1 - parity;
+        if (has_pf != 0) {
+            long long pf_base = (long long)pf_slot * (long long)state_slot_stride + (long long)(pf_head * 128 * 128) + (long long)(state_owner_row_base * 128) + (long long)k_start;
             #pragma unroll
             for (int stage_tile_1 = 0; stage_tile_1 < 2; stage_tile_1++) {
                 #pragma unroll
                 for (int stage_row_1 = 0; stage_row_1 < 4; stage_row_1++) {
                     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                        :: "r"(next_stage_byte + (stage_tile_1 * 64 + stage_row_1) * 256), "l"(state + (next_base + (long long)((stage_tile_1 * 64 + stage_row_1) * 128))));
+                        :: "r"(sStage_addr + (unsigned int)(pf_slot_idx * 32768) + (unsigned int)lane_stage_byte + (unsigned int)((stage_tile_1 * 64 + stage_row_1) * 256)), "l"(state + (pf_base + (long long)((stage_tile_1 * 64 + stage_row_1) * 128))));
                 }
             }
+            asm volatile("cp.async.commit_group;");
+        } else {
+            asm volatile("cp.async.commit_group;");
         }
-        asm volatile("cp.async.commit_group;");
         long long state_group_base = (long long)slot * (long long)state_slot_stride + (long long)(head * 128 * 128) + (long long)(state_owner_row_base * 128) + (long long)k_start;
         asm volatile("cp.async.wait_group 1;");
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1177,4 +1182,3 @@ kernel_cake_fused_kda_decode_stream_bf16_wide_slot_offsets(__nv_bfloat16* __rest
 
 } // extern "C"
 
-} // extern "C"
