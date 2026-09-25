@@ -21,6 +21,7 @@
 #include <flashinfer/exception.h>
 #include <flashinfer/logging.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <cub/cub.cuh>
 #include <cute/arch/cluster_sm90.hpp>
@@ -190,6 +191,26 @@ __device__ void initArr(int startIdx, int numElts, int stride, DataType* arr, Da
     for (int i = startIdx; i < numElts; i += stride) {
       arr[i] = value;
     }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// The thread writing a tile's MnLimit owns its unused routing-map entries.
+// TMA gathers may read these rows even though the GEMM masks their outputs.
+// Write -1 to suppress those loads, without touching live rows or allocation slack.
+__device__ __forceinline__ void initRoutingTilePadding(int32_t* tokenIdx, int32_t begin,
+                                                       int32_t end) {
+  if (tokenIdx == nullptr) return;
+  // Vectorize the bulk stores, including when a caller supplies an offset view.
+  for (; begin < end && reinterpret_cast<uintptr_t>(tokenIdx + begin) % alignof(int4) != 0;
+       ++begin) {
+    tokenIdx[begin] = -1;
+  }
+  for (; end - begin >= 4; begin += 4) {
+    *reinterpret_cast<int4*>(tokenIdx + begin) = make_int4(-1, -1, -1, -1);
+  }
+  for (; begin < end; ++begin) {
+    tokenIdx[begin] = -1;
   }
 }
 
@@ -462,6 +483,7 @@ __device__ void routingPermutation(KernelParams params,
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
 
       // get the padded offset associated with this expert (token-space, CGA granularity)
@@ -768,6 +790,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
   }
@@ -1149,6 +1172,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
     }
     params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
+    initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
   }
 
   // get the padded offset associated with this expert (token-space, CGA granularity)
