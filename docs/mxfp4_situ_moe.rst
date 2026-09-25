@@ -1126,8 +1126,10 @@ same node, and every row of the tables below is either at or under
   partial store, both from stamps).
 * the per-SM load ring: each GEMM keeps only ``S`` K-stages of operands
   in flight per SM (4 stages of 50688 B for the dense gather GEMM1 and of
-  42496 B for the dense finalize GEMM2, 5 of 36 KB for the swap GEMM1, 11
-  for the swap GEMM2; the FP4 operand occupies 8-bit containers in shared
+  42496 B for the dense finalize GEMM2; the swap kernels size their ring
+  from the same budget, 5 stages of 36 KB for GEMM1 and 11 for GEMM2 at
+  the 8-row decode tile, fewer as the row tile widens the token operand;
+  the FP4 operand occupies 8-bit containers in shared
   memory for ``kind::mxf8f6f4``, so a fifth dense stage does not fit the
   227 KB budget), and a K-stage costs the fill of that stage through the
   SM's async-copy unit plus one loaded round trip divided by the depth:
@@ -1136,9 +1138,10 @@ same node, and every row of the tables below is either at or under
   A stage-depth sweep on the dense kernels (capping the ring at 3 and 2
   stages, EP=8 T=2048 balanced, same GPU) gives GEMM1 509 / 572 / 747 us
   and GEMM2 274 / 314 / 436 us at 4 / 3 / 2 stages, i.e. ``a + L / S``
-  with ``L`` = 0.93 us per stage in both kernels, and the same ``L`` with
-  the kernels' own fill terms reproduces the swap GEMM1 / GEMM2 at T=512
-  (393 / 212 us) within 3%.
+  with ``L`` = 0.93 us per stage in both kernels, and the same ``L`` at
+  the printed depths reproduces the 32-row swap GEMM1 / GEMM2 at T=512
+  (393 / 212 us) with fill terms of 0.19 / 0.12 us, which the model uses
+  as its calibration for the swap form.
 
 The reachable floor of a row is the smallest, over the swap-AB form at the
 planner's row tile and the dense form at the 128- and 256-row tiles (128 x
