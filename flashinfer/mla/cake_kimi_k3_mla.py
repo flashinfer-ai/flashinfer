@@ -15,7 +15,7 @@ same plan.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -249,21 +249,22 @@ class KimiK3MlaFp8PagedAttention:
         self._main_fn = None
         self._reduce_fn = None
 
-    def _load(self):
+    def _load(self) -> Callable[..., Any]:
         from ..jit.cake_kimi_k3_mla import get_cake_kimi_k3_mla_module
 
-        self._main_fn = getattr(get_cake_kimi_k3_mla_module(self._main["name"]), self._main["ffi_entry"])
+        main_fn = getattr(get_cake_kimi_k3_mla_module(self._main["name"]), self._main["ffi_entry"])
+        self._main_fn = main_fn
         if self._reduce_args is not None:
             self._reduce_fn = getattr(
                 get_cake_kimi_k3_mla_module(self._reduce["name"]), self._reduce["ffi_entry"]
             )
+        return main_fn
 
     def launch(self) -> None:
         """Enqueue the attention (and the split merge) on the current stream; no allocation."""
-        if self._main_fn is None:
-            self._load()
-        self._main_fn(*self._main_args)
-        if self._reduce_fn is not None:
+        main_fn = self._main_fn if self._main_fn is not None else self._load()
+        main_fn(*self._main_args)
+        if self._reduce_fn is not None and self._reduce_args is not None:
             self._reduce_fn(*self._reduce_args)
 
 

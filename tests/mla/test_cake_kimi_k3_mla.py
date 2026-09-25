@@ -109,9 +109,8 @@ def _run(case, *, fixed_q_len=None, graph=False):
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(g, stream=stream):
-            call()
+    with torch.cuda.stream(stream), torch.cuda.graph(g, stream=stream):
+        call()
     torch.cuda.synchronize()
     return out, g
 
