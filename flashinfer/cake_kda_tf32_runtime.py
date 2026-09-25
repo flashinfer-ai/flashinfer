@@ -300,6 +300,8 @@ AFFINE_BF16_COST_MODEL_US: dict[tuple[str, str], tuple[float, float, float, floa
     # sm_103a (GB300, 152 SMs), 2026-09-25: composite 95 + 11.7 * chunks/window
     # (H12 87 + 12.05, H16 102 + 11.4), sequential 18 + 3.6 * chunks.
     ("sm_103a", "unbounded_softplus"): (95.0, 11.7, 18.0, 3.6),
+    # bounded gate: composite 83 + 7.8 (H12 77 + 8.1, H16 89 + 7.5), sequential 14 + 1.66.
+    ("sm_103a", "lower_bound"): (83.0, 7.8, 14.0, 1.66),
 }
 SMALL_BH_GROUP_SIZE = 8
 SMALL_BH_RING_STAGES = 35
