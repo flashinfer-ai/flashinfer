@@ -24,11 +24,12 @@ sparse block size explicitly: 4, 8, 16, 32, 64, or 128 tokens.
 Patterns can be shared across KV heads or supplied independently for each head.
 
 Construction uses one CUDA C++ CTA per route. Q1 maps selected and tail blocks
-directly. Q2--Q8 radix-sort at most ``G * (topk + 1)`` selected/tail IDs,
-segmented-OR equal-key memberships, and emit only unique pages; work and
-temporary storage are independent of the model context length. On SM90 and
-newer, the metadata grid releases the prepared attention grid through
-programmatic dependent launch (PDL).
+directly. Q2--Q8 union at most ``G * (topk + 1)`` selected/tail IDs using a
+shared byte/bit map when its model-context footprint fits without adding CTA
+waves, or a bounded radix-sort fallback. No global-cache-sized scratch is
+required. On SM90 and newer, the metadata grid releases the attention prologue
+at entry through programmatic dependent launch (PDL); the consumer wait still
+covers metadata completion.
 """
 
 from __future__ import annotations
@@ -188,6 +189,7 @@ class _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
     attention_workspace_byte_offset: int
     attention_scratch_bytes: int
     uses_split_kv: bool
+    query_major_memberships: bool
     max_seq_len: int
     total_bytes: int
 
@@ -245,6 +247,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     storage_page_size: int
     max_seq_len_kv: int
     release_attention_pdl: bool
+    locator_head_multiplier: int = 1
 
     def run(
         self,
@@ -270,6 +273,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
+                self.locator_head_multiplier,
             )
         else:
             self.metadata_run(
@@ -285,6 +289,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
+                self.locator_head_multiplier,
             )
 
 
@@ -973,7 +978,10 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
 
     from .decode import (
-        _resolve_decode_workspace_layout,
+        _dtype_key,
+        _make_decode_workspace_layout,
+        _resolve_cuda_device,
+        _resolve_decode_launch_spec,
         _validate_prims_ts_q_token_kv_block_sparse_group_capacity,
     )
 
@@ -1000,6 +1008,50 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         (max_seq_len_kv + sparse_block_size - 1) // sparse_block_size,
     )
     page_capacity = block_capacity * (sparse_block_size // fragment_size)
+    # Padding is an allocation property, not additional selected KV work.
+    max_seq_len = (
+        block_topk * sparse_block_size + (sparse_block_size - 1)
+        if group_size == 1
+        else page_capacity * fragment_size
+    )
+    max_seq_len = min(max_seq_len, max_seq_len_kv)
+    if kv_dtype is None:
+        kv_dtype = q_dtype
+    if out_dtype is None:
+        out_dtype = q_dtype
+    _, device_index = _resolve_cuda_device(device)
+    spec = _resolve_decode_launch_spec(
+        device_index,
+        groups,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        fragment_size,
+        max_seq_len,
+        group_size,
+        _dtype_key(q_dtype),
+        _dtype_key(kv_dtype),
+        _dtype_key(kv_dtype),
+        _dtype_key(out_dtype),
+        "HND",
+        "causal",
+        use_packed_q,
+        -1,
+        storage_page_size,
+        True,
+        True,
+        split_kv,
+        share_pattern_across_kv_heads,
+    )
+    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
+    # Other profiles and the standalone metadata API retain page-byte masks.
+    query_major_memberships = (
+        sparse_block_size == 4
+        and spec.config.use_fp8_qkv
+        and spec.config.supports_query_major_memberships
+    )
+    if query_major_memberships:
+        page_capacity = (page_capacity + 31) // 32 * 32
     membership_words = (
         0
         if group_size == 1
@@ -1023,38 +1075,11 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     seq_lens_numel = metadata_rows
     seq_lens_bytes = seq_lens_numel * 4
-    max_seq_len = (
-        block_topk * sparse_block_size + (sparse_block_size - 1)
-        if group_size == 1
-        else page_capacity * fragment_size
-    )
-    max_seq_len = min(max_seq_len, max_seq_len_kv)
-    if kv_dtype is None:
-        kv_dtype = q_dtype
-    if out_dtype is None:
-        out_dtype = q_dtype
-    attention_layout = _resolve_decode_workspace_layout(
-        groups,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        fragment_size,
-        max_seq_len,
-        group_size,
-        q_dtype,
-        kv_dtype,
-        kv_dtype,
+    attention_layout = _make_decode_workspace_layout(
+        spec.scratch_shapes,
         out_dtype,
-        "HND",
-        "causal",
-        use_packed_q,
-        -1,
-        storage_page_size,
-        device,
-        use_q_token_kv_block_sparse_route=True,
-        use_pdl=True,
-        split_kv=split_kv,
-        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
+        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+        use_split_kv=spec.config.use_split_kv,
     )
     attention_scratch_bytes = attention_layout.total_bytes
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
@@ -1071,6 +1096,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         attention_workspace_byte_offset=attention_workspace_byte_offset,
         attention_scratch_bytes=attention_scratch_bytes,
         uses_split_kv=attention_layout.uses_split_kv,
+        query_major_memberships=query_major_memberships,
         max_seq_len=max_seq_len,
         total_bytes=attention_workspace_byte_offset + attention_scratch_bytes,
     )
@@ -1296,11 +1322,12 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     The membership output has one Int32 word per four page slots, or zero
     columns for Q1.
     Q1 uses one CUDA C++ CTA per route to map its selected blocks and causal
-    tail directly. Q2--Q8 use one CUDA C++ CTA per route to radix-sort the
-    bounded ``group_size * (block_topk + 1)`` candidates, unique them while
-    OR-reducing membership bits, and map the resulting logical pages through
-    the dense block table. The terminal metadata grid releases a following
-    PDL-capable QToken-KvBlock-Sparse-Attention attention launch when requested by the combined API.
+    tail directly. Q2--Q8 union the bounded
+    ``group_size * (block_topk + 1)`` candidates with a shared map or radix
+    sort, OR membership bits, and map the sorted unique logical blocks through
+    the dense block table. A map is used only when it fits shared memory and
+    requires no extra CTA waves. The combined API releases attention at
+    metadata entry; the consumer wait still covers every output store.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets; this builder checks only its structural tensor contract and does
     not read route values back to the host.
@@ -1384,6 +1411,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
+            1,
         )
     else:
         metadata_module.run_fixed(
@@ -1399,6 +1427,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
+            1,
         )
     return outputs
 
@@ -1428,7 +1457,7 @@ def _build_q_token_kv_block_sparse_metadata(
     physical_page * (storage_page_size/F) + subpage. No CSR conversion is needed.
 
     Q1 uses one CUDA C++ direct-mapping kernel. Q2--Q8 use one CUDA C++
-    radix-sort and union kernel per route. Neither path requires
+    map-or-sort union kernel per route. Neither path requires
     caller-provided scratch. Advanced callers that capture this raw path must
     preallocate ``out``, warm the same metadata geometry once before capture,
     and retain every tensor at a stable address through replay. The three
@@ -1514,8 +1543,18 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     max_seq_len_kv: int,
     sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
+    query_major_memberships: bool = False,
+    locator_head_multiplier: int = 1,
 ) -> _PrimsTSQTokenKvBlockSparseMetadataPlan:
-    """Freeze validated metadata tensors and launch constants."""
+    """Freeze validated metadata tensors and launch constants.
+
+    Query-major memberships use a private logical [row, KV tile, query slot]
+    layout: each uint32 masks 32 four-token union fragments for one query.
+    The rank-two tensor flattens eight slots per tile, with unused slots and
+    tail bits zero. This encoding must match the attention plan. Standalone
+    metadata retains per-fragment membership bytes; Q/K/V layouts, the union,
+    and page indices are unchanged.
+    """
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     rows = block_indices.shape[0]
@@ -1531,9 +1570,16 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     )
     release_attention_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
-    metadata_run = (
-        metadata_module.run_packed if use_packed_q else metadata_module.run_fixed
-    )
+    if query_major_memberships:
+        metadata_run = (
+            metadata_module.run_packed_query_major
+            if use_packed_q
+            else metadata_module.run_fixed_query_major
+        )
+    else:
+        metadata_run = (
+            metadata_module.run_packed if use_packed_q else metadata_module.run_fixed
+        )
     return _PrimsTSQTokenKvBlockSparseMetadataPlan(
         q_token_kv_block_sparse_page_indices=q_token_kv_block_sparse_page_indices,
         q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
@@ -1546,6 +1592,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         storage_page_size=storage_page_size,
         max_seq_len_kv=max_seq_len_kv,
         release_attention_pdl=release_attention_pdl,
+        locator_head_multiplier=locator_head_multiplier,
     )
 
 
@@ -1729,20 +1776,6 @@ def _prepare_q_token_kv_block_sparse_attention(
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     views = layout.bind(workspace_buffer)
-    metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
-        block_indices,
-        block_table,
-        token_to_request,
-        query_positions,
-        views.q_token_kv_block_sparse_page_indices,
-        views.q_token_kv_block_sparse_page_memberships,
-        views.seq_lens,
-        group_size=group_size,
-        storage_page_size=int(k_cache.shape[2]),
-        max_seq_len_kv=max_seq_len_kv,
-        sparse_block_size=sparse_block_size,
-        qo_indptr=qo_indptr,
-    )
     from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
 
     scale_qk = _validate_scale(
@@ -1767,6 +1800,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         kv_layout="HND",
         page_size=math.gcd(sparse_block_size, int(k_cache.shape[2])),
         direct_q1_sparse_block_size=sparse_block_size,
+        query_major_memberships=layout.query_major_memberships,
         use_q_token_kv_block_sparse_route=True,
         use_pdl=True,
         split_kv=split_kv,
@@ -1780,6 +1814,25 @@ def _prepare_q_token_kv_block_sparse_attention(
             else ()
         ),
         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
+        allow_head_aware_locators=group_size > 1,
+    )
+    # Preparation only binds shapes and storage; attention does not read these
+    # outputs until metadata runs. Use its resolved format for the producer.
+    metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
+        block_indices,
+        block_table,
+        token_to_request,
+        query_positions,
+        views.q_token_kv_block_sparse_page_indices,
+        views.q_token_kv_block_sparse_page_memberships,
+        views.seq_lens,
+        group_size=group_size,
+        storage_page_size=int(k_cache.shape[2]),
+        max_seq_len_kv=max_seq_len_kv,
+        sparse_block_size=sparse_block_size,
+        qo_indptr=qo_indptr,
+        query_major_memberships=layout.query_major_memberships,
+        locator_head_multiplier=attention_plan._flat_locator_heads,
     )
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,

@@ -15,7 +15,7 @@
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import math
 import numbers
@@ -1393,12 +1393,16 @@ def _make_decode_compile_spec(
     kv_prefix_mode: Literal["dynamic", "planned_full"],
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
+    flat_native_kv_tma: bool = False,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
+    config_items = dict(launch_spec.config.compile_signature())
+    config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
+    config_items["flat_native_kv_num_heads"] = num_kv_heads if flat_native_kv_tma else 1
     return _DecodeCompileSpec(
         device_index=device_index,
-        config_items=launch_spec.config.compile_signature(),
+        config_items=tuple(config_items.items()),
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -2361,6 +2365,7 @@ class PrimsTSBatchDecodePlan:
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
     _direct_q1_inputs: tuple[torch.Tensor, ...] = ()
+    _flat_locator_heads: int = 1
 
     def run(
         self,
@@ -3218,6 +3223,7 @@ def _prepare_prims_ts_batch_decode_plan(
     kv_layout: Literal["HND"],
     page_size: Optional[int],
     q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
+    query_major_memberships: bool = False,
     use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
     split_kv: bool = True,
@@ -3225,6 +3231,7 @@ def _prepare_prims_ts_batch_decode_plan(
     direct_q1_max_model_len: Optional[int] = None,
     direct_q1_sparse_block_size: int = 4,
     share_pattern_across_kv_heads: bool = True,
+    allow_head_aware_locators: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -3324,6 +3331,12 @@ def _prepare_prims_ts_batch_decode_plan(
         share_pattern_across_kv_heads,
     )
     spec = _resolve_decode_launch_spec(*policy_args)
+    if query_major_memberships:
+        if not spec.config.supports_query_major_memberships:
+            raise ValueError(
+                "query-major memberships require one G2..G8 Keeps/page-4 CTA"
+            )
+        spec = replace(spec, config=replace(spec.config, query_major_memberships=True))
     if spec.config.uses_q_token_kv_block_sparse_page_membership:
         if q_token_kv_block_sparse_page_memberships is None:
             raise ValueError(
@@ -3383,6 +3396,16 @@ def _prepare_prims_ts_batch_decode_plan(
             kv_block_size=direct_q1_sparse_block_size,
             page_capacity=max_num_pages,
         )
+    flat_native_kv_tma = (
+        use_q_token_kv_block_sparse_route
+        and spec.config.uses_staged_one_inst_tmem_p
+        and query.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and spec.config.has_storage_subpages
+        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
+        and k_cache.is_contiguous()
+        and normalized_cache.v_cache.is_contiguous()
+        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
+    )
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -3400,6 +3423,7 @@ def _prepare_prims_ts_batch_decode_plan(
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
         direct_q1_spec=direct_q1_spec,
+        flat_native_kv_tma=flat_native_kv_tma,
     )
     compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
     workspace = _bind_decode_workspace(workspace_buffer, layout)
@@ -3428,6 +3452,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
         _direct_q1_inputs=direct_q1_inputs,
+        _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
     )
     return plan, out
 

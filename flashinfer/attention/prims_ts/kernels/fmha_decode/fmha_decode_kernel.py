@@ -386,7 +386,7 @@ def _build_decode_gen_schedule(
     if cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1 and not cfg.uses_tmem_p:
         raise ValueError(
             "one-instance KeepsMmaAb is enabled only for the staged headDim=256 "
-            "profile with head_dim_per_stage_kv=128 and o_stages=1"
+            "profile with D128 bands (or D256 for sparse FP8) and o_stages=1"
         )
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")
@@ -512,7 +512,18 @@ def _build_decode_gen_schedule(
     # ring, each shared by both K/V instances.
     use_shared_inst_kv_rings = cfg.k_dtype != cfg.v_dtype and cfg.tile_size_kv != 256
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
-    one_inst_kv_stages = cfg.num_head_dim_stages_kv if use_one_inst_qkv else 1
+    # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
+    # smaller stage tiles can prefetch farther without increasing the budget.
+    one_inst_kv_stages = (
+        max(
+            cfg.num_head_dim_stages_kv,
+            cfg.kv_stages
+            // (2 * cfg.num_head_dim_stages_kv)
+            * cfg.num_head_dim_stages_kv,
+        )
+        if use_one_inst_qkv
+        else 1
+    )
     use_distributed_split_kv_stages = not use_one_inst_qkv
     if cfg.tile_size_q == 128 and use_distributed_split_kv_stages:
         # Q128's four instruction-local K0/K1/V0/V1 rings need equal depth.
@@ -805,15 +816,14 @@ def _build_decode_gen_schedule(
         advance_on_wait=True,
     )
 
-    # Two-instance Keeps keeps stats outside S and orders each same-instance PV
-    # before the next QK, so it needs no stats-done credit.
-    # The staged one-instance path needs an overwrite-credit gate across its
-    # double-buffered S/P overlay: correction returns the stage credit before
-    # MMA can reissue QK into those columns.
+    # The single MMA issuer orders PV before QK reuses the same S/P slot.
+    # PTX's same-warp mma(A-read) -> mma(D-write) pipeline protects that alias.
+    # Separate SMEM stats have their own softmax-local handoff, just as in
+    # two-instance Keeps; correction need not additionally gate S reuse.
     stats_done0_cfg = None
     stats_done1_cfg = None
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]]
-    if use_one_inst_qkv:
+    if use_one_inst_qkv and (not cfg.keeps_stats_via_smem or cfg.mma_num_warps != 1):
         stats_done0_cfg = PipelineConfig.create_async_async_pipeline_cfg(
             num_stages=one_inst_tmem_stages,
             producer_group=mma_grp,
@@ -3034,30 +3044,60 @@ def fmha_decode_launch(
     if cutlass.const_expr(cfg.use_paged_kv):
         if cutlass.const_expr(use_native_paged_kv):
             storage_tokens_per_page = Int32(cfg.effective_storage_tokens_per_page)
-            kv_shape = (
-                d,
-                storage_tokens_per_page,
-                h_k,
-                num_physical_kv_pages,
-            )
-            k_layout = cute.make_layout(
-                kv_shape,
-                stride=(
-                    1,
-                    k_token_stride,
-                    k_head_stride,
-                    k_page_stride,
-                ),
-            )
-            v_layout = cute.make_layout(
-                kv_shape,
-                stride=(
-                    1,
-                    v_token_stride,
-                    v_head_stride,
-                    v_page_stride,
-                ),
-            )
+            if cutlass.const_expr(cfg.use_flat_native_kv_tma):
+                # Reinterpret compact HND rows, without copying/repacking KV
+                # or requiring contiguous sparse selections. Planning checked
+                # signed-32-bit row bounds; other bindings use the general map.
+                # For S tokens/page, F tokens/fragment and H heads, metadata
+                # emits A = page*H*(S/F) + subpage. Attention addresses row
+                # (A + head*(S/F))*F, avoiding per-copy page/subpage divmod.
+                # Bytes and TMA count are unchanged; rank-2 issuing below is a
+                # separate optimization of this descriptor-only flat view.
+                flat_tokens = (
+                    num_physical_kv_pages
+                    * Int64(storage_tokens_per_page)
+                    * Int64(cfg.flat_native_kv_num_heads)
+                )
+                kv_shape = (d, flat_tokens, Int32(1), Int32(1))
+                k_head_stride = k_token_stride * flat_tokens
+                k_page_stride = k_head_stride
+                v_head_stride = v_token_stride * flat_tokens
+                v_page_stride = v_head_stride
+            else:
+                kv_shape = (
+                    d,
+                    storage_tokens_per_page,
+                    h_k,
+                    num_physical_kv_pages,
+                )
+            if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
+                # The prepared flat view has no head/page coordinates. Keep
+                # the same physical rows and SW128 tile without repacking KV.
+                k_layout = cute.make_layout(
+                    (kv_shape[0], kv_shape[1]), stride=(1, k_token_stride)
+                )
+                v_layout = cute.make_layout(
+                    (kv_shape[0], kv_shape[1]), stride=(1, v_token_stride)
+                )
+            else:
+                k_layout = cute.make_layout(
+                    kv_shape,
+                    stride=(
+                        1,
+                        k_token_stride,
+                        k_head_stride,
+                        k_page_stride,
+                    ),
+                )
+                v_layout = cute.make_layout(
+                    kv_shape,
+                    stride=(
+                        1,
+                        v_token_stride,
+                        v_head_stride,
+                        v_page_stride,
+                    ),
+                )
             k_tma = cute.make_tensor(k_iter, k_layout)
             v_tma = cute.make_tensor(v_iter, v_layout)
         else:
@@ -3187,16 +3227,24 @@ def fmha_decode_launch(
             stride_order=(0, 1, 2, 3, 4),
             swizzle=tma_swizzle_qk,
         )
+    if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
+        k_box_dims = (tma_box0_k, tma_kv_tokens)
+        v_box_dims = (tma_box0_v, tma_kv_tokens)
+        kv_stride_order = (0, 1)
+    else:
+        k_box_dims = (tma_box0_k, tma_kv_tokens, 1, 1)
+        v_box_dims = (tma_box0_v, tma_kv_tokens, 1, 1)
+        kv_stride_order = (0, 1, 2, 3)
     tma_desc_k = create_tensor_map_tiled_from_view(
         k_tma,
-        box_dims=(tma_box0_k, tma_kv_tokens, 1, 1),
-        stride_order=(0, 1, 2, 3),
+        box_dims=k_box_dims,
+        stride_order=kv_stride_order,
         swizzle=tma_swizzle_qk,
     )
     tma_desc_v = create_tensor_map_tiled_from_view(
         v_tma,
-        box_dims=(tma_box0_v, tma_kv_tokens, 1, 1),
-        stride_order=(0, 1, 2, 3),
+        box_dims=v_box_dims,
+        stride_order=kv_stride_order,
         swizzle=tma_swizzle_v,
     )
 

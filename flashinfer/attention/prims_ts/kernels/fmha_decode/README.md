@@ -18,13 +18,20 @@ instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
 QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
-blocks and causal tail directly through the dense page table. Q2--Q8 sort at
-most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
-shared memory, unique equal logical IDs while OR-reducing query-membership
-bits, and map only the compact union. Work and temporary storage therefore do
-not scale with the configured model length or global cache capacity. Plain
+blocks and causal tail directly through the dense page table. Q2--Q8 union at
+most ``group_size * (block_topk + 1)`` selected/tail candidates with a shared
+byte/bit map and compact the sorted logical union. A cached occupancy check
+selects bounded radix sort when the map would exceed shared memory or add CTA
+waves. The map is sized by model context, never global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
+
+Compatible FP8 G2–G8/page-4 Keeps plans instead use eight query words per
+32-fragment tile, emitted directly into the same workspace with unused slots
+and tail bits zero. The public
+standalone metadata format remains page-byte masks. Sparse FP8 D256 Keeps
+loads a full head stage as two SW128 planes and uses compact single-head
+TensorMaps when cache strides permit; other cache layouts retain their descriptors.
 
 Attention caches a grouped membership row in SMEM only when the complete
 resource layout, including barriers, fits the compilation budget. Larger rows
@@ -34,8 +41,8 @@ the caller's split-KV permission.
 
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
-release only after their page indices, membership words, and sequence lengths
-are published. Every active attention CTA allocates and initializes its task
+release at entry to overlap the attention prologue; the dependency wait still
+covers completion of every metadata CTA. Attention allocates and initializes its task
 barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
 read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
 initialization and acquire, then contracts the useful runtime prefix. Pruned
@@ -56,6 +63,11 @@ Independent query-offset metadata may be read before that wait. QToken-KvBlock-S
 lengths remain behind it because they originate in the metadata producer two
 PDL stages upstream. This preserves producer-to-reducer overlap while gating
 every producer-dependent global-memory read.
+
+The separate reducer uses one 512-thread CTA per 8 KiB output slice for
+S2--S4. S5--S16 use one 512-thread CTA per 2 KiB slice: four adjacent lanes
+fold interleaved split slots and merge through warp shuffles. Larger split
+counts retain clustered 128-thread CTAs and distributed-SMEM merging.
 
 ## Public APIs
 
