@@ -158,15 +158,17 @@ def autotune_tactics(
     A tactic is ``(cta_tile_shape_mnk, ab_stages, sfb_tmem_stages, split_k)``.  The public
     dispatch paths use the direct SMEM-to-TMEM SFB copy, where the SFB TMEM
     stage count is not consumed by the mainloop, so it is canonically one.
-    CTA-K covers every MMA-K multiple that divides K, AB stages cover the full
+    CTA-K covers every MMA-K multiple up to 512 plus larger divisors of K (a
+    partial last K tile is zero-filled by TMA), AB stages cover the full
     supported range, and ``can_implement`` applies the TMEM/SMEM limits.
     """
     _, _, k, _ = problem_sizes_mnkl
     mma_k = 64 if a_dtype.width == b_dtype.width == 4 else 32
     tactics = []
+    k_padded = (k + mma_k - 1) // mma_k * mma_k
     for cta_m in _SUPPORTED_CTA_M:
-        for cta_k in range(mma_k, k + 1, mma_k):
-            if k % cta_k:
+        for cta_k in range(mma_k, k_padded + 1, mma_k):
+            if cta_k > 512 and k % cta_k:
                 continue
             for num_ab_stage in range(1, _MAX_AB_STAGES + 1):
                 for split_k in _SUPPORTED_SPLIT_K:
@@ -553,7 +555,7 @@ class LowLatencyBlockscaledGemmKernel:
             )
         else:
             # Each CTA N tile owns one 128-row SF atom (512 B) per four scale
-            sfb_k_atoms = cute.assume(k // (self.sf_vec_size * 4), 1)
+            sfb_k_atoms = cute.ceil_div(k, self.sf_vec_size * 4)
             sfb_n_tiles = cute.ceil_div(n, self.cta_tile_shape_mnk[1])
             sfb = cute.make_tensor(
                 sfb_ptr,
@@ -763,9 +765,15 @@ class LowLatencyBlockscaledGemmKernel:
         mma_k = 64 if a_dtype.width == 4 and b_dtype.width == 4 else 32
         if cta_k is None:
             cta_k = 4 * mma_k
-        if cta_m not in _SUPPORTED_CTA_M or cta_n != 8 or cta_k <= 0 or k % cta_k != 0:
+        if cta_m not in _SUPPORTED_CTA_M or cta_n != 8 or cta_k <= 0:
             return False
-        if cta_k % mma_k != 0:
+        if cta_k % mma_k != 0 or cta_k > (k + mma_k - 1) // mma_k * mma_k:
+            return False
+        # TMA OOB fill pads to CTA-K tiles; 16 B-aligned A/B rows needed
+        if k % sf_vec_size or k * min(a_dtype.width, b_dtype.width) % 128:
+            return False
+        # Mixed-width operands must be a multiple of 128 elements
+        if a_dtype.width != b_dtype.width and k % 128:
             return False
         # Register-mediated SFB TMA-loads compact rows of K / sf_vec_size bytes;
         # TMA needs 16 B multiples for both the inner box and the row stride
