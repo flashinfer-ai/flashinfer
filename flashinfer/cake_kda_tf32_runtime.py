@@ -5504,6 +5504,35 @@ class RebindPlan:
     addresses: tuple[_RebindAddress, ...]
     owned_keepalive: tuple[Any, ...]
     sub_owned_keepalive: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    # Specs grouped by caller input, so a partial rebind (``changed``) walks
+    # only the moved inputs' specs instead of skipping through all of them.
+    views_by_input: dict[str, tuple[_RebindView, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    addresses_by_input: dict[str, tuple[_RebindAddress, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def __post_init__(self):
+        if not self.views_by_input:
+            for spec in self.views:
+                self.views_by_input.setdefault(spec.input_name, ())
+                self.views_by_input[spec.input_name] += (spec,)
+        if not self.addresses_by_input:
+            for spec in self.addresses:
+                self.addresses_by_input.setdefault(spec.input_name, ())
+                self.addresses_by_input[spec.input_name] += (spec,)
+
+    def specs_for(self, changed):
+        """(views, addresses) to re-point: every spec, or only the moved inputs' specs."""
+        if changed is None:
+            return self.views, self.addresses
+        views = []
+        addresses = []
+        for name in changed:
+            views.extend(self.views_by_input.get(name, ()))
+            addresses.extend(self.addresses_by_input.get(name, ()))
+        return views, addresses
 
 
 # Split-sequence affine composites hold three prepared part launches plus a
@@ -5735,9 +5764,8 @@ def rebind_prepared_launch(
 
     stale_owners: list = []
     touched: set[str] = set()
-    for spec in plan.views:
-        if changed is not None and spec.input_name not in changed:
-            continue
+    view_specs, address_specs = plan.specs_for(changed)
+    for spec in view_specs:
         touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
@@ -5751,9 +5779,7 @@ def rebind_prepared_launch(
             if owner not in stale_owners:
                 stale_owners.append(owner)
         container[spec.key] = replacement
-    for address in plan.addresses:
-        if changed is not None and address.input_name not in changed:
-            continue
+    for address in address_specs:
         touched.add(address.container)
         containers[address.container][address.key] = (
             inputs[address.input_name].data_ptr() + address.byte_offset
