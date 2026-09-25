@@ -7546,7 +7546,6 @@ class KDAPrefillPlanCache:
         if bound == facts:
             # Bound to exactly these tensors already (another entry was hit in
             # between); nothing to re-point.
-            tma_moved = False
             self.fast_hits += 1
         else:
             changed = None
@@ -7555,14 +7554,20 @@ class KDAPrefillPlanCache:
                 # the views and addresses of the moved inputs only.
                 changed = frozenset(
                     name
-                    for name, before, after in zip(REBIND_INPUT_NAMES, bound, facts)
+                    for name, before, after in zip(
+                        REBIND_INPUT_NAMES, bound, facts, strict=True
+                    )
                     if before != after
                 )
-            tma_moved = rebind_prepared_launch(
+            # The rebind marks the launches whose descriptor sources moved.
+            rebind_prepared_launch(
                 owner, plan, inputs, signature=key[0], changed=changed
             )
             self._facts[key] = facts
-        if tma_moved or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
+            # A captured launch always re-encodes so the graph replays with
+            # self-contained descriptor contents; outside capture the rebind
+            # marked exactly the launches whose descriptor sources moved.
             owner._descriptors_stale = True
         self.hits += 1
         self._last_fast = fast

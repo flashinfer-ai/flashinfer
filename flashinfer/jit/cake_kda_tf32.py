@@ -12182,16 +12182,37 @@ class PreparedKernel:
         )
 
     def _arguments(self, grid, bindings):
-        grid = tuple(grid) + (1,) * (3 - len(grid))
-        args = []
-        for kind, name in self._arg_plan:
-            if kind == "grid":
-                args.append(grid[("grid_x", "grid_y", "grid_z").index(name)])
-            elif kind == "workspace":
-                args.append(self.descriptor_storage)
-            else:
-                args.append(bindings[name])
+        # One list build per call: binding names resolve straight from the
+        # caller's dict, grid/workspace slots are patched afterwards.
+        packers = self._packers
+        if packers is None:
+            packers = self._packers = self._build_packers()
+        names, grid_slots, workspace_slots = packers
+        args = [bindings[name] if name is not None else None for name in names]
+        if grid_slots:
+            grid = tuple(grid) + (1,) * (3 - len(grid))
+            for slot, axis in grid_slots:
+                args[slot] = grid[axis]
+        for slot in workspace_slots:
+            args[slot] = self.descriptor_storage
         return args
+
+    _packers = None
+
+    def _build_packers(self):
+        names = []
+        grid_slots = []
+        workspace_slots = []
+        for slot, (kind, name) in enumerate(self._arg_plan):
+            if kind == "grid":
+                names.append(None)
+                grid_slots.append((slot, ("grid_x", "grid_y", "grid_z").index(name)))
+            elif kind == "workspace":
+                names.append(None)
+                workspace_slots.append(slot)
+            else:
+                names.append(name)
+        return tuple(names), tuple(grid_slots), tuple(workspace_slots)
 
     def prepare(self, *, grid, **bindings):
         if self._prepare is not None:

@@ -296,16 +296,24 @@ AFFINE_MIN_CHUNKS_PER_WINDOW = 8
 # One wave is the measured default; FLASHINFER_KDA_AFFINE_WINDOW_WAVES=2 is an
 # A/B knob for shapes whose passes are chain-latency bound.
 AFFINE_WINDOW_WAVES_ENV = "FLASHINFER_KDA_AFFINE_WINDOW_WAVES"
+AFFINE_MAX_WINDOW_WAVES = 3
+AFFINE_MULTI_WAVE_MIN_GAIN = 0.15
 
 
-def _affine_window_waves() -> int:
+def _affine_window_waves() -> int | None:
+    """Forced resident-window waves (``FLASHINFER_KDA_AFFINE_WINDOW_WAVES``), ``None`` = cost-model choice."""
     import os
 
+    raw = os.environ.get(AFFINE_WINDOW_WAVES_ENV, "")
+    if raw in ("", "auto"):
+        return None
     try:
-        waves = int(os.environ.get(AFFINE_WINDOW_WAVES_ENV, "1"))
+        waves = int(raw)
     except ValueError:
-        waves = 1
-    return min(4, max(1, waves))
+        return None
+    return min(AFFINE_MAX_WINDOW_WAVES, max(1, waves))
+
+
 AFFINE_BF16_COST_MODEL_US: dict[tuple[str, str], tuple[float, float, float, float]] = {
     # (gpu_arch, gate_kind): (composite_fixed, composite_per_window_chunk,
     #                          sequential_fixed, sequential_per_chunk)
@@ -402,68 +410,20 @@ def _affine_window_chunks(chunks: int, parts: int, checkpoints: bool) -> int:
 
 
 def _affine_bf16_window_targets(
-    chunk_counts: list[int], *, num_heads: int, sm_count: int
+    chunk_counts: list[int], *, num_heads: int, sm_count: int, waves: int = 1
 ) -> list[int]:
     """Most windows the BF16 composite can give each sequence.
 
-    One wave of windows per head (``sm_count // num_heads``), at least
-    ``AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks per window (256-token launches): shorter windows only
-    add per-window preparation while the main/correction passes stay
-    chain-bound.
+    ``waves`` waves of windows per head (``sm_count // num_heads`` each), at
+    least ``AFFINE_MIN_CHUNKS_PER_WINDOW`` chunks per window (256-token
+    launches): shorter windows only add per-window preparation while the
+    main/correction passes stay chain-bound.
     """
-    per_head = max(1, sm_count // num_heads) * _affine_window_waves()
+    per_head = max(1, sm_count // num_heads) * waves
     return [
         min(per_head, max(1, chunks // AFFINE_MIN_CHUNKS_PER_WINDOW))
         for chunks in chunk_counts
     ]
-
-
-def _affine_bf16_split_estimate_us(
-    *,
-    sequence_lengths: tuple[int, ...],
-    num_heads: int,
-    sm_count: int,
-    checkpoints: bool,
-    gate_kind: str,
-    gpu_arch: str,
-):
-    """Estimated (composite, sequential) microseconds for a BF16-family call.
-
-    ``None`` when the architecture/gate has no measured model or the call is
-    outside the composite's contract (task cap, window budget, no sequence
-    that would actually split).
-    """
-    model = AFFINE_BF16_COST_MODEL_US.get((gpu_arch, gate_kind))
-    tasks = len(sequence_lengths) * num_heads
-    if (
-        model is None
-        or not sequence_lengths
-        or min(sequence_lengths) <= 0
-        or num_heads <= 0
-        or tasks > AFFINE_SPLIT_MAX_TASKS
-        or 2 * tasks > sm_count
-    ):
-        return None
-    chunk_counts = [
-        (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
-    ]
-    targets = _affine_bf16_window_targets(
-        chunk_counts, num_heads=num_heads, sm_count=sm_count
-    )
-    counts = _affine_window_counts(
-        chunk_counts, targets, max(len(sequence_lengths), sm_count // num_heads * _affine_window_waves())
-    )
-    if sum(counts) <= len(sequence_lengths):
-        return None
-    window_chunks = max(
-        _affine_window_chunks(chunks, parts, checkpoints)
-        for chunks, parts in zip(chunk_counts, counts, strict=True)
-    )
-    composite_fixed, composite_chunk, sequential_fixed, sequential_chunk = model
-    return (
-        composite_fixed + composite_chunk * window_chunks,
-        sequential_fixed + sequential_chunk * max(chunk_counts),
-    )
 
 
 def _affine_max_tasks() -> int:
@@ -513,6 +473,133 @@ def _affine_split_part_count(
     return parts
 
 
+def _affine_window_budget(
+    num_sequences: int, num_heads: int, sm_count: int, waves: int
+) -> int:
+    return max(num_sequences, sm_count // num_heads * waves)
+
+
+def _affine_bf16_composite_estimate_us(
+    chunk_counts: list[int],
+    *,
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    model: tuple,
+    waves: int,
+):
+    """Modelled composite microseconds on the windows ``waves`` waves would plan; ``None`` if nothing splits.
+
+    Every pass is chain-bound on its longest window, and the resident waves of
+    one pass run back to back, so the per-window-chunk slope scales with the
+    wave count while the fixed part (launch chain, scan, epilogue) is paid
+    once.  Checked on the B200 two-wave lanes (round v6): H16 2x8192 927 vs
+    933 us measured, H12 2x(8128+64) 757 vs 777, H16 2x(8128+64) 984 vs 985,
+    H16 4x4096 984 vs 914, H16 8192 501 vs 581.
+    """
+    targets = _affine_bf16_window_targets(
+        chunk_counts, num_heads=num_heads, sm_count=sm_count, waves=waves
+    )
+    counts = _affine_window_counts(
+        chunk_counts,
+        targets,
+        _affine_window_budget(len(chunk_counts), num_heads, sm_count, waves),
+    )
+    if sum(counts) <= len(chunk_counts):
+        return None
+    window_chunks = max(
+        _affine_window_chunks(chunks, parts, checkpoints)
+        for chunks, parts in zip(chunk_counts, counts, strict=True)
+    )
+    composite_fixed, composite_chunk, _, _ = model
+    return composite_fixed + waves * composite_chunk * window_chunks
+
+
+def _affine_bf16_waves(
+    chunk_counts: list[int],
+    *,
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    gate_kind: str,
+    gpu_arch: str | None,
+) -> tuple[int, float | None]:
+    """``(waves, composite_us)``: the forced wave count, else one wave unless more waves model clearly cheaper.
+
+    A second or third wave is taken only when its estimate beats the one-wave
+    composite by ``AFFINE_MULTI_WAVE_MIN_GAIN``: the model's error on the
+    two-wave B200 lanes is up to 15 %, so smaller modelled gains are noise
+    (H16 2x8192 927 vs 984 modelled, 933 vs 924 measured; H12 2x(8128+64) 757
+    vs 813 modelled, 777 vs 772 measured), while the one case it accepts,
+    H16 2x(8128+64) 984 vs 1296, measured 985 vs the 1056 sequential body.
+    ``composite_us`` is ``None`` when the architecture/gate has no model or no
+    wave count splits anything (the caller then keeps one wave).
+    """
+    forced = _affine_window_waves()
+    model = AFFINE_BF16_COST_MODEL_US.get((gpu_arch, gate_kind))
+    if model is None:
+        return forced or 1, None
+    best: tuple[int, float] | None = None
+    for waves in (forced,) if forced else range(1, AFFINE_MAX_WINDOW_WAVES + 1):
+        estimate = _affine_bf16_composite_estimate_us(
+            chunk_counts,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            checkpoints=checkpoints,
+            model=model,
+            waves=waves,
+        )
+        if estimate is None:
+            continue
+        if best is None or estimate < best[1] * (1.0 - AFFINE_MULTI_WAVE_MIN_GAIN):
+            best = (waves, estimate)
+    return best if best is not None else (forced or 1, None)
+
+
+def _affine_bf16_split_estimate_us(
+    *,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    checkpoints: bool,
+    gate_kind: str,
+    gpu_arch: str,
+):
+    """Estimated (composite, sequential) microseconds for a BF16-family call.
+
+    The composite estimate is the cheapest wave count (``_affine_bf16_waves``).
+    ``None`` when the architecture/gate has no measured model or the call is
+    outside the composite's contract (task cap, window budget, no sequence
+    that would actually split).
+    """
+    model = AFFINE_BF16_COST_MODEL_US.get((gpu_arch, gate_kind))
+    tasks = len(sequence_lengths) * num_heads
+    if (
+        model is None
+        or not sequence_lengths
+        or min(sequence_lengths) <= 0
+        or num_heads <= 0
+        or tasks > _affine_max_tasks()
+        or 2 * tasks > sm_count
+    ):
+        return None
+    chunk_counts = [
+        (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
+    ]
+    _, composite_us = _affine_bf16_waves(
+        chunk_counts,
+        num_heads=num_heads,
+        sm_count=sm_count,
+        checkpoints=checkpoints,
+        gate_kind=gate_kind,
+        gpu_arch=gpu_arch,
+    )
+    if composite_us is None:
+        return None
+    _, _, sequential_fixed, sequential_chunk = model
+    return composite_us, sequential_fixed + sequential_chunk * max(chunk_counts)
+
+
 def _affine_split_windows(
     *,
     sequence_lengths: tuple[int, ...],
@@ -522,6 +609,7 @@ def _affine_split_windows(
     shared_tf32_factors: bool,
     checkpoints: bool,
     unbounded_softplus: bool = False,
+    gpu_arch: str | None = None,
 ):
     """Partition original sequences into runtime windows without crossing boundaries."""
     tasks = len(sequence_lengths) * num_heads
@@ -537,14 +625,34 @@ def _affine_split_windows(
     chunk_counts = [
         (length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths
     ]
-    window_budget = max(len(sequence_lengths), sm_count // num_heads * _affine_window_waves())
     if not shared_tf32_factors and _affine_split_policy() == "model":
-        # The cost model already decided the split; give every sequence the
-        # most windows the budget allows so the longest window is shortest.
+        # The cost model already decided the split and its wave count; give
+        # every sequence the most windows that budget allows so the longest
+        # window is shortest.
+        if gpu_arch is None:
+            # Planner-only callers (CPU tests) get the one-wave plan.
+            try:
+                gpu_arch = detect_gpu_arch()
+            except Exception:
+                gpu_arch = None
+        waves, _ = _affine_bf16_waves(
+            chunk_counts,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            checkpoints=checkpoints,
+            gate_kind="unbounded_softplus" if unbounded_softplus else "lower_bound",
+            gpu_arch=gpu_arch,
+        )
+        window_budget = _affine_window_budget(
+            len(sequence_lengths), num_heads, sm_count, waves
+        )
         targets = _affine_bf16_window_targets(
-            chunk_counts, num_heads=num_heads, sm_count=sm_count
+            chunk_counts, num_heads=num_heads, sm_count=sm_count, waves=waves
         )
     else:
+        window_budget = _affine_window_budget(
+            len(sequence_lengths), num_heads, sm_count, _affine_window_waves() or 1
+        )
         targets = [
             _affine_split_part_count(
                 sm_count=sm_count,
@@ -5585,7 +5693,7 @@ def rebind_prepared_launch(
         ):
             tma_moved = True
             owner, _ = _rebind_owner(impl, spec.container)
-            if owner is not impl and owner not in stale_owners:
+            if owner not in stale_owners:
                 stale_owners.append(owner)
         container[spec.key] = replacement
     for address in plan.addresses:
@@ -5619,8 +5727,9 @@ def rebind_prepared_launch(
         if sub is not None:
             sub._keepalive = owned + new_inputs
     for owner in stale_owners:
-        # Part launches re-encode their own descriptors inside their launch
-        # stream context (see _launch_uncaptured).
+        # Only the launches whose descriptor sources moved re-encode, inside
+        # their launch stream context (see _launch_uncaptured); a composite
+        # whose parts moved does not re-encode the untouched parts.
         owner._descriptors_stale = True
     impl._keepalive = plan.owned_keepalive + new_inputs
     return tma_moved
