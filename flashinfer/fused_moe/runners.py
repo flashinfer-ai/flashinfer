@@ -30,7 +30,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Literal, Mapping, Optional
+from typing import Any, Callable, ClassVar, List, Literal, Mapping, Optional, Sequence
 
 import torch
 
@@ -41,8 +41,13 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from ..utils import next_positive_power_of_2, round_up
+from ..utils import get_compute_capability, next_positive_power_of_2, round_up
+from ..tllm_enums import DEFAULT_SWIGLU_LIMIT
 from .api import (
+    _CUDNN_GROUPED_GEMM_BF16_ARCHS,
+    _CUDNN_GROUPED_GEMM_FP4_ARCHS,
+    _CUDNN_GROUPED_GEMM_FP8_ARCHS,
+    _CUDNN_GROUPED_GEMM_MXFP8_ARCHS,
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_FP8_ARCHS,
     _CUTLASS_FP8_BLOCK_ARCHS,
@@ -7608,6 +7613,1398 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+
+# ---------------------------------------------------------------------------
+# cuDNN grouped-GEMM runners
+# ---------------------------------------------------------------------------
+#
+# A grouped GEMM multiplies contiguous row segments of one activation matrix by
+# per-expert weights; segment ``e`` is ``rows[m_indptr[e]:m_indptr[e + 1]]``.
+# The runners compose the flat API into the layer, one kernel per stage:
+#
+#     hidden_states [T, H], topk_ids / topk_weights [T, k]
+#       (1) permute  sort the T*k assignments by expert (m_indptr, row maps),
+#                    then gather token rows into that order
+#       (2) gemm1    grouped_mm_*(permuted, W1, m_indptr) -> [rows, 2I | I]
+#       (3) act      typed ActivationConfig -> [rows, I]  (+ requant when quantized,
+#                    by a fused activation+quantize kernel)
+#       (4) gemm2    grouped_mm_*(intermediate, W2, m_indptr) -> [rows, H]
+#       (5) finalize out[t] = sum_k topk_weights[t, k] * rows[token_to_row[t, k]]
+
+# Expert-segment tile of the block-scaled runners (cuDNN reads block scales in
+# 128-row tiles) and the multiple their hidden_size and intermediate_size need.
+_BLOCK_SCALE_TILE = 128
+# Expert-segment tile of the BF16 and FP8 runners: the smallest moe_sort tile.
+_PLAIN_SEGMENT_ROWS = 16
+# Architectures whose moe_utils kernels sort, permute and finalize.
+_MOE_UTILS_ARCHS: tuple[int, ...] = (90, 100, 103)
+
+# (gemm1, gemm2) plan indices of the fallback tactic
+_FALLBACK_STAGE_TACTIC: tuple[int, int] = (-1, -1)
+
+
+@dataclass
+class _GroupedGemmLayout:
+    """Expert-sorted row layout of one call; rows beyond ``m_indptr[-1]`` are padding."""
+
+    m_indptr: torch.Tensor  # [E_local + 1] int32 segment offsets for grouped_mm_*
+    token_to_row: torch.Tensor  # [T, k] int32 row of every assignment, -1 if non-local
+    row_expert: torch.Tensor  # [rows] int32 local expert per row (padding: last)
+    row_valid: torch.Tensor  # [rows] bool, True where a local assignment lives
+    num_rows: int
+    # [rows] int64 source token of every row (padding -> 0); torch permute path only.
+    row_to_token: Optional[torch.Tensor] = None
+
+
+def _layout_from_topk(
+    topk_ids: torch.Tensor,
+    *,
+    num_local_experts: int,
+    local_expert_offset: int,
+    num_rows: int,
+    segment_alignment: int,
+) -> _GroupedGemmLayout:
+    """Expert-sort the assignments with torch ops.
+
+    Non-local ids get no row, every expert segment is padded to
+    ``segment_alignment`` rows and unused rows read token 0.
+    """
+    num_tokens, top_k = topk_ids.shape
+    num_assignments = num_tokens * top_k
+    device = topk_ids.device
+
+    local = topk_ids.reshape(-1) - local_expert_offset
+    valid = (local >= 0) & (local < num_local_experts)
+    key = torch.where(valid, local, num_local_experts)
+    sorted_key, order = torch.sort(key, stable=True)
+    boundaries = torch.arange(num_local_experts + 1, dtype=torch.int32, device=device)
+    # Unaligned segment starts; ``starts[-1]`` counts the local assignments.
+    starts = torch.searchsorted(sorted_key, boundaries)
+    counts = starts[1:] - starts[:-1]
+    counts = (counts + segment_alignment - 1) // segment_alignment * segment_alignment
+    m_indptr = torch.cat((starts[:1], torch.cumsum(counts, 0)))
+    rank = torch.arange(num_assignments, device=device) - starts[sorted_key]
+    row_of_sorted = torch.where(
+        sorted_key < num_local_experts,
+        m_indptr[sorted_key] + rank,
+        torch.full_like(rank, num_rows),  # non-local: parked on the spare slot
+    )
+    row_of_assignment = torch.empty_like(row_of_sorted)
+    row_of_assignment[order] = row_of_sorted
+    token_to_row = torch.where(
+        row_of_assignment < num_rows,
+        row_of_assignment,
+        torch.full_like(row_of_assignment, -1),
+    )
+    # Tail entries (non-local assignments) land on the spare slot num_rows.
+    row_to_token = torch.zeros(num_rows + 1, dtype=torch.int64, device=device)
+    row_to_token[row_of_sorted] = order // top_k
+    row_valid = torch.zeros(num_rows + 1, dtype=torch.bool, device=device)
+    row_valid.index_fill_(0, row_of_sorted, True)  # no host scalar: capture-safe
+    row_expert = torch.searchsorted(
+        m_indptr[1:], torch.arange(num_rows, device=device), right=True
+    )
+    return _GroupedGemmLayout(
+        m_indptr=m_indptr.to(torch.int32),
+        token_to_row=token_to_row.to(torch.int32).view(num_tokens, top_k),
+        row_expert=row_expert.clamp_(max=num_local_experts - 1).to(torch.int32),
+        row_valid=row_valid[:num_rows],
+        num_rows=num_rows,
+        row_to_token=row_to_token[:num_rows],
+    )
+
+
+def _scatter_rows(
+    source: torch.Tensor, token_to_row: torch.Tensor, *, out: torch.Tensor
+) -> torch.Tensor:
+    """``out[token_to_row[t, j]] = source[t]``; the spare last row of ``out`` absorbs the -1 slots."""
+    num_tokens, top_k = token_to_row.shape
+    spare = out.shape[0] - 1
+    rows = torch.where(
+        token_to_row >= 0, token_to_row, torch.full_like(token_to_row, spare)
+    )
+    is_fp8 = out.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    storage = out.view(torch.int8) if is_fp8 else out
+    source_storage = source.view(torch.int8) if is_fp8 else source
+    expanded = source_storage.unsqueeze(1).expand(-1, top_k, -1)
+    storage.index_copy_(
+        0, rows.reshape(-1).to(torch.int64), expanded.reshape(num_tokens * top_k, -1)
+    )
+    return out
+
+
+def _combine_rows(
+    rows: torch.Tensor,
+    token_to_row: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``out[t] = sum_j topk_weights[t, j] * rows[token_to_row[t, j]]`` over local slots.
+
+    Float32 accumulation one slot at a time; -1 slots contribute nothing.
+    """
+    local = token_to_row >= 0
+    indices = token_to_row.clamp(min=0).to(torch.int64)
+    weights = topk_weights.float()
+    acc = torch.zeros(out.shape, dtype=torch.float32, device=out.device)
+    for slot in range(indices.shape[1]):
+        gathered = rows.index_select(0, indices[:, slot]).float()
+        gathered = torch.where(local[:, slot, None], gathered, 0.0)
+        acc.addcmul_(gathered, weights[:, slot, None])
+    return out.copy_(acc)
+
+
+_CUDNN_GROUPED_GEMM_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
+    SwiGLU,
+    GeGLU,
+    GeGLUTanh,
+)
+
+
+def _apply_moe_activation(
+    gemm1_out: torch.Tensor,
+    activation: ActivationConfig,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused ``activation(gate) * up`` over ``[rows, 2I]`` BF16 rows in ``[gate, up]`` column order."""
+    from ..activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+
+    if isinstance(activation, SwiGLU):
+        kernel = silu_and_mul
+    elif isinstance(activation, GeGLUTanh):
+        kernel = gelu_tanh_and_mul
+    elif isinstance(activation, GeGLU):
+        kernel = gelu_and_mul
+    else:
+        raise NotImplementedError(
+            "cuDNN grouped-GEMM runners support SwiGLU, GeGLU and GeGLUTanh, "
+            f"got {activation!r}."
+        )
+    return kernel(gemm1_out, out=out, enable_pdl=False)
+
+
+def _dequant_rows_by_expert(
+    out: torch.Tensor, per_expert: torch.Tensor, layout: _GroupedGemmLayout
+) -> torch.Tensor:
+    """Multiply every GEMM output row by its expert's dequant factor, in place."""
+    return out.mul_(per_expert.index_select(0, layout.row_expert)[:, None])
+
+
+@dataclass
+class _GroupedGemmWorkspace:
+    """Stage buffers of one ``(token bucket, hidden_size)``; GEMM2's output is
+    allocated per call."""
+
+    num_rows: int
+    permuted_hidden_states: torch.Tensor  # [rows, H / k_pack], activation dtype
+    gemm1_out: torch.Tensor  # [rows, 2I | I] bf16
+    intermediate: torch.Tensor  # [rows, I] bf16
+    sort: Optional[dict[str, torch.Tensor]] = (
+        None  # moe_sort out_* buffers (kernel path)
+    )
+    # Block-scaled runners: token-major permuted scale rows with a spare last row
+    # for the -1 slots, and their swizzled 128x4 copy that the GEMM1 graph reads.
+    permuted_hidden_states_scale_rows: Optional[torch.Tensor] = None
+    permuted_hidden_states_scale: Optional[torch.Tensor] = None
+
+
+class _CudnnGroupedGemmRunnerBase(MoERunner):
+    """Shared pipeline of the cuDNN grouped-GEMM MoE runners.
+
+    permute (``moe_sort`` + ``moe_permute``, or fallback to torch ops)
+    -> GEMM1
+    -> fused activation
+    -> GEMM2
+    -> finalize (``moe_unpermute`` or fallback to torch ops).
+
+    Every expert segment is padded to ``_segment_alignment`` rows; padding rows
+    are computed but never read back.
+    """
+
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supported_activation_classes = _CUDNN_GROUPED_GEMM_ACTIVATIONS
+    supports_expert_parallelism = True
+    _num_top_tactics_per_stage: ClassVar[int] = 2
+    _x_dtype: ClassVar[torch.dtype]
+    _weight_dtype: ClassVar[torch.dtype]
+    _supported_archs: ClassVar[tuple[int, ...]]
+    _required_weight_keys: ClassVar[tuple[str, ...]]
+    _expected_num_inputs: ClassVar[int]
+    _segment_alignment: ClassVar[int] = _PLAIN_SEGMENT_ROWS
+    # Packed-input index of the [E_local] float32 GEMM2 weight dequant, if any.
+    _fc2_dequant_input: ClassVar[Optional[int]] = None
+    _k_pack: ClassVar[int] = 1  # elements per stored byte along K (2 for packed FP4)
+
+    def __init__(self, config: MoEConfig, device: torch.device) -> None:
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError(f"{type(self).__name__} requires CUDA, got {device}.")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(self.device)
+        self._device_arch = major * 10 + minor
+        self._use_moe_utils = self._device_arch in _MOE_UTILS_ARCHS
+        self._workspace_cache: dict[tuple[int, int], _GroupedGemmWorkspace] = {}
+        self.tuning_config = TuningConfig()
+
+    # --- lifecycle --------------------------------------------------------
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.execution.enable_pdl is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support PDL launches."
+            )
+        if self._device_arch not in self._supported_archs:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support SM{self._device_arch}; "
+                f"supported architectures are {self._supported_archs}."
+            )
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per_token_scale=True; the "
+                "cuDNN grouped GEMMs take no per-token activation scale."
+            )
+        if self.config.quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} reads token-major activation block scales "
+                "only; swizzled_scale_factors=True is not supported."
+            )
+        from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
+
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
+
+    def _check_activation_parameters(self) -> None:
+        activation = self.config.activation
+        if isinstance(activation, SwiGLU) and (
+            activation.alpha != 1.0
+            or activation.beta != 0.0
+            or activation.limit != DEFAULT_SWIGLU_LIMIT
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports SwiGLU with default scalars only "
+                f"(the fused silu_and_mul kernel), got {activation!r}."
+            )
+
+    def _build(self) -> None:
+        """Load the ``moe_utils`` kernels; without them the torch permute and finalize run."""
+        if not self._use_moe_utils:
+            return
+        from .cute_dsl.moe_utils import _get_moe_utils_module
+
+        try:
+            _get_moe_utils_module()
+        except (RuntimeError, OSError) as exc:
+            warnings.warn(
+                f"{type(self).__name__}: the moe_utils kernels are unavailable "
+                f"({exc}); using the torch permute and finalize path.",
+                stacklevel=2,
+            )
+            self._use_moe_utils = False
+
+    # --- geometry and workspace -------------------------------------------
+
+    @property
+    def _num_local_experts(self) -> int:
+        experts = self.config.experts
+        return (
+            experts.local_num_experts
+            if experts.local_num_experts is not None
+            else self.config.routing.num_experts
+        )
+
+    @property
+    def _gemm1_rows(self) -> int:
+        return self.config.experts.intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+
+    def _activation_geometry(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        return hidden_states.shape[0], hidden_states.shape[1] * self._k_pack
+
+    def _ensure_workspace(
+        self, num_tokens: int, hidden_size: int
+    ) -> _GroupedGemmWorkspace:
+        """Stage buffers for the token bucket of ``num_tokens``, allocated once per bucket."""
+        self._require_built()
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        key = (map_to_hybrid_bucket(num_tokens, ceiling), hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is None:
+            from .cute_dsl.moe_utils import (
+                allocate_moe_sort_buffers,
+                get_max_num_permuted_tokens,
+            )
+
+            # Every assignment gets a row and every expert segment is padded to
+            # the tile: the row count of the bucket's layout.
+            rows = get_max_num_permuted_tokens(
+                key[0],
+                self.config.routing.top_k,
+                self._num_local_experts,
+                self._segment_alignment,
+            )
+            workspace = self._allocate_workspace(rows, hidden_size)
+            if self._use_moe_utils:
+                workspace.sort = allocate_moe_sort_buffers(
+                    key[0],
+                    self.config.routing.num_experts,
+                    self.config.routing.top_k,
+                    num_local_experts=self._num_local_experts,
+                    tile_tokens_dim=self._segment_alignment,
+                    device=self.device,
+                )
+            self._workspace_cache[key] = workspace
+        return workspace
+
+    def _allocate_workspace(self, rows: int, hidden_size: int) -> _GroupedGemmWorkspace:
+        """Shared stage buffers; the permuted rows start zeroed so padding rows are finite."""
+
+        def empty(*shape: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+            return torch.empty(*shape, dtype=dtype, device=self.device)
+
+        return _GroupedGemmWorkspace(
+            num_rows=rows,
+            permuted_hidden_states=torch.zeros(
+                rows,
+                hidden_size // self._k_pack,
+                dtype=self._x_dtype,
+                device=self.device,
+            ),
+            gemm1_out=empty(rows, self._gemm1_rows),
+            intermediate=empty(rows, self.config.experts.intermediate_size),
+        )
+
+    # --- pack_inputs ------------------------------------------------------
+
+    def _validate_input_count(self, inputs: Sequence[Any]) -> None:
+        expected = self._expected_num_inputs + int(self.config.finalize.do_finalize)
+        if len(inputs) != expected:
+            raise ValueError(
+                f"{type(self).__name__} expects {expected} inputs, got {len(inputs)}."
+            )
+
+    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        if hidden_states.dtype is not self._x_dtype:
+            raise TypeError(
+                f"{type(self).__name__} requires 2D {self._x_dtype} hidden_states_q, "
+                f"got dtype={hidden_states.dtype}."
+            )
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                f"{type(self).__name__} requires 2D {self._x_dtype} hidden_states_q, "
+                f"got shape={tuple(hidden_states.shape)}."
+            )
+        if hidden_states.device != self.device or not hidden_states.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__} requires contiguous hidden states on {self.device}."
+            )
+        num_tokens, hidden_size = self._activation_geometry(hidden_states)
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support zero tokens."
+            )
+        # moe_permute copies 16 bytes per thread.
+        permute_elements = 16 * self._k_pack // hidden_states.element_size()
+        if self._use_moe_utils and hidden_size % permute_elements:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_size divisible by "
+                f"{permute_elements} for {self._x_dtype} rows, got {hidden_size}."
+            )
+        return num_tokens, hidden_size
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        missing = [key for key in self._required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        w1, w2 = view["fc1_expert_weights"], view["fc2_expert_weights"]
+        pack = self._k_pack
+        expected_w1 = (self._num_local_experts, self._gemm1_rows, hidden_size // pack)
+        expected_w2 = (
+            self._num_local_experts,
+            hidden_size,
+            self.config.experts.intermediate_size // pack,
+        )
+        if w1.dtype is not self._weight_dtype or w2.dtype is not self._weight_dtype:
+            raise TypeError(
+                f"{self.backend_key} prepared weights must be {self._weight_dtype}, "
+                f"got {w1.dtype}/{w2.dtype}."
+            )
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"{self.backend_key} weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        for tensor in (w1, w2):
+            if tensor.device != self.device or not tensor.is_contiguous():
+                raise ValueError(
+                    f"{self.backend_key} prepared weights must be contiguous on {self.device}."
+                )
+        return [w1, w2]
+
+    def _require_view_tensor(
+        self,
+        view: dict[str, torch.Tensor],
+        name: str,
+        *,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        tensor = view[name]
+        if tensor.dtype is not dtype or tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{self.backend_key} {name} must be {dtype} {shape}, "
+                f"got {tensor.dtype} {tuple(tensor.shape)}."
+            )
+        if tensor.device != self.device or not tensor.is_contiguous():
+            raise ValueError(
+                f"{self.backend_key} {name} must be contiguous on {self.device}."
+            )
+        return tensor
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Validated inputs appended after the five base ones (scale tensors)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _pack_extra_inputs."
+        )
+
+    def _token_sized_extra_inputs(self) -> tuple[int, ...]:
+        """Packed-input indices beyond the first three whose dim 0 is the token count."""
+        return ()
+
+    def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Give synthesized profiles a valid, balanced routing over the local experts."""
+        num_tokens, hidden_size = self._activation_geometry(inputs[0])
+        self._ensure_workspace(num_tokens, hidden_size)
+        top_k = self.config.routing.top_k
+        offset = self.config.experts.local_expert_offset
+        assignments = torch.arange(
+            num_tokens * top_k, dtype=torch.int32, device=inputs[1].device
+        ).reshape(num_tokens, top_k)
+        inputs[1].copy_(assignments % self._num_local_experts + offset)
+        inputs[2].fill_(1.0 / top_k)
+        return inputs
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode not in self.supported_routing_modes:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports pre-routed packs only "
+                f"(PackedPrecomputed / UnpackedPrecomputed), got {act.routing_input_mode!r}."
+            )
+        num_tokens, hidden_size = self._validate_hidden_states(act.hidden_states_q)
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32, torch.bfloat16),
+            require_contiguous=True,
+        )
+        if act.per_token_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
+                "GEMMs have no per-token activation scale input."
+            )
+        view = weights.get_view(self.backend_key)
+        weight_inputs = self._pack_weight_inputs(view, hidden_size)
+        extra_inputs = self._pack_extra_inputs(act, view)
+        self._ensure_workspace(num_tokens, hidden_size)
+        # Packed routing narrows the weights to BF16; unpacked routing hands the
+        # caller's tensor through unchanged.
+        topk_weights = (
+            act.topk_weights
+            if act.routing_input_mode is RoutingInputMode.UnpackedPrecomputed
+            else act.topk_weights.to(torch.bfloat16)
+        )
+        inputs = [
+            act.hidden_states_q,
+            act.topk_ids,
+            topk_weights,
+            *weight_inputs,
+            *extra_inputs,
+        ]
+        if self.config.finalize.do_finalize:
+            inputs.append(
+                torch.empty(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=self.device
+                )
+            )
+        return inputs
+
+    def tuning_config_for(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        token_sized = [0, 1, 2, *self._token_sized_extra_inputs()]
+        if self.config.finalize.do_finalize:
+            token_sized.append(len(inputs) - 1)
+        ceiling = self.config.execution.tune_max_num_tokens
+        return TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=tuple(token_sized),
+                    dim_idx=(0,) * len(token_sized),
+                    gen_tuning_buckets=(
+                        map_to_hybrid_bucket(inputs[0].shape[0], ceiling),
+                    ),
+                    map_to_tuning_buckets=make_hybrid_bucket_mapper(ceiling),
+                ),
+            ),
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+
+    # --- execution --------------------------------------------------------
+
+    def _layout_from_moe_sort(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        workspace: _GroupedGemmWorkspace,
+    ) -> _GroupedGemmLayout:
+        """Segments from ``moe_sort``'s tile tables; tiles at or beyond ``num_non_exiting_tiles`` are unused."""
+        from .cute_dsl.moe_utils import moe_sort
+
+        assert workspace.sort is not None
+        tile = self._segment_alignment
+        num_local_experts = self._num_local_experts
+        tile_expert, tile_limit, token_to_row, _, _, num_tiles = moe_sort(
+            topk_ids,
+            topk_weights,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            local_expert_offset=self.config.experts.local_expert_offset,
+            num_local_experts=num_local_experts,
+            tile_tokens_dim=tile,
+            **workspace.sort,
+        )
+        device = topk_ids.device
+        tile_in_use = torch.arange(tile_expert.numel(), device=device) < num_tiles
+        # Unused tiles count for no expert; unused rows name the last expert.
+        tile_expert = torch.where(
+            tile_in_use, tile_expert, torch.full_like(tile_expert, num_local_experts)
+        )
+        tiles_per_expert = torch.zeros(
+            num_local_experts + 1, dtype=torch.int32, device=device
+        ).index_add_(0, tile_expert.long(), torch.ones_like(tile_expert))
+        m_indptr = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(tiles_per_expert[:num_local_experts], 0, dtype=torch.int32)
+                * tile,
+            )
+        )
+        row_expert = tile_expert.clamp(max=num_local_experts - 1).repeat_interleave(
+            tile
+        )
+        row_limit = torch.where(
+            tile_in_use, tile_limit, torch.zeros_like(tile_limit)
+        ).repeat_interleave(tile)
+        row_valid = torch.arange(row_limit.numel(), device=device) < row_limit
+        return _GroupedGemmLayout(
+            m_indptr=m_indptr,
+            # A copy: the sort buffer is rewritten by the next call while the
+            # returned unfinalized triple stays with the caller.
+            token_to_row=token_to_row[: topk_ids.shape[0]].clone(),
+            row_expert=row_expert,
+            row_valid=row_valid,
+            num_rows=workspace.num_rows,
+        )
+
+    def _permute(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[_GroupedGemmLayout, _GroupedGemmWorkspace]:
+        hidden_states, topk_ids, topk_weights = inputs[:3]
+        workspace = self._ensure_workspace(*self._activation_geometry(hidden_states))
+        if workspace.sort is None:
+            layout = _layout_from_topk(
+                topk_ids,
+                num_local_experts=self._num_local_experts,
+                local_expert_offset=self.config.experts.local_expert_offset,
+                num_rows=workspace.num_rows,
+                segment_alignment=self._segment_alignment,
+            )
+            assert layout.row_to_token is not None
+            # permuted[r] = hidden_states[row_to_token[r]]; FP8 storage goes
+            # through an int8 view, which index_select accepts.
+            permuted = workspace.permuted_hidden_states
+            if permuted.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                torch.index_select(
+                    hidden_states.view(torch.int8),
+                    0,
+                    layout.row_to_token,
+                    out=permuted.view(torch.int8),
+                )
+            else:
+                torch.index_select(hidden_states, 0, layout.row_to_token, out=permuted)
+            return layout, workspace
+        from .cute_dsl.moe_utils import moe_permute
+
+        layout = self._layout_from_moe_sort(topk_ids, topk_weights, workspace)
+        sort = workspace.sort
+        moe_permute(
+            hidden_states,
+            workspace.permuted_hidden_states,
+            sort["out_tile_idx_to_mn_limit"],
+            sort["out_permuted_idx_to_expanded_idx"],
+            sort["out_num_non_exiting_tiles"],
+            workspace.num_rows,
+            self.config.routing.top_k,
+            self._segment_alignment,
+        )
+        return layout, workspace
+
+    def _run_plan(
+        self,
+        stage: int,
+        tactic: int,
+        run: Callable[[int], Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        """``run(tactic)``; a plan index beyond cuDNN's count for this shape runs the heuristic plan."""
+        result = run(tactic)
+        if result is None:
+            warnings.warn(
+                f"{self.backend_key} GEMM{stage} tactic {tactic} is not a cuDNN "
+                "execution-plan index for this shape on this device; running the "
+                "heuristic plan instead.",
+                stacklevel=2,
+            )
+            result = run(-1)
+        if result is None:
+            raise RuntimeError(
+                f"{self.backend_key} GEMM{stage} has no cuDNN execution plan for "
+                "this shape."
+            )
+        return result
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        """GEMM1 into ``workspace.gemm1_out``; returns the dequantized ``[rows, 2I | I]`` BF16 rows."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _gemm1.")
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        """GEMM2 of the BF16 intermediate; returns new dequantized ``[rows, H]`` BF16 rows."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _gemm2.")
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        self._require_built()
+        self._validate_input_count(inputs)
+        if tactic == -1 or tactic is None:
+            gemm1_tactic, gemm2_tactic = _FALLBACK_STAGE_TACTIC
+        elif isinstance(tactic, (tuple, list)) and len(tactic) == 2:
+            gemm1_tactic, gemm2_tactic = int(tactic[0]), int(tactic[1])
+        else:
+            raise ValueError(
+                "cuDNN grouped-GEMM tactic must be -1 or a (gemm1, gemm2) pair, "
+                f"got {tactic!r}."
+            )
+        _, topk_ids, topk_weights = inputs[:3]
+        layout, workspace = self._permute(inputs)
+        gemm1_out = self._gemm1(inputs, layout, workspace, gemm1_tactic)
+        intermediate = _apply_moe_activation(
+            gemm1_out, self.config.activation, out=workspace.intermediate
+        )
+        gemm2_out = self._gemm2(inputs, layout, workspace, intermediate, gemm2_tactic)
+        fc2_dequant = (
+            None if self._fc2_dequant_input is None else inputs[self._fc2_dequant_input]
+        )
+        if not self.config.finalize.do_finalize:
+            if fc2_dequant is not None:
+                _dequant_rows_by_expert(gemm2_out, fc2_dequant, layout)
+            return [gemm2_out, topk_weights, layout.token_to_row.reshape(-1)]
+        if fc2_dequant is not None:
+            # GEMM2's per-expert dequant rides on the routing weights of the
+            # finalize (a [T, k] product) instead of a pass over the [rows, H]
+            # output; slots of non-local experts are skipped by the finalize.
+            local = topk_ids.long() - self.config.experts.local_expert_offset
+            topk_weights = (
+                topk_weights.float()
+                * fc2_dequant[local.clamp(0, self._num_local_experts - 1)]
+            )
+        out = inputs[-1]
+        if self._use_moe_utils:
+            from .cute_dsl.moe_utils import moe_unpermute
+
+            num_tokens, top_k = topk_ids.shape
+            moe_unpermute(
+                gemm2_out, out, layout.token_to_row, topk_weights, num_tokens, top_k
+            )
+        else:
+            _combine_rows(gemm2_out, layout.token_to_row, topk_weights, out=out)
+        return out
+
+    # --- autotuning -------------------------------------------------------
+
+    def _plan_indices(
+        self,
+        a: torch.Tensor,
+        weights: torch.Tensor,
+        *,
+        alpha: Optional[torch.Tensor] = None,
+    ) -> List[Any]:
+        """``range(plan_count)`` of the plain graph for these operand shapes, ``[-1]`` when none."""
+        from ..grouped_mm.cudnn import _cudnn_moe_grouped_gemm_plan_count
+
+        m_indptr = torch.zeros(
+            self._num_local_experts + 1, dtype=torch.int32, device=self.device
+        )
+        count = _cudnn_moe_grouped_gemm_plan_count(
+            a, weights, m_indptr, alpha=alpha, out_dtype=torch.bfloat16
+        )
+        return list(range(count)) if count > 0 else [-1]
+
+    def _block_scale_plan_indices(
+        self,
+        a: torch.Tensor,
+        weights: torch.Tensor,
+        a_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        block_size: int,
+        alpha: Optional[torch.Tensor] = None,
+    ) -> List[Any]:
+        """``_plan_indices`` for the block-scaled graphs."""
+        from ..grouped_mm.cudnn import _cudnn_moe_block_scale_grouped_gemm_plan_count
+
+        m_indptr = torch.zeros(
+            self._num_local_experts + 1, dtype=torch.int32, device=self.device
+        )
+        count = _cudnn_moe_block_scale_grouped_gemm_plan_count(
+            a,
+            weights,
+            a_scale,
+            weight_scale,
+            m_indptr,
+            alpha=alpha,
+            out_dtype=torch.bfloat16,
+            block_size=block_size,
+        )
+        return list(range(count)) if count > 0 else [-1]
+
+    def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
+        """Valid tactics of GEMM ``stage`` (1 or 2) for the bucket shape of ``inputs``."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _stage_tactics."
+        )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        """Rank each GEMM's plans on its own (the other GEMM at -1), then pair the top
+        ``_num_top_tactics_per_stage`` of each and add the all-heuristic fallback.
+        """
+        self._require_built()
+        self._validate_input_count(inputs)
+        tuner = AutoTuner.get()
+        tuning_config = TuningConfig(
+            use_cuda_graph=True, inputs_pre_hook=self._prepare_tuning_inputs
+        )
+        prefix = f"moe_{self.backend_key}_sm{self._device_arch}"
+        ranked = []
+        for stage in (1, 2):
+            tactics = tuner.rank_tactics(
+                f"{prefix}_gemm{stage}",
+                [_GroupedGemmStageRunner(self, stage)],
+                tuning_config,
+                inputs,
+                k=self._num_top_tactics_per_stage,
+            )
+            ranked.append([int(t) for t in tactics])
+        pairs = list(dict.fromkeys((g1, g2) for g1 in ranked[0] for g2 in ranked[1]))
+        if _FALLBACK_STAGE_TACTIC not in pairs:
+            pairs.append(_FALLBACK_STAGE_TACTIC)
+        return pairs
+
+    def _cache_key_extras(self) -> tuple:
+        # Plan indices are only meaningful for the cuDNN build that produced
+        # them and for the row layout of the permute path.
+        import cudnn
+
+        return super()._cache_key_extras() + (
+            self._device_arch,
+            int(cudnn.backend_version()),
+            self._use_moe_utils,
+        )
+
+
+class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
+    """BF16 MoE over ``grouped_mm_bf16``; no extra packed inputs."""
+
+    backend_key = "cudnn_grouped_gemm_bf16"
+    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    _x_dtype = torch.bfloat16
+    _weight_dtype = torch.bfloat16
+    _supported_archs = _CUDNN_GROUPED_GEMM_BF16_ARCHS
+    _required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
+    _expected_num_inputs = 5
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} BF16 activations do not use hidden_states_scale."
+            )
+        return []
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_bf16
+
+        return self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_bf16(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                tactic=plan,
+            ),
+        )
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_bf16
+
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_bf16(
+                intermediate, inputs[4], layout.m_indptr, tactic=plan
+            ),
+        )
+
+    def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
+        workspace = self._ensure_workspace(*self._activation_geometry(inputs[0]))
+        a = workspace.permuted_hidden_states if stage == 1 else workspace.intermediate
+        return self._plan_indices(a, inputs[2 + stage])
+
+
+class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
+    """FP8 per-tensor MoE over ``grouped_mm_fp8``.
+
+    The canonical per-tensor FP8 pack (no activation scale); the view carries
+    the folded static scales. GEMM1 rows are scaled by ``fc1_dequant_scale``,
+    the fused Triton SwiGLU requantizes with ``fc2_act_quant_scale`` (so SwiGLU
+    with default scalars is the only activation) and the finalize applies
+    ``fc2_dequant_scale``.
+    Extra packed inputs: ``[fc1_dequant_scale, fc2_act_quant_scale, fc2_dequant_scale]``.
+    """
+
+    backend_key = "cudnn_grouped_gemm_fp8_per_tensor"
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_activation_classes = (SwiGLU,)
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.float8_e4m3fn
+    _supported_archs = _CUDNN_GROUPED_GEMM_FP8_ARCHS
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_dequant_scale",
+        "fc2_act_quant_scale",
+        "fc2_dequant_scale",
+    )
+    _expected_num_inputs = 8
+    _fc2_dequant_input = 7
+
+    def _build(self) -> None:
+        super()._build()
+        from ..triton.activation import silu_and_mul  # noqa: F401
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} activations do not use hidden_states_scale; "
+                "the static multipliers live in the weight view."
+            )
+        expected = (self._num_local_experts,)
+        return [
+            self._require_view_tensor(
+                view, "fc1_dequant_scale", dtype=torch.float32, shape=expected
+            ),
+            self._require_view_tensor(
+                view, "fc2_act_quant_scale", dtype=torch.float32, shape=()
+            ),
+            self._require_view_tensor(
+                view, "fc2_dequant_scale", dtype=torch.float32, shape=expected
+            ),
+        ]
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp8
+
+        out = self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_fp8(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                tactic=plan,
+            ),
+        )
+        return _dequant_rows_by_expert(out, inputs[5], layout)
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        """Requantize GEMM1's output with the static ``fc2_act_quant_scale``
+        multiplier inside the fused Triton SwiGLU kernel, then run GEMM2."""
+        from ..grouped_mm import grouped_mm_fp8
+        from ..triton.activation import silu_and_mul
+
+        quantized = silu_and_mul(
+            workspace.gemm1_out, o_scale=inputs[6], dtype=torch.float8_e4m3fn
+        )
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_fp8(
+                quantized, inputs[4], layout.m_indptr, tactic=plan
+            ),
+        )
+
+    def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
+        workspace = self._ensure_workspace(*self._activation_geometry(inputs[0]))
+        a = (
+            workspace.permuted_hidden_states
+            if stage == 1
+            else torch.empty(
+                workspace.num_rows,
+                self.config.experts.intermediate_size,
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+        )
+        return self._plan_indices(a, inputs[2 + stage])
+
+
+class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
+    """Block-scaled runners: pre-quantized activations with token-major block
+    scales (``hidden_states_scale [M, H // _block_size]``, the last extra input),
+    128-row expert segments and sizes divisible by 128. The permuted scale rows
+    are swizzled into cuDNN's 128x4 layout for GEMM1; the intermediate is
+    quantized straight into that layout for GEMM2. Subclasses declare
+    ``_block_size``, ``_block_scale_dtype`` and ``_gemm2_takes_alpha``.
+    """
+
+    _segment_alignment = _BLOCK_SCALE_TILE
+    _block_size: ClassVar[int]
+    _block_scale_dtype: ClassVar[torch.dtype]
+    _gemm2_takes_alpha: ClassVar[bool]
+
+    @property
+    def _hidden_states_scale_input(self) -> int:
+        """Packed-input index of the activation block scales: the last extra input."""
+        return self._expected_num_inputs - 1
+
+    def _token_sized_extra_inputs(self) -> tuple[int, ...]:
+        return (self._hidden_states_scale_input,)
+
+    def _allocate_workspace(self, rows: int, hidden_size: int) -> _GroupedGemmWorkspace:
+        """Add the permuted scale rows with one spare row for the -1 slots."""
+        workspace = super()._allocate_workspace(rows, hidden_size)
+        workspace.permuted_hidden_states_scale_rows = torch.zeros(
+            rows + 1,
+            hidden_size // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
+        return workspace
+
+    def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
+        workspace = self._ensure_workspace(*self._activation_geometry(inputs[0]))
+        rows = workspace.num_rows
+        k = (
+            self._activation_geometry(inputs[0])[1]
+            if stage == 1
+            else self.config.experts.intermediate_size
+        )
+        a = torch.empty(
+            rows, k // self._k_pack, dtype=self._x_dtype, device=self.device
+        )
+        a_scale = torch.empty(
+            rows,
+            k // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
+        alpha = (
+            torch.ones(1, dtype=torch.float32, device=self.device)
+            if self._gemm2_takes_alpha and stage == 2
+            else None
+        )
+        return self._block_scale_plan_indices(
+            a,
+            inputs[2 + stage],
+            a_scale,
+            inputs[4 + stage],
+            block_size=self._block_size,
+            alpha=alpha,
+        )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        intermediate_size = self.config.experts.intermediate_size
+        if intermediate_size % _BLOCK_SCALE_TILE:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires intermediate_size divisible by "
+                f"{_BLOCK_SCALE_TILE}, got {intermediate_size}."
+            )
+
+    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        num_tokens, hidden_size = super()._validate_hidden_states(hidden_states)
+        if hidden_size % _BLOCK_SCALE_TILE:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_size divisible by "
+                f"{_BLOCK_SCALE_TILE}, got {hidden_size}."
+            )
+        return num_tokens, hidden_size
+
+    def _pack_hidden_states_scale(
+        self, act: MoEActivationPack, hidden_size: int
+    ) -> torch.Tensor:
+        """The pack's token-major ``[M, H // block]`` scales (``uint8`` or ``float8_e4m3fn`` storage)."""
+        scale = act.hidden_states_scale
+        expected = (act.hidden_states_q.shape[0], hidden_size // self._block_size)
+        if (
+            scale is None
+            or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or tuple(scale.shape) != expected
+        ):
+            got = None if scale is None else (scale.dtype, tuple(scale.shape))
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_states_scale as token-major "
+                f"uint8 or float8_e4m3fn block scales of shape {expected}, got {got}."
+            )
+        if scale.device != self.device or not scale.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__} requires contiguous hidden_states_scale on "
+                f"{self.device}."
+            )
+        return scale.view(self._block_scale_dtype)
+
+    def _permute(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[_GroupedGemmLayout, _GroupedGemmWorkspace]:
+        """Scatter the token-major scale rows into expert order, then swizzle them."""
+        layout, workspace = super()._permute(inputs)
+        assert workspace.permuted_hidden_states_scale_rows is not None
+        _scatter_rows(
+            inputs[self._hidden_states_scale_input],
+            layout.token_to_row,
+            out=workspace.permuted_hidden_states_scale_rows,
+        )
+        # cuDNN's swizzled 128x4 layout. The rows are a multiple of 128 and the
+        # columns of 4 (128-row segments, hidden_size % 128 == 0), so the
+        # swizzled buffer has exactly the row-major one's size.
+        from ..quantization.fp4_quantization import block_scale_interleave
+
+        scale_rows = workspace.permuted_hidden_states_scale_rows[: workspace.num_rows]
+        workspace.permuted_hidden_states_scale = (
+            block_scale_interleave(scale_rows.view(torch.uint8))
+            .view(scale_rows.shape)
+            .view(self._block_scale_dtype)
+        )
+        return layout, workspace
+
+
+class CudnnGroupedGemmMxfp8Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
+    """MXFP8 MoE over ``grouped_mm_mxfp8``.
+
+    E4M3 rows with UE8M0 ``uint8 [M, H // 32]`` token-major scales; E4M3 weights
+    with UE8M0 block scales per expert.
+    Extra packed inputs: ``[fc1_weight_scale, fc2_weight_scale, hidden_states_scale]``.
+    """
+
+    backend_key = "cudnn_grouped_gemm_mxfp8"
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.float8_e4m3fn
+    _supported_archs = _CUDNN_GROUPED_GEMM_MXFP8_ARCHS
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_weight_scale",
+        "fc2_weight_scale",
+    )
+    _expected_num_inputs = 8
+    _block_size = 32
+    _block_scale_dtype = torch.uint8
+    _gemm2_takes_alpha = False
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        hidden_size = act.hidden_states_q.shape[1]
+        num_experts = self._num_local_experts
+        intermediate_size = self.config.experts.intermediate_size
+        return [
+            self._require_view_tensor(
+                view,
+                "fc1_weight_scale",
+                dtype=torch.uint8,
+                shape=(num_experts, self._gemm1_rows, hidden_size // self._block_size),
+            ),
+            self._require_view_tensor(
+                view,
+                "fc2_weight_scale",
+                dtype=torch.uint8,
+                shape=(num_experts, hidden_size, intermediate_size // self._block_size),
+            ),
+            self._pack_hidden_states_scale(act, hidden_size),
+        ]
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_mxfp8
+
+        assert workspace.permuted_hidden_states_scale is not None
+        return self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_mxfp8(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                workspace.permuted_hidden_states_scale,
+                inputs[5],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                tactic=plan,
+            ),
+        )
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_mxfp8
+        from .prepare import _quantize_mxfp8_rows
+
+        quantized, scale = _quantize_mxfp8_rows(intermediate)
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_mxfp8(
+                quantized,
+                inputs[4],
+                scale,
+                inputs[6],
+                layout.m_indptr,
+                tactic=plan,
+            ),
+        )
+
+
+class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
+    """NVFP4 MoE over ``grouped_mm_fp4`` (16-wide blocks).
+
+    Packed E2M1 ``uint8 [M, H // 2]`` rows with ``float8_e4m3fn [M, H // 16]``
+    token-major scales and a global scale of one; packed E2M1 weights with E4M3
+    block scales and one global dequant per expert. The intermediate is
+    requantized with a global scale of one.
+    Extra packed inputs: ``[fc1_weight_scale, fc2_weight_scale, fc1_dequant,
+    fc2_dequant, hidden_states_scale]``.
+    """
+
+    backend_key = "cudnn_grouped_gemm_nvfp4"
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    _x_dtype = torch.uint8
+    _weight_dtype = torch.uint8
+    _k_pack = 2
+    _supported_archs = _CUDNN_GROUPED_GEMM_FP4_ARCHS
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_weight_scale",
+        "fc2_weight_scale",
+        "fc1_dequant",
+        "fc2_dequant",
+    )
+    _expected_num_inputs = 10
+    _fc2_dequant_input = 8
+    _block_size = 16
+    _block_scale_dtype = torch.float8_e4m3fn
+    _gemm2_takes_alpha = False
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        hidden_size = act.hidden_states_q.shape[1] * self._k_pack
+        num_experts = self._num_local_experts
+        intermediate_size = self.config.experts.intermediate_size
+        return [
+            self._require_view_tensor(
+                view,
+                "fc1_weight_scale",
+                dtype=torch.float8_e4m3fn,
+                shape=(num_experts, self._gemm1_rows, hidden_size // self._block_size),
+            ),
+            self._require_view_tensor(
+                view,
+                "fc2_weight_scale",
+                dtype=torch.float8_e4m3fn,
+                shape=(num_experts, hidden_size, intermediate_size // self._block_size),
+            ),
+            self._require_view_tensor(
+                view, "fc1_dequant", dtype=torch.float32, shape=(num_experts,)
+            ),
+            self._require_view_tensor(
+                view, "fc2_dequant", dtype=torch.float32, shape=(num_experts,)
+            ),
+            self._pack_hidden_states_scale(act, hidden_size),
+        ]
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp4
+
+        assert workspace.permuted_hidden_states_scale is not None
+        out = self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_fp4(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                workspace.permuted_hidden_states_scale,
+                inputs[5],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                block_size=self._block_size,
+                tactic=plan,
+            ),
+        )
+        return _dequant_rows_by_expert(out, inputs[7], layout)
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp4
+        from .prepare import _quantize_nvfp4_rows
+
+        quantized, scale, _ = _quantize_nvfp4_rows(intermediate)
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_fp4(
+                quantized,
+                inputs[4],
+                scale,
+                inputs[6],
+                layout.m_indptr,
+                block_size=self._block_size,
+                tactic=plan,
+            ),
+        )
+
+
+class _GroupedGemmStageRunner(TunableRunner):
+    """Autotuner view of one GEMM stage: varies its plan, keeps the other at -1."""
+
+    def __init__(self, parent: _CudnnGroupedGemmRunnerBase, stage: int) -> None:
+        if stage not in (1, 2):
+            raise ValueError(f"stage must be 1 or 2, got {stage}")
+        self.parent = parent
+        self.stage = stage
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self.parent._validate_input_count(inputs)
+        return self.parent._stage_tactics(inputs, self.stage)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        compound = list(_FALLBACK_STAGE_TACTIC)
+        compound[self.stage - 1] = int(tactic)
+        return self.parent.forward(
+            inputs, tactic=tuple(compound), do_preparation=do_preparation, **kwargs
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (*self.parent._cache_key_extras(), "stage", self.stage)
 
 
 def __getattr__(name: str):

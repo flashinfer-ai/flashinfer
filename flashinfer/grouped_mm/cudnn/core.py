@@ -7,6 +7,9 @@ This module owns every cuDNN-specific concern for the grouped GEMM family:
 * Graph builders (cached with :func:`functools.lru_cache`) for the plain and
   block-scaled MOE grouped matmul variants.
 * Runners that wire PyTorch tensors into the cuDNN graphs and execute them.
+* Plan-count queries (:func:`_cudnn_moe_grouped_gemm_plan_count` and
+  :func:`_cudnn_moe_block_scale_grouped_gemm_plan_count`) that tell autotuners
+  which ``tactic`` indices a grouped GEMM accepts.
 
 The public ``grouped_mm_*`` entry points in :mod:`..core` dispatch into the
 ``_run_*`` helpers exported here.  Anything cuDNN-specific should live in this
@@ -224,6 +227,42 @@ def _build_cudnn_moe_grouped_gemm_graph(
     return graph, graph.get_workspace_size()
 
 
+def _cudnn_moe_grouped_gemm_plan_count(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    """Return how many execution plans cuDNN offers for this grouped GEMM.
+
+    The count is taken from the ``build_plan_policy.ALL`` graph that
+    :func:`_run_cudnn_moe_grouped_gemm` executes for ``tactic >= 0``, so the
+    valid tactic indices for these operand shapes, strides and dtypes are
+    exactly ``range(count)``. Building that graph compiles every plan once and
+    is refused while a CUDA graph is being captured, so autotuners must query it
+    outside capture.
+    """
+    token_3d = a.unsqueeze(0)
+    weight_3d = b.transpose(1, 2)
+    fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+    graph, _ = _build_cudnn_moe_grouped_gemm_graph(
+        _get_handle(a.device),
+        token_3d.shape,
+        token_3d.stride(),
+        _to_cudnn_dtype(a.dtype),
+        weight_3d.shape,
+        weight_3d.stride(),
+        _to_cudnn_dtype(b.dtype),
+        fto.shape,
+        fto.stride(),
+        _to_cudnn_dtype(alpha.dtype) if alpha is not None else None,
+        _to_cudnn_dtype(out_dtype),
+        policy=cudnn.build_plan_policy.ALL,
+    )
+    return graph.get_execution_plan_count()
+
+
 def _run_cudnn_moe_grouped_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -423,6 +462,70 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     graph.build_plans(policy)
 
     return graph, graph.get_workspace_size()
+
+
+def _cudnn_moe_block_scale_grouped_gemm_plan_count(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    block_size: int = 32,
+) -> int:
+    """Return how many execution plans cuDNN offers for this block-scaled grouped GEMM.
+
+    The count is taken from the ``build_plan_policy.ALL`` graph that
+    :func:`_run_cudnn_moe_block_scale_grouped_gemm_mxfp8` (``block_size=32``,
+    E4M3/E5M2 ``a``) or :func:`_run_cudnn_moe_block_scale_grouped_gemm_fp4`
+    (packed FP4 ``a``) executes for ``tactic >= 0``, so the valid tactic
+    indices for these operand shapes, strides and dtypes are exactly
+    ``range(count)``. Like the plain query, it compiles every plan once and is
+    refused while a CUDA graph is being captured.
+    """
+    token_3d = a.unsqueeze(0)
+    weight_3d = b.transpose(1, 2)
+    token_descale_3d = a_descale.unsqueeze(0)
+    weight_descale_3d = b_descale.transpose(1, 2)
+    fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+    if a.dtype in (torch.uint8, torch.float4_e2m1fn_x2):
+        token_shape, token_stride = _get_real_fp4_shape_from_packed_uint8(token_3d)
+        weight_shape, weight_stride = _get_real_fp4_shape_from_packed_uint8(weight_3d)
+        token_cudnn_dtype = weight_cudnn_dtype = cudnn.data_type.FP4_E2M1
+    else:
+        token_shape, token_stride = token_3d.shape, token_3d.stride()
+        weight_shape, weight_stride = weight_3d.shape, weight_3d.stride()
+        token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
+        weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
+
+    def descale_dtype(descale: torch.Tensor):
+        if descale.dtype == torch.uint8:
+            return cudnn.data_type.FP8_E8M0
+        return _to_cudnn_dtype(descale.dtype)
+
+    graph, _ = _build_cudnn_moe_block_scale_grouped_gemm_graph(
+        _get_handle(a.device),
+        token_shape,
+        token_stride,
+        token_cudnn_dtype,
+        token_descale_3d.shape,
+        token_descale_3d.stride(),
+        descale_dtype(a_descale),
+        weight_shape,
+        weight_stride,
+        weight_cudnn_dtype,
+        weight_descale_3d.shape,
+        weight_descale_3d.stride(),
+        descale_dtype(b_descale),
+        fto.shape,
+        fto.stride(),
+        _to_cudnn_dtype(alpha.dtype) if alpha is not None else None,
+        _to_cudnn_dtype(out_dtype),
+        block_size=block_size,
+        policy=cudnn.build_plan_policy.ALL,
+    )
+    return graph.get_execution_plan_count()
 
 
 def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
