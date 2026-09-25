@@ -21,10 +21,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir import ir
 
-try:
-    from cutlass.cute import iket  # type: ignore
-except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import iket  # type: ignore[no-redef]
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import iket
 
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
     MoEWorkTileInfo,
@@ -1015,7 +1012,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         First trace site consumes pre-init work; later trace sites advance normally.
         """
-        iket.range_push("produce_tile_id")
+        iket.range_push("scheduler_select_next_work_tile")
         # static mode first call short-circuits: internal_init already wrote
         # the first work tile to self.current_work, so just leave it alone.
         # All other (mode, call-site) combinations run the full advance +

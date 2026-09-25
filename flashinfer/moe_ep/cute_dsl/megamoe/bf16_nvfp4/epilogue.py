@@ -134,7 +134,9 @@ class W4A16Epilogue:
             barrier_id=self._EpilogueSyncWaitBarId,
             num_threads=32 * self._EpilogueWarpCnt,
         )
+        iket.range_push("epilogue_wait_sched_record")
         work_tile_info = sched_consumer.consume_work()
+        iket.range_pop()
 
         flag_tracker = GpuReleaseFlagBatchTracker(
             flag_addr=Int64(0),
@@ -169,7 +171,9 @@ class W4A16Epilogue:
 
             acc_consumer_state.advance()
 
+            iket.range_push("epilogue_wait_sched_record")
             work_tile_info = sched_consumer.consume_work()
+            iket.range_pop()
 
             wait_only_named_barrier.arrive_and_wait()
 
@@ -333,15 +337,22 @@ class W4A16Fc2Epilogue(EpilogueContext):
             # routing uses only the work record and can precede the acc wait.
             if not work_tile_info.peek_ready:
                 acc_ready = True
+                iket.range_push("epilogue_wait_fc2_mma_result")
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                iket.range_pop()
         fc2_output_router = self._make_output_router(work_tile_info)
         # Each warp may address only its own 32 TMEM rows.
         tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
             tmem_acc_tensor,
             (32, self._EpilogueTokenTileSize),
         )[None, None, self.tidx // 32, None]
+        iket.range_push("epilogue_wait_fc2_mma_result")
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
-        iket.range_push("fc2_epi")
+        iket.range_pop()
+        iket.range_push(
+            "epilogue_store_fc2_token_output",
+            (work_tile_info.phase << 16) | work_tile_info.expert_idx,
+        )
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
         # W4A16 rejects overlapping accumulators. Static subtiles make the
@@ -502,8 +513,13 @@ class W4A16Fc1Epilogue(EpilogueContext):
             norm_const = self.optional_epi_args.fc1_norm_const[
                 work_tile_info.expert_idx
             ]
+        iket.range_push("epilogue_wait_fc1_mma_result")
         acc_pipeline.consumer_wait(acc_consumer_state)
-        iket.range_push("fc1_epi")
+        iket.range_pop()
+        iket.range_push(
+            "epilogue_store_fc1_intermediate",
+            (work_tile_info.phase << 16) | work_tile_info.expert_idx,
+        )
         # Keep prior subtiles in the established loop and specialize only the
         # final one. N64 has no prior subtile; N128 has one.
         if cutlass.const_expr(self.subtile_cnt > 1):

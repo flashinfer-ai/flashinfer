@@ -22,6 +22,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import mixed_input_helpers as mixed_input_utils
 from cutlass.utils import blockscaled_layout as blockscaled_utils
 
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import iket
 from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16_kernel import (
     Sm100W4A16GroupedGemmKernel,
 )
@@ -53,6 +54,16 @@ _NvlinkSlotCount = 2
 
 class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
     """Reuse local W4A16 layouts with Mega-fitted raw and decoded-TMEM stages."""
+
+    @cute.jit
+    def _trace_transform_push(
+        self, name: cutlass.Constexpr, k_tile: cutlass.Int32
+    ) -> None:
+        iket.range_push(name, k_tile)
+
+    @cute.jit
+    def _trace_transform_pop(self) -> None:
+        iket.range_pop()
 
     def _compute_stages_and_tmem_cols(
         self,
@@ -889,6 +900,11 @@ class Sm100W4A16MegaMoEKernel:
         k_count,
     ):
         """Packed A+SF TMA path from local W4A16 and swapped Mega slicing."""
+        # Work-range payload: FC phase in the high 16 bits, local expert below.
+        # IKET emits one record per active warp; normal compilation strips it.
+        iket.range_push(
+            "weight_issue_nvfp4_and_scale_tma", (work.phase << 16) | work.expert_idx
+        )
         real_a, _ = ext.get_gmem_tensor("a", tensor, work)
         real_s, _ = ext.get_gmem_tensor("sfa", sf_tensor, work)
         thr = mma.get_slice(cute.arch.block_idx()[0] % cute.size(mma.thr_id.shape))
@@ -942,6 +958,7 @@ class Sm100W4A16MegaMoEKernel:
             )
             pipe.producer_commit(state)
             state.advance()
+        iket.range_pop()
         return state
 
     @cute.jit
@@ -959,6 +976,9 @@ class Sm100W4A16MegaMoEKernel:
         state,
         k_count,
     ):
+        iket.range_push(
+            "activation_issue_bf16_tma", (work.phase << 16) | work.expert_idx
+        )
         real_b, _ = ext.get_gmem_tensor("b", tensor, work)
         # Match the existing swapped Mega dynamic-N split in both FC phases.
         # Only two-CTA MMA splits B at align16(valid)/2. One-CTA
@@ -1001,6 +1021,7 @@ class Sm100W4A16MegaMoEKernel:
             )
             pipe.producer_commit(state)
             state.advance()
+        iket.range_pop()
         return state
 
     @cute.jit
@@ -1212,15 +1233,27 @@ class Sm100W4A16MegaMoEKernel:
             cute.arch.setmaxregister_decrease(80)
 
         if warp == 7:
+            iket.range_push("sched_wait_dispatch_metadata")
             self.token_comm.sched_warp_pre_init_wait(token_comm_args)
+            iket.range_pop()
             if cutlass.const_expr(not early_init):
                 scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
             scheduler.gen_next_work()
             while scheduler.current_work.is_valid_tile:
+                iket.range_push(
+                    "sched_publish_work_record",
+                    (scheduler.current_work.phase << 16)
+                    | scheduler.current_work.expert_idx,
+                )
                 scheduler.publish_work()
+                iket.range_pop()
                 scheduler.gen_next_work()
+            iket.range_push("sched_publish_work_record", cutlass.Int32(-1))
             scheduler.publish_work()
+            iket.range_pop()
+            iket.range_push("sched_wait_records_released")
             scheduler.produce_tail()
+            iket.range_pop()
 
         # Each role owns its scheduler state, including mutations inside jit calls.
         if warp == 5:
@@ -1228,7 +1261,9 @@ class Sm100W4A16MegaMoEKernel:
             state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, mix.num_load2trans_stage
             )
+            iket.range_push("weight_wait_sched_record")
             work = consumer.consume_work()
+            iket.range_pop()
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
                     state = self._weight_task(
@@ -1264,18 +1299,29 @@ class Sm100W4A16MegaMoEKernel:
                         state,
                         self._fc2_k_tiles,
                     )
+                iket.range_push("weight_wait_sched_record")
                 work = consumer.consume_work()
+                iket.range_pop()
+            iket.range_push("weight_wait_raw_smem_released")
             raw_pipe.producer_tail(state)
+            iket.range_pop()
 
         if warp == 6:
             consumer = scheduler.make_consumer()
             state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_activation_stages
             )
+            iket.range_push("activation_wait_sched_record")
             work = consumer.consume_work()
+            iket.range_pop()
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
+                    iket.range_push(
+                        "activation_wait_fc1_tokens_ready",
+                        (work.phase << 16) | work.expert_idx,
+                    )
                     self.token_comm.fc1_tma_b_predispatch_spin(token_comm_args, work)
+                    iket.range_pop()
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1290,6 +1336,10 @@ class Sm100W4A16MegaMoEKernel:
                         self._fc1_k_tiles,
                     )
                 else:
+                    iket.range_push(
+                        "activation_wait_fc1_intermediate",
+                        (work.phase << 16) | work.expert_idx,
+                    )
                     if not work.peek_ready:
                         spin_wait(
                             fc1_done.iterator
@@ -1298,6 +1348,7 @@ class Sm100W4A16MegaMoEKernel:
                             lambda v: v >= fc2_threshold,
                             fail_sleep_cycles=500,
                         )
+                    iket.range_pop()
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1311,8 +1362,12 @@ class Sm100W4A16MegaMoEKernel:
                         state,
                         self._fc2_k_tiles,
                     )
+                iket.range_push("activation_wait_sched_record")
                 work = consumer.consume_work()
+                iket.range_pop()
+            iket.range_push("activation_wait_smem_released")
             activation_pipe.producer_tail(state)
+            iket.range_pop()
 
         if warp == 4:
             consumer = scheduler.make_consumer()
@@ -1334,7 +1389,9 @@ class Sm100W4A16MegaMoEKernel:
             acc_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, 2
             )
+            iket.range_push("mma_wait_sched_record")
             work = consumer.consume_work()
+            iket.range_pop()
             while work.is_valid_tile:
                 k_count = cutlass.Int32(self._fc2_k_tiles)
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
@@ -1342,11 +1399,22 @@ class Sm100W4A16MegaMoEKernel:
                 a_state.reset_count()
                 b_state.reset_count()
                 if leader:
+                    iket.range_push(
+                        "mma_wait_and_issue_tile", (work.phase << 16) | work.expert_idx
+                    )
+                    iket.range_push("mma_wait_acc_slot_free")
                     acc_pipe.producer_acquire(acc_state)
+                    iket.range_pop()
                     tile_acc = acc[(None, None, None, acc_state.index)]
                     for k_tile in cutlass.range(k_count, unroll=1):
+                        iket.range_push("mma_wait_weight_tmem_ready", k_tile)
                         transform_pipe.consumer_wait(a_state)
+                        iket.range_pop()
+                        iket.range_push("mma_wait_activation_smem_ready", k_tile)
                         activation_pipe.consumer_wait(b_state)
+                        iket.range_pop()
+                        # This interval is asynchronous MMA issue, not completion.
+                        iket.range_push("mma_issue_k_tile", k_tile)
                         dynamic_mainloop.issue_dynamic_bf16_mma_tile(
                             acc_tensor=tile_acc,
                             a_frag_tile=a_frag[(None, None, None, a_state.index)],
@@ -1355,14 +1423,20 @@ class Sm100W4A16MegaMoEKernel:
                             valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler,
                         )
+                        iket.range_pop()
                         transform_pipe.consumer_release(a_state)
                         activation_pipe.consumer_release(b_state)
                         a_state.advance()
                         b_state.advance()
                     acc_pipe.producer_commit(acc_state)
+                    iket.range_pop()
                 acc_state.advance()
+                iket.range_push("mma_wait_sched_record")
                 work = consumer.consume_work()
+                iket.range_pop()
+            iket.range_push("mma_wait_acc_tmem_released")
             acc_pipe.producer_tail(acc_state)
+            iket.range_pop()
 
         if warp < 4:
             consumer = scheduler.make_consumer()
@@ -1390,6 +1464,7 @@ class Sm100W4A16MegaMoEKernel:
         if warp >= 8 and warp < 12:
             cute.arch.setmaxregister_decrease(64)
             if cutlass.const_expr(staging_inputs is not None):
+                iket.range_push("dispatch_stage_local_inputs")
                 self.token_comm.stage_inputs(
                     staging_inputs[0],
                     staging_inputs[1],
@@ -1398,6 +1473,8 @@ class Sm100W4A16MegaMoEKernel:
                     warp_idx=warp,
                     lane_idx=cute.arch.lane_idx(),
                 )
+                iket.range_pop()
+            iket.range_push("dispatch_exchange_tokens")
             self.token_comm.dispatch_warp_body(
                 token_comm_args,
                 comm_storage,
@@ -1405,6 +1482,7 @@ class Sm100W4A16MegaMoEKernel:
                 lane_idx=cute.arch.lane_idx(),
                 tidx=tidx,
             )
+            iket.range_pop()
             if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") != "1"):
                 # Input publication retires previous-bank readers on every
                 # rank. The existing drain publishes these clears before the
@@ -1484,8 +1562,14 @@ class Sm100W4A16MegaMoEKernel:
             transform_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, mix.num_trans2mma_stage
             )
+            iket.range_push("transform_wait_sched_record")
             work = consumer.consume_work()
+            iket.range_pop()
             while work.is_valid_tile:
+                iket.range_push(
+                    "transform_decode_nvfp4_to_bf16",
+                    (work.phase << 16) | work.expert_idx,
+                )
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
                     raw_state, transform_state = self.mixed_fc1._transform_tile(
                         raw_pipe,
@@ -1504,7 +1588,10 @@ class Sm100W4A16MegaMoEKernel:
                         *parts_fc2,
                         cutlass.Int32(self._fc2_k_tiles),
                     )
+                iket.range_pop()
+                iket.range_push("transform_wait_sched_record")
                 work = consumer.consume_work()
+                iket.range_pop()
             if cutlass.const_expr(
                 not self.in_kernel_fc2_reduce and reduced_output is not None
             ):
@@ -1521,18 +1608,24 @@ class Sm100W4A16MegaMoEKernel:
                     score_reg,
                     tidx - 32 * self.transform_warp_id[0],
                 )
+            iket.range_push("transform_wait_tmem_released")
             transform_pipe.producer_tail(transform_state)
+            iket.range_pop()
 
         tail_barrier = pipeline.NamedBarrier(
             barrier_id=self.token_comm.kernel_tail_named_barrier_id,
             num_threads=self.token_comm.kernel_tail_threads,
         )
+        iket.range_push("cta_wait_all_roles_finished")
         tail_barrier.arrive_and_wait()
+        iket.range_pop()
+        iket.range_push("cta_drain_peer_token_returns")
         self.token_comm.kernel_tail_drain(
             token_comm_args,
             warp_idx=warp,
             lane_idx=cute.arch.lane_idx(),
         )
+        iket.range_pop()
         if cutlass.const_expr(
             not self.in_kernel_fc2_reduce and reduced_output is not None
         ):
@@ -1551,8 +1644,11 @@ class Sm100W4A16MegaMoEKernel:
                     tidx + 32 * self.num_transform_warps,
                 )
             # bar.sync is aligned: every role must execute one common site.
+            iket.range_push("cta_wait_returns_before_combine")
             tail_barrier.arrive_and_wait()
+            iket.range_pop()
             if warp < 8 or warp >= 12:
+                iket.range_push("combine_reduce_topk_bf16")
                 combine = cute.recast_tensor(
                     token_comm_args.combine_output, cutlass.BFloat16
                 )
@@ -1578,6 +1674,7 @@ class Sm100W4A16MegaMoEKernel:
                                 worker_idx,
                             )
                         )
+                iket.range_pop()
             else:
                 self.token_comm.kernel_tail_cleanup(
                     token_comm_args,
