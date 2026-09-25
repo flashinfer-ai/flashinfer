@@ -73,6 +73,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
+"flashinfer.experimental.adaptive_sparse_block_mask" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
