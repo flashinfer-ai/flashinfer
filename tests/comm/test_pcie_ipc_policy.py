@@ -45,8 +45,11 @@ from flashinfer.comm.pcie_ipc_policy import (
     IpcLaunchConfig,
     IpcVariant,
     _admits,
+    _is_fused_launchable,
     _is_launchable,
     _seed,
+    fused_rms_norm_threads,
+    get_pcie_ipc_fused_launch_config,
     get_pcie_ipc_launch_config,
 )
 
@@ -226,6 +229,140 @@ def test_the_seed_crosses_to_a_staged_kernel_as_the_payload_grows() -> None:
     # Two ranks stage exactly the bytes they would have pushed (2P/N is P at
     # N == 2), so there is no crossover to place and no second branch.
     assert len({_config(2, numel).variant for numel in _LADDER}) == 1
+
+
+def _fused_config(world_size, batch, hidden, max_blocks=MAX_BLOCKS):
+    return get_pcie_ipc_fused_launch_config(
+        world_size, batch * hidden, hidden, _ELEM_SIZE, max_blocks
+    )
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_every_fused_config_is_launchable(world_size: int) -> None:
+    """The seed must never name something the fused dispatch cannot reach."""
+    for hidden in _HIDDENS:
+        for batch in _BATCHES:
+            config = _fused_config(world_size, batch, hidden)
+            if config is None:
+                continue
+            assert _is_fused_launchable(
+                world_size, config, MAX_BLOCKS, hidden, _ELEM_SIZE
+            ), f"ws={world_size} batch={batch} hidden={hidden} -> {config}"
+
+
+def test_the_world8_block_kernel_needs_blocks_in_fours() -> None:
+    """Both counts, not just the grid.
+
+    The kernel takes its chunk from ``blockIdx.x & 3`` and its stride from
+    ``transport_blocks >> 2``. A grid that is a multiple of four with a
+    transport slice that is not leaves the stride short of the work, and a
+    transport slice of one to three makes it zero -- the grid-stride loops then
+    never advance and the collective hangs with nothing to time it out.
+    """
+    hidden = 6144
+    threads = fused_rms_norm_threads(hidden, _ELEM_SIZE)
+    for blocks, transport, ok in (
+        (4, 0, True),  # 0 means every block, so the slice is 4
+        (8, 4, True),
+        (8, 8, True),
+        (4, 2, False),
+        (8, 2, False),
+        (8, 6, False),
+        (6, 0, False),
+        (2, 0, False),
+    ):
+        config = IpcLaunchConfig(blocks, threads, IpcVariant.STAGED, transport)
+        assert _is_fused_launchable(8, config, MAX_BLOCKS, hidden, _ELEM_SIZE) is ok, (
+            config
+        )
+    # The rule is the world-8 block kernel's alone: the same counts are fine for
+    # the transports that partition by grid stride rather than by blockIdx bits.
+    for variant in (IpcVariant.STAGED_RING, IpcVariant.UNSTAGED):
+        config = IpcLaunchConfig(8, threads, variant, 2)
+        assert _is_fused_launchable(8, config, MAX_BLOCKS, hidden, _ELEM_SIZE), config
+    # And it does not follow the variant to a smaller world, where kStaged names
+    # the flat push instead.
+    config = IpcLaunchConfig(2, threads, IpcVariant.STAGED, 0)
+    assert _is_fused_launchable(4, config, MAX_BLOCKS, hidden, _ELEM_SIZE), config
+
+
+def test_the_flat_push_is_eight_ranks_only_on_the_fused_path_too() -> None:
+    """The same restriction the plain admission puts on FLAT_STAGED.
+
+    It exists so the two dispatches accept the same set: a variant that is
+    launchable on one path and not the other is exactly the asymmetry that hid
+    the missing world-8 kernel.
+    """
+    hidden = 6144
+    threads = fused_rms_norm_threads(hidden, _ELEM_SIZE)
+    config = IpcLaunchConfig(4, threads, IpcVariant.FLAT_STAGED, 0)
+    assert _is_fused_launchable(8, config, MAX_BLOCKS, hidden, _ELEM_SIZE)
+    for world_size in (2, 4):
+        assert not _is_fused_launchable(
+            world_size, config, MAX_BLOCKS, hidden, _ELEM_SIZE
+        ), world_size
+
+
+def test_the_fused_seed_crosses_to_the_ring_as_the_payload_grows() -> None:
+    """Same one-way crossover as the plain seed, at a world-size-dependent point.
+
+    Where it sits is measured and moves between machines; that it happens once
+    and does not come back is structural, and is what is pinned here. Two ranks
+    have no ring kernel at all, so they never cross.
+    """
+    hidden = 6144
+    for world_size in (4, 8):
+        variants = [
+            _fused_config(world_size, batch, hidden).variant
+            for batch in (1, 2, 4, 8, 16, 32, 64, 128)
+        ]
+        # Which non-ring transport starts the ladder depends on the world size
+        # -- staged at four ranks, the island one-shot at eight -- and that is
+        # the plain seed's split too. What matters here is only that it is not
+        # the ring yet.
+        assert variants[0] is not IpcVariant.STAGED_RING, world_size
+        assert variants[-1] is IpcVariant.STAGED_RING, world_size
+        ring = [v is IpcVariant.STAGED_RING for v in variants]
+        assert ring == sorted(ring), f"ws={world_size}: {variants}"
+
+    assert all(
+        _fused_config(2, batch, hidden).variant is not IpcVariant.STAGED_RING
+        for batch in (1, 8, 128)
+    )
+
+
+def test_the_fused_seed_refuses_rows_wider_than_the_register_budget() -> None:
+    """Admission for the fused path is stricter than for the plain one.
+
+    A row is held in registers across the normalisation, so past
+    ``4 * 1024`` packs there is no thread count that can hold one -- and the
+    plain all-reduce still takes the same shape.
+    """
+    wide = 4 * 1024 * _PACK_ELEMS * 2  # twice what the widest block can hold
+    assert _fused_config(4, 1, wide) is None
+    assert _config(4, wide) is not None
+
+
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+def test_the_fused_seed_never_names_a_plain_only_variant(world_size: int) -> None:
+    """The fused entry point dispatches three transports; the enum carries four.
+
+    FLAT_STAGED names no fused kernel: at world size 8 the fused STAGED already
+    *is* the flat form, and below that the two would be the same kernel.
+    """
+    for hidden in _HIDDENS:
+        for batch in _BATCHES:
+            config = _fused_config(world_size, batch, hidden)
+            if config is None:
+                continue
+            assert config.variant in (
+                IpcVariant.UNSTAGED,
+                IpcVariant.STAGED,
+                IpcVariant.STAGED_RING,
+            )
+            # No TP2 ring kernel exists to dispatch to.
+            if world_size == 2:
+                assert config.variant is not IpcVariant.STAGED_RING
 
 
 def test_the_answer_keys_on_the_element_count_not_on_its_factorisation() -> None:
