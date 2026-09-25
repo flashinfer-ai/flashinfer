@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests for the SM100 eight-peer Cake fused norm-combine export.
+Tests for the SM100 / SM103 eight-peer Cake fused norm-combine export.
 
 The CPU tests check the verified module inventory, the token dispatch, the
 workspace layout helper and the argument validation of the public API.  The
-distributed test runs the public API on eight SM100 GPUs against an
-independent PyTorch reference of the same math."""
+distributed test runs the public API on eight SM100 or eight SM103 GPUs
+against an independent PyTorch reference of the same math."""
 
 from __future__ import annotations
 
@@ -44,11 +44,19 @@ WORKER_TIMEOUT_SECONDS = 20 * 60
 
 def test_module_inventory_is_verified_source_only() -> None:
     assert loader.MODULES
-    assert set(loader.ROUTES) == {loader.VARIANT_ONE_SHOT, loader.VARIANT_OWNER_REDUCE}
-    assert set(loader.ROUTES.values()) == set(loader.MODULES)
+    assert set(loader.ROUTES) == set(loader.ARCHES) == {"sm_100a", "sm_103a"}
+    assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
+    routed = set()
+    for arch, routes in loader.ROUTES.items():
+        assert set(routes) == {loader.VARIANT_ONE_SHOT, loader.VARIANT_OWNER_REDUCE}
+        assert all(loader.MODULES[name]["arch"] == arch for name in routes.values())
+        routed |= set(routes.values())
+    assert routed == set(loader.MODULES)
     for name, record in loader.MODULES.items():
         assert name.startswith("cake_") and record["cache_name"].startswith("cake_")
+        assert record["cache_name"].endswith(record["arch"])
         assert record["kernel_symbol"].startswith("kernel_cake_")
+        assert all(f"/{record['arch']}/" in path for path in record["sources"])
         assert record["ffi_entry"] == "run"
         paths = loader.verified_sources(name)
         assert len(paths) == 2 and all(path.suffix == ".cu" for path in paths)
@@ -77,21 +85,27 @@ def test_module_inventory_is_verified_source_only() -> None:
         assert launch["use_pdl"] is True
         assert launch["cooperative"] is False
         assert tuple(launch["cluster"]) == (1, 1, 1)
-    one_shot = loader.MODULES[loader.ROUTES[loader.VARIANT_ONE_SHOT]]["launch"]
-    owner = loader.MODULES[loader.ROUTES[loader.VARIANT_OWNER_REDUCE]]["launch"]
-    # The one-shot half runs both tracks concurrently (two 160-thread halves);
-    # the owner reduce keeps the source's 160-thread row.
-    assert tuple(one_shot["block"]) == (320, 1, 1)
-    assert tuple(owner["block"]) == (160, 1, 1)
+    for routes in loader.ROUTES.values():
+        one_shot = loader.MODULES[routes[loader.VARIANT_ONE_SHOT]]["launch"]
+        owner = loader.MODULES[routes[loader.VARIANT_OWNER_REDUCE]]["launch"]
+        # The one-shot half runs both tracks concurrently (two 160-thread
+        # halves); the owner reduce keeps the source's 160-thread row.
+        assert tuple(one_shot["block"]) == (320, 1, 1)
+        assert tuple(owner["block"]) == (160, 1, 1)
 
 
 def test_jit_spec_math_flags_follow_the_source_build() -> None:
     # The source arm compiles the same translation units without fast-math unless
-    # the recorded compile flags say otherwise; the JIT build must not add it.
+    # the recorded compile flags say otherwise; the JIT build must not add it,
+    # and every module is compiled for exactly its own architecture.
     for name, record in loader.MODULES.items():
         flags = loader.spec(name).extra_cuda_cflags or []
         fast = any(flag in ("-use_fast_math", "--use_fast_math") for flag in flags)
         assert fast == ("--use_fast_math" in record["compile_flags"]), name
+        gencode = [flag for flag in flags if flag.startswith("-gencode=")]
+        assert gencode == [
+            f"-gencode=arch=compute_{record['arch'][3:]},code={record['arch']}"
+        ], name
 
 
 @pytest.mark.parametrize(
@@ -109,7 +123,10 @@ def test_jit_spec_math_flags_follow_the_source_build() -> None:
 def test_token_dispatch(tokens: int, expected: str) -> None:
     assert loader.LARGE_MIN_TOKENS == 256
     assert loader.select_variant(tokens) == expected
-    assert loader.route_module_name(tokens) == loader.ROUTES[expected]
+    for arch in loader.ARCHES:
+        assert loader.route_module_name(tokens, arch) == loader.ROUTES[arch][expected]
+    with pytest.raises(ValueError):
+        loader.route_module_name(tokens, "sm_90a")
     assert api.select_variant(tokens) == expected
 
 
@@ -119,19 +136,24 @@ def test_token_dispatch_rejects_non_positive_counts(tokens) -> None:
         loader.select_variant(tokens)
 
 
-def test_route_scope_is_eight_sm100_peers_with_hidden_2560() -> None:
-    assert loader.route_applies(
-        world_size=8, device_capability=(10, 0), hidden_dim=2560
-    )
-    assert not loader.route_applies(
-        world_size=4, device_capability=(10, 0), hidden_dim=2560
-    )
-    assert not loader.route_applies(
-        world_size=8, device_capability=(10, 3), hidden_dim=2560
-    )
-    assert not loader.route_applies(
-        world_size=8, device_capability=(10, 0), hidden_dim=4096
-    )
+def test_route_scope_is_eight_sm100_or_sm103_peers_with_hidden_2560() -> None:
+    assert loader.arch_for_capability((10, 0)) == "sm_100a"
+    assert loader.arch_for_capability((10, 3)) == "sm_103a"
+    assert loader.arch_for_capability((9, 0)) is None
+    for capability in ((10, 0), (10, 3)):
+        assert loader.route_applies(
+            world_size=8, device_capability=capability, hidden_dim=2560
+        )
+        assert not loader.route_applies(
+            world_size=4, device_capability=capability, hidden_dim=2560
+        )
+        assert not loader.route_applies(
+            world_size=8, device_capability=capability, hidden_dim=4096
+        )
+    for capability in ((9, 0), (12, 0), (12, 1)):
+        assert not loader.route_applies(
+            world_size=8, device_capability=capability, hidden_dim=2560
+        )
 
 
 def test_workspace_layout_matches_the_kernel_contract() -> None:
@@ -379,14 +401,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def _sm100_eight_gpu_node() -> bool:
+def _exported_eight_gpu_node() -> bool:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
         return False
-    return all(torch.cuda.get_device_capability(index) == (10, 0) for index in range(8))
+    capabilities = {
+        tuple(torch.cuda.get_device_capability(index)) for index in range(8)
+    }
+    return len(capabilities) == 1 and capabilities.issubset(loader.ARCH_BY_CAPABILITY)
 
 
 @pytest.mark.skipif(
-    not _sm100_eight_gpu_node(), reason="requires eight SM100 GPUs on one node"
+    not _exported_eight_gpu_node(),
+    reason="requires eight SM100 or eight SM103 GPUs on one node",
 )
 def test_eight_peer_fused_norm_combine_matches_the_reference() -> None:
     world_size = 8

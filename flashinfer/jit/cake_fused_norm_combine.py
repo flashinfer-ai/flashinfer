@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Verified source-only JIT loading for the Cake SM100 eight-peer fused norm-combine.
+Verified source-only JIT loading for the Cake SM100 / SM103 eight-peer fused norm-combine.
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding that FlashInfer's JIT compiles
@@ -34,11 +34,12 @@ from typing import Any, Literal, Sequence
 import torch
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
+from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Filled mechanically from the complete verified program bundle.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058": {
+        "arch": "sm_100a",
         "arg_plan": [
             ("buffer", "x"),
             ("buffer", "residual"),
@@ -74,7 +75,45 @@ MODULES: dict[str, dict[str, Any]] = {
             "csrc/cake_fused_norm_combine/sm_100a/cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058_binding.cu",
         ],
     },
+    "cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d": {
+        "arch": "sm_103a",
+        "arg_plan": [
+            ("buffer", "x"),
+            ("buffer", "residual"),
+            ("buffer", "weight"),
+            ("buffer", "norm_out"),
+            ("buffer", "residual_out"),
+            ("buffer", "collective_out"),
+            ("buffer", "workspace"),
+            ("parameter", "rank"),
+            ("parameter", "tokens"),
+            ("parameter", "epsilon"),
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ],
+        "cache_name": "cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_sm_103a",
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d",
+        "launch": {
+            "block": (160, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": True,
+        },
+        "source_sha256": {
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_binding.cu": "dd4b44333046149e289582dca4a739c6f6bef1f1b81d8ee23918b2251becff80",
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_kernel.cu": "ee7bfcaa3bc2b01b64a99648ea2a99775a7a43c0b6e7c3895ff99844fc4fb2c5",
+        },
+        "sources": [
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_kernel.cu",
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_binding.cu",
+        ],
+    },
     "cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912": {
+        "arch": "sm_100a",
         "arg_plan": [
             ("buffer", "x"),
             ("buffer", "residual"),
@@ -110,16 +149,67 @@ MODULES: dict[str, dict[str, Any]] = {
             "csrc/cake_fused_norm_combine/sm_100a/cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912_binding.cu",
         ],
     },
+    "cake_fused_norm_combine_bf16_ee481367764d334ab381": {
+        "arch": "sm_103a",
+        "arg_plan": [
+            ("buffer", "x"),
+            ("buffer", "residual"),
+            ("buffer", "weight"),
+            ("buffer", "norm_out"),
+            ("buffer", "residual_out"),
+            ("buffer", "collective_out"),
+            ("buffer", "workspace"),
+            ("parameter", "rank"),
+            ("parameter", "tokens"),
+            ("parameter", "epsilon"),
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ],
+        "cache_name": "cake_fused_norm_combine_bf16_ee481367764d334ab381_sm_103a",
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_ee481367764d334ab381",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 10496,
+            "use_pdl": True,
+        },
+        "source_sha256": {
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_ee481367764d334ab381_binding.cu": "e444156fe651e1649cf414a217f71e67998725f2d968a685666461cc114c60ef",
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_ee481367764d334ab381_kernel.cu": "888daa8fe93eb4b164d724148423ad6aed936a121f40065d728a03de864cdae6",
+        },
+        "sources": [
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_ee481367764d334ab381_kernel.cu",
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_ee481367764d334ab381_binding.cu",
+        ],
+    },
 }
-ROUTES: dict[str, str] = {
-    "owner_lamport": "cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912",
-    "parallel_lamport": "cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058",
+ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "owner_lamport": "cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912",
+        "parallel_lamport": "cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058",
+    },
+    "sm_103a": {
+        "owner_lamport": "cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d",
+        "parallel_lamport": "cake_fused_norm_combine_bf16_ee481367764d334ab381",
+    },
 }
 LARGE_MIN_TOKENS = 256
 
 SOURCE_PACKAGE = "cake_fused_norm_combine"
-ARCH = "sm_100a"
-DEVICE_CAPABILITY = (10, 0)
+# One verified build per architecture: B200 (``sm_100a``) and B300 (``sm_103a``).
+ARCHES = ("sm_100a", "sm_103a")
+ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+}
+_ARCH_NVCC_FLAGS: dict[str, list[str]] = {
+    "sm_100a": sm100a_nvcc_flags,
+    "sm_103a": sm103a_nvcc_flags,
+}
 WORLD_SIZE = 8
 HIDDEN_DIM = 2560
 TRACKS = 2
@@ -143,26 +233,38 @@ def select_variant(tokens: int) -> str:
     return VARIANT_ONE_SHOT
 
 
+def arch_for_capability(device_capability: Sequence[int]) -> str | None:
+    """Name the exported architecture for one device capability, if any."""
+
+    values = [int(value) for value in device_capability]
+    if len(values) != 2:
+        return None
+    return ARCH_BY_CAPABILITY.get((values[0], values[1]))
+
+
 def route_applies(
     *, world_size: int, device_capability: Sequence[int], hidden_dim: int
 ) -> bool:
     """Whether the verified export owns a fused norm-combine call."""
 
+    arch = arch_for_capability(device_capability)
     return (
-        bool(ROUTES)
+        arch is not None
+        and bool(ROUTES.get(arch))
         and int(world_size) == WORLD_SIZE
-        and tuple(int(value) for value in device_capability) == DEVICE_CAPABILITY
         and int(hidden_dim) == HIDDEN_DIM
     )
 
 
-def route_module_name(tokens: int) -> str:
-    """Return the exported module name for one token count."""
+def route_module_name(tokens: int, arch: str) -> str:
+    """Return the exported module name for one token count on ``arch``."""
 
     variant = select_variant(tokens)
-    name = ROUTES.get(variant)
+    name = ROUTES.get(arch, {}).get(variant)
     if name is None:
-        raise ValueError(f"unsupported Cake fused norm-combine route: {variant!r}")
+        raise ValueError(
+            f"unsupported Cake fused norm-combine route: {variant!r} on {arch!r}"
+        )
     return name
 
 
@@ -217,7 +319,7 @@ def spec(name: str) -> JitSpec:
     return gen_jit_spec(
         name=record["cache_name"],
         sources=list(verified_sources(name)),
-        extra_cuda_cflags=[*sm100a_nvcc_flags, *record["compile_flags"]],
+        extra_cuda_cflags=[*_ARCH_NVCC_FLAGS[record["arch"]], *record["compile_flags"]],
         extra_include_paths=[_source_dir().parent],
         # The source build carries every math flag in ``compile_flags``; the
         # default ``-use_fast_math`` would change rounding against it.
@@ -258,9 +360,12 @@ def run_cake_fused_norm_combine(
     device_index = x.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    if tuple(torch.cuda.get_device_capability(device_index)) != DEVICE_CAPABILITY:
-        raise ValueError("the Cake fused norm-combine export targets SM100 only")
-    name = route_module_name(int(tokens))
+    arch = arch_for_capability(torch.cuda.get_device_capability(device_index))
+    if arch is None:
+        raise ValueError(
+            "the Cake fused norm-combine export targets SM100 and SM103 only"
+        )
+    name = route_module_name(int(tokens), arch)
     record = MODULES[name]
     values: dict[str, object] = {
         "x": x,
@@ -284,8 +389,8 @@ def run_cake_fused_norm_combine(
 
 
 __all__ = [
-    "ARCH",
-    "DEVICE_CAPABILITY",
+    "ARCHES",
+    "ARCH_BY_CAPABILITY",
     "HIDDEN_DIM",
     "LARGE_MIN_TOKENS",
     "MODULES",
@@ -295,6 +400,7 @@ __all__ = [
     "VARIANT_OWNER_REDUCE",
     "WORKSPACE_TABLE_ENTRIES",
     "WORLD_SIZE",
+    "arch_for_capability",
     "load",
     "route_applies",
     "route_module_name",
