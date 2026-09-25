@@ -21,68 +21,111 @@ import pytest
 import torch
 
 from flashinfer.cudnn import decode, prefill
-from flashinfer.cudnn.utils import (
-    execute_cudnn_backend,
-    prepare_cudnn_backend_execution,
-)
+from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
 
 
-def test_backend_execution_rebinds_pointer_frame_and_handle():
-    calls = []
-    native = SimpleNamespace(
-        uids=(3, 8),
-        execute=lambda pointers, **kwargs: calls.append((pointers, kwargs)),
-    )
-    prepared = prepare_cudnn_backend_execution(
-        SimpleNamespace(_prepare_backend_execution=lambda: native)
-    )
-    inputs = [torch.empty(4), torch.empty(4)]
-    outputs = [torch.empty(4), torch.empty(4)]
-    workspaces = [torch.empty(16, dtype=torch.uint8) for _ in range(2)]
-    for i in range(2):
-        # Map insertion order differs from the native execution UID order.
-        execute_cudnn_backend(
-            prepared,
-            {8: outputs[i], 3: inputs[i]},
-            workspaces[i],
-            SimpleNamespace(backend_handle=100 + i),
-        )
-    for i, (pointers, kwargs) in enumerate(calls):
-        assert pointers.tolist() == [inputs[i].data_ptr(), outputs[i].data_ptr()]
-        assert kwargs == dict(workspace=workspaces[i].data_ptr(), handle=100 + i)
-    assert calls[0][0] is not calls[1][0]
+def test_ordered_execution_feature_detection():
+    class Legacy:
+        def execute(self, tensor_dict, workspace=None, handle=None):
+            pass
+
+    class Ordered:
+        def execute(self, tensors, workspace=None, handle=None, tensor_uids=None):
+            pass
+
+    assert not supports_ordered_cudnn_execution(Legacy)
+    assert supports_ordered_cudnn_execution(Ordered)
 
 
-@pytest.mark.parametrize("error", [NotImplementedError, ValueError, RuntimeError])
-def test_backend_preparation_only_falls_back_for_unsupported_plans(error):
-    assert prepare_cudnn_backend_execution(object()) is None
-
-    def prepare():
-        raise error("prepare failed")
-
-    graph = SimpleNamespace(_prepare_backend_execution=prepare)
-    if error is NotImplementedError:
-        assert prepare_cudnn_backend_execution(graph) is None
-    else:
-        with pytest.raises(error, match="prepare failed"):
-            prepare_cudnn_backend_execution(graph)
-
-
-def test_backend_execution_errors_are_not_retried():
+def test_ordered_execution_errors_are_not_retried(monkeypatch):
     calls = []
 
-    def execute(*args, **kwargs):
-        calls.append(args)
-        raise RuntimeError("stale execution plan")
+    class Graph:
+        def execute(self, buffers, **kwargs):
+            calls.append((buffers, kwargs))
+            raise RuntimeError("invalid binding")
 
-    prepared = prepare_cudnn_backend_execution(
-        SimpleNamespace(
-            _prepare_backend_execution=lambda: SimpleNamespace(uids=(), execute=execute)
+    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: 17)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
+    tensor = torch.empty(1)
+    with pytest.raises(RuntimeError, match="invalid binding"):
+        decode._execute_decode(
+            Graph(),
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            None,
+            tensor,
+            actual_seq_lens_q=tensor,
+            actual_seq_lens_kv=tensor,
+            block_tables=tensor,
+            return_lse=False,
+            sinks=None,
+            execution_bindings=(1, 2, 3, 1000, 100, 101, 201, 202),
         )
-    )
-    with pytest.raises(RuntimeError, match="stale execution plan"):
-        execute_cudnn_backend(prepared, {}, torch.empty(0), 17)
     assert len(calls) == 1
+    assert calls[0][1]["handle"] == 17
+    assert calls[0][1]["workspace"] is tensor
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
+    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
+    calls = []
+
+    def execute(buffers, *, tensor_uids=None, **kwargs):
+        mapping = (
+            dict(zip(tensor_uids, buffers, strict=True))
+            if tensor_uids is not None
+            else buffers
+        )
+        calls.append((buffers, mapping, kwargs))
+        mapping[1000].copy_(mapping[1])
+        mapping[1001].fill_(1)
+
+    class Graph:
+        def execute(self, buffers, *, tensor_uids=None, **kwargs):
+            execute(buffers, tensor_uids=tensor_uids, **kwargs)
+
+    graph = Graph() if ordered else SimpleNamespace(execute=execute)
+    prepared = prefill.CudnnPrefillGraph(
+        None, graph, override_cache=None, return_lse=True
+    )
+    previous = None
+    sources = []
+    for value in (1, 2):
+        indptr = torch.tensor([0, 3], dtype=torch.int32)
+        metadata = prefill._PrefillMetadata(
+            3,
+            3,
+            False,
+            True,
+            cu_seq_lens_q=indptr,
+            cu_seq_lens_kv=indptr,
+            batch_offsets_q=indptr,
+            batch_offsets_o=indptr,
+            batch_offsets_k=indptr,
+            batch_offsets_v=indptr,
+            batch_offsets_stats=indptr,
+        )
+        q = torch.full((3, 4, 8), float(value))
+        out, lse, workspace = torch.empty_like(q), torch.empty(3, 4), torch.empty(8)
+        plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device, previous)
+        prepared.run_planned(q, q, q, out, lse, workspace, plan=plan, lse_base="ln")
+        torch.testing.assert_close(out, q)
+        torch.testing.assert_close(lse, torch.ones_like(lse))
+        assert calls[-1][1][100].data_ptr() == indptr.data_ptr()
+        assert calls[-1][1][1] is q
+        assert calls[-1][1][1000] is out
+        assert calls[-1][2] == dict(workspace=workspace, handle=23)
+        sources.append((q, out, indptr))
+        previous = plan
+    assert calls[0][0] is not calls[1][0]
+    assert isinstance(calls[0][0], list if ordered else dict)
+    torch.testing.assert_close(sources[0][1], sources[0][0])
 
 
 @pytest.fixture
@@ -228,16 +271,26 @@ def test_decode_cubin_preserves_offsets(monkeypatch, decode_inputs):
     assert calls[0][11] is offsets_o
 
 
-def test_decode_binding_is_per_call_and_lse_is_base2(monkeypatch, decode_inputs):
+@pytest.mark.parametrize("ordered", [False, True])
+def test_decode_binding_is_per_call_and_lse_is_base2(
+    monkeypatch, decode_inputs, ordered
+):
     q, k, v, kwargs = decode_inputs
-    packs = []
+    packs, raw_packs = [], []
 
-    def execute(pack, **unused):
+    def execute(pack, tensor_uids=None, **unused):
+        raw_packs.append(pack)
+        if tensor_uids is not None:
+            pack = dict(zip(tensor_uids, pack, strict=True))
         packs.append(pack)
         pack[decode.UIDs.O_UID.value].copy_(pack[decode.UIDs.Q_UID.value])
         pack[decode.UIDs.STATS_UID.value].fill_(torch.log(torch.tensor(2.0)))
 
-    graph = SimpleNamespace(execute=execute)
+    class OrderedGraph:
+        def execute(self, buffers, tensor_uids=None, **kwargs):
+            execute(buffers, tensor_uids, **kwargs)
+
+    graph = OrderedGraph() if ordered else SimpleNamespace(execute=execute)
     monkeypatch.setattr(
         decode, "_build_decode_graph", lambda *a, **kw: (graph, []), raising=False
     )
@@ -262,6 +315,8 @@ def test_decode_binding_is_per_call_and_lse_is_base2(monkeypatch, decode_inputs)
         torch.testing.assert_close(output, query)
         torch.testing.assert_close(stats, torch.ones_like(stats))
     assert packs[0] is not packs[1]
+    assert raw_packs[0] is not raw_packs[1]
+    assert isinstance(raw_packs[0], list if ordered else dict)
     assert packs[0][decode.UIDs.O_UID.value] is out0
     assert packs[0][decode.UIDs.Q_UID.value] is q
     decode.cudnn_batch_decode_with_kv_cache(

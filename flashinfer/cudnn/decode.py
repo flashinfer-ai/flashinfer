@@ -8,10 +8,9 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
 from .utils import (
-    execute_cudnn_backend,
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
-    prepare_cudnn_backend_execution,
+    supports_ordered_cudnn_execution,
 )
 
 try:
@@ -484,35 +483,49 @@ def _execute_decode(
     block_tables,
     return_lse,
     sinks,
-    backend_execution=None,
+    execution_bindings=None,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
     handle_ = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
-    var_map = {
-        UIDs.Q_UID.value: q,
-        UIDs.K_UID.value: k_cache,
-        UIDs.V_UID.value: v_cache,
-        UIDs.O_UID.value: out,
-    }
-    if return_lse:
-        var_map[UIDs.STATS_UID.value] = lse
-    if sinks is not None:
-        var_map[UIDs.SINK_UID.value] = sinks
-    if actual_seq_lens_q is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
-    if actual_seq_lens_kv is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
-
-    if block_tables is not None:
-        var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
-        var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
-
-    if backend_execution is None:
-        graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
+    if execution_bindings is not None:
+        # UIDs are fixed by preparation; tensor observation remains FE's job.
+        # Each call owns its sequence, including during capture and rebind.
+        buffers = [q, k_cache, v_cache, out]
+        if return_lse:
+            buffers.append(lse)
+        if sinks is not None:
+            buffers.append(sinks)
+        buffers.extend(
+            (actual_seq_lens_q, actual_seq_lens_kv, block_tables, block_tables)
+        )
+        graph.execute(
+            buffers,
+            workspace=workspace_buffer,
+            handle=handle_,
+            tensor_uids=execution_bindings,
+        )
     else:
-        execute_cudnn_backend(backend_execution, var_map, workspace_buffer, handle_)
+        var_map = {
+            UIDs.Q_UID.value: q,
+            UIDs.K_UID.value: k_cache,
+            UIDs.V_UID.value: v_cache,
+            UIDs.O_UID.value: out,
+        }
+        if return_lse:
+            var_map[UIDs.STATS_UID.value] = lse
+        if sinks is not None:
+            var_map[UIDs.SINK_UID.value] = sinks
+        if actual_seq_lens_q is not None:
+            var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
+        if actual_seq_lens_kv is not None:
+            var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
 
+        if block_tables is not None:
+            var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
+            var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
+
+        graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
     if return_lse:
         # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
         # base-2 (the cascade-merge kernels consume it), as in the prefill path.
@@ -548,7 +561,7 @@ class CudnnDecodeGraph:
         "lse_shape",
         "sinks_view",
         "seq_lens_q",
-        "backend_execution",
+        "execution_bindings",
     )
 
     def __init__(
@@ -573,7 +586,27 @@ class CudnnDecodeGraph:
         self.lse_shape = lse_shape
         self.sinks_view = sinks_view
         self.seq_lens_q = seq_lens_q
-        self.backend_execution = prepare_cudnn_backend_execution(graph)
+        self.execution_bindings = None
+        if supports_ordered_cudnn_execution(type(graph)):
+            uids = [
+                UIDs.Q_UID.value,
+                UIDs.K_UID.value,
+                UIDs.V_UID.value,
+                UIDs.O_UID.value,
+            ]
+            if return_lse:
+                uids.append(UIDs.STATS_UID.value)
+            if sinks_view is not None:
+                uids.append(UIDs.SINK_UID.value)
+            uids.extend(
+                (
+                    UIDs.ACTUAL_SEQ_LENS_Q_UID.value,
+                    UIDs.ACTUAL_SEQ_LENS_KV_UID.value,
+                    UIDs.BLOCK_TABLES_K_UID.value,
+                    UIDs.BLOCK_TABLES_V_UID.value,
+                )
+            )
+            self.execution_bindings = tuple(uids)
 
     def _q_graph(self, q: torch.Tensor) -> torch.Tensor:
         return _decode_q_view(q, self.batch_size, self.q_len_per_req)
@@ -682,7 +715,7 @@ class CudnnDecodeGraph:
             # Normalize current values on this call's stream. In capture, a
             # strided sink's copy is captured too, rather than cached stale.
             sinks=self.sinks_view if sinks is None else _decode_sinks(q, sinks),
-            backend_execution=self.backend_execution,
+            execution_bindings=self.execution_bindings,
         )
 
 

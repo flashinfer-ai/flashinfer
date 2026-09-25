@@ -43,17 +43,19 @@ def _reference(q, k, v, q_lens, kv_lens, scale):
     return torch.cat(outputs), torch.cat(stats)
 
 
-@pytest.mark.parametrize("require_native", [False, True], ids=["compatible", "native"])
+@pytest.mark.parametrize(
+    "require_ordered", [False, True], ids=["compatible", "ordered"]
+)
 def test_prepared_ragged_interleaved_wrappers_capture_replan(
-    monkeypatch, require_native
+    monkeypatch, require_ordered
 ):
     """Shared graph-cache entries must not share shapes or changing bindings."""
     if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
         pytest.skip("requires direct cuDNN cumulative sequence lengths")
-    if require_native and not callable(
-        getattr(cudnn_prefill.cudnn.pygraph, "_prepare_backend_execution", None)
+    if require_ordered and not cudnn_prefill.supports_ordered_cudnn_execution(
+        cudnn_prefill.cudnn.pygraph
     ):
-        pytest.skip("requires FE native prepared execution support")
+        pytest.skip("requires FE ordered tensor execution support")
     torch.manual_seed(52)
     scale = 128**-0.5
     cases = []
@@ -100,20 +102,21 @@ def test_prepared_ragged_interleaved_wrappers_capture_replan(
         plan(case)
         run(case)
         check(case)
-    if require_native:
-        if any(
-            case[0]._cudnn_prepared.graph.selected_engine is not None for case in cases
-        ):
-            pytest.skip("selected provider is not the native cuDNN backend")
-        for case in cases:
-            assert case[0]._cudnn_plan.backend_execution is not None
+    if require_ordered:
+        original_execute = cudnn_prefill.cudnn.pygraph.execute
 
-        def unexpected_fallback(*args, **kwargs):
-            pytest.fail("native prepared execution fell back to graph.execute")
+        def require_tensor_sequence(self, tensors, *args, tensor_uids=None, **kwargs):
+            assert tensor_uids is not None, "ordered execution fell back to a mapping"
+            assert isinstance(tensors, (tuple, list))
+            return original_execute(
+                self, tensors, *args, tensor_uids=tensor_uids, **kwargs
+            )
 
-        # Guard the class so newly created graphs after replan/workspace changes
-        # cannot silently turn this native-isolation test into a fallback test.
-        monkeypatch.setattr(cudnn_prefill.cudnn.pygraph, "execute", unexpected_fallback)
+        # Include graph instances created after replan/workspace replacement.
+        # The same consumer contract applies to native and FROST providers.
+        monkeypatch.setattr(
+            cudnn_prefill.cudnn.pygraph, "execute", require_tensor_sequence
+        )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(cases[0])

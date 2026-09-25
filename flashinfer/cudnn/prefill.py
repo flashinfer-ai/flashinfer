@@ -11,10 +11,9 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
 from ..utils import check_lse_base, log2e
 from .utils import (
-    execute_cudnn_backend,
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
-    prepare_cudnn_backend_execution,
+    supports_ordered_cudnn_execution,
 )
 
 try:
@@ -1048,7 +1047,7 @@ class _CudnnPrefillPlan:
 
     Tensor values can change in place. Layout changes require another plan;
     detached views keep a caller's later Tensor metadata mutation from changing
-    these descriptors. Each execute copies its binding map before rebinding.
+    these descriptors. Each execute creates call-local bindings before rebinding.
     """
 
     _tensor_fields = (
@@ -1137,16 +1136,30 @@ class _CudnnPrefillPlan:
         without_stats = bindings.copy()
         without_stats.pop(UIDs.RAGGED_STATS_UID.value, None)
         self.bindings = (without_stats, bindings)
+        dynamic_uids = (
+            UIDs.Q_UID.value,
+            UIDs.K_UID.value,
+            UIDs.V_UID.value,
+            UIDs.O_UID.value,
+        )
+        self.ordered_bindings = (
+            (
+                dynamic_uids + tuple(without_stats),
+                (None,) * 4 + tuple(without_stats.values()),
+            ),
+            (
+                dynamic_uids + (UIDs.STATS_UID.value,) + tuple(bindings),
+                (None,) * 5 + tuple(bindings.values()),
+            ),
+        )
         self.execution_shape = exact[0][0]
         self.bound_graph = None
         self.execute_kwargs = {}
-        self.backend_execution = None
         # Real shape overrides depend on bounds and on the prepared graph's
         # runtime tensor layout, not on the new indptr pointers or values.
         if previous is not None and previous.execution_shape == self.execution_shape:
             self.bound_graph = previous.bound_graph
             self.execute_kwargs = previous.execute_kwargs
-            self.backend_execution = previous.backend_execution
 
     def build_metadata(self, return_lse):
         # The output-only variant is needed only when preparing a new graph.
@@ -1180,6 +1193,7 @@ class CudnnPrefillGraph:
         "graph",
         "override_cache",
         "return_lse",
+        "ordered_execution",
     )
 
     def __init__(self, key, graph, *, override_cache, return_lse: bool):
@@ -1187,6 +1201,7 @@ class CudnnPrefillGraph:
         self.graph = graph
         self.override_cache = override_cache
         self.return_lse = return_lse
+        self.ordered_execution = supports_ordered_cudnn_execution(type(graph))
 
     def matches_plan(self, q, k_cache, v_cache, scale, plan, return_lse):
         metadata = plan.metadata
@@ -1229,10 +1244,23 @@ class CudnnPrefillGraph:
                 if self.override_cache is not None
                 else {}
             )
-            plan.backend_execution = prepare_cudnn_backend_execution(
-                self.graph, **plan.execute_kwargs
-            )
             plan.bound_graph = self
+        if self.ordered_execution:
+            uids, template = plan.ordered_bindings[self.return_lse]
+            buffers = list(template)
+            buffers[:4] = q, k_cache, v_cache, out
+            if self.return_lse:
+                buffers[4] = lse
+            return self._execute(
+                q,
+                out,
+                lse,
+                workspace_buffer,
+                buffers,
+                plan.execute_kwargs,
+                lse_base,
+                tensor_uids=uids,
+            )
         var_map = plan.bindings[self.return_lse].copy()
         var_map.update(
             {
@@ -1252,7 +1280,6 @@ class CudnnPrefillGraph:
             var_map,
             plan.execute_kwargs,
             lse_base,
-            backend_execution=plan.backend_execution,
         )
 
     def run(
@@ -1316,15 +1343,21 @@ class CudnnPrefillGraph:
         var_map,
         execute_kwargs,
         lse_base,
-        backend_execution=None,
+        tensor_uids=None,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
-        if backend_execution is None:
+        if tensor_uids is None:
             self.graph.execute(
                 var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs
             )
         else:
-            execute_cudnn_backend(backend_execution, var_map, workspace_buffer, handle)
+            self.graph.execute(
+                var_map,
+                workspace=workspace_buffer,
+                handle=handle,
+                tensor_uids=tensor_uids,
+                **execute_kwargs,
+            )
 
         if self.return_lse:
             # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer

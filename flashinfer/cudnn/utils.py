@@ -15,9 +15,9 @@ limitations under the License.
 """
 
 import functools
+import inspect
 import threading
 import weakref
-from array import array
 
 import torch
 
@@ -28,34 +28,18 @@ from ..jit import gen_cudnn_fmha_module
 _attention_handles = threading.local()
 
 
-def prepare_cudnn_backend_execution(graph, **execute_kwargs):
-    """Prepare immutable native bindings when this FE and selected plan allow it.
+def supports_ordered_cudnn_execution(graph_type):
+    """Detect the optional tensor-sequence overload once, independent of engine."""
+    return _supports_ordered_execute(getattr(graph_type, "execute", None))
 
-    Shape overrides belong to a wrapper's metadata plan, not the shared graph
-    cache: two wrappers may use the same envelope graph at different shapes.
-    Old Frontends and FROST keep the regular graph.execute path. Invalid
-    descriptors and execution errors must still propagate to the caller.
-    """
-    prepare = getattr(graph, "_prepare_backend_execution", None)
-    if prepare is None:
-        return None
+
+@functools.cache
+def _supports_ordered_execute(execute):
     try:
-        prepared = prepare(**execute_kwargs)
-    except NotImplementedError:
-        return None
-    return prepared, prepared.uids
-
-
-def execute_cudnn_backend(prepared, bindings, workspace, handle):
-    # CUDA pointers are 64-bit. Keep this frame call-local: graph capture and
-    # another wrapper must never overwrite a retained mutable pointer buffer.
-    execution, uids = prepared
-    pointers = array("Q", (bindings[uid].data_ptr() for uid in uids))
-    execution.execute(
-        pointers,
-        workspace=workspace.data_ptr(),
-        handle=getattr(handle, "backend_handle", handle),
-    )
+        return "tensor_uids" in inspect.signature(execute).parameters
+    except (TypeError, ValueError):
+        # Older native graph classes may not expose an inspectable signature.
+        return False
 
 
 class _AttentionHandle:
