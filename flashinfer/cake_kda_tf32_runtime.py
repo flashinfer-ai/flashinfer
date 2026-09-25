@@ -285,12 +285,21 @@ BF16_AFFINE_SPLIT_MIN_CHUNKS = 128
 # sm_100a (B200, 148 SMs), 2026-09-25: composite 75 + 14.2 * chunks/window,
 # sequential 20 + 4.0 * chunks (unbounded softplus, FP32 rows); composite
 # 84 + 8.8 * chunks/window, sequential 16 + 1.75 * chunks (bounded gate).
-AFFINE_MIN_CHUNKS_PER_WINDOW = 4
+# Windows never go below 16 chunks (512 tokens): the fused-body specialization
+# flags flip at 128 / 256 / 512 tokens of launch max_seq_len (H12 early state
+# pack, scalar beta / generic register inverse, sm_103a prediction-first), and
+# only the >= 512-token slab variants are exported.  Shorter windows would
+# select unexported programs; the sequences they could speed up (<= 2048
+# tokens) lose at most ~0.1 ms on the sequential body.
+AFFINE_MIN_CHUNKS_PER_WINDOW = 16
 AFFINE_BF16_COST_MODEL_US: dict[tuple[str, str], tuple[float, float, float, float]] = {
     # (gpu_arch, gate_kind): (composite_fixed, composite_per_window_chunk,
     #                          sequential_fixed, sequential_per_chunk)
     ("sm_100a", "unbounded_softplus"): (75.0, 14.2, 20.0, 4.0),
     ("sm_100a", "lower_bound"): (84.0, 8.8, 16.0, 1.75),
+    # sm_103a (GB300, 152 SMs), 2026-09-25: composite 95 + 11.7 * chunks/window
+    # (H12 87 + 12.05, H16 102 + 11.4), sequential 18 + 3.6 * chunks.
+    ("sm_103a", "unbounded_softplus"): (95.0, 11.7, 18.0, 3.6),
 }
 SMALL_BH_GROUP_SIZE = 8
 SMALL_BH_RING_STAGES = 35
