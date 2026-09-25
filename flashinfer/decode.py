@@ -59,6 +59,7 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    check_trtllm_gen_fmha_arch,
     log2e,
     FP4Tensor,
     MaskMode,
@@ -3754,6 +3755,10 @@ def trtllm_batch_decode_with_kv_cache(
     if backend == "auto":
         backend = (
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
+        )
+    elif backend == "trtllm-gen":
+        check_trtllm_gen_fmha_arch(
+            query.device, sm12x_alternative="backend='xqa' or backend='auto'"
         )
 
     if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:

@@ -26,7 +26,11 @@ pytestmark = pytest.mark.skipif(
     reason="installed CuTe DSL does not support this GPU architecture",
 )
 
-from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+    is_sm110a_supported,
+)
 from flashinfer.cute_dsl import is_cute_dsl_available
 
 
@@ -36,6 +40,13 @@ def skip_if_unsupported():
         pytest.skip("Requires SM100-SM110 (tcgen05)")
     if not is_cute_dsl_available():
         pytest.skip("CuTe DSL not available")
+
+
+def skip_if_trtllm_gen_unsupported():
+    """Guard explicit backend="trtllm-gen" calls: SM110 has tcgen05 but no cubins."""
+    skip_if_unsupported()
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("Requires the trtllm-gen FMHA cubins (SM100/SM103/SM107)")
 
 
 def skip_if_sm100a_unsupported():
@@ -2621,7 +2632,7 @@ def test_mla_decode_auto_dispatches_to_cute_dsl_for_block_size_128():
 
 
 def test_mla_decode_trtllm_gen_rejects_block_size_128():
-    skip_if_unsupported()
+    skip_if_trtllm_gen_unsupported()
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     args = _mla_decode_inputs()
@@ -2641,7 +2652,7 @@ def test_mla_decode_auto_dispatches_to_cute_dsl_for_trtllm_head_gap():
 
 
 def test_mla_decode_trtllm_gen_rejects_head_gap():
-    skip_if_unsupported()
+    skip_if_trtllm_gen_unsupported()
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     args = _mla_decode_inputs(num_heads=96, page_size=64)
