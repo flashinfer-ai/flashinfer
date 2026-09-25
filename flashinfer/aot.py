@@ -857,6 +857,7 @@ def gen_all_modules(
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
+            gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
@@ -902,6 +903,7 @@ def gen_all_modules(
         # and CUDA IPC, and target PCIe machines without NVLink, which is
         # orthogonal to the SM version.
         jit_specs.append(gen_pcie_ipc_comm_module())
+        jit_specs.append(gen_pcie_ipc_ag_rs_module())
 
     if add_misc:
         jit_specs += [
@@ -1399,7 +1401,7 @@ def main():
     parser.add_argument(
         "--add-comm",
         type=parse_bool,
-        help="Add communication kernels (trtllm_comm, vllm_comm, pcie_ipc_comm)",
+        help="Add communication kernels (trtllm_comm, vllm_comm, pcie_ipc_comm, pcie_ipc_ag_rs)",
     )
     parser.add_argument(
         "--add-gemma",
