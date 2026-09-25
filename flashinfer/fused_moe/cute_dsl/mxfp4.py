@@ -311,11 +311,19 @@ DENSE_DUAL_TILE_MIN_TOKENS = int(
 # larger ``MXFP4_DENSE_DUAL_TILE_MAX_SHARD``) until the unchosen launches can
 # be skipped on the device (graph conditional nodes).
 DENSE_DUAL_TILE_MAX_SHARD = int(
-    os.environ.get("MXFP4_DENSE_DUAL_TILE_MAX_SHARD", "512")
+    os.environ.get("MXFP4_DENSE_DUAL_TILE_MAX_SHARD", "3072")
 )
 DENSE_DUAL_TILE_THRESHOLD_PERMILLE = int(
     os.environ.get("MXFP4_DENSE_DUAL_TILE_THRESHOLD_PERMILLE", "1100")
 )
+# Dense chain with the fused (reduce-add) finalize: the T x H BF16 output must
+# be zero before GEMM2. The zero-fill runs at the HBM write rate (B300: 5.6 us
+# at T=2048, 75 us at T=32768) and used to sit between GEMM1 and GEMM2 in
+# stream order. With this on, ``run`` forks it onto an auxiliary stream right
+# after the sort (the previous run's GEMM2 is already ordered before it) and
+# joins before GEMM2, so it overlaps the sort and GEMM1; captured graphs get
+# the fork/join as edges. 0 = keep the zero-fill in the main stream.
+DENSE_ASYNC_MEMSET = os.environ.get("MXFP4_DENSE_ASYNC_MEMSET", "1") == "1"
 B300_SITU_DENSE_DUAL_TACTIC = _T256_N256_C1
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
 # applies the route weights (no bulk reduce-add into the output).
@@ -654,6 +662,9 @@ class Mxfp4MoEPlan:
         self._route_ids = route_ids
         self._route_weights = route_weights
         self._route_preprocess = None
+        self._aux_stream = None
+        self._main_event = None
+        self._memset_event = None
         self.device = self.output.device
         self._packed_weight_view = (
             topk_ids.view(torch.bfloat16)[:, ::2] if topk_weights is None else None
@@ -681,6 +692,12 @@ class Mxfp4MoEPlan:
         self._finalize_alt = launches.get("finalize_alt")
         # No memset in the expanded-row (non-fused) finalize form.
         self._memset, self._memset_args = launches.get("memset", (None, None))
+        # Auxiliary stream and fork/join events for the output zero-fill (see
+        # DENSE_ASYNC_MEMSET); created here, outside any graph capture.
+        if self._memset is not None and DENSE_ASYNC_MEMSET:
+            self._aux_stream = torch.cuda.Stream(device=self.device)
+            self._main_event = torch.cuda.Event()
+            self._memset_event = torch.cuda.Event()
         self._finalize, self._finalize_args = launches["finalize"]
         self._unpermute = launches.get("unpermute")
         self._finalize_rows = None
@@ -746,11 +763,25 @@ class Mxfp4MoEPlan:
                 or not self._route_preprocess.sorts_tokens
             ):
                 self._sort(*self._sort_args, stream_ptr)
+            async_memset = (
+                self._route_preprocess is None and self._aux_stream is not None
+            )
+            if async_memset:
+                # Fork: the zero-fill waits for everything enqueued so far
+                # (the previous run's GEMM2 included) and runs beside GEMM1.
+                current = torch.cuda.current_stream()
+                self._main_event.record(current)
+                self._aux_stream.wait_event(self._main_event)
+                self._memset(*self._memset_args, self._aux_stream.cuda_stream)
+                self._memset_event.record(self._aux_stream)
             self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
             if self._gather_alt is not None:
                 gather_alt, gather_alt_args, gather_alt_kwargs = self._gather_alt
                 gather_alt(*gather_alt_args, stream=stream, **gather_alt_kwargs)
-            if self._route_preprocess is None and self._memset is not None:
+            if async_memset:
+                # Join: GEMM2 reduce-adds into the zeroed output.
+                torch.cuda.current_stream().wait_event(self._memset_event)
+            elif self._route_preprocess is None and self._memset is not None:
                 self._memset(*self._memset_args, stream_ptr)
             self._finalize(*self._finalize_args, stream=stream)
             if self._finalize_alt is not None:
