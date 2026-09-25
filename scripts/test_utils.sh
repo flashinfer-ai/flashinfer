@@ -2,6 +2,9 @@
 # Common test functions for FlashInfer test scripts
 # This file is meant to be sourced by test runner scripts
 
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_path_scope.sh"
+
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
 
