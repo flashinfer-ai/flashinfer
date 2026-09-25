@@ -170,7 +170,7 @@ def _source_catalog() -> Mapping[str, object]:
     }
     if (
         isinstance(catalog["schema_version"], bool)
-        or catalog["schema_version"] != 3
+        or catalog["schema_version"] != 4
         or not canonical_targets
         or target_order != canonical_targets
         or not isinstance(catalog["targets"], dict)
@@ -188,32 +188,44 @@ def _source_catalog() -> Mapping[str, object]:
             "TRT-LLM MLA Blackwell generated-source catalog domain topology is invalid"
         )
     source_paths: set[str] = set()
-    module_idents: set[str] = set()
+    # Every physical target carries its own generated host source and device
+    # identities: the schedules are traced per target, so module identities and
+    # host dispatch code are independent between targets.
+    module_idents_by_target: dict[str, set[str]] = {
+        target: set() for target in target_order
+    }
     device_source_count = {target: 0 for target in target_order}
     for domain, expected_device_count in _DOMAIN_DEVICE_COUNTS.items():
         profile = domains[domain]
         if not isinstance(profile, dict) or set(profile) != {
-            "host_source",
+            "host_sources",
             "device_sources",
         }:
             raise RuntimeError(
                 f"TRT-LLM MLA Blackwell catalog domain {domain!r} schema is invalid"
             )
-        host = _source_record(profile["host_source"], domain=domain, kind="host_source")
+        hosts_by_target = profile["host_sources"]
         devices_by_target = profile["device_sources"]
         if (
-            not isinstance(devices_by_target, dict)
+            not isinstance(hosts_by_target, dict)
+            or list(hosts_by_target) != target_order
+            or not isinstance(devices_by_target, dict)
             or list(devices_by_target) != target_order
         ):
             raise RuntimeError(
                 f"TRT-LLM MLA catalog domain {domain!r} target inventory is invalid"
             )
-        host_path = str(host["path"])
-        if host_path != f"host/{domain}.cpp" or host_path in source_paths:
-            raise RuntimeError("TRT-LLM MLA catalog host source paths are invalid")
-        source_paths.add(host_path)
-        expected_idents: tuple[str, ...] | None = None
         for target in target_order:
+            host = _source_record(
+                hosts_by_target[target],
+                domain=domain,
+                target=target,
+                kind="host_source",
+            )
+            host_path = str(host["path"])
+            if host_path != f"host/{target}/{domain}.cpp" or host_path in source_paths:
+                raise RuntimeError("TRT-LLM MLA catalog host source paths are invalid")
+            source_paths.add(host_path)
             devices = devices_by_target[target]
             if not isinstance(devices, list) or len(devices) != expected_device_count:
                 raise RuntimeError(
@@ -231,23 +243,14 @@ def _source_catalog() -> Mapping[str, object]:
                 for index, device in enumerate(devices)
             ]
             idents = tuple(str(record["module_ident"]) for record in records)
-            if len(set(idents)) != len(idents):
+            module_idents = module_idents_by_target[target]
+            if len(set(idents)) != len(idents) or any(
+                ident in module_idents for ident in idents
+            ):
                 raise RuntimeError(
                     "TRT-LLM MLA catalog contains duplicate device module identities"
                 )
-            if expected_idents is None:
-                expected_idents = idents
-                if any(ident in module_idents for ident in idents):
-                    raise RuntimeError(
-                        "TRT-LLM MLA catalog contains duplicate device module "
-                        "identities"
-                    )
-                module_idents.update(idents)
-            elif idents != expected_idents:
-                raise RuntimeError(
-                    f"TRT-LLM MLA catalog domain {domain!r} device identity "
-                    "order differs across targets"
-                )
+            module_idents.update(idents)
             paths = [str(record["path"]) for record in records]
             expected_paths = [f"device/{target}/{ident}.cu" for ident in idents]
             if paths != expected_paths or any(path in source_paths for path in paths):
@@ -256,9 +259,9 @@ def _source_catalog() -> Mapping[str, object]:
                 )
             source_paths.update(paths)
             device_source_count[target] += len(records)
-    if len(module_idents) != 18 or device_source_count != {
-        target: 18 for target in target_order
-    }:
+    if device_source_count != {target: 18 for target in target_order} or any(
+        len(module_idents_by_target[target]) != 18 for target in target_order
+    ):
         raise RuntimeError(
             "TRT-LLM MLA generated-source catalog must contain exactly 18 "
             "device sources for each supported target"
@@ -363,11 +366,13 @@ def _load_domain_module(domain: str, target: str):
     profile = _domain_profile(domain, target)
     arch, multi_processor_count = _TARGETS[target]
     source_dir = _source_dir()
-    host = profile["host_source"]
+    hosts_by_target = profile["host_sources"]
     devices_by_target = profile["device_sources"]
-    assert isinstance(host, dict)
+    assert isinstance(hosts_by_target, dict)
     assert isinstance(devices_by_target, dict)
+    host = hosts_by_target[target]
     devices = devices_by_target[target]
+    assert isinstance(host, dict)
     assert isinstance(devices, list)
     _, host_payload = _sealed_source_bytes(source_dir, host)
     nvcc = _nvcc()
