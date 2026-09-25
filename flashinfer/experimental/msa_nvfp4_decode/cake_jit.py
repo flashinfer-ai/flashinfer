@@ -33,8 +33,60 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # at most ``max_clusters`` clusters per launch).  Populated verbatim by the
 # generated-program export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {
+    "cake_msa_nvfp4_decode_sm_100a_short": {
+        "arch": "sm_100a",
+        "route": "short",
+        "max_pages": 4,
+        "cluster": 4,
+        "max_clusters": 32,
+        "main": {
+            "module": "cake_msa_nvfp4_decode_e8756444575e4dd50978",
+            "sources": [
+                "cake_msa_nvfp4_decode/sm_100a/cake_msa_nvfp4_decode_e8756444575e4dd50978_kernel.cu",
+                "cake_msa_nvfp4_decode/sm_100a/cake_msa_nvfp4_decode_e8756444575e4dd50978_binding.cu",
+            ],
+            "compile_flags": ["--use_fast_math"],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["buffer", "Q"],
+                ["buffer", "K"],
+                ["buffer", "K_scale"],
+                ["buffer", "V"],
+                ["buffer", "V_scale"],
+                ["buffer", "O"],
+                ["buffer", "msa_lse"],
+                ["buffer", "kv_indices"],
+                ["buffer", "kv_indptr"],
+                ["buffer", "task_kind"],
+                ["buffer", "task_request"],
+                ["buffer", "task_kv_head"],
+                ["parameter", "total_q"],
+                ["parameter", "seqlen_q"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "softmax_scale_log2"],
+                ["parameter", "output_scale"],
+                ["parameter", "msa_max_pages"],
+                ["parameter", "k_page_stride"],
+                ["parameter", "k_head_stride"],
+                ["parameter", "ks_page_stride"],
+                ["parameter", "ks_head_stride"],
+                ["parameter", "v_page_stride"],
+                ["parameter", "v_head_stride"],
+                ["parameter", "vs_page_stride"],
+                ["parameter", "vs_head_stride"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "acdbe147fb783f345705cf7fa9ace7294f962b291e890ff01e588953a48f9509",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "acdbe147fb783f345705cf7fa9ace7294f962b291e890ff01e588953a48f9509",
+    },
     "cake_msa_nvfp4_decode_sm_100a_split1": {
         "arch": "sm_100a",
+        "route": "swap_tsk",
         "splits": 1,
         "ctas_per_sm": 1,
         "main": {
@@ -80,6 +132,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_msa_nvfp4_decode_sm_100a_split2": {
         "arch": "sm_100a",
+        "route": "swap_tsk",
         "splits": 2,
         "ctas_per_sm": 1,
         "main": {
@@ -125,6 +178,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_msa_nvfp4_decode_sm_100a_split4": {
         "arch": "sm_100a",
+        "route": "swap_tsk",
         "splits": 4,
         "ctas_per_sm": 1,
         "main": {
@@ -170,6 +224,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_msa_nvfp4_decode_sm_100a_split8": {
         "arch": "sm_100a",
+        "route": "swap_tsk",
         "splits": 8,
         "ctas_per_sm": 1,
         "main": {
@@ -213,8 +268,60 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "closure_sha256": "e2fcf3e5ba86a6edf664dff8f8932e78172e32f6e1788428e781caaba5645b60",
     },
+    "cake_msa_nvfp4_decode_sm_103a_short": {
+        "arch": "sm_103a",
+        "route": "short",
+        "max_pages": 4,
+        "cluster": 4,
+        "max_clusters": 32,
+        "main": {
+            "module": "cake_msa_nvfp4_decode_ea637f6d9fac2e60b40a",
+            "sources": [
+                "cake_msa_nvfp4_decode/sm_103a/cake_msa_nvfp4_decode_ea637f6d9fac2e60b40a_kernel.cu",
+                "cake_msa_nvfp4_decode/sm_103a/cake_msa_nvfp4_decode_ea637f6d9fac2e60b40a_binding.cu",
+            ],
+            "compile_flags": ["--use_fast_math"],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["buffer", "Q"],
+                ["buffer", "K"],
+                ["buffer", "K_scale"],
+                ["buffer", "V"],
+                ["buffer", "V_scale"],
+                ["buffer", "O"],
+                ["buffer", "msa_lse"],
+                ["buffer", "kv_indices"],
+                ["buffer", "kv_indptr"],
+                ["buffer", "task_kind"],
+                ["buffer", "task_request"],
+                ["buffer", "task_kv_head"],
+                ["parameter", "total_q"],
+                ["parameter", "seqlen_q"],
+                ["parameter", "num_q_heads"],
+                ["parameter", "num_kv_heads"],
+                ["parameter", "softmax_scale_log2"],
+                ["parameter", "output_scale"],
+                ["parameter", "msa_max_pages"],
+                ["parameter", "k_page_stride"],
+                ["parameter", "k_head_stride"],
+                ["parameter", "ks_page_stride"],
+                ["parameter", "ks_head_stride"],
+                ["parameter", "v_page_stride"],
+                ["parameter", "v_head_stride"],
+                ["parameter", "vs_page_stride"],
+                ["parameter", "vs_head_stride"],
+                ["grid", "grid_x"],
+                ["grid", "grid_y"],
+                ["grid", "grid_z"],
+            ],
+            "closure_sha256": "525ecd117bda21f862c7cb981ccfdde5ba4dd1d9de30550bb4f1bb53113939c3",
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "525ecd117bda21f862c7cb981ccfdde5ba4dd1d9de30550bb4f1bb53113939c3",
+    },
     "cake_msa_nvfp4_decode_sm_103a_split1": {
         "arch": "sm_103a",
+        "route": "swap_tsk",
         "splits": 1,
         "ctas_per_sm": 1,
         "main": {
@@ -260,6 +367,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_msa_nvfp4_decode_sm_103a_split2": {
         "arch": "sm_103a",
+        "route": "swap_tsk",
         "splits": 2,
         "ctas_per_sm": 1,
         "main": {
@@ -305,6 +413,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_msa_nvfp4_decode_sm_103a_split4": {
         "arch": "sm_103a",
+        "route": "swap_tsk",
         "splits": 4,
         "ctas_per_sm": 1,
         "main": {
@@ -350,6 +459,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_msa_nvfp4_decode_sm_103a_split8": {
         "arch": "sm_103a",
+        "route": "swap_tsk",
         "splits": 8,
         "ctas_per_sm": 1,
         "main": {
