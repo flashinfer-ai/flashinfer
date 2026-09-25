@@ -7491,6 +7491,9 @@ class KDAPrefillPlanCache:
         # reuse between forwards), so ``get`` answers it from this memo.
         self._last_fast = None
         self._last_entry = None
+        # Address-level facts of the inputs each entry is currently bound to;
+        # a hit rebinds only the inputs whose facts changed.
+        self._facts: dict[object, tuple] = {}
 
     def __len__(self):
         return len(self._entries)
@@ -7502,6 +7505,7 @@ class KDAPrefillPlanCache:
                 close()
         self._entries.clear()
         self._bytes.clear()
+        self._facts.clear()
         self.bytes = 0
         self._last_fast = None
         self._last_entry = None
@@ -7509,6 +7513,7 @@ class KDAPrefillPlanCache:
     def _evict_oldest(self):
         key, (evicted, _) = self._entries.popitem(last=False)
         self.bytes -= self._bytes.pop(key, 0)
+        self._facts.pop(key, None)
         self.evictions += 1
         if self._last_entry is not None and self._last_entry[0] is evicted:
             self._last_fast = None
@@ -7532,9 +7537,10 @@ class KDAPrefillPlanCache:
         graph replays with self-contained descriptor contents.
         """
         import torch
-        from .cake_kda_tf32_runtime import rebind_prepared_launch
+        from .cake_kda_tf32_runtime import REBIND_INPUT_NAMES, rebind_prepared_launch
 
-        fast = (_fast_signature(inputs), tuple(sorted(scalars.items())))
+        facts = _fast_signature(inputs)
+        fast = (facts, tuple(sorted(scalars.items())))
         if fast == self._last_fast:
             # Same addresses, layouts, dtypes and scalars as the previous hit:
             # the prepared launch is already bound to these tensors.
@@ -7551,7 +7557,26 @@ class KDAPrefillPlanCache:
         self._entries.move_to_end(key)
         prepared, plan = entry
         owner = getattr(prepared, "_impl", prepared)
-        tma_moved = rebind_prepared_launch(owner, plan, inputs, signature=key[0])
+        bound = self._facts.get(key)
+        if bound == facts:
+            # Bound to exactly these tensors already (another entry was hit in
+            # between); nothing to re-point.
+            tma_moved = False
+            self.fast_hits += 1
+        else:
+            changed = None
+            if bound is not None:
+                # Same structural key, so only addresses can differ: re-point
+                # the views and addresses of the moved inputs only.
+                changed = frozenset(
+                    name
+                    for name, before, after in zip(REBIND_INPUT_NAMES, bound, facts)
+                    if before != after
+                )
+            tma_moved = rebind_prepared_launch(
+                owner, plan, inputs, signature=key[0], changed=changed
+            )
+            self._facts[key] = facts
         if tma_moved or torch.cuda.is_current_stream_capturing():
             owner._descriptors_stale = True
         self.hits += 1
@@ -7580,6 +7605,7 @@ class KDAPrefillPlanCache:
         self._last_fast = None
         self._last_entry = None
         self._entries[key] = (prepared, plan)
+        self._facts[key] = _fast_signature(inputs)
         self._entries.move_to_end(key)
         self._bytes[key] = int(retained_bytes)
         self.bytes += int(retained_bytes)

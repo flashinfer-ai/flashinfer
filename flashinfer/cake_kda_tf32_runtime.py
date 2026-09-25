@@ -5478,7 +5478,12 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
 
 
 def rebind_prepared_launch(
-    impl, plan: RebindPlan, inputs: dict, *, signature: tuple | None = None
+    impl,
+    plan: RebindPlan,
+    inputs: dict,
+    *,
+    signature: tuple | None = None,
+    changed: frozenset | None = None,
 ) -> bool:
     """Point a prepared launch at new caller tensors with the recorded layout.
 
@@ -5488,7 +5493,10 @@ def rebind_prepared_launch(
     argument (``*_tma`` keys) moved, in which case the caller must re-encode
     the descriptors (``prepare_descriptors``): one stream-ordered upload
     kernel, and therefore CUDA-graph capturable.  Unchanged descriptor
-    sources may keep the workspace contents.
+    sources may keep the workspace contents.  ``changed`` names the caller
+    tensors whose address differs from the previous binding of this plan;
+    when given, views and addresses of the other inputs are left in place
+    (their tensors still hold the recorded addresses and layouts).
     """
     import torch
 
@@ -5543,6 +5551,8 @@ def rebind_prepared_launch(
 
     stale_owners: list = []
     for spec in plan.views:
+        if changed is not None and spec.input_name not in changed:
+            continue
         container = containers[spec.container]
         replacement = view_for(spec)
         if (
@@ -5556,6 +5566,8 @@ def rebind_prepared_launch(
                 stale_owners.append(owner)
         container[spec.key] = replacement
     for address in plan.addresses:
+        if changed is not None and address.input_name not in changed:
+            continue
         containers[address.container][address.key] = (
             inputs[address.input_name].data_ptr() + address.byte_offset
         )

@@ -196,6 +196,23 @@ def test_repeat_call_on_unchanged_tensors_skips_the_rebind_and_stays_bitwise():
     assert cache.fast_hits == 1 and cache.hits == 3
 
 
+def test_hit_with_a_fresh_output_only_repoints_the_output_and_stays_bitwise():
+    """Serving allocates the output per call; the hit rebinds that input only."""
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192], 16, seed=13)
+    pool = d["pool"].clone()
+    _run(d, cache)
+    for _ in range(3):
+        d = dict(d, out=torch.empty_like(d["out"]))
+        _run(d, cache)
+    assert (cache.misses, cache.hits, cache.fast_hits) == (1, 3, 0)
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    for _ in range(4):
+        _run(d)
+    _assert_same(got, _snapshot(d))
+
+
 def test_split_sequence_affine_route_caches_and_rebinds():
     # A long bounded-gate sequence without a checkpoint request takes the
     # affine split route.  Its main/map/correction part launches and the
