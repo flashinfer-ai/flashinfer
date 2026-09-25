@@ -223,7 +223,7 @@ def _moe_core_impl(
     # GEMM2 tile raster order (Blackwell finalize kernel): M-fastest keeps the
     # fused finalize's reduce target slab (one N tile of every token row)
     # L2-resident; N-fastest (default) reuses each A tile across N tiles.
-    gemm2_raster_along_m: bool = False,
+    gemm2_raster_along_m: Union[bool, str] = False,
     gemm2_swizzle_size: int = 1,
     # Launch the alternate-tile GEMMs as programmatic dependents of the base
     # ones (PDL): their launch overlaps the base kernel's tail, so the variant

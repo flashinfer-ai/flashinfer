@@ -42,7 +42,7 @@ Key features:
 
 import functools
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -207,7 +207,7 @@ def _get_compiled_finalize_kernel(
     sf_vec_size: int,
     tile_size: int,
     cluster_shape_mn: Tuple[int, int],
-    raster_along_m: bool,
+    raster_along_m: Union[bool, str],
     a_dtype: type,
     b_dtype: type,
     sf_dtype: type,
@@ -310,7 +310,8 @@ def _get_compiled_finalize_kernel(
                 mma_inst_shape=mma_inst_shape,
                 mma_tiler=mma_tiler,
                 cluster_shape_mn=cluster_shape_mn,
-                raster_along_m=raster_along_m,
+                # The SM107 kernel has no device-side raster choice.
+                raster_along_m=raster_along_m is True,
                 topK=topk,
                 enable_pdl=enable_pdl,
             )
@@ -395,7 +396,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     sf_vec_size: int = 16,
     mma_tiler_mn: Tuple[int, int] = (256, 128),
     cluster_shape_mn: Tuple[int, int] = (2, 1),
-    raster_along_m: bool = False,
+    raster_along_m: Union[bool, str] = False,
     # Persistent scheduler swizzle: with raster_along_m, tiles advance along M in
     # groups of swizzle_size N tiles (must divide the N tile count).
     swizzle_size: int = 1,
@@ -442,7 +443,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
         mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
-        raster_along_m: If True, raster tiles along M dimension. Default: False
+        raster_along_m: True rasters tiles along M, False along N, "auto" lets the
+            kernel pick per launch from the routing (Blackwell finalize kernel). Default: False
         sm_count: Number of SMs to use. Default: max available.
         tile_idx_to_row_group: Optional int32 work list, shape (num_tiles,):
             scheduler slot ``i`` processes the ``tile_size``-row group

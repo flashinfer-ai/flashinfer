@@ -1587,9 +1587,11 @@ def test_dense_dual_tile_default_follows_the_shard(monkeypatch):
 
 
 def test_dense_gemm2_raster_policy(monkeypatch):
-    """M-fastest GEMM2 raster: off by default, ``1`` forces it with the swizzle
-    when the swizzle divides the N tile count (7168 / 256 = 28 tiles), ``auto``
-    applies the shard/token rule."""
+    """Dense GEMM2 raster: ``auto`` (default) hands the shard's GEMM2 both
+    rasters from DENSE_GEMM2_RASTER_M_MIN_TOKENS tokens (device-side choice),
+    ``1`` forces M-fastest with the swizzle when it divides the N tile count
+    (7168 / 256 = 28 tiles), ``0`` keeps N-fastest; the wide expert-parallel
+    rank never rasters along M."""
     from flashinfer.fused_moe.cute_dsl import mxfp4
 
     tp8 = _policy_wrapper(moe_tp_size=8, moe_tp_rank=0)
@@ -1602,11 +1604,15 @@ def test_dense_gemm2_raster_policy(monkeypatch):
     assert ep8._gemm2_raster(8192, 256) == (True, 4)
     monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 3)
     assert tp8._gemm2_raster(8192, 256) == (True, 1)  # 28 N tiles: no group of 3
-    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 7)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 4)
     monkeypatch.setattr(mxfp4, "DENSE_GEMM2_RASTER_M", "auto")
-    assert tp8._gemm2_raster(8192, 256) == (True, 7)
-    assert tp8._gemm2_raster(4096, 256) == (False, 1)
+    assert tp8._gemm2_raster(16384, 256) == ("auto", 4)
+    assert tp8._gemm2_raster(32768, 256) == ("auto", 4)
+    assert tp8._gemm2_raster(8192, 256) == (False, 1)
     assert ep8._gemm2_raster(32768, 256) == (False, 1)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_RASTER_M_MIN_TOKENS", 8192)
+    monkeypatch.setattr(mxfp4, "DENSE_GEMM2_SWIZZLE", 7)
+    assert tp8._gemm2_raster(8192, 256) == ("auto", 7)
 
 
 def test_swap_split_policy(monkeypatch):

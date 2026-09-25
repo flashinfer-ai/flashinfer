@@ -345,23 +345,27 @@ DENSE_TWO_STAGE_FINALIZE = os.environ.get("MXFP4_DENSE_TWO_STAGE", "0") == "1"
 # each 128-row A tile across the N tiles; M-fastest walks the M tiles of one
 # N tile so the fused finalize's reduce-add target (one 256-column slab of
 # every routed token row) stays L2-resident, and with ``swizzle`` N tiles per
-# group the A tile is still reused ``swizzle`` times. On the 384-wide MoE-TP
-# shard, whose GEMM2 is bound by the reduce-add traffic, M-fastest with groups
-# of 4 cuts the balanced and empty rows by 6-13% at T=8192..32768 (interleaved
-# A/B/A/B, 30 graph replays each) but costs the hot routing (one expert holding
-# every token plus 895 small ones) 1.2% at T=32768 and up to 3.4% at T=16384,
-# and the wide rank (K=3072) 3-5%. Off by default until the raster can follow
-# the routing on the device; ``MXFP4_GEMM2_RASTER_M=1`` (swizzle
-# ``MXFP4_GEMM2_SWIZZLE``, default 4) enables it, ``auto`` applies it to shards
-# up to ``MXFP4_GEMM2_RASTER_M_MAX_SHARD`` columns from
-# ``MXFP4_GEMM2_RASTER_M_MIN_TOKENS`` tokens.
-DENSE_GEMM2_RASTER_M = os.environ.get("MXFP4_GEMM2_RASTER_M", "0")
+# group the A tile is still reused ``swizzle`` times. Measured on B300 (r38e,
+# graph, same GPU) on the 384-wide MoE-TP shard, span vs N-fastest with
+# swizzle 4: T=16384 balanced 0.916 / empty 0.844 / hot 1.059, T=32768
+# balanced 0.867 / empty 0.864 / hot 1.088; T=8192 loses 1-6 % on every
+# routing and the wide expert-parallel rank (K = 3072) 3-5 %. The hot loss is
+# specific to one dominant expert next to a long tail of small ones (a single
+# giant expert plus 895 small: +4.5-6 %; 16 giant experts: -20 %; 512 equal
+# small experts: -8 %), so the choice follows the routing on the device:
+# ``auto`` compiles both rasters into the shard's GEMM2 from
+# ``MXFP4_GEMM2_RASTER_M_MIN_TOKENS`` tokens (shards up to
+# ``MXFP4_GEMM2_RASTER_M_MAX_SHARD`` columns) and the kernel's scheduler warp
+# keeps N-fastest when one expert holds at least half the rows while more
+# than 32 experts are active. ``1`` forces M-fastest, ``0`` N-fastest;
+# ``MXFP4_GEMM2_SWIZZLE`` (default 4) sets the group.
+DENSE_GEMM2_RASTER_M = os.environ.get("MXFP4_GEMM2_RASTER_M", "auto")
 DENSE_GEMM2_SWIZZLE = int(os.environ.get("MXFP4_GEMM2_SWIZZLE", "4"))
 DENSE_GEMM2_RASTER_M_MAX_SHARD = int(
     os.environ.get("MXFP4_GEMM2_RASTER_M_MAX_SHARD", "512")
 )
 DENSE_GEMM2_RASTER_M_MIN_TOKENS = int(
-    os.environ.get("MXFP4_GEMM2_RASTER_M_MIN_TOKENS", "8192")
+    os.environ.get("MXFP4_GEMM2_RASTER_M_MIN_TOKENS", "16384")
 )
 if DENSE_GEMM2_RASTER_M not in ("auto", "0", "1"):
     raise ValueError("MXFP4_GEMM2_RASTER_M must be auto, 0 or 1")
@@ -1669,16 +1673,20 @@ class CuteDslMxfp4MoEWrapper:
 
     def _gemm2_raster(self, num_tokens, gemm2_tile_n):
         """(raster_along_m, swizzle_size) of the dense GEMM2 (see
-        DENSE_GEMM2_RASTER_M). The swizzle groups N tiles, so it must divide
-        the N tile count; otherwise the raster runs ungrouped."""
+        DENSE_GEMM2_RASTER_M): ``raster_along_m`` is ``"auto"`` (device-side
+        choice), True (M-fastest) or False (N-fastest). The swizzle groups N
+        tiles, so it must divide the N tile count; otherwise the raster runs
+        ungrouped."""
         if DENSE_GEMM2_RASTER_M == "auto":
-            along_m = (
+            if not (
                 self.intermediate_shard <= DENSE_GEMM2_RASTER_M_MAX_SHARD
                 and num_tokens >= DENSE_GEMM2_RASTER_M_MIN_TOKENS
-            )
+            ):
+                return False, 1
+            mode = "auto"
+        elif DENSE_GEMM2_RASTER_M == "1":
+            mode = True
         else:
-            along_m = DENSE_GEMM2_RASTER_M == "1"
-        if not along_m:
             return False, 1
         n_tiles = -(-self.hidden_size // gemm2_tile_n)
         swizzle = (
@@ -1686,7 +1694,7 @@ class CuteDslMxfp4MoEWrapper:
             if DENSE_GEMM2_SWIZZLE > 0 and n_tiles % DENSE_GEMM2_SWIZZLE == 0
             else 1
         )
-        return True, swizzle
+        return mode, swizzle
 
     def _dual_tactic(self, num_tokens):
         """Alternate (M256, two-CTA) dense tactic the routing may select at run

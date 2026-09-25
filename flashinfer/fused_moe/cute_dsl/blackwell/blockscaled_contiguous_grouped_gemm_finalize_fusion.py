@@ -29,6 +29,8 @@
 from typing import Optional, Tuple, Type, Union
 
 
+import os
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -368,7 +370,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        raster_along_m: bool = False,
+        raster_along_m: Union[bool, str] = False,
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
@@ -414,7 +416,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
-        self.raster_along_m = raster_along_m
+        # "auto" compiles both rasters; the scheduler warp picks one per launch
+        # from the routing it is given (see the kernel's raster selection).
+        self.raster_auto = raster_along_m == "auto"
+        self.raster_along_m = True if self.raster_auto else bool(raster_along_m)
+        # Debug override of the device-side choice ("n" / "m"); empty in production.
+        self.raster_auto_force = os.environ.get("MXFP4_GEMM2_RASTER_AUTO_FORCE", "")
         if swizzle_size < 1:
             raise ValueError("swizzle_size must be >= 1")
         self.swizzle_size = swizzle_size
@@ -916,6 +923,21 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.raster_along_m,
             self.swizzle_size,
         )
+        # N-fastest scheduler of the auto mode (same tile count and grid). A
+        # conditional expression: an ``if`` here would carry ``self`` through
+        # a traced region.
+        self.tile_sched_params_n = (
+            self._compute_grid(
+                (a.shape[0], b.shape[0], a.shape[2]),
+                self.cta_tile_shape_mnk,
+                self.cluster_shape_mn,
+                max_active_clusters,
+                False,
+                1,
+            )[0]
+            if self.raster_auto
+            else None
+        )
 
         self.buffer_align_bytes = 1024
 
@@ -956,6 +978,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 # 1 byte alignment
                 1,
             ]
+            # Raster of this launch chosen by the scheduler warp (auto mode).
+            sched_mode: cute.struct.MemRange[cutlass.Int32, 4]
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[
@@ -1050,6 +1074,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.epi_layout,
             self.topK,
             self.tile_sched_params,
+            self.tile_sched_params_n,
             epilogue_op,
         ).launch(
             grid=grid,
@@ -1139,6 +1164,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         epi_layout: cute.Layout,
         topK: cutlass.Int32,
         tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params_n: Optional[utils.PersistentTileSchedulerParams],
         epilogue_op: cutlass.Constexpr,
     ):
         """
@@ -1285,6 +1311,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # (bidx, bidy, bidz, valid)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
+        sSchedMode = storage.sched_mode.get_tensor(cute.make_layout((4,)))
 
         # Per-row finalize metadata staged by the meta loader warp: (row, stage)
         meta_layout = cute.make_layout(
@@ -1495,6 +1522,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
         work_tile = tile_sched.initial_work_tile_info()
+        if cutlass.const_expr(self.raster_auto):
+            tile_sched_n = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params_n, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            work_tile_n = tile_sched_n.initial_work_tile_info()
 
         tile_info_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_tile_stage
@@ -1502,10 +1534,59 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         num_valid_tiles = num_non_exiting_tiles[0]
         is_continue = cutlass.Boolean(1)
-
         if warp_idx == self.sched_warp_id:
+            # Raster of this launch: 1 = N-fastest (row-major tiles), 0 = M-fastest.
+            sched_mode_n = cutlass.Int32(0 if self.raster_along_m else 1)
+            if cutlass.const_expr(self.raster_auto):
+                # 64 evenly spaced samples of the expert id of the valid 128-row
+                # groups (the groups are expert-sorted), two per lane: two
+                # consecutive samples of one expert mark a dominant expert
+                # (more than about 1/64 of the groups, a quarter of the tokens
+                # at top_k = 16); more than 32 distinct samples mark a long
+                # tail of active experts. One dominant expert with a long
+                # tail keeps the N-fastest raster (M-fastest measured 6-9 %
+                # slower there on B300); every other routing takes M-fastest.
+                lane = cute.arch.lane_idx()
+                stride = cutlass.max(num_valid_tiles // 64, 1)
+                last_group = cutlass.max(num_valid_tiles - 1, 0)
+                g0 = cutlass.min(lane * stride, last_group)
+                g1 = cutlass.min((lane + 32) * stride, last_group)
+                if cutlass.const_expr(tile_idx_to_row_group is not None):
+                    g0 = tile_idx_to_row_group[g0]
+                    g1 = tile_idx_to_row_group[g1]
+                e0 = tile_idx_to_expert_idx[g0]
+                e1 = tile_idx_to_expert_idx[g1]
+                e0_prev = cute.arch.shuffle_sync_up(e0, 1)
+                e1_prev = cute.arch.shuffle_sync_up(e1, 1)
+                e0_last = cute.arch.shuffle_sync(e0, 31)
+                is_lane0 = cutlass.Int32(lane == 0)
+                e1_prev = e1_prev * (1 - is_lane0) + e0_last * is_lane0
+                not_lane0 = lane > 0
+                same = (not_lane0 & (e0 == e0_prev)) | (e1 == e1_prev)
+                transitions = cutlass.Int32(not_lane0 & (e0 != e0_prev)) + cutlass.Int32(
+                    e1 != e1_prev
+                )
+                giant_any = cute.arch.vote_any_sync(same)
+                distinct = cute.arch.warp_redux_sync(transitions, "add") + 1
+                # A launch without valid tiles (the unchosen alternate tile)
+                # takes N-fastest, whose loop exits at the first padded group.
+                sched_mode_n = cutlass.Int32(
+                    (giant_any & (distinct > 32)) | (num_valid_tiles == 0)
+                )
+                if cutlass.const_expr(self.raster_auto_force == "n"):
+                    sched_mode_n = cutlass.Int32(1)
+                if cutlass.const_expr(self.raster_auto_force == "m"):
+                    sched_mode_n = cutlass.Int32(0)
+                # Published for the scheduling loop after the CTA-wide waits.
+                sSchedMode[0] = sched_mode_n
             if work_tile.is_valid_tile:
-                cur_tile_coord = work_tile.tile_idx
+                coord_m = work_tile.tile_idx[0]
+                coord_n = work_tile.tile_idx[1]
+                if cutlass.const_expr(self.raster_auto):
+                    if sched_mode_n == 1:
+                        coord_m = work_tile_n.tile_idx[0]
+                        coord_n = work_tile_n.tile_idx[1]
+                cur_tile_coord = (coord_m, coord_n)
                 mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                     tiled_mma.thr_id.shape
                 )
@@ -1543,11 +1624,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
                     tile_info_producer_state.advance()
                 else:
-                    if cutlass.const_expr(not self.raster_along_m):
+                    if cutlass.const_expr(self.raster_auto):
+                        if sched_mode_n == 1:
+                            is_continue = cutlass.Boolean(0)
+                    elif cutlass.const_expr(not self.raster_along_m):
                         is_continue = cutlass.Boolean(0)
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.raster_auto):
+                    tile_sched_n.advance_to_next_work()
+                    work_tile_n = tile_sched_n.get_current_work()
 
         #
         # Cluster wait after early scheduler/TMEM setup
@@ -1565,103 +1652,75 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized Schedule warp
         #
         if warp_idx == self.sched_warp_id:
+            sched_mode_n = cutlass.Int32(0 if self.raster_along_m else 1)
+            if cutlass.const_expr(self.raster_auto):
+                sched_mode_n = sSchedMode[0]
             #
             # Persistent tile scheduling loop, starting after the pre-emitted
             # first tile.
             #
-            if cutlass.const_expr(self.raster_along_m):
-                while work_tile.is_valid_tile:
-                    cur_tile_coord = work_tile.tile_idx
-                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(
-                        tiled_mma.thr_id.shape
-                    )
-                    tile_idx = mma_tile_coord_m
-                    if tile_idx < num_valid_tiles:
-                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                        sched_group = tile_idx
-                        sched_coord_m = cur_tile_coord[0]
-                        if cutlass.const_expr(tile_idx_to_row_group is not None):
-                            # Compacted work list: the scheduler slot names the
-                            # 128-row group whose rows, expert and limit follow.
-                            sched_group = tile_idx_to_row_group[tile_idx]
-                            sched_coord_m = sched_group * cute.size(
-                                tiled_mma.thr_id.shape
-                            ) + (
-                                cur_tile_coord[0]
-                                - tile_idx * cute.size(tiled_mma.thr_id.shape)
-                            )
-                        expert_idx = tile_idx_to_expert_idx[sched_group]
-                        mn_limit = tile_idx_to_mn_limit[sched_group]
-                        with cute.arch.elect_one():
-                            sInfo[(0, tile_info_producer_state.index)] = sched_coord_m
-                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
-                                1
-                            ]
-                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
-                            sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
-                                work_tile.is_valid_tile
-                            )
-                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
-                            # fence view async shared
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
+            while work_tile.is_valid_tile and is_continue:
+                coord_m = work_tile.tile_idx[0]
+                coord_n = work_tile.tile_idx[1]
+                if cutlass.const_expr(self.raster_auto):
+                    if sched_mode_n == 1:
+                        coord_m = work_tile_n.tile_idx[0]
+                        coord_n = work_tile_n.tile_idx[1]
+                cur_tile_coord = (coord_m, coord_n)
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(
+                    tiled_mma.thr_id.shape
+                )
+                tile_idx = mma_tile_coord_m
+                if tile_idx < num_valid_tiles:
+                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    sched_group = tile_idx
+                    sched_coord_m = cur_tile_coord[0]
+                    if cutlass.const_expr(tile_idx_to_row_group is not None):
+                        # Compacted work list: the scheduler slot names the
+                        # 128-row group whose rows, expert and limit follow.
+                        sched_group = tile_idx_to_row_group[tile_idx]
+                        sched_coord_m = sched_group * cute.size(
+                            tiled_mma.thr_id.shape
+                        ) + (
+                            cur_tile_coord[0]
+                            - tile_idx * cute.size(tiled_mma.thr_id.shape)
                         )
-
-                        self.sched_sync_barrier.arrive_and_wait()
-                        tile_info_pipeline.producer_commit(tile_info_producer_state)
-                        tile_info_producer_state.advance()
-
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
-            else:
-                while work_tile.is_valid_tile and is_continue:
-                    cur_tile_coord = work_tile.tile_idx
-                    mma_tile_coord_m = cur_tile_coord[0] // cute.size(
-                        tiled_mma.thr_id.shape
-                    )
-                    tile_idx = mma_tile_coord_m
-                    if tile_idx < num_valid_tiles:
-                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                        sched_group = tile_idx
-                        sched_coord_m = cur_tile_coord[0]
-                        if cutlass.const_expr(tile_idx_to_row_group is not None):
-                            # Compacted work list: the scheduler slot names the
-                            # 128-row group whose rows, expert and limit follow.
-                            sched_group = tile_idx_to_row_group[tile_idx]
-                            sched_coord_m = sched_group * cute.size(
-                                tiled_mma.thr_id.shape
-                            ) + (
-                                cur_tile_coord[0]
-                                - tile_idx * cute.size(tiled_mma.thr_id.shape)
-                            )
-                        expert_idx = tile_idx_to_expert_idx[sched_group]
-                        mn_limit = tile_idx_to_mn_limit[sched_group]
-                        with cute.arch.elect_one():
-                            sInfo[(0, tile_info_producer_state.index)] = sched_coord_m
-                            sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
-                                1
-                            ]
-                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
-                            sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
-                                work_tile.is_valid_tile
-                            )
-                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
-                            # fence view async shared
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
+                    expert_idx = tile_idx_to_expert_idx[sched_group]
+                    mn_limit = tile_idx_to_mn_limit[sched_group]
+                    with cute.arch.elect_one():
+                        sInfo[(0, tile_info_producer_state.index)] = sched_coord_m
+                        sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
+                            1
+                        ]
+                        sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                        sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
+                            work_tile.is_valid_tile
                         )
+                        sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                        # fence view async shared
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
 
-                        self.sched_sync_barrier.arrive_and_wait()
-                        tile_info_pipeline.producer_commit(tile_info_producer_state)
-                        tile_info_producer_state.advance()
+                    self.sched_sync_barrier.arrive_and_wait()
+                    tile_info_pipeline.producer_commit(tile_info_producer_state)
+                    tile_info_producer_state.advance()
 
-                    else:
+                else:
+                    # N-fastest walks the valid rows first and may stop at the
+                    # first padded group; M-fastest interleaves them.
+                    if cutlass.const_expr(self.raster_auto):
+                        if sched_mode_n == 1:
+                            is_continue = cutlass.Boolean(0)
+                    elif cutlass.const_expr(not self.raster_along_m):
                         is_continue = cutlass.Boolean(0)
 
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.raster_auto):
+                    tile_sched_n.advance_to_next_work()
+                    work_tile_n = tile_sched_n.get_current_work()
 
             tile_info_pipeline.producer_acquire(tile_info_producer_state)
             with cute.arch.elect_one():
