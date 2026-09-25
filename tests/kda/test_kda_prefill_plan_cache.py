@@ -173,6 +173,29 @@ def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
         _assert_same(want, _snapshot(d))
 
 
+def test_repeat_call_on_unchanged_tensors_skips_the_rebind_and_stays_bitwise():
+    """The same tensors, addresses and scalars as the previous hit take the memo path."""
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192], 16, seed=11)
+    pool = d["pool"].clone()
+    _run(d, cache)  # miss: prepare + put
+    _run(d, cache)  # hit: rebind (memo armed)
+    _run(d, cache)  # hit: memo, no rebind
+    assert (cache.misses, cache.hits, cache.fast_hits) == (1, 2, 1)
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    for _ in range(3):
+        _run(d)
+    _assert_same(got, _snapshot(d))
+    # A different token count on the same buffers must not take the memo.
+    other = _inputs([4096], 16, seed=12)
+    _run(other, cache)
+    assert cache.fast_hits == 1 and cache.misses == 2
+    # Coming back to the first tensors: the memo belongs to the other entry now.
+    _run(d, cache)
+    assert cache.fast_hits == 1 and cache.hits == 3
+
+
 def test_split_sequence_affine_route_caches_and_rebinds():
     # A long bounded-gate sequence without a checkpoint request takes the
     # affine split route.  Its main/map/correction part launches and the

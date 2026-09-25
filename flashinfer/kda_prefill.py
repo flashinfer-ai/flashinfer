@@ -7420,6 +7420,26 @@ def kda_prefill_supports_fp32_checkpoints(device=None, *, lower_bound=None) -> b
     )
 
 
+def _fast_signature(inputs):
+    """Address-level identity of the rebind inputs: (data_ptr, shape, stride, dtype) per tensor.
+
+    Equal fast signatures mean a prepared launch rebound to the previous call
+    already points at these tensors; the structural key (``rebind_signature``)
+    is implied because shapes, strides, dtypes and low address bits are all
+    part of it.
+    """
+    from .cake_kda_tf32_runtime import REBIND_INPUT_NAMES
+
+    facts = []
+    for name in REBIND_INPUT_NAMES:
+        tensor = inputs.get(name)
+        if tensor is None:
+            facts.append(None)
+        else:
+            facts.append((tensor.data_ptr(), tensor.shape, tensor.stride(), tensor.dtype))
+    return tuple(facts)
+
+
 class KDAPrefillPlanCache:
     """Bounded LRU of prepared KDA launches keyed by structural signature.
 
@@ -7461,9 +7481,16 @@ class KDAPrefillPlanCache:
         self._bytes: dict[object, int] = {}
         self.bytes = 0
         self.hits = 0
+        self.fast_hits = 0
         self.misses = 0
         self.uncacheable = 0
         self.evictions = 0
+        # Last hit: (address-level signature, entry).  A repeat call whose
+        # caller tensors kept their addresses, layouts and dtypes needs no
+        # rebind at all (static buffers, CUDA-graph style loops, allocator
+        # reuse between forwards), so ``get`` answers it from this memo.
+        self._last_fast = None
+        self._last_entry = None
 
     def __len__(self):
         return len(self._entries)
@@ -7476,11 +7503,16 @@ class KDAPrefillPlanCache:
         self._entries.clear()
         self._bytes.clear()
         self.bytes = 0
+        self._last_fast = None
+        self._last_entry = None
 
     def _evict_oldest(self):
         key, (evicted, _) = self._entries.popitem(last=False)
         self.bytes -= self._bytes.pop(key, 0)
         self.evictions += 1
+        if self._last_entry is not None and self._last_entry[0] is evicted:
+            self._last_fast = None
+            self._last_entry = None
         close = getattr(evicted, "close", None)
         if callable(close):
             close()
@@ -7502,6 +7534,16 @@ class KDAPrefillPlanCache:
         import torch
         from .cake_kda_tf32_runtime import rebind_prepared_launch
 
+        fast = (_fast_signature(inputs), tuple(sorted(scalars.items())))
+        if fast == self._last_fast:
+            # Same addresses, layouts, dtypes and scalars as the previous hit:
+            # the prepared launch is already bound to these tensors.
+            prepared, _ = self._last_entry
+            if torch.cuda.is_current_stream_capturing():
+                getattr(prepared, "_impl", prepared)._descriptors_stale = True
+            self.hits += 1
+            self.fast_hits += 1
+            return prepared
         key = self._key(inputs, **scalars)
         entry = self._entries.get(key)
         if entry is None:
@@ -7513,6 +7555,8 @@ class KDAPrefillPlanCache:
         if tma_moved or torch.cuda.is_current_stream_capturing():
             owner._descriptors_stale = True
         self.hits += 1
+        self._last_fast = fast
+        self._last_entry = entry
         return prepared
 
     def put(self, prepared, inputs, *, retained_bytes: int = 0, **scalars):
@@ -7533,6 +7577,8 @@ class KDAPrefillPlanCache:
         key = self._key(inputs, **scalars)
         if key in self._entries:
             self.bytes -= self._bytes.pop(key, 0)
+        self._last_fast = None
+        self._last_entry = None
         self._entries[key] = (prepared, plan)
         self._entries.move_to_end(key)
         self._bytes[key] = int(retained_bytes)
