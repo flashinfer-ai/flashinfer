@@ -460,7 +460,7 @@ def test_affine_fused_epilogue_keeps_subnormal_sums():
     from flashinfer.jit.cake_kda_affine_epilogue import load_for_device
 
     device = torch.device("cuda", torch.cuda.current_device())
-    run = load_for_device(device)
+    run = load_for_device(device).run
     heads, elems, tail_elems = 1, 128 * 128, 1024
     gen = torch.Generator(device=device).manual_seed(3)
 

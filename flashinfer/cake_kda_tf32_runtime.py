@@ -1268,6 +1268,7 @@ class _FusedAffineEpilogue:
     """Static arguments of the fused affine epilogue launch."""
 
     run: Any
+    index_prep: Any
     heads: int
     tail_elems: int
     pool_slot_stride: int
@@ -1299,11 +1300,12 @@ class _FusedAffineEpilogue:
             if impl._checkpoint_output.stride(0) != row_elems:
                 return None
         try:
-            run = load_for_device(impl._launch_device)
+            module = load_for_device(impl._launch_device)
         except NotImplementedError:
             return None
         return _FusedAffineEpilogue(
-            run=run,
+            run=module.run,
+            index_prep=module.index_prep,
             heads=heads,
             tail_elems=int(out_tail.numel()),
             pool_slot_stride=int(pool.stride(0)),
@@ -4969,20 +4971,39 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         with tvm_ffi.use_torch_stream():
             for destination, source in self._affine_input_refreshes:
                 destination.copy_(source)
-            self._part_state_indices.index_copy_(
-                0, self._first_parts, self._state_indices
-            )
-            if self._checkpoint_in_place:
-                starts = self._part_row_starts[: self.num_parts]
-                torch.index_select(
-                    self._checkpoint_start, 0, self._part_seq_ids, out=starts
+            if self._fused_epilogue is not None:
+                # One kernel gathers every per-call index the parts consume
+                # (window state indices, in-place row starts, the int64 state
+                # indices of the epilogue); the torch sequence below costs
+                # four launches on the host path before the first chain kernel.
+                rows = self._checkpoint_in_place
+                self._fused_epilogue.index_prep(
+                    self._state_indices,
+                    self._first_parts,
+                    self._part_state_indices,
+                    self._state_indices_long,
+                    self._checkpoint_start if rows else self._first_parts,
+                    self._part_seq_ids if rows else self._first_parts,
+                    self._part_local_rows if rows else self._first_parts,
+                    self._part_row_starts if rows else self._first_parts,
+                    self.num_parts if rows else 0,
                 )
-                starts.add_(self._part_local_rows)
-            # The parts share this stream context (no re-entry per part); the
-            # int64 index copy is only consumed by the final-state scatter and
-            # the fused epilogue, so it follows the first chain kernel.
+            else:
+                self._part_state_indices.index_copy_(
+                    0, self._first_parts, self._state_indices
+                )
+                if self._checkpoint_in_place:
+                    starts = self._part_row_starts[: self.num_parts]
+                    torch.index_select(
+                        self._checkpoint_start, 0, self._part_seq_ids, out=starts
+                    )
+                    starts.add_(self._part_local_rows)
+            # The parts share this stream context (no re-entry per part).
             self._main._launch_in_stream()
-            self._state_indices_long.copy_(self._state_indices)
+            if self._fused_epilogue is None:
+                # The int64 index copy is only consumed by the final-state
+                # scatter, so it follows the first chain kernel.
+                self._state_indices_long.copy_(self._state_indices)
             self._map._launch_in_stream()
             self._scan_module.launch(
                 grid=(self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1),

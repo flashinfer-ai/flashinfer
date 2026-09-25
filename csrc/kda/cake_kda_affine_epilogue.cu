@@ -26,7 +26,8 @@
 //                     final_pool[state_indices[s]] = final_compact[s]  (fp32 or bf16 pool)
 // Every value is produced by exactly the operation torch used (one fp32 add,
 // round-to-nearest-even to bf16), so the result is bitwise identical to the
-// unfused path.
+// unfused path.  ``index_prep`` (below) is the launch's other helper: the
+// per-call integer index gathers that precede the first chain kernel.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -236,6 +237,87 @@ void Run(TensorView main_rows, TensorView corr_rows, TensorView out_rows, Tensor
       << "affine epilogue launch failed: " << cudaGetErrorString(status);
 }
 
+// Per-launch index preparation of the composite, one kernel instead of the
+// torch sequence that preceded the first chain kernel (index_copy_,
+// index_select, add_) plus the int64 copy of the state indices that followed
+// it:
+//   part_state_indices[first_parts[s]] = state_indices[s]          (int32)
+//   state_indices_long[s]              = state_indices[s]          (int64)
+//   part_row_starts[p] = checkpoint_start[part_seq_ids[p]] + part_local_rows[p]
+//                                                        (rows in place only)
+struct IndexPrepParams {
+  const void* state_indices;
+  int state_indices_i64;
+  const int64_t* first_parts;
+  int32_t* part_state_indices;
+  int64_t* state_indices_long;
+  int64_t num_sequences;
+  const int64_t* checkpoint_start;
+  const int64_t* part_seq_ids;
+  const int64_t* part_local_rows;
+  int64_t* part_row_starts;
+  int64_t num_parts;
+};
+
+__global__ void __launch_bounds__(kThreads) index_prep_kernel(IndexPrepParams p) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (i < p.num_sequences) {
+    const int64_t index = p.state_indices_i64
+                              ? static_cast<const int64_t*>(p.state_indices)[i]
+                              : static_cast<int64_t>(static_cast<const int32_t*>(p.state_indices)[i]);
+    p.part_state_indices[p.first_parts[i]] = static_cast<int32_t>(index);
+    p.state_indices_long[i] = index;
+  }
+  if (p.part_row_starts != nullptr && i < p.num_parts) {
+    p.part_row_starts[i] = p.checkpoint_start[p.part_seq_ids[i]] + p.part_local_rows[i];
+  }
+}
+
+void IndexPrep(TensorView state_indices, TensorView first_parts, TensorView part_state_indices,
+               TensorView state_indices_long, TensorView checkpoint_start, TensorView part_seq_ids,
+               TensorView part_local_rows, TensorView part_row_starts, int64_t num_parts) {
+  auto is_i32 = [](const TensorView& t) { return t.dtype().code == kDLInt && t.dtype().bits == 32; };
+  auto is_i64 = [](const TensorView& t) { return t.dtype().code == kDLInt && t.dtype().bits == 64; };
+  const int64_t num_sequences = state_indices.size(0);
+  TVM_FFI_CHECK(is_i32(state_indices) || is_i64(state_indices), ValueError)
+      << "affine index prep: state indices must be int32 or int64";
+  TVM_FFI_CHECK(is_i64(first_parts) && first_parts.size(0) >= num_sequences, ValueError)
+      << "affine index prep: first_parts must be int64 with one entry per sequence";
+  TVM_FFI_CHECK(is_i32(part_state_indices) && is_i64(state_indices_long) &&
+                    state_indices_long.size(0) >= num_sequences,
+                ValueError)
+      << "affine index prep: part_state_indices must be int32 and state_indices_long int64";
+  IndexPrepParams p{};
+  p.state_indices = state_indices.data_ptr();
+  p.state_indices_i64 = is_i64(state_indices) ? 1 : 0;
+  p.first_parts = static_cast<const int64_t*>(first_parts.data_ptr());
+  p.part_state_indices = static_cast<int32_t*>(part_state_indices.data_ptr());
+  p.state_indices_long = static_cast<int64_t*>(state_indices_long.data_ptr());
+  p.num_sequences = num_sequences;
+  p.num_parts = num_parts;
+  if (num_parts > 0) {
+    TVM_FFI_CHECK(is_i64(checkpoint_start) && is_i64(part_seq_ids) && is_i64(part_local_rows) &&
+                      is_i64(part_row_starts) && part_seq_ids.size(0) >= num_parts &&
+                      part_local_rows.size(0) >= num_parts && part_row_starts.size(0) >= num_parts,
+                  ValueError)
+        << "affine index prep: row-start tensors must be int64 with one entry per window";
+    p.checkpoint_start = static_cast<const int64_t*>(checkpoint_start.data_ptr());
+    p.part_seq_ids = static_cast<const int64_t*>(part_seq_ids.data_ptr());
+    p.part_local_rows = static_cast<const int64_t*>(part_local_rows.data_ptr());
+    p.part_row_starts = static_cast<int64_t*>(part_row_starts.data_ptr());
+  }
+  const int64_t items = num_sequences > num_parts ? num_sequences : num_parts;
+  TVM_FFI_CHECK(items > 0 && items < (int64_t{1} << 31), ValueError)
+      << "affine index prep: nothing to prepare";
+  const int64_t blocks = (items + kThreads - 1) / kThreads;
+  cudaStream_t stream = get_stream(state_indices.device());
+  index_prep_kernel<<<dim3(static_cast<unsigned>(blocks)), dim3(kThreads), 0, stream>>>(p);
+  cudaError_t status = cudaGetLastError();
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "affine index prep launch failed: " << cudaGetErrorString(status);
+}
+
 }  // namespace cake_kda_affine_epilogue
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_kda_affine_epilogue::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(index_prep, cake_kda_affine_epilogue::IndexPrep);
