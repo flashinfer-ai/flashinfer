@@ -178,10 +178,10 @@ def test_repeat_call_on_unchanged_tensors_skips_the_rebind_and_stays_bitwise():
     cache = KDAPrefillPlanCache(8)
     d = _inputs([8192], 16, seed=11)
     pool = d["pool"].clone()
-    _run(d, cache)  # miss: prepare + put
-    _run(d, cache)  # hit: rebind (memo armed)
+    _run(d, cache)  # miss: prepare + put (bound to these tensors)
+    _run(d, cache)  # hit: still bound, no rebind (memo armed)
     _run(d, cache)  # hit: memo, no rebind
-    assert (cache.misses, cache.hits, cache.fast_hits) == (1, 2, 1)
+    assert (cache.misses, cache.hits, cache.fast_hits) == (1, 2, 2)
     got = _snapshot(d)
     d["pool"].copy_(pool)
     for _ in range(3):
@@ -190,10 +190,11 @@ def test_repeat_call_on_unchanged_tensors_skips_the_rebind_and_stays_bitwise():
     # A different token count on the same buffers must not take the memo.
     other = _inputs([4096], 16, seed=12)
     _run(other, cache)
-    assert cache.fast_hits == 1 and cache.misses == 2
-    # Coming back to the first tensors: the memo belongs to the other entry now.
+    assert cache.fast_hits == 2 and cache.misses == 2
+    # Coming back to the first tensors: the memo belongs to the other entry
+    # now, but this entry is still bound to these tensors, so no rebind.
     _run(d, cache)
-    assert cache.fast_hits == 1 and cache.hits == 3
+    assert cache.fast_hits == 3 and cache.hits == 3
 
 
 def test_hit_with_a_fresh_output_only_repoints_the_output_and_stays_bitwise():
