@@ -281,3 +281,78 @@ def test_single_prefill_masked_key_never_dominates(dtype):
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, backend="fa2")
     o_ref, _ = ref_single_prefill(q, k, v, causal=True)
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize(
+    "bad_shape",
+    [
+        (10, 15),  # fewer columns than kv_len: the kernel reads past the packed mask
+        (10, 27),  # more columns than kv_len
+        (7, 20),  # fewer rows than qo_len
+        (20, 10),  # transposed
+        (1, 10, 20),  # rank 3: right element count, shape the API does not define
+    ],
+)
+def test_single_prefill_custom_mask_shape_mismatch(kv_layout, bad_shape):
+    """A custom_mask whose shape is not (qo_len, kv_len) must be rejected.
+
+    ``custom_mask`` is packed bit by bit with ``packbits(mask.view(-1))``, which
+    flattens any shape without checking its size. A mask smaller than
+    ``qo_len * kv_len`` therefore made the kernel read past the end of the packed
+    buffer and return corrupted results with no error at all.
+    """
+    qo_len, kv_len = 10, 20
+    num_qo_heads, num_kv_heads, head_dim = 8, 4, 128
+
+    q = torch.randn(
+        qo_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0"
+    )
+    kv_shape = (
+        (kv_len, num_kv_heads, head_dim)
+        if kv_layout == "NHD"
+        else (num_kv_heads, kv_len, head_dim)
+    )
+    k = torch.randn(*kv_shape, dtype=torch.float16, device="cuda:0")
+    v = torch.randn(*kv_shape, dtype=torch.float16, device="cuda:0")
+
+    bad_mask = torch.ones(*bad_shape, dtype=torch.bool, device="cuda:0")
+
+    with pytest.raises(ValueError, match="custom_mask"):
+        flashinfer.single_prefill_with_kv_cache(
+            q, k, v, custom_mask=bad_mask, kv_layout=kv_layout
+        )
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("flatten", [False, True])
+def test_single_prefill_custom_mask_valid_shapes_accepted(kv_layout, flatten):
+    """A correctly sized mask keeps working, flattened or not.
+
+    ``packbits`` produces the same bytes for ``(qo_len, kv_len)`` and for its
+    flattened form, so the validation must not reject the 1-D spelling.
+    """
+    qo_len, kv_len = 10, 20
+    num_qo_heads, num_kv_heads, head_dim = 8, 4, 128
+
+    q = torch.randn(
+        qo_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0"
+    )
+    kv_shape = (
+        (kv_len, num_kv_heads, head_dim)
+        if kv_layout == "NHD"
+        else (num_kv_heads, kv_len, head_dim)
+    )
+    k = torch.randn(*kv_shape, dtype=torch.float16, device="cuda:0")
+    v = torch.randn(*kv_shape, dtype=torch.float16, device="cuda:0")
+
+    mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device="cuda:0")
+    mask[:, kv_len // 2 :] = False
+    if flatten:
+        mask = mask.reshape(-1)
+
+    o = flashinfer.single_prefill_with_kv_cache(
+        q, k, v, custom_mask=mask, kv_layout=kv_layout
+    )
+    assert o.shape == (qo_len, num_qo_heads, head_dim)
+    assert torch.isfinite(o).all()
