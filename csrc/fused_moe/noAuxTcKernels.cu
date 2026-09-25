@@ -28,7 +28,10 @@ static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroups = 4;
 
-static __device__ inline float sigmoid_accurate(float x) { return 0.5f * tanhf(0.5f * x) + 0.5f; }
+static __device__ inline float sigmoid_accurate(float x) {
+  // Avoid cancellation when the sigmoid is close to zero.
+  return 1.0f / (1.0f + expf(-x));
+}
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts,
           bool UseGroups>
