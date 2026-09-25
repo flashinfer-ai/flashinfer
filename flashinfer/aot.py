@@ -132,6 +132,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
+    gen_gemm_sm103_module_cutlass_fp4,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_mm_bf16_cublaslt_module,
@@ -272,6 +273,7 @@ def gen_attention(
     use_logits_soft_cap_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    has_sm103: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
@@ -417,7 +419,7 @@ def gen_attention(
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
-    if has_sm100:
+    if has_sm100 or has_sm103:
         yield gen_fmha_cutlass_sm100a_module(
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
@@ -450,7 +452,7 @@ def gen_attention(
             )
 
     # MLA SM100
-    if has_sm100:
+    if has_sm100 or has_sm103:
         yield gen_mla_module()
 
 
@@ -463,11 +465,12 @@ def gen_xqa(
     use_sliding_window_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    has_sm103: bool,
     has_sm120: bool,
     has_sm121: bool,
 ) -> Iterator[JitSpec]:
     """Generate XQA modules for various configurations."""
-    if not has_sm90 and not has_sm100 and not has_sm120 and not has_sm121:
+    if not any((has_sm90, has_sm100, has_sm103, has_sm120, has_sm121)):
         return  # XQA requires SM90+
 
     for (
@@ -605,6 +608,7 @@ def gen_all_modules(
             use_logits_soft_cap_,
             has_sm90,
             has_sm100,
+            has_sm103,
             add_gemma,
             add_oai_oss,
         )
@@ -789,13 +793,11 @@ def gen_all_modules(
             # the fixed E=256/N=512/K=2048 shape (BS8).
             jit_specs.append(gen_monomoe_module())
         if has_sm100:
+            # SM103 registers its own FP4 quantization, CUTLASS fused MoE and FP4 GEMM
+            # below, and takes the SM100f TGV GEMMs instead of these sm_100a ones.
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
-            jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
@@ -803,12 +805,18 @@ def gen_all_modules(
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=False)
             )
-            jit_specs.append(gen_mxfp8_quantization_sm100_module())
+        if has_sm100 or has_sm103:
+            # SM103 loads these SM100-named modules too; they build for the targeted SM10x arch.
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
+            jit_specs.append(gen_gemm_sm100_module())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
             jit_specs.append(gen_trtllm_gen_routing_module())
-        if has_sm100f:
+        if has_sm100f or has_sm103:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
@@ -825,6 +833,7 @@ def gen_all_modules(
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
+            jit_specs.append(gen_gemm_sm103_module_cutlass_fp4())
         if sm_capabilities.get("sm103a_exact", False):
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
         if has_sm107:
@@ -874,11 +883,11 @@ def gen_all_modules(
             or has_sm121
         ):
             jit_specs.append(gen_trtllm_comm_module())
-        if has_sm100:
+        if has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
-            # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
+            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
         if (
@@ -923,7 +932,7 @@ def gen_all_modules(
         ):
             jit_specs.append(gen_cake_sampling_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
-        if has_sm100:
+        if has_sm100 or has_sm103:
             for C in _SUPPORTED_C:
                 for tokens in _SUPPORTED_TOKENS:
                     for dtype in ["bf16", "fp8", "nvfp4"]:
@@ -1025,7 +1034,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
-        if has_sm90 or has_sm100:
+        if has_sm90 or has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
@@ -1052,6 +1061,7 @@ def gen_all_modules(
                 use_sliding_window_,
                 has_sm90,
                 has_sm100,
+                has_sm103,
                 has_sm120,
                 has_sm121,
             )
