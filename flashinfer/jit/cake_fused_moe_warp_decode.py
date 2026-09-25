@@ -357,8 +357,9 @@ def _load_exported_device_sources(
     return device_sources, has_silu
 
 
-
-def _load_clamped_e256_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> list[Path]:
+def _load_clamped_e256_sources(
+    csrc_dir: Path, target: CakeWarpDecodeTarget
+) -> list[Path]:
     """Enable the SM100 extension only with its complete generated inventory."""
     if target != "sm100a":
         return []
@@ -366,7 +367,9 @@ def _load_clamped_e256_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> 
     manifest_path = directory / "module_manifest.json"
     if not manifest_path.is_file():
         return []
-    manifest = _require_dict(json.loads(manifest_path.read_text()), "clamped E256 modules")
+    manifest = _require_dict(
+        json.loads(manifest_path.read_text()), "clamped E256 modules"
+    )
     if manifest.get("schema_version") != 1 or manifest.get("target") != "sm_100a":
         raise ValueError("Clamped E256 inventory requires schema 1 and exact sm_100a")
     modules = manifest.get("modules")
@@ -378,27 +381,51 @@ def _load_clamped_e256_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> 
         module = _require_dict(module, "clamped E256 module")
         identity = module.get("id")
         filename = module.get("file")
-        if (not isinstance(identity, str) or identity in identifiers
-                or not isinstance(filename, str) or Path(filename).name != filename
-                or not filename.endswith(".cu")):
+        if (
+            not isinstance(identity, str)
+            or identity in identifiers
+            or not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".cu")
+        ):
             raise ValueError("Clamped E256 module identity/source path is invalid")
         if module.get("compile_options") != ["--use_fast_math"]:
-            raise ValueError("Clamped E256 module compile options differ from the selected source")
+            raise ValueError(
+                "Clamped E256 module compile options differ from the selected source"
+            )
         if module.get("pdl") is not True or module.get("cooperative") is not False:
-            raise ValueError("Clamped E256 requires non-cooperative programmatic dependent launch")
+            raise ValueError(
+                "Clamped E256 requires non-cooperative programmatic dependent launch"
+            )
         identifiers.add(identity)
-        paths.append(_resolve_export_path(
-            csrc_dir, "csrc/fused_moe/warp_decode/generated/dsv4_clamped_e256/" + filename,
-            "clamped E256 device source"))
+        paths.append(
+            _resolve_export_path(
+                csrc_dir,
+                "csrc/fused_moe/warp_decode/generated/dsv4_clamped_e256/" + filename,
+                "clamped E256 device source",
+            )
+        )
     if len(set(paths)) != len(paths):
         raise ValueError("Clamped E256 inventory repeats a device source")
-    for filename in ("declarations.cuh", "dsv4_clamped_e256_manifest.cuh", "route_metadata.json"):
+    for filename in (
+        "declarations.cuh",
+        "dsv4_clamped_e256_manifest.cuh",
+        "route_metadata.json",
+    ):
         if not (directory / filename).is_file():
-            raise FileNotFoundError(f"Clamped E256 generated source missing: {directory / filename}")
-    routes = _require_dict(json.loads((directory / "route_metadata.json").read_text()), "clamped E256 routes")
+            raise FileNotFoundError(
+                f"Clamped E256 generated source missing: {directory / filename}"
+            )
+    routes = _require_dict(
+        json.loads((directory / "route_metadata.json").read_text()),
+        "clamped E256 routes",
+    )
     rows = routes.get("routes")
-    if (routes.get("schema_version") != 1 or not isinstance(rows, list)
-            or [row.get("T") for row in rows] != list(range(1, 33))):
+    if (
+        routes.get("schema_version") != 1
+        or not isinstance(rows, list)
+        or [row.get("T") for row in rows] != list(range(1, 33))
+    ):
         raise ValueError("Clamped E256 inventory must cover every token count 1..32")
     used: set[str] = set()
     for row in rows:
@@ -408,7 +435,9 @@ def _load_clamped_e256_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> 
             raise ValueError("Clamped E256 route has an incomplete launch sequence")
         for order, call in enumerate(calls):
             if call.get("order") != order or call.get("module_id") not in identifiers:
-                raise ValueError("Clamped E256 route references a missing or unordered module")
+                raise ValueError(
+                    "Clamped E256 route references a missing or unordered module"
+                )
             used.add(call["module_id"])
     if used != identifiers:
         raise ValueError("Clamped E256 inventory contains an unselected module")

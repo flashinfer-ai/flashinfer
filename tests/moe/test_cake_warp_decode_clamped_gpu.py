@@ -18,7 +18,9 @@ def test_clamped_swiglu_parameter_view_keeps_zero_beta():
     assert set(view) == {"gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"}
     torch.testing.assert_close(view["gemm1_alpha"], torch.ones(256), atol=0, rtol=0)
     torch.testing.assert_close(view["gemm1_beta"], torch.zeros(256), atol=0, rtol=0)
-    torch.testing.assert_close(view["gemm1_clamp_limit"], torch.full((256,), 10.0), atol=0, rtol=0)
+    torch.testing.assert_close(
+        view["gemm1_clamp_limit"], torch.full((256,), 10.0), atol=0, rtol=0
+    )
 
 
 @pytest.fixture(scope="module")
@@ -37,7 +39,9 @@ def clamped_fixture():
     view = fixture.weight_view
     torch.testing.assert_close(
         view["gemm1_clamp_limit"] * view["output1_scale_gate_scalar"],
-        torch.full((256,), 10.0, device="cuda"), atol=1e-6, rtol=1e-6,
+        torch.full((256,), 10.0, device="cuda"),
+        atol=1e-6,
+        rtol=1e-6,
     )
     assert torch.unique(view["gemm1_clamp_limit"]).numel() > 1
     yield harness, fixture

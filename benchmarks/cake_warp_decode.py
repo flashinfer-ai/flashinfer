@@ -133,8 +133,15 @@ GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
-    Geometry("e256_i2048_k6_clamp10", 4096, 2048, 256, 6,
-             (1, 6, 7, 8, 9, 10, 11, 12, 22, 23, 24, 32), SwiGLU(limit=10.0)),
+    Geometry(
+        "e256_i2048_k6_clamp10",
+        4096,
+        2048,
+        256,
+        6,
+        (1, 6, 7, 8, 9, 10, 11, 12, 22, 23, 24, 32),
+        SwiGLU(limit=10.0),
+    ),
 )
 
 
@@ -341,10 +348,13 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
     if geometry.activation == SwiGLU(limit=10.0):
         # Both arms consume these same physical tensors. Non-unit gate scales
         # exercise the raw-accumulator clamp conversion used by calibrated views.
-        gate_scale = torch.linspace(0.5, 1.5, geometry.num_experts,
-                                    dtype=torch.float32, device=device)
+        gate_scale = torch.linspace(
+            0.5, 1.5, geometry.num_experts, dtype=torch.float32, device=device
+        )
         weight_view["output1_scale_gate_scalar"] = gate_scale
-        weight_view["gemm1_clamp_limit"] = torch.full_like(gate_scale, 10.0) / gate_scale
+        weight_view["gemm1_clamp_limit"] = (
+            torch.full_like(gate_scale, 10.0) / gate_scale
+        )
     initial_ids, initial_weights = _make_routing(geometry, mutated=False)
     mutated_ids, mutated_weights = _make_routing(geometry, mutated=True)
     return PhysicalFixture(
@@ -487,8 +497,12 @@ def _invoke_cake(
     )
     if case.geometry.activation == SwiGLU(limit=10.0):
         module.cake_fused_moe_warp_decode_clamped_swiglu(
-            *launch_inputs, view["gemm1_alpha"], view["gemm1_beta"],
-            view["gemm1_clamp_limit"], workspace_receipt, True,
+            *launch_inputs,
+            view["gemm1_alpha"],
+            view["gemm1_beta"],
+            view["gemm1_clamp_limit"],
+            workspace_receipt,
+            True,
         )
     else:
         module.cake_fused_moe_warp_decode(*launch_inputs, workspace_receipt, True)
@@ -889,7 +903,9 @@ def _workspace_retirement_case(
             _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
 
 
-def _layer_graph_case(fixture: PhysicalFixture, num_tokens: int | None = None) -> dict[str, Any]:
+def _layer_graph_case(
+    fixture: PhysicalFixture, num_tokens: int | None = None
+) -> dict[str, Any]:
     """Exercise the public MoELayer winner path and graph capture end to end."""
     if num_tokens is None:
         num_tokens = fixture.geometry.selector_boundaries[1]
@@ -1480,9 +1496,12 @@ def run_benchmark(
 
 def _selected_geometries(name: str) -> tuple[Geometry, ...]:
     if name == "all":
-        return tuple(geometry for geometry in GEOMETRIES
-                     if geometry.activation != SwiGLU(limit=10.0)
-                     or torch.cuda.get_device_capability() == (10, 0))
+        return tuple(
+            geometry
+            for geometry in GEOMETRIES
+            if geometry.activation != SwiGLU(limit=10.0)
+            or torch.cuda.get_device_capability() == (10, 0)
+        )
     selected = tuple(geometry for geometry in GEOMETRIES if geometry.name == name)
     if not selected:
         raise ValueError(f"unknown geometry {name!r}")

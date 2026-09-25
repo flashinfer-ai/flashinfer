@@ -801,7 +801,9 @@ class CakeWarpDecodeRunner(MoERunner):
     )
     _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
     _CLAMPED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
-        "gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"
+        "gemm1_alpha",
+        "gemm1_beta",
+        "gemm1_clamp_limit",
     )
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
     _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
@@ -1318,8 +1320,11 @@ class CakeWarpDecodeRunner(MoERunner):
         if self._uses_clamped_swiglu() and self._device_arch != 100:
             raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         gated_weight_keys = (
-            self._CLAMPED_WEIGHT_KEYS if self._uses_clamped_swiglu()
-            else self._GATED_WEIGHT_KEYS if activation.is_gated else ()
+            self._CLAMPED_WEIGHT_KEYS
+            if self._uses_clamped_swiglu()
+            else self._GATED_WEIGHT_KEYS
+            if activation.is_gated
+            else ()
         )
         required_weight_keys = self._REQUIRED_WEIGHT_KEYS + gated_weight_keys
         missing = [key for key in required_weight_keys if key not in view]
@@ -1358,8 +1363,11 @@ class CakeWarpDecodeRunner(MoERunner):
         )
         for name in gated_weight_keys:
             self._require_tensor(
-                view[name], name=name, dtype=torch.float32,
-                shape=(num_experts,), device=device,
+                view[name],
+                name=name,
+                dtype=torch.float32,
+                shape=(num_experts,),
+                device=device,
             )
         self._require_tensor(
             view["gemm2_weights"],

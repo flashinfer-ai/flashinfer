@@ -647,13 +647,13 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
 }
 
 void RunImpl(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
-         TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
-         TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
-         TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
-         TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
-         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl,
-         const TensorView* gemm1_alpha_f32, const TensorView* gemm1_beta_f32,
-         const TensorView* gemm1_clamp_limit_f32) {
+             TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32,
+             TensorView topk_weights_bf16, TensorView gemm1_weights_u8,
+             TensorView gemm1_weights_scale_e4m3, TensorView gemm2_weights_u8,
+             TensorView gemm2_weights_scale_e4m3, TensorView output1_scale_scalar_f32,
+             TensorView output1_scale_gate_scalar_f32, TensorView output2_scale_scalar_f32,
+             int64_t workspace_receipt, bool enable_pdl, const TensorView* gemm1_alpha_f32,
+             const TensorView* gemm1_beta_f32, const TensorView* gemm1_clamp_limit_f32) {
   TVM_FFI_ICHECK(enable_pdl)
       << "cake warp decode requires programmatic dependent launch; enable_pdl must be true";
   TVM_FFI_ICHECK(output_bf16.device().device_type == kDLCUDA)
@@ -683,8 +683,7 @@ void RunImpl(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_
                  clamped == (gemm1_clamp_limit_f32 != nullptr))
       << "clamped E256 warp decode requires alpha, beta and raw-accumulator clamp tensors";
   if (clamped) {
-    TVM_FFI_ICHECK(kTarget == Target::kSm100a)
-        << "clamped E256 warp decode requires exact SM100";
+    TVM_FFI_ICHECK(kTarget == Target::kSm100a) << "clamped E256 warp decode requires exact SM100";
     const std::array<NamedTensor, 3> activation_parameters{{
         {gemm1_alpha_f32, "gemm1_alpha_f32"},
         {gemm1_beta_f32, "gemm1_beta_f32"},
@@ -762,7 +761,8 @@ void RunImpl(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_
   CheckCuda(completion_status, "cudaEventRecord(workspace completion)");
   const int32_t expected_launches =
       schedule.route_layout == RouteLayout::kDirect && schedule.route_packer == RoutePacker::kNone
-          ? 3 : 4;
+          ? 3
+          : 4;
   TVM_FFI_ICHECK(context.launch_count == expected_launches)
       << "generated manifest emitted " << context.launch_count
       << " launches for a schedule that requires " << expected_launches;
@@ -774,27 +774,26 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
          TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
          TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
          TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl) {
-  RunImpl(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
-          topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
-          gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
-          output1_scale_gate_scalar_f32, output2_scale_scalar_f32, workspace_receipt, enable_pdl,
-          nullptr, nullptr, nullptr);
+  RunImpl(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3, topk_ids_i32,
+          topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3, gemm2_weights_u8,
+          gemm2_weights_scale_e4m3, output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
+          output2_scale_scalar_f32, workspace_receipt, enable_pdl, nullptr, nullptr, nullptr);
 }
 
-void RunClampedSwiGLU(
-    TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
-    TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
-    TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
-    TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
-    TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
-    TensorView output2_scale_scalar_f32, TensorView gemm1_alpha_f32,
-    TensorView gemm1_beta_f32, TensorView gemm1_clamp_limit_f32,
-    int64_t workspace_receipt, bool enable_pdl) {
-  RunImpl(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
-          topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
-          gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
-          output1_scale_gate_scalar_f32, output2_scale_scalar_f32, workspace_receipt, enable_pdl,
-          &gemm1_alpha_f32, &gemm1_beta_f32, &gemm1_clamp_limit_f32);
+void RunClampedSwiGLU(TensorView output_bf16, TensorView workspace_u8,
+                      TensorView hidden_states_q_u8, TensorView hidden_states_scale_e4m3,
+                      TensorView topk_ids_i32, TensorView topk_weights_bf16,
+                      TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
+                      TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
+                      TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
+                      TensorView output2_scale_scalar_f32, TensorView gemm1_alpha_f32,
+                      TensorView gemm1_beta_f32, TensorView gemm1_clamp_limit_f32,
+                      int64_t workspace_receipt, bool enable_pdl) {
+  RunImpl(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3, topk_ids_i32,
+          topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3, gemm2_weights_u8,
+          gemm2_weights_scale_e4m3, output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
+          output2_scale_scalar_f32, workspace_receipt, enable_pdl, &gemm1_alpha_f32,
+          &gemm1_beta_f32, &gemm1_clamp_limit_f32);
 }
 
 }  // namespace flashinfer::warp_decode
