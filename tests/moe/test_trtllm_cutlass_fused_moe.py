@@ -25,6 +25,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import (
     get_compute_capability,
@@ -1405,6 +1406,8 @@ def test_moe_fp8_block_scaling(
         intermediate_size: Intermediate dimension size
         ep_size: Number of expert shards, evaluated sequentially on one GPU.
     """
+    if not is_cuda_version_at_least("12.8"):
+        pytest.skip("FP8 block-scale MoE requires CUDA 12.8 or newer")
     if num_experts % ep_size:
         pytest.skip("Experts must divide evenly across EP ranks")
     torch.manual_seed(42)
