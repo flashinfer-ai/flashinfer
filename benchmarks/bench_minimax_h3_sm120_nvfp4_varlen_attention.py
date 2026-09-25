@@ -18,7 +18,7 @@ packed token stream ``[T, 56, 128]`` with ``int32`` ``cu_seqlens`` segment bound
 (RTX 5090 / RTX PRO 6000 Blackwell) the tensor pipe is the bound, so
 ``flashinfer.diffusion_ops.minimax_h3_sm120_varlen_attention_nvfp4`` (experimental) quantizes
 Q / K to NVFP4 (E2M1 + UE4M3 block scales) for the block-scaled ``mma.sync kind::mxf4nvf4``
-scores and P / V to E4M3 for the value product (FP32 softmax), all in four launches.  This
+scores and P / V to E4M3 for the value product (FP32 softmax), in three PDL-chained launches.  This
 script times that operator against the shipped FP8 operator
 (``minimax_h3_sm120_varlen_attention_fp8``) and the FlashInfer BF16 ragged routes (``fa2``,
 ``cudnn`` and ``auto``) with ``bench_gpu_time`` (CUPTI, cold L2), reports the error of every
