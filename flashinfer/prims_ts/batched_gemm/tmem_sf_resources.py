@@ -398,6 +398,8 @@ class TmemSfRouteResource(MemoryResource):
         )
 
     def get_tmem_requirements(self):
+        if self.cfg.has_mxfp8_backed_dsfp8 and self.cfg.use_tile256_tmem_overlap:
+            return []
         return [self._alloc_sf]
 
     @cute.jit
@@ -405,7 +407,18 @@ class TmemSfRouteResource(MemoryResource):
         tmem_raw = context.tmem_ptr_i32.load()
         base_col = tmem_raw & 0xFFFF
         base_row = tmem_raw >> 16
-        sf_col = base_col + self._alloc_sf.offset
+        if cutlass.const_expr(
+            self.cfg.has_mxfp8_backed_dsfp8 and self.cfg.use_tile256_tmem_overlap
+        ):
+            # Tile-N256 overlap places both SF rings in the final 64 columns of
+            # the 512-column accumulator allocation. SFA starts at that window;
+            # SFB keeps the generated 16-column boundary required by block-scale
+            # MMA even when SFA uses fewer columns.
+            sf_col = base_col + self.cfg.tmem_total_cols - 64
+            if cutlass.const_expr(self._operand == "b"):
+                sf_col += 16
+        else:
+            sf_col = base_col + self._alloc_sf.offset
         self.sf_tmem_addr_base = (base_row << 16) | sf_col
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -419,9 +432,44 @@ class TmemSfRouteResource(MemoryResource):
         self._setup_common(stage_info.context)
 
     @cute.jit
-    def _producer_work_impl(self, stage_info: StageInfo, desc_s2t_base) -> None:
+    def _store_sttm_slices(
+        self,
+        tmem_addr: Int32,
+        src_vals,
+        num_slices: Constexpr[int],
+    ) -> None:
+        """Store row slices as the legal power-of-two STTM source vectors."""
+        slice_offset = 0
+        remaining = num_slices
+        # Descending powers greedily cover every routed tile, including the six
+        # 32-row slices of N=192, using legal tcgen05.st source-vector widths.
+        for group_size in (8, 4, 2, 1):
+            if cutlass.const_expr(remaining >= group_size):
+                tmem_ptr = prims.make_tmem_ptr(
+                    tmem_addr + Int32(slice_offset), cutlass.Int32
+                )
+                if cutlass.const_expr(group_size == 1):
+                    src = src_vals[slice_offset]
+                else:
+                    src = cutlass.Vector.from_elements(
+                        tuple(src_vals[slice_offset : slice_offset + group_size]),
+                        dtype=cutlass.Int32,
+                    )
+                prims.tcgen05_st("32x32b", tmem_ptr, src)
+                slice_offset += group_size
+                remaining -= group_size
+
+    @cute.jit
+    def _producer_work_impl(
+        self,
+        stage_info: StageInfo,
+        desc_s2t_base,
+        *,
+        is_b: Constexpr[bool],
+        smem_stage_ptr: Int64,
+        sf_tmem_addr_base,
+    ) -> None:
         """Copy SF from SMEM to TMEM with the generated layout."""
-        is_b = cutlass.const_expr(self._operand == "b")
         smem_layout = self.cfg.smem_sfb_layout if is_b else self.cfg.smem_sfa_layout
         copy_mode = (
             self.cfg.sfb_smem_to_tmem_copy if is_b else self.cfg.sfa_smem_to_tmem_copy
@@ -434,14 +482,6 @@ class TmemSfRouteResource(MemoryResource):
             # Uses LDS+STTM for non-R128c4 SF SMEM layouts.
             # LINEAR uses the uint128 gather4 layout; R8c4 uses the compact
             # uint32 8-row-block layout.
-            bytes_per_stage = (
-                self.cfg.num_bytes_sfb_per_stage
-                if is_b
-                else self.cfg.num_bytes_sfa_per_stage
-            )
-            stage_base = self.smem_sf_resource.smem_buf.subview(
-                bytes_per_stage * stage_info.stage_idx
-            )
             sf_block_size = (
                 self.cfg.input_sf_block_size_b
                 if is_b
@@ -467,64 +507,26 @@ class TmemSfRouteResource(MemoryResource):
                         smem_word_offset = (
                             sf_tile_idx * Int32(8) + local_vec_idx
                         ) * Int32(TMEM_SF_PACK_SIZE_BYTES)
-                        smem_word = cutlass.Array(
-                            stage_base.data_ptr() + smem_word_offset,
-                            dtype=cutlass.Int32,
-                            shape=(1,),
-                            addrspace=3,
+                        smem_word = cutlass.inttoptr(
+                            smem_stage_ptr + Int64(smem_word_offset),
+                            3,
+                            cutlass.Int32,
                         )
                         sf_val = Int32(0)
                         if source_lane < Int32(tile_rows):
                             sf_val = smem_word.load()
                         src_vals.append(sf_val)
                     tmem_addr = (
-                        self.sf_tmem_addr_base
+                        sf_tmem_addr_base
                         + sf_stage_col_offset
                         + Int32(sttm_idx * col_stride)
                     )
-                    tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                    if cutlass.const_expr(source_slices == 6):
-                        # tcgen05.st only accepts power-of-two vector lengths.
-                        # A 192-row R8c4 tile has six 32-row source slices, so
-                        # publish it as the hardware-supported 4+2 sequence.
-                        prims.tcgen05_st(
-                            "32x32b",
-                            tmem_ptr,
-                            cutlass.Vector.from_elements(
-                                tuple(src_vals[:4]), dtype=cutlass.Int32
-                            ),
-                        )
-                        tail_tmem_ptr = prims.make_tmem_ptr(
-                            tmem_addr + Int32(4), cutlass.Int32
-                        )
-                        prims.tcgen05_st(
-                            "32x32b",
-                            tail_tmem_ptr,
-                            cutlass.Vector.from_elements(
-                                tuple(src_vals[4:]), dtype=cutlass.Int32
-                            ),
-                        )
-                    elif cutlass.const_expr(source_slices == 1):
-                        src = src_vals[0]
-                        prims.tcgen05_st(
-                            "32x32b",
-                            tmem_ptr,
-                            src,
-                        )
-                    else:
-                        src = cutlass.Vector.from_elements(
-                            tuple(src_vals), dtype=cutlass.Int32
-                        )
-                        prims.tcgen05_st(
-                            "32x32b",
-                            tmem_ptr,
-                            src,
-                        )
+                    self._store_sttm_slices(tmem_addr, src_vals, source_slices)
             elif cutlass.const_expr(smem_layout == int(SfLayout.R128c4)):
-                # Routed N=192 SFB is staged in two physical R128 blocks but
-                # MMA expects six contiguous 32-row TMEM columns. Load the six
-                # logical slices from their shuffled R128 positions and emit
-                # the same legal x4+x2 STTM sequence used by compact R8c4.
+                # A routed tile can span multiple physical R128 blocks. Load
+                # its logical 32-row slices from the shuffled R128 positions;
+                # _store_sttm_slices lowers the resulting count to legal STTM
+                # vector widths (for example, N=192 becomes x4 + x2).
                 num_sttm_iters = sf_k // TMEM_SF_PACK_SIZE_BYTES
                 for sttm_idx in cutlass.range_constexpr(num_sttm_iters):
                     src_vals = []
@@ -536,36 +538,18 @@ class TmemSfRouteResource(MemoryResource):
                             + lane_id * Int32(16)
                             + Int32(quadrant * 4)
                         )
-                        smem_word = cutlass.Array(
-                            stage_base.data_ptr() + smem_word_offset,
-                            dtype=cutlass.Int32,
-                            shape=(1,),
-                            addrspace=3,
+                        smem_word = cutlass.inttoptr(
+                            smem_stage_ptr + Int64(smem_word_offset),
+                            3,
+                            cutlass.Int32,
                         )
                         src_vals.append(smem_word.load())
                     tmem_addr = (
-                        self.sf_tmem_addr_base
+                        sf_tmem_addr_base
                         + sf_stage_col_offset
                         + Int32(sttm_idx * col_stride)
                     )
-                    tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                    prims.tcgen05_st(
-                        "32x32b",
-                        tmem_ptr,
-                        cutlass.Vector.from_elements(
-                            tuple(src_vals[:4]), dtype=cutlass.Int32
-                        ),
-                    )
-                    tail_tmem_ptr = prims.make_tmem_ptr(
-                        tmem_addr + Int32(4), cutlass.Int32
-                    )
-                    prims.tcgen05_st(
-                        "32x32b",
-                        tail_tmem_ptr,
-                        cutlass.Vector.from_elements(
-                            tuple(src_vals[4:]), dtype=cutlass.Int32
-                        ),
-                    )
+                    self._store_sttm_slices(tmem_addr, src_vals, source_slices)
             elif cutlass.const_expr(smem_layout == int(SfLayout.LINEAR)):
                 num_vec4 = sf_k // TMEM_SF_PACK_SIZE_BYTES
                 num_groups_per_16sf = 16 // TMEM_SF_PACK_SIZE_BYTES
@@ -593,11 +577,10 @@ class TmemSfRouteResource(MemoryResource):
                             smem_word_offset = vec_idx * Int32(16) + Int32(
                                 word_idx * TMEM_SF_PACK_SIZE_BYTES
                             )
-                            smem_word = cutlass.Array(
-                                stage_base.data_ptr() + smem_word_offset,
-                                dtype=cutlass.Int32,
-                                shape=(1,),
-                                addrspace=3,
+                            smem_word = cutlass.inttoptr(
+                                smem_stage_ptr + Int64(smem_word_offset),
+                                3,
+                                cutlass.Int32,
                             )
                             sf_val = Int32(0)
                             if source_lane < Int32(tile_rows):
@@ -605,22 +588,11 @@ class TmemSfRouteResource(MemoryResource):
                             src_vals.append(sf_val)
                         group_idx = vec16_idx * num_groups_per_16sf + group_in_vec16
                         tmem_addr = (
-                            self.sf_tmem_addr_base
+                            sf_tmem_addr_base
                             + sf_stage_col_offset
                             + Int32(col_stride * group_idx)
                         )
-                        tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                        if cutlass.const_expr(source_slices == 1):
-                            src = src_vals[0]
-                        else:
-                            src = cutlass.Vector.from_elements(
-                                tuple(src_vals), dtype=cutlass.Int32
-                            )
-                        prims.tcgen05_st(
-                            "32x32b",
-                            tmem_ptr,
-                            src,
-                        )
+                        self._store_sttm_slices(tmem_addr, src_vals, source_slices)
             else:
                 raise AssertionError(
                     f"Unsupported LDS+STTM SMEM SF layout: {smem_layout}"
@@ -635,7 +607,7 @@ class TmemSfRouteResource(MemoryResource):
             if cta_rank == Int32(0):
                 for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
                     tmem_addr = (
-                        self.sf_tmem_addr_base
+                        sf_tmem_addr_base
                         + sf_stage_col_offset
                         + s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
                     )
@@ -676,7 +648,13 @@ class TmemSfRouteAResource(TmemSfRouteResource):
         desc_a_s2t_base: prims.Tcgen05SmemDesc,
         smem_sfa_stage_ptr: Int64,
     ) -> None:
-        self._producer_work_impl(stage_info, desc_a_s2t_base)
+        self._producer_work_impl(
+            stage_info,
+            desc_a_s2t_base,
+            is_b=False,
+            smem_stage_ptr=smem_sfa_stage_ptr,
+            sf_tmem_addr_base=self.sf_tmem_addr_base,
+        )
 
     @consumer_work(returns=TmemSfRouteResource.sfa_stage_col_offset)
     @cute.jit
@@ -698,7 +676,34 @@ class TmemSfRouteBResource(TmemSfRouteResource):
         *,
         desc_b_s2t_base: prims.Tcgen05SmemDesc,
     ) -> None:
-        self._producer_work_impl(stage_info, desc_b_s2t_base)
+        stage_base = self.smem_sf_resource.smem_buf.subview(
+            self.cfg.num_bytes_sfb_per_stage * stage_info.stage_idx
+        )
+        self._producer_work_impl(
+            stage_info,
+            desc_b_s2t_base,
+            is_b=True,
+            smem_stage_ptr=Int64(stage_base.data_ptr().toint()),
+            sf_tmem_addr_base=self.sf_tmem_addr_base,
+        )
+
+    @producer_work
+    @cute.jit
+    def copy_sfb_from_stage(
+        self,
+        stage_info: StageInfo,
+        *,
+        desc_b_s2t_base: prims.Tcgen05SmemDesc,
+        smem_sfb_stage_ptr: Int64,
+    ) -> None:
+        """Copy SFB using the SMEM consumer stage selected by LoadSfB."""
+        self._producer_work_impl(
+            stage_info,
+            desc_b_s2t_base,
+            is_b=True,
+            smem_stage_ptr=smem_sfb_stage_ptr,
+            sf_tmem_addr_base=self.sf_tmem_addr_base,
+        )
 
     @consumer_work(returns=TmemSfRouteResource.sfb_stage_col_offset)
     @cute.jit

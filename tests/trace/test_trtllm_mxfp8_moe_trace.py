@@ -3,6 +3,60 @@
 import torch
 
 
+def test_mx_backed_dsfp8_trace_dispatch_preserves_recipe_contract():
+    from flashinfer.trace.templates.moe import (
+        prims_ts_fp8_block_scale_moe_trace_dispatch,
+        prims_ts_fp8_block_scale_routed_moe_trace_dispatch,
+        trtllm_fp8_block_scale_moe_mx_backed_ds_trace,
+        trtllm_fp8_block_scale_routed_mx_backed_ds_trace,
+    )
+
+    assert (
+        prims_ts_fp8_block_scale_moe_trace_dispatch(
+            routing_method_type=2,
+            use_mxfp8_backed_dsfp8=True,
+        )
+        is trtllm_fp8_block_scale_moe_mx_backed_ds_trace
+    )
+    assert (
+        prims_ts_fp8_block_scale_routed_moe_trace_dispatch(use_mxfp8_backed_dsfp8=True)
+        is trtllm_fp8_block_scale_routed_mx_backed_ds_trace
+    )
+
+    for template in (
+        trtllm_fp8_block_scale_moe_mx_backed_ds_trace,
+        trtllm_fp8_block_scale_routed_mx_backed_ds_trace,
+    ):
+        assert template.inputs["hidden_states_scale"].dim_names == [
+            "seq_len",
+            "num_hidden_mx_blocks",
+        ]
+        assert template.inputs["hidden_states_scale"].dtype == "uint8"
+        assert template.inputs["use_mxfp8_backed_dsfp8"].dtype == "bool"
+
+
+def test_mx_backed_dsfp8_trace_init_builds_token_major_ue8m0_scales():
+    from flashinfer.trace.templates.moe import (
+        trtllm_fp8_block_scale_moe_mx_backed_ds_trace,
+    )
+
+    inputs = trtllm_fp8_block_scale_moe_mx_backed_ds_trace.init(
+        seq_len=2,
+        num_experts=8,
+        top_k=2,
+        n_group=2,
+        topk_group=1,
+        num_local_experts=2,
+        hidden_size=128,
+        intermediate_size=128,
+        device="cpu",
+        seed=0,
+    )
+    assert inputs["hidden_states_scale"].dtype == torch.uint8
+    assert inputs["hidden_states_scale"].shape == (2, 4)
+    assert inputs["use_mxfp8_backed_dsfp8"] is True
+
+
 def _mxfp8_trace_kwargs():
     seq_len = 4
     num_experts = 2

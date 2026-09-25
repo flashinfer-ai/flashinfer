@@ -921,6 +921,7 @@ def create_copy_sfa_task(
     num_k_tiles: int,
 ) -> Task:
     is_persistent = _is_persistent(cfg)
+    has_mxfp8_backed_dsfp8 = getattr(cfg, "has_mxfp8_backed_dsfp8", False)
 
     @schedule
     def copy_sfa_schedule(
@@ -943,6 +944,8 @@ def create_copy_sfa_task(
     captured_schedule = _call_schedule_with_optional_work_queue(
         copy_sfa_schedule, is_persistent, work_queue, smem_sfa, tmem_sfa
     )
+    # LDS+STTM is CTA-scoped. Each CTA's four-warp copy group stores its local
+    # SFA tile to TMEM and participates in the cluster-scoped producer pipeline.
     return Task(
         src_resources=[smem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfa],
@@ -951,7 +954,9 @@ def create_copy_sfa_task(
         schedule=captured_schedule,
         num_registers=cfg.copy_sfa_task_regs,
         name="CopySfATask",
-        run_only_on_cta_id=0 if cfg.has_cluster else None,
+        run_only_on_cta_id=(
+            0 if cfg.has_cluster and not has_mxfp8_backed_dsfp8 else None
+        ),
     )
 
 
@@ -963,6 +968,7 @@ def create_copy_sfb_task(
     num_k_tiles: int,
 ) -> Task:
     is_persistent = _is_persistent(cfg)
+    has_mxfp8_backed_dsfp8 = getattr(cfg, "has_mxfp8_backed_dsfp8", False)
 
     @schedule
     def copy_sfb_schedule(
@@ -974,9 +980,15 @@ def create_copy_sfb_task(
         def issue_sfb_copy() -> None:
             smem.try_wait()
             smem.wait()
-            desc_b_s2t_base = smem.build_sfb_s2t_desc()
+            desc_b_s2t = smem.build_sfb_s2t_desc()
             tmem.acquire()
-            tmem.copy_sfb(desc_b_s2t_base=desc_b_s2t_base)
+            if cutlass.const_expr(has_mxfp8_backed_dsfp8):
+                tmem.copy_sfb_from_stage(
+                    desc_b_s2t_base=desc_b_s2t[0],
+                    smem_sfb_stage_ptr=desc_b_s2t[1],
+                )
+            else:
+                tmem.copy_sfb(desc_b_s2t_base=desc_b_s2t)
 
         with _k_tile_schedule_loop(cfg, wq, num_k_tiles):
             issue_sfb_copy()
@@ -1436,6 +1448,13 @@ def create_mma_task(
         tmem_sfab_res,
         tmem_cast_a_res,
     ) -> None:
+        # Release the scale stages before the operand SMEM stages, matching the
+        # established MMA-source cleanup order.
+        if has_combined_sf:
+            tmem_sfab_res.release()
+        if has_separate_sf:
+            tmem_sfa_res.release()
+            tmem_sfb_res.release()
         if has_cast_a:
             tmem_cast_a_res.release()
             smem_b_res.release()
@@ -1447,11 +1466,6 @@ def create_mma_task(
         if has_fused_sf:
             smem_sfa_res.release()
             smem_sfb_res.release()
-        if has_separate_sf:
-            tmem_sfa_res.release()
-            tmem_sfb_res.release()
-        if has_combined_sf:
-            tmem_sfab_res.release()
 
     src_resources = [tmem_cast_a, smem_b] if has_cast_a else [smem_a, smem_b]
     if has_proxy:

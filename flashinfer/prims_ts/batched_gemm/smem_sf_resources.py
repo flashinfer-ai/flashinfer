@@ -389,6 +389,345 @@ class SmemSfBResource(MemoryResource):
         return desc_s2t
 
 
+@cute.jit
+def fp32_to_nearest_ue8m0_bits(scale) -> cutlass.Int32:
+    """Encode a positive FP32 scale as the nearest finite UE8M0 value.
+
+    Native MX quantization normally rounds upward to prevent payload overflow.
+    The E4M3 checkpoint payload is already fixed here, so select the nearest
+    power of two instead. The midpoint between adjacent powers of two has FP32
+    mantissa 1.5, represented by bit 22.
+    """
+    bits = scale.bitcast(cutlass.Int32)
+    exponent = (bits >> cutlass.Int32(23)) & cutlass.Int32(0xFF)
+    mantissa = bits & cutlass.Int32(0x7FFFFF)
+    if (mantissa >= cutlass.Int32(0x400000)) & (exponent < cutlass.Int32(254)):
+        exponent += cutlass.Int32(1)
+    if exponent > cutlass.Int32(254):
+        exponent = cutlass.Int32(254)
+    return exponent
+
+
+@dataclass(kw_only=True)
+class SmemDsFp8MxFp8SfResource(MemoryResource):
+    """Stage MX-backed DSFP8 scales with one GMEM-loading warp.
+
+    SFA reads compact FP32 K128x128 checkpoint scales, converts each value to
+    UE8M0, and replicates it over the four native K32 scale IDs. SFB reads four
+    native UE8M0 K32 values from LINEAR, R8c4, or R128c4 GMEM. Each loader
+    writes packed words in the generated R8c4/R128c4 SMEM layouts; a separate
+    four-warp CopySf task consumes the stage and performs the collective TMEM
+    stores.
+    """
+
+    cfg: Constexpr[BatchedGemmConfig]
+    compact_scales: Any = None
+    problem_rows: Any = None
+    source_rows: Any = None
+    problem_k: Any = None
+    route_map: Any = None
+    mn_limit: Any = None
+    smem_buf: Any = None
+    _operand: Constexpr[str] = "a"
+    _alloc_sf: Constexpr[Optional[SmemAllocation]] = None
+    desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    smem_sfb_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    @property
+    def bytes_per_stage(self) -> int:
+        return (
+            self.cfg.num_bytes_sfb_per_stage
+            if self._operand == "b"
+            else self.cfg.num_bytes_sfa_per_stage
+        )
+
+    def __post_init__(self) -> None:
+        if self._alloc_sf is None:
+            stages = (
+                self.cfg.num_stages_smem_sfb
+                if self._operand == "b"
+                else self.cfg.num_stages_smem_sfa
+            )
+            self._alloc_sf = SmemAllocation(
+                f"{self.name}_dsfp8_mxfp8_sf",
+                size_bytes=self.bytes_per_stage * stages,
+                alignment=128,
+            )
+        self.desc_a_s2t_base = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="MX-backed DSFP8 SFA stage pointer."
+        )
+        self.smem_sfa_stage_ptr = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="MX-backed DSFP8 SFA stage pointer."
+        )
+        self.desc_b_s2t_base = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="MX-backed DSFP8 SFB stage pointer."
+        )
+        self.smem_sfb_stage_ptr = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="MX-backed DSFP8 SFB stage pointer."
+        )
+
+    def get_smem_requirements(self):
+        return [self._alloc_sf]
+
+    @cute.jit
+    def _init_smem(self, context) -> None:
+        self.smem_buf = cutlass.Array(
+            context.smem_base.data_ptr() + self._alloc_sf.offset,
+            dtype=cutlass.Uint8,
+            shape=(self._alloc_sf.size_bytes,),
+            addrspace=3,
+        )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_load_state(self, stage_info: StageInfo) -> None:
+        self._init_smem(stage_info.context)
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_s2t_state(self, stage_info: StageInfo) -> None:
+        self._init_smem(stage_info.context)
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def prepare_sfa_tile(self, stage_info: StageInfo) -> None:
+        del stage_info
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def prepare_sfb_tile(self, stage_info: StageInfo) -> None:
+        del stage_info
+
+    @cute.jit
+    def _load_packed_scale(self, compact_idx: Int32) -> Int32:
+        fp32_scale = self.compact_scales.load(idx=compact_idx, vector_size=1)[0]
+        scale_byte = fp32_to_nearest_ue8m0_bits(fp32_scale)
+        return (
+            scale_byte
+            | (scale_byte << Int32(8))
+            | (scale_byte << Int32(16))
+            | (scale_byte << Int32(24))
+        )
+
+    @cute.jit
+    def _load_native_mx_scale(self, row: Int32, k128_block: Int32) -> Int32:
+        layout = self.cfg.dsfp8_mxfp8_native_sfb_layout
+        if cutlass.const_expr(layout == int(SfLayout.LINEAR)):
+            sf_k = self.problem_k // Int32(32)
+            padded_sf_k = ((sf_k + Int32(15)) // Int32(16)) * Int32(16)
+            byte_offset = row * padded_sf_k + k128_block * Int32(4)
+        elif cutlass.const_expr(layout == int(SfLayout.R8c4)):
+            num_k128_blocks = self.problem_k // Int32(128)
+            byte_offset = (
+                (row // Int32(8)) * num_k128_blocks * Int32(32)
+                + k128_block * Int32(32)
+                + (row % Int32(8)) * Int32(4)
+            )
+        else:
+            num_k128_blocks = self.problem_k // Int32(128)
+            row_in_m128 = row % Int32(128)
+            outer_m = row_in_m128 % Int32(32)
+            inner_m = row_in_m128 // Int32(32)
+            byte_offset = (
+                (row // Int32(128)) * num_k128_blocks * Int32(512)
+                + k128_block * Int32(512)
+                + outer_m * Int32(16)
+                + inner_m * Int32(4)
+            )
+        bytes4 = self.compact_scales.load(idx=byte_offset, vector_size=4)
+        packed = Int32(0)
+        for byte_idx in cutlass.range_constexpr(4):
+            byte = Int32(bytes4[byte_idx].bitcast(cutlass.Int8)) & Int32(0xFF)
+            packed = packed | (byte << Int32(byte_idx * 8))
+        return packed
+
+    @cute.jit
+    def _store_word(
+        self,
+        stage_info: StageInfo,
+        k128_in_tile: int,
+        source_slice: int,
+        source_slices: int,
+        packed: Int32,
+    ) -> None:
+        lane_id = cute.arch.lane_idx()
+        stage_base = self.smem_buf.subview(self.bytes_per_stage * stage_info.stage_idx)
+        words = cutlass.Array(
+            stage_base.data_ptr(),
+            dtype=cutlass.Int32,
+            shape=(self.bytes_per_stage // 4,),
+            addrspace=3,
+        )
+        layout = (
+            self.cfg.smem_sfb_layout
+            if self._operand == "b"
+            else self.cfg.smem_sfa_layout
+        )
+        source_lane = Int32(source_slice * 32) + lane_id
+        if cutlass.const_expr(layout == int(SfLayout.R8c4)):
+            word_idx = (
+                (source_lane // Int32(8)) * Int32(self.cfg.tile_k // 128)
+                + Int32(k128_in_tile)
+            ) * Int32(8) + source_lane % Int32(8)
+        else:
+            block_idx = source_slice // 4
+            quadrant = source_slice % 4
+            word_idx = (
+                Int32(block_idx * (self.cfg.tile_k // 128) + k128_in_tile) * Int32(128)
+                + lane_id * Int32(4)
+                + Int32(quadrant)
+            )
+        words.subview(word_idx).store(packed)
+
+    @cute.jit
+    def _load_sfa(self, stage_info: StageInfo, coord_k: Int32, coord_mn: Int32):
+        lane_id = cute.arch.lane_idx()
+        num_k128_blocks = self.problem_k // Int32(128)
+        source_slices = (self.cfg.tile_m + 31) // 32
+        k128_blocks_per_tile = self.cfg.tile_k // 128
+        for k128_in_tile in cutlass.range_constexpr(k128_blocks_per_tile):
+            compact_k128 = coord_k * Int32(k128_blocks_per_tile) + Int32(k128_in_tile)
+            for source_slice in cutlass.range_constexpr(source_slices):
+                if cutlass.const_expr(self.cfg.has_gated_epilogue):
+                    m128_blocks_per_expert = self.source_rows
+                    expert_idx = coord_mn // m128_blocks_per_expert
+                    physical_m128 = coord_mn % m128_blocks_per_expert
+                    physical_row = (
+                        physical_m128 * Int32(128) + Int32(source_slice * 32) + lane_id
+                    )
+                    row_in_shuffle = physical_row % Int32(32)
+                    interleaved_row = (
+                        (physical_row // Int32(32)) * Int32(32)
+                        + (row_in_shuffle % Int32(8)) * Int32(4)
+                        + row_in_shuffle // Int32(8)
+                    )
+                    half_rows = m128_blocks_per_expert * Int32(64)
+                    logical_row = (
+                        interleaved_row // Int32(2)
+                        + (interleaved_row % Int32(2)) * half_rows
+                    )
+                    logical_m128 = logical_row // Int32(128)
+                    compact_m128 = expert_idx * m128_blocks_per_expert + logical_m128
+                else:
+                    compact_m128 = coord_mn + Int32(source_slice // 4)
+                compact_idx = compact_m128 * num_k128_blocks + compact_k128
+                packed = Int32(0)
+                if compact_k128 < num_k128_blocks:
+                    packed = self._load_packed_scale(compact_idx)
+                self._store_word(
+                    stage_info,
+                    k128_in_tile,
+                    source_slice,
+                    source_slices,
+                    packed,
+                )
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _load_sfb(self, stage_info: StageInfo, coord_k: Int32, coord_mn: Int32):
+        lane_id = cute.arch.lane_idx()
+        num_k128_blocks = self.problem_k // Int32(128)
+        source_slices = (self.cfg.tile_n + 31) // 32
+        k128_blocks_per_tile = self.cfg.tile_k // 128
+        for k128_in_tile in cutlass.range_constexpr(k128_blocks_per_tile):
+            compact_k128 = coord_k * Int32(k128_blocks_per_tile) + Int32(k128_in_tile)
+            for source_slice in cutlass.range_constexpr(source_slices):
+                row_in_tile = lane_id + Int32(source_slice * 32)
+                if cutlass.const_expr(self.cfg.has_routed_sfs):
+                    routed_base = coord_mn
+                    token_tile = routed_base // Int32(self.cfg.tile_n)
+                    tile_limit = (
+                        self.mn_limit.load(idx=token_tile, vector_size=1)[0]
+                        - routed_base
+                    )
+                    if tile_limit < Int32(0):
+                        tile_limit = Int32(0)
+                    if tile_limit > Int32(self.cfg.tile_n):
+                        tile_limit = Int32(self.cfg.tile_n)
+                    row = Int32(0)
+                    row_is_valid = (row_in_tile < Int32(self.cfg.tile_n)) & (
+                        row_in_tile < tile_limit
+                    )
+                    if row_is_valid:
+                        row = self.route_map.load(
+                            idx=routed_base + row_in_tile, vector_size=1
+                        )[0]
+                else:
+                    row = coord_mn * Int32(self.cfg.tile_n) + row_in_tile
+                    row_is_valid = (row_in_tile < Int32(self.cfg.tile_n)) & (
+                        row < self.problem_rows
+                    )
+                packed = Int32(0)
+                if (compact_k128 < num_k128_blocks) & row_is_valid:
+                    packed = self._load_native_mx_scale(row, compact_k128)
+                if row_in_tile < Int32(self.cfg.tile_n):
+                    self._store_word(
+                        stage_info,
+                        k128_in_tile,
+                        source_slice,
+                        source_slices,
+                        packed,
+                    )
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _stage_ptr(self, stage_info: StageInfo) -> Int64:
+        stage_base = self.smem_buf.subview(self.bytes_per_stage * stage_info.stage_idx)
+        return Int64(stage_base.data_ptr().toint())
+
+
+@dataclass(kw_only=True)
+class SmemDsFp8MxFp8SfAResource(SmemDsFp8MxFp8SfResource):
+    """SMEM staging for compact FP32 checkpoint weight scales."""
+
+    _operand: Constexpr[str] = "a"
+
+    @producer_work
+    @cute.jit
+    def load_sfa_tile(
+        self, stage_info: StageInfo, *, coord_sfa_k: Int32, coord_sfa_mn: Int32
+    ) -> None:
+        self._load_sfa(stage_info, coord_sfa_k, coord_sfa_mn)
+
+    @consumer_work(
+        returns=(
+            SmemDsFp8MxFp8SfResource.desc_a_s2t_base,
+            SmemDsFp8MxFp8SfResource.smem_sfa_stage_ptr,
+        )
+    )
+    @cute.jit
+    def build_sfa_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
+        stage_ptr = self._stage_ptr(stage_info)
+        return stage_ptr, stage_ptr
+
+
+@dataclass(kw_only=True)
+class SmemDsFp8MxFp8SfBResource(SmemDsFp8MxFp8SfResource):
+    """SMEM staging for native UE8M0 activation scales."""
+
+    _operand: Constexpr[str] = "b"
+
+    @producer_work
+    @cute.jit
+    def load_sfb_tile(
+        self, stage_info: StageInfo, *, coord_sfb_k: Int32, coord_sfb_mn: Int32
+    ) -> None:
+        self._load_sfb(stage_info, coord_sfb_k, coord_sfb_mn)
+
+    @consumer_work(
+        returns=(
+            SmemDsFp8MxFp8SfResource.desc_b_s2t_base,
+            SmemDsFp8MxFp8SfResource.smem_sfb_stage_ptr,
+        )
+    )
+    @cute.jit
+    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
+        stage_ptr = self._stage_ptr(stage_info)
+        return stage_ptr, stage_ptr
+
+
 # Module-level TMA gather4 helpers (shared with smem_ab_resources)
 @cute.jit
 def _tma_gather4_cta(smem_dst, tma_desc, k_coord, row0, row1, row2, row3, barrier):

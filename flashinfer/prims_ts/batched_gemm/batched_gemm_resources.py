@@ -38,6 +38,8 @@ from .smem_ab_resources import (
     SmemTmaGatherResource,
 )
 from .smem_sf_resources import (
+    SmemDsFp8MxFp8SfAResource,
+    SmemDsFp8MxFp8SfBResource,
     SmemSfAResource,
     SmemSfBResource,
     SmemSfGatherResource,
@@ -79,6 +81,8 @@ __all__ = [
     "SmemAResource",
     "SmemBResource",
     "SmemDeepSeekSfAbResource",
+    "SmemDsFp8MxFp8SfAResource",
+    "SmemDsFp8MxFp8SfBResource",
     "SmemGatherResource",
     "SmemSfAResource",
     "SmemSfBResource",
