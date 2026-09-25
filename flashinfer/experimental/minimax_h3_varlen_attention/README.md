@@ -60,7 +60,7 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
 runner = prepare_minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out)
 runner()            # launches on the current stream, returns out (no allocation)
 nv = prepare_minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp8", out=out8)
-nv.quantize()       # quantizer stage only (fp8: amax reduction + one fused launch)
+nv.quantize()       # quantization only (fp8: the amax kernel + one fused launch)
 nv.attention()      # attention launch only
 nv()                # complete pipeline (what the one-shot API times)
 ```
@@ -184,17 +184,20 @@ reading the packed operands. The launch attribute
 (`cudaLaunchAttributeProgrammaticStreamSerialization`) is baked into both
 generated attention host bindings by the export, so the runner only enqueues
 the launches in order on the current stream (quantizer, the bound attention
-program and, for plans with K/V-split units, the `combine` stage); the `fp8`
-`amax(V)` reduction runs before the quantizer launch.
+program and, for plans with K/V-split units, the `combine` stage). The `fp8`
+route starts with the `amax` stage, a fixed grid of 512 CTAs that each write
+one partial `max|V|`; its quantizer binding carries the same launch
+attribute, so the quantizer's Q/K/V loads overlap the partial-max tail and
+only the fold of the partials waits.
 
 Packed operands (`q_fp4`, `k_fp4`, `q_scale`, `k_scale`, plus `v_fp4_t`,
 `v_scale_lo`, `v_scale_hi` for `fp4` or `v_fp8`, `v_amax` for `fp8`) cost
 about 180 bytes per (token, head) and are allocated at preparation
 (`nvfp4_workspace_shapes(heads, PB, pv_mode)`); a caller-owned set may be
-passed through `workspace=`. For `pv_mode="fp8"` the per-tensor
-`amax(V)` is one device reduction into `v_amax` before the fused quantizer
-launch; the scalar never visits the host, so the pipeline is CUDA-Graph
-capturable.
+passed through `workspace=`. For `pv_mode="fp8"` the per-tensor `amax(V)`
+is computed on the device (`amax` partials in `v_amax_partial`, folded into
+`v_amax` by the quantizer); the scalar never visits the host, so the pipeline
+is CUDA-Graph capturable.
 
 ## Supported hardware and limitations
 

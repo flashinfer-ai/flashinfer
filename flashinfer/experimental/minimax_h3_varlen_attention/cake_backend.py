@@ -54,8 +54,11 @@ Two program families share this package:
   (E2M1 x E2M1, UE4M3 block-16 scales) and either ``kind::mxf4nvf4`` PV (E2M1
   P anchored at the score-tile maximum, per-16-token UE4M3 V^T scales) or
   ``kind::f8f6f4`` PV (E4M3 P in TMEM, dense E4M3 V with one per-tensor scale
-  ``448 / amax(V)``; the ``amax`` is one torch reduction before the quantizer
-  launch).  The host builds the per-block tables consumed by the quantizer
+  ``448 / amax(V)``; the ``amax`` is one bandwidth-bound partial-max kernel
+  (stage ``amax``, a fixed grid of ``AMAX_CTAS`` CTAs striding over V) whose
+  per-CTA partials the quantizer folds after its own loads -- the quantizer
+  is that kernel's programmatic dependent launch).  The host builds the
+  per-block tables consumed by the quantizer
   (``block_token``, ``block_valid``) and, per ``(cu_seqlens, heads)``, the
   five per-tile scheduler tables consumed by the attention kernel
   (``cl_head``, ``cl_seg_begin``, ``cl_seg_len``, ``cl_kv_base``,
@@ -147,8 +150,17 @@ SF_VEC = 16  # NVFP4 scale block along head_dim
 QUANTIZE_SUB_TOKENS = 32
 QUANTIZE_SUBS_PER_BLOCK = BLOCK_M // QUANTIZE_SUB_TOKENS
 FP8_E4M3_MAX = 448.0
+# fp8 PV: ``amax(V)`` is a fixed grid of AMAX_CTAS 256-thread CTAs, each
+# striding over 32-byte (16 x BF16) vectors of the flat V tensor in chunks of
+# AMAX_CHUNK vectors and writing one partial maximum; the quantizer folds the
+# AMAX_CTAS partials (order independent, so the result is exact).
+AMAX_CTAS = 512
+AMAX_VECTOR = 16
+AMAX_CHUNK = 256 * 4
 PV_MODES = ("fp4", "fp8")
 NVFP4_VARIANT = {"fp4": "nvfp4_fp4pv", "fp8": "nvfp4_fp8pv"}
+# Stages of the quantization step (``runner.quantize()``); the rest is attention.
+QUANTIZE_STAGES = ("amax", "quantize")
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 QK_MMA_DTYPE = {
@@ -209,8 +221,12 @@ QUANTIZE_QKV_KWARGS = (
     + QUANTIZE_TAIL_KWARGS
 )
 QUANTIZE_QK_FP8V_KWARGS = (
-    QUANTIZE_COMMON_KWARGS + ("v_fp8", "v_amax") + QUANTIZE_TAIL_KWARGS
+    QUANTIZE_COMMON_KWARGS
+    + ("v_fp8", "v_amax", "v_amax_partial")
+    + QUANTIZE_TAIL_KWARGS
 )
+# fp8 PV only: the per-CTA ``max|V|`` partial kernel that precedes the quantizer.
+AMAX_KWARGS = ("v", "v_amax_partial", "num_vectors", "num_chunks", "grid")
 # The dense ``attention`` program takes the five scheduler tables (the first
 # delivery's kernel signature); the ``attention_split`` program adds the K/V
 # range and partial-slot tables, the partial workspace and the unit count.
@@ -874,11 +890,9 @@ def nvfp4_workspace_shapes(
         shapes["v_scale_hi"] = ((heads * PB * 16, 32), torch.uint8)
     else:
         shapes["v_fp8"] = ((rows, HEAD_DIM), torch.uint8)
-        # Two-stage max|V| reduction target: ``heads * HEAD_DIM`` partial maxima
-        # (one per (head, dim) row of V viewed as [heads * HEAD_DIM, T]) then the
-        # scalar. A single-output ATen reduction allocates its accumulation
-        # buffer on every call; the two-stage form allocates nothing.
-        shapes["v_amax_partial"] = ((heads * HEAD_DIM,), torch.float32)
+        # ``amax`` stage output (one partial ``max|V|`` per CTA) and the scalar
+        # the quantizer publishes for the attention kernel.
+        shapes["v_amax_partial"] = ((AMAX_CTAS,), torch.float32)
         shapes["v_amax"] = ((1,), torch.float32)
     return shapes
 
@@ -904,35 +918,31 @@ def allocate_nvfp4_workspace(
     return ws
 
 
-def reduce_v_amax(value: torch.Tensor, workspace: dict[str, torch.Tensor]) -> None:
-    """``workspace["v_amax"][0] = max|value|`` with no device allocation.
+def amax_kwargs(
+    value: torch.Tensor, workspace: dict[str, torch.Tensor]
+) -> dict[str, Any]:
+    """Keyword bindings of the ``amax`` stage for the contiguous BF16 V operand.
 
-    ``value`` is the contiguous BF16 ``[T, heads, HEAD_DIM]`` V operand; it is
-    viewed as ``[heads * HEAD_DIM, T]`` (any row split of a contiguous tensor
-    yields the same maximum), reduced per row into ``v_amax_partial`` and then
-    to the scalar. The scalar never visits the host.
+    The kernel views ``value`` as ``numel / AMAX_VECTOR`` 32-byte vectors
+    (any split of a contiguous tensor yields the same maximum) and each of the
+    ``AMAX_CTAS`` CTAs strides over the ``num_chunks`` chunks of ``AMAX_CHUNK``
+    vectors; the scalar never visits the host.
     """
-    partial = workspace["v_amax_partial"]
-    rows = int(partial.shape[0])
-    flat = value.view(-1)
-    if flat.numel() <= rows:
-        # T == 1: a reduction over a size-1 dimension allocates in ATen; copy the
-        # (at most ``rows``) values into the partial buffer elementwise instead.
-        n = flat.numel()
-        partial[:n].copy_(flat)
-        partial[:n].abs_()
-        partial[n:].zero_()
-    else:
-        torch.linalg.vector_norm(
-            flat.view(rows, -1),
-            ord=float("inf"),
-            dim=1,
-            dtype=torch.float32,
-            out=partial,
-        )
-    torch.linalg.vector_norm(
-        partial, ord=float("inf"), dim=0, keepdim=True, out=workspace["v_amax"]
+    numel = int(value.numel())
+    if numel % AMAX_VECTOR != 0:
+        raise ValueError(f"V.numel() must be a multiple of {AMAX_VECTOR}, got {numel}")
+    if not value.is_contiguous():
+        raise ValueError("V must be contiguous for the amax stage")
+    num_vectors = numel // AMAX_VECTOR
+    kwargs = dict(
+        v=value,
+        v_amax_partial=workspace["v_amax_partial"],
+        num_vectors=num_vectors,
+        num_chunks=(num_vectors + AMAX_CHUNK - 1) // AMAX_CHUNK,
+        grid=(AMAX_CTAS, 1, 1),
     )
+    assert tuple(kwargs) == AMAX_KWARGS
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -1108,8 +1118,11 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
     The attention binding is generated with the programmatic-dependent-launch
     attribute (``cudaLaunchAttributeProgrammaticStreamSerialization``): its
     prologue overlaps the quantizer tail and ``griddepcontrol.wait`` orders the
-    packed-operand reads.  Both launches are enqueued on the current torch
-    stream in order, which is all the handshake requires from the host.
+    packed-operand reads.  For ``pv_mode="fp8"`` the quantizer binding carries
+    the same attribute towards the preceding ``amax`` stage (its Q/K/V loads
+    overlap the partial-max kernel's tail; the fold of the partials waits).
+    All launches are enqueued on the current torch stream in order, which is
+    all the handshakes require from the host.
     """
 
     variant: str
@@ -1128,16 +1141,15 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
             for name, entry, arguments in self._stages:
                 if name not in names or entry is None:
                     continue
-                if name == "quantize" and self.pv_mode == "fp8":
-                    reduce_v_amax(self._value, self.workspace)
                 entry(*arguments)
 
     def quantize(self) -> None:
-        self._run(("quantize",))
+        # fp8: the ``amax`` partial-max kernel and the quantizer that folds it.
+        self._run(tuple(s for s in STAGES[self.variant] if s in QUANTIZE_STAGES))
 
     def attention(self) -> torch.Tensor:
         # The bound attention program and, for K/V-split plans, the combine launch.
-        self._run(tuple(s for s in STAGES[self.variant] if s != "quantize"))
+        self._run(tuple(s for s in STAGES[self.variant] if s not in QUANTIZE_STAGES))
         return self.out
 
     @property
@@ -1359,7 +1371,11 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
             v_scale_hi=workspace["v_scale_hi"],
         )
     else:
-        quantize_kwargs.update(v_fp8=workspace["v_fp8"], v_amax=workspace["v_amax"])
+        quantize_kwargs.update(
+            v_fp8=workspace["v_fp8"],
+            v_amax=workspace["v_amax"],
+            v_amax_partial=workspace["v_amax_partial"],
+        )
     quantize_kwargs.update(
         block_token=plan.block_token,
         block_valid=plan.block_valid,
@@ -1370,7 +1386,10 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
     assert tuple(quantize_kwargs) == (
         QUANTIZE_QKV_KWARGS if pv_mode == "fp4" else QUANTIZE_QK_FP8V_KWARGS
     )
-    stage_kwargs: dict[str, dict] = {"quantize": quantize_kwargs}
+    stage_kwargs: dict[str, dict] = {}
+    if pv_mode == "fp8":
+        stage_kwargs["amax"] = amax_kwargs(value, workspace)
+    stage_kwargs["quantize"] = quantize_kwargs
     total_tiles = tiles.total_tiles
     attention_common = dict(
         Q=workspace["q_fp4"],

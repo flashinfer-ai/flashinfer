@@ -452,7 +452,7 @@ def test_nvfp4_workspace_shapes():
     )
     shapes = nvfp4_workspace_shapes(7, 0, "fp8")  # PB padded to one block
     assert shapes["v_fp8"] == ((7 * 128, 128), torch.uint8)
-    assert shapes["v_amax_partial"] == ((7 * 128,), torch.float32)
+    assert shapes["v_amax_partial"] == ((cake_backend.AMAX_CTAS,), torch.float32)
     assert shapes["v_amax"] == ((1,), torch.float32)
     with pytest.raises(ValueError, match="pv_mode"):
         nvfp4_workspace_shapes(7, 3, "bf16")
@@ -659,8 +659,9 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     assert runner.plan.PB == 2 + 2 + 5 and runner.plan.total_clusters == 1 + 1 + 2
     assert runner.tile_tables.total_tiles >= heads * 4
     assert runner.route_metadata["pv_mode"] == pv_mode
-    assert tuple(runner.stage_kwargs) == (
-        "quantize",
+    # fp8 precedes the quantizer with the ``amax`` partial-max stage.
+    quantize_stages = ("amax", "quantize") if pv_mode == "fp8" else ("quantize",)
+    assert tuple(runner.stage_kwargs) == quantize_stages + (
         "attention",
         "attention_split",
         "combine",
@@ -670,10 +671,13 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     assert runner.tile_tables.num_partial_slots == 0
     assert runner.attention_stage == "attention"
     assert runner.route_metadata["attention_variant"] == "attention"
-    assert [name for name, entry, _ in runner._stages if entry is not None] == [
-        "quantize",
-        "attention",
-    ]
+    assert [name for name, entry, _ in runner._stages if entry is not None] == list(
+        quantize_stages
+    ) + ["attention"]
+    if pv_mode == "fp8":
+        assert tuple(runner.stage_kwargs["amax"]) == cake_backend.AMAX_KWARGS
+        assert runner.stage_kwargs["amax"]["grid"] == (cake_backend.AMAX_CTAS, 1, 1)
+        assert runner.stage_kwargs["amax"]["num_vectors"] == v.numel() // 16
     # The dense program takes the first delivery's parameter set; the split
     # program's bindings add the K/V range / partial-slot tables, the partial
     # workspace and the unit count.
@@ -747,11 +751,9 @@ def test_nvfp4_split_plan_binds_split_program(pv_mode):
     assert tiles.num_partial_slots > 0 and tiles.num_combine_units > 0
     assert runner.attention_stage == "attention_split"
     assert runner.route_metadata["attention_variant"] == "attention_split"
-    assert [name for name, entry, _ in runner._stages if entry is not None] == [
-        "quantize",
-        "attention_split",
-        "combine",
-    ]
+    assert [name for name, entry, _ in runner._stages if entry is not None] == (
+        ["amax"] if pv_mode == "fp8" else []
+    ) + ["quantize", "attention_split", "combine"]
     out = runner()
     torch.cuda.synchronize()
     _check(
