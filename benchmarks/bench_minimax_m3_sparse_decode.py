@@ -19,7 +19,7 @@ CUDA graph timing includes metadata, scale preparation, native attention and
 reduction, and all kernels in the complete Triton wrapper. It excludes Python
 dispatch and one-time workspace allocation/JIT. Repeated input buffers are warm.
 Each workspace is captured once; a timed sample replays that single-call graph
-32 times. This differs from the earlier standalone wrapper's 32-call capture.
+32 times.
 """
 
 import argparse
@@ -36,16 +36,70 @@ import torch
 import triton
 import triton.language as tl
 
-from flashinfer.msa_ops import msa_sparse_decode_attention
-
-# The benchmark shares reproducible *input generation*, not its correctness
-# reference, with the tests. No CPU/GPU gathers occur in either timed callable.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests.msa_ops.test_minimax_m3 import (  # noqa: E402
-    assert_numerics,
-    make_case,
-    packed_kv_cache,
+from flashinfer.msa_ops import (
+    MSASparseAttentionWorkspace,
+    msa_sparse_decode_attention,
 )
+
+
+def _make_inputs(batch, qlen, hkv, context, *, shared, ragged):
+    """Build deterministic inputs outside the timed call, retaining packed KV."""
+    torch.manual_seed(4567)
+    pages = (context + 127) // 128
+    table = torch.randperm(batch * pages, dtype=torch.int32).reshape(batch, pages)
+    if shared and batch > 1:
+        table[1:, : pages // 2] = table[0, : pages // 2]
+    lengths = torch.tensor(
+        [
+            (
+                max(qlen, context - (i * 137) % max(1, context - qlen + 1))
+                if ragged
+                else max(qlen, context)
+            )
+            for i in range(batch)
+        ],
+        dtype=torch.int32,
+    )
+    indices = torch.full((hkv, batch * qlen, 16), 0x7FFFFFFF, dtype=torch.int32)
+    for h in range(hkv):
+        for t in range(batch * qlen):
+            length = int(lengths[t // qlen]) - qlen + t % qlen + 1
+            count = (length + 127) // 128
+            candidates = torch.randperm(count)
+            # Exercise selections both including and excluding the partial page.
+            if count > 16:
+                candidates = candidates[candidates != count - 1]
+                if t % 2 == 0:
+                    candidates = torch.cat((torch.tensor([count - 1]), candidates))
+            selected = candidates[:16]
+            indices[h, t, : selected.numel()] = selected
+    q = torch.randn(batch * qlen, hkv * 16, 128, device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn(
+        batch * pages, hkv, 128, 256, device="cuda", dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    inputs = dict(
+        q=q,
+        k=packed[..., :128],
+        v=packed[..., 128:],
+        seqlen_q=qlen,
+        q2k_indices=indices.cuda(),
+        page_table=table.cuda(),
+        seqused_k=lengths.cuda(),
+        k_scale=torch.tensor([0.7], device="cuda"),
+        v_scale=torch.tensor([1.3], device="cuda"),
+        out=torch.empty_like(q),
+        workspace=MSASparseAttentionWorkspace(q.device),
+    )
+    return inputs, packed
+
+
+def _assert_numerics(actual, expected):
+    """Compare against the pinned Triton output before timing either path."""
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    error_rms = (actual.float() - expected.float()).square().mean(dim=-1).sqrt()
+    ref_rms = expected.float().square().mean(dim=-1).sqrt()
+    assert torch.all(error_rms <= 0.015 * ref_rms + 1e-5)
 
 
 def load_reference(path):
@@ -108,7 +162,7 @@ def main():
     parser.add_argument(
         "--no-prefix-sharing",
         action="store_true",
-        help="Use disjoint physical pages (default: 50% logical prefix shared)",
+        help="Use disjoint physical pages (default: 50%% logical prefix shared)",
     )
     parser.add_argument(
         "--strided-indices",
@@ -130,7 +184,7 @@ def main():
         for context in args.contexts:
             for qlen in args.query_lens:
                 for batch in args.batch_sizes:
-                    case = make_case(
+                    case, packed = _make_inputs(
                         batch,
                         qlen,
                         hkv,
@@ -147,7 +201,6 @@ def main():
                         view.copy_(case["q2k_indices"])
                         case["q2k_indices"] = view
                     ref = torch.empty_like(case["out"])
-                    packed = packed_kv_cache(case)
 
                     def candidate(case=case):
                         return msa_sparse_decode_attention(**case)
@@ -173,7 +226,7 @@ def main():
                         candidate()
                         baseline()
                     torch.cuda.synchronize()
-                    assert_numerics(case["out"], ref)
+                    _assert_numerics(case["out"], ref)
                     fi_graph = capture_call(candidate, stream)
                     tr_graph = capture_call(baseline, stream)
                     fi_a = graph_times_us(fi_graph)
