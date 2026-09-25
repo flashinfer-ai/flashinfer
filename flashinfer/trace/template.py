@@ -880,7 +880,7 @@ class TraceTemplate:
                 out_dir = Path(effective_dir)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = out_dir / f"{name}.json"
-                out_path.write_text(json.dumps(result, indent=2) + "\n")
+                out_path.write_text(json.dumps(result, indent=2))
                 if _is_auto_dump:
                     _DUMPED_NAMES.add(name)
 

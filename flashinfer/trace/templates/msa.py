@@ -857,6 +857,85 @@ msa_sparse_decode_attention_trace = TraceTemplate(
 )
 
 
+def _packed_fp8_decode_trace(k_rank, v_rank):
+    axes = {
+        "total_q": Var(),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="p"),
+        "topk": Const(abbrev="topk"),
+        "batch_size": Var(),
+        "max_pages": Var(),
+    }
+    if k_rank or v_rank:
+        axes["scale_size"] = Var()
+    return TraceTemplate(
+        op_type="msa_sparse",
+        name_prefix=f"msa_sparse_decode_packed_fp8_k{k_rank}v{v_rank}",
+        description=(
+            "Causal packed-FP8 MSA decode with independent per-query sparse rows, "
+            f"BF16 Q/O and device scalar K/V scales of ranks {k_rank}/{v_rank}. "
+            "K/V are split HND views of one cache with token stride 256."
+        ),
+        axes=axes,
+        inputs={
+            "q": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype="bfloat16"),
+            "k": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+                dtype="float8_e4m3fn",
+            ),
+            "v": Tensor(
+                ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+                dtype="float8_e4m3fn",
+            ),
+            "q2k_indices": Tensor(["num_kv_heads", "total_q", "topk"], dtype="int32"),
+            "page_table": Tensor(["batch_size", "max_pages"], dtype="int32"),
+            "seqused_k": Tensor(["batch_size"], dtype="int32"),
+            "k_scale": Tensor(["scale_size"] if k_rank else [], dtype="float32"),
+            "v_scale": Tensor(["scale_size"] if v_rank else [], dtype="float32"),
+            "seqlen_q": Scalar("int32"),
+            "softmax_scale": Scalar("float32", optional=True),
+        },
+        outputs={
+            "output": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype="bfloat16")
+        },
+        check=_msa_attention_check,
+        tags=["stage:decode"],
+    )
+
+
+_PACKED_FP8_DECODE_TRACES = {
+    (k_rank, v_rank): _packed_fp8_decode_trace(k_rank, v_rank)
+    for k_rank in (0, 1)
+    for v_rank in (0, 1)
+}
+
+
+def msa_sparse_decode_attention_trace_dispatch(**kwargs):
+    k = kwargs.get("k")
+    if (
+        isinstance(k, torch.Tensor)
+        and k.ndim == 4
+        and k.dtype == torch.float8_e4m3fn
+        and kwargs.get("page_table") is not None
+        and kwargs.get("k_scale") is not None
+        and kwargs.get("v_scale") is not None
+    ):
+        ranks = tuple(
+            getattr(kwargs[name], "ndim", -1) for name in ("k_scale", "v_scale")
+        )
+        return _PACKED_FP8_DECODE_TRACES.get(ranks)
+    return msa_sparse_decode_attention_trace
+
+
+msa_sparse_decode_attention_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    msa_sparse_decode_attention_trace,
+    *_PACKED_FP8_DECODE_TRACES.values(),
+)
+
+
 def _bind_init_dependency(init_fn):
     # Inline _msa_varlen_cu_seqlens into each dumped JSON's "init" field so it
     # stays self-contained; unlike moe.py, __signature__ is left alone to keep

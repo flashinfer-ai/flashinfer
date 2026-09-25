@@ -18,7 +18,7 @@ namespace flashinfer {
 // One warp per (KV head, query token). In particular, speculative queries
 // are NOT folded together: their selections and causal lengths are independent.
 // Only metadata is reordered; the attention kernel reads the original KV pool.
-__global__ void MiniMaxM3PrepareSparseDecode(
+__global__ void PrepareMSADecodeMetadata(
     const int32_t* topk, const int32_t* block_table, const int32_t* seq_lens, const float* k_scale,
     int32_t* sparse_pages, int32_t* sparse_lens, float* qk_scale_log2, int total_q,
     int num_kv_heads, int query_len, int max_pages, int num_physical_pages, float sm_scale,
