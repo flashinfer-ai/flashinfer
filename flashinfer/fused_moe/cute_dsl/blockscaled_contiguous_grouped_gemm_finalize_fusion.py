@@ -180,6 +180,18 @@ def create_finalize_fusion_tensors(
 _finalize_kernel_cache: Dict[Tuple, Any] = {}
 
 
+class _RouteSplitFinalize:
+    """Two preparation-bound G2 launches; no output initialization between them."""
+
+    def __init__(self, dense, sparse):
+        self.route_split_dense = dense
+        self.route_split_sparse = sparse
+
+    def __call__(self, *args, stream):
+        self.route_split_dense(*args, stream=stream)
+        self.route_split_sparse(*args, stream=stream)
+
+
 def _get_compiled_finalize_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
     seq_len: int,
@@ -222,6 +234,12 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    enable_narrow_a: bool = False,
+    enable_sparse_narrow_a: bool = False,
+    enable_route_split: bool = False,
+    write_expanded_weighted: bool = False,
+    enable_t4_compact_output: bool = False,
+    enable_skinny_finalize: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -239,8 +257,26 @@ def _get_compiled_finalize_kernel(
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
 
+    enable_t16_const_scheduler = bool(
+        enable_skinny_finalize
+        and seq_len == 16
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
+    )
+    enable_t16_slot_planes = enable_t16_const_scheduler
+    enable_t4_const_scheduler = bool(
+        enable_skinny_finalize
+        and seq_len == 4
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
+    )
+
     # Cache key includes tactic and pointer dtype parameters, NOT problem dimensions.
-    cache_key = (
+    cache_key: Tuple[Any, ...] = (
         "sm107" if is_rubin else "sm100",
         sf_vec_size,
         tile_size,
@@ -257,7 +293,25 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        enable_narrow_a,
+        enable_sparse_narrow_a,
+        enable_skinny_finalize,
+        enable_route_split,
+        write_expanded_weighted,
     )
+
+    if enable_t4_compact_output:
+        cache_key += ("t4_compact_output",)
+
+    if enable_t4_const_scheduler:
+        cache_key += ("t4_g2_const_one_slot",)
+
+    if enable_t16_const_scheduler:
+        cache_key += ("t16_g2_const_scheduler",)
+    if enable_t16_slot_planes:
+        cache_key += ("t16_g2_slot_planes",)
+    if enable_t4_const_scheduler or enable_t16_slot_planes:
+        cache_key += ("t4_t16_g2_tail_stream_k",)
 
     if cache_key not in _finalize_kernel_cache:
         if is_rubin:
@@ -299,15 +353,29 @@ def _get_compiled_finalize_kernel(
             )
             wrapper_fn = gemm_rubin.wrapper  # type: ignore[attr-defined]
         else:
-            gemm_bw = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
-                sf_vec_size=sf_vec_size,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                raster_along_m=raster_along_m,
-                enable_pdl=enable_pdl,
-                use_a_per_token_scale=use_a_per_token_scale,
-                use_fused_finalize=use_fused_finalize,
-            )
+            if enable_skinny_finalize:
+                from .blackwell.skinny_decode_finalize import SkinnyDecodeFinalizeKernel
+
+                gemm_bw: Any = SkinnyDecodeFinalizeKernel(
+                    enable_t16_const_scheduler=enable_t16_const_scheduler,
+                    enable_t16_slot_planes=enable_t16_slot_planes,
+                    enable_t4_const_scheduler=enable_t4_const_scheduler,
+                )
+            else:
+                gemm_bw = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+                    sf_vec_size=sf_vec_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    raster_along_m=raster_along_m,
+                    enable_pdl=enable_pdl,
+                    use_a_per_token_scale=use_a_per_token_scale,
+                    use_fused_finalize=use_fused_finalize,
+                    enable_narrow_a=enable_narrow_a,
+                    enable_sparse_narrow_a=enable_sparse_narrow_a,
+                    enable_route_split_dense=enable_route_split,
+                    write_expanded_weighted=write_expanded_weighted,
+                    enable_t4_compact_output=enable_t4_compact_output,
+                )
             wrapper_fn = gemm_bw.wrapper
 
         # Compile with runtime parameters - they can vary across calls.
@@ -348,6 +416,41 @@ def _get_compiled_finalize_kernel(
             stream=stream,
         )
 
+        if enable_route_split:
+            from .blackwell.single_n16_prefill_finalize import (
+                SingleN16PrefillFinalizeKernel,
+            )
+
+            sparse_kernel = SingleN16PrefillFinalizeKernel(
+                write_expanded_weighted=write_expanded_weighted
+            )
+            compiled_sparse = cute.compile(
+                sparse_kernel.wrapper,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_ptr,
+                tile_idx_ptr,
+                mn_limit_ptr,
+                permuted_idx_ptr,
+                num_tiles_ptr,
+                token_scales_ptr,
+                *([] if is_rubin else [a_per_token_scale_ptr]),
+                permuted_m,
+                n,
+                k,
+                num_experts,
+                seq_len,
+                topk,
+                tile_size=tile_size,
+                scaling_vector_size=sf_vec_size,
+                max_active_clusters=max_active_clusters,
+                stream=stream,
+            )
+            compiled_gemm = _RouteSplitFinalize(compiled_gemm, compiled_sparse)
+
         _finalize_kernel_cache[cache_key] = compiled_gemm
 
     return _finalize_kernel_cache[cache_key]
@@ -381,6 +484,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+    _enable_narrow_a: bool = False,
+    _enable_sparse_narrow_a: bool = False,
+    _write_expanded_weighted: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -574,7 +681,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    output_rows = seq_len if use_fused_finalize else seq_len * topk
+    output_rows = (
+        seq_len
+        if use_fused_finalize and not _write_expanded_weighted
+        else seq_len * topk
+    )
 
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
@@ -653,6 +764,94 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     else:
         a_per_token_scale_ptr = None
 
+    # T512 route-tile split: both launches are bound during preparation.
+    # Native route128 metadata and the exact forward/workspace remain authoritative.
+    enable_route_split = bool(
+        _enable_sparse_narrow_a
+        and not _enable_narrow_a
+        and (major, minor) == (10, 3)
+        and not is_rubin
+        and seq_len == 512
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
+        and tile_size == 128
+        and mma_tiler_mn == (128, 128)
+        and cluster_shape_mn == (1, 1)
+        and not raster_along_m
+        and not enable_pdl
+        and use_fused_finalize
+        and not use_a_per_token_scale
+        and a_dtype_cutlass is cutlass.Float8E4M3FN
+        and b_dtype_cutlass is cutlass.Float4E2M1FN
+        and sf_dtype_cutlass is cutlass.Float8E8M0FNU
+        and out_dtype_cutlass is cutlass.BFloat16
+        and token_scales_dtype is cutlass.Float32
+        and sf_vec_size == 32
+    )
+
+    if _write_expanded_weighted and not enable_route_split:
+        raise ValueError(
+            "weighted expanded output requires the private T512 route-split path"
+        )
+
+    # Preparation-only SM103 T4 selection with unique-ID decode provenance.
+    enable_t4_compact_output = bool(
+        _enable_narrow_a
+        and not _enable_sparse_narrow_a
+        and (major, minor) == (10, 3)
+        and not is_rubin
+        and seq_len == 4
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
+        and tile_size == 128
+        and mma_tiler_mn == (128, 128)
+        and cluster_shape_mn == (1, 1)
+        and not raster_along_m
+        and not enable_pdl
+        and not use_a_per_token_scale
+        and use_fused_finalize
+        and a_dtype_cutlass is cutlass.Float8E4M3FN
+        and b_dtype_cutlass is cutlass.Float4E2M1FN
+        and sf_dtype_cutlass is cutlass.Float8E8M0FNU
+        and out_dtype_cutlass is cutlass.BFloat16
+        and token_scales_dtype is cutlass.Float32
+        and sf_vec_size == 32
+    )
+
+    # Shape-only preparation choice; unique-ID decode provenance guarantees
+    # at most T rows per expert. Every routing distribution uses this choice.
+    enable_skinny_finalize = bool(
+        _enable_narrow_a
+        and (major, minor) == (10, 3)
+        and not is_rubin
+        and seq_len in (8, 16)
+        and n == 7168
+        and k == 3072
+        and num_experts == 112
+        and topk == 16
+        and tile_size == 128
+        and mma_tiler_mn == (128, 128)
+        and cluster_shape_mn == (1, 1)
+        and not raster_along_m
+        and not enable_pdl
+        and use_fused_finalize
+        and not use_a_per_token_scale
+        and a_dtype_cutlass is cutlass.Float8E4M3FN
+        and b_dtype_cutlass is cutlass.Float4E2M1FN
+        and sf_dtype_cutlass is cutlass.Float8E8M0FNU
+        and out_dtype_cutlass is cutlass.BFloat16
+        and token_scales_dtype is cutlass.Float32
+        and sf_vec_size == 32
+    )
+
+    # The existing compact T4 guard binds full shape and unique-ID decode
+    # provenance, including the sparse-prefill exclusion, before compilation.
+    enable_skinny_finalize = enable_skinny_finalize or enable_t4_compact_output
+
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -693,6 +892,27 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        enable_narrow_a=_enable_narrow_a,
+        enable_t4_compact_output=enable_t4_compact_output,
+        enable_skinny_finalize=enable_skinny_finalize,
+        enable_route_split=enable_route_split,
+        write_expanded_weighted=_write_expanded_weighted,
+        enable_sparse_narrow_a=(
+            _enable_sparse_narrow_a
+            and not _enable_narrow_a
+            and not is_rubin
+            and not use_a_per_token_scale
+            and use_fused_finalize
+            and not enable_pdl
+            and a_dtype == "float8_e4m3fn"
+            and b_dtype == "float4_e2m1fn"
+            and sf_dtype == "float8_e8m0fnu"
+            and out_dtype == "bfloat16"
+            and sf_vec_size == 32
+            and tile_size == 128
+            and mma_tiler_mn == (128, 128)
+            and cluster_shape_mn == (1, 1)
+        ),
     )
 
     # Execute kernel with runtime parameters.
@@ -702,7 +922,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
     #  [a_per_token_scale_ptr], m, n, k, l, num_tokens, top_k, stream)
-    compiled_gemm(
+    launch_args = (
         a_ptr,
         b_ptr,
         a_sf_ptr,
@@ -721,8 +941,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         num_experts,
         seq_len,
         topk,
-        stream=stream,
     )
+    if _prepared_launches is not None:
+        _prepared_launches["finalize"] = (compiled_gemm, launch_args)
+    compiled_gemm(*launch_args, stream=stream)
 
     return out
 

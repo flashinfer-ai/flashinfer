@@ -35,6 +35,11 @@ if is_cute_dsl_available():
         cute_dsl_fused_moe_bf16,
         CuteDslBf16MoEWrapper,
     )
+    from .mxfp4 import (
+        CuteDslMxfp4MoEWrapper,
+        Mxfp4MoEPlan,
+        mxfp4_moe_capability,
+    )
 
     from .blackwell_sm12x import (
         cute_dsl_sm12x_moe_gemm_fp8,
@@ -70,4 +75,7 @@ if is_cute_dsl_available():
         "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
         "cute_dsl_sm12x_fc2_finalize_fp8",
         "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
+        "CuteDslMxfp4MoEWrapper",
+        "Mxfp4MoEPlan",
+        "mxfp4_moe_capability",
     ]

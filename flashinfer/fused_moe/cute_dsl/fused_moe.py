@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import warnings
 import weakref
@@ -233,8 +233,13 @@ def _moe_core_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+    _enable_decode_specialization: bool = False,
+    _enable_sparse_prefill_epilogue: bool = False,
+    _enable_sparse_prefill_narrow_a: bool = False,
+    _expanded_weighted_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -313,8 +318,6 @@ def _moe_core_impl(
         raise ValueError("quant_mode='w4a8' supports only torch.bfloat16 output")
     if is_mxfp8 and not use_fused_finalize:
         raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
-    if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
-        raise ValueError("SiTU is not supported when quant_mode='w4a8'")
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
         validate_w4a8_inputs(
@@ -383,6 +386,7 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
+        _prepared_launches=_prepared_launches,
         **moe_sort_kwargs,
     )
 
@@ -441,6 +445,9 @@ def _moe_core_impl(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             gated=gated,
+            _enable_compact_epilogue=_enable_decode_specialization,
+            _enable_sparse_prefill_epilogue=_enable_sparse_prefill_epilogue,
+            _prepared_launches=_prepared_launches,
         )
     )
     if use_per_token_activation:
@@ -466,12 +473,18 @@ def _moe_core_impl(
         if use_async_memset:
             with torch.cuda.stream(aux_stream):
                 main_event.wait()
-                moe_output_memset_inplace(moe_output)
+                moe_output_memset_inplace(
+                    moe_output, _prepared_launches=_prepared_launches
+                )
                 memset_event.record()
             memset_event.wait()
         else:
-            moe_output_memset_inplace(moe_output)
-        gemm2_output = moe_output
+            moe_output_memset_inplace(moe_output, _prepared_launches=_prepared_launches)
+        gemm2_output = (
+            moe_output
+            if _expanded_weighted_output is None
+            else _expanded_weighted_output
+        )
     else:
         gemm2_output = torch.empty(
             (num_tokens * top_k, hidden_size),
@@ -504,6 +517,10 @@ def _moe_core_impl(
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        _prepared_launches=_prepared_launches,
+        _enable_narrow_a=_enable_decode_specialization,
+        _enable_sparse_narrow_a=_enable_sparse_prefill_narrow_a,
+        _write_expanded_weighted=_expanded_weighted_output is not None,
     )
 
     # Step 4: Deterministic routing-weight reduction
