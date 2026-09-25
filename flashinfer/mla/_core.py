@@ -2539,6 +2539,25 @@ def _compute_mla_decode_buckets(
     return get_hybrid_num_tokens_buckets(max(1, cap))
 
 
+def _cake_trtllm_mla_blackwell_supports(
+    query: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sparse_mla_top_k: int,
+) -> bool:
+    """Whether the generated TRT-LLM-style Blackwell MLA programs cover this dimension tuple."""
+    from .cake_trtllm_mla_blackwell import supports_dimension_tuple
+
+    return supports_dimension_tuple(
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        int(query.shape[-2]),
+        int(sparse_mla_top_k),
+    )
+
+
 def _validate_mla_dcp_args(
     *,
     query: torch.Tensor,
@@ -3687,7 +3706,12 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
 
-    if backend == "cake":
+    if backend == "cake" and _cake_trtllm_mla_blackwell_supports(
+        query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, sparse_mla_top_k
+    ):
+        # Two Cake MLA families answer to backend="cake": the TRT-LLM-style Blackwell decode
+        # programs for their generated dimension tuples, and the Kimi-K3 FP8 paged-cache route
+        # (below) for everything else in its contract.
         from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
         return trtllm_mla_blackwell_decode(

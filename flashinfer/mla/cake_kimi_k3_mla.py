@@ -267,7 +267,9 @@ class KimiK3MlaFp8PagedAttention:
             self.num_split = (
                 int(num_split)
                 if num_split
-                else plan_num_split(self.batch * self.m_tiles, int(max_seq_len), sm_count)
+                else plan_num_split(
+                    self.batch * self.m_tiles, int(max_seq_len), sm_count
+                )
             )
         self.max_pages_per_seq = int(block_tables.shape[-1])
         self.softmax_scale_log2 = float(bmm1_scale) * math.log2(math.e)

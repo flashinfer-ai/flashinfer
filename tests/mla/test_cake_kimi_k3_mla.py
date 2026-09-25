@@ -249,7 +249,8 @@ def test_route_selection():
     assert wide.route_metadata["route"] == "wide" and wide.rt is None
     assert wide.plan["grid_main"] == (2 * wide.num_split, 1, 2)
     # 96 rows but longest KV below 16384 -> row tiles (lazy-E4M3 precision gate of the wide route).
-    short = runner(_make_case(2, [1, 1], [16383, 300], 96, seed=2, device=device))
+    # max_seq_len is the page-rounded table width, so the longest KV must stay below 16384 pages-wise.
+    short = runner(_make_case(2, [1, 1], [16000, 300], 96, seed=2, device=device))
     assert short.route_metadata["route"] == "swapped" and short.rt == 96
     # 12 rows -> the 16-row tile whatever the KV.
     small = runner(_make_case(1, [1], [40000], 12, seed=3, device=device))
