@@ -271,6 +271,34 @@ def test_bf16_checkpoint_rows_keep_the_bf16_carrier_on_fp32_state():
     )
 
 
+@pytest.mark.parametrize(
+    "lengths,checkpoints",
+    [([2048], True), ([4096], False), ([8128, 64], True), ([8192], True)],
+)
+def test_dense_h12_beta_matches_the_strided_carrier_on_the_unbounded_gate(
+    lengths, checkpoints
+):
+    # Serving hands beta over as a strided slice of a wider allocation; a dense
+    # [tokens, 12] beta (token stride == heads) selects the pair-packed beta
+    # TensorMap instead of the padded carrier.  Both layouts must be exported
+    # for the unbounded gate (Kimi-Linear) and produce the same bits, on the
+    # sequential body and on the affine split alike.
+    d = _inputs(lengths, 12, seed=31)
+    if kda_prefill_supports_fp32_checkpoints(lower_bound=None):
+        d["state_checkpoints"] = torch.zeros_like(
+            d["state_checkpoints"], dtype=torch.float32
+        )
+    pool = d["pool"].clone()
+    assert d["beta"].stride(1) != 12
+    _run(d, checkpoints=checkpoints)
+    want = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["beta"] = d["beta"].contiguous()
+    assert d["beta"].stride(1) == 12
+    _run(d, checkpoints=checkpoints)
+    _assert_same(_snapshot(d), want)
+
+
 def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
     import flashinfer.cake_kda_tf32_runtime as runtime
 
