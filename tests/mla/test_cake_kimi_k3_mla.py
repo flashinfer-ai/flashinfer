@@ -161,7 +161,9 @@ def _check(out, ref, *, atol, rtol):
 
 
 @pytest.mark.parametrize("num_heads", [12, 96])
-@pytest.mark.parametrize("kv_lens", [[1, 200, 64], [4096, 777, 65]])
+@pytest.mark.parametrize(
+    "kv_lens", [[1, 200, 64], [4096, 777, 65], [20000, 16384, 17001]]
+)
 def test_decode_q1(num_heads, kv_lens):
     _skip_unless_sm100_family()
     device = torch.device("cuda")
@@ -178,6 +180,7 @@ def test_decode_q1(num_heads, kv_lens):
         (12, [1, 5, 8, 3], [300, 1500, 64, 129]),
         (12, [5, 2], [1500, 2600]),  # 60 query rows -> the 64-row tile
         (96, [4, 4], [2048, 333]),
+        (96, [4, 3], [20000, 16385]),  # two-CTA wide route (rows > 64, KV >= 16384)
     ],
 )
 def test_mtp_variable_q(num_heads, q_lens, kv_lens):
@@ -202,6 +205,58 @@ def test_incremental_prefill_prefix_reuse():
     _check(out, _reference(case), atol=5e-3, rtol=2e-2)
 
 
+def test_prefill_wide_route():
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    # 512 new tokens x 12 heads = 6144 packed rows over a 32768-token cached prefix: the two-CTA
+    # wide route with per-row causal tails (bottom-right aligned) and a planned KV split.
+    case = _make_case(1, [512], [32768], 12, seed=645402, device=device)
+    out = _run(case)
+    _check(out, _reference(case), atol=5e-3, rtol=2e-2)
+
+
+def test_route_selection():
+    _skip_unless_sm100_family()
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        KimiK3MlaFp8PagedAttention,
+        workspace_bytes,
+    )
+
+    device = torch.device("cuda")
+    workspace = torch.zeros(64 << 20, dtype=torch.uint8, device=device)
+
+    def runner(case):
+        total_q = case["query"].shape[0]
+        out = torch.empty(
+            (total_q, case["num_heads"], LATENT), dtype=torch.bfloat16, device=device
+        )
+        assert workspace.numel() >= workspace_bytes(total_q * case["num_heads"], 256)
+        return KimiK3MlaFp8PagedAttention(
+            query=case["query"],
+            kv_cache=case["kv_cache"],
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=out,
+            workspace_buffer=workspace,
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=max(case["q_lens"]),
+            max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
+        )
+
+    # 96 rows, longest KV 20000 -> wide route: one two-CTA cluster per (split, tile, request).
+    wide = runner(_make_case(2, [1, 1], [20000, 300], 96, seed=1, device=device))
+    assert wide.route_metadata["route"] == "wide" and wide.rt is None
+    assert wide.plan["grid_main"] == (2 * wide.num_split, 1, 2)
+    # 96 rows but longest KV below 16384 -> row tiles (lazy-E4M3 precision gate of the wide route).
+    short = runner(_make_case(2, [1, 1], [16383, 300], 96, seed=2, device=device))
+    assert short.route_metadata["route"] == "swapped" and short.rt == 96
+    # 12 rows -> the 16-row tile whatever the KV.
+    small = runner(_make_case(1, [1], [40000], 12, seed=3, device=device))
+    assert small.route_metadata["route"] == "swapped" and small.rt == 16
+    assert small.plan["grid_main"] == (small.num_split, 1, 1)
+
+
 def test_cuda_graph_replay_changing_page_table():
     _skip_unless_sm100_family()
     device = torch.device("cuda")
@@ -218,6 +273,31 @@ def test_cuda_graph_replay_changing_page_table():
     perm = torch.randperm(128, generator=gen, device=device).to(torch.int32)
     width = case["block_tables"].shape[1]
     for b in range(3):
+        n = (case["kv_lens"][b] + PAGE - 1) // PAGE
+        case["block_tables"][b, :n] = perm[b * width : b * width + n]
+    out.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    _check(out, _reference(case), atol=1e-2, rtol=1e-2)
+
+
+def test_cuda_graph_replay_wide_route():
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    # H96 decode over long KV (two-CTA wide route, planned KV split + merge) captured once and replayed
+    # with a new page assignment and new cache contents.
+    case = _make_case(
+        2, [1, 1], [20000, 16384], 96, seed=645205, device=device, pool_pages=1024
+    )
+    out, g = _run(case, fixed_q_len=1, graph=True)
+    _check(out, _reference(case), atol=1e-2, rtol=1e-2)
+    gen = torch.Generator(device=device).manual_seed(11)
+    case["kv_cache"].copy_(
+        _fp8(torch.randn(case["kv_cache"].shape, generator=gen, device=device) * 0.5)
+    )
+    perm = torch.randperm(1024, generator=gen, device=device).to(torch.int32)
+    width = case["block_tables"].shape[1]
+    for b in range(2):
         n = (case["kv_lens"][b] + PAGE - 1) // PAGE
         case["block_tables"][b, :n] = perm[b * width : b * width + n]
     out.fill_(float("nan"))

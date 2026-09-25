@@ -33,6 +33,15 @@ REDUCE_WARPS = 8  # warp reducer CTA: 256 threads
 REDUCE_WARP_MAX_SPLITS = 32  # lane s owns split s
 REDUCE_DIM_CHUNKS = 4  # CTA reducer: 128 latent dims per CTA
 ROW_TILES = (16, 32, 48, 64, 96)
+# Two-CTA wide route (Cake ``kimi_k3_mla_wide``): 128 packed rows per cluster of two CTAs, K tokens
+# split across the pair.  Taken for requests with more than WIDE_MIN_ROWS packed rows whose longest
+# KV is at least WIDE_MIN_KV tokens (the lazy-E4M3 probability reference of that schedule is out of
+# the contract tolerance on shorter KV prefill, which stays on the row tiles).
+WIDE_MIN_ROWS = 64
+WIDE_MIN_KV = 16384
+WIDE_TILE_Q = 128  # packed rows per two-CTA cluster
+WIDE_CLUSTER = 2  # CTAs per cluster: one SM pair per work item
+WIDE_MIN_TILES_PER_SPLIT = 2
 
 
 def _target_arch(device: torch.device) -> str:
@@ -53,6 +62,41 @@ def plan_num_split(items: int, max_seq_len: int, sm_count: int) -> int:
     target = max(1, sm_count // max(1, items))
     max_by_len = max(1, (max_seq_len + TILE_TOK - 1) // TILE_TOK // MIN_TILES_PER_SPLIT)
     return max(1, min(target, MAX_SPLITS, max_by_len))
+
+
+def use_wide_route(rows_per_request: int, max_seq_len: int) -> bool:
+    """Whether a request shape runs the two-CTA wide route (else a swapped-AB row tile)."""
+    return rows_per_request > WIDE_MIN_ROWS and int(max_seq_len) >= WIDE_MIN_KV
+
+
+def plan_num_split_wide(
+    clusters: int,
+    max_seq_len: int,
+    sm_count: int,
+    min_tiles_per_split: int = WIDE_MIN_TILES_PER_SPLIT,
+    max_splits: int = MAX_SPLITS,
+) -> int:
+    """KV splits per cluster of the wide route (mirrors Cake ``plan_num_split_wide``).
+
+    Work items (clusters x splits) run one per SM pair; the cost of ``s`` splits in 128-token
+    tile periods is ``ceil(items / pairs) * ceil(tiles / s)`` plus ~0.05 tile periods per item for
+    the split merge.  A split is taken only when that model predicts at least 15 %.
+    """
+    pairs = max(1, sm_count // WIDE_CLUSTER)
+    tiles = max(1, (max_seq_len + TILE_TOK - 1) // TILE_TOK)
+    max_s = max(1, min(max_splits, tiles // max(1, min_tiles_per_split)))
+    best_s, best_cost, cost_one = 1, None, None
+    for s in range(1, max_s + 1):
+        items = clusters * s
+        cost = -(-items // pairs) * (-(-tiles // s)) + 0.05 * items
+        if s == 1:
+            cost_one = cost
+        if best_cost is None or cost < best_cost:
+            best_s, best_cost = s, cost
+    assert cost_one is not None and best_cost is not None
+    if best_s > 1 and cost_one / best_cost < 1.15:
+        return 1
+    return best_s
 
 
 def reduce_warps_per_row(rows: int) -> int:
@@ -125,6 +169,11 @@ def _bound_args(
 
 class KimiK3MlaFp8PagedAttention:
     """Prepared launcher (no allocation at ``launch``; all planning at construction).
+
+    Route: requests with more than ``WIDE_MIN_ROWS`` packed (token, head) rows and a longest KV of
+    at least ``WIDE_MIN_KV`` tokens run the two-CTA wide schedule (``main_wide``: 128 rows per
+    cluster); every other shape runs the swapped-AB row tile ``main_rt{16,32,48,64,96}``.  Both
+    routes share the split-KV merge kernels and this workspace layout.
 
     Args mirror ``trtllm_batch_decode_with_kv_cache_mla``: ``query`` FP8 ``[B, q_len, H, 576]``
     or ``[total_q, H, 576]`` with ``cum_seq_lens_q``; ``kv_cache`` FP8 ``[pages, 64, 576]`` or
@@ -201,13 +250,25 @@ class KimiK3MlaFp8PagedAttention:
         self.max_q_len = int(max_q_len)
         self.rows_max = self.batch * self.max_q_len * self.num_heads
         rows_per_request = self.max_q_len * self.num_heads
-        self.rt = swapped_rt(rows_per_request)
-        self.m_tiles = (rows_per_request + self.rt - 1) // self.rt
-        self.num_split = (
-            int(num_split)
-            if num_split
-            else plan_num_split(self.batch * self.m_tiles, int(max_seq_len), sm_count)
-        )
+        self.wide = use_wide_route(rows_per_request, int(max_seq_len))
+        if self.wide:
+            self.rt: Optional[int] = None
+            self.m_tiles = (rows_per_request + WIDE_TILE_Q - 1) // WIDE_TILE_Q
+            self.num_split = (
+                int(num_split)
+                if num_split
+                else plan_num_split_wide(
+                    self.batch * self.m_tiles, int(max_seq_len), sm_count
+                )
+            )
+        else:
+            self.rt = swapped_rt(rows_per_request)
+            self.m_tiles = (rows_per_request + self.rt - 1) // self.rt
+            self.num_split = (
+                int(num_split)
+                if num_split
+                else plan_num_split(self.batch * self.m_tiles, int(max_seq_len), sm_count)
+            )
         self.max_pages_per_seq = int(block_tables.shape[-1])
         self.softmax_scale_log2 = float(bmm1_scale) * math.log2(math.e)
         self.bmm2_scale = float(bmm2_scale)
@@ -220,7 +281,12 @@ class KimiK3MlaFp8PagedAttention:
         self.partial_O, self.partial_max, self.partial_sum = _carve_workspace(
             workspace_buffer, self.rows_max, self.num_split
         )
-        self.grid_main = (self.num_split, self.m_tiles, self.batch)
+        # The wide route launches one cluster of two CTAs per (split, row tile, request) item.
+        self.grid_main = (
+            (WIDE_CLUSTER if self.wide else 1) * self.num_split,
+            self.m_tiles,
+            self.batch,
+        )
         if self.num_split <= REDUCE_WARP_MAX_SPLITS:
             self.reduce_warps = reduce_warps_per_row(self.rows_max)
             rows_per_cta = REDUCE_WARPS // self.reduce_warps
@@ -234,11 +300,13 @@ class KimiK3MlaFp8PagedAttention:
             self.reduce_warps = 0
             self.grid_reduce = (self.rows_max, REDUCE_DIM_CHUNKS, 1)
             reduce_kind = "reduce_cta"
-        self._main = get_cake_kimi_k3_mla_route(f"main_rt{self.rt}", arch=self.arch)
+        main_kind = "main_wide" if self.wide else f"main_rt{self.rt}"
+        self._main = get_cake_kimi_k3_mla_route(main_kind, arch=self.arch)
         self._reduce = get_cake_kimi_k3_mla_route(reduce_kind, arch=self.arch)
         self.route_metadata = dict(
             backend="cake",
             arch=self.arch,
+            route="wide" if self.wide else "swapped",
             rt=self.rt,
             reducer=reduce_kind,
             main_module=self._main["name"],
@@ -263,6 +331,7 @@ class KimiK3MlaFp8PagedAttention:
                 tmap_qr=self.q_rows,
                 tmap_k=self.kv_rows,
                 tmap_kr=self.kv_rows,
+                tmap_v=self.kv_rows,
                 partial_O=write_target,
                 partial_max=self.partial_max,
                 partial_sum=self.partial_sum,
@@ -356,6 +425,8 @@ __all__ = [
     "run_cake_kimi_k3_mla_fp8_paged_attention",
     "workspace_bytes",
     "swapped_rt",
+    "use_wide_route",
     "plan_num_split",
+    "plan_num_split_wide",
     "reduce_warps_per_row",
 ]
