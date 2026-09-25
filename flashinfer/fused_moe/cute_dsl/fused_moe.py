@@ -383,6 +383,7 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
+        enable_pdl=enable_pdl,
         **moe_sort_kwargs,
     )
 
