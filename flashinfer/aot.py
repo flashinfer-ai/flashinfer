@@ -798,6 +798,9 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+        # Both TGV variants share a module name, so a build that also targets SM103
+        # must keep only the SM100f one, which runs on both.
+        if has_sm100 and not has_sm103:
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)

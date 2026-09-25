@@ -57,7 +57,7 @@ SM103_ONLY_MODULES = {
 }
 
 
-def _registered_generators(monkeypatch, sm_capabilities):
+def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
     """Run gen_all_modules with every module generator stubbed to its own name."""
     from flashinfer import aot
     from flashinfer.jit import comm as jit_comm
@@ -75,6 +75,8 @@ def _registered_generators(monkeypatch, sm_capabilities):
                 monkeypatch.setattr(
                     module, attr, lambda *args, _result=result, **kwargs: _result
                 )
+    for attr, stub in (overrides or {}).items():
+        monkeypatch.setattr(aot, attr, stub)
     monkeypatch.setattr(aot, "_gen_blackwell_bf16_bmm_aot_specs", lambda caps: [])
     monkeypatch.setattr(aot, "get_cuda_version", lambda: Version("13.0"))
 
@@ -132,14 +134,53 @@ def test_combined_build_registers_both_variants(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("sm_capabilities", "expected_use_sm_100f"),
+    [
+        ({"sm100": True, "sm100a_exact": True, "sm100f": True}, False),
+        ({"sm103": True, "sm103a_exact": True}, True),
+        (
+            {
+                "sm100": True,
+                "sm100a_exact": True,
+                "sm100f": True,
+                "sm103": True,
+                "sm103a_exact": True,
+            },
+            True,
+        ),
+    ],
+    ids=["sm100a", "sm103a", "sm100a+sm103a"],
+)
+def test_registered_tgv_gemm_runs_on_every_targeted_arch(
+    monkeypatch, sm_capabilities, expected_use_sm_100f
+):
+    # Both TGV variants share a module name and the first one registered wins,
+    # so it must be the SM100f build whenever SM103 is targeted.
+    calls = []
+
+    def gen_tgv(dtype, use_sm_100f=False):
+        calls.append(use_sm_100f)
+        return SimpleNamespace(name=f"tgv_gemm_{dtype}")
+
+    _registered_generators(
+        monkeypatch, sm_capabilities, {"gen_tgv_gemm_sm10x_module": gen_tgv}
+    )
+
+    assert calls[0] is expected_use_sm_100f
+
+
+@pytest.mark.parametrize(
     ("arch_list", "expected", "unexpected"),
     [
-        ("10.0a", "compute_100a", "compute_103a"),
-        ("10.3a", "compute_103a", "compute_100a"),
+        ("10.0a", "-gencode=arch=compute_100a,code=sm_100a", "sm_103a"),
+        ("10.3a", "-gencode=arch=compute_103a,code=sm_103a", "sm_100a"),
     ],
 )
-def test_trtllm_gen_gemm_targets_the_built_sm10x_arch(
-    monkeypatch, arch_list, expected, unexpected
+@pytest.mark.parametrize(
+    "generator", ["gen_trtllm_gen_gemm_module", "gen_trtllm_low_latency_gemm_module"]
+)
+def test_trtllm_gen_gemm_runners_target_the_built_sm10x_arch(
+    monkeypatch, generator, arch_list, expected, unexpected
 ):
     # Provider validation rejects an sm_100a image in the sm103a wheel.
     from flashinfer.compilation_context import CompilationContext
@@ -147,8 +188,12 @@ def test_trtllm_gen_gemm_targets_the_built_sm10x_arch(
 
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
     monkeypatch.setattr(gemm_core, "current_compilation_context", CompilationContext())
+    monkeypatch.setattr(gemm_core, "get_artifact", lambda *args: "artifact")
+    monkeypatch.setattr(gemm_core, "get_meta_hash", lambda *args: "hash")
+    monkeypatch.setattr(gemm_core, "ensure_symlink", lambda *args: None)
+    monkeypatch.setattr(gemm_core, "verify_symlinked_headers", lambda *args: None)
 
-    flags = " ".join(gemm_core._trtllm_gen_gemm_nvcc_flags(enable_rubin=False))
+    flags = getattr(gemm_core, generator)().extra_cuda_cflags
 
     assert expected in flags
-    assert unexpected not in flags
+    assert unexpected not in " ".join(flags)
