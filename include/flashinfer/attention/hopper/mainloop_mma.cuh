@@ -16,8 +16,26 @@
 
 namespace flashinfer {
 
+// Zero rows [row_begin, row_end) of a (rows, cols) smem tile, 16 bytes per store.
+template <typename STensor>
+CUTLASS_DEVICE void zero_smem_rows(STensor& tile, int row_begin, int row_end, int thread_idx,
+                                   int num_threads) {
+  using T = typename STensor::value_type;
+  constexpr int VEC = 16 / sizeof(T);
+  constexpr int VECS_PER_ROW = decltype(size<1>(tile))::value / VEC;
+  const int num_vecs = (row_end - row_begin) * VECS_PER_ROW;
+  for (int i = thread_idx; i < num_vecs; i += num_threads) {
+    *reinterpret_cast<uint4*>(&tile(row_begin + i / VECS_PER_ROW, (i % VECS_PER_ROW) * VEC)) =
+        uint4{0, 0, 0, 0};
+  }
+}
+
+// ZERO_V_TAIL: the producer loads the last KV tile in mainloop_params.box_rows-row boxes without
+// masking, so rows [kv_len, round_up(kv_len, box_rows)) of its V stage hold whatever the KV pool
+// contains there. They are zeroed before the first P*V, since 0 * NaN != 0. K needs nothing:
+// masked logits are overwritten, not accumulated.
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
-          typename WarpScheduler, typename AttentionVariant, typename Params,
+          typename WarpScheduler, bool ZERO_V_TAIL, typename AttentionVariant, typename Params,
           typename MainloopPipeline, typename PipelineState, typename SharedStorage,
           typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
@@ -63,6 +81,32 @@ CUTLASS_DEVICE void mma_f16(
 
   tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
   int kv_tile_idx = kv_tile_idx_count - 1;
+
+  // Garbage rows of the last tile's V, consumed by the first PV gemm; empty unless partial.
+  int v_tail_begin = CTA_KV, v_tail_end = CTA_KV;
+  if constexpr (ZERO_V_TAIL) {
+    const int valid_rows = kv_len - kv_tile_idx * CTA_KV;  // >= CTA_KV unless the tile is partial
+    if (valid_rows < CTA_KV) {
+      v_tail_begin = valid_rows;
+      v_tail_end = cutlass::round_up(valid_rows, mainloop_params.box_rows);
+    }
+  }
+  auto consumer_wait_v = [&]() {
+    consumer_wait(pipeline_v, smem_pipe_read_v);
+    if constexpr (ZERO_V_TAIL) {
+      if (v_tail_begin < v_tail_end) {
+        // Every warp zeroes the whole tail, so its own stores and fence cover its own wgmma; the
+        // other warps only ever write the same zeros. No cross-warp barrier is needed.
+        Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
+        Tensor sV_stage = sV(_, _, smem_pipe_read_v.index());
+        zero_smem_rows(sV_stage, v_tail_begin, v_tail_end, thread_idx % cutlass::NumThreadsPerWarp,
+                       cutlass::NumThreadsPerWarp);
+        cutlass::arch::fence_view_async_shared();
+        __syncwarp();
+        v_tail_begin = v_tail_end;
+      }
+    }
+  };
 
   cutlass::ConsumerToken barrier_token =
       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
@@ -190,7 +234,7 @@ CUTLASS_DEVICE void mma_f16(
     if (masking_step > 0) {
       attention_updater.rescale_o(tOrO);
     }
-    consumer_wait(pipeline_v, smem_pipe_read_v);
+    consumer_wait_v();
     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
     WarpScheduler::barrier_arrive();
@@ -235,7 +279,7 @@ CUTLASS_DEVICE void mma_f16(
     gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
                                         tSrS);
     attention_updater.rescale_o(tOrO);
-    consumer_wait(pipeline_v, smem_pipe_read_v);
+    consumer_wait_v();
     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
     WarpScheduler::barrier_arrive();
@@ -282,7 +326,7 @@ CUTLASS_DEVICE void mma_f16(
       gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ,
                                           tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
       attention_updater.rescale_o(tOrO);
-      consumer_wait(pipeline_v, smem_pipe_read_v);
+      consumer_wait_v();
       gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
                                            tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
       WarpScheduler::barrier_arrive();
@@ -315,7 +359,7 @@ CUTLASS_DEVICE void mma_f16(
   cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
   attention_updater.rescale_o(tOrO);
-  consumer_wait(pipeline_v, smem_pipe_read_v);
+  consumer_wait_v();
   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
                                        tOrO);
   attention_updater.finalize(tSrS, get_variant_scale_pv(variant));
