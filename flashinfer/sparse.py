@@ -1682,15 +1682,30 @@ class VariableBlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-            If set to ``auto``, the function will automatically choose the backend based on the
-            device architecture and kernel availability.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or the
+            experimental ``vsa_sm90_blk64``. Defaults to ``auto``. Automatic
+            selection does not select ``vsa_sm90_blk64``. Explicitly select it
+            for Hopper BF16, head dimension 128, equal Q/KV head counts, and
+            noncausal attention with uniform 64-token blocks. It requires
+            contiguous HND inputs, nonempty sparse rows with at most 64 KV
+            blocks, and does not support LSE, PDL, positional encoding, logits
+            soft caps, or FP16 QK reduction. Use :meth:`plan` and :meth:`run`;
+            the deprecated :meth:`forward` overrides are unsupported.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._workspace_size = (
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
+        if backend == "vsa_sm90_blk64":
+            from .api_logging import warn_experimental_backend_once
+
+            warn_experimental_backend_once(
+                "VariableBlockSparseAttentionWrapper", backend
+            )
+            self._backend = backend
+            self._vsa_sm90_plan = None
+            return
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
@@ -1814,6 +1829,24 @@ class VariableBlockSparseAttentionWrapper:
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple kernel runs.
 
+        For ``vsa_sm90_blk64``, planning snapshots the mask and block sizes and
+        performs descriptor transfers synchronously. Call :meth:`plan` again
+        after changing metadata or the softmax scale. Warm up :meth:`run` once
+        before timing or graph capture; kernel compilation is lazy. Q/K/V
+        values are never cached. ``non_blocking`` does not make this backend's
+        CPU descriptor conversion asynchronous.
+
+        This backend supports zero and negative softmax scales; the scale must
+        remain finite in FP32 after log2 conversion. Nonfinite activations and
+        arithmetic overflow are outside its numerical guarantees. It uses
+        stable padding masks, so results can differ from FA3's finite-mask
+        behavior for zero, tiny, or negative scales and very negative logits.
+
+        CUDA graph capture with ``vsa_sm90_blk64`` requires a preallocated
+        output and keeping the wrapper and captured buffers alive for replay.
+        A captured plan cannot be replaced; use a separate wrapper for a new
+        plan. Concurrent host calls on the same wrapper are unsupported.
+
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
@@ -1823,6 +1856,30 @@ class VariableBlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = q_data_type
+
+        if self._backend == "vsa_sm90_blk64":
+            from .experimental.vsa_sm90 import create_plan
+
+            if self._vsa_sm90_plan is not None:
+                self._vsa_sm90_plan.check_replan()
+            self._vsa_sm90_plan = None
+            self._vsa_sm90_plan = create_plan(
+                self.device,
+                block_mask_map,
+                block_row_sz,
+                block_col_sz,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                logits_soft_cap=logits_soft_cap,
+                sm_scale=sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+            )
+            return
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -2015,6 +2072,8 @@ class VariableBlockSparseAttentionWrapper:
         rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Warning: This method is deprecated, please use :meth:`run` instead."""
+        if self._backend == "vsa_sm90_blk64":
+            raise ValueError("vsa_sm90_blk64 requires plan() followed by run()")
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._logits_soft_cap = logits_soft_cap
@@ -2046,6 +2105,10 @@ class VariableBlockSparseAttentionWrapper:
             The value tensor with shape ``(num_kv_heads, kv_len, head_dim)``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
+            A supplied buffer has shape ``(num_kv_heads * qo_len,
+            num_qo_heads // num_kv_heads, head_dim)``. The returned view is HND.
+            For ``vsa_sm90_blk64``, it must be contiguous and must not overlap
+            Q/K/V storage.
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
@@ -2063,6 +2126,13 @@ class VariableBlockSparseAttentionWrapper:
             * The attention output, shape: ``[M, num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
+        if self._backend == "vsa_sm90_blk64":
+            if self._vsa_sm90_plan is None:
+                raise RuntimeError("Call plan() successfully before run()")
+            return self._vsa_sm90_plan.run(
+                q, k, v, out=out, lse=lse, return_lse=return_lse, enable_pdl=enable_pdl
+            )
+
         # NOTE(Zihao): defer import of einops
         import einops
 
