@@ -2960,6 +2960,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         lse: Optional[torch.Tensor],
         return_lse_base: Optional[Literal["basee", "base2"]],
         use_fp16_softmax: Optional[bool] = None,
+        fill_empty_kv_rows: bool = False,
     ):
         self._run = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         self.kv_cache = kv_cache
@@ -2989,6 +2990,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.lse = lse
         self.return_lse_base = return_lse_base
         self.use_fp16_softmax = use_fp16_softmax
+        self.fill_empty_kv_rows = fill_empty_kv_rows
 
     def __hash__(self):
         # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
@@ -3125,6 +3127,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             sparse_mla_top_k_lens,
             0,  # bf16q_fp8kv_transform_mode
             self.use_fp16_softmax,
+            self.fill_empty_kv_rows,
         )
         return out
 
@@ -3362,6 +3365,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    fill_empty_kv_rows: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with Blackwell, TRTLLM-GEN, CuteDSL, XQA, or sparse kernels.
 
@@ -3415,7 +3419,10 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     seq_lens : Optional[torch.Tensor]
         Per-request physical KV sequence lengths for dense and TRTLLM-GEN
         paths. With DCP these are rank-local lengths and continue to control
-        paging, memory bounds, and split-KV. For
+        paging, memory bounds, and split-KV. Requests with ``seq_lens == 0``
+        are skipped by the ``trtllm-gen`` kernel (their ``out`` rows are left
+        untouched, ``lse = -inf``); see ``fill_empty_kv_rows`` to have them
+        written as the empty-attention identity instead. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
@@ -3507,6 +3514,17 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
         supported only by monolithic CuTeDSL.
+    fill_empty_kv_rows : bool = False
+        When True, requests with ``seq_lens == 0`` (for example a DCP rank
+        that owns no KV slice of a request, or an exhausted KV chunk) are
+        written as the empty-attention identity, ``out = 0`` and
+        ``lse = -inf``, so a downstream merge of partial states ignores them
+        without reading stale memory. Off by default: such rows are padding
+        for most callers, and the kernel leaves their ``out`` untouched.
+        Requires ``return_lse=True``; only meaningful for the ``trtllm-gen``
+        backend on dense MLA decode without attention sinks (``cute-dsl``
+        already writes the identity unconditionally). Not supported with
+        sparse MLA or compact variable-length Q.
     return_lse_base : Optional[Literal["basee", "base2"]] = None
         Logarithm base of LSE values, including values written to a supplied
         ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``
@@ -3640,6 +3658,17 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
+    if fill_empty_kv_rows:
+        if not return_lse:
+            raise ValueError("fill_empty_kv_rows requires return_lse=True")
+        if sinks is not None:
+            raise ValueError("fill_empty_kv_rows is not supported with attention sinks")
+        if sparse_mla_top_k > 0:
+            raise ValueError("fill_empty_kv_rows is not supported with sparse MLA")
+        if cum_seq_lens_q is not None:
+            raise ValueError(
+                "fill_empty_kv_rows is not supported with compact variable-length Q"
+            )
 
     is_nope_mla = (
         kv_lora_rank == nope_mla_dimensions.kv_lora_rank
@@ -4093,6 +4122,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             sparse_mla_top_k_lens,
             0,  # bf16q_fp8kv_transform_mode
             use_fp16_softmax,
+            False,  # fill_empty_kv_rows (no LSE on this path)
         )
         return out
 
@@ -4228,6 +4258,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 lse=lse,
                 return_lse_base=return_lse_base,
                 use_fp16_softmax=use_fp16_softmax,
+                fill_empty_kv_rows=fill_empty_kv_rows,
             )
         )
     if "cute-dsl" in runner_names:
@@ -4344,6 +4375,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    fill_empty_kv_rows: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """See :func:`_trtllm_batch_decode_with_kv_cache_mla_impl` for parameter documentation."""
     return _trtllm_batch_decode_with_kv_cache_mla_impl(
@@ -4380,6 +4412,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        fill_empty_kv_rows=fill_empty_kv_rows,
     )
 
 
