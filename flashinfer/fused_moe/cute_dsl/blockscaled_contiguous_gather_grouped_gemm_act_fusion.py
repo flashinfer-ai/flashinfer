@@ -235,6 +235,47 @@ class _RouteSplitGather:
         self.route_split_sparse(*args, stream=stream, **kwargs)
 
 
+def _route_fold_launch_kwargs(args):
+    """Wrapper kwargs of the folded routing prologue (skinny/paired decode gather only).
+
+    The plan binds the caller's top-k ids, the weight source (the packed int32
+    ids viewed as BF16 with doubled strides, or the separate BF16/FP32 weights),
+    the route_ids/route_weights conversion buffers, the expanded and padded-total
+    sort buffers and the BF16 output (cleared as u32 words), with the same
+    dtypes, alignments and strides as the fused route preprocess planner.
+    """
+    weights_dtype = (
+        cutlass.Float32 if args["mode"] == "separate_fp32" else cutlass.BFloat16
+    )
+
+    def pointer(dtype, tensor, align):
+        return make_ptr(
+            dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+        )
+
+    return {
+        "route_ids_src_ptr": pointer(cutlass.Int32, args["topk_ids"], 4),
+        "route_weights_src_ptr": pointer(
+            weights_dtype,
+            args["weights_source"],
+            2 if weights_dtype == cutlass.BFloat16 else 4,
+        ),
+        "route_ids_ptr": pointer(cutlass.Int32, args["route_ids"], 4),
+        "route_weights_ptr": pointer(cutlass.Float32, args["route_weights"], 4),
+        "route_expanded_ptr": pointer(cutlass.Int32, args["expanded"], 4),
+        "route_padded_total_ptr": pointer(cutlass.Int32, args["padded_total"], 4),
+        "route_output_words_ptr": pointer(cutlass.Uint32, args["output"], 4),
+        "route_output_word_count": args["output"].numel() // 2,
+        "route_num_experts": args["num_experts"],
+        "route_local_experts": args["num_local_experts"],
+        "route_local_offset": args["local_expert_offset"],
+        "route_ids_row_stride": args["topk_ids"].stride(0),
+        "route_ids_col_stride": args["topk_ids"].stride(1),
+        "route_weights_row_stride": args["weights_strides"][0],
+        "route_weights_col_stride": args["weights_strides"][1],
+    }
+
+
 def _get_compiled_gather_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
     orig_m: int,
@@ -297,6 +338,7 @@ def _get_compiled_gather_kernel(
     enable_prefill_weight_prefetch: bool = False,
     _route_split_mode: str = "",
     _private_paired_t2: bool = False,
+    _route_fold_args: Optional[Dict[str, Any]] = None,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -432,6 +474,7 @@ def _get_compiled_gather_kernel(
             "_input_aligned_16": _input_aligned_16,
             "enable_prefill_weight_prefetch": enable_prefill_weight_prefetch,
             "_private_paired_t2": _private_paired_t2,
+            "_route_fold_args": _route_fold_args,
         }
         dense = _get_compiled_gather_kernel(**options, _route_split_mode="dense")
         sparse = _get_compiled_gather_kernel(**options, _route_split_mode="sparse")
@@ -481,6 +524,20 @@ def _get_compiled_gather_kernel(
         and topk == 16
         and not raster_along_m
     )
+    # Fold the decode route preprocess into the skinny/paired gather
+    # (those kernel paths only); fold arguments must never be dropped silently.
+    enable_route_fold = bool(
+        _route_fold_args is not None
+        and enable_skinny_decode
+        and not is_rubin
+        and not enable_route_split_sparse
+    )
+    if _route_fold_args is not None and not enable_route_fold:
+        raise ValueError("route fold requires the skinny or paired decode gather")
+    route_fold_mode = _route_fold_args["mode"] if enable_route_fold else "packed"
+    route_fold_kwargs = (
+        _route_fold_launch_kwargs(_route_fold_args) if enable_route_fold else {}
+    )
 
     cache_key: Tuple[Any, ...] = (
         "sm107" if is_rubin else "sm100",
@@ -529,6 +586,8 @@ def _get_compiled_gather_kernel(
 
     if enable_t4_scale_address:
         cache_key += ("paired_t4_scale_address", "paired_t4_sfb_cohort")
+    if enable_route_fold:
+        cache_key += ("g1_route_fold", route_fold_mode)
 
     if cache_key not in _gather_kernel_cache:
         if is_rubin:
@@ -583,6 +642,8 @@ def _get_compiled_gather_kernel(
                 enable_sfb_cp=(orig_m == 2),
                 enable_t16_const_scheduler=enable_t16_const_scheduler,
                 enable_t16_slot_planes=enable_t16_slot_planes,
+                enable_route_fold=enable_route_fold,
+                route_fold_mode=route_fold_mode,
             )
         elif enable_skinny_decode:
             gemm = SkinnyDecodeGatherKernel(
@@ -591,6 +652,8 @@ def _get_compiled_gather_kernel(
                 enable_b_vector_load=enable_b_vector_load,
                 enable_t16_const_scheduler=enable_t16_const_scheduler,
                 enable_t16_slot_planes=enable_t16_slot_planes,
+                enable_route_fold=enable_route_fold,
+                route_fold_mode=route_fold_mode,
             )
         else:
             # Create kernel instance
@@ -664,6 +727,7 @@ def _get_compiled_gather_kernel(
                 if not is_rubin
                 else {}
             ),
+            **route_fold_kwargs,
         )
 
         _gather_kernel_cache[cache_key] = compiled_gemm
@@ -712,6 +776,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     _prepared_launches: Optional[Dict[str, Any]] = None,
     _enable_compact_epilogue: bool = False,
     _enable_sparse_prefill_epilogue: bool = False,
+    _route_fold_args: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -1168,6 +1233,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         _enable_sparse_prefill_epilogue=_enable_sparse_prefill_epilogue,
         _input_aligned_16=a.data_ptr() % 16 == 0,
         _private_paired_t2=private_paired_t2,
+        _route_fold_args=_route_fold_args,
         runtime_situ_beta_ptr=runtime_situ_beta_ptr,
         runtime_situ_linear_beta_ptr=runtime_situ_linear_beta_ptr,
         situ_beta_stride=situ_beta_stride,
@@ -1232,6 +1298,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         if not is_rubin
         else {}
     )
+    if _route_fold_args is not None:
+        launch_kwargs = {**launch_kwargs, **_route_fold_launch_kwargs(_route_fold_args)}
     if _prepared_launches is not None:
         _prepared_launches["gather"] = (compiled_gemm, launch_args, launch_kwargs)
     compiled_gemm(*launch_args, stream=stream, **launch_kwargs)

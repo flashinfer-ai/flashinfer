@@ -113,6 +113,12 @@ class Mxfp4MoEPlan:
     Update bound activation, routing, beta and scale tensors in-place before
     calling ``run`` or replaying a captured graph. No weights are copied.
     The output is this rank's contribution when expert parallelism is used.
+
+    Decode plans of the SM103 SiTU specialization (1 <= T <= 16, <= 112 local
+    experts, top_k <= 16) enqueue two launches per forward: the skinny gather
+    recomputes the routing from the bound top-k ids, clears the output and
+    rewrites the routing words, then the finalize runs. Other plans keep the
+    route preprocess (or conversion and sort), memset and finalize launches.
     """
 
     def __init__(
@@ -137,6 +143,10 @@ class Mxfp4MoEPlan:
         self._route_weights = route_weights
         self._route_preprocess = None
         self._expanded_combine = None
+        # The decode specialization folds the route preprocess into the
+        # skinny gather; run() then enqueues two launches (gather, finalize).
+        self._route_fold = False
+        self._route_fold_args = None
         self.device = self.output.device
         self._packed_weight_view = (
             topk_ids.view(torch.bfloat16)[:, ::2] if topk_weights is None else None
@@ -149,13 +159,68 @@ class Mxfp4MoEPlan:
         elif self._route_weights is not self._topk_weights:
             self._route_weights.copy_(self._topk_weights)
 
+    def _route_fold_arguments(self):
+        """Fold arguments for the skinny/paired decode gather, or None.
+
+        The fold holds exactly for the decode specialization (SM103, 1 <= T <=
+        16, SiTU, PDL off, tile 128, default tactics) with <= 112 local experts
+        and top_k <= 16 (the kernels' static shared-table caps), a hidden size
+        that is a multiple of 512 (the skinny gather's K eligibility), a 4-byte
+        aligned output for the paired BF16 zero stores and no expanded
+        contribution combine. Every other plan keeps the parent's route
+        preprocess / conversion, native sort and memset launches.
+        """
+        kwargs = self._kwargs
+        if not (
+            kwargs["_enable_decode_specialization"]
+            and kwargs["num_local_experts"] <= 112
+            and kwargs["top_k"] <= 16
+            and self.output.shape[1] % 512 == 0
+            and self.output.data_ptr() % 4 == 0
+            and kwargs.get("_expanded_weighted_output") is None
+        ):
+            return None
+        if self._topk_weights is None:
+            mode = "packed"
+            weights_source = self._topk_ids
+            weights_strides = tuple(2 * value for value in self._topk_ids.stride())
+        else:
+            mode = (
+                "separate_bf16"
+                if self._topk_weights.dtype == torch.bfloat16
+                else "separate_fp32"
+            )
+            weights_source = self._topk_weights
+            weights_strides = tuple(self._topk_weights.stride())
+        buffers = kwargs["moe_sort_buffers"]
+        return dict(
+            mode=mode,
+            topk_ids=self._topk_ids,
+            weights_source=weights_source,
+            weights_strides=weights_strides,
+            route_ids=self._route_ids,
+            route_weights=self._route_weights,
+            expanded=buffers["out_expanded_idx_to_permuted_idx"],
+            padded_total=buffers["out_total_num_padded_tokens"],
+            output=self.output,
+            num_experts=kwargs["num_experts"],
+            num_local_experts=kwargs["num_local_experts"],
+            local_expert_offset=kwargs["local_expert_offset"],
+        )
+
     def _prepare(self):
         # The existing path validates and warms the exact pointers/callables
         # retained below. No stream is retained: run resolves the caller's.
         launches = {}
+        self._route_fold_args = self._route_fold_arguments()
+        self._route_fold = self._route_fold_args is not None
         with torch.cuda.device(self.device):
             self._prepare_routing()
-            _moe_core_impl(**self._kwargs, _prepared_launches=launches)
+            _moe_core_impl(
+                **self._kwargs,
+                _prepared_launches=launches,
+                _route_fold_args=self._route_fold_args,
+            )
         self._sort, self._sort_args = launches["sort"]
         self._gather, self._gather_args, self._gather_kwargs = launches["gather"]
         self._memset, self._memset_args = launches["memset"]
@@ -181,7 +246,15 @@ class Mxfp4MoEPlan:
                 self._topk_weights is None or self._topk_weights.dtype == torch.bfloat16
             )
         )
-        if decode or prefill_route_conversion:
+        if self._route_fold:
+            # No route preprocess for the decode specialization -- the
+            # folded gather recomputes the routing per CTA and clears the
+            # output (_FusedRoutePreprocess stays reachable from PDL-on and
+            # non-SiTU plans). The warm-up above ran the native four-launch
+            # path; run one two-launch forward so plan keeps its valid-output
+            # postcondition.
+            self.run()
+        elif decode or prefill_route_conversion:
             self._route_preprocess = _plan_route_preprocess(
                 self._topk_ids,
                 self._topk_weights,
@@ -217,21 +290,28 @@ class Mxfp4MoEPlan:
         with torch.cuda.device(self.device):
             stream_ptr = torch.cuda.current_stream().cuda_stream
             stream = cuda.CUstream(stream_ptr)
-            if self._route_preprocess is None:
-                self._prepare_routing()
+            if self._route_fold:
+                # Two launches: the gather rebuilds the routing from the bound
+                # top-k ids, clears the output and (CTA 0) rewrites the routing
+                # words the finalize reads; no conversion, sort or memset.
+                self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
+                self._finalize(*self._finalize_args, stream=stream)
             else:
-                self._route_preprocess.run(stream)
-            if (
-                self._route_preprocess is None
-                or not self._route_preprocess.sorts_tokens
-            ):
-                self._sort(*self._sort_args, stream_ptr)
-            self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
-            if self._route_preprocess is None and self._expanded_combine is None:
-                self._memset(*self._memset_args, stream_ptr)
-            self._finalize(*self._finalize_args, stream=stream)
-            if self._expanded_combine is not None:
-                self._expanded_combine.run(stream)
+                if self._route_preprocess is None:
+                    self._prepare_routing()
+                else:
+                    self._route_preprocess.run(stream)
+                if (
+                    self._route_preprocess is None
+                    or not self._route_preprocess.sorts_tokens
+                ):
+                    self._sort(*self._sort_args, stream_ptr)
+                self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
+                if self._route_preprocess is None and self._expanded_combine is None:
+                    self._memset(*self._memset_args, stream_ptr)
+                self._finalize(*self._finalize_args, stream=stream)
+                if self._expanded_combine is not None:
+                    self._expanded_combine.run(stream)
         return self.output
 
 

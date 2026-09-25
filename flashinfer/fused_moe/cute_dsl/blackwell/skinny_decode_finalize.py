@@ -12,9 +12,15 @@ unchanged linear-scale BF16 bulk reduce-add into the cleared output, so partial
 sums add without a partial workspace, counter or fixup. Rows of a split item
 receive up to six BF16 reduce-adds instead of one. Every decision derives from
 the device routing arrays the scheduler already reads (Graph-replay and
-concurrent-stream safe). Single-round launches are not split. Each CTA emits
-its first walk position (block_id, never at or beyond the cut) before the
-valid-tile scan, so the scan overlaps the consumers' first item.
+concurrent-stream safe). A launch without a full round whose walk positions fit
+twice into the grid instead cuts every position into min(epochs, grid // stride)
+pieces, one piece per CTA derived from block_id and active_tiles alone (T16:
+stride doubles when a tile holds a ninth row, found by one load when a single
+tile is active, else by one ballot over the plane-1 rows). Launches that cannot
+split -- multi-round or one piece per position -- take the parent's scheduler
+path unchanged, decided by one compare before any divide. Multi-round launches
+emit each CTA's first global walk position (never at or beyond the cut) before
+the valid-tile scan, so the scan overlaps the consumers' first item.
 """
 
 from typing import Optional
@@ -475,6 +481,26 @@ class SkinnyDecodeFinalizeKernel:
         return cut, full_items, count0, begin, end
 
     @cute.jit
+    def sub_round_piece(self, grid_x, block_id, span, stride, epochs):
+        """No full round: piece p of walk position q runs on CTA q + p * stride, where
+        stride counts the positions of the planes holding any valid row (a multiple of
+        span), so every CTA holds at most one piece. pieces = min(epochs, max(1, grid_x
+        // stride)) balanced contiguous K512 ranges [p * epochs // pieces, (p + 1) *
+        epochs // pieces) partition [0, epochs) once per position; pieces == 1 is the
+        unsplit walk (block_id < stride: whole K). Returns (piece, pieces, slot,
+        k_begin, k_end); the caller derives tile and feature from block_id % span."""
+        pieces = cutlass.min(epochs, cutlass.max(cutlass.Int32(1), grid_x // stride))
+        piece = block_id // stride
+        slot = (block_id - piece * stride) // span
+        return (
+            piece,
+            pieces,
+            slot,
+            piece * epochs // pieces,
+            (piece + 1) * epochs // pieces,
+        )
+
+    @cute.jit
     def wrapper(
         self,
         a_ptr: cute.Pointer,
@@ -760,43 +786,90 @@ class SkinnyDecodeFinalizeKernel:
                 total = active_tiles[0] * 56
                 linear_work = cutlass.Int32(block_id)
                 if cutlass.const_expr(self.enable_tail_stream_k):
-                    # Peeled first walk position: block_id < grid_x is never at or
-                    # beyond the cut (a split implies cut >= (rounds - 1) * grid_x
-                    # >= grid_x; without a split there is no cut), so its record is
-                    # emitted before the valid-tile scan and the consumers' first
-                    # item overlaps the scan. Textual copy of the loop body below.
-                    if linear_work < total:
-                        feature = linear_work % 56
-                        slot = cutlass.Int32(0)
-                        route_tile = linear_work // 56
-                        limit = route_limit[route_tile]
-                        row_base = route_tile * 128 + slot * 8
-                        if row_base < limit:
-                            mp.producer_acquire(ms)
-                            expert = route_expert[route_tile]
-                            with cute.arch.elect_one():
-                                records[(0, ms.index)] = feature.to(cutlass.Int32)
-                                records[(1, ms.index)] = route_tile.to(cutlass.Int32)
-                                records[(2, ms.index)] = slot.to(cutlass.Int32)
-                                records[(3, ms.index)] = expert
-                                records[(4, ms.index)] = limit
-                                if cutlass.const_expr(self.enable_tail_stream_k):
-                                    records[(5, ms.index)] = cutlass.Int32(0)
-                                    records[(6, ms.index)] = epochs
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            mp.producer_commit(ms)
-                            ms.advance()
+                    cut = total
+                    full_items = cutlass.Int32(0)
+                    count0 = cutlass.Int32(0)
+                    unit_begin = cutlass.Int32(0)
+                    unit_end = cutlass.Int32(0)
+                    # One regime compare, no divide: a launch whose positions fit
+                    # twice into the grid (2 * total <= grid_x, hence pieces =
+                    # min(epochs, grid_x // total) >= 2 for epochs >= 2) is split
+                    # in the second branch; every other launch -- multi-round or
+                    # one piece per position -- takes the parent's scheduler path,
+                    # written first so the common path keeps the parent's layout.
+                    if 2 * total > grid_x:
+                        # Peeled first walk position: block_id < grid_x is never at or
+                        # beyond the cut (a split implies cut >= (rounds - 1) * grid_x
+                        # >= grid_x; without a split there is no cut), so its record is
+                        # emitted before the valid-tile scan and the consumers' first
+                        # item overlaps the scan. Textual copy of the loop body below.
+                        if linear_work < total:
+                            feature = linear_work % 56
+                            slot = cutlass.Int32(0)
+                            route_tile = linear_work // 56
+                            limit = route_limit[route_tile]
+                            row_base = route_tile * 128 + slot * 8
+                            if row_base < limit:
+                                mp.producer_acquire(ms)
+                                expert = route_expert[route_tile]
+                                with cute.arch.elect_one():
+                                    records[(0, ms.index)] = feature.to(cutlass.Int32)
+                                    records[(1, ms.index)] = route_tile.to(
+                                        cutlass.Int32
+                                    )
+                                    records[(2, ms.index)] = slot.to(cutlass.Int32)
+                                    records[(3, ms.index)] = expert
+                                    records[(4, ms.index)] = limit
+                                    if cutlass.const_expr(self.enable_tail_stream_k):
+                                        records[(5, ms.index)] = cutlass.Int32(0)
+                                        records[(6, ms.index)] = epochs
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                mp.producer_commit(ms)
+                                ms.advance()
+                            linear_work += grid_x
+                        # Positions at or beyond the cut are tail pieces, not full items.
+                        cut, full_items, count0, unit_begin, unit_end = self.tail_split(
+                            route_limit,
+                            active_tiles[0],
+                            planes,
+                            grid_x,
+                            block_id,
+                            epochs,
+                            lane,
+                        )
+                    else:
+                        # Sub-round split (no full round, at least two pieces per
+                        # position): every position of the single plane is cut into
+                        # `pieces` contiguous K512 ranges and piece p of position q
+                        # runs on CTA q + p * total, so this CTA's only piece follows
+                        # from block_id and active_tiles alone: no scan. Empty
+                        # positions emit nothing, as before; each valid position's
+                        # [0, epochs) is covered exactly once across the CTAs.
+                        if linear_work < total * epochs:
+                            feature = linear_work % 56
+                            route_tile = (linear_work % total) // 56
+                            limit = route_limit[route_tile]
+                            piece, pieces, slot, k_begin, k_end = self.sub_round_piece(
+                                grid_x, linear_work, total, total, epochs
+                            )
+                            row_base = route_tile * 128 + slot * 8
+                            if piece < pieces:
+                                if row_base < limit:
+                                    mp.producer_acquire(ms)
+                                    expert = route_expert[route_tile]
+                                    with cute.arch.elect_one():
+                                        records[(0, ms.index)] = feature
+                                        records[(1, ms.index)] = route_tile
+                                        records[(2, ms.index)] = slot
+                                        records[(3, ms.index)] = expert
+                                        records[(4, ms.index)] = limit
+                                        records[(5, ms.index)] = k_begin
+                                        records[(6, ms.index)] = k_end
+                                    cute.arch.fence_proxy("async.shared", space="cta")
+                                    mp.producer_commit(ms)
+                                    ms.advance()
+                        # Past the walk: the loop below and the tail loop have nothing.
                         linear_work += grid_x
-                    # Positions at or beyond the cut are tail pieces, not full items.
-                    cut, full_items, count0, unit_begin, unit_end = self.tail_split(
-                        route_limit,
-                        active_tiles[0],
-                        planes,
-                        grid_x,
-                        block_id,
-                        epochs,
-                        lane,
-                    )
                     total = cut
                 while linear_work < total:
                     feature = linear_work % 56
@@ -824,42 +897,109 @@ class SkinnyDecodeFinalizeKernel:
                 span = active_tiles[0] * 56
                 linear_work = cutlass.Int32(block_id)
                 if cutlass.const_expr(self.enable_tail_stream_k):
-                    # Peeled first plane-0 position (slot 0): block_id < grid_x is
-                    # never at or beyond the cut (a split implies cut >= (rounds - 1)
-                    # * grid_x >= grid_x; without a split there is no cut), so the
-                    # cut test is omitted and the record is emitted before the
-                    # valid-tile scan. Textual copy of the plane-0 loop body below
-                    # with slot = 0.
-                    if linear_work < span:
-                        feature = linear_work % 56
-                        route_tile = linear_work // 56
-                        limit = route_limit[route_tile]
-                        row_base = route_tile * 128
-                        if row_base < limit:
-                            mp.producer_acquire(ms)
-                            expert = route_expert[route_tile]
-                            with cute.arch.elect_one():
-                                records[(0, ms.index)] = feature.to(cutlass.Int32)
-                                records[(1, ms.index)] = route_tile.to(cutlass.Int32)
-                                records[(2, ms.index)] = cutlass.Int32(0)
-                                records[(3, ms.index)] = expert
-                                records[(4, ms.index)] = limit
-                                if cutlass.const_expr(self.enable_tail_stream_k):
+                    cut = 2 * span
+                    full_items = cutlass.Int32(0)
+                    count0 = cutlass.Int32(0)
+                    unit_begin = cutlass.Int32(0)
+                    unit_end = cutlass.Int32(0)
+                    # stride counts the positions of the planes that hold any valid
+                    # row. It is resolved only when both planes fit into the grid
+                    # (2 * span <= grid_x, false on every multi-round launch): with
+                    # one active tile, plane 1 holds a row iff that tile has a ninth
+                    # row (one load, no ballot); otherwise one ballot over the
+                    # plane-1 rows. The launch splits iff 2 * stride <= grid_x
+                    # (pieces = min(epochs, grid_x // stride) >= 2 for epochs >= 2);
+                    # every other launch -- multi-round, or one piece per position
+                    # such as one tile with more than eight rows -- takes the
+                    # parent's scheduler path, written first so the common path
+                    # keeps the parent's layout: at most one load and three compares
+                    # before its first record, never a divide, never a ballot.
+                    stride = span
+                    if 2 * span <= grid_x:
+                        if active_tiles[0] == 1:
+                            if route_limit[0] > 8:
+                                stride = 2 * span
+                        else:
+                            count1, _ = self.scan_valid_tiles(
+                                route_limit, active_tiles[0], 1, cutlass.Int32(-1), lane
+                            )
+                            if count1 > 0:
+                                stride = 2 * span
+                    if 2 * stride > grid_x:
+                        # Generalised peel: this CTA's first GLOBAL walk position (plane 0
+                        # at block_id when block_id < span, else plane 1 at block_id -
+                        # span) is emitted before the valid-tile scan. block_id < grid_x
+                        # is never at or beyond the cut (a split implies cut >= (rounds
+                        # - 1) * grid_x >= grid_x; without a split there is no cut), so
+                        # the cut test is omitted. A plane-1 first position exists only
+                        # when span < grid_x and is then the CTA's only position
+                        # (block_id + grid_x - span >= grid_x > span skips both plane
+                        # loops), and a plane-0 first position continues at block_id +
+                        # grid_x as before: the per-CTA record sequence is unchanged.
+                        if linear_work < 2 * span:
+                            slot = linear_work // span
+                            position = linear_work - slot * span
+                            feature = position % 56
+                            route_tile = position // 56
+                            limit = route_limit[route_tile]
+                            row_base = route_tile * 128 + slot * 8
+                            if row_base < limit:
+                                mp.producer_acquire(ms)
+                                expert = route_expert[route_tile]
+                                with cute.arch.elect_one():
+                                    records[(0, ms.index)] = feature
+                                    records[(1, ms.index)] = route_tile
+                                    records[(2, ms.index)] = slot
+                                    records[(3, ms.index)] = expert
+                                    records[(4, ms.index)] = limit
                                     records[(5, ms.index)] = cutlass.Int32(0)
                                     records[(6, ms.index)] = epochs
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            mp.producer_commit(ms)
-                            ms.advance()
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                mp.producer_commit(ms)
+                                ms.advance()
+                            linear_work += grid_x
+                        cut, full_items, count0, unit_begin, unit_end = self.tail_split(
+                            route_limit,
+                            active_tiles[0],
+                            planes,
+                            grid_x,
+                            block_id,
+                            epochs,
+                            lane,
+                        )
+                    else:
+                        # Sub-round split (no full round, at least two pieces per
+                        # position, at most one position per CTA): positions are cut
+                        # into `pieces` K512 ranges and piece p of position q runs on
+                        # CTA q + p * stride with the stride resolved above, so this
+                        # CTA's only piece follows from block_id, active_tiles and
+                        # stride; no locate_valid_tile, no ballot here. Empty
+                        # positions emit nothing, as before.
+                        if linear_work < 2 * span * epochs:
+                            feature = linear_work % 56
+                            route_tile = (linear_work % span) // 56
+                            limit = route_limit[route_tile]
+                            piece, pieces, slot, k_begin, k_end = self.sub_round_piece(
+                                grid_x, linear_work, span, stride, epochs
+                            )
+                            row_base = route_tile * 128 + slot * 8
+                            if piece < pieces:
+                                if row_base < limit:
+                                    mp.producer_acquire(ms)
+                                    expert = route_expert[route_tile]
+                                    with cute.arch.elect_one():
+                                        records[(0, ms.index)] = feature
+                                        records[(1, ms.index)] = route_tile
+                                        records[(2, ms.index)] = slot
+                                        records[(3, ms.index)] = expert
+                                        records[(4, ms.index)] = limit
+                                        records[(5, ms.index)] = k_begin
+                                        records[(6, ms.index)] = k_end
+                                    cute.arch.fence_proxy("async.shared", space="cta")
+                                    mp.producer_commit(ms)
+                                    ms.advance()
+                        # Past both planes: the plane loops and the tail loop have nothing.
                         linear_work += grid_x
-                    cut, full_items, count0, unit_begin, unit_end = self.tail_split(
-                        route_limit,
-                        active_tiles[0],
-                        planes,
-                        grid_x,
-                        block_id,
-                        epochs,
-                        lane,
-                    )
                 # Carry each CTA's global ordinal across the two slot planes.
                 # Resetting here would put both plane remainders on the same CTAs.
                 for slot in cutlass.range_constexpr(2):

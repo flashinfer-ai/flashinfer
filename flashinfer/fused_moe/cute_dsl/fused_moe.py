@@ -240,6 +240,7 @@ def _moe_core_impl(
     _enable_sparse_prefill_epilogue: bool = False,
     _enable_sparse_prefill_narrow_a: bool = False,
     _expanded_weighted_output: Optional[torch.Tensor] = None,
+    _route_fold_args: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -448,6 +449,7 @@ def _moe_core_impl(
             _enable_compact_epilogue=_enable_decode_specialization,
             _enable_sparse_prefill_epilogue=_enable_sparse_prefill_epilogue,
             _prepared_launches=_prepared_launches,
+            _route_fold_args=_route_fold_args,
         )
     )
     if use_per_token_activation:

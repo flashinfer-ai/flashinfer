@@ -3,6 +3,14 @@
 Retains caller routing tile128, packed prepared weights and token-major MXFP8
 output. Six asynchronous operand/SF rings follow the qualified N8 primitive;
 metadata and accumulator pipelines make the CTA persistent across output tiles.
+
+Route fold (enable_route_fold): every CTA clears its grid-stride slice of
+the BF16 output and recomputes the <= 256-assignment decode routing from the
+caller's top-k ids in warps 0-7 (deterministic assignment-order rank per expert
+through match.any, no shared atomics) into shared tables that the scheduler and
+the B/SFB producers read instead of global routing words; CTA 0 also writes the
+route preprocess outputs to global memory for the finalize. The decode forward
+is two launches (gather, finalize) instead of three.
 """
 
 from typing import Optional
@@ -15,6 +23,8 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     UnalignedNamedBarrier,
@@ -29,6 +39,48 @@ from ....quantization.quantization_cute_dsl_utils import (
 )
 
 
+# Static caps of the folded decode routing (host guard: <= 112 local
+# experts, top_k <= 16 so an expert holds at most 16 rows of its single tile;
+# T * top_k <= 256 assignments handled by eight warps, one per thread).
+ROUTE_FOLD_EXPERTS = 112
+ROUTE_FOLD_RANKS = 16
+ROUTE_FOLD_WARPS = 8
+
+
+@dsl_user_op
+def route_fold_match_any(value: cutlass.Int32, *, loc=None, ip=None):
+    """Lane mask of this warp's lanes holding `value`; every lane must execute it.
+
+    Same narrow inline-asm form as the routing kernel's shared add. match.any
+    is a warp-collective compare, not a memory operation, so every CTA that
+    evaluates the same ids derives the same masks.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
+            "match.any.sync.b32 $0, $1, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def route_fold_warp_inclusive(value: cutlass.Int32, lane: cutlass.Int32):
+    """Warp inclusive prefix sum: the routing kernel's five-step shuffle scan."""
+    for step in cutlass.range_constexpr(5):
+        offset = 1 << step
+        other = cute.arch.shuffle_sync_up(value, offset=offset, mask_and_clamp=0)
+        if lane >= offset:
+            value += other
+    return value
+
+
 class SkinnyDecodeGatherKernel:
     def __init__(
         self,
@@ -38,8 +90,20 @@ class SkinnyDecodeGatherKernel:
         enable_b_vector_load=False,
         enable_t16_const_scheduler=False,
         enable_t16_slot_planes=False,
+        enable_route_fold=False,
+        route_fold_mode="packed",
     ):
         self.top_k = topk
+        self.enable_route_fold = bool(enable_route_fold)
+        assert route_fold_mode in ("packed", "separate_bf16", "separate_fp32")
+        assert not self.enable_route_fold or topk <= ROUTE_FOLD_RANKS
+        self.route_fold_mode = route_fold_mode
+        # Shared routing tables exist only with the fold; one word otherwise.
+        self.route_fold_experts = ROUTE_FOLD_EXPERTS if self.enable_route_fold else 1
+        self.route_fold_routes = (
+            ROUTE_FOLD_EXPERTS * ROUTE_FOLD_RANKS if self.enable_route_fold else 1
+        )
+        self.route_fold_warps = ROUTE_FOLD_WARPS if self.enable_route_fold else 1
         self.enable_t16_const_scheduler = enable_t16_const_scheduler
         self.enable_t16_slot_planes = enable_t16_slot_planes
         self.runtime_situ_linear_beta = runtime_situ_linear_beta
@@ -77,6 +141,172 @@ class SkinnyDecodeGatherKernel:
         mp.consumer_release(state)
 
     @cute.jit
+    def _route_fold_prologue(
+        self,
+        storage,
+        ids_src,
+        weights_src,
+        route_ids,
+        route_weights,
+        expanded,
+        permuted,
+        tile_expert,
+        tile_limit,
+        active_total,
+        padded_total,
+        output_words,
+        num_experts,
+        local_experts,
+        local_offset,
+    ):
+        """Clear this CTA's output slice and rebuild the decode routing.
+
+        Steps b-h of the fused route preprocess (mxfp4_routing._FusedRoutePreprocess,
+        decode branch) on 256 threads -- one assignment per thread of warps 0-7 --
+        into this CTA's shared tables; CTA 0 additionally writes the parent's eight
+        global outputs with the parent's values and write set. The rank of an
+        assignment within its expert is its position among the valid assignments
+        of that expert in assignment order (warp match mask below the lane plus the
+        lower warps' counts), so every CTA derives the same permutation without
+        shared atomics. Five CTA barriers here; the caller's mbarrier-init barrier
+        publishes the final scatter to the consumer warps.
+        """
+        tid, _, _ = cute.arch.thread_idx()
+        block_id, _, _ = cute.arch.block_idx()
+        grid_x, _, _ = cute.arch.grid_dim()
+        lane = tid % 32
+        warp = tid // 32
+        rt_expert = storage.rt_expert.get_tensor(cute.make_layout(ROUTE_FOLD_EXPERTS))
+        rt_limit = storage.rt_limit.get_tensor(cute.make_layout(ROUTE_FOLD_EXPERTS))
+        rt_routes = storage.rt_routes.get_tensor(
+            cute.make_layout(ROUTE_FOLD_EXPERTS * ROUTE_FOLD_RANKS)
+        )
+        # The per-warp expert counts alias the routes table: dead before the scatter writes it.
+        rt_wcount = storage.rt_routes.get_tensor(
+            cute.make_layout(ROUTE_FOLD_WARPS * ROUTE_FOLD_EXPERTS)
+        )
+        rt_bases = storage.rt_bases.get_tensor(cute.make_layout(ROUTE_FOLD_EXPERTS))
+        rt_warp_sums = storage.rt_warp_sums.get_tensor(
+            cute.make_layout(ROUTE_FOLD_WARPS)
+        )
+        rt_active = storage.rt_active.get_tensor(cute.make_layout(1))
+
+        # Output clear (the preprocess kernel's step i): this CTA's grid-stride
+        # slice of u32 words, before the guard, so a launch without work still
+        # hands the finalize a zeroed output for its reduce-adds.
+        words_per_cta = (cute.size(output_words) + grid_x - 1) // grid_x
+        first_word = block_id * words_per_cta
+        last_word = cutlass.min(first_word + words_per_cta, cute.size(output_words))
+        for word in cutlass.range(first_word + tid, last_word, 512):
+            output_words[word] = cutlass.Uint32(0)
+        for entry in cutlass.range(tid, ROUTE_FOLD_WARPS * ROUTE_FOLD_EXPERTS, 512):
+            rt_wcount[entry] = cutlass.Int32(0)
+
+        # Steps b/c: one assignment per thread. `key` is the local expert of a
+        # valid assignment and -1 otherwise (never a valid local id).
+        key = cutlass.Int32(-1)
+        if tid < cute.size(expanded):
+            token = tid // self.top_k
+            slot = tid % self.top_k
+            expert = ids_src[(token, slot)]
+            if cutlass.const_expr(self.route_fold_mode == "packed"):
+                expert = expert >> 16
+                if block_id == 0:
+                    route_ids[tid] = expert
+            if cutlass.const_expr(self.route_fold_mode != "separate_fp32"):
+                if block_id == 0:
+                    route_weights[tid] = weights_src[(token, slot)].to(cutlass.Float32)
+            local = expert - local_offset
+            if block_id == 0:
+                expanded[tid] = cutlass.Int32(-1)
+            if (
+                (expert >= 0)
+                & (expert < num_experts)
+                & (local >= 0)
+                & (local < local_experts)
+            ):
+                key = local
+        cute.arch.sync_threads()
+
+        # Deterministic rank: lanes below this lane holding the same expert now,
+        # plus the lower warps' counts after the barrier. The lowest lane of each
+        # match group publishes the group size.
+        inclusive = cutlass.Uint32(0xFFFFFFFF) >> (31 - lane)
+        rank_in_warp = cutlass.Int32(0)
+        if warp < ROUTE_FOLD_WARPS:
+            matched = route_fold_match_any(key)
+            # popc keeps its Uint32 operand type: convert where the branch joins the Int32 pre-init.
+            rank_in_warp = cute.arch.popc(matched & (inclusive >> 1)).to(cutlass.Int32)
+            if key >= 0:
+                if rank_in_warp == 0:
+                    rt_wcount[warp * ROUTE_FOLD_EXPERTS + key] = cute.arch.popc(
+                        matched
+                    ).to(cutlass.Int32)
+        cute.arch.sync_threads()
+
+        count = cutlass.Int32(0)
+        if tid < ROUTE_FOLD_EXPERTS:
+            for w in cutlass.range_constexpr(ROUTE_FOLD_WARPS):
+                count += rt_wcount[w * ROUTE_FOLD_EXPERTS + tid]
+        lower_warps = cutlass.Int32(0)
+        if key >= 0:
+            for w in cutlass.range(warp):
+                lower_warps += rt_wcount[w * ROUTE_FOLD_EXPERTS + key]
+        # Steps d-g on the 256 routing threads, the preprocess kernel's
+        # single-tile mode: unique ids per token give at most T <= 16 rows per
+        # expert, so every expert has zero or one 128-row tile.
+        ntiles = cutlass.Int32(0)
+        within_warp = cutlass.Int32(0)
+        if warp < ROUTE_FOLD_WARPS:
+            ntiles = (count > 0).to(cutlass.Int32)
+            active_mask = cute.arch.vote_ballot_sync(count > 0)
+            within_warp = cute.arch.popc(active_mask & inclusive).to(cutlass.Int32)
+            if lane == 31:
+                rt_warp_sums[warp] = within_warp
+        cute.arch.sync_threads()
+        if warp == 0:
+            subtotal = cutlass.Int32(0)
+            if lane < ROUTE_FOLD_WARPS:
+                subtotal = rt_warp_sums[lane]
+            subtotal = route_fold_warp_inclusive(subtotal, lane)
+            if lane < ROUTE_FOLD_WARPS:
+                rt_warp_sums[lane] = subtotal
+        cute.arch.sync_threads()
+        if warp < ROUTE_FOLD_WARPS:
+            preceding_warps = cutlass.Int32(0)
+            if warp > 0:
+                preceding_warps = rt_warp_sums[warp - 1]
+            tile_base = preceding_warps + within_warp - ntiles
+            row_base = tile_base * 128
+            if tid < ROUTE_FOLD_EXPERTS:
+                rt_bases[tid] = row_base
+            if tid < local_experts:
+                if ntiles > 0:
+                    limit = row_base + 128
+                    if limit > row_base + count:
+                        limit = row_base + count
+                    rt_expert[tile_base] = tid
+                    rt_limit[tile_base] = limit
+                    if block_id == 0:
+                        tile_expert[tile_base] = tid
+                        tile_limit[tile_base] = limit
+            if tid == ROUTE_FOLD_WARPS * 32 - 1:
+                active = preceding_warps + within_warp
+                rt_active[0] = active
+                if block_id == 0:
+                    active_total[0] = active
+                    padded_total[0] = active * 128
+        cute.arch.sync_threads()
+        # Step h: scatter into the shared routes table (rank < 16 within the
+        # tile) and, from CTA 0, into the global expanded/permuted words.
+        if key >= 0:
+            row = rt_bases[key] + lower_warps + rank_in_warp
+            rt_routes[(row // 128) * ROUTE_FOLD_RANKS + row % 128] = tid
+            if block_id == 0:
+                expanded[tid] = row
+                permuted[row] = tid
+
+    @cute.jit
     def wrapper(
         self,
         a_ptr: cute.Pointer,
@@ -106,6 +336,21 @@ class SkinnyDecodeGatherKernel:
         situ_linear_beta_ptr: Optional[cute.Pointer] = None,
         situ_beta_stride: cutlass.Int32 = 0,
         situ_linear_beta_stride: cutlass.Int32 = 0,
+        route_ids_src_ptr: Optional[cute.Pointer] = None,
+        route_weights_src_ptr: Optional[cute.Pointer] = None,
+        route_ids_ptr: Optional[cute.Pointer] = None,
+        route_weights_ptr: Optional[cute.Pointer] = None,
+        route_expanded_ptr: Optional[cute.Pointer] = None,
+        route_padded_total_ptr: Optional[cute.Pointer] = None,
+        route_output_words_ptr: Optional[cute.Pointer] = None,
+        route_output_word_count: cutlass.Int32 = 0,
+        route_num_experts: cutlass.Int32 = 0,
+        route_local_experts: cutlass.Int32 = 0,
+        route_local_offset: cutlass.Int32 = 0,
+        route_ids_row_stride: cutlass.Int32 = 0,
+        route_ids_col_stride: cutlass.Int32 = 0,
+        route_weights_row_stride: cutlass.Int32 = 0,
+        route_weights_col_stride: cutlass.Int32 = 0,
     ):
         weights = cute.make_tensor(
             b_ptr, cute.make_layout((n, k, l), stride=(k, 1, n * k))
@@ -142,6 +387,48 @@ class SkinnyDecodeGatherKernel:
             cute.recast_ptr(c_sf_ptr, dtype=cutlass.Uint8),
             cute.make_layout(m * (n // 2) // 32),
         )
+        route_ids_src, route_weights_src, route_ids, route_weights = (
+            None,
+            None,
+            None,
+            None,
+        )
+        route_expanded, route_padded_total, route_output_words = None, None, None
+        if cutlass.const_expr(self.enable_route_fold):
+            # The caller's top-k ids (and weights) with their (tokens,
+            # top_k) strides, and the flat preprocess outputs CTA 0 rewrites,
+            # exactly as the fused route preprocess kernel binds them.
+            assert tile_size == 128
+            route_ids_src = cute.make_tensor(
+                route_ids_src_ptr,
+                cute.make_layout(
+                    (orig_m, self.top_k),
+                    stride=(route_ids_row_stride, route_ids_col_stride),
+                ),
+            )
+            if cutlass.const_expr(self.route_fold_mode != "separate_fp32"):
+                route_weights_src = cute.make_tensor(
+                    route_weights_src_ptr,
+                    cute.make_layout(
+                        (orig_m, self.top_k),
+                        stride=(route_weights_row_stride, route_weights_col_stride),
+                    ),
+                )
+            route_ids = cute.make_tensor(
+                route_ids_ptr, cute.make_layout(orig_m * self.top_k)
+            )
+            route_weights = cute.make_tensor(
+                route_weights_ptr, cute.make_layout(orig_m * self.top_k)
+            )
+            route_expanded = cute.make_tensor(
+                route_expanded_ptr, cute.make_layout(orig_m * self.top_k)
+            )
+            route_padded_total = cute.make_tensor(
+                route_padded_total_ptr, cute.make_layout(1)
+            )
+            route_output_words = cute.make_tensor(
+                route_output_words_ptr, cute.make_layout(route_output_word_count)
+            )
         mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             cutlass.Float4E2M1FN,
             cutlass.Float8E4M3FN,
@@ -181,6 +468,17 @@ class SkinnyDecodeGatherKernel:
             sb: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, 384], 128]
             work: cute.struct.MemRange[cutlass.Int32, 10]
             gates: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 512], 128]
+            # Routing tables (one word each without the fold): per-tile
+            # expert and row limit, the permuted rows of every tile's <= 16
+            # ranks (its first 8 x 112 words double as the per-warp count
+            # scratch before the scatter), per-expert row bases, the eight
+            # warps' tile sums and the active tile count.
+            rt_expert: cute.struct.MemRange[cutlass.Int32, self.route_fold_experts]
+            rt_limit: cute.struct.MemRange[cutlass.Int32, self.route_fold_experts]
+            rt_routes: cute.struct.MemRange[cutlass.Int32, self.route_fold_routes]
+            rt_bases: cute.struct.MemRange[cutlass.Int32, self.route_fold_experts]
+            rt_warp_sums: cute.struct.MemRange[cutlass.Int32, self.route_fold_warps]
+            rt_active: cute.struct.MemRange[cutlass.Int32, 1]
 
         self.shared_storage = Storage
         self.kernel(
@@ -204,6 +502,16 @@ class SkinnyDecodeGatherKernel:
             sal,
             sbl,
             epilogue_op,
+            route_ids_src,
+            route_weights_src,
+            route_ids,
+            route_weights,
+            route_expanded,
+            route_padded_total,
+            route_output_words,
+            route_num_experts,
+            route_local_experts,
+            route_local_offset,
         ).launch(
             grid=(max_active_clusters, 1, 1),
             block=(512, 1, 1),
@@ -234,33 +542,91 @@ class SkinnyDecodeGatherKernel:
         sal,
         sbl,
         epilogue_op: cutlass.Constexpr,
+        route_ids_src,
+        route_weights_src,
+        route_ids,
+        route_weights,
+        route_expanded,
+        route_padded_total,
+        route_output_words,
+        route_num_experts,
+        route_local_experts,
+        route_local_offset,
     ):
         block_id, _, _ = cute.arch.block_idx()
         feature_tiles = cute.size(out, mode=[1]) // 64
         token_subtiles = cute.ceil_div(cute.size(x, mode=[0]), 8)
-        if block_id < active_tiles[0] * feature_tiles * token_subtiles:
-            self._kernel_body(
-                mma,
-                tma,
-                ma,
-                ws,
-                x,
-                xs,
+        if cutlass.const_expr(self.enable_route_fold):
+            # Every CTA clears its output slice and recomputes the routing
+            # into shared tables before the guard; CTAs beyond the work exit as
+            # before, reading the active tile count from shared memory.
+            storage = utils.SmemAllocator().allocate(self.shared_storage)
+            self._route_fold_prologue(
+                storage,
+                route_ids_src,
+                route_weights_src,
+                route_ids,
+                route_weights,
+                route_expanded,
                 routes,
                 route_expert,
                 route_limit,
                 active_tiles,
-                alpha,
-                beta,
-                linear,
-                out,
-                out_sf,
-                al,
-                bl,
-                sal,
-                sbl,
-                epilogue_op,
+                route_padded_total,
+                route_output_words,
+                route_num_experts,
+                route_local_experts,
+                route_local_offset,
             )
+            rt_active = storage.rt_active.get_tensor(cute.make_layout(1))
+            if block_id < rt_active[0] * feature_tiles * token_subtiles:
+                self._kernel_body(
+                    mma,
+                    tma,
+                    ma,
+                    ws,
+                    x,
+                    xs,
+                    routes,
+                    route_expert,
+                    route_limit,
+                    active_tiles,
+                    alpha,
+                    beta,
+                    linear,
+                    out,
+                    out_sf,
+                    al,
+                    bl,
+                    sal,
+                    sbl,
+                    epilogue_op,
+                    storage,
+                )
+        else:
+            if block_id < active_tiles[0] * feature_tiles * token_subtiles:
+                self._kernel_body(
+                    mma,
+                    tma,
+                    ma,
+                    ws,
+                    x,
+                    xs,
+                    routes,
+                    route_expert,
+                    route_limit,
+                    active_tiles,
+                    alpha,
+                    beta,
+                    linear,
+                    out,
+                    out_sf,
+                    al,
+                    bl,
+                    sal,
+                    sbl,
+                    epilogue_op,
+                )
 
     @cute.jit
     def _kernel_body(
@@ -285,6 +651,7 @@ class SkinnyDecodeGatherKernel:
         sal,
         sbl,
         epilogue_op: cutlass.Constexpr,
+        storage=None,
     ):
         tid, _, _ = cute.arch.thread_idx()
         block_id, _, _ = cute.arch.block_idx()
@@ -295,7 +662,22 @@ class SkinnyDecodeGatherKernel:
         features = cute.size(out, mode=[1])
         feature_tiles = features // 64
         token_subtiles = cute.ceil_div(cute.size(x, mode=[0]), 8)
-        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        if cutlass.const_expr(self.enable_route_fold):
+            # The scheduler and the B/SFB producers read the routing
+            # tables this CTA built in shared memory (kernel() allocated the
+            # storage); the global routing words stay CTA 0's copies for G2.
+            route_expert = storage.rt_expert.get_tensor(
+                cute.make_layout(ROUTE_FOLD_EXPERTS)
+            )
+            route_limit = storage.rt_limit.get_tensor(
+                cute.make_layout(ROUTE_FOLD_EXPERTS)
+            )
+            active_tiles = storage.rt_active.get_tensor(cute.make_layout(1))
+            rt_routes = storage.rt_routes.get_tensor(
+                cute.make_layout(ROUTE_FOLD_EXPERTS * ROUTE_FOLD_RANKS)
+            )
+        else:
+            storage = utils.SmemAllocator().allocate(self.shared_storage)
         bars = storage.barriers.data_ptr()
         ap = pipeline.PipelineTmaUmma.create(
             num_stages=3,
@@ -546,7 +928,15 @@ class SkinnyDecodeGatherKernel:
                 for vr in cutlass.range_constexpr(4):
                     row = (local_tid + vr * 64) // 32
                     if row_base + row < limit:
-                        routed_tokens[vr] = routes[row_base + row] // self.top_k
+                        if cutlass.const_expr(self.enable_route_fold):
+                            routed_tokens[vr] = (
+                                rt_routes[
+                                    work[1] * ROUTE_FOLD_RANKS + work[2] * 8 + row
+                                ]
+                                // self.top_k
+                            )
+                        else:
+                            routed_tokens[vr] = routes[row_base + row] // self.top_k
                 for kt in cutlass.range(k // 512, unroll=1):
                     bp.producer_acquire(b_state)
                     b_nk = b_nks[(None, None, b_state.index)]
@@ -658,10 +1048,19 @@ class SkinnyDecodeGatherKernel:
                     for kc in cutlass.range_constexpr(4):
                         value = cutlass.Uint8(127)
                         if row_base + row < limit:
-                            value = xs[
-                                routes[row_base + row] // self.top_k,
-                                kt * 16 + kc * 4 + g,
-                            ].to(cutlass.Uint8)
+                            if cutlass.const_expr(self.enable_route_fold):
+                                value = xs[
+                                    rt_routes[
+                                        work[1] * ROUTE_FOLD_RANKS + work[2] * 8 + row
+                                    ]
+                                    // self.top_k,
+                                    kt * 16 + kc * 4 + g,
+                                ].to(cutlass.Uint8)
+                            else:
+                                value = xs[
+                                    routes[row_base + row] // self.top_k,
+                                    kt * 16 + kc * 4 + g,
+                                ].to(cutlass.Uint8)
                         raw_sfb[sb_prod.index * 128 + kc * 32 + lane] = value
                     sbp.producer_commit(sb_prod)
                     sb_prod.advance()

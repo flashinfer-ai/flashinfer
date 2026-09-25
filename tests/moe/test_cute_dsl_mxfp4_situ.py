@@ -867,6 +867,26 @@ def full_kimi_decode_pair(full_kimi_case):
     return prepare_cute_decode_weights(full_kimi_case)
 
 
+@pytest.fixture(scope="module")
+def full_kimi_route_fold_guard_case():
+    """Full geometry with 113 local experts: one above the folded routing cap."""
+    if os.getenv("FLASHINFER_KIMI_K3_FULL") != "1":
+        pytest.skip("set FLASHINFER_KIMI_K3_FULL=1 for full Kimi geometry")
+    _require_blackwell()
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("full Kimi acceptance runs require B300")
+    return make_case(
+        tokens=4,
+        hidden=7168,
+        intermediate=3072,
+        num_experts=896,
+        local_num_experts=113,
+        local_expert_offset=336,
+        top_k=16,
+        distribution="hot",
+    )
+
+
 def _full_kimi_case(base, tokens, distribution):
     ids, weights = make_routing(tokens, 896, 16, 112, 336, distribution)
     return replace(
@@ -940,6 +960,105 @@ def test_full_kimi_graph_replay(full_kimi_case, tokens, paired, request):
     for _ in range(100):
         graph.replay()
     torch.testing.assert_close(output, eager, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
+def test_full_kimi_decode_route_fold_graph(full_kimi_case, tokens):
+    """The default B300 decode forward folds routing and the output clear into GEMM1.
+
+    The routing words the folded gather rewrites must satisfy the public
+    mapping contract, and the output must agree with the separate-sort (PDL)
+    plan, including after the packed routing is changed in place and consumed
+    by an existing CUDA Graph capture without an eager forward or a replan.
+    """
+    weights = prepare_cute_weights(full_kimi_case)
+    case = _full_kimi_case(full_kimi_case, tokens, "hot")
+    plan, output, _ = prepare_candidate(case, packed=True, prepared_weights=weights)
+    assert plan._route_fold and plan._route_preprocess is None
+    separate, separate_output, _ = prepare_candidate(
+        case, packed=True, prepared_weights=weights, enable_pdl=True
+    )
+    assert not separate._route_fold and separate._route_preprocess is not None
+    compiled_before = _compiled_counts()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    buffers = plan._kwargs["moe_sort_buffers"]
+    for distribution, seed in (
+        ("hot", 17),
+        ("balanced", 4111 + tokens),
+        ("empty", 5233 + tokens),
+    ):
+        ids, routing_weights = make_routing(
+            tokens, 896, 16, 112, 336, distribution, seed=seed
+        )
+        packed = pack_topk(ids, routing_weights)
+        plan._topk_ids.copy_(packed)
+        separate._topk_ids.copy_(packed)
+        # The fold rewrites every routing word the decode kernels consume; the
+        # native expert-count histogram is not part of that contract.
+        for name, tensor in buffers.items():
+            if name != "out_expert_counts":
+                tensor.fill_(-97)
+        plan._route_ids.fill_(-97)
+        plan._route_weights.fill_(float("nan"))
+        output.fill_(7)
+        graph.replay()
+        separate.run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            plan._route_ids.flatten(), ids.flatten(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            plan._route_weights.flatten(),
+            routing_weights.float().flatten(),
+            atol=0,
+            rtol=0,
+        )
+        _assert_decode_route_semantics(buffers, ids, 112, 336, 128)
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, separate_output, atol=1e-2, rtol=1e-2)
+    assert _compiled_counts() == compiled_before
+
+
+def test_full_kimi_decode_route_fold_guard(
+    full_kimi_route_fold_guard_case, record_property
+):
+    """Above 112 local experts the decode plan keeps the separate route preprocess."""
+    case = full_kimi_route_fold_guard_case
+    plan, output, _ = prepare_candidate(case, packed=True)
+    assert not plan._route_fold and plan._route_preprocess is not None
+    baseline, baseline_output = make_trt_baseline(case, packed=True)
+    plan.run()
+    baseline()
+    eager = output.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(3):
+        graph.replay()
+    torch.testing.assert_close(output, eager, atol=1e-2, rtol=1e-2)
+    refs = reference_moe(case)
+    report = {
+        name: paired_accuracy(output, baseline_output, reference)
+        for name, reference in refs.items()
+    }
+    report["routing"] = routing_histogram(case)
+    record_property("numerical_report", json.dumps(report))
+    assert report["ideal_fp64"]["candidate"]["finite"]
+    assert report["ideal_fp64"]["baseline"]["finite"]
+    ref = refs["ideal_fp64"]
+    floor = torch.linalg.vector_norm(ref.to(torch.bfloat16).double() - ref)
+    assert (
+        torch.linalg.vector_norm(output.double() - ref)
+        <= torch.linalg.vector_norm(baseline_output.double() - ref) + floor
+    ), report
 
 
 def test_full_kimi_paired_decode_weights_require_exact_pair(

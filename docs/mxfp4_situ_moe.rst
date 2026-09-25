@@ -97,12 +97,21 @@ the high 16 bits and BF16 weight bits in the low 16. FP32 weights are bound
 directly; BF16/packed routing is converted into preallocated workspace on the
 caller stream.
 
-For T=1..16, one CuTe kernel combines routing unpack/conversion with output
-clearing and, when PDL is disabled, local expert histogram/prefix/scatter.
-The default decode forward then launches GEMM1 and GEMM2 with finalize:
-three device-kernel launches in total. Expert IDs must be unique within each
-token and lie in ``[0, num_experts)``, as in standard top-k routing.
-PDL-enabled decode retains separate native sorting.
+For T=1..16 on the dedicated B300 decode kernels described below (SiTU, PDL
+disabled) with at most 112 local experts and top-k at most 16, the GEMM1
+gather kernel itself unpacks and converts the routing, clears the output and
+rebuilds the local expert histogram/prefix/scatter tables: every CTA
+recomputes the routing deterministically from the caller's top-k ids in
+shared memory and one CTA rewrites the routing words in workspace. The
+default decode forward is therefore two device-kernel launches, GEMM1 with
+the folded routing prologue and GEMM2 with finalize. Every other decode plan
+(PDL enabled, more than 112 local experts or top-k above 16) keeps one CuTe
+kernel that combines routing unpack/conversion with output clearing and, when
+PDL is disabled, local expert histogram/prefix/scatter, followed by GEMM1 and
+GEMM2 with finalize: three device-kernel launches when PDL is disabled, while
+PDL-enabled decode retains separate native sorting. Expert IDs must be unique
+within each token and lie in ``[0, num_experts)``, as in standard top-k
+routing.
 
 On B300 with SiTU, PDL disabled, routing tile size 128 and both GEMMs on the
 M128/N128, cluster1, non-raster tactics, T1..16 uses dedicated decode kernels.
@@ -187,7 +196,10 @@ bytes, not these allocated capacities. Workspace layout matches the previous
 implementation except for the T=512 expanded-contribution region. Other
 tactics have separate resource requirements; the dedicated decode and T512
 kernels have their own shared-memory and TMEM footprints within the same
-per-CTA limits.
+per-CTA limits. The folded routing prologue adds 8,192 shared bytes to each
+decode GEMM1 kernel (227,328 dynamic shared bytes for the T1/T8 skinny
+gather, 228,352 at T2 and 225,280 at T4/T16 for the paired gathers) with
+unchanged TMEM allocation.
 
 .. list-table:: Measured workspace, separate output size and kernel activities per forward
    :header-rows: 1
@@ -199,23 +211,23 @@ per-CTA limits.
    * - 1
      - 6,499,072
      - 14,336
-     - 3 / 4
+     - 2 / 4
    * - 2
      - 12,995,328
      - 28,672
-     - 3 / 4
+     - 2 / 4
    * - 4
      - 25,987,840
      - 57,344
-     - 3 / 4
+     - 2 / 4
    * - 8
      - 45,477,888
      - 114,688
-     - 3 / 4
+     - 2 / 4
    * - 16
      - 45,885,440
      - 229,376
-     - 3 / 4
+     - 2 / 4
    * - 128
      - 51,591,168
      - 1,835,008
@@ -245,8 +257,9 @@ Workspace bytes come from ``get_workspace_size(T)`` at the full B300 shape
 with the default tactics and are identical for eager and Graph execution and
 for balanced, empty-expert and hot routing. Kernel activities are measured
 CUPTI ``CONCURRENT_KERNEL`` records per forward at the same shape (again
-identical across execution modes and routing distributions): three for
-T1..16 (fused route preprocess, GEMM1, GEMM2 with finalize), four for
+identical across execution modes and routing distributions): two for
+T1..16 (GEMM1 with the folded routing prologue and output clear, GEMM2 with
+finalize), four for
 T128/T256 and T1024/T2048/T4096 (route conversion with output clear, native
 sort, GEMM1, GEMM2 with finalize) and six for T512 (fused sort and route
 preprocess, dense and sparse GEMM1 launches, GEMM2, the N16 sparse finalize
@@ -260,17 +273,20 @@ Evaluation status
 Evaluated on one NVIDIA B300 (SXM6, compute capability 10.3) with CUDA 13.1
 (PyTorch build; cuda-bindings 13.4.1, cupti-python 13.4.0), PyTorch
 2.10.0a0+a36e1d39eb.nv26.1.42222806, nvidia-cutlass-dsl 4.8.0.dev0 and
-apache-tvm-ffi 0.1.14.post0. ``FLASHINFER_KIMI_K3_FULL=1`` collects 190
-tests on the exported tree: 188 passed, 2 skipped, 0 failed;
+apache-tvm-ffi 0.1.14.post0. ``FLASHINFER_KIMI_K3_FULL=1`` collects 197
+tests on the exported tree: 195 passed, 2 skipped, 0 failed;
 ``FLASHINFER_KIMI_K3_ALL_LOCAL=1 -k all_local`` passes its 2 tests. The
 CUDA API trace audit of the planned forward records no allocation, host
 synchronization, device-to-host copy or compilation in ``run()`` (21
 rejected misuse cases are asserted by the tests). Sanitizer results:
 compute-sanitizer synccheck and racecheck on the T1024 route/clear
-qualification pass with 0 errors (7.72 s and 12.65 s); on the decode
+qualification pass with 0 errors (11.19 s and 16.58 s); on the decode
 qualification both tools were stopped at a 20 s hard cap with no reported
 errors and were not retried, so no sanitizer verdict is claimed for the
-decode path.
+decode path; on the T512 prefill qualification both tools were likewise
+stopped at the 20 s cap with no reported errors and were not retried (the
+prefill kernels are byte-identical to the previous revision, whose prefill
+synccheck passed).
 
 Full geometry is H=7168, I=3072, E=896, top-k=16, 112 local experts and
 offset 336. All inputs are synthetic; matching real-checkpoint evaluation has
@@ -304,7 +320,7 @@ benchmark script computes its accuracy metrics before timing):
      - 0.027003
      - 0.027037
      - 0.999636
-     - 0.003738 / 0.007121 / 0.022998
+     - 0.003738 / 0.007122 / 0.022998
    * - Explicit MXFP8
      - 0.004468
      - 0.002532
@@ -314,8 +330,9 @@ benchmark script computes its accuracy metrics before timing):
 Against the ideal reference this runner and TRT-LLM Gen are indistinguishable
 at the reported precision (the ideal error is dominated by the shared
 quantized operands). Against the explicit MXFP8 reference this runner's worst
-relative L2 is 1.8x TRT-LLM Gen's (0.004468 versus 0.002532, both at
-T4096/hot); the difference comes from the explicit FP32-to-MXFP8 activation
+relative L2 is 1.8x TRT-LLM Gen's (0.004468 versus 0.002532, at
+graph/T4096/hot versus graph/T8/balanced);
+the difference comes from the explicit FP32-to-MXFP8 activation
 rounding that this runner performs between GEMM1 and GEMM2 while the reference
 rounds once. At T4 and T16 with balanced routing the finalize splits the
 last round of work items into K slices and reduce-adds up to six BF16
