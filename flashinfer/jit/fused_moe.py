@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import platform
 from typing import List, Optional
 
 from . import env as jit_env
@@ -27,7 +28,7 @@ from .core import (
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
 )
-from .cpp_ext import is_cuda_version_at_least
+from .cpp_ext import host_compiler_is_gcc, is_cuda_version_at_least
 from .cubin_loader import (
     get_artifact,
     get_meta_hash,
@@ -275,6 +276,32 @@ def gen_cutlass_fused_moe_module(
     )
 
 
+# The trtllm-gen kernel manifest is a large table of prebuilt-cubin descriptors.
+# Its entry type is not a literal type -- it embeds the polymorphic option
+# structs, which own heap members -- so the table cannot be a compile-time
+# constant and cannot live in read-only data. The host compiler materializes it
+# as load-time initialization code instead, concentrating the whole manifest
+# into one enormous straight-line basic block.
+#
+# GCC schedules instructions once before and once after register allocation, and
+# the pre-allocation pass is superlinear in basic block size. x86 already
+# disables that pass by default, because lengthening live ranges ahead of
+# allocation costs more than it gains on a register-poor target; aarch64 leaves
+# it on. An initializer that only stores constants gives the pass nothing worth
+# reordering, so on aarch64 it ends up dominating the build time of this module
+# for no benefit. Turning it off there is just adopting the x86 default.
+#
+# Scoped to GCC on aarch64: the spelling is GCC's, and on x86 the pass is
+# already off. Post-allocation scheduling still runs everywhere. -Xcompiler
+# reaches only the host compiler, so device compilation is untouched and the
+# emitted cubins are identical; what is given up applies to code that runs once
+# per process during initialization.
+def _manifest_host_compile_flags() -> List[str]:
+    if platform.machine() != "aarch64" or not host_compiler_is_gcc():
+        return []
+    return ["-Xcompiler", "-fno-schedule-insns"]
+
+
 def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
@@ -375,6 +402,7 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
+            *_manifest_host_compile_flags(),
         ]
         + nvcc_flags,
         extra_include_paths=[
