@@ -17,8 +17,9 @@ Verified source-only JIT loading for the Cake SM100 / SM103 eight-peer fused nor
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding that FlashInfer's JIT compiles
-together.  ``MODULES``, ``ROUTES`` and ``LARGE_MIN_TOKENS`` are filled by the
-exporter from the complete verified program bundle.  The loader checks every
+together.  ``MODULES``, ``ROUTES``, ``LARGE_MIN_TOKENS``, ``WIDE_MIN_TOKENS``
+and ``WIDE_COOPERATIVE`` are filled by the exporter from the complete verified
+program bundle.  The loader checks every
 source file's SHA-256 before its first build, so a modified or partially
 delivered source tree fails closed instead of silently running a different
 kernel.
@@ -58,6 +59,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "cache_name": "cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058_sm_100a",
         "compile_flags": [],
         "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "per_token",
+        },
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058",
         "launch": {
             "block": (320, 1, 1),
@@ -95,6 +99,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "cache_name": "cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_sm_103a",
         "compile_flags": [],
         "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "per_token",
+        },
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d",
         "launch": {
             "block": (160, 1, 1),
@@ -110,6 +117,48 @@ MODULES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_kernel.cu",
             "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d_binding.cu",
+        ],
+    },
+    "cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9": {
+        "arch": "sm_103a",
+        "arg_plan": [
+            ("buffer", "x"),
+            ("buffer", "residual"),
+            ("buffer", "weight"),
+            ("buffer", "norm_out"),
+            ("buffer", "residual_out"),
+            ("buffer", "collective_out"),
+            ("buffer", "workspace"),
+            ("parameter", "rank"),
+            ("parameter", "tokens"),
+            ("parameter", "epsilon"),
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ],
+        "cache_name": "cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9_sm_103a",
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 4,
+            "kind": "co_resident_odd",
+            "sm_count": 148,
+        },
+        "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9",
+        "launch": {
+            "block": (160, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": True,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": True,
+        },
+        "source_sha256": {
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9_binding.cu": "a22436c4b2d859fddb9018c68426c2f678ce86a5c9e2992c3ba2f8fc01a839bd",
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9_kernel.cu": "abacdc91247b2b46c81eb12bb91443cc5935ddc6fdc68e4dd19e878f684e8831",
+        },
+        "sources": [
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9_kernel.cu",
+            "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9_binding.cu",
         ],
     },
     "cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912": {
@@ -132,6 +181,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "cache_name": "cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912_sm_100a",
         "compile_flags": [],
         "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "per_token",
+        },
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912",
         "launch": {
             "block": (160, 1, 1),
@@ -169,6 +221,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "cache_name": "cake_fused_norm_combine_bf16_ee481367764d334ab381_sm_103a",
         "compile_flags": [],
         "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "per_token",
+        },
         "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_ee481367764d334ab381",
         "launch": {
             "block": (320, 1, 1),
@@ -186,18 +241,64 @@ MODULES: dict[str, dict[str, Any]] = {
             "csrc/cake_fused_norm_combine/sm_103a/cake_fused_norm_combine_bf16_ee481367764d334ab381_binding.cu",
         ],
     },
+    "cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9": {
+        "arch": "sm_100a",
+        "arg_plan": [
+            ("buffer", "x"),
+            ("buffer", "residual"),
+            ("buffer", "weight"),
+            ("buffer", "norm_out"),
+            ("buffer", "residual_out"),
+            ("buffer", "collective_out"),
+            ("buffer", "workspace"),
+            ("parameter", "rank"),
+            ("parameter", "tokens"),
+            ("parameter", "epsilon"),
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ],
+        "cache_name": "cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9_sm_100a",
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 4,
+            "kind": "co_resident_odd",
+            "sm_count": 148,
+        },
+        "kernel_symbol": "kernel_cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9",
+        "launch": {
+            "block": (160, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": True,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": True,
+        },
+        "source_sha256": {
+            "csrc/cake_fused_norm_combine/sm_100a/cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9_binding.cu": "c4cefbb359a5174ba5d5f1b193c70e0b0857cc6383471e17d84c4502634b5647",
+            "csrc/cake_fused_norm_combine/sm_100a/cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9_kernel.cu": "0ada05b7e241e810553d8bfd4360fad59a0f121bd6c52c5760be333a2b65782d",
+        },
+        "sources": [
+            "csrc/cake_fused_norm_combine/sm_100a/cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9_kernel.cu",
+            "csrc/cake_fused_norm_combine/sm_100a/cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9_binding.cu",
+        ],
+    },
 }
 ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "owner_lamport": "cake_fused_norm_combine_bf16_d1b159bb3eda5b4f3912",
+        "owner_lamport_pipelined": "cake_fused_norm_combine_bf16_fc0be1404d798e2dcbb9",
         "parallel_lamport": "cake_fused_norm_combine_bf16_0ac3aea2cc92e53cb058",
     },
     "sm_103a": {
         "owner_lamport": "cake_fused_norm_combine_bf16_a4503e9f297ee7549f0d",
+        "owner_lamport_pipelined": "cake_fused_norm_combine_bf16_a7ccd61bc956f00010a9",
         "parallel_lamport": "cake_fused_norm_combine_bf16_ee481367764d334ab381",
     },
 }
 LARGE_MIN_TOKENS = 256
+WIDE_MIN_TOKENS = 1024
+WIDE_COOPERATIVE = True
 
 SOURCE_PACKAGE = "cake_fused_norm_combine"
 # One verified build per architecture: B200 (``sm_100a``) and B300 (``sm_103a``).
@@ -214,10 +315,14 @@ WORLD_SIZE = 8
 HIDDEN_DIM = 2560
 TRACKS = 2
 # Token counts below ``LARGE_MIN_TOKENS`` run the one-shot Lamport exchange
-# with the concurrent-track local body; at and above they run the fence-free
-# two-round owner reduce (token t is owned by peer t % 8).
+# with the concurrent-track local body; from ``LARGE_MIN_TOKENS`` they run the
+# fence-free two-round owner reduce (token t is owned by peer t % 8) with one
+# CTA per token; from ``WIDE_MIN_TOKENS`` the same owner reduce runs as a
+# persistent software-pipelined grid (each CTA publishes token k while it
+# reduces its owned token k - 2), sized by the module's ``grid_rule``.
 VARIANT_ONE_SHOT = "parallel_lamport"
 VARIANT_OWNER_REDUCE = "owner_lamport"
+VARIANT_PIPELINED = "owner_lamport_pipelined"
 # Workspace pointer table: eight data regions, eight flag regions, eight
 # three-slot Lamport payload regions, then the local control words.
 WORKSPACE_TABLE_ENTRIES = 3 * WORLD_SIZE + 1
@@ -228,6 +333,8 @@ def select_variant(tokens: int) -> str:
 
     if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
         raise ValueError("tokens must be a positive integer")
+    if tokens >= WIDE_MIN_TOKENS:
+        return VARIANT_PIPELINED
     if tokens >= LARGE_MIN_TOKENS:
         return VARIANT_OWNER_REDUCE
     return VARIANT_ONE_SHOT
@@ -266,6 +373,56 @@ def route_module_name(tokens: int, arch: str) -> str:
             f"unsupported Cake fused norm-combine route: {variant!r} on {arch!r}"
         )
     return name
+
+
+def persistent_grid(tokens: int, capacity: int) -> int:
+    """Grid of the persistent pipelined kernel.
+
+    ``tokens`` CTAs when they are all co-resident, otherwise the largest odd
+    CTA count not above ``capacity``: an odd grid keeps the token-to-owner
+    assignment (owner = token % 8) rotating across the CTAs.
+    """
+
+    if tokens <= 0 or capacity <= 0:
+        raise ValueError("tokens and capacity must be positive")
+    limit = min(tokens, capacity)
+    if limit >= tokens:
+        return tokens
+    return limit if limit % 2 else limit - 1
+
+
+def launch_grid_x(tokens: int, rule: dict[str, Any], *, sm_count: int) -> int | None:
+    """Grid width for ``tokens`` under one module's recorded grid rule.
+
+    ``per_token`` modules launch one CTA per token.  ``co_resident_odd``
+    modules were verified with ``ctas_per_sm * sm_count`` co-resident CTAs on
+    a device with exactly ``sm_count`` SMs; on any other SM count the rule
+    does not apply and ``None`` is returned so the caller falls back to the
+    per-token owner reduce.
+    """
+
+    kind = rule["kind"]
+    if kind == "per_token":
+        return int(tokens)
+    if kind != "co_resident_odd":
+        raise ValueError(f"unknown Cake fused norm-combine grid rule: {kind!r}")
+    if int(sm_count) != int(rule["sm_count"]):
+        return None
+    return persistent_grid(
+        int(tokens), int(rule["ctas_per_sm"]) * int(rule["sm_count"])
+    )
+
+
+def resolve_launch(tokens: int, arch: str, device_index: int) -> tuple[str, int]:
+    """Module name and grid width for ``tokens`` on ``arch`` at ``device_index``."""
+
+    name = route_module_name(tokens, arch)
+    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    grid_x = launch_grid_x(tokens, MODULES[name]["grid_rule"], sm_count=sm_count)
+    if grid_x is None:
+        name = ROUTES[arch][VARIANT_OWNER_REDUCE]
+        grid_x = int(tokens)
+    return name, grid_x
 
 
 def _source_dir() -> Path:
@@ -350,7 +507,8 @@ def run_cake_fused_norm_combine(
 
     ``flashinfer.comm.cake_fused_norm_combine`` validates shapes, dtypes,
     devices and the workspace before calling this entry; the launch grid is one
-    CTA per token row on every peer.
+    CTA per token row on every peer, or the recorded co-resident persistent
+    grid for the wide route (``resolve_launch``).
     """
 
     if backend != "cake":
@@ -365,7 +523,7 @@ def run_cake_fused_norm_combine(
         raise ValueError(
             "the Cake fused norm-combine export targets SM100 and SM103 only"
         )
-    name = route_module_name(int(tokens), arch)
+    name, grid_x = resolve_launch(int(tokens), arch, device_index)
     record = MODULES[name]
     values: dict[str, object] = {
         "x": x,
@@ -378,7 +536,7 @@ def run_cake_fused_norm_combine(
         "rank": int(rank),
         "tokens": int(tokens),
         "epsilon": float(epsilon),
-        "grid_x": int(tokens),
+        "grid_x": int(grid_x),
         "grid_y": 1,
         "grid_z": 1,
     }
@@ -398,10 +556,16 @@ __all__ = [
     "TRACKS",
     "VARIANT_ONE_SHOT",
     "VARIANT_OWNER_REDUCE",
+    "VARIANT_PIPELINED",
+    "WIDE_COOPERATIVE",
+    "WIDE_MIN_TOKENS",
     "WORKSPACE_TABLE_ENTRIES",
     "WORLD_SIZE",
     "arch_for_capability",
+    "launch_grid_x",
     "load",
+    "persistent_grid",
+    "resolve_launch",
     "route_applies",
     "route_module_name",
     "run_cake_fused_norm_combine",

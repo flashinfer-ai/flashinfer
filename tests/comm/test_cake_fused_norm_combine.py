@@ -48,7 +48,11 @@ def test_module_inventory_is_verified_source_only() -> None:
     assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
     routed = set()
     for arch, routes in loader.ROUTES.items():
-        assert set(routes) == {loader.VARIANT_ONE_SHOT, loader.VARIANT_OWNER_REDUCE}
+        assert set(routes) == {
+            loader.VARIANT_ONE_SHOT,
+            loader.VARIANT_OWNER_REDUCE,
+            loader.VARIANT_PIPELINED,
+        }
         assert all(loader.MODULES[name]["arch"] == arch for name in routes.values())
         routed |= set(routes.values())
     assert routed == set(loader.MODULES)
@@ -83,15 +87,27 @@ def test_module_inventory_is_verified_source_only() -> None:
         ]
         launch = record["launch"]
         assert launch["use_pdl"] is True
-        assert launch["cooperative"] is False
         assert tuple(launch["cluster"]) == (1, 1, 1)
+        rule = record["grid_rule"]
+        if rule["kind"] == "per_token":
+            assert launch["cooperative"] is False
+        else:
+            assert rule["kind"] == "co_resident_odd"
+            assert rule["ctas_per_sm"] >= 1 and rule["sm_count"] >= 1
+            assert launch["cooperative"] is loader.WIDE_COOPERATIVE
     for routes in loader.ROUTES.values():
-        one_shot = loader.MODULES[routes[loader.VARIANT_ONE_SHOT]]["launch"]
-        owner = loader.MODULES[routes[loader.VARIANT_OWNER_REDUCE]]["launch"]
+        one_shot = loader.MODULES[routes[loader.VARIANT_ONE_SHOT]]
+        owner = loader.MODULES[routes[loader.VARIANT_OWNER_REDUCE]]
+        wide = loader.MODULES[routes[loader.VARIANT_PIPELINED]]
         # The one-shot half runs both tracks concurrently (two 160-thread
-        # halves); the owner reduce keeps the source's 160-thread row.
-        assert tuple(one_shot["block"]) == (320, 1, 1)
-        assert tuple(owner["block"]) == (160, 1, 1)
+        # halves); both owner reduces keep the source's 160-thread row.
+        assert tuple(one_shot["launch"]["block"]) == (320, 1, 1)
+        assert tuple(owner["launch"]["block"]) == (160, 1, 1)
+        assert tuple(wide["launch"]["block"]) == (160, 1, 1)
+        assert (
+            one_shot["grid_rule"]["kind"] == owner["grid_rule"]["kind"] == "per_token"
+        )
+        assert wide["grid_rule"]["kind"] == "co_resident_odd"
 
 
 def test_jit_spec_math_flags_follow_the_source_build() -> None:
@@ -116,12 +132,14 @@ def test_jit_spec_math_flags_follow_the_source_build() -> None:
         (64, loader.VARIANT_ONE_SHOT),
         (255, loader.VARIANT_ONE_SHOT),
         (256, loader.VARIANT_OWNER_REDUCE),
-        (1024, loader.VARIANT_OWNER_REDUCE),
-        (2048, loader.VARIANT_OWNER_REDUCE),
+        (1023, loader.VARIANT_OWNER_REDUCE),
+        (1024, loader.VARIANT_PIPELINED),
+        (2048, loader.VARIANT_PIPELINED),
     ],
 )
 def test_token_dispatch(tokens: int, expected: str) -> None:
     assert loader.LARGE_MIN_TOKENS == 256
+    assert loader.WIDE_MIN_TOKENS == 1024
     assert loader.select_variant(tokens) == expected
     for arch in loader.ARCHES:
         assert loader.route_module_name(tokens, arch) == loader.ROUTES[arch][expected]
@@ -134,6 +152,37 @@ def test_token_dispatch(tokens: int, expected: str) -> None:
 def test_token_dispatch_rejects_non_positive_counts(tokens) -> None:
     with pytest.raises(ValueError):
         loader.select_variant(tokens)
+
+
+@pytest.mark.parametrize(
+    "tokens,capacity,expected",
+    [
+        (1, 1184, 1),
+        (1184, 1184, 1184),
+        (1185, 1184, 1183),
+        (2048, 1184, 1183),
+        (2048, 1185, 1185),
+        (2048, 2, 1),
+    ],
+)
+def test_persistent_grid_is_every_token_or_the_largest_odd_co_resident_grid(
+    tokens: int, capacity: int, expected: int
+) -> None:
+    assert loader.persistent_grid(tokens, capacity) == expected
+
+
+def test_wide_route_grid_rule_applies_only_to_the_verified_sm_count() -> None:
+    assert loader.launch_grid_x(2048, {"kind": "per_token"}, sm_count=1) == 2048
+    for routes in loader.ROUTES.values():
+        rule = loader.MODULES[routes[loader.VARIANT_PIPELINED]]["grid_rule"]
+        capacity = rule["ctas_per_sm"] * rule["sm_count"]
+        assert loader.launch_grid_x(
+            2048, rule, sm_count=rule["sm_count"]
+        ) == loader.persistent_grid(2048, capacity)
+        assert loader.launch_grid_x(1, rule, sm_count=rule["sm_count"]) == 1
+        assert loader.launch_grid_x(2048, rule, sm_count=rule["sm_count"] + 1) is None
+    with pytest.raises(ValueError):
+        loader.launch_grid_x(8, {"kind": "unknown"}, sm_count=1)
 
 
 def test_route_scope_is_eight_sm100_or_sm103_peers_with_hidden_2560() -> None:
