@@ -1607,3 +1607,284 @@ def test_dense_gemm2_raster_policy(monkeypatch):
     assert tp8._gemm2_raster(8192, 256) == (True, 7)
     assert tp8._gemm2_raster(4096, 256) == (False, 1)
     assert ep8._gemm2_raster(32768, 256) == (False, 1)
+
+
+def test_swap_split_policy(monkeypatch):
+    """Split form (policy-tile groups plus 128-row groups for the experts
+    above SWAP_SPLIT_MIN_ROWS rows): fused-routing token counts from
+    SWAP_SPLIT_MIN_TOKENS up, finalize only, MoE-TP shard by default; the
+    workspace carries the wide slot arrays and a row capacity that covers
+    any split of the routes into narrow and wide experts."""
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+    from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT", True)
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT_EP", False)
+    monkeypatch.setattr(mxfp4, "SWAP_MIXED", False)
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT_MIN_ROWS", 64)
+    tp8 = _policy_wrapper(moe_tp_size=8, moe_tp_rank=0)
+    ep8 = _policy_wrapper(ep_size=8, ep_rank=3)
+    assert tp8._swap_split(128) and tp8._swap_split(256) and tp8._swap_split(512)
+    assert tp8._swap_split(1024)
+    assert not tp8._swap_split(64)  # below SWAP_SPLIT_MIN_TOKENS
+    assert not tp8._swap_split(2048)  # above SWAP_SPLIT_MAX_TOKENS (hybrid range)
+    assert not tp8._swap_split(128, do_finalize=False)
+    assert not ep8._swap_split(128)
+    # The shard takes the 16384-route fused routing only for the split form.
+    assert tp8._fused_route_cap() == mxfp4.FUSED_ROUTE_MAX_ROUTES
+    assert tp8._fused_route_cap(1024) == mxfp4.FUSED_ROUTE_MAX_ROUTES_LARGE
+    assert tp8._fused_route_cap(1024, do_finalize=False) == mxfp4.FUSED_ROUTE_MAX_ROUTES
+    assert ep8._fused_route_cap() == mxfp4.FUSED_ROUTE_MAX_ROUTES_LARGE
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT_EP", True)
+    assert ep8._swap_split(128)
+    for wrapper, local in ((tp8, 896), (ep8, 112)):
+        for tokens in (128, 256, 512, 1024):
+            tile = wrapper._swap_tile(tokens)
+            groups, rows = wrapper._swap_split_capacity(tokens)
+            narrow = get_max_num_tiles(tokens, 16, local, tile) * tile
+            assert rows % 128 == 0 and rows >= -(-narrow // 128) * 128 + groups * 128
+            # Worst case for the wide region: every wide expert holds
+            # SWAP_SPLIT_MIN_ROWS + 1 rows (one padded 128-row group each).
+            wide_experts = min(local, tokens * 16 // 65)
+            assert groups >= wide_experts
+            fields = {f.name: f.shape for f in wrapper._workspace_fields(tokens)[0]}
+            assert fields["swap_wide_list"] == (rows // 128,)
+            assert fields["swap_wide_expert"] == (rows // 128,)
+            assert fields["swap_wide_limit"] == (rows // 128,)
+            assert fields["out_permuted_idx_to_expanded_idx"] == (rows,)
+            assert fields["gemm1_out"][0] == rows
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT", False)
+    names = {f.name for f in tp8._workspace_fields(128)[0]}
+    assert "swap_wide_list" not in names
+    assert not tp8._swap_split(128)
+
+
+def _split_layout_reference(
+    ids, local_experts, offset, tile, wide_tile, wide_min_rows, permille=0
+):
+    """Host model of the split layout: narrow experts (1..wide_min_rows rows)
+    in ``tile``-row groups by local index, then the wide experts in
+    ``wide_tile``-row groups from the next ``wide_tile`` multiple; no wide
+    experts unless they hold ``permille`` of the local rows."""
+    ids = ids.cpu().flatten().tolist()
+    groups = [
+        [q for q, expert in enumerate(ids) if expert == offset + local]
+        for local in range(local_experts)
+    ]
+    total = sum(len(g) for g in groups)
+    wide_rows = sum(len(g) for g in groups if len(g) > wide_min_rows)
+    if wide_rows * 1000 < total * permille:
+        wide_min_rows = total  # nothing is wide
+    tile_experts, tile_limits, bases, wide_slots, wide_list = [], [], {}, {}, []
+    base = 0
+    for local, assignments in enumerate(groups):
+        count = len(assignments)
+        if not 0 < count <= wide_min_rows:
+            continue
+        num_tiles = -(-count // tile)
+        bases[local] = base
+        tile_experts.extend([local] * num_tiles)
+        tile_limits.extend(
+            min(base + (j + 1) * tile, base + count) for j in range(num_tiles)
+        )
+        base += num_tiles * tile
+    narrow_tiles = len(tile_experts)
+    base = -(-base // wide_tile) * wide_tile
+    for local, assignments in enumerate(groups):
+        count = len(assignments)
+        if count <= wide_min_rows:
+            continue
+        num_tiles = -(-count // wide_tile)
+        bases[local] = base
+        for j in range(num_tiles):
+            slot = base // wide_tile + j
+            wide_slots[slot] = (local, min(base + (j + 1) * wide_tile, base + count))
+            wide_list.append(slot)
+        base += num_tiles * wide_tile
+    return dict(
+        groups=groups,
+        tile_experts=tile_experts,
+        tile_limits=tile_limits,
+        narrow_tiles=narrow_tiles,
+        bases=bases,
+        wide_slots=wide_slots,
+        wide_list=wide_list,
+        padded=base,
+    )
+
+
+def _assert_split_layout(buffers, split, ids, local_experts, offset, tile):
+    ref = _split_layout_reference(
+        ids, local_experts, offset, tile, 128, 64, split["wide_min_permille"]
+    )
+    ints = ("wide_tile", "wide_min_rows", "wide_min_permille", "rows_capacity")
+    arrays = {
+        name: tensor.cpu().flatten().tolist()
+        for name, tensor in list(buffers.items()) + list(split.items())
+        if name != "out_expert_counts" and name not in ints
+    }
+    narrow = ref["narrow_tiles"]
+    assert arrays["out_num_non_exiting_tiles"] == [narrow]
+    assert arrays["out_tile_idx_to_expert_idx"][:narrow] == ref["tile_experts"]
+    assert arrays["out_tile_idx_to_mn_limit"][:narrow] == ref["tile_limits"]
+    assert arrays["out_total_num_padded_tokens"] == [ref["padded"]]
+    assert arrays["wide_count"] == [len(ref["wide_list"])]
+    assert arrays["wide_list"][: len(ref["wide_list"])] == ref["wide_list"]
+    for slot, (local, limit) in ref["wide_slots"].items():
+        assert arrays["wide_expert"][slot] == local, slot
+        assert arrays["wide_limit"][slot] == limit, slot
+    expanded = arrays["out_expanded_idx_to_permuted_idx"]
+    permuted = arrays["out_permuted_idx_to_expanded_idx"]
+    seen = set()
+    for local, assignments in enumerate(ref["groups"]):
+        if not assignments:
+            continue
+        base = ref["bases"][local]
+        assert sorted(permuted[base : base + len(assignments)]) == assignments
+        for q in assignments:
+            row = expanded[q]
+            assert base <= row < base + len(assignments)
+            assert permuted[row] == q and row not in seen
+            seen.add(row)
+    for q, expert in enumerate(ids.cpu().flatten().tolist()):
+        if not offset <= expert < offset + local_experts:
+            assert expanded[q] == -1
+
+
+@pytest.mark.parametrize("tokens", [128, 256])
+@pytest.mark.parametrize("local_experts,offset", [(896, 0), (112, 336)])
+@pytest.mark.parametrize("distribution", ["balanced", "hot", "empty"])
+@pytest.mark.parametrize("permille", [0, 250])
+def test_fused_routing_split_layout(
+    tokens, local_experts, offset, distribution, permille
+):
+    """The fused routing kernel's split layout matches the host model on the
+    first run and after a graph replay over changed routing (wide experts
+    appearing and disappearing)."""
+    _require_blackwell()
+    import cuda.bindings.driver as cuda
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        get_max_num_tiles,
+    )
+    from flashinfer.fused_moe.cute_dsl.mxfp4_routing import _plan_route_preprocess
+
+    tile, top_k = 16, 16
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ids, weights = make_routing(
+            tokens, 896, top_k, local_experts, offset, distribution
+        )
+        source_ids = pack_topk(ids, weights)
+        route_ids = torch.empty_like(ids)
+        route_weights = torch.empty_like(weights, dtype=torch.float32)
+        buffers = allocate_moe_sort_buffers(tokens, 896, top_k, local_experts, tile)
+        narrow_rows = get_max_num_tiles(tokens, top_k, local_experts, tile) * tile
+        wide_groups = get_max_num_tiles(tokens, top_k, local_experts, 128)
+        rows = -(-narrow_rows // 128) * 128 + wide_groups * 128
+        buffers["out_permuted_idx_to_expanded_idx"] = torch.full(
+            (rows,), -7, dtype=torch.int32, device="cuda"
+        )
+        split = dict(
+            wide_expert=torch.full(
+                (rows // 128,), -7, dtype=torch.int32, device="cuda"
+            ),
+            wide_limit=torch.full((rows // 128,), -7, dtype=torch.int32, device="cuda"),
+            wide_list=torch.full((wide_groups,), -7, dtype=torch.int32, device="cuda"),
+            wide_count=torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            wide_tile=128,
+            wide_min_rows=64,
+            wide_min_permille=permille,
+            rows_capacity=rows,
+        )
+        output = torch.zeros((tokens, 512), dtype=torch.bfloat16, device="cuda")
+        plan = _plan_route_preprocess(
+            source_ids,
+            None,
+            output=output,
+            route_ids=route_ids,
+            route_weights=route_weights,
+            moe_sort_buffers=buffers,
+            num_experts=896,
+            num_local_experts=local_experts,
+            local_expert_offset=offset,
+            tile_size=tile,
+            split_layout=split,
+        )
+        stream.synchronize()
+        _assert_split_layout(buffers, split, ids, local_experts, offset, tile)
+        if local_experts == 896 and distribution == "empty":
+            assert int(split["wide_count"].item()) > 0  # 16 experts x T rows
+        if local_experts == 896 and distribution == "hot":
+            # One expert with T of the 16 T local rows: wide only without the rule.
+            assert (int(split["wide_count"].item()) > 0) == (permille == 0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            plan.run(cuda.CUstream(stream.cuda_stream))
+        for changed in ("balanced", "hot", "empty"):
+            if changed == distribution:
+                continue
+            changed_ids, changed_weights = make_routing(
+                tokens, 896, top_k, local_experts, offset, changed
+            )
+            source_ids.copy_(pack_topk(changed_ids, changed_weights))
+            for name in ("wide_expert", "wide_limit", "wide_list"):
+                split[name].fill_(-7)
+            graph.replay()
+            stream.synchronize()
+            _assert_split_layout(
+                buffers, split, changed_ids, local_experts, offset, tile
+            )
+
+
+@pytest.mark.parametrize("tokens", [128, 192, 256])
+@pytest.mark.parametrize("distribution", ["hot", "empty", "balanced"])
+def test_swap_split_form_matches_default(monkeypatch, tokens, distribution):
+    """The split form (wide experts through the 128-row swap launches)
+    matches the default swap form and stays within the BF16 floor of the
+    FP64 reference; a captured graph follows routing changes that move
+    experts between the narrow and the wide layout."""
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT", True)
+    monkeypatch.setattr(mxfp4, "SWAP_MIXED", False)
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT_MIN_ROWS", 64)
+    case = make_case(tokens=tokens, distribution=distribution)
+    prepared = prepare_cute_weights(case)
+    split, output, _ = prepare_candidate(case, prepared_weights=prepared)
+    assert split.split
+    monkeypatch.setattr(mxfp4, "SWAP_SPLIT", False)
+    default, expected, _ = prepare_candidate(case, prepared_weights=prepared)
+    assert not default.split
+    split.run()
+    default.run()
+    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
+    ref = reference_moe(case)["ideal_fp64"]
+    floor = torch.linalg.vector_norm(ref.to(torch.bfloat16).double() - ref)
+    assert torch.linalg.vector_norm(output.double() - ref) <= (
+        torch.linalg.vector_norm(expected.double() - ref) + floor
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        split.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for changed in ("hot", "empty", "balanced"):
+        if changed == distribution:
+            continue
+        ids, weights = make_routing(
+            tokens,
+            case.num_experts,
+            case.topk_ids.shape[1],
+            case.local_num_experts,
+            case.local_expert_offset,
+            changed,
+        )
+        case.topk_ids.copy_(ids)
+        case.topk_weights.copy_(weights)
+        default.run()
+        for _ in range(5):
+            graph.replay()
+        torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)

@@ -439,6 +439,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         runtime_situ: bool = False,
         runtime_situ_linear_beta: bool = False,
         weight_l2_hint: Optional[int] = None,
+        pdl_trigger_early: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -501,6 +502,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
+        # Trigger the programmatic dependents at kernel entry instead of at
+        # the end (launches that usually find no tiles: the split form's
+        # wide GEMM1), so the dependent grid is resident during the wait.
+        self.pdl_trigger_early = bool(pdl_trigger_early)
         self.use_a_per_token_scale = use_a_per_token_scale
         self.topk = topk
         self.gated = gated
@@ -1607,6 +1612,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
+        if cutlass.const_expr(self.pdl_trigger_early):
+            griddepcontrol_launch_dependents()
         griddepcontrol_wait()
 
         #
@@ -3442,7 +3449,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             c_pipeline.producer_tail()
 
-        griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.pdl_trigger_early):
+            griddepcontrol_launch_dependents()
 
     def epilog_tmem_copy_and_partition(
         self,

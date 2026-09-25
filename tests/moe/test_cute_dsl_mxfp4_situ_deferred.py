@@ -160,6 +160,21 @@ def test_deferred_workspace_and_row_queries(tokens, mode):
             } <= names
             assert "partial_rows" not in names
             assert finalized < deferred + rows * 7168 * 2
+        elif wrapper._swap_split(tokens):
+            # Split form (finalize only): the wide experts' 128-row groups
+            # enlarge every row-indexed region and add the wide lists; the
+            # deferred form keeps the default layout.
+            names = {f.name for f in wrapper._workspace_fields(tokens, True)[0]}
+            assert {
+                "swap_wide_expert",
+                "swap_wide_limit",
+                "swap_wide_list",
+                "swap_wide_count",
+                "partial_rows",
+            } <= names
+            split_rows = wrapper._swap_split_capacity(tokens)[1]
+            assert split_rows > rows and split_rows % 128 == 0
+            assert finalized > deferred + rows * 7168 * 2
         elif (
             tokens > m.SWAP_ATOMIC_FINALIZE_MAX_TOKENS
             and wrapper.intermediate_shard <= m.SWAP_TWO_STAGE_MAX_SHARD

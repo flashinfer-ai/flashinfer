@@ -366,6 +366,7 @@ def _get_compiled_swapab_kernel(
     sf_blocked: bool = False,
     wide_out: bool = False,
     m_group: Optional[int] = None,
+    pdl_trigger_early: bool = False,
 ):
     import os
     import sys
@@ -404,6 +405,7 @@ def _get_compiled_swapab_kernel(
         group_rows,
         sf_blocked,
         wide_out,
+        pdl_trigger_early,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -427,6 +429,7 @@ def _get_compiled_swapab_kernel(
             group_rows=group_rows,
             sf_blocked=sf_blocked,
             wide_out=wide_out,
+            pdl_trigger_early=pdl_trigger_early,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -469,6 +472,7 @@ def swapab_gemm1_situ(
     tile_idx_to_row_group: Optional[torch.Tensor] = None,
     group_rows: Optional[int] = None,
     sf_blocked: bool = False,
+    pdl_trigger_early: bool = False,
 ) -> None:
     """GEMM1 (up/gate) + SiTU + MXFP8 requantization on the swap path.
 
@@ -563,6 +567,7 @@ def swapab_gemm1_situ(
         row_tma=row_tma,
         group_rows=group_rows,
         sf_blocked=sf_blocked,
+        pdl_trigger_early=pdl_trigger_early,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -593,6 +598,7 @@ def swapab_gemm2(
     group_rows: Optional[int] = None,
     sf_blocked: bool = False,
     m_group: Optional[int] = None,
+    pdl_trigger_early: bool = False,
 ) -> None:
     """GEMM2 (down) on the swap path.
 
@@ -691,6 +697,7 @@ def swapab_gemm2(
         sf_blocked=sf_blocked,
         wide_out=wide_out,
         m_group=m_group,
+        pdl_trigger_early=pdl_trigger_early,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)

@@ -112,6 +112,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         group_rows: Optional[int] = None,
         sf_blocked: bool = False,
         wide_out: bool = False,
+        pdl_trigger_early: bool = False,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
@@ -134,6 +135,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # 32-bit tensor layout math is kept unchanged.
         self.wide_out = wide_out
         self.enable_pdl = enable_pdl
+        # Trigger the programmatic dependents at kernel entry instead of at
+        # the end of the epilogue: for launches that usually find few or no
+        # work items (the wide launches of the split form) the dependent
+        # grid becomes resident during this grid's prologue and wait.
+        self.pdl_trigger_early = bool(pdl_trigger_early)
         self.use_linear_beta = use_linear_beta
         # GEMM1 gathers activation rows through the permuted->expanded map;
         # GEMM2 reads the already-permuted GEMM1 output rows contiguously.
@@ -868,6 +874,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         tile_sched_params: utils.PersistentTileSchedulerParams,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if cutlass.const_expr(self.pdl_trigger_early):
+            griddepcontrol_launch_dependents()
         n_tile = self.n_tile
         hold_meta = self.hold_meta
 
@@ -2167,7 +2175,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
-        griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.pdl_trigger_early):
+            griddepcontrol_launch_dependents()
 
     # ------------------------------------------------------------------
     # Raw-pointer wrapper (compiled once per tactic, shapes are runtime)

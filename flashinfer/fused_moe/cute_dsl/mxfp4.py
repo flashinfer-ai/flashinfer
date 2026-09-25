@@ -34,7 +34,12 @@ from ...tllm_enums import ActivationType
 from .fused_moe import _moe_core_impl, validate_w4a8_inputs
 from .moe_utils import get_max_num_tiles, moe_sort
 from .mxfp4_finalize import plan_finalize_rows
-from .mxfp4_routing import FUSED_ROUTE_MAX_ROUTES, _plan_route_preprocess
+from .mxfp4_routing import (
+    FUSED_ROUTE_LARGE_MAX_LOCAL_EXPERTS,
+    FUSED_ROUTE_MAX_ROUTES,
+    FUSED_ROUTE_MAX_ROUTES_LARGE,
+    _plan_route_preprocess,
+)
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     blockscaled_contiguous_gather_grouped_gemm_act_fusion,
 )
@@ -89,6 +94,8 @@ DENSE_WEIGHT_L2_HINT = _DENSE_L2_HINTS[os.environ.get("MXFP4_DENSE_L2HINT", "fir
 # kernel. B300 TP8 T=2048: 434 + 314 us against 434 + 295 + 94 (two-stage).
 SWAP_HYBRID = os.environ.get("SWAPAB_HYBRID", "1") != "0"
 SWAP_HYBRID_GROUP_ROWS = 128
+# Hybrid form from this many routes (T * top_k) up: T > 256 for top-16.
+SWAP_HYBRID_MIN_ROUTES = 4096
 SWAP_HYBRID_MIN_TILE = 64
 # Hybrid form, mixed GEMM1 tiles: a 128-row sort group with more valid rows
 # than this runs as one dense gather-GEMM1 tile (its expert's weights stream
@@ -113,6 +120,46 @@ SWAP_MIXED = os.environ.get("SWAPAB_MIXED", "0") == "1"
 # and prologue of each GEMM overlap the previous kernel. The caller's
 # ``enable_pdl`` still governs the first launch of the op. 0 = plain launches.
 SWAP_PDL = os.environ.get("SWAPAB_PDL", "1") != "0"
+# Split form (swap-AB path, fused routing, finalize, T >= SWAP_SPLIT_MIN_TOKENS):
+# the fused routing kernel lays out the local experts holding more than
+# SWAP_SPLIT_MIN_ROWS rows in 128-row groups behind the policy-tile groups of
+# the other experts, and a second pair of launches runs those groups: the
+# dense gather GEMM1 (128-row tiles, block-scaled output scales) and the swap
+# GEMM2 at n_tile = 128 reading those blocked scales. One weight stream per
+# 128 rows instead of one per policy tile, and 8x fewer GEMM2 work items.
+# Targets the routings where a few local experts hold most rows (the MoE-TP
+# shard's ``empty`` rows re-stream each hot expert 8x at T=128); under
+# balanced routing both wide launches find an empty list. The 128-row swap
+# GEMM1 measured 2.3x slower than the dense gather tile for the same groups
+# (65 vs 28 us, B300 TP8 T=128 empty), so the dense tile takes GEMM1.
+# SWAPAB_SPLIT=0 disables, SWAPAB_SPLIT_EP=1 also enables it on
+# expert-parallel ranks.
+SWAP_SPLIT = os.environ.get("SWAPAB_SPLIT", "1") != "0"
+SWAP_SPLIT_WIDE_TILE = 128
+SWAP_SPLIT_MIN_ROWS = int(os.environ.get("SWAPAB_SPLIT_MIN_ROWS", "64"))
+# ... and only when those experts hold this share (per mille) of the local
+# rows: one wide expert (a ``hot`` routing, 1/16 of the rows) would pay the
+# dense tile's single-CTA-per-N-tile latency (26 us at K=7168) for nothing.
+SWAP_SPLIT_MIN_PERMILLE = int(os.environ.get("SWAPAB_SPLIT_MIN_PERMILLE", "250"))
+SWAP_SPLIT_MIN_TOKENS = int(os.environ.get("SWAPAB_SPLIT_MIN_TOKENS", "128"))
+# Upper bound: the fused routing kernel (which lays the split out) handles
+# 16384 routes = T=1024 for top-16; there it costs the shard 17 us against 16
+# for the conversion kernel plus moe_sort, and the split's balanced/hot rows
+# pay 0.4-0.7 % (B300) for a 0.65x ``empty`` row. Above, the hybrid form.
+SWAP_SPLIT_MAX_TOKENS = int(os.environ.get("SWAPAB_SPLIT_MAX_TOKENS", "1024"))
+SWAP_SPLIT_EP = os.environ.get("SWAPAB_SPLIT_EP", "0") == "1"
+# Wide launches of the split form: trigger their programmatic dependents at
+# kernel entry (they often find no work items).
+SWAP_SPLIT_EARLY_TRIGGER = os.environ.get("SWAPAB_SPLIT_EARLY_TRIGGER", "1") != "0"
+# N tile of the wide dense GEMM1 by token count: with few wide groups the
+# 128-wide tile doubles the streaming CTAs (B300 TP8 empty: T=128 65 -> 57 us,
+# T=512 140 -> 134), from T=1024 the 256-wide tile is back ahead (236 vs 242).
+SWAP_SPLIT_GEMM1_N_POLICY = ((512, 128), (1 << 62, 256))
+SWAP_SPLIT_GEMM1_N = (
+    int(os.environ["SWAPAB_SPLIT_GEMM1_N"])
+    if os.environ.get("SWAPAB_SPLIT_GEMM1_N")
+    else None
+)
 SWAP_MIXED_MIN_TOKENS = int(os.environ.get("SWAPAB_MIXED_MIN_TOKENS", "128"))
 # Mixed form by default on the fused-routing path (T * top_k <= 4096, i.e.
 # T <= 256 for top-16) up to this token count (0 disables): there the fused
@@ -729,6 +776,7 @@ class Mxfp4MoESwapAbPlan:
         self.deferred = not self.finalize
         self.hybrid = wrapper._swap_hybrid(x.shape[0], self.finalize)
         self.mixed = wrapper._swap_mixed(x.shape[0], self.finalize)
+        self.split = wrapper._swap_split(x.shape[0], self.finalize)
         self.group_rows = (
             SWAP_HYBRID_GROUP_ROWS if (self.hybrid or self.mixed) else n_tile
         )
@@ -787,6 +835,7 @@ class Mxfp4MoESwapAbPlan:
         self._dispatch = None
         self._dispatch_args = None
         self._gemm1_dense = None
+        self._gemm2_wide = None
         self._token_index = None
         self._token_index_args = None
         self._packed_weight_view = (
@@ -813,11 +862,12 @@ class Mxfp4MoESwapAbPlan:
         lists_from_routing = (
             self.mixed
             and SWAP_MIXED_FUSED_LISTS
-            and num_tokens * w.top_k <= FUSED_ROUTE_MAX_ROUTES
+            and num_tokens * w.top_k <= w._fused_route_cap(num_tokens, self.finalize)
         )
         with torch.cuda.device(self.device):
-            if num_tokens * w.top_k <= FUSED_ROUTE_MAX_ROUTES:
-                # Fused routing (T <= 256 for top-16): ID unpack, FP32
+            if num_tokens * w.top_k <= w._fused_route_cap(num_tokens, self.finalize):
+                # Fused routing (T <= 512 for top-16 on the shard, T <= 1024
+                # on an expert-parallel rank or with the split form): ID unpack, FP32
                 # weights, n_tile-row groups and the output zero-fill in one
                 # single-CTA launch instead of the conversion kernel plus
                 # ``moe_sort`` (about 3 us against 11 us at T=128).
@@ -851,6 +901,22 @@ class Mxfp4MoESwapAbPlan:
                         if lists_from_routing
                         else None
                     ),
+                    split_layout=(
+                        dict(
+                            wide_expert=b["swap_wide_expert"],
+                            wide_limit=b["swap_wide_limit"],
+                            wide_list=b["swap_wide_list"],
+                            wide_count=b["swap_wide_count"],
+                            wide_tile=SWAP_SPLIT_WIDE_TILE,
+                            wide_min_rows=SWAP_SPLIT_MIN_ROWS,
+                            wide_min_permille=SWAP_SPLIT_MIN_PERMILLE,
+                            rows_capacity=b["out_permuted_idx_to_expanded_idx"].shape[
+                                0
+                            ],
+                        )
+                        if self.split
+                        else None
+                    ),
                 )
             else:
                 # Generic routing: one conversion + output-clear launch, then
@@ -876,6 +942,7 @@ class Mxfp4MoESwapAbPlan:
                     **sort_buffers,
                 )
                 self._sort, self._sort_args = launches["sort"]
+            fused_finalize = self.finalize and not self.two_stage
             gemm1_lists = {}
             if (self.hybrid or self.mixed) and not lists_from_routing:
                 # Work lists over the 128-row sort groups: wide (dense GEMM1
@@ -941,6 +1008,67 @@ class Mxfp4MoESwapAbPlan:
                     **gemm1_lists,
                 },
             )
+            if self.split:
+                # Split form: dense gather GEMM1 tiles over the wide experts'
+                # 128-row groups (slots listed by the routing kernel); they
+                # write the block-scaled row scales the wide swap GEMM2 reads.
+                gemm1_tactic = w._tactic(num_tokens)[1]
+                if gemm1_tactic[0][0] != SWAP_SPLIT_WIDE_TILE:
+                    raise ValueError(
+                        "split-form GEMM1 tactic tile must match the "
+                        f"{SWAP_SPLIT_WIDE_TILE}-row wide groups, got {gemm1_tactic!r}"
+                    )
+                gemm1_n = SWAP_SPLIT_GEMM1_N
+                if gemm1_n is None:
+                    for limit, value in SWAP_SPLIT_GEMM1_N_POLICY:
+                        if num_tokens <= limit:
+                            gemm1_n = value
+                            break
+                if gemm1_tactic[0][1] != gemm1_n:
+                    gemm1_tactic = ((SWAP_SPLIT_WIDE_TILE, gemm1_n), (1, 1), False)
+                wide_launches = {}
+                blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+                    a=x,
+                    b=w1,
+                    a_scale=x_sf,
+                    b_scale=w1_sf,
+                    alpha=b["w1_alpha"],
+                    tile_idx_to_expert_idx=b["swap_wide_expert"],
+                    tile_idx_to_mn_limit=b["swap_wide_limit"],
+                    token_id_mapping=b["out_permuted_idx_to_expanded_idx"],
+                    num_non_exiting_tiles=b["swap_wide_count"],
+                    tile_idx_to_row_group=b["swap_wide_list"],
+                    out=b["gemm1_out"],
+                    out_scale=b["gemm1_out_scale"],
+                    c_dtype="float8_e4m3fn",
+                    a_dtype="float8_e4m3fn",
+                    b_dtype="float4_e2m1fn",
+                    sf_dtype="float8_e8m0fnu",
+                    sf_vec_size=32,
+                    quantize_output=True,
+                    topk=w.top_k,
+                    mma_tiler_mn=gemm1_tactic[0],
+                    cluster_shape_mn=gemm1_tactic[1],
+                    enable_pdl=pdl,
+                    activation_type=w.activation_type.value,
+                    situ_beta=self._beta,
+                    situ_linear_beta=self._linear_beta,
+                    weight_l2_hint=DENSE_WEIGHT_L2_HINT,
+                    pdl_trigger_early=pdl and SWAP_SPLIT_EARLY_TRIGGER,
+                    _prepared_launches=wide_launches,
+                )
+                self._gemm1_dense = wide_launches["gather"]
+                self._prepare_swap_gemm2(
+                    w,
+                    b,
+                    w2,
+                    w2_sf,
+                    num_tokens,
+                    fused_finalize,
+                    wide_launches,
+                    wide=True,
+                )
+                self._gemm2_wide = wide_launches["swap_gemm2"]
             if (
                 self.hybrid or self.mixed
             ) and self.group_rows > SWAP_HYBRID_DENSE_MIN_ROWS:
@@ -984,7 +1112,6 @@ class Mxfp4MoESwapAbPlan:
                     _prepared_launches=launches,
                 )
                 self._gemm1_dense = launches["gather"]
-            fused_finalize = self.finalize and not self.two_stage
             if self.hybrid:
                 # Dense contiguous grouped GEMM2 over the 128-row sort groups
                 # with the bulk-reduce finalize into the zero-filled output.
@@ -1034,8 +1161,36 @@ class Mxfp4MoESwapAbPlan:
                 )
 
     def _prepare_swap_gemm2(
-        self, w, b, w2, w2_sf, num_tokens, fused_finalize, launches
+        self, w, b, w2, w2_sf, num_tokens, fused_finalize, launches, wide=False
     ):
+        if wide:
+            # Split form, wide launch: the 128-row groups of the wide experts
+            # (block-scaled row scales written by the dense GEMM1 tiles),
+            # kernel defaults for the stage depth and weight grouping.
+            with torch.cuda.device(self.device):
+                swapab_gemm2(
+                    w2=w2,
+                    w2_sf=w2_sf,
+                    act=b["gemm1_out"],
+                    act_sf=b["gemm1_out_scale"],
+                    out=self._partial_rows if self.two_stage else self.output,
+                    tile_idx_to_expert_idx=b["swap_wide_expert"],
+                    tile_idx_to_mn_limit=b["swap_wide_limit"],
+                    num_non_exiting_tiles=b["swap_wide_count"],
+                    tile_idx_to_row_group=b["swap_wide_list"],
+                    alpha=b["w2_alpha"],
+                    permuted_idx_to_expanded_idx=b["out_permuted_idx_to_expanded_idx"],
+                    token_final_scales=self._route_weights if fused_finalize else None,
+                    top_k=w.top_k,
+                    finalize=fused_finalize,
+                    n_tile=SWAP_SPLIT_WIDE_TILE,
+                    sf_blocked=True,
+                    enable_pdl=self._pdl,
+                    weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
+                    pdl_trigger_early=self._pdl and SWAP_SPLIT_EARLY_TRIGGER,
+                    _prepared_launches=launches,
+                )
+            return
         with torch.cuda.device(self.device):
             # Short GEMM2 stages (4 K blocks) pipeline deeper and win 6-10 us
             # on the wide expert-parallel shard while every expert fits one
@@ -1099,9 +1254,9 @@ class Mxfp4MoESwapAbPlan:
 
     def run(self) -> torch.Tensor:
         """Enqueue three (T <= 16), four (deferred), five (two-stage
-        finalize), six (hybrid: sort, dispatch, swap and dense GEMM1
-        tiles, GEMM2) or up to seven (mixed: + two-stage finalize) launches
-        on the caller's stream."""
+        finalize or split: + wide GEMM1/GEMM2), six (hybrid: sort, dispatch,
+        swap and dense GEMM1 tiles, GEMM2) or up to seven (mixed / split +
+        two-stage finalize) launches on the caller's stream."""
         with torch.cuda.device(self.device):
             stream_ptr = torch.cuda.current_stream().cuda_stream
             stream = cuda.CUstream(stream_ptr)
@@ -1112,8 +1267,15 @@ class Mxfp4MoESwapAbPlan:
                 self._dispatch(*self._dispatch_args, stream_ptr)
             if self._token_index is not None:
                 self._token_index(*self._token_index_args, stream=stream)
+            if self.split:
+                # Wide launches first: when they find no groups, their CTAs
+                # are resident during the routing kernel and leave at once.
+                compiled, args, kwargs = self._gemm1_dense
+                compiled(*args, stream=stream, **kwargs)
+                compiled, args = self._gemm2_wide
+                compiled(*args, stream=stream)
             self._gemm1(*self._gemm1_args, stream=stream)
-            if self._gemm1_dense is not None:
+            if self._gemm1_dense is not None and not self.split:
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
             self._gemm2(*self._gemm2_args, stream=stream)
@@ -1393,7 +1555,7 @@ class CuteDslMxfp4MoEWrapper:
         return (
             SWAP_HYBRID
             and bool(do_finalize)
-            and num_tokens * self.top_k > FUSED_ROUTE_MAX_ROUTES
+            and num_tokens * self.top_k > SWAP_HYBRID_MIN_ROUTES
             and self._swap_tile(num_tokens) >= SWAP_HYBRID_MIN_TILE
         )
 
@@ -1405,7 +1567,7 @@ class CuteDslMxfp4MoEWrapper:
                 SWAP_MIXED
                 or (
                     num_tokens <= SWAP_MIXED_AUTO_MAX_TOKENS
-                    and num_tokens * self.top_k <= FUSED_ROUTE_MAX_ROUTES
+                    and num_tokens * self.top_k <= self._fused_route_cap()
                 )
             )
             and bool(do_finalize)
@@ -1414,6 +1576,61 @@ class CuteDslMxfp4MoEWrapper:
             and not self._swap_hybrid(num_tokens, do_finalize)
             and SWAP_HYBRID_GROUP_ROWS % self._swap_tile(num_tokens) == 0
         )
+
+    def _fused_route_cap(self, num_tokens=None, do_finalize=True):
+        """Routes (T * top_k) the fused routing kernel handles for this
+        rank. Its single CTA scales with the local expert count: on B300 it
+        takes 7 / 13 us for 8192 / 16384 routes over 112 local experts
+        (against 12-13 us for the conversion kernel plus ``moe_sort``) but
+        11 / 15 us over the 896 experts of the MoE-TP shard (16 us for the
+        conversion kernel plus ``moe_sort`` at 16384 routes), so the shard
+        takes 16384 routes only where the split form needs the fused
+        layout (T=1024: the split saves 127 us on concentrated routings
+        for +0.4-0.7 % elsewhere)."""
+        if self.num_local_experts <= FUSED_ROUTE_LARGE_MAX_LOCAL_EXPERTS:
+            return FUSED_ROUTE_MAX_ROUTES_LARGE
+        if num_tokens is not None and self._swap_split(num_tokens, do_finalize):
+            return FUSED_ROUTE_MAX_ROUTES_LARGE
+        return FUSED_ROUTE_MAX_ROUTES
+
+    def _swap_split(self, num_tokens, do_finalize=True):
+        """Split form: policy-tile groups for most experts plus 128-row groups
+        (a second pair of swap GEMM launches) for the experts above
+        SWAP_SPLIT_MIN_ROWS rows; fused routing, finalize only."""
+        return (
+            SWAP_SPLIT
+            and bool(do_finalize)
+            and SWAP_SPLIT_MIN_TOKENS <= num_tokens <= SWAP_SPLIT_MAX_TOKENS
+            and num_tokens * self.top_k <= FUSED_ROUTE_MAX_ROUTES_LARGE
+            and (self.intermediate_shard < 1024 or SWAP_SPLIT_EP)
+            and self._swap_tile(num_tokens) < SWAP_SPLIT_WIDE_TILE
+            and not self._swap_hybrid(num_tokens, do_finalize)
+            and not self._swap_mixed(num_tokens, do_finalize)
+        )
+
+    def _swap_split_capacity(self, num_tokens):
+        """``(wide_groups, rows)`` of the split layout: the narrow groups'
+        rows rounded up to the wide tile plus the wide groups' rows. Experts
+        need more than SWAP_SPLIT_MIN_ROWS rows to be wide, which bounds their
+        number and, through ``get_max_num_tiles``, their 128-row groups."""
+        tile = self._swap_tile(num_tokens)
+        wide = SWAP_SPLIT_WIDE_TILE
+        narrow_rows = (
+            get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
+            * tile
+        )
+        wide_experts = min(
+            self.num_local_experts,
+            num_tokens * self.top_k // (SWAP_SPLIT_MIN_ROWS + 1),
+        )
+        wide_groups = max(
+            1,
+            get_max_num_tiles(num_tokens, self.top_k, max(1, wide_experts), wide)
+            if wide_experts
+            else 0,
+        )
+        rows = -(-narrow_rows // wide) * wide + wide_groups * wide
+        return wide_groups, rows
 
     def _swap_group_rows(self, num_tokens, do_finalize=True):
         if self._swap_hybrid(num_tokens, do_finalize) or self._swap_mixed(
@@ -1429,14 +1646,30 @@ class CuteDslMxfp4MoEWrapper:
             tile = self._swap_tile(num_tokens)
             hybrid = self._swap_hybrid(num_tokens, do_finalize)
             mixed = self._swap_mixed(num_tokens, do_finalize)
+            split = self._swap_split(num_tokens, do_finalize)
             group = self._swap_group_rows(num_tokens, do_finalize)
             tiles = get_max_num_tiles(
                 num_tokens, self.top_k, self.num_local_experts, group
             )
             rows = tiles * group
+            if split:
+                rows = self._swap_split_capacity(num_tokens)[1]
+            wide_slots = rows // SWAP_SPLIT_WIDE_TILE
             specs = [
                 ("out_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
                 ("out_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
+                *(
+                    # Split form: the wide experts' 128-row groups (the list
+                    # spans every slot: the dense gather GEMM1 requires it).
+                    [
+                        ("swap_wide_expert", (wide_slots,), torch.int32, 4),
+                        ("swap_wide_limit", (wide_slots,), torch.int32, 4),
+                        ("swap_wide_list", (wide_slots,), torch.int32, 4),
+                        ("swap_wide_count", (1,), torch.int32, 4),
+                    ]
+                    if split
+                    else []
+                ),
                 *(
                     # Dispatch work lists of the hybrid form.
                     [

@@ -23,6 +23,8 @@ import cutlass.utils as utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 import cuda.bindings.driver as cuda
+import os
+
 import torch
 
 from ...cute_dsl.utils import make_ptr
@@ -41,6 +43,14 @@ _LIST_BUFFER_NAMES = (
     "all_count",
 )
 
+_WIDE_BUFFER_NAMES = ("wide_expert", "wide_limit")
+# Dynamic shared memory available to the single-CTA fused routing kernel
+# (227 KiB on sm_100 / sm_103).
+FUSED_ROUTE_SMEM_LIMIT = 232448
+# Layouts with more rows than this stage the inverse permutation in shared
+# memory (large-route variant only); below it the direct scattered stores
+# are as fast (2048 rows: 1.2 us direct against 1.5 us staged on B300).
+FUSED_ROUTE_STAGE_MIN_ROWS = 8192
 _SORT_BUFFER_NAMES = (
     "out_tile_idx_to_expert_idx",
     "out_tile_idx_to_mn_limit",
@@ -216,10 +226,22 @@ def _routing_block_exclusive(
     return exclusive, total
 
 
-# Routes (token, slot) one fused sorting CTA handles: T*top_k up to 4096, i.e.
-# T <= 256 for Kimi's top-16. Beyond that the generic conversion kernel and
-# ``moe_sort`` run.
-FUSED_ROUTE_MAX_ROUTES = 4096
+# Routes (T * top_k) the single-CTA fused routing kernel handles; its per-route
+# rank/expert scratch is 4 bytes per route of dynamic shared memory (int16
+# rank and local expert: 32 KB at 8192, 64 KB at 16384), plus the int16 row
+# staging of the large variant (see ``_FusedRoutePreprocess``), all within the
+# 227 KB of SM100/SM103. Beyond the cap the wrapper runs the conversion kernel
+# plus ``moe_sort``. Ranks with at most FUSED_ROUTE_LARGE_MAX_LOCAL_EXPERTS
+# local experts take the large cap, and so does the MoE-TP shard's split form
+# (the kernel's time grows with the local expert count, see
+# ``CuteDslMxfp4MoEWrapper._fused_route_cap``).
+FUSED_ROUTE_MAX_ROUTES = 8192
+FUSED_ROUTE_MAX_ROUTES_LARGE = 16384
+FUSED_ROUTE_LARGE_MAX_LOCAL_EXPERTS = int(
+    os.environ.get("MXFP4_FUSED_ROUTE_LARGE_MAX_LOCAL_EXPERTS", "128")
+)
+# Routes loaded per thread before processing in the fused routing histogram.
+ROUTE_UNROLL = 8
 
 
 class _FusedRoutePreprocess:
@@ -231,8 +253,20 @@ class _FusedRoutePreprocess:
         max_routes=FUSED_ROUTE_MAX_ROUTES,
         clear=True,
         dispatch_lists=False,
+        split_layout=False,
+        max_rows=None,
     ):
         self.single_tile_per_expert = single_tile_per_expert
+        # ``split_layout``: two-granularity row layout for the swap-AB split
+        # form. Experts with more than ``wide_min_rows`` rows are laid out in
+        # ``wide_tile``-row groups after the ``tile_size``-row groups of the
+        # other experts (the wide region starts at a ``wide_tile`` multiple);
+        # tile_expert/tile_limit describe the narrow groups (active_total of
+        # them), wide_expert/wide_limit the wide groups (indexed at
+        # ``wide_tile`` granularity from row 0, listed in wide_list).
+        if dispatch_lists and split_layout:
+            raise ValueError("dispatch_lists and split_layout are exclusive")
+        self.split_layout = split_layout
         # ``dispatch_lists``: also emit the swap-AB work lists over the sort
         # groups (wide = dense GEMM1 tiles, narrow = swap GEMM1 sub-tiles,
         # all = every occupied sub-tile for the swap GEMM2), replacing the
@@ -242,8 +276,33 @@ class _FusedRoutePreprocess:
         self.convert_weights = mode != "separate_fp32"
         self.threads = threads
         self.warps = threads // 32
-        # Per-route rank / local-expert scratch for T*top_k > threads.
+        # Per-route rank / local-expert scratch for T*top_k > threads
+        # (int16: ranks and route indices stay below 16384 routes, local
+        # expert indices below the thread count).
         self.max_routes = max_routes
+        # The inverse permutation (row -> route) is staged in shared memory:
+        # scattered 4-byte global stores cost one 32-byte sector each (16384
+        # sectors take ~8 us through one SM's L1 at T=1024), the shared
+        # scatter plus a coalesced copy-out of ``max_rows`` int16 entries
+        # about a quarter of that. Only the large-route variant stages (the
+        # 8192-route variant never exceeds FUSED_ROUTE_STAGE_MIN_ROWS by
+        # enough to pay for it), and only layouts above that many rows; rows
+        # at or beyond ``max_rows`` (a caller's row capacity past what the
+        # shared memory holds) take the direct global store.
+        fixed = 4 * (2 * threads + 2 * self.warps) + 4 * max_routes
+        fit = (FUSED_ROUTE_SMEM_LIMIT - fixed) // 2
+        if fit <= 0:
+            raise ValueError(
+                f"fused routing scratch for {max_routes} routes exceeds the "
+                "shared memory limit"
+            )
+        self.stage_rows = max_routes > FUSED_ROUTE_MAX_ROUTES
+        wanted = max_rows if max_rows is not None else max_routes
+        self.max_rows = max(1, min(wanted, fit)) if self.stage_rows else 0
+        # Dynamic shared memory: counts + bases (threads each) and the two
+        # warp scan buffers (int32), the two per-route scratch arrays and
+        # the row staging array (int16).
+        self.smem_bytes = fixed + 2 * self.max_rows
         # ``clear=False``: only CTA 0 (the sort) runs; the two-stage finalize
         # overwrites every output row itself.
         self.clear = clear
@@ -268,6 +327,8 @@ class _FusedRoutePreprocess:
         narrow_count_ptr: cute.Pointer,
         all_list_ptr: cute.Pointer,
         all_count_ptr: cute.Pointer,
+        wide_expert_ptr: cute.Pointer,
+        wide_limit_ptr: cute.Pointer,
         tokens: cutlass.Int32,
         top_k: cutlass.Int32,
         hidden: cutlass.Int32,
@@ -279,6 +340,9 @@ class _FusedRoutePreprocess:
         narrow_tile: cutlass.Int32,
         wide_min_rows: cutlass.Int32,
         wide_min_permille: cutlass.Int32,
+        wide_tile: cutlass.Int32,
+        wide_capacity: cutlass.Int32,
+        rows_capacity: cutlass.Int32,
         ids_row_stride: cutlass.Int32,
         ids_col_stride: cutlass.Int32,
         weights_row_stride: cutlass.Int32,
@@ -309,18 +373,22 @@ class _FusedRoutePreprocess:
             tile_limit_ptr, cute.make_layout((tile_capacity,))
         )
         expanded = cute.make_tensor(expanded_ptr, cute.make_layout((tokens * top_k,)))
-        permuted = cute.make_tensor(
-            permuted_ptr, cute.make_layout((tile_capacity * tile_size,))
-        )
+        permuted = cute.make_tensor(permuted_ptr, cute.make_layout((rows_capacity,)))
         padded_total = cute.make_tensor(padded_total_ptr, cute.make_layout((1,)))
         active_total = cute.make_tensor(active_total_ptr, cute.make_layout((1,)))
         sub_tiles = tile_capacity * (tile_size // narrow_tile)
-        wide_list = cute.make_tensor(wide_list_ptr, cute.make_layout((tile_capacity,)))
+        wide_list = cute.make_tensor(wide_list_ptr, cute.make_layout((wide_capacity,)))
         wide_count = cute.make_tensor(wide_count_ptr, cute.make_layout((1,)))
         narrow_list = cute.make_tensor(narrow_list_ptr, cute.make_layout((sub_tiles,)))
         narrow_count = cute.make_tensor(narrow_count_ptr, cute.make_layout((1,)))
         all_list = cute.make_tensor(all_list_ptr, cute.make_layout((sub_tiles,)))
         all_count = cute.make_tensor(all_count_ptr, cute.make_layout((1,)))
+        wide_expert = cute.make_tensor(
+            wide_expert_ptr, cute.make_layout((wide_capacity,))
+        )
+        wide_limit = cute.make_tensor(
+            wide_limit_ptr, cute.make_layout((wide_capacity,))
+        )
         self.kernel(
             ids_src,
             weights_src,
@@ -339,6 +407,8 @@ class _FusedRoutePreprocess:
             narrow_count,
             all_list,
             all_count,
+            wide_expert,
+            wide_limit,
             num_experts,
             local_experts,
             local_offset,
@@ -346,6 +416,7 @@ class _FusedRoutePreprocess:
             narrow_tile,
             wide_min_rows,
             wide_min_permille,
+            wide_tile,
         ).launch(
             grid=(
                 cute.ceil_div(cute.size(output), self.threads)
@@ -355,6 +426,7 @@ class _FusedRoutePreprocess:
                 1,
             ),
             block=(self.threads, 1, 1),
+            smem=self.smem_bytes,
             stream=stream,
         )
 
@@ -378,6 +450,8 @@ class _FusedRoutePreprocess:
         narrow_count: cute.Tensor,
         all_list: cute.Tensor,
         all_count: cute.Tensor,
+        wide_expert: cute.Tensor,
+        wide_limit: cute.Tensor,
         num_experts: cutlass.Int32,
         local_experts: cutlass.Int32,
         local_offset: cutlass.Int32,
@@ -385,6 +459,7 @@ class _FusedRoutePreprocess:
         narrow_tile: cutlass.Int32,
         wide_min_rows: cutlass.Int32,
         wide_min_permille: cutlass.Int32,
+        wide_tile: cutlass.Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
@@ -399,11 +474,15 @@ class _FusedRoutePreprocess:
         warp_sums = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.warps,)))
         scan_buf = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.warps,)))
         rank_buf = smem.allocate_tensor(
-            cutlass.Int32, cute.make_layout((self.max_routes,))
+            cutlass.Int16, cute.make_layout((self.max_routes,))
         )
         local_buf = smem.allocate_tensor(
-            cutlass.Int32, cute.make_layout((self.max_routes,))
+            cutlass.Int16, cute.make_layout((self.max_routes,))
         )
+        if cutlass.const_expr(self.stage_rows):
+            row_buf = smem.allocate_tensor(
+                cutlass.Int16, cute.make_layout((self.max_rows,))
+            )
         num_routes = cute.size(expanded)
 
         # The branch is uniform across the entire CTA. Each barrier below has
@@ -413,31 +492,91 @@ class _FusedRoutePreprocess:
             cute.arch.sync_threads()
             # Histogram: every route of the CTA (grid-stride over the threads)
             # converts its ID/weight and takes a rank within its local expert.
-            for r in cutlass.range(tid, num_routes, self.threads):
-                token = r // ids_src.shape[1]
-                slot = r % ids_src.shape[1]
-                expert = ids_src[(token, slot)]
-                if cutlass.const_expr(self.packed):
-                    expert = expert >> 16
-                    ids_dst[r] = expert
-                if cutlass.const_expr(self.convert_weights):
-                    weights_dst[r] = weights_src[(token, slot)].to(cutlass.Float32)
-                local = expert - local_offset
-                expanded[r] = cutlass.Int32(-1)
-                rank = cutlass.Int32(-1)
-                if (
-                    (expert >= 0)
-                    & (expert < num_experts)
-                    & (local >= 0)
-                    & (local < local_experts)
-                ):
-                    address = (counts.iterator + local).toint().to(cutlass.Int32)
-                    rank = _routing_shared_add(address, cutlass.Int32(1))
-                rank_buf[r] = rank
-                local_buf[r] = local
+            # The loads of ROUTE_UNROLL routes per thread are issued before
+            # any of them is processed (clamped to the last route so every
+            # load is in bounds): one CTA's 32 warps are latency-bound
+            # otherwise (16 dependent round trips at 16384 routes).
+            # Up to one route per thread (decode) the plain loop is shorter:
+            # the clamped duplicate loads cost 0.2-0.4 us at T=1 on B300.
+            top_k = ids_src.shape[1]
+            last = num_routes - 1
+            if num_routes > self.threads:
+                for base in cutlass.range(tid, num_routes, self.threads * ROUTE_UNROLL):
+                    experts = []
+                    weights = []
+                    for u in cutlass.range_constexpr(ROUTE_UNROLL):
+                        r = cutlass.min(base + u * self.threads, last)
+                        coord = (r // top_k, r % top_k)
+                        experts.append(ids_src[coord])
+                        if cutlass.const_expr(self.convert_weights):
+                            weights.append(weights_src[coord].to(cutlass.Float32))
+                    for u in cutlass.range_constexpr(ROUTE_UNROLL):
+                        r = base + u * self.threads
+                        if r < num_routes:
+                            expert = experts[u]
+                            if cutlass.const_expr(self.packed):
+                                expert = expert >> 16
+                                ids_dst[r] = expert
+                            if cutlass.const_expr(self.convert_weights):
+                                weights_dst[r] = weights[u]
+                            local = expert - local_offset
+                            expanded[r] = cutlass.Int32(-1)
+                            rank = cutlass.Int32(-1)
+                            if (
+                                (expert >= 0)
+                                & (expert < num_experts)
+                                & (local >= 0)
+                                & (local < local_experts)
+                            ):
+                                address = (
+                                    (counts.iterator + local).toint().to(cutlass.Int32)
+                                )
+                                rank = _routing_shared_add(address, cutlass.Int32(1))
+                            rank_buf[r] = cutlass.Int16(rank)
+                            local_buf[r] = cutlass.Int16(local)
+            else:
+                for r in cutlass.range(tid, num_routes, self.threads):
+                    coord = (r // top_k, r % top_k)
+                    expert = ids_src[coord]
+                    if cutlass.const_expr(self.packed):
+                        expert = expert >> 16
+                        ids_dst[r] = expert
+                    if cutlass.const_expr(self.convert_weights):
+                        weights_dst[r] = weights_src[coord].to(cutlass.Float32)
+                    local = expert - local_offset
+                    expanded[r] = cutlass.Int32(-1)
+                    rank = cutlass.Int32(-1)
+                    if (
+                        (expert >= 0)
+                        & (expert < num_experts)
+                        & (local >= 0)
+                        & (local < local_experts)
+                    ):
+                        address = (counts.iterator + local).toint().to(cutlass.Int32)
+                        rank = _routing_shared_add(address, cutlass.Int32(1))
+                    rank_buf[r] = cutlass.Int16(rank)
+                    local_buf[r] = cutlass.Int16(local)
             cute.arch.sync_threads()
 
             count = counts[tid]
+            # Split layout: experts above ``wide_min_rows`` take no narrow
+            # groups; their ``wide_tile``-row groups follow the narrow region.
+            wide = cutlass.Int32(0)
+            nwide = cutlass.Int32(0)
+            if cutlass.const_expr(self.split_layout):
+                wide = (count > wide_min_rows).to(cutlass.Int32)
+                # Global rule: wide groups only when the experts above
+                # ``wide_min_rows`` hold ``wide_min_permille`` of the rows
+                # (a single wide expert does not pay for its own launches).
+                _, total_rows = _routing_block_exclusive(
+                    count, lane, warp, self.warps, scan_buf
+                )
+                _, total_wide = _routing_block_exclusive(
+                    count * wide, lane, warp, self.warps, scan_buf
+                )
+                if total_wide * 1000 < total_rows * wide_min_permille:
+                    wide = cutlass.Int32(0)
+                nwide = ((count + wide_tile - 1) // wide_tile) * wide
             if cutlass.const_expr(self.single_tile_per_expert):
                 # Unique IDs give at most T rows per expert, and planning
                 # requires tile_size >= T. Every expert has zero or one tile.
@@ -446,7 +585,7 @@ class _FusedRoutePreprocess:
                 inclusive_mask = cutlass.Uint32(0xFFFFFFFF) >> (31 - lane)
                 within_warp = cute.arch.popc(active_mask & inclusive_mask)
             else:
-                ntiles = (count + tile_size - 1) // tile_size
+                ntiles = ((count + tile_size - 1) // tile_size) * (1 - wide)
                 within_warp = _routing_warp_inclusive(ntiles, lane)
             if lane == 31:
                 warp_sums[warp] = within_warp
@@ -464,6 +603,30 @@ class _FusedRoutePreprocess:
                 preceding_warps = warp_sums[warp - 1]
             tile_base = preceding_warps + within_warp - ntiles
             row_base = tile_base * tile_size
+            wide_total = cutlass.Int32(0)
+            wide_row0 = cutlass.Int32(0)
+            if cutlass.const_expr(self.split_layout):
+                wide_base, wide_total = _routing_block_exclusive(
+                    nwide, lane, warp, self.warps, scan_buf
+                )
+                # Wide region: first ``wide_tile`` multiple past the narrow rows.
+                narrow_total = warp_sums[self.warps - 1]
+                wide_row0 = (
+                    (narrow_total * tile_size + wide_tile - 1) // wide_tile
+                ) * wide_tile
+                if wide == 1:
+                    row_base = wide_row0 + wide_base * wide_tile
+                if tid < local_experts:
+                    for j in cutlass.range(nwide):
+                        slot = wide_row0 // wide_tile + wide_base + j
+                        limit = row_base + (j + 1) * wide_tile
+                        if limit > row_base + count:
+                            limit = row_base + count
+                        wide_expert[slot] = tid
+                        wide_limit[slot] = limit
+                        wide_list[wide_base + j] = slot
+                if tid == self.threads - 1:
+                    wide_count[0] = wide_total
             bases[tid] = row_base
             if cutlass.const_expr(self.dispatch_lists):
                 # Swap-AB work lists over this CTA's sort groups (the same
@@ -540,14 +703,41 @@ class _FusedRoutePreprocess:
             if tid == self.threads - 1:
                 active = preceding_warps + within_warp
                 active_total[0] = active
-                padded_total[0] = active * tile_size
+                if cutlass.const_expr(self.split_layout):
+                    padded_total[0] = wide_row0 + wide_total * wide_tile
+                else:
+                    padded_total[0] = active * tile_size
             cute.arch.sync_threads()
-            for r in cutlass.range(tid, num_routes, self.threads):
-                rank = rank_buf[r]
-                if rank >= 0:
-                    row = bases[local_buf[r]] + rank
-                    expanded[r] = row
-                    permuted[row] = r
+            if cutlass.const_expr(self.stage_rows):
+                # Inverse permutation through shared memory (see smem_bytes)
+                # for layouts above FUSED_ROUTE_STAGE_MIN_ROWS rows; staged
+                # padding rows of partially filled groups read -1.
+                rows_total = padded_total[0]
+                rows_out = cutlass.Int32(0)
+                if rows_total > FUSED_ROUTE_STAGE_MIN_ROWS:
+                    rows_out = cutlass.min(rows_total, cutlass.Int32(self.max_rows))
+                for row in cutlass.range(tid, rows_out, self.threads):
+                    row_buf[row] = cutlass.Int16(-1)
+                cute.arch.sync_threads()
+                for r in cutlass.range(tid, num_routes, self.threads):
+                    rank = rank_buf[r].to(cutlass.Int32)
+                    if rank >= 0:
+                        row = bases[local_buf[r].to(cutlass.Int32)] + rank
+                        expanded[r] = row
+                        if row < rows_out:
+                            row_buf[row] = cutlass.Int16(r)
+                        else:
+                            permuted[row] = r
+                cute.arch.sync_threads()
+                for row in cutlass.range(tid, rows_out, self.threads):
+                    permuted[row] = row_buf[row].to(cutlass.Int32)
+            else:
+                for r in cutlass.range(tid, num_routes, self.threads):
+                    rank = rank_buf[r].to(cutlass.Int32)
+                    if rank >= 0:
+                        row = bases[local_buf[r].to(cutlass.Int32)] + rank
+                        expanded[r] = row
+                        permuted[row] = r
 
         if cutlass.const_expr(self.clear):
             # Each word is covered once, independently of the assignment count.
@@ -626,6 +816,7 @@ def _plan_route_preprocess(
     _single_tile_per_expert=False,
     clear_output=True,
     dispatch_lists=None,
+    split_layout=None,
 ):
     """Compile, bind and enqueue one warmup, outside CUDA Graph capture.
 
@@ -644,7 +835,8 @@ def _plan_route_preprocess(
 
     Inputs may have independent nonnegative 2-D strides. Output and conversion
     buffers are contiguous. The conversion + clear kernel serves any token
-    count; the fused sorting mode supports tokens from 1..16. Top-k is 1..32
+    count; the fused sorting mode supports up to FUSED_ROUTE_MAX_ROUTES_LARGE
+    routes (T * top_k). Top-k is 1..32
     and the hidden size a positive even number. No input data are read on
     the host. Tensor contents must be valid when planning because warmup runs.
     ``dispatch_lists`` (fused sorting only) is a dict with the int32 buffers
@@ -656,6 +848,21 @@ def _plan_route_preprocess(
     (dense-tile groups above ``wide_min_rows``, the narrow sub-tiles of the
     others, and every occupied sub-tile), so the mixed form needs no extra
     launch.
+    ``split_layout`` (fused sorting only, exclusive with ``dispatch_lists``)
+    is a dict with the int32 buffers ``wide_expert`` and ``wide_limit``
+    (``rows_capacity // wide_tile`` slots), ``wide_list`` (``wide_capacity``)
+    and ``wide_count`` (1) plus the ints ``wide_tile`` (a multiple of
+    tile_size), ``wide_min_rows``, ``rows_capacity`` and the optional
+    ``wide_min_permille`` (wide groups only when the experts above
+    ``wide_min_rows`` hold that share of the rows): local experts with
+    more than ``wide_min_rows`` rows are laid out in ``wide_tile``-row groups
+    behind the ``tile_size``-row groups of the other experts (the wide region
+    starts at a ``wide_tile`` multiple, ``out_total_num_padded_tokens`` covers
+    both). The six sort outputs then describe the narrow groups only
+    (``out_num_non_exiting_tiles`` narrow groups), ``wide_expert`` /
+    ``wide_limit`` the wide groups at ``wide_tile`` granularity from row 0
+    and ``wide_list`` their slot indices (``wide_count`` of them);
+    ``out_permuted_idx_to_expanded_idx`` has ``rows_capacity`` entries.
 
     Shapes/strides are dynamic kernel arguments; beta values and tactic choices
     do not enter compilation. Cache entries are per input/sort mode, thread
@@ -680,13 +887,18 @@ def _plan_route_preprocess(
             "route preprocessing clears the output with 16-byte stores; the "
             "hidden size must be a multiple of 8"
         )
-    if moe_sort_buffers is not None and tokens * top_k > FUSED_ROUTE_MAX_ROUTES:
+    if moe_sort_buffers is not None and tokens * top_k > FUSED_ROUTE_MAX_ROUTES_LARGE:
         # The fused sort is a single-CTA kernel bounded by its per-route smem
         # scratch; the conversion + output clear kernel is grid-strided and
         # serves any token count (moe_sort then groups the rows).
         raise ValueError(
-            f"fused route sorting handles at most {FUSED_ROUTE_MAX_ROUTES} routes"
+            f"fused route sorting handles at most {FUSED_ROUTE_MAX_ROUTES_LARGE} routes"
         )
+    max_routes = (
+        FUSED_ROUTE_MAX_ROUTES
+        if tokens * top_k <= FUSED_ROUTE_MAX_ROUTES
+        else FUSED_ROUTE_MAX_ROUTES_LARGE
+    )
     if threads not in (128, 256):
         raise ValueError("route preprocessing supports 128 or 256 threads per block")
     device = output.device
@@ -715,11 +927,20 @@ def _plan_route_preprocess(
         ):
             raise ValueError("invalid fused decode sorting geometry")
         tile_capacity = get_max_num_tiles(tokens, top_k, num_local_experts, tile_size)
+        rows_capacity = tile_capacity * tile_size
+        if split_layout is not None:
+            if dispatch_lists is not None:
+                raise ValueError("dispatch_lists and split_layout are exclusive")
+            rows_capacity = int(split_layout["rows_capacity"])
+            if rows_capacity < tile_capacity * tile_size:
+                raise ValueError(
+                    "split_layout.rows_capacity must cover the narrow groups"
+                )
         shapes = (
             (tile_capacity,),
             (tile_capacity,),
             shape,
-            (tile_capacity * tile_size,),
+            (rows_capacity,),
             (1,),
             (1,),
         )
@@ -761,8 +982,44 @@ def _plan_route_preprocess(
             )
         else:
             list_ints = (tile_size, tile_size, 0)
-    elif dispatch_lists is not None:
-        raise ValueError("dispatch_lists requires moe_sort_buffers (fused sorting)")
+        wide_tile = tile_size
+        wide_capacity = tile_capacity
+        if split_layout is not None:
+            wide_tile = int(split_layout["wide_tile"])
+            if wide_tile <= 0 or wide_tile % tile_size or rows_capacity % wide_tile:
+                raise ValueError(
+                    "split_layout.wide_tile must be a multiple of tile_size "
+                    "dividing rows_capacity"
+                )
+            wide_capacity = split_layout["wide_list"].shape[0]
+            wide_slots = rows_capacity // wide_tile
+            if wide_capacity <= 0 or wide_capacity > wide_slots:
+                raise ValueError("split_layout.wide_list must hold 1..slots entries")
+            for name, expected in (
+                ("wide_expert", (wide_slots,)),
+                ("wide_limit", (wide_slots,)),
+                ("wide_list", (wide_capacity,)),
+                ("wide_count", (1,)),
+            ):
+                tensor = split_layout[name]
+                _check_tensor(
+                    "split_layout." + name,
+                    tensor,
+                    expected,
+                    torch.int32,
+                    device,
+                    contiguous=True,
+                )
+                writable.append(("split_layout." + name, tensor))
+            list_ints = (
+                tile_size,
+                int(split_layout["wide_min_rows"]),
+                int(split_layout.get("wide_min_permille", 0)),
+            )
+    elif dispatch_lists is not None or split_layout is not None:
+        raise ValueError(
+            "dispatch_lists / split_layout require moe_sort_buffers (fused sorting)"
+        )
 
     if topk_weights is None:
         mode = "packed"
@@ -876,14 +1133,20 @@ def _plan_route_preprocess(
             )
             # Work-list pointers; without lists the (never written) slots
             # alias the padded-total word so the signature stays fixed.
-            list_source = (
-                dispatch_lists
-                if dispatch_lists is not None
-                else {
-                    name: moe_sort_buffers["out_total_num_padded_tokens"]
-                    for name in _LIST_BUFFER_NAMES
-                }
-            )
+            padded_word = moe_sort_buffers["out_total_num_padded_tokens"]
+            list_source = {name: padded_word for name in _LIST_BUFFER_NAMES}
+            list_source.update({name: padded_word for name in _WIDE_BUFFER_NAMES})
+            if dispatch_lists is not None:
+                list_source.update(
+                    {name: dispatch_lists[name] for name in _LIST_BUFFER_NAMES}
+                )
+            if split_layout is not None:
+                list_source.update(
+                    {
+                        name: split_layout[name]
+                        for name in _WIDE_BUFFER_NAMES + ("wide_list", "wide_count")
+                    }
+                )
             pointers += tuple(
                 make_ptr(
                     cutlass.Int32,
@@ -891,7 +1154,7 @@ def _plan_route_preprocess(
                     cute.AddressSpace.gmem,
                     assumed_align=4,
                 )
-                for name in _LIST_BUFFER_NAMES
+                for name in _LIST_BUFFER_NAMES + _WIDE_BUFFER_NAMES
             )
             arguments = pointers + (
                 tokens,
@@ -903,6 +1166,9 @@ def _plan_route_preprocess(
                 tile_size,
                 tile_capacity,
                 *list_ints,
+                wide_tile,
+                wide_capacity,
+                rows_capacity,
                 *topk_ids.stride(),
                 *weight_strides,
             )
@@ -915,7 +1181,17 @@ def _plan_route_preprocess(
                 *weight_strides,
             )
         single_tile_per_expert = (
-            _single_tile_per_expert and sorts_tokens and tile_size >= tokens
+            _single_tile_per_expert
+            and sorts_tokens
+            and tile_size >= tokens
+            and split_layout is None
+        )
+        # Row staging capacity, rounded to bound the number of compiled
+        # kernel variants across token counts.
+        max_rows = (
+            -(-rows_capacity // 4096) * 4096
+            if sorts_tokens and max_routes > FUSED_ROUTE_MAX_ROUTES
+            else 0
         )
         cache_key = (
             mode,
@@ -926,6 +1202,9 @@ def _plan_route_preprocess(
             single_tile_per_expert,
             bool(clear_output),
             dispatch_lists is not None,
+            split_layout is not None,
+            max_routes,
+            max_rows,
         )
         compiled = _route_preprocess_kernel_cache.get(cache_key)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
@@ -935,9 +1214,11 @@ def _plan_route_preprocess(
                     mode,
                     threads,
                     single_tile_per_expert,
-                    max_routes=FUSED_ROUTE_MAX_ROUTES,
+                    max_routes=max_routes,
                     clear=bool(clear_output),
                     dispatch_lists=dispatch_lists is not None,
+                    split_layout=split_layout is not None,
+                    max_rows=max_rows,
                 )
                 if sorts_tokens
                 else _RoutePreprocess(mode, threads, clear=bool(clear_output))
@@ -955,6 +1236,7 @@ def _plan_route_preprocess(
                 output,
                 moe_sort_buffers,
                 dispatch_lists,
+                split_layout,
             ),
             route_ids,
             route_weights,
