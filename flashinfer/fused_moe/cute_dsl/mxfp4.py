@@ -47,6 +47,7 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     blockscaled_contiguous_grouped_gemm_finalize_fusion,
 )
 from .swapab_moe import (
+    SWAP_MAX_AB_STAGES,
     SWAP_ROW_TILE,
     fill_permuted_token_index,
     swap_row_tma,
@@ -151,6 +152,12 @@ SWAP_SPLIT_EP = os.environ.get("SWAPAB_SPLIT_EP", "0") == "1"
 # Wide launches of the split form: trigger their programmatic dependents at
 # kernel entry (they often find no work items).
 SWAP_SPLIT_EARLY_TRIGGER = os.environ.get("SWAPAB_SPLIT_EARLY_TRIGGER", "1") != "0"
+# Plain chain (routing -> GEMM1 -> GEMM2, no split / hybrid / mixed launches):
+# GEMM1 triggers its dependent right after its own dependency wait and GEMM2
+# waits on GEMM1 only in the warps that load GEMM1's output, so GEMM2's CTAs
+# take the SMs GEMM1's tile-less CTAs leave and stream their weight stages
+# while GEMM1 runs. SWAPAB_DEP_PREFETCH=0 disables.
+SWAP_DEP_PREFETCH = os.environ.get("SWAPAB_DEP_PREFETCH", "1") != "0"
 # N tile of the wide dense GEMM1 by token count: with few wide groups the
 # 128-wide tile doubles the streaming CTAs (B300 TP8 empty: T=128 65 -> 57 us,
 # T=512 140 -> 134), from T=1024 the 256-wide tile is back ahead (236 vs 242).
@@ -851,6 +858,9 @@ class Mxfp4MoESwapAbPlan:
         # Swap-chain kernels are PDL-launched (see SWAP_PDL); each waits before
         # its first read of a predecessor's output.
         self._pdl = pdl = w.enable_pdl or SWAP_PDL
+        self._dep_prefetch = SWAP_DEP_PREFETCH and not (
+            self.split or self.hybrid or self.mixed
+        )
         x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf = self._inputs
         b = self._buffers
         num_tokens = x.shape[0]
@@ -1032,6 +1042,7 @@ class Mxfp4MoESwapAbPlan:
                 zero_output=None,
                 n_tile=self.n_tile,
                 enable_pdl=pdl,
+                pdl_trigger_after_wait=pdl and self._dep_prefetch,
                 weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
                 **{
@@ -1283,6 +1294,16 @@ class Mxfp4MoESwapAbPlan:
                 and not os.environ.get("SWAPAB_KBLOCKS2")
             ):
                 gemm2_k_blocks = 4
+                # dep_prefetch_full_ring: with the dependent-side prefetch the
+                # weight tile is resident before GEMM1 ends only if the stage
+                # ring covers K; 8-block (256-wide) stages do for K = 3072
+                # (12 stages). B300 EP8 decode rows: 1.02-1.03x -> 1.04-1.05x.
+                if (
+                    self._dep_prefetch
+                    and w.intermediate_shard % 256 == 0
+                    and w.intermediate_shard // 256 <= SWAP_MAX_AB_STAGES
+                ):
+                    gemm2_k_blocks = 8
             gemm2_m_group = None
             if (
                 w.intermediate_shard <= SWAP_TWO_STAGE_MAX_SHARD
@@ -1329,6 +1350,7 @@ class Mxfp4MoESwapAbPlan:
                 weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
                 m_group=gemm2_m_group,
+                late_dep_wait=self._pdl and self._dep_prefetch,
                 **gemm2_lists,
             )
 

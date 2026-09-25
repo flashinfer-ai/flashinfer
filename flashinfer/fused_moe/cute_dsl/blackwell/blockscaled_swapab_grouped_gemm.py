@@ -113,6 +113,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sf_blocked: bool = False,
         wide_out: bool = False,
         pdl_trigger_early: bool = False,
+        late_dep_wait: bool = False,
+        pdl_trigger_after_wait: bool = False,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
@@ -140,6 +142,18 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # work items (the wide launches of the split form) the dependent
         # grid becomes resident during this grid's prologue and wait.
         self.pdl_trigger_early = bool(pdl_trigger_early)
+        # Dependent-side prefetch (plain routing -> GEMM1 -> GEMM2 chain):
+        # ``late_dep_wait`` lets only the warps loading the row operand (the
+        # predecessor's output) wait on the dependency, so the scheduler and
+        # TMA warps stream the routing tables and the weight stages while the
+        # predecessor still runs; every other input of this launch was written
+        # by grids that completed before the predecessor started. Requires the
+        # predecessor to trigger no earlier than after its own dependency wait
+        # (``pdl_trigger_after_wait`` on it).
+        self.late_dep_wait = bool(late_dep_wait)
+        self.pdl_trigger_after_wait = bool(pdl_trigger_after_wait)
+        if self.pdl_trigger_early and self.pdl_trigger_after_wait:
+            raise ValueError("pdl_trigger_early and pdl_trigger_after_wait are exclusive")
         self.use_linear_beta = use_linear_beta
         # GEMM1 gathers activation rows through the permuted->expanded map;
         # GEMM2 reads the already-permuted GEMM1 output rows contiguously.
@@ -1051,7 +1065,20 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Programmatic dependent launch: the prologue above (allocation, barrier
         # init, descriptor prefetch) does not depend on the predecessor grid;
         # wait here, before the first read of a routing output.
-        griddepcontrol_wait()
+        if cutlass.const_expr(self.late_dep_wait):
+            # Only the row operand is the predecessor's output: its loaders
+            # wait, the scheduler / TMA / MMA / epilogue warps start at once.
+            reads_rows = (warp_idx >= self.gather_warp_id) & (
+                warp_idx < self.gather_warp_id + self.num_gather_warps
+            )
+            if cutlass.const_expr(self.row_tma and not self.gather_rows):
+                reads_rows = reads_rows | (warp_idx == self.tma_warp_id)
+            if reads_rows:
+                griddepcontrol_wait()
+        else:
+            griddepcontrol_wait()
+            if cutlass.const_expr(self.pdl_trigger_after_wait):
+                griddepcontrol_launch_dependents()
         num_valid_groups = num_non_exiting_tiles[0]
 
         # First tile before the CTA-wide sync so consumers can start immediately.
@@ -2175,7 +2202,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
-        if cutlass.const_expr(not self.pdl_trigger_early):
+        if cutlass.const_expr(
+            not (self.pdl_trigger_early or self.pdl_trigger_after_wait)
+        ):
             griddepcontrol_launch_dependents()
 
     # ------------------------------------------------------------------

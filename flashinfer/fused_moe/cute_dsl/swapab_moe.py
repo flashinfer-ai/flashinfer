@@ -367,6 +367,8 @@ def _get_compiled_swapab_kernel(
     wide_out: bool = False,
     m_group: Optional[int] = None,
     pdl_trigger_early: bool = False,
+    late_dep_wait: bool = False,
+    pdl_trigger_after_wait: bool = False,
 ):
     import os
     import sys
@@ -406,6 +408,8 @@ def _get_compiled_swapab_kernel(
         sf_blocked,
         wide_out,
         pdl_trigger_early,
+        late_dep_wait,
+        pdl_trigger_after_wait,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -430,6 +434,8 @@ def _get_compiled_swapab_kernel(
             sf_blocked=sf_blocked,
             wide_out=wide_out,
             pdl_trigger_early=pdl_trigger_early,
+            late_dep_wait=late_dep_wait,
+            pdl_trigger_after_wait=pdl_trigger_after_wait,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -473,6 +479,8 @@ def swapab_gemm1_situ(
     group_rows: Optional[int] = None,
     sf_blocked: bool = False,
     pdl_trigger_early: bool = False,
+    late_dep_wait: bool = False,
+    pdl_trigger_after_wait: bool = False,
 ) -> None:
     """GEMM1 (up/gate) + SiTU + MXFP8 requantization on the swap path.
 
@@ -568,6 +576,8 @@ def swapab_gemm1_situ(
         group_rows=group_rows,
         sf_blocked=sf_blocked,
         pdl_trigger_early=pdl_trigger_early,
+        late_dep_wait=late_dep_wait,
+        pdl_trigger_after_wait=pdl_trigger_after_wait,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -599,6 +609,8 @@ def swapab_gemm2(
     sf_blocked: bool = False,
     m_group: Optional[int] = None,
     pdl_trigger_early: bool = False,
+    late_dep_wait: bool = False,
+    pdl_trigger_after_wait: bool = False,
 ) -> None:
     """GEMM2 (down) on the swap path.
 
@@ -698,6 +710,8 @@ def swapab_gemm2(
         wide_out=wide_out,
         m_group=m_group,
         pdl_trigger_early=pdl_trigger_early,
+        late_dep_wait=late_dep_wait,
+        pdl_trigger_after_wait=pdl_trigger_after_wait,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)
