@@ -452,6 +452,9 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
+# Prims-TS (CUTLASS primitives + task scheduling) GEMMs are SM100/SM103 only.
+_PRIMS_TS_ARCHS = (100, 103)
+
 # Dense BF16 follows the architecture dispatch already exposed by the flat
 # CUTLASS API.
 _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
@@ -682,6 +685,102 @@ class CakeWarpDecodeConfig:
 
     def __repr__(self) -> str:
         return "CakeWarpDecodeConfig(backend='cake')"
+
+
+@dataclass(frozen=True)
+class PrimsTsConfig:
+    """Explicit Prims-TS backend for SM100 and SM103.
+
+    Opt-in only: this config is never part of the default backend list. The
+    physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` (NVFP4×NVFP4, MajorK) and
+    :class:`TrtllmBf16Config` (BF16×BF16, BlockMajorK). Register the same
+    dictionary under ``"prims_ts"`` and the matching TRT-LLM key to share one
+    quantized representation between the two runners.
+
+    The GEMM middle stage is Prims-TS; routing and finalize stay on the
+    TRT-LLM Gen path.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _PRIMS_TS_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the shared TRTLLM physical weight view for Prims-TS.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("prims_ts", view)``. The same dictionary
+        may also be registered for ``"trtllm_fp4_routed"`` (NVFP4×NVFP4) or
+        ``"trtllm_bf16_routed"`` (BF16×BF16) without copying.
+        """
+        pair = quant.pair
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return TrtllmFp4Config.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                quant=quant,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                permute_cache=permute_cache,
+            )
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return TrtllmBf16Config.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                permute_cache=permute_cache,
+            )
+        raise ValueError(
+            "Prims-TS weight preparation supports NVFP4×NVFP4 and BF16×BF16, "
+            f"got {quant!r}."
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig,
+    ):
+        """Build activations for the matching TRTLLM physical layout.
+
+        NVFP4×NVFP4 returns ``(hidden_states_q, hidden_states_scale)``.
+        BF16×BF16 returns ``(hidden_states_bf16, None)``.
+        """
+        pair = quant.pair
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return TrtllmFp4Config.prepare_activations(
+                hidden_states_bf16,
+                quant=quant,
+            )
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return hidden_states_bf16, None
+        raise ValueError(
+            "Prims-TS activation preparation supports NVFP4×NVFP4 and "
+            f"BF16×BF16, got {quant!r}."
+        )
+
+    def __repr__(self) -> str:
+        return "PrimsTsConfig()"
 
 
 @dataclass(frozen=True)
@@ -1853,6 +1952,7 @@ class B12xW4A16Config:
 # Union type for backend config
 BackendConfigType = Union[
     CakeWarpDecodeConfig,
+    PrimsTsConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
@@ -1886,6 +1986,7 @@ BackendConfigType = Union[
 
 ALL_BACKEND_CONFIGS = (
     CakeWarpDecodeConfig,
+    PrimsTsConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
