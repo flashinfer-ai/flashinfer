@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import inspect
 import threading
 import weakref
 
@@ -25,6 +26,20 @@ from ..jit import gen_cudnn_fmha_module
 
 
 _attention_handles = threading.local()
+
+
+def supports_ordered_cudnn_execution(graph_type):
+    """Detect the optional tensor-sequence overload once, independent of engine."""
+    return _supports_ordered_execute(getattr(graph_type, "execute", None))
+
+
+@functools.cache
+def _supports_ordered_execute(execute):
+    try:
+        return "tensor_uids" in inspect.signature(execute).parameters
+    except (TypeError, ValueError):
+        # Older native graph classes may not expose an inspectable signature.
+        return False
 
 
 class _AttentionHandle:

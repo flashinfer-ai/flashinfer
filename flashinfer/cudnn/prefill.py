@@ -10,7 +10,11 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
 from ..utils import check_lse_base, log2e
-from .utils import get_cudnn_fmha_gen_module, get_cudnn_attention_handle
+from .utils import (
+    get_cudnn_fmha_gen_module,
+    get_cudnn_attention_handle,
+    supports_ordered_cudnn_execution,
+)
 
 try:
     import cudnn
@@ -1043,7 +1047,7 @@ class _CudnnPrefillPlan:
 
     Tensor values can change in place. Layout changes require another plan;
     detached views keep a caller's later Tensor metadata mutation from changing
-    these descriptors. Each execute copies its binding map before rebinding.
+    these descriptors. Each execute creates call-local bindings before rebinding.
     """
 
     _tensor_fields = (
@@ -1132,6 +1136,22 @@ class _CudnnPrefillPlan:
         without_stats = bindings.copy()
         without_stats.pop(UIDs.RAGGED_STATS_UID.value, None)
         self.bindings = (without_stats, bindings)
+        dynamic_uids = (
+            UIDs.Q_UID.value,
+            UIDs.K_UID.value,
+            UIDs.V_UID.value,
+            UIDs.O_UID.value,
+        )
+        self.ordered_bindings = (
+            (
+                dynamic_uids + tuple(without_stats),
+                (None,) * 4 + tuple(without_stats.values()),
+            ),
+            (
+                dynamic_uids + (UIDs.STATS_UID.value,) + tuple(bindings),
+                (None,) * 5 + tuple(bindings.values()),
+            ),
+        )
         self.execution_shape = exact[0][0]
         self.bound_graph = None
         self.execute_kwargs = {}
@@ -1173,6 +1193,7 @@ class CudnnPrefillGraph:
         "graph",
         "override_cache",
         "return_lse",
+        "ordered_execution",
     )
 
     def __init__(self, key, graph, *, override_cache, return_lse: bool):
@@ -1180,6 +1201,7 @@ class CudnnPrefillGraph:
         self.graph = graph
         self.override_cache = override_cache
         self.return_lse = return_lse
+        self.ordered_execution = supports_ordered_cudnn_execution(type(graph))
 
     def matches_plan(self, q, k_cache, v_cache, scale, plan, return_lse):
         metadata = plan.metadata
@@ -1223,6 +1245,22 @@ class CudnnPrefillGraph:
                 else {}
             )
             plan.bound_graph = self
+        if self.ordered_execution:
+            uids, template = plan.ordered_bindings[self.return_lse]
+            buffers = list(template)
+            buffers[:4] = q, k_cache, v_cache, out
+            if self.return_lse:
+                buffers[4] = lse
+            return self._execute(
+                q,
+                out,
+                lse,
+                workspace_buffer,
+                buffers,
+                plan.execute_kwargs,
+                lse_base,
+                tensor_uids=uids,
+            )
         var_map = plan.bindings[self.return_lse].copy()
         var_map.update(
             {
@@ -1235,7 +1273,13 @@ class CudnnPrefillGraph:
         if self.return_lse:
             var_map[UIDs.STATS_UID.value] = lse
         return self._execute(
-            q, out, lse, workspace_buffer, var_map, plan.execute_kwargs, lse_base
+            q,
+            out,
+            lse,
+            workspace_buffer,
+            var_map,
+            plan.execute_kwargs,
+            lse_base,
         )
 
     def run(
@@ -1291,12 +1335,29 @@ class CudnnPrefillGraph:
         )
 
     def _execute(
-        self, q, out, lse, workspace_buffer, var_map, execute_kwargs, lse_base
+        self,
+        q,
+        out,
+        lse,
+        workspace_buffer,
+        var_map,
+        execute_kwargs,
+        lse_base,
+        tensor_uids=None,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
-        self.graph.execute(
-            var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs
-        )
+        if tensor_uids is None:
+            self.graph.execute(
+                var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs
+            )
+        else:
+            self.graph.execute(
+                var_map,
+                workspace=workspace_buffer,
+                handle=handle,
+                tensor_uids=tensor_uids,
+                **execute_kwargs,
+            )
 
         if self.return_lse:
             # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
