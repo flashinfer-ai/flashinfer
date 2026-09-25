@@ -24,7 +24,7 @@ from typing import Any, Callable, Literal, Optional, Union
 
 import torch
 
-from ..jit.trtllm_mla_blackwell import get_domain_module
+from ..jit.cake_trtllm_mla_blackwell import get_domain_module
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..utils import get_compute_capability, get_device_sm_count, log2e
 

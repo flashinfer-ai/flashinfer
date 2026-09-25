@@ -3688,7 +3688,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     )
 
     if backend == "trtllm-mla-blackwell":
-        from .trtllm_mla_blackwell import trtllm_mla_blackwell_decode
+        from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
         return trtllm_mla_blackwell_decode(
             query=query,

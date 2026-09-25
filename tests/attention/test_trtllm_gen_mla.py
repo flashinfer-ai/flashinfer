@@ -1918,7 +1918,7 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
 def test_trtllm_mla_blackwell_semantic_domain_selection(
     overrides: dict, expected_domain: str
 ) -> None:
-    from flashinfer.mla.trtllm_mla_blackwell import (
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
         ROUTE_TO_DOMAIN,
         _BlackwellDispatchMetadata,
         _select_route,
@@ -1946,7 +1946,7 @@ def test_trtllm_mla_blackwell_semantic_domain_selection(
 
 
 def test_trtllm_mla_blackwell_rejects_non_scalar_or_nonfinite_scales() -> None:
-    from flashinfer.mla.trtllm_mla_blackwell import _normalize_scale
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _normalize_scale
 
     with pytest.raises(TypeError, match="requires scalar bmm1_scale"):
         _normalize_scale(torch.ones(1), "bmm1_scale")
@@ -1957,7 +1957,7 @@ def test_trtllm_mla_blackwell_rejects_non_scalar_or_nonfinite_scales() -> None:
 def test_trtllm_mla_blackwell_caches_host_lengths_until_tensor_version_changes() -> (
     None
 ):
-    from flashinfer.mla.trtllm_mla_blackwell import (
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
         _HOST_METADATA_CACHE,
         _host_int_tuple,
     )

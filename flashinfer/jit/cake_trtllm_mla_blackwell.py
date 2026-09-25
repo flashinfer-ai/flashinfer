@@ -44,7 +44,7 @@ _TARGETS = {
 }
 _TARGET_ORDER = tuple(_TARGETS)
 _ARCH_CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
-_SOURCE_CATALOG_RELATIVE_PATH = Path("generated") / "source_catalog.json"
+_SOURCE_CATALOG_RELATIVE_PATH = Path("generated") / "cake_source_catalog.json"
 _DOMAIN_DEVICE_COUNTS = {
     "mla_bf16_vquarter": 1,
     "mla_bf16_vhalf": 1,
@@ -65,10 +65,10 @@ _C_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 def _source_dir() -> Path:
     """Locate the generated MLA source package in installs and checkouts."""
 
-    packaged = jit_env.FLASHINFER_CSRC_DIR / "mla" / "trtllm_mla_blackwell"
+    packaged = jit_env.FLASHINFER_CSRC_DIR / "cake_trtllm_mla_blackwell"
     if packaged.is_dir():
         return packaged
-    return Path(__file__).resolve().parents[2] / "csrc" / "mla" / "trtllm_mla_blackwell"
+    return Path(__file__).resolve().parents[2] / "csrc" / "cake_trtllm_mla_blackwell"
 
 
 def _source_record(
@@ -223,7 +223,7 @@ def _source_catalog() -> Mapping[str, object]:
                 kind="host_source",
             )
             host_path = str(host["path"])
-            if host_path != f"host/{target}/{domain}.cpp" or host_path in source_paths:
+            if host_path != f"host/{target}/cake_{domain}.cpp" or host_path in source_paths:
                 raise RuntimeError("TRT-LLM MLA catalog host source paths are invalid")
             source_paths.add(host_path)
             devices = devices_by_target[target]
@@ -252,7 +252,7 @@ def _source_catalog() -> Mapping[str, object]:
                 )
             module_idents.update(idents)
             paths = [str(record["path"]) for record in records]
-            expected_paths = [f"device/{target}/{ident}.cu" for ident in idents]
+            expected_paths = [f"device/{target}/cake_{ident}.cu" for ident in idents]
             if paths != expected_paths or any(path in source_paths for path in paths):
                 raise RuntimeError(
                     "TRT-LLM MLA catalog device source paths are invalid"
