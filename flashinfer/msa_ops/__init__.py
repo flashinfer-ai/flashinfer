@@ -26,6 +26,7 @@ from .sparse_decode import (
     prepare_msa_nvfp4_sparse_decode,
 )
 from .sparse_topk_select import msa_topk_select
+from .minimax_m3 import MiniMaxM3SparseDecodeWorkspace, minimax_m3_sparse_attn_decode
 
 # Legacy aggregate capability flag retained for callers that only target
 # SM120/SM121. Mixed-architecture callers should query supports_packed_kv().
@@ -55,4 +56,6 @@ __all__ = [
     "msa_topk_select",
     "prepare_msa_nvfp4_sparse_decode",
     "supports_packed_kv",
+    "MiniMaxM3SparseDecodeWorkspace",
+    "minimax_m3_sparse_attn_decode",
 ]
