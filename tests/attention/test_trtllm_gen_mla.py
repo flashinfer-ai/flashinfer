@@ -1981,9 +1981,21 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
     if get_compute_capability(torch.device("cuda")) not in {(10, 0), (10, 3)}:
         pytest.skip("TRT-LLM MLA Blackwell requires SM100a or SM103a")
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _source_catalog, _target_key
+
+    device = torch.device("cuda")
+    try:
+        target = _target_key(device)
+    except ValueError as exc:
+        pytest.skip(f"TRT-LLM MLA Blackwell has no target for this GPU: {exc}")
+    shipped_targets = _source_catalog()["target_order"]
+    if target not in shipped_targets:
+        pytest.skip(
+            f"TRT-LLM MLA Blackwell generated-source catalog ships "
+            f"{shipped_targets!r}, not {target!r}"
+        )
 
     torch.manual_seed(42)
-    device = torch.device("cuda")
     page_size = 32
     max_seq_len = 1024
     pages_per_sequence = max_seq_len // page_size
