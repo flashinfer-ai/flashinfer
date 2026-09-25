@@ -16,6 +16,7 @@ limitations under the License.
 
 from types import SimpleNamespace
 
+import pytest
 from packaging.version import Version
 
 # SM100-named modules that SM103 loads at runtime, so a jit-cache built only for
@@ -128,3 +129,26 @@ def test_combined_build_registers_both_variants(monkeypatch):
     )
 
     assert registered >= SM103_SHARED_MODULES | SM100_ONLY_MODULES | SM103_ONLY_MODULES
+
+
+@pytest.mark.parametrize(
+    ("arch_list", "expected", "unexpected"),
+    [
+        ("10.0a", "compute_100a", "compute_103a"),
+        ("10.3a", "compute_103a", "compute_100a"),
+    ],
+)
+def test_trtllm_gen_gemm_targets_the_built_sm10x_arch(
+    monkeypatch, arch_list, expected, unexpected
+):
+    # Provider validation rejects an sm_100a image in the sm103a wheel.
+    from flashinfer.compilation_context import CompilationContext
+    from flashinfer.jit.gemm import core as gemm_core
+
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
+    monkeypatch.setattr(gemm_core, "current_compilation_context", CompilationContext())
+
+    flags = " ".join(gemm_core._trtllm_gen_gemm_nvcc_flags(enable_rubin=False))
+
+    assert expected in flags
+    assert unexpected not in flags
