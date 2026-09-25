@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """DeepSeek-V3 MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM.
 
-Compares NVFP4 and BF16 MoE backends on DeepSeek-V3 configuration:
+Compares NVFP4, MXFP8, and BF16 MoE backends on DeepSeek-V3 configuration:
 - CuteDSL W4A4: NVFP4 activations and weights
 - CuteDSL W4A16: BF16 activations with NVFP4 weights decoded online
 - CUTLASS: NVIDIA CUTLASS-based implementation
 - TRTLLM NVFP4: TensorRT-LLM's NVFP4 implementation
+- TRTLLM MXFP8: E4M3 activations and weights with 32-element UE8M0 scales
 - TRTLLM BF16: unquantized BF16 activations and weights
 
 Usage:
@@ -26,14 +27,14 @@ Usage:
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
 
-    # Include activation quantization for FP4-activation backends
+    # Include activation quantization for FP4-activation and MXFP8 backends
     python bench_moe_deepseek.py --include-activation-quant
 
     # Compare CuTe DSL W4A4/W4A16 against pure BF16 TRTLLM MoE
     python bench_moe_deepseek.py --backends cutedsl,trtllm-bf16
 
-    # Compare TRTLLM NVFP4 and BF16
-    python bench_moe_deepseek.py --backends trtllm-nvfp4,trtllm-bf16
+    # Compare TRTLLM NVFP4, MXFP8, and BF16
+    python bench_moe_deepseek.py --backends trtllm-nvfp4,trtllm-mxfp8,trtllm-bf16
 
     # Disable CUDA graph (useful for debugging or profiling)
     python bench_moe_deepseek.py --no-cuda-graph
@@ -726,14 +727,14 @@ def bench_trtllm(
     distributions=("uniform",),
     precision="nvfp4",
 ):
-    """Benchmark TRTLLM NVFP4 or pure BF16 MoE with native finalize.
+    """Benchmark TRTLLM NVFP4, MXFP8, or pure BF16 MoE with native finalize.
 
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
-        precision: ``"nvfp4"`` or ``"bf16"``. Both modes prepare the same
+        precision: ``"nvfp4"``, ``"mxfp8"``, or ``"bf16"``. All modes prepare the same
             source weights outside timing. BF16 preserves the activations
-            and weights without quantization; FP4 activation flags do not
-            affect it.
+            and weights without quantization. FP4 per-token and 4over6 flags
+            do not affect MXFP8 or BF16.
     """
     from flashinfer.fused_moe import RoutingMethodType
     from flashinfer.fused_moe.da_tuner import (
@@ -761,6 +762,8 @@ def bench_trtllm(
         local_expert_offset=local_expert_offset,
         local_num_experts=num_local_experts,
         do_finalize=True,
+        # Profile large-token rows at their own size, beyond the native 8192 cap.
+        tune_max_num_tokens=max(n, 8192),
     )
 
     if precision == "bf16":
@@ -785,6 +788,48 @@ def bench_trtllm(
             gemm2_weights=weights["gemm2_weights"],
         )
         logits_moe, routed_moe = trtllm_bf16_moe, trtllm_bf16_routed_moe
+    elif precision == "mxfp8":
+        from flashinfer.fused_moe import (
+            QuantConfig,
+            QuantFormat,
+            TrtllmFp8BlockConfig,
+            trtllm_fp8_block_scale_moe,
+            trtllm_fp8_block_scale_routed_moe,
+        )
+        from flashinfer.tllm_enums import Fp8QuantizationType, WeightLayout
+
+        quant = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+        # Reuse the public gated row reorder and shuffled MajorK scale layout.
+        weights = TrtllmFp8BlockConfig.prepare_weights(
+            inputs["w1_bf16"][expert_start:expert_end],
+            inputs["w2_bf16"][expert_start:expert_end],
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=CFG.intermediate_size,
+            device=dev,
+        )
+        moe_kwargs.update(
+            gemm1_weights=weights["gemm1_weights"],
+            gemm1_weights_scale=weights["gemm1_weights_scale"],
+            gemm2_weights=weights["gemm2_weights"],
+            gemm2_weights_scale=weights["gemm2_weights_scale"],
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK,
+        )
+
+        def quantize_hidden(hidden_states):
+            return TrtllmFp8BlockConfig.prepare_activations(hidden_states, quant=quant)
+
+        if not include_activation_quant:
+            hidden_states, hidden_states_scale = quantize_hidden(inputs["hidden_bf16"])
+            input_kwargs.update(
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+            )
+        logits_moe = trtllm_fp8_block_scale_moe
+        routed_moe = trtllm_fp8_block_scale_routed_moe
     elif precision == "nvfp4":
         from flashinfer import SfLayout, nvfp4_quantize
         from flashinfer.fused_moe import (
@@ -821,7 +866,7 @@ def bench_trtllm(
                 )
             else:
                 hidden_states, hidden_states_scale = fp4_quantize(
-                    hidden_states, hidden_global_scale, sv, False, True
+                    hidden_states, hidden_global_scale, sv, False, False
                 )
                 per_token_scale = None
             hidden_states = hidden_states.view(torch.uint8).reshape(
@@ -882,6 +927,7 @@ def bench_trtllm(
         sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
         moe_kwargs.update(
             gemm1_weights=w1f,
+            hidden_states_scale_layout=SfLayout.layout_linear,
             gemm1_weights_scale=w1s,
             gemm1_bias=None,
             gemm1_alpha=None,
@@ -907,6 +953,9 @@ def bench_trtllm(
     routing_weights = None
     is_routed = routing_input_mode == "routed"
     if is_routed:
+        if precision == "mxfp8":
+            # The FP8 Renormalize path consumes precomputed, ungrouped routes.
+            moe_kwargs.update(n_group=None, topk_group=None)
         # Share this row's cached routes across precisions, including after
         # autotuning advances the RNG. Release the cache with the input row.
         factory = inputs.get("_trtllm_routing_factory")
@@ -951,9 +1000,13 @@ def bench_trtllm(
                 hidden_states_scale=hidden_states_scale,
                 per_token_scale=per_token_scale,
             )
+        elif precision == "mxfp8":
+            if include_activation_quant:
+                hidden_states, hidden_states_scale = quantize_hidden(hidden_states)
+            activation_kwargs["hidden_states_scale"] = hidden_states_scale
         if is_routed:
             routing_kwargs = {"topk_ids": (routing_ids, routing_weights)}
-            if precision == "nvfp4":
+            if precision in ("nvfp4", "mxfp8"):
                 routing_kwargs["routing_bias"] = None
         else:
             routing_kwargs = dict(
@@ -1056,8 +1109,8 @@ def run_benchmark(
         routing_bias_scale: Scale for random routing bias generation
         use_per_token_activation: Whether supported FP4 MoE backends should use
             per-token NVFP4 activation scaling.
-        include_activation_quant: Include the initial activation FP4
-            quantization in each backend's timing.
+        include_activation_quant: Include the initial FP4 or MXFP8 activation
+            quantization in each quantized-activation backend's timing.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         profile_cuda: Capture one backend for an external CUDA profiler.
@@ -1171,7 +1224,10 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    selected = set(backends or ("cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"))
+    selected = set(
+        backends
+        or ("cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-mxfp8", "trtllm-bf16")
+    )
     run_cute_dsl_w4a4 = "cutedsl" in selected and profile_backend in (
         None,
         "cute-dsl",
@@ -1185,7 +1241,10 @@ def _benchmark_single(
         None,
         "trtllm-nvfp4",
     )
-
+    run_trtllm_mxfp8 = "trtllm-mxfp8" in selected and profile_backend in (
+        None,
+        "trtllm-mxfp8",
+    )
     run_trtllm_bf16 = "trtllm-bf16" in selected and profile_backend in (
         None,
         "trtllm-bf16",
@@ -1247,6 +1306,7 @@ def _benchmark_single(
         )
     for precision, enabled in (
         ("nvfp4", run_trtllm_nvfp4),
+        ("mxfp8", run_trtllm_mxfp8),
         ("bf16", run_trtllm_bf16),
     ):
         if enabled:
@@ -1295,16 +1355,16 @@ def _print_header(
     use_fused_finalize=True,
 ):
     """Print benchmark header."""
-    table_width = 173 if use_per_token_activation else 212
+    table_width = 217 if use_per_token_activation else 256
     print("\n" + "=" * table_width)
     if use_per_token_activation:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4 / TRTLLM BF16 "
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4 / TRTLLM MXFP8 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     else:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM BF16 "
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM MXFP8 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     print("=" * table_width)
@@ -1327,7 +1387,7 @@ def _print_header(
         f"(larger values tend to create expert imbalance)"
     )
     print(
-        "Timed initial activation quantization for FP4-activation backends: "
+        "Timed initial activation quantization for FP4-activation and MXFP8 backends: "
         f"{'included' if include_activation_quant else 'excluded'}; "
         "W4A16 and TRTLLM BF16 consume BF16 directly"
     )
@@ -1336,7 +1396,7 @@ def _print_header(
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
     )
     print(
-        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
+        "TRTLLM NVFP4 / TRTLLM MXFP8 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
     )
     if use_per_token_activation:
         print("CUTLASS omitted: it does not consume the per-token activation scale.")
@@ -1347,8 +1407,10 @@ def _print_header(
             f"{'CuteDSL W4A4':^15} | "
             f"{'CuteDSL W4A16':^15} | "
             f"{'TRTLLM NVFP4':^15} | "
+            f"{'TRTLLM MXFP8':^15} | "
             f"{'TRTLLM BF16':^15} | "
             f"{'Speedup vs TRTLLM NVFP4':^23} | "
+            f"{'Speedup vs TRTLLM MXFP8':^23} | "
             f"{'Speedup vs TRTLLM BF16':^23} | "
             f"{'Winner':^12} | "
             f"{'Active':^7} | "
@@ -1360,6 +1422,8 @@ def _print_header(
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'W4A4':>11} {'W4A16':>11} | "
             f"{'W4A4':>11} {'W4A16':>11} | "
             f"{'W4A4':>11} {'W4A16':>11} | "
             f"{'':^12} | "
@@ -1373,9 +1437,11 @@ def _print_header(
             f"{'CuteDSL W4A16':^15} | "
             f"{'CUTLASS':^15} | "
             f"{'TRTLLM NVFP4':^15} | "
+            f"{'TRTLLM MXFP8':^15} | "
             f"{'TRTLLM BF16':^15} | "
             f"{'Speedup vs CUTLASS':^18} | "
             f"{'Speedup vs TRTLLM NVFP4':^23} | "
+            f"{'Speedup vs TRTLLM MXFP8':^23} | "
             f"{'Speedup vs TRTLLM BF16':^23} | "
             f"{'Winner':^12} | "
             f"{'Active':^7} | "
@@ -1388,7 +1454,9 @@ def _print_header(
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'W4A4':>8}  {'W4A16':>8} | "
+            f"{'W4A4':>11} {'W4A16':>11} | "
             f"{'W4A4':>11} {'W4A16':>11} | "
             f"{'W4A4':>11} {'W4A16':>11} | "
             f"{'':^12} | "
@@ -1408,6 +1476,7 @@ def _print_row(results, histogram_record):
         r["TRTLLM NVFP4"],
     )
     cutlass = r.get("CUTLASS")
+    mxfp8 = r["TRTLLM MXFP8"]
     bf16 = r["TRTLLM BF16"]
 
     # Calculate speedups (> 1.0 means CuteDSL is faster)
@@ -1415,6 +1484,12 @@ def _print_row(results, histogram_record):
         nvfp4.latency_ms / w4a4.latency_ms,
         nvfp4.latency_ms / w4a16.latency_ms,
     )
+
+    mxfp8_speedups = (
+        mxfp8.latency_ms / w4a4.latency_ms,
+        mxfp8.latency_ms / w4a16.latency_ms,
+    )
+    mxfp8_speedups_text = f"{mxfp8_speedups[0]:>7.2f}x {mxfp8_speedups[1]:>7.2f}x"
 
     bf16_speedups = (
         bf16.latency_ms / w4a4.latency_ms,
@@ -1442,8 +1517,10 @@ def _print_row(results, histogram_record):
             f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
             f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
+            f"{mxfp8.latency_ms:>7.3f} {mxfp8.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
             f"{speedups:>23} | "
+            f"{mxfp8_speedups_text:>23} | "
             f"{bf16_speedups_text:>23} | "
             f"{winner:^12} | "
             f"{active_experts:>7} | "
@@ -1464,9 +1541,11 @@ def _print_row(results, histogram_record):
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
             f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
             f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
+            f"{mxfp8.latency_ms:>7.3f} {mxfp8.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
             f"{cutlass_speedups_text:>18} | "
             f"{nvfp4_speedups_text:>23} | "
+            f"{mxfp8_speedups_text:>23} | "
             f"{bf16_speedups_text:>23} | "
             f"{winner:^12} | "
             f"{active_experts:>7} | "
@@ -1476,7 +1555,7 @@ def _print_row(results, histogram_record):
 
 def _print_footer(use_per_token_activation):
     """Print benchmark footer."""
-    table_width = 173 if use_per_token_activation else 212
+    table_width = 217 if use_per_token_activation else 256
     print("-" * table_width)
     print(
         "Speedup > 1.0 means that CuTe DSL mode is faster than the comparison backend"
@@ -1560,7 +1639,7 @@ def main():
     parser.add_argument(
         "--backends",
         type=str,
-        help="Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,trtllm-bf16 (default: all)",
+        help="Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,trtllm-mxfp8,trtllm-bf16 (default: all)",
     )
     parser.add_argument(
         "--distributions",
@@ -1615,7 +1694,7 @@ def main():
     parser.add_argument(
         "--include-activation-quant",
         action="store_true",
-        help="Include initial activation quantization for FP4-activation backends; BF16 is unaffected.",
+        help="Include initial FP4 or MXFP8 activation quantization; BF16 is unaffected.",
     )
     parser.add_argument(
         "--no-fused-finalize",
@@ -1641,6 +1720,7 @@ def main():
             "cute-dsl-w4a16",
             "cutlass",
             "trtllm-nvfp4",
+            "trtllm-mxfp8",
             "trtllm-bf16",
         ],
         help="Backend captured by --profile-cuda.",
@@ -1665,7 +1745,8 @@ def main():
             item.strip() for item in args.backends.split(",") if item.strip()
         )
         unknown = sorted(
-            set(backends) - {"cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"}
+            set(backends)
+            - {"cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-mxfp8", "trtllm-bf16"}
         )
         if unknown:
             parser.error(f"unknown --backends value(s): {', '.join(unknown)}")
@@ -1721,7 +1802,9 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
-    print("CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4 and TRTLLM BF16")
+    print(
+        "CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4, TRTLLM MXFP8, TRTLLM BF16"
+    )
     print(f"Tensor parallelism simulation: TP={args.tp}")
     print(f"CUDA profiler capture: {args.profile_cuda}")
     print(
@@ -1730,7 +1813,7 @@ def main():
     )
 
     print(
-        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
+        "TRTLLM NVFP4 / TRTLLM MXFP8 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
     )
 
     run_benchmark(
