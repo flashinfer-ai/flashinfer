@@ -2510,6 +2510,17 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
+        elif is_cuda_graph_compatible:
+            print(
+                "[INFO] CUTLASS backend is not CUDA-graph safe (its plan buffers "
+                "are allocated per plan() call); benchmarking it eagerly."
+            )
+
+    # Backends whose wrappers cannot run in CUDA-graph mode. They are planned
+    # and timed eagerly so the rest of the backend list still runs under graph
+    # replay: fa2 (long-standing) and cutlass, which the wrapper refuses with
+    # use_cuda_graph=True.
+    eager_only_backends = {"fa2", "cutlass"}
 
     if "trtllm-gen" in backends:
         print("[INFO] trtllm-gen backend does not support ragged prefill. Skipping.")
@@ -2787,8 +2798,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     workspace_buffer,
                     "NHD",
                     use_cuda_graph=is_cuda_graph_compatible
-                    if backend != "fa2"
-                    else False,
+                    and backend not in eager_only_backends,
                     qo_indptr_buf=qo_indptr,
                     kv_indptr_buf=kv_indptr,
                     backend=backend,
@@ -3119,7 +3129,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            use_cuda_graph=(
+                is_cuda_graph_compatible and cur_backend not in eager_only_backends
+            ),
             cold_l2_cache=True,
             input_args=(
                 q,
