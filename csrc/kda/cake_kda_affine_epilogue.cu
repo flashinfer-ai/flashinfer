@@ -262,9 +262,9 @@ struct IndexPrepParams {
 __global__ void __launch_bounds__(kThreads) index_prep_kernel(IndexPrepParams p) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
   if (i < p.num_sequences) {
-    const int64_t index = p.state_indices_i64
-                              ? static_cast<const int64_t*>(p.state_indices)[i]
-                              : static_cast<int64_t>(static_cast<const int32_t*>(p.state_indices)[i]);
+    const int64_t index =
+        p.state_indices_i64 ? static_cast<const int64_t*>(p.state_indices)[i]
+                            : static_cast<int64_t>(static_cast<const int32_t*>(p.state_indices)[i]);
     p.part_state_indices[p.first_parts[i]] = static_cast<int32_t>(index);
     p.state_indices_long[i] = index;
   }
@@ -276,8 +276,12 @@ __global__ void __launch_bounds__(kThreads) index_prep_kernel(IndexPrepParams p)
 void IndexPrep(TensorView state_indices, TensorView first_parts, TensorView part_state_indices,
                TensorView state_indices_long, TensorView checkpoint_start, TensorView part_seq_ids,
                TensorView part_local_rows, TensorView part_row_starts, int64_t num_parts) {
-  auto is_i32 = [](const TensorView& t) { return t.dtype().code == kDLInt && t.dtype().bits == 32; };
-  auto is_i64 = [](const TensorView& t) { return t.dtype().code == kDLInt && t.dtype().bits == 64; };
+  auto is_i32 = [](const TensorView& t) {
+    return t.dtype().code == kDLInt && t.dtype().bits == 32;
+  };
+  auto is_i64 = [](const TensorView& t) {
+    return t.dtype().code == kDLInt && t.dtype().bits == 64;
+  };
   const int64_t num_sequences = state_indices.size(0);
   TVM_FFI_CHECK(is_i32(state_indices) || is_i64(state_indices), ValueError)
       << "affine index prep: state indices must be int32 or int64";
