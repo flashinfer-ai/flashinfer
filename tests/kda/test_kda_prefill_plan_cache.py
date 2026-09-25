@@ -233,8 +233,11 @@ def test_deferred_part_rebinds_flush_before_another_hit_and_land_in_the_newest_o
     assert (cache.misses, cache.hits) == (1, 2)
     assert not skipped["out"].any(), "a skipped binding received output rows"
     got = _snapshot(newest)
+    # Two launches updated the in-place pool (the miss and the newest hit);
+    # replay both from the original pool without the cache.
     newest["pool"].copy_(pool)
-    _run(newest)
+    for _ in range(2):
+        _run(newest)
     _assert_same(got, _snapshot(newest))
 
 
