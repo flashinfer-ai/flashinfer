@@ -405,8 +405,10 @@ def generate_spec_dec_mask(
                 (4, 1, 32, 2, 5, 128),
                 (128, 1, 64, 2, 6, 128),
                 (256, 1, 64, 4, 8, 128),
+                # 32 q heads / 2 kv heads (group ratio 16)
                 (4, 1, 32, 2, 16, 128),
                 (4, 4, 32, 2, 16, 128),
+                # head_dim 512 (Gemma-style GQA), decode only (no spec dec)
                 (4, 1, 32, 2, 4, 512),
                 (4, 1, 32, 2, 5, 512),
                 (16, 1, 64, 2, 8, 512),
