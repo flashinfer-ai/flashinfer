@@ -5765,14 +5765,14 @@ def rebind_prepared_launch(
     view_specs, address_specs = plan.specs_for(changed)
     if defer_parts:
         prefixes = tuple(f"{name}." for name in defer_parts)
-        now_views = []
-        later_views = []
+        now_views: list[_RebindView] = []
+        later_views: list[_RebindView] = []
         for spec in view_specs:
             (later_views if spec.container.startswith(prefixes) else now_views).append(
                 spec
             )
-        now_addresses = []
-        later_addresses = []
+        now_addresses: list[_RebindAddress] = []
+        later_addresses: list[_RebindAddress] = []
         for spec in address_specs:
             (
                 later_addresses
@@ -5781,7 +5781,8 @@ def rebind_prepared_launch(
             ).append(spec)
         view_specs, address_specs = now_views, now_addresses
     else:
-        later_views = later_addresses = []
+        later_views = []
+        later_addresses = []
     tma_moved = _apply_rebind_specs(
         impl, view_specs, address_specs, inputs, address_by_input, changed
     )
