@@ -450,7 +450,26 @@ output; the summed kernel durations rise by 0.4-1.3 us because a dependent
 kernel's clock runs while it waits, so overlapped rows are reported by GPU
 span. Triggering the dependents right after the wait instead of at the end
 of the epilogue gains nothing further (the dependent CTAs cannot become
-resident before the working CTAs leave their SMs).
+resident before the working CTAs leave their SMs) as long as the
+dependent waits in every warp. In the plain chain (routing -> GEMM1 ->
+GEMM2, no split / hybrid / mixed launches; ``SWAPAB_DEP_PREFETCH``,
+default 1) GEMM1 therefore triggers its dependent right after its own
+wait -- the routing grid is complete by then -- and GEMM2 executes
+``griddepcontrol.wait`` only in the warps that load its row operand,
+GEMM1's output (the gather warps, plus the TMA warp when the row tile is
+TMA-fed); its scheduler reads the routing tables and its TMA warp streams
+the weight stages at once, so GEMM2's tile CTAs take the SMs GEMM1's
+tile-less CTAs leave and hold their weights before GEMM1 ends. The
+decode-class GEMM2 (short 4-block stages) takes 8-block stages when the
+stage ring then covers the whole K (K = 3072: 12 stages of 256), so the
+whole tile is resident. Measured on B300 (same GPU, paired, FP64
+identical): EP=8 decode rows 1.04-1.05 x (22.4-23.0 -> 21.5-21.9 us),
+MoE-TP decode 1.00-1.03 x, EP=8 ``empty`` T=128 1.03 x and T=256..1024
+1.01 x; every other row 0.997-1.007 x. Every other input of GEMM2 (tables,
+finalize metadata, the routing kernel's output clear) was written by
+grids that completed before GEMM1 started, which is what makes the
+partial wait sound; the two flags are exclusive with the entry trigger of
+the split form's wide launches.
 
 Routing preprocessing (expert histogram, permutation, per-row scale, output
 clear) runs as one fused CuTe kernel whenever ``T * top_k <= 8192``
@@ -764,6 +783,14 @@ shard's balanced row 5% (709 us against 676 us); no single tactic wins
 both, and the per-row-oracle baseline is not one a caller can deploy. Both arms record their error against the FP64 oracles on every row
 (relative L2 0.026-0.027 for both).
 
+Note on the kernel-sum rows: from the dependent-side prefetch (round 12)
+the swap GEMM2 of the plain chain starts right after GEMM1's own
+dependency wait, so on the decode-class rows its kernel duration counts
+8-11 us of waiting for GEMM1; the summed kernel durations of those rows
+exceed the row's GPU span and are no longer a measure of work. Every
+graph-span and end-to-end ratio is above one; the kernel-sum rows are
+kept for continuity with the earlier revisions only.
+
 .. list-table:: Paired ratios (TRT / candidate), all required rows
    :header-rows: 1
 
@@ -776,38 +803,38 @@ both, and the per-row-oracle baseline is not one a caller can deploy. Both arms 
    * - EP=8 (rank 3, 112 local experts)
      - Graph, GPU span
      - 44
-     - 1.304
-     - 1.013 (T128 balanced)
+     - 1.331
+     - 1.030 (T128 balanced)
      - 0
    * - EP=8
-     - Graph, kernel sum
+     - Graph, kernel sum (includes GEMM2's dependency wait, see note)
      - 44
-     - 1.212
-     - 1.004 (T128 balanced)
-     - 0
+     - 1.056
+     - 0.768 (T2 empty)
+     - 18 (all the swap-chain rows whose GEMM2 waits inside the kernel)
    * - EP=8
-     - eager, kernel sum
+     - eager, kernel sum (same note)
      - 44
-     - 1.250
-     - 1.008 (T128 balanced)
-     - 0
+     - 1.243
+     - 0.974 (T128 balanced)
+     - 3 (T128 balanced / hot / remote-dominated; eager e2e min 1.080, 0 rows)
    * - MoE TP=8 (rank 0, shard 384)
      - Graph, GPU span
      - 33
-     - 1.388
-     - 1.072 (T2048 hot)
+     - 1.396
+     - 1.073 (T2048 hot)
      - 0
    * - MoE TP=8
-     - Graph, kernel sum
+     - Graph, kernel sum (same note)
      - 33
-     - 1.283
-     - 1.027 (T2048 hot)
-     - 0
+     - 1.168
+     - 0.842 (T1 empty)
+     - 5 (decode rows of the swap chain)
    * - MoE TP=8
      - eager, kernel sum
      - 33
-     - 1.333
-     - 1.034 (T2048 hot)
+     - 1.320
+     - 1.033 (T2048 hot)
      - 0
 
 Per-``T`` Graph-mode rows, EP=8 (kernel-sum milliseconds for balanced
@@ -820,17 +847,17 @@ graph-replay e2e ratio for balanced routing):
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
    T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  remote-dom. ratio  balanced e2e ratio
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
-   1     0.0278            0.0327           1.175           1.016      1.031        1.009              1.259
-   2     0.0417            0.0503           1.206           1.042      1.033        1.181              1.258
-   4     0.0615            0.0738           1.201           1.082      1.058        1.204              1.223
-   8     0.1056            0.1222           1.157           1.288      1.293        1.279              1.187
-   16    0.1863            0.2017           1.083           1.267      1.311        1.167              1.102
-   128   0.6126            0.6149           1.004           1.018      1.138        1.004              1.017
-   256   0.6073            0.6410           1.056           1.054      1.111        1.050              1.068
-   512   0.6162            0.6985           1.134           1.071      1.326        1.151              1.143
-   1024  0.6257            0.7631           1.220           1.112      1.449        1.237              1.231
-   2048  0.8064            1.2401           1.538           1.472      1.742        1.554              1.526
-   4096  0.8392            1.2469           1.486           1.494      2.016        1.552              1.476
+   1     0.0388            0.0324           0.836           0.771      0.782        0.785              1.292
+   2     0.0489            0.0505           1.034           0.771      0.768        0.841              1.283
+   4     0.0692            0.0757           1.094           0.772      0.771        1.017              1.276
+   8     0.1131            0.1232           1.090           0.970      0.962        1.149              1.210
+   16    0.1966            0.2030           1.033           0.934      0.959        1.093              1.127
+   128   0.6320            0.6146           0.972           0.983      0.859        0.975              1.031
+   256   0.6284            0.6420           1.022           1.020      0.864        1.017              1.061
+   512   0.6311            0.6977           1.106           1.043      1.032        1.127              1.146
+   1024  0.6382            0.7636           1.196           1.081      1.112        1.207              1.233
+   2048  0.8054            1.2332           1.531           1.474      1.722        1.549              1.518
+   4096  0.8382            1.2362           1.475           1.476      2.018        1.545              1.465
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
 
 Per-``T`` Graph-mode rows, MoE TP=8:
@@ -841,17 +868,17 @@ Per-``T`` Graph-mode rows, MoE TP=8:
    ====  ================  ===============  ==============  =========  ===========  ==================
    T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  balanced e2e ratio
    ====  ================  ===============  ==============  =========  ===========  ==================
-   1     0.0280            0.0333           1.191           1.209      1.182        1.244
-   2     0.0422            0.0528           1.252           1.251      1.245        1.295
-   4     0.0627            0.0758           1.208           1.215      1.227        1.232
-   8     0.1091            0.1308           1.199           1.251      1.447        1.226
-   16    0.1880            0.2174           1.157           1.190      1.424        1.173
-   128   0.6255            0.6721           1.075           1.076      2.677        1.086
-   256   0.6474            0.6919           1.069           1.072      2.160        1.078
-   512   0.6662            0.7155           1.074           1.081      2.719        1.084
-   1024  0.7249            0.7814           1.078           1.067      2.077        1.092
-   2048  0.8342            0.8890           1.066           1.027      1.343        1.085
-   4096  0.9245            1.1066           1.197           1.186      1.231        1.192
+   1     0.0398            0.0337           0.846           0.864      0.842        1.258
+   2     0.0496            0.0531           1.071           1.064      0.856        1.296
+   4     0.0718            0.0757           1.055           1.068      0.879        1.232
+   8     0.1189            0.1311           1.103           1.137      1.035        1.235
+   16    0.2019            0.2173           1.076           1.100      1.236        1.175
+   128   0.6266            0.6723           1.073           1.079      2.670        1.082
+   256   0.6456            0.6896           1.068           1.067      2.181        1.077
+   512   0.6668            0.7134           1.070           1.079      2.726        1.081
+   1024  0.7254            0.7781           1.073           1.062      2.082        1.085
+   2048  0.8330            0.8884           1.066           1.031      1.344        1.080
+   4096  0.9252            1.1119           1.202           1.179      1.232        1.198
    ====  ================  ===============  ==============  =========  ===========  ==================
 
 Eager-mode ratios match the Graph-mode ones within 1% on every row, and
@@ -886,17 +913,17 @@ those token counts.
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
    T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  remote-dom. ratio  balanced e2e ratio
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
-   1     0.0251            0.0301           1.201           1.107      1.079        1.103              1.149
-   2     0.0392            0.0476           1.215           1.136      1.143        1.221              1.168
-   4     0.0589            0.0711           1.206           1.109      1.120        1.242              1.184
-   8     0.1028            0.1202           1.170           1.333      1.357        1.295              1.160
-   16    0.1832            0.1989           1.086           1.338      1.330        1.163              1.084
-   128   0.5928            0.6072           1.024           1.018      1.204        1.027              1.024
-   256   0.6020            0.6343           1.054           1.045      1.189        1.051              1.055
-   512   0.6116            0.6875           1.124           1.054      1.351        1.139              1.122
-   1024  0.6207            0.7419           1.195           1.073      1.302        1.211              1.191
-   2048  1.0121            1.2078           1.193           0.986      1.464        1.915              1.190
-   4096  1.4931            1.1705           0.784           0.664      1.265        1.158              0.783
+   1     0.0243            0.0308           1.267           1.157      1.133        1.152              1.189
+   2     0.0380            0.0476           1.252           1.194      1.179        1.251              1.194
+   4     0.0579            0.0711           1.229           1.162      1.184        1.283              1.177
+   8     0.1013            0.1193           1.177           1.352      1.378        1.324              1.172
+   16    0.1810            0.1987           1.098           1.378      1.376        1.186              1.092
+   128   0.5967            0.6079           1.019           1.017      1.245        1.021              1.020
+   256   0.6091            0.6349           1.042           1.037      1.229        1.042              1.042
+   512   0.6122            0.6893           1.126           1.060      1.354        1.133              1.129
+   1024  0.6193            0.7437           1.201           1.084      1.313        1.212              1.197
+   2048  1.0122            1.2017           1.187           0.991      1.473        1.915              1.183
+   4096  1.4905            1.1717           0.786           0.675      1.269        1.159              0.785
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
 
 .. table:: Deferred finalize, Graph mode, MoE TP=8
@@ -905,17 +932,17 @@ those token counts.
    ====  ================  ===============  ==============  =========  ===========  ==================
    T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  balanced e2e ratio
    ====  ================  ===============  ==============  =========  ===========  ==================
-   1     0.0248            0.0311           1.251           1.270      1.236        1.167
-   2     0.0380            0.0483           1.271           1.253      1.268        1.230
-   4     0.0576            0.0720           1.252           1.256      1.262        1.203
-   8     0.1032            0.1260           1.221           1.284      1.541        1.201
-   16    0.1831            0.2150           1.174           1.196      1.544        1.165
-   128   0.5980            0.6630           1.109           1.110      1.294        1.106
-   256   0.6082            0.6757           1.111           1.110      1.167        1.110
-   512   0.6236            0.6971           1.118           1.121      1.790        1.116
-   1024  0.6586            0.7398           1.123           1.105      1.128        1.120
-   2048  0.7483            0.8074           1.079           1.047      0.835        1.076
-   4096  1.3384            0.9509           0.710           0.687      0.639        0.714
+   1     0.0245            0.0311           1.269           1.290      1.264        1.196
+   2     0.0375            0.0487           1.300           1.273      1.275        1.234
+   4     0.0571            0.0718           1.257           1.254      1.301        1.210
+   8     0.1027            0.1263           1.230           1.299      1.579        1.206
+   16    0.1844            0.2149           1.165           1.186      1.574        1.159
+   128   0.5998            0.6604           1.101           1.103      1.418        1.098
+   256   0.6152            0.6737           1.095           1.108      1.170        1.091
+   512   0.6247            0.6958           1.114           1.120      1.801        1.113
+   1024  0.6610            0.7358           1.113           1.102      1.125        1.112
+   2048  0.7511            0.8078           1.075           1.045      0.834        1.076
+   4096  1.3485            0.9503           0.705           0.687      0.639        0.709
    ====  ================  ===============  ==============  =========  ===========  ==================
 
 Long prefill (optional rows)
@@ -990,7 +1017,14 @@ kernel end): the swap-AB chain is launched with programmatic dependent
 launch, so summed kernel durations count the overlapped wait inside the
 dependent kernels and would overstate the candidate by 0.4-1.3 us per
 row. Span is never smaller than the kernel sum for a plain launch chain,
-so the earlier rows are comparable.
+so the earlier rows are comparable. From the dependent-side prefetch
+(round 12) the swap GEMM2 of the plain chain starts right after GEMM1's
+own dependency wait and holds its weights while GEMM1 runs, so its kernel
+duration includes 8-11 us of waiting on the decode rows: the summed
+kernel durations of those rows are no longer a measure of work (their
+ratio to TRT-LLM Gen drops below one on the decode rows while the span
+and the synchronized replay time improve), and only span and end-to-end
+figures are compared from here on.
 
 .. list-table:: Roofline summary, Graph mode (candidate at the two-CTA-GEMM1
    revision, one B300 node, same-node floors)
@@ -1004,75 +1038,75 @@ so the earlier rows are comparable.
    * - EP=8 rank 3
      - 56
      - 9 (T=128 balanced/hot/remote-dominated; T=256 balanced/remote-dominated; T=512 balanced/remote-dominated; T=1024 balanced/remote-dominated)
-     - 2.07
+     - 2.04
      - 4.95 (T=256 empty)
    * - MoE TP=8 rank 0
      - 42
      - 2 (T=128 balanced/hot)
      - 1.86
-     - 4.40 (T=128 empty)
+     - 4.42 (T=128 empty)
 
 Expert-parallel rank 3 (112 local experts, ``I_shard = 3072``):
 
    =====  ===========  =======  ================  =======  ==========  ======  =========
    T      routing      experts  floor µs (bound)  cand µs  cand/floor  TRT µs  TRT/floor
    =====  ===========  =======  ================  =======  ==========  ======  =========
-   1      balanced     2        10 (mem)          25       2.49        34      3.36
-   1      empty        1        5 (mem)           23       4.52        27      5.36
-   1      hot          1        5 (mem)           23       4.53        27      5.36
-   1      remote-dom.  1        5 (mem)           23       4.57        28      5.42
-   2      balanced     4        20 (mem)          40       1.95        52      2.55
-   2      empty        1        5 (mem)           23       4.53        28      5.44
-   2      hot          1        5 (mem)           23       4.46        27      5.40
-   2      remote-dom.  2        10 (mem)          25       2.45        33      3.28
-   4      balanced     8        41 (mem)          59       1.46        75      1.84
-   4      empty        1        5 (mem)           23       4.54        28      5.59
-   4      hot          1        5 (mem)           23       4.52        29      5.60
-   4      remote-dom.  4        20 (mem)          39       1.94        51      2.52
-   8      balanced     16       81 (mem)          103      1.27        123     1.52
-   8      empty        1        5 (mem)           23       4.46        34      6.71
-   8      hot          1        5 (mem)           23       4.53        34      6.75
-   8      remote-dom.  8        41 (mem)          59       1.45        79      1.95
-   16     balanced     32       162 (mem)         184      1.13        203     1.25
-   16     empty        1        5 (mem)           23       4.46        35      6.76
-   16     hot          1        5 (mem)           24       4.57        35      6.78
-   16     remote-dom.  16       81 (mem)          103      1.27        124     1.52
-   128    balanced     112      569 (mem)         608      1.07        616     1.08
-   128    empty        1        5 (mem)           27       4.95        38      6.92
-   128    hot          112      569 (mem)         620      1.09        638     1.12
-   128    remote-dom.  112      569 (mem)         603      1.06        612     1.08
-   256    balanced     112      570 (mem)         601      1.05        642     1.13
-   256    empty        1        6 (mem)           29       4.95        42      7.06
-   256    hot          112      570 (mem)         627      1.10        669     1.17
-   256    remote-dom.  112      569 (mem)         599      1.05        637     1.12
-   512    balanced     112      571 (mem)         611      1.07        700     1.23
-   512    empty        1        7 (mem)           30       4.43        49      7.28
-   512    hot          112      571 (mem)         673      1.18        728     1.27
-   512    remote-dom.  112      570 (mem)         607      1.06        706     1.24
-   1024   balanced     112      574 (mem)         620      1.08        764     1.33
-   1024   empty        1        8 (mem)           31       3.72        55      6.58
-   1024   hot          112      574 (mem)         746      1.30        838     1.46
-   1024   remote-dom.  112      573 (mem)         614      1.07        767     1.34
-   2048   balanced     112      579 (mem)         808      1.40        1241    2.15
-   2048   empty        1        12 (mem)          55       4.80        95      8.25
-   2048   hot          112      580 (mem)         877      1.51        1289    2.22
-   2048   remote-dom.  112      577 (mem)         803      1.39        1247    2.16
-   4096   balanced     112      589 (mem)         840      1.43        1248    2.12
-   4096   empty        1        18 (mem)          64       3.53        127     7.03
-   4096   hot          112      592 (mem)         993      1.68        1482    2.50
-   4096   remote-dom.  112      585 (mem)         821      1.40        1272    2.17
-   8192   balanced     112      609 (mem)         1478     2.43        1161    1.91
-   8192   empty        1        31 (mem)          79       2.56        189     6.09
-   8192   hot          112      830 (mma)         1851     2.23        1493    1.80
-   8192   remote-dom.  112      602 (mem)         860      1.43        1297    2.16
-   16384  balanced     112      1162 (mma)        2213     1.90        2241    1.93
-   16384  empty        1        57 (mem)          82       1.44        293     5.15
-   16384  hot          112      1664 (mma)        3053     1.84        2926    1.76
-   16384  remote-dom.  112      635 (mem)         1478     2.33        1267    2.00
-   32768  balanced     112      2324 (mma)        4068     1.75        4706    2.02
-   32768  empty        1        109 (mem)         131      1.21        536     4.94
-   32768  hot          112      3323 (mma)        5760     1.73        6382    1.92
-   32768  remote-dom.  112      1162 (mma)        2310     1.99        3179    2.74
+   1      balanced     2        10 (mem)          24       2.41        34      3.30
+   1      empty        1        5 (mem)           22       4.27        28      5.46
+   1      hot          1        5 (mem)           22       4.28        28      5.44
+   1      remote-dom.  1        5 (mem)           22       4.29        28      5.53
+   2      balanced     4        20 (mem)          38       1.89        52      2.55
+   2      empty        1        5 (mem)           22       4.31        28      5.47
+   2      hot          1        5 (mem)           22       4.31        28      5.51
+   2      remote-dom.  2        10 (mem)          25       2.41        34      3.32
+   4      balanced     8        41 (mem)          57       1.41        77      1.89
+   4      empty        1        5 (mem)           22       4.28        28      5.47
+   4      hot          1        5 (mem)           22       4.35        28      5.50
+   4      remote-dom.  4        20 (mem)          38       1.87        50      2.46
+   8      balanced     16       81 (mem)          101      1.24        124     1.53
+   8      empty        1        5 (mem)           22       4.25        34      6.75
+   8      hot          1        5 (mem)           22       4.29        35      6.77
+   8      remote-dom.  8        41 (mem)          57       1.41        80      1.97
+   16     balanced     32       162 (mem)         181      1.12        204     1.25
+   16     empty        1        5 (mem)           22       4.33        35      6.80
+   16     hot          1        5 (mem)           23       4.45        35      6.82
+   16     remote-dom.  16       81 (mem)          101      1.25        125     1.54
+   128    balanced     112      569 (mem)         598      1.05        616     1.08
+   128    empty        1        5 (mem)           26       4.83        38      6.88
+   128    hot          112      569 (mem)         613      1.08        638     1.12
+   128    remote-dom.  112      569 (mem)         592      1.04        611     1.07
+   256    balanced     112      570 (mem)         606      1.06        643     1.13
+   256    empty        1        6 (mem)           29       4.95        42      7.19
+   256    hot          112      570 (mem)         631      1.11        669     1.17
+   256    remote-dom.  112      569 (mem)         604      1.06        638     1.12
+   512    balanced     112      571 (mem)         609      1.07        699     1.22
+   512    empty        1        7 (mem)           29       4.37        49      7.33
+   512    hot          112      571 (mem)         673      1.18        727     1.27
+   512    remote-dom.  112      570 (mem)         605      1.06        705     1.24
+   1024   balanced     112      574 (mem)         619      1.08        765     1.33
+   1024   empty        1        8 (mem)           31       3.73        55      6.64
+   1024   hot          112      574 (mem)         743      1.29        830     1.45
+   1024   remote-dom.  112      573 (mem)         613      1.07        763     1.33
+   2048   balanced     112      579 (mem)         807      1.39        1234    2.13
+   2048   empty        1        12 (mem)          54       4.70        93      8.02
+   2048   hot          112      580 (mem)         874      1.51        1287    2.22
+   2048   remote-dom.  112      577 (mem)         801      1.39        1241    2.15
+   4096   balanced     112      589 (mem)         839      1.43        1237    2.10
+   4096   empty        1        18 (mem)          63       3.50        126     6.99
+   4096   hot          112      592 (mem)         989      1.67        1459    2.46
+   4096   remote-dom.  112      585 (mem)         820      1.40        1266    2.16
+   8192   balanced     112      609 (mem)         1502     2.47        1189    1.95
+   8192   empty        1        31 (mem)          79       2.56        189     6.10
+   8192   hot          112      830 (mma)         1799     2.17        1521    1.83
+   8192   remote-dom.  112      602 (mem)         862      1.43        1301    2.16
+   16384  balanced     112      1162 (mma)        2434     2.09        2427    2.09
+   16384  empty        1        57 (mem)          82       1.44        292     5.13
+   16384  hot          112      1664 (mma)        3092     1.86        3067    1.84
+   16384  remote-dom.  112      635 (mem)         1501     2.36        1291    2.03
+   32768  balanced     112      2324 (mma)        4084     1.76        4716    2.03
+   32768  empty        1        109 (mem)         132      1.21        536     4.93
+   32768  hot          112      3323 (mma)        5789     1.74        6382    1.92
+   32768  remote-dom.  112      1162 (mma)        2321     2.00        3221    2.77
    =====  ===========  =======  ================  =======  ==========  ======  =========
 
 MoE tensor-parallel rank 0 (896 experts, ``I_shard = 384``):
@@ -1080,48 +1114,48 @@ MoE tensor-parallel rank 0 (896 experts, ``I_shard = 384``):
    =====  ========  =======  ================  =======  ==========  ======  =========
    T      routing   experts  floor µs (bound)  cand µs  cand/floor  TRT µs  TRT/floor
    =====  ========  =======  ================  =======  ==========  ======  =========
-   1      balanced  16       10 (mem)          26       2.52        34      3.39
-   1      empty     16       10 (mem)          26       2.54        35      3.44
-   1      hot       16       10 (mem)          26       2.53        35      3.48
-   2      balanced  32       20 (mem)          40       1.96        54      2.65
-   2      empty     16       10 (mem)          25       2.46        35      3.46
-   2      hot       31       20 (mem)          39       1.97        53      2.68
-   4      balanced  64       41 (mem)          60       1.49        77      1.89
-   4      empty     16       10 (mem)          25       2.50        36      3.49
-   4      hot       61       39 (mem)          58       1.50        75      1.93
-   8      balanced  128      81 (mem)          106      1.31        132     1.62
-   8      empty     16       10 (mem)          26       2.52        42      4.16
-   8      hot       121      77 (mem)          97       1.26        125     1.63
-   16     balanced  256      162 (mem)         185      1.14        218     1.34
-   16     empty     16       10 (mem)          36       3.48        56      5.49
+   1      balanced  16       10 (mem)          25       2.48        35      3.43
+   1      empty     16       10 (mem)          25       2.48        35      3.45
+   1      hot       16       10 (mem)          25       2.47        35      3.49
+   2      balanced  32       20 (mem)          40       1.95        54      2.67
+   2      empty     16       10 (mem)          25       2.45        35      3.44
+   2      hot       31       20 (mem)          38       1.95        53      2.68
+   4      balanced  64       41 (mem)          60       1.48        77      1.88
+   4      empty     16       10 (mem)          25       2.46        35      3.49
+   4      hot       61       39 (mem)          58       1.50        75      1.94
+   8      balanced  128      81 (mem)          106      1.31        132     1.63
+   8      empty     16       10 (mem)          25       2.48        42      4.16
+   8      hot       121      77 (mem)          97       1.26        126     1.65
+   16     balanced  256      162 (mem)         184      1.13        218     1.34
+   16     empty     16       10 (mem)          35       3.42        57      5.56
    16     hot       241      153 (mem)         171      1.12        208     1.36
-   128    balanced  896      569 (mem)         619      1.09        673     1.18
-   128    empty     16       11 (mem)          47       4.40        197     18.26
-   128    hot       896      569 (mem)         619      1.09        674     1.18
-   256    balanced  896      570 (mem)         640      1.12        693     1.22
-   256    empty     16       18 (mma)          67       3.70        192     10.55
-   256    hot       896      570 (mem)         639      1.12        695     1.22
-   512    balanced  896      571 (mem)         659      1.15        716     1.25
-   512    empty     16       36 (mma)          97       2.66        321     8.84
-   512    hot       896      571 (mem)         660      1.16        724     1.27
-   1024   balanced  896      574 (mem)         716      1.25        783     1.36
-   1024   empty     16       73 (mma)          161      2.22        399     5.50
-   1024   hot       896      574 (mem)         725      1.26        784     1.37
-   2048   balanced  896      579 (mem)         820      1.42        890     1.54
-   2048   empty     16       145 (mma)         299      2.06        435     3.00
-   2048   hot       896      579 (mem)         820      1.42        879     1.52
-   4096   balanced  896      589 (mem)         925      1.57        1108    1.88
-   4096   empty     16       291 (mma)         541      1.86        666     2.29
-   4096   hot       896      589 (mem)         930      1.58        1103    1.87
-   8192   balanced  896      609 (mem)         1705     2.80        1679    2.76
-   8192   empty     16       581 (mma)         1024     1.76        1222    2.10
-   8192   hot       896      609 (mem)         1706     2.80        1645    2.70
-   16384  balanced  896      1162 (mma)        3223     2.77        3316    2.85
-   16384  empty     16       1162 (mma)        2487     2.14        2581    2.22
-   16384  hot       896      1162 (mma)        2875     2.47        3337    2.87
-   32768  balanced  896      2324 (mma)        5787     2.49        6427    2.77
-   32768  empty     16       2324 (mma)        5189     2.23        5242    2.26
-   32768  hot       896      2324 (mma)        5115     2.20        6293    2.71
+   128    balanced  896      569 (mem)         620      1.09        673     1.18
+   128    empty     16       11 (mem)          48       4.42        198     18.33
+   128    hot       896      569 (mem)         619      1.09        676     1.19
+   256    balanced  896      570 (mem)         638      1.12        691     1.21
+   256    empty     16       18 (mma)          67       3.70        194     10.68
+   256    hot       896      570 (mem)         640      1.12        693     1.22
+   512    balanced  896      571 (mem)         659      1.15        714     1.25
+   512    empty     16       36 (mma)          96       2.66        320     8.81
+   512    hot       896      571 (mem)         660      1.16        721     1.26
+   1024   balanced  896      574 (mem)         717      1.25        779     1.36
+   1024   empty     16       73 (mma)          161      2.22        400     5.51
+   1024   hot       896      574 (mem)         726      1.27        781     1.36
+   2048   balanced  896      579 (mem)         822      1.42        890     1.54
+   2048   empty     16       145 (mma)         300      2.06        437     3.01
+   2048   hot       896      579 (mem)         819      1.41        879     1.52
+   4096   balanced  896      589 (mem)         926      1.57        1113    1.89
+   4096   empty     16       291 (mma)         541      1.86        665     2.29
+   4096   hot       896      589 (mem)         930      1.58        1096    1.86
+   8192   balanced  896      609 (mem)         1703     2.80        1653    2.71
+   8192   empty     16       581 (mma)         1044     1.80        1234    2.12
+   8192   hot       896      609 (mem)         1709     2.81        1661    2.73
+   16384  balanced  896      1162 (mma)        3202     2.76        3167    2.73
+   16384  empty     16       1162 (mma)        2524     2.17        2535    2.18
+   16384  hot       896      1162 (mma)        2855     2.46        3263    2.81
+   32768  balanced  896      2324 (mma)        5883     2.53        6687    2.88
+   32768  empty     16       2324 (mma)        5269     2.27        5278    2.27
+   32768  hot       896      2324 (mma)        5365     2.31        6415    2.76
    =====  ========  =======  ================  =======  ==========  ======  =========
 
 **Reachable floor per row.** The floor above charges each row the
@@ -1183,9 +1217,9 @@ The reachable floor of a row is the smallest, over the swap-AB form at the
 planner's row tile and the dense form at the 128- and 256-row tiles (128 x
 128 and 128 x 256 GEMM tiles), of the routing kernel (2.6 us) plus the two
 GEMMs, each taking the largest of its five terms, plus one launch gap per
-dependent kernel. With the load-ring term 39 of the 56 expert-parallel rows
+dependent kernel. With the load-ring term 38 of the 56 expert-parallel rows
 and 36 of the 42 MoE-TP rows sit within 1.10 x of their reachable floor
-(geometric mean candidate / reachable 1.08 and 1.02); the binding
+(geometric mean candidate / reachable 1.07 and 1.02); the binding
 term of nearly every row is the ring, i.e. the kernels are bound by the
 operand bytes each SM keeps in flight, not by HBM bandwidth or MMA rate. It is a lower bound of what any schedule built from these
 kernels reaches on this node, not a promise that a schedule exists; the
@@ -1196,62 +1230,62 @@ Reachable floor, expert-parallel rank 3 (same rows and candidate as above):
    =====  ===========  ========  ===================  =======  ==========  ==============  ======
    T      routing      floor µs  reachable µs (form)  cand µs  cand/floor  cand/reachable  TRT µs
    =====  ===========  ========  ===================  =======  ==========  ==============  ======
-   1      balanced     10        24 (swap)            25       2.49        1.05            34
-   1      empty        5         22 (swap)            23       4.52        1.07            27
-   1      hot          5         22 (swap)            23       4.53        1.07            27
-   1      remote-dom.  5         22 (swap)            23       4.57        1.08            28
-   2      balanced     20        40 (dense128)        40       1.95        0.98            52
-   2      empty        5         22 (swap)            23       4.53        1.07            28
-   2      hot          5         22 (swap)            23       4.46        1.05            27
-   2      remote-dom.  10        24 (swap)            25       2.45        1.03            33
-   4      balanced     41        62 (swap)            59       1.46        0.95            75
-   4      empty        5         22 (swap)            23       4.54        1.07            28
-   4      hot          5         22 (swap)            23       4.52        1.07            29
-   4      remote-dom.  20        40 (dense128)        39       1.94        0.98            51
-   8      balanced     81        109 (swap)           103      1.27        0.94            123
-   8      empty        5         22 (swap)            23       4.46        1.06            34
-   8      hot          5         22 (swap)            23       4.53        1.07            34
-   8      remote-dom.  41        62 (swap)            59       1.45        0.95            79
-   16     balanced     162       193 (swap)           184      1.13        0.95            203
-   16     empty        5         22 (swap)            23       4.46        1.06            35
-   16     hot          5         22 (swap)            24       4.57        1.09            35
-   16     remote-dom.  81        109 (swap)           103      1.27        0.94            124
-   128    balanced     569       621 (swap)           608      1.07        0.98            616
-   128    empty        5         22 (swap)            27       4.95        1.26            38
-   128    hot          569       657 (swap)           620      1.09        0.94            638
-   128    remote-dom.  569       621 (swap)           603      1.06        0.97            612
-   256    balanced     570       659 (swap)           601      1.05        0.91            642
+   1      balanced     10        24 (swap)            24       2.41        1.01            34
+   1      empty        5         22 (swap)            22       4.27        1.01            28
+   1      hot          5         22 (swap)            22       4.28        1.01            28
+   1      remote-dom.  5         22 (swap)            22       4.29        1.01            28
+   2      balanced     20        40 (dense128)        38       1.89        0.95            52
+   2      empty        5         22 (swap)            22       4.31        1.02            28
+   2      hot          5         22 (swap)            22       4.31        1.02            28
+   2      remote-dom.  10        24 (swap)            25       2.41        1.02            34
+   4      balanced     41        62 (swap)            57       1.41        0.92            77
+   4      empty        5         22 (swap)            22       4.28        1.01            28
+   4      hot          5         22 (swap)            22       4.35        1.03            28
+   4      remote-dom.  20        40 (dense128)        38       1.87        0.94            50
+   8      balanced     81        109 (swap)           101      1.24        0.92            124
+   8      empty        5         22 (swap)            22       4.25        1.01            34
+   8      hot          5         22 (swap)            22       4.29        1.02            35
+   8      remote-dom.  41        62 (swap)            57       1.41        0.92            80
+   16     balanced     162       193 (swap)           181      1.12        0.94            204
+   16     empty        5         22 (swap)            22       4.33        1.03            35
+   16     hot          5         22 (swap)            23       4.45        1.06            35
+   16     remote-dom.  81        109 (swap)           101      1.25        0.93            125
+   128    balanced     569       621 (swap)           598      1.05        0.96            616
+   128    empty        5         22 (swap)            26       4.83        1.23            38
+   128    hot          569       657 (swap)           613      1.08        0.93            638
+   128    remote-dom.  569       621 (swap)           592      1.04        0.95            611
+   256    balanced     570       659 (swap)           606      1.06        0.92            643
    256    empty        6         22 (swap)            29       4.95        1.35            42
-   256    hot          570       697 (swap)           627      1.10        0.90            669
-   256    remote-dom.  569       659 (swap)           599      1.05        0.91            637
-   512    balanced     571       659 (swap)           611      1.07        0.93            700
-   512    empty        7         22 (swap)            30       4.43        1.33            49
-   512    hot          571       726 (dense128)       673      1.18        0.93            728
-   512    remote-dom.  570       659 (swap)           607      1.06        0.92            706
-   1024   balanced     574       659 (swap)           620      1.08        0.94            764
-   1024   empty        8         24 (swap)            31       3.72        1.31            55
-   1024   hot          574       762 (dense128)       746      1.30        0.98            838
-   1024   remote-dom.  573       659 (swap)           614      1.07        0.93            767
-   2048   balanced     579       726 (dense128)       808      1.40        1.11            1241
-   2048   empty        12        26 (swap)            55       4.80        2.09            95
-   2048   hot          580       808 (dense128)       877      1.51        1.09            1289
-   2048   remote-dom.  577       659 (swap)           803      1.39        1.22            1247
-   4096   balanced     589       726 (dense128)       840      1.43        1.16            1248
-   4096   empty        18        35 (dense128n128)    64       3.53        1.82            127
-   4096   hot          592       916 (dense128)       993      1.68        1.08            1482
-   4096   remote-dom.  585       726 (dense128)       821      1.40        1.13            1272
-   8192   balanced     609       1406 (dense128)      1478     2.43        1.05            1161
+   256    hot          570       697 (swap)           631      1.11        0.90            669
+   256    remote-dom.  569       659 (swap)           604      1.06        0.92            638
+   512    balanced     571       659 (swap)           609      1.07        0.92            699
+   512    empty        7         22 (swap)            29       4.37        1.31            49
+   512    hot          571       726 (dense128)       673      1.18        0.93            727
+   512    remote-dom.  570       659 (swap)           605      1.06        0.92            705
+   1024   balanced     574       659 (swap)           619      1.08        0.94            765
+   1024   empty        8         24 (swap)            31       3.73        1.31            55
+   1024   hot          574       762 (dense128)       743      1.29        0.97            830
+   1024   remote-dom.  573       659 (swap)           613      1.07        0.93            763
+   2048   balanced     579       726 (dense128)       807      1.39        1.11            1234
+   2048   empty        12        26 (swap)            54       4.70        2.05            93
+   2048   hot          580       808 (dense128)       874      1.51        1.08            1287
+   2048   remote-dom.  577       659 (swap)           801      1.39        1.22            1241
+   4096   balanced     589       726 (dense128)       839      1.43        1.16            1237
+   4096   empty        18        35 (dense128n128)    63       3.50        1.80            126
+   4096   hot          592       916 (dense128)       989      1.67        1.08            1459
+   4096   remote-dom.  585       726 (dense128)       820      1.40        1.13            1266
+   8192   balanced     609       1406 (dense128)      1502     2.47        1.07            1189
    8192   empty        31        50 (dense128n128)    79       2.56        1.58            189
-   8192   hot          830       1787 (dense128)      1851     2.23        1.04            1493
-   8192   remote-dom.  602       733 (dense128)       860      1.43        1.17            1297
-   16384  balanced     1162      2086 (dense128)      2213     1.90        1.06            2241
-   16384  empty        57        70 (dense128)        82       1.44        1.16            293
-   16384  hot          1664      2847 (dense128)      3053     1.84        1.07            2926
-   16384  remote-dom.  635       1406 (dense128)      1478     2.33        1.05            1267
-   32768  balanced     2324      3445 (dense128)      4068     1.75        1.18            4706
-   32768  empty        109       110 (dense128)       131      1.21        1.20            536
-   32768  hot          3323      4995 (dense128)      5760     1.73        1.15            6382
-   32768  remote-dom.  1162      2086 (dense128)      2310     1.99        1.11            3179
+   8192   hot          830       1787 (dense128)      1799     2.17        1.01            1521
+   8192   remote-dom.  602       733 (dense128)       862      1.43        1.17            1301
+   16384  balanced     1162      2086 (dense128)      2434     2.09        1.17            2427
+   16384  empty        57        70 (dense128)        82       1.44        1.16            292
+   16384  hot          1664      2847 (dense128)      3092     1.86        1.09            3067
+   16384  remote-dom.  635       1406 (dense128)      1501     2.36        1.07            1291
+   32768  balanced     2324      3445 (dense128)      4084     1.76        1.19            4716
+   32768  empty        109       110 (dense128)       132      1.21        1.20            536
+   32768  hot          3323      4995 (dense128)      5789     1.74        1.16            6382
+   32768  remote-dom.  1162      2086 (dense128)      2321     2.00        1.11            3221
    =====  ===========  ========  ===================  =======  ==========  ==============  ======
 
 Reachable floor, MoE tensor-parallel rank 0:
@@ -1259,48 +1293,48 @@ Reachable floor, MoE tensor-parallel rank 0:
    =====  ========  ========  ===================  =======  ==========  ==============  ======
    T      routing   floor µs  reachable µs (form)  cand µs  cand/floor  cand/reachable  TRT µs
    =====  ========  ========  ===================  =======  ==========  ==============  ======
-   1      balanced  10        24 (swap)            26       2.52        1.05            34
-   1      empty     10        24 (swap)            26       2.54        1.06            35
-   1      hot       10        24 (swap)            26       2.53        1.05            35
-   2      balanced  20        40 (swap)            40       1.96        0.99            54
-   2      empty     10        24 (swap)            25       2.46        1.03            35
-   2      hot       20        40 (swap)            39       1.97        0.97            53
-   4      balanced  41        59 (swap)            60       1.49        1.03            77
-   4      empty     10        24 (swap)            25       2.50        1.04            36
+   1      balanced  10        24 (swap)            25       2.48        1.04            35
+   1      empty     10        24 (swap)            25       2.48        1.03            35
+   1      hot       10        24 (swap)            25       2.47        1.03            35
+   2      balanced  20        40 (swap)            40       1.95        0.99            54
+   2      empty     10        24 (swap)            25       2.45        1.02            35
+   2      hot       20        40 (swap)            38       1.95        0.96            53
+   4      balanced  41        59 (swap)            60       1.48        1.02            77
+   4      empty     10        24 (swap)            25       2.46        1.03            35
    4      hot       39        58 (swap)            58       1.50        1.00            75
    8      balanced  81        107 (swap)           106      1.31        0.99            132
-   8      empty     10        24 (swap)            26       2.52        1.05            42
-   8      hot       77        97 (swap)            97       1.26        1.00            125
-   16     balanced  162       193 (swap)           185      1.14        0.96            218
-   16     empty     10        35 (dense128n128)    36       3.48        1.01            56
+   8      empty     10        24 (swap)            25       2.48        1.04            42
+   8      hot       77        97 (swap)            97       1.26        0.99            126
+   16     balanced  162       193 (swap)           184      1.13        0.95            218
+   16     empty     10        35 (dense128n128)    35       3.42        0.99            57
    16     hot       153       181 (swap)           171      1.12        0.95            208
-   128    balanced  569       635 (swap)           619      1.09        0.98            673
-   128    empty     11        35 (dense128n128)    47       4.40        1.34            197
-   128    hot       569       638 (swap)           619      1.09        0.97            674
-   256    balanced  570       654 (swap)           640      1.12        0.98            693
-   256    empty     18        46 (dense128)        67       3.70        1.45            192
-   256    hot       570       657 (swap)           639      1.12        0.97            695
-   512    balanced  571       692 (swap)           659      1.15        0.95            716
-   512    empty     36        96 (dense128)        97       2.66        1.01            321
-   512    hot       571       696 (swap)           660      1.16        0.95            724
-   1024   balanced  574       692 (swap)           716      1.25        1.03            783
-   1024   empty     73        157 (dense128)       161      2.22        1.02            399
-   1024   hot       574       712 (swap)           725      1.26        1.02            784
-   2048   balanced  579       770 (swap)           820      1.42        1.07            890
-   2048   empty     145       307 (dense128)       299      2.06        0.97            435
-   2048   hot       579       791 (swap)           820      1.42        1.04            879
-   4096   balanced  589       959 (dense128)       925      1.57        0.97            1108
-   4096   empty     291       579 (dense128)       541      1.86        0.93            666
-   4096   hot       589       974 (dense128)       930      1.58        0.95            1103
-   8192   balanced  609       1883 (dense128)      1705     2.80        0.91            1679
-   8192   empty     581       1124 (dense128)      1024     1.76        0.91            1222
-   8192   hot       609       1940 (dense128)      1706     2.80        0.88            1645
-   16384  balanced  1162      2806 (dense128)      3223     2.77        1.15            3316
-   16384  empty     1162      2239 (dense128)      2487     2.14        1.11            2581
-   16384  hot       1162      2948 (dense128)      2875     2.47        0.98            3337
-   32768  balanced  2324      4658 (dense128)      5787     2.49        1.24            6427
-   32768  empty     2324      4470 (dense128)      5189     2.23        1.16            5242
-   32768  hot       2324      4912 (dense128)      5115     2.20        1.04            6293
+   128    balanced  569       635 (swap)           620      1.09        0.98            673
+   128    empty     11        35 (dense128n128)    48       4.42        1.35            198
+   128    hot       569       638 (swap)           619      1.09        0.97            676
+   256    balanced  570       654 (swap)           638      1.12        0.98            691
+   256    empty     18        46 (dense128)        67       3.70        1.46            194
+   256    hot       570       657 (swap)           640      1.12        0.97            693
+   512    balanced  571       692 (swap)           659      1.15        0.95            714
+   512    empty     36        96 (dense128)        96       2.66        1.00            320
+   512    hot       571       696 (swap)           660      1.16        0.95            721
+   1024   balanced  574       692 (swap)           717      1.25        1.03            779
+   1024   empty     73        157 (dense128)       161      2.22        1.02            400
+   1024   hot       574       712 (swap)           726      1.27        1.02            781
+   2048   balanced  579       770 (swap)           822      1.42        1.07            890
+   2048   empty     145       307 (dense128)       300      2.06        0.98            437
+   2048   hot       579       791 (swap)           819      1.41        1.03            879
+   4096   balanced  589       959 (dense128)       926      1.57        0.97            1113
+   4096   empty     291       579 (dense128)       541      1.86        0.93            665
+   4096   hot       589       974 (dense128)       930      1.58        0.96            1096
+   8192   balanced  609       1883 (dense128)      1703     2.80        0.90            1653
+   8192   empty     581       1124 (dense128)      1044     1.80        0.93            1234
+   8192   hot       609       1940 (dense128)      1709     2.81        0.88            1661
+   16384  balanced  1162      2806 (dense128)      3202     2.76        1.14            3167
+   16384  empty     1162      2239 (dense128)      2524     2.17        1.13            2535
+   16384  hot       1162      2948 (dense128)      2855     2.46        0.97            3263
+   32768  balanced  2324      4658 (dense128)      5883     2.53        1.26            6687
+   32768  empty     2324      4470 (dense128)      5269     2.27        1.18            5278
+   32768  hot       2324      4912 (dense128)      5365     2.31        1.09            6415
    =====  ========  ========  ===================  =======  ==========  ==============  ======
 
 **Where the gaps come from (measured on the same node).**
@@ -1580,10 +1614,34 @@ T=128..1024 row stays within 0.999-1.015 x and the decode rows within
 (27-31 us) is three launches with their dependency hops (the routing
 kernel's own launch plus 4.5-6.8 us of work, the swap GEMM1's 56-stage
 chain on one expert, 17-18 us, and the swap GEMM2, 11-12 us), which the
-loop term of the reachable floor already charges; the tables below are
-regenerated on this revision (39 of the 56 rank rows and 36 of the 42
-shard rows within 1.10 x of the reachable floor, geometric mean 1.08 /
-1.02).
+loop term of the reachable floor already charges; at that revision 39 of
+the 56 rank rows and 36 of the 42 shard rows sat within 1.10 x of the
+reachable floor (geometric mean 1.08 / 1.02).
+
+*Decode rows, dependent-side weight prefetch (round 12, same node).* Per-
+kernel CUPTI start / end offsets of one graph replay (EP=8 T=1 hot):
+before, routing 0-2.4 us, GEMM1 1.0-14.9, GEMM2 13.5-22.3, i.e. GEMM2
+starts 1.4 us before GEMM1 ends and its tail after GEMM1 is 7.4 us. With
+the partial wait GEMM2 starts at 3.8 us (right after GEMM1's own wait),
+streams its 13 MB while GEMM1's loop runs (GEMM1 ends 0.2 us later, 15.1),
+and its tail after GEMM1 is 6.8 us with half the tile in the 12 x 128-wide
+stages and ~6 us with the whole tile resident (12 x 256-wide stages; row
+22.4 -> 21.5 us). An 11 us head start on the weight stream therefore
+removes 1-1.4 us: what remains after GEMM1 is the row gather from GEMM1's
+output, the MMA-issue-bound loop (96 ``kind::f8f6f4`` MMAs of K = 32 at
+~64 issue cycles, ~3.1 us; N = 8 leaves the tensor pipe idle), the
+epilogue and the drain. The GEMM2 half of the decode chain is thus
+independent of the weight bytes once they are resident; the remaining
+lever there is spreading the issue-bound loop over more CTAs with the
+resident tile (split-K with a cluster reduction), not the memory system.
+GEMM1's stream cannot start before the routing kernel publishes the
+expert ids (2.4 us), so the same prefetch does not apply to it. The tables
+below are regenerated on this revision: 38 of the 56 rank rows and 36 of
+the 42 shard rows within 1.10 x of the reachable floor (geometric mean
+1.07 / 1.02; the rank loses one long dense row to the node's run-to-run
+band, its decode rows move from 1.07-1.09 x to 1.01-1.06 x of the
+reachable figure), and against the bytes / FLOPs / launch floor 9 of 56
+and 2 of 42 rows as before (geometric mean 2.04 / 1.86).
 
 *MoE-TP shard, GEMM2 with the fused finalize.* Its K is 384, and the
 CUTLASS kernel on exactly that shape peaks at 1427 TFLOPS (12 K-steps of
