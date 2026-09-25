@@ -1975,7 +1975,7 @@
         },
         "1:5120:148:True:True:0:False": {
           "config": {
-            "num_launch_sms": 148,
+            "num_launch_sms": 40,
             "num_sms": 148,
             "num_splits": 40
           },
@@ -2071,7 +2071,7 @@
         },
         "64:5120:148:True:True:0:False": {
           "config": {
-            "num_launch_sms": 148,
+            "num_launch_sms": 80,
             "num_sms": 148,
             "num_splits": 40
           },
@@ -2079,7 +2079,7 @@
         },
         "64:5120:148:True:True:224:False": {
           "config": {
-            "num_launch_sms": 148,
+            "num_launch_sms": 80,
             "num_sms": 148,
             "num_splits": 40
           },
@@ -2087,7 +2087,7 @@
         },
         "65:5120:148:False:True:0:False": {
           "config": {
-            "num_launch_sms": 148,
+            "num_launch_sms": 80,
             "num_sms": 148,
             "num_splits": 40
           },
@@ -2103,7 +2103,7 @@
         },
         "65:5120:148:True:True:0:False": {
           "config": {
-            "num_launch_sms": 148,
+            "num_launch_sms": 83,
             "num_sms": 148,
             "num_splits": 40
           },
@@ -2111,7 +2111,7 @@
         },
         "65:5120:148:True:True:224:False": {
           "config": {
-            "num_launch_sms": 148,
+            "num_launch_sms": 83,
             "num_sms": 148,
             "num_splits": 40
           },

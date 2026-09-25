@@ -157,14 +157,23 @@ class _Stage:
 
 
 class V3Plan:
-    """Retain operands/workspaces; submit original reset/repack and compute scope.
+    """Retain operands/workspaces; submit the original reset/repack and compute scope.
 
-    Full pipeline model routes zero one original contiguous reset tensor; smoke
-    routes zero their original seven counters. Grouped fused zeroes L1 arrivals.
-    Grouped L2 repacks both scale tensors on every invocation before GEMM.
-    run() owns no CUDA graph; callers may capture it. The source comparison's
-    prepared graph contains the same reset/main workload and is retained by the
-    private fixture. Never time only launch_without_reset for full/fused routes.
+    A route whose catalog metadata declares ``self_cleaning`` launches exactly one
+    kernel per run(): the kernel zeroes its per-launch workspace words before it
+    exits and its grid gates are phase-toggling words that no host code resets.
+    Such a plan zeroes the caller's counter workspace once, when it is bound
+    (never inside run(), so a captured run() holds only the kernel node), and
+    rejects reset(). ``self_cleaning`` reports which contract applies.
+
+    Every other route keeps its host resets inside run(): full pipeline model
+    routes zero one original contiguous reset tensor; smoke routes zero their
+    original seven counters. Grouped fused zeroes L1 arrivals. Grouped L2
+    repacks both scale tensors on every invocation before GEMM. run() owns no
+    CUDA graph; callers may capture it after binding. The source comparison's
+    prepared callable has the same workload and is retained by the private
+    fixture. Never time only launch_without_reset for full/fused routes that
+    are not self-cleaning.
     """
 
     def __init__(
@@ -188,18 +197,40 @@ class V3Plan:
         self.arch = _route_arch(route, t.device)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
+        # Declared per architecture by the exported catalog route; absent means
+        # the original host-reset lifecycle.
+        self.self_cleaning = bool(route["metadata"].get("self_cleaning", False))
         self.stages = tuple(
             _Stage(self.arch, s["program"], stage_bindings[s["name"]])
             for s in route["stages"]
         )
         self.owners = owners
+        if self.self_cleaning:
+            # One-time zero of the counter workspace, stream-ordered before this
+            # plan's first launch. It must not become a graph node: the kernel
+            # keeps the words clean and the gate phase bits consistent afterwards.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Binding a self-cleaning MegaMoE plan during CUDA stream "
+                    "capture is unsupported; bind (and warm up) before capturing run()"
+                )
+            self._zero_workspace()
 
-    def reset(self):
+    def _zero_workspace(self):
         if self.reset_storage is not None:
             self.reset_storage.zero_()
         else:
             for tensor in self.reset_buffers:
                 tensor.zero_()
+
+    def reset(self):
+        if self.self_cleaning:
+            raise RuntimeError(
+                "This route is self-cleaning: the kernel owns its workspace "
+                "lifecycle and the plan zeroed the counters once when bound; "
+                "do not reset them on the host"
+            )
+        self._zero_workspace()
 
     def launch_without_reset(self):
         for stage in self.stages:
@@ -207,7 +238,8 @@ class V3Plan:
         return self.outputs
 
     def run(self):
-        self.reset()
+        if not self.self_cleaning:
+            self.reset()
         return self.launch_without_reset()
 
 
@@ -221,7 +253,13 @@ def bind_prepared(
     reset_buffers=(),
     owners=(),
 ):
-    """Bind explicit packed tensors to a catalog route with its original lifecycle."""
+    """Bind explicit packed tensors to a catalog route with its original lifecycle.
+
+    ``reset_storage``/``reset_buffers`` are the route's counter words. A
+    self-cleaning route zeroes them once here (outside any stream capture) and
+    never again; the workspace may already have been used by another plan of
+    the same route as long as no launch is in flight on it.
+    """
     import torch
 
     t = next(
@@ -252,7 +290,9 @@ def prepare_pipeline(inputs):
     topk_idx(int64)/topk_weights(FP32), w1_fp4/w2_fp4 (or w1_fp8/w2_fp8),
     and w1_sf/w2_sf (FP32 powers-of-two, granularity32). Gate/up weights are
     logical halves; preparation applies the selected 8-way interleave and
-    source-schedule scale permutation. No upstream library is imported.
+    source-schedule scale permutation. No upstream library is imported. The
+    counter workspace is allocated zeroed; a self-cleaning route never zeroes it
+    again, other routes zero it inside every run().
     """
     device = inputs["x_fp8_packed"].device
     route = _route(device_arch(device), "pipeline", inputs)

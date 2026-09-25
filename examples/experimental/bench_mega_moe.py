@@ -43,7 +43,11 @@ def main():
                 precision=args.precision,
                 median_ms=statistics.median(milliseconds),
                 timing="CUPTI cold L2",
-                scope="complete plan.run, including reset or scale repack",
+                scope=(
+                    "complete plan.run: one self-cleaning kernel, no host reset"
+                    if getattr(plan, "self_cleaning", False)
+                    else "complete plan.run, including reset or scale repack"
+                ),
             )
         )
     )

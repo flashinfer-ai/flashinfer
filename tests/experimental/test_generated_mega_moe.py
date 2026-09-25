@@ -42,7 +42,60 @@ def output_of(plan, family):
     return plan.output if family == "source" else plan.outputs
 
 
+def graph_node_names(graph):
+    """Names of the nodes captured in ``graph`` (kept, not yet instantiated):
+    kernel function names, or ``<memset>`` for memset nodes."""
+    driver = pytest.importorskip("cuda.bindings.driver")
+
+    def checked(result):
+        assert int(result[0]) == 0, repr(result)
+        return result[1] if len(result) == 2 else result[1:]
+
+    raw = driver.CUgraph(graph.raw_cuda_graph())
+    _, count = checked(driver.cuGraphGetNodes(raw, 0))
+    nodes, count = checked(driver.cuGraphGetNodes(raw, count))
+    names = []
+    for node in nodes[:count]:
+        kind = checked(driver.cuGraphNodeGetType(node))
+        if kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            params = checked(driver.cuGraphKernelNodeGetParams(node))
+            names.append(checked(driver.cuFuncGetName(params.func)).decode())
+        elif kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMSET:
+            names.append("<memset>")
+        else:
+            raise AssertionError(f"unexpected graph node type {kind}")
+    return names
+
+
+def check_v3_graph_topology(plan, names):
+    """A self-cleaning route captures exactly one kernel node; every other
+    route captures its host counter resets together with the kernel."""
+    kernels = [name for name in names if name.startswith("kernel_")]
+    others = [name for name in names if not name.startswith("kernel_")]
+    assert len(kernels) == 1, names
+    if plan.self_cleaning:
+        assert not others, names
+    else:
+        assert others, names
+
+
+def check_v3_workspace(plan):
+    """After a self-cleaning run every per-launch workspace word is zero again
+    and each grid gate holds only its phase bit (bits 0..30 clear)."""
+    if not plan.self_cleaning:
+        return
+    bindings = plan.stages[0].bindings
+    for name in ("expert_counts", "expert_scatter_offsets", "l1_arrival"):
+        assert bindings[name].view(torch.int32).count_nonzero().item() == 0, name
+    for name in ("histogram_done", "prefix_done", "dispatch_done", "l2_done"):
+        word = bindings[name].view(torch.int32) & 0x7FFFFFFF
+        assert word.count_nonzero().item() == 0, name
+
+
 def check_v3_metadata(plan, inputs):
+    # The expert histogram survives a run only while the host owns the reset;
+    # a self-cleaning kernel zeroes it before exit (see check_v3_workspace).
+    assert not plan.self_cleaning
     bindings = plan.stages[0].bindings
     routes = inputs["topk_idx"]
     count = torch.bincount(routes.reshape(-1), minlength=8).to(torch.int32)
@@ -137,11 +190,15 @@ def test_pipeline_reference_and_replay(family, precision, seed):
                 atol=0 if family == "source" else atol,
                 rtol=0 if family == "source" else 0.1,
             )
-    # Capture contains plan.run(): v3 counter resets remain in the graph;
-    # the source plan relies on device cleanup and performs no host reset.
-    graph = torch.cuda.CUDAGraph()
+    # Capture contains plan.run(). A v3 route keeps its host counter resets in
+    # the graph unless it declares itself self-cleaning, in which case the graph
+    # is the kernel alone; the source plan relies on device cleanup throughout.
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph):
         plan.run()
+    if family == "v3":
+        check_v3_graph_topology(plan, graph_node_names(graph))
+    graph.instantiate()
     for _ in range(2):
         output.fill_(float("nan"))
         graph.replay()
@@ -153,6 +210,51 @@ def test_pipeline_reference_and_replay(family, precision, seed):
             rtol=0 if family == "source" else 0.1,
         )
         check_metadata(plan, inputs)
+
+
+def test_v3_model_route_workspace_lifecycle():
+    """FP4 single-token model route: one kernel per run() when the catalog
+    declares the route self-cleaning, host counter resets inside run() otherwise."""
+    if torch.cuda.mem_get_info()[0] < 48 * 2**30:
+        pytest.skip(
+            "the 384-expert model inputs need about 48 GiB of free device memory"
+        )
+    inputs, xs = fixtures.model_inputs("fp4", num_tokens=1)
+    arch = _v3_runtime.device_arch(torch.device("cuda"))
+    try:
+        route = _v3_runtime._route(arch, "pipeline", inputs)
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    from flashinfer.mega_moe_v3 import prepare_pipeline
+
+    plan = prepare_pipeline(inputs)
+    assert plan.self_cleaning == bool(route["metadata"].get("self_cleaning", False))
+    if plan.self_cleaning:
+        with pytest.raises(RuntimeError):
+            plan.reset()
+    expected = fixtures.model_reference(inputs, xs)
+    first = None
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        plan.run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, expected, atol=1.0, rtol=0.1)
+        check_v3_workspace(plan)
+        if first is None:
+            first = plan.outputs.clone()
+        else:
+            torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        plan.run()
+    check_v3_graph_topology(plan, graph_node_names(graph))
+    graph.instantiate()
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
+        check_v3_workspace(plan)
 
 
 def test_source_update_inputs_reuses_workspace():

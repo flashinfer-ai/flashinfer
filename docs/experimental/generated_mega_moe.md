@@ -15,10 +15,17 @@ into the same workspace; do not reset its counters on the host.
 
 `flashinfer.mega_moe_v3.prepare_pipeline` accepts logical gate/up weight halves
 and float power-of-two scales. Preparation packs scales and interleaves the
-weights. `run()` includes its required counter resets. The separately exported
-`prepare_grouped_l2` accepts E4M3 activation values, packed E2M1 weights and
-natural row-major packed scale words; every `run()` repacks both scale tensors
-before the clustered GEMM. Do not time the GEMM alone.
+weights. A route whose catalog entry declares `self_cleaning` launches exactly
+one kernel per `run()`: the kernel zeroes its per-launch workspace words before
+it exits and its grid gates are phase-toggling words, so the plan zeroes the
+counter workspace once when it is bound, never inside `run()` (a captured
+`run()` contains only the kernel node), and `plan.reset()` is rejected. Every
+other route keeps its required counter resets inside `run()`.
+`plan.self_cleaning` reports which contract applies; the declaration is per
+exported architecture. The separately exported `prepare_grouped_l2` accepts
+E4M3 activation values, packed E2M1 weights and natural row-major packed scale
+words; every `run()` repacks both scale tensors before the clustered GEMM. Do
+not time the GEMM alone.
 
 FP4 packs the earlier K element into the low nibble. The scale granularity is
 32 values. A UE8M0 byte contains the biased exponent of a power-of-two scale;
@@ -49,8 +56,12 @@ python examples/experimental/bench_mega_moe.py --family v3 --precision fp4
 The public tests use independent PyTorch math on the exact packed inputs,
 check valid dispatch metadata and reusable counters, poison outputs between
 launches, and exercise direct and graph replay. They include both routed
-precisions on the two smoke routes and the catalog's grouped L2 route. These
-examples do not enumerate every model shape or claim model-wide performance.
+precisions on the two smoke routes and the catalog's grouped L2 route, and they
+check that a captured `run()` has the declared topology (one kernel node for a
+self-cleaning route, counter resets plus kernel otherwise). The FP4 single-token
+model route's workspace lifecycle is covered when the device has about 48 GiB of
+free memory for the 384-expert inputs. These examples do not enumerate every
+model shape or claim model-wide performance.
 
 The benchmark requires `cupti-python >= 13`, flushes L2, and sums all kernel
 activities belonging to the complete `plan.run()` call. Missing CUPTI is an

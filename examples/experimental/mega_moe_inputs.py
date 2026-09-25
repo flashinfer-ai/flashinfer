@@ -125,6 +125,21 @@ def source_weights(inputs, shared):
     return dict(B1=b1, SFB1=s1, B2=b2, SFB2=s2, SB1=sb1, SSFB1=ss1, SB2=sb2, SSFB2=ss2)
 
 
+def _expert(x_rows, first, second, route_weight, width):
+    """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2 for one expert."""
+    projected = (x_rows @ first.T).bfloat16().float()
+    gate = projected[:, :width].clamp(max=10.0)
+    up = projected[:, width:].clamp(min=-10.0, max=10.0)
+    intermediate = gate * torch.sigmoid(gate) * up * route_weight[:, None]
+    groups = intermediate.reshape(-1, width // 32, 32)
+    scales = torch.pow(
+        2.0, torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448.0))
+    )
+    quantized = (groups / scales[..., None]).to(torch.float8_e4m3fn)
+    dequantized = (quantized.float() * scales[..., None]).reshape(-1, width)
+    return (dequantized @ second.T).bfloat16().float()
+
+
 def reference(inputs, x_scales, shared=None):
     """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2/sum."""
     precision = inputs["routed_weight_dtype"]
@@ -133,36 +148,92 @@ def reference(inputs, x_scales, shared=None):
     w2 = unpack(inputs[f"w2_{precision}"], inputs["w2_sf"], precision)
     width = inputs["intermediate"]
 
-    def expert(x_rows, first, second, route_weight):
-        projected = (x_rows @ first.T).bfloat16().float()
-        gate = projected[:, :width].clamp(max=10.0)
-        up = projected[:, width:].clamp(min=-10.0, max=10.0)
-        intermediate = gate * torch.sigmoid(gate) * up * route_weight[:, None]
-        groups = intermediate.reshape(-1, width // 32, 32)
-        scales = torch.pow(
-            2.0, torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448.0))
-        )
-        quantized = (groups / scales[..., None]).to(torch.float8_e4m3fn)
-        dequantized = (quantized.float() * scales[..., None]).reshape(-1, width)
-        return (dequantized @ second.T).bfloat16().float()
-
     output = torch.zeros_like(x)
     for slot in range(inputs["top_k"]):
         for index in range(inputs["num_experts"]):
             selected = inputs["topk_idx"][:, slot] == index
-            output[selected] += expert(
+            output[selected] += _expert(
                 x[selected],
                 w1[index],
                 w2[index],
                 inputs["topk_weights"][selected, slot],
+                width,
             )
     if shared is not None:
-        output += expert(
+        output += _expert(
             x,
             unpack(shared[0], shared[1], "fp8")[0],
             unpack(shared[2], shared[3], "fp8")[0],
             torch.ones(x.shape[0], device=x.device),
+            width,
         )
+    return output.bfloat16()
+
+
+def model_inputs(precision, num_tokens=1, seed=0):
+    """Synthetic packed inputs at the catalogued model geometry: 384 experts,
+    top-6, hidden 5120, intermediate 2304, clamp 10. Every token routes to six
+    distinct experts. The packed weights take about 7 GiB of device memory."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    experts, top_k, hidden, intermediate = 384, 6, 5120, 2304
+    x, xs = operand((num_tokens, hidden), "fp8", generator, exponent_low=-1)
+    w1, s1 = operand((experts, 2 * intermediate, hidden), precision, generator)
+    w2, s2 = operand((experts, hidden, intermediate), precision, generator)
+    token = torch.arange(num_tokens, device="cuda")
+    routes = torch.stack(
+        [(token * top_k + slot + seed) % experts for slot in range(top_k)], dim=1
+    ).long()
+    weights = torch.stack(
+        [
+            torch.full_like(token, 0.5 if slot % 2 == 0 else -0.25, dtype=torch.float32)
+            for slot in range(top_k)
+        ],
+        dim=1,
+    )
+    inputs = dict(
+        num_tokens=num_tokens,
+        num_experts=experts,
+        top_k=top_k,
+        hidden=hidden,
+        intermediate=intermediate,
+        routed_weight_dtype=precision,
+        activation_clamp=10.0,
+        x_fp8_packed=x,
+        x_sf_packed=scale_words(xs),
+        topk_idx=routes,
+        topk_weights=weights,
+        w1_sf=s1,
+        w2_sf=s2,
+    )
+    inputs[f"w1_{precision}"] = w1
+    inputs[f"w2_{precision}"] = w2
+    return inputs, xs
+
+
+def model_reference(inputs, x_scales):
+    """``reference`` restricted to the routed experts; dequantizing all 384
+    experts at once would need tens of GiB."""
+    precision = inputs["routed_weight_dtype"]
+    x = unpack(inputs["x_fp8_packed"], x_scales, "fp8")
+    width = inputs["intermediate"]
+    output = torch.zeros_like(x)
+    for index in inputs["topk_idx"].unique().tolist():
+        first = unpack(
+            inputs[f"w1_{precision}"][index], inputs["w1_sf"][index], precision
+        )
+        second = unpack(
+            inputs[f"w2_{precision}"][index], inputs["w2_sf"][index], precision
+        )
+        for slot in range(inputs["top_k"]):
+            selected = inputs["topk_idx"][:, slot] == index
+            if selected.any():
+                output[selected] += _expert(
+                    x[selected],
+                    first,
+                    second,
+                    inputs["topk_weights"][selected, slot],
+                    width,
+                )
     return output.bfloat16()
 
 
