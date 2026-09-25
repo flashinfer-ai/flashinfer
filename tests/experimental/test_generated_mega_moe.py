@@ -1,10 +1,13 @@
-"""Public packed-input MoE behavior, metadata and replay tests on SM103a."""
+"""Public packed-input MoE behavior, metadata and replay tests on SM100a and SM103a."""
 
 import importlib.util
 from pathlib import Path
 
 import pytest
 import torch
+
+from flashinfer.experimental.mega_moe_v3 import runtime as _v3_runtime
+from flashinfer.experimental.source_mega_moe import runtime as _source_runtime
 
 _HELPER = (
     Path(__file__).resolve().parents[2] / "examples/experimental/mega_moe_inputs.py"
@@ -18,13 +21,17 @@ _spec.loader.exec_module(fixtures)
 def supported_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    properties = torch.cuda.get_device_properties(0)
-    if (properties.major, properties.minor, properties.multi_processor_count) != (
-        10,
-        3,
-        152,
-    ):
-        pytest.skip("This generated catalog requires SM103a and 152 physical SMs")
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    for runtime in (_source_runtime, _v3_runtime):
+        try:
+            arch = runtime.device_arch(torch.device("cuda"))
+        except RuntimeError as error:
+            pytest.skip(str(error))
+        if sms not in runtime.supported_num_sms(arch):
+            pytest.skip(
+                f"The exported {arch} schedules cover {runtime.supported_num_sms(arch)} SMs, "
+                f"this device has {sms}"
+            )
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     yield
