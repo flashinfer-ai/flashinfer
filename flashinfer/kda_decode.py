@@ -521,8 +521,8 @@ def fused_kda_decode(
 
     This operator fuses a width-four depthwise causal convolution with SiLU,
     one recurrent KDA update, and gated RMSNorm. It is specialized for
-    head dimension 128 and 12, 24, 32, 48, or 96 heads. ``conv_state`` and
-    ``state`` are updated in-place.
+    head dimension 128 and 8, 12, 24, 32, 48, or 96 heads. ``conv_state``
+    and ``state`` are updated in-place.
 
     Slot zero is reserved as a null slot. Rows whose ``state_indices`` value
     is non-positive produce zeros and do not update either cache.

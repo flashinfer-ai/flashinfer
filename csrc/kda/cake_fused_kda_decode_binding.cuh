@@ -28,6 +28,9 @@
 #ifndef FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS
 #error "FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS must match the frozen kernel ABI"
 #endif
+#ifndef FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID
+#error "FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID must match the frozen launch contract"
+#endif
 #ifndef FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16
 #error "FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 must match the frozen state dtype"
 #endif
@@ -41,6 +44,11 @@ static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_THREADS > 0 &&
 static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES > 0);
 static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS == 0 ||
               FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS == 1);
+static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID == 0 ||
+              FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID == 1);
+static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID == 0 ||
+                  FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS == 1,
+              "persistent Cake fused KDA decode kernels receive the row count");
 static_assert(FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 == 0 ||
               FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 == 1);
 static_assert(sizeof(FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256) == 65,
@@ -50,6 +58,7 @@ static_assert(sizeof(FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256) == 65,
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +72,11 @@ namespace cake_fused_kda_decode {
 
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kQKV = 3;
+// The persistent streaming family keeps three 256-thread CTAs resident per SM
+// (register and 70 KiB dynamic shared memory budget) and fills every resident
+// slot with a grid-strided (row, head) item sequence.  Mirrors the source
+// launcher's STREAM_MAX_RESIDENT_CTAS_PER_SM.
+constexpr int64_t kPersistentResidentCtasPerSm = 3;
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
@@ -171,9 +185,9 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
       << "x must have shape [rows, 3 * H * 128]";
   const int64_t rows = x.size(0);
   const int64_t num_heads = x.size(1) / (kQKV * kHeadDim);
-  TVM_FFI_ICHECK(num_heads == 12 || num_heads == 24 || num_heads == 32 || num_heads == 48 ||
-                 num_heads == 96)
-      << "H must be one of 12, 24, 32, 48, or 96";
+  TVM_FFI_ICHECK(num_heads == 8 || num_heads == 12 || num_heads == 24 || num_heads == 32 ||
+                 num_heads == 48 || num_heads == 96)
+      << "H must be one of 8, 12, 24, 32, 48, or 96";
   const int64_t hidden = num_heads * kHeadDim;
   const int64_t qkv_size = kQKV * hidden;
   TVM_FFI_ICHECK(x.stride(1) == 1) << "x must have unit channel stride";
@@ -302,7 +316,23 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
             "cudaFuncSetAttribute(Cake fused KDA decode)");
 #endif
 
-#if FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS
+#if FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID
+  // One persistent launch walks every (row, head) work item with a grid-stride
+  // loop.  The grid fills the resident CTA capacity of the launching device
+  // rather than the work-item count, reproducing the source launcher's
+  // max(1, min(rows * H, 3 * SM count)) schedule on B200 and B300 alike.
+  int sm_count = 0;
+  CheckCuda(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id),
+            "cudaDeviceGetAttribute(multiprocessor count)");
+  TVM_FFI_ICHECK(sm_count > 0) << "CUDA device " << device_id << " reports no multiprocessors";
+  const int64_t work_items = rows * num_heads;
+  const int64_t grid_x = std::max<int64_t>(
+      1, std::min<int64_t>(work_items, kPersistentResidentCtasPerSm * sm_count));
+  const dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+  CheckCuda(
+      cudaLaunchKernel(kernel, grid, block, args, FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES, stream),
+      "Cake fused KDA decode persistent launch");
+#elif FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS
   // Repeated slots have sequential recurrent semantics.  Launch each row on
   // the same stream so every row observes the preceding mutation of its slot.
   // The frozen owner-chain kernel receives one row and therefore retains its

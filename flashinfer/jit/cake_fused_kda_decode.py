@@ -83,15 +83,24 @@ _RUNTIME_CONFIG_ABI: tuple[tuple[str, str, str], ...] = (
     ("parameter", "lower_bound_log2", "float32_scalar"),
     ("parameter", "norm_eps", "float32_scalar"),
 )
+_ROWS_ABI: tuple[tuple[str, str, str], ...] = (("parameter", "rows", "int32"),)
 CAKE_FUSED_KDA_DECODE_ABIS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    # One CTA per (head, row) grid cell.
     "standard": _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _RUNTIME_CONFIG_ABI,
+    # The frozen owner-chain kernel receives one row per launch; the binding
+    # walks the rows sequentially so repeated slots observe every mutation.
     "repeated_safe": (
-        _COMMON_BUFFER_ABI
-        + _COMMON_SCALAR_ABI
-        + (("parameter", "rows", "int32"),)
-        + _RUNTIME_CONFIG_ABI
+        _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _ROWS_ABI + _RUNTIME_CONFIG_ABI
+    ),
+    # One persistent launch receives every row and walks the (row, head) work
+    # items with a grid-stride loop; the binding sizes the grid from the
+    # launching device's resident-CTA capacity instead of the item count.
+    "persistent_rows": (
+        _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _ROWS_ABI + _RUNTIME_CONFIG_ABI
     ),
 }
+_ROWS_ABI_KINDS = frozenset({"repeated_safe", "persistent_rows"})
+_HEADS: tuple[int, ...] = (8, 12, 24, 32, 48, 96)
 _ARG_PLAN_SHA256 = {
     name: hashlib.sha256(
         json.dumps(arguments, separators=(",", ":")).encode()
@@ -149,6 +158,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -240,6 +264,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": None,
@@ -329,6 +368,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -420,6 +474,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": None,
@@ -509,6 +578,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 37,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 76,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -600,6 +699,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 37,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 76,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": 12,
@@ -689,6 +818,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -780,6 +924,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": 12,
@@ -870,6 +1029,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": 12,
@@ -959,6 +1133,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -1290,6 +1479,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 36480,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 25,
                 "maximum_rows": 37,
@@ -1379,6 +1583,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 36480,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 25,
@@ -1470,6 +1689,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 36480,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 63,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 25,
                 "maximum_rows": 37,
@@ -1559,6 +1793,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 36480,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 63,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 25,
@@ -2010,6 +2259,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 28288,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 77,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2085,6 +2364,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 28288,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 77,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2159,6 +2468,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 28288,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 99,
@@ -2250,6 +2574,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 28288,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2340,6 +2679,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 20096,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2429,6 +2783,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 20096,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 99,
@@ -2880,6 +3249,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 37,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 13,
                 "maximum_rows": 24,
@@ -3074,6 +3473,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 37,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 13,
@@ -3270,6 +3699,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 13,
                 "maximum_rows": 24,
@@ -3434,6 +3878,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 13,
@@ -3861,6 +4320,16 @@ def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
     """Choose positive-unique FP32 schedules by resident-CTA wave capacity."""
 
     sm_count = 148
+    if num_heads == 8:
+        # Measured H=8 bands (B200 and B300 route matrices, 2026-09-25): the
+        # staged compact family loses 5-16 % to high-work for rows 38..55,
+        # the vector-four producer loses to the spread producer, and the
+        # nearly empty third high-work wave makes wide512 the better route
+        # for rows 56..76.  Beyond that the rotating high-work pipeline is
+        # at least as fast everywhere.
+        if num_rows <= 37 or 56 <= num_rows <= 76:
+            return ("wide512_positive_f32",)
+        return ("high_work_positive_f32",)
     work_items = num_heads * num_rows
     if 2 * sm_count < work_items <= 3 * sm_count:
         return ("compact_async_pr_eval_h96_f32", "compact_async_positive_f32")
@@ -3912,7 +4381,7 @@ def select_cake_fused_kda_decode_variant(
 
     if target not in _TARGETS:
         raise ValueError(f"unsupported Cake fused KDA target: {target}")
-    if num_heads not in (12, 24, 32, 48, 96):
+    if num_heads not in _HEADS:
         raise ValueError(f"unsupported Cake fused KDA head count: {num_heads}")
     if num_rows <= 0 or num_slots <= 0:
         raise ValueError("Cake fused KDA rows and slots must be positive")
@@ -4036,7 +4505,7 @@ def _kernel_declaration(variant: CakeFusedKDADecodeVariant) -> str:
         "int output_gate_row_stride",
         "int H",
     ]
-    if variant.abi_kind == "repeated_safe":
+    if variant.abi_kind in _ROWS_ABI_KINDS:
         arguments.append("int rows")
     arguments.extend(
         ["int use_lower_bound", "float lower_bound_log2", "float norm_eps"]
@@ -4049,7 +4518,8 @@ def _kernel_declaration(variant: CakeFusedKDADecodeVariant) -> str:
 
 
 def _render_binding(variant: CakeFusedKDADecodeVariant) -> str:
-    has_rows = int(variant.abi_kind == "repeated_safe")
+    has_rows = int(variant.abi_kind in _ROWS_ABI_KINDS)
+    persistent_grid = int(variant.abi_kind == "persistent_rows")
     state_is_bfloat16 = int(variant.state_dtype == "bfloat16")
     return f"""\
 /*
@@ -4076,6 +4546,7 @@ def _render_binding(variant: CakeFusedKDADecodeVariant) -> str:
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_THREADS {variant.threads}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES {variant.dynamic_smem_bytes}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS {has_rows}
+#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID {persistent_grid}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 {state_is_bfloat16}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256 "{_ARG_PLAN_SHA256[variant.abi_kind]}"
 
