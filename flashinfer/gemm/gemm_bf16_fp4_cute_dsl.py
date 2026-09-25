@@ -639,6 +639,47 @@ def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
 
 _SM100_BF16_FP4_TACTICS = tuple(_sm100_bf16_fp4_tactic_configs())
 
+_SM100_BF16_FP4_TACTIC_ORDER = {t: i for i, t in enumerate(_SM100_BF16_FP4_TACTICS)}
+
+# Untuned pick, memoized on (m, n, k, sm_count) -- everything it depends on.
+_SM100_BF16_FP4_DEFAULT_TACTIC_CACHE: Dict[Tuple[int, int, int, int], Tuple] = {}
+
+
+def _sm100_bf16_fp4_tactic_ctas(tactic: Tuple, m: int, n: int) -> int:
+    """Tile count for a public ``(m, n)``, in CTAs.
+
+    The kernel's M mode carries public output channels ``n`` and its N mode
+    public rows ``m`` (see ``_sm100_bf16_fp4_tactic_configs``).  A 256-wide M
+    tile is the ``use_2cta_instrs`` tile and takes two CTAs; the rest take one.
+    """
+    (tile_n, tile_m, _), _, _ = tactic
+    ctas_per_tile = 2 if tile_n == 256 else 1
+    return -(-n // tile_n) * ctas_per_tile * -(-m // tile_m)
+
+
+def _select_sm100_bf16_fp4_default_tactic(
+    valid_tactics: List[Tuple], m: int, n: int, sm_count: int
+) -> Tuple:
+    """Pick the no-autotune fallback tactic for the SM100/103 dense W4A16 GEMM.
+
+    Ranks by ``waves x per-CTA bytes`` (``tile_n`` FP4 weights at half a byte,
+    ``tile_m`` BF16 activations at two): a wider row tile cuts waves but makes
+    each CTA dearer, so the best tile grows with ``m``.  A heuristic; callers
+    that need the last few percent should autotune.
+    """
+
+    def rank(tactic: Tuple) -> Tuple:
+        tile_n, tile_m, _ = tactic[0]
+        waves = -(-_sm100_bf16_fp4_tactic_ctas(tactic, m, n) // sm_count)
+        return (
+            waves * (tile_n + 4 * tile_m),
+            bool(tactic[2]),
+            _SM100_BF16_FP4_TACTIC_ORDER[tactic],
+        )
+
+    return min(valid_tactics, key=rank)
+
+
 _SM100_BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -717,7 +758,7 @@ def _get_sm100_bf16_fp4_kernel(
         k,
         max_active_clusters=max_active_clusters,
         stream=stream,
-        options="--opt-level 3 --enable-tvm-ffi",
+        options="--opt-level 2 --enable-tvm-ffi",
     )
     _SM100_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
     return compiled
@@ -862,15 +903,22 @@ def _cute_dsl_sm100_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
         ) -> torch.Tensor:
             a, b, b_descale, alpha_for_launch, _, out, _ = inputs
             if tactic == -1:
-                valid = self.get_valid_tactics(inputs, None)
-                if valid:
-                    tactic = valid[0]
-                else:
-                    m, k = map(int, a.shape)
-                    raise ValueError(
-                        "no SM100 cute-dsl w4a16 tactic supports "
-                        f"m={m}, n={int(b.shape[0])}, k={k}"
+                m, k = map(int, a.shape)
+                n = int(b.shape[0])
+                sm_count = get_device_sm_count(a.device)
+                cache_key = (m, n, k, sm_count)
+                tactic = _SM100_BF16_FP4_DEFAULT_TACTIC_CACHE.get(cache_key)
+                if tactic is None:
+                    valid = self.get_valid_tactics(inputs, None)
+                    if not valid:
+                        raise ValueError(
+                            "no SM100 cute-dsl w4a16 tactic supports "
+                            f"m={m}, n={n}, k={k}"
+                        )
+                    tactic = _select_sm100_bf16_fp4_default_tactic(
+                        valid, m, n, sm_count
                     )
+                    _SM100_BF16_FP4_DEFAULT_TACTIC_CACHE[cache_key] = tactic
             return _launch_cute_dsl_sm100(
                 a,
                 b,
