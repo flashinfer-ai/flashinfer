@@ -1423,6 +1423,11 @@ def _alphamoe_try_complete_routed(
             )
             merge_counters = _s5_merge_counters(capacity * blocks, hidden_states.device)
     elif route_id == 8:
+        if not accumulate:
+            # accumulate=False hands over an uninitialized output. This route seeds its FP32
+            # accumulator from ``out`` (``initial_out`` below) before the operator's own
+            # accumulate=False zero fill runs, so clear the caller output here first.
+            out.zero_()
         get_alphamoe_nvfp4_sm100_module().nvfp4_complete_small_alignment_op(
             hidden_states,
             hidden_states_scale,
