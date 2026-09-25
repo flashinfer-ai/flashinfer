@@ -9,54 +9,55 @@ You may obtain a copy of the License at
 """
 
 import warnings
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.mla._batch_mla._auto_policy import _BatchMLAPagedAttentionAutoBackend
 
 
 WARN_TAG = "not Blackwell-native"
 
 
-def _fresh_state():
-    BatchMLAPagedAttentionWrapper._blackwell_auto_fallback_warned = False
+@pytest.fixture(autouse=True)
+def _fresh_warning_state(monkeypatch):
+    monkeypatch.setattr(
+        _BatchMLAPagedAttentionAutoBackend, "_blackwell_auto_fallback_warned", False
+    )
 
 
-def _make(buf, backend):
-    with warnings.catch_warnings(record=True) as w:
+@pytest.mark.parametrize("backend", ["auto", "fa2", "cutlass"])
+def test_constructor_does_not_emit_backend_selection_warning(backend):
+    workspace = torch.empty(1, dtype=torch.uint8)
+    with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        BatchMLAPagedAttentionWrapper(buf, backend=backend)
-        return [str(x.message) for x in w if WARN_TAG in str(x.message)]
+        BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+        BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+    assert not [warning for warning in caught if WARN_TAG in str(warning.message)]
 
 
-@pytest.fixture
-def buf():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    _fresh_state()
-    return torch.empty(8 * 1024 * 1024, dtype=torch.int8, device="cuda")
-
-
-@patch(
-    "flashinfer.mla._batch_mla._wrapper._get_compute_capability", return_value=(10, 0)
+@pytest.mark.parametrize(
+    ("capability", "expected_backend", "unexpected_backend"),
+    [
+        ((10, 0), "backend='cutile'", "backend='cutlass'"),
+        ((11, 0), "backend='cutlass'", "backend='cutile'"),
+    ],
 )
-def test_auto_warns_once_on_blackwell(_cc, buf):
-    assert len(_make(buf, "auto")) == 1
-    assert len(_make(buf, "auto")) == 0  # one-time
+def test_auto_warning_recommends_an_architecture_supported_backend(
+    monkeypatch, capability, expected_backend, unexpected_backend
+):
+    """The fallback warning must not recommend a backend that rejects the GPU."""
+    monkeypatch.setattr(
+        "flashinfer.mla._batch_mla._auto_policy._get_compute_capability",
+        lambda _device: capability,
+    )
 
+    with pytest.warns(UserWarning, match=WARN_TAG) as caught:
+        _BatchMLAPagedAttentionAutoBackend._maybe_warn_blackwell_auto_fallback(
+            torch.device("cuda"), "fa2"
+        )
 
-@patch(
-    "flashinfer.mla._batch_mla._wrapper._get_compute_capability", return_value=(10, 0)
-)
-def test_explicit_backend_does_not_warn(_cc, buf):
-    assert _make(buf, "fa2") == []
-    assert _make(buf, "cutlass") == []
-
-
-@patch(
-    "flashinfer.mla._batch_mla._wrapper._get_compute_capability", return_value=(9, 0)
-)
-def test_no_warn_on_hopper(_cc, buf):
-    assert _make(buf, "auto") == []
+    message = str(caught[0].message)
+    assert expected_backend in message
+    assert unexpected_backend not in message

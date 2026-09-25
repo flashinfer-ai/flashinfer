@@ -22,6 +22,11 @@ from .progress import PYTEST_EVENT_PREFIX, decode_pytest_event
 from .summary import batch_directory, batch_xml_path
 
 
+_DEFAULT_MASTER_PORT = 29500
+_MASTER_PORT_STRIDE = 100
+_MAX_TCP_PORT = 65535
+
+
 @dataclass(frozen=True)
 class BatchExecution:
     status: str
@@ -86,6 +91,46 @@ class _BatchProgress:
 
 _CONSOLE_LOCK = threading.Lock()
 _OUTPUT_DRAIN_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class _HostCpuTimes:
+    total: int
+    idle: int
+    iowait: int
+
+
+@dataclass(frozen=True)
+class _ProcessTreeStats:
+    worker_cpu_seconds: float
+    descendant_cpu_seconds: float
+    descendant_process_count: int
+    running_process_count: int
+    disk_sleep_process_count: int
+
+
+@dataclass(frozen=True)
+class _ProcessCpuStat:
+    state: str
+    own_cpu_seconds: float
+    children_cpu_seconds: float
+
+
+@dataclass(frozen=True)
+class _ResourceSample:
+    timestamp: float
+    host_rss_mib: float
+    gpu_memory_mib: float
+    host_cpu_percent: float | None
+    host_iowait_percent: float | None
+    load1: float
+    load5: float
+    load15: float
+    worker_cpu_seconds: float
+    descendant_cpu_seconds: float
+    descendant_process_count: int
+    running_process_count: int
+    disk_sleep_process_count: int
 
 
 def write_console(message: str) -> None:
@@ -170,15 +215,115 @@ def _gpu_mib(pids: set[int]) -> float:
     return total
 
 
-def _monitor_memory(
+def _read_host_cpu_times() -> _HostCpuTimes | None:
+    try:
+        fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+        if not fields or fields[0] != "cpu":
+            return None
+        values = [int(value) for value in fields[1:]]
+    except (OSError, ValueError):
+        return None
+    if len(values) < 5:
+        return None
+    # Linux reports guest time again inside user/nice, so only the first eight
+    # non-guest counters belong in the total.
+    return _HostCpuTimes(total=sum(values[:8]), idle=values[3], iowait=values[4])
+
+
+def _host_cpu_percentages(
+    previous: _HostCpuTimes | None, current: _HostCpuTimes | None
+) -> tuple[float | None, float | None]:
+    if previous is None or current is None:
+        return None, None
+    total = current.total - previous.total
+    if total <= 0:
+        return None, None
+    idle = max(0, current.idle - previous.idle)
+    iowait = max(0, current.iowait - previous.iowait)
+    busy = max(0, total - idle - iowait)
+    return 100 * busy / total, 100 * iowait / total
+
+
+def _parse_process_cpu_stat(stat: str, ticks_per_second: float) -> _ProcessCpuStat:
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return _ProcessCpuStat(
+        state=fields[0],
+        own_cpu_seconds=(int(fields[11]) + int(fields[12])) / ticks_per_second,
+        children_cpu_seconds=(int(fields[13]) + int(fields[14])) / ticks_per_second,
+    )
+
+
+def _process_tree_stats(root_pid: int, pids: set[int]) -> _ProcessTreeStats:
+    try:
+        ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError):
+        ticks_per_second = 100.0
+    cpu_stats: dict[int, _ProcessCpuStat] = {}
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            cpu_stat = _parse_process_cpu_stat(stat, ticks_per_second)
+            cpu_stats[pid] = cpu_stat
+        except (IndexError, OSError, ValueError):
+            continue
+    return _summarize_process_tree(root_pid, cpu_stats)
+
+
+def _summarize_process_tree(
+    root_pid: int, cpu_stats: dict[int, _ProcessCpuStat]
+) -> _ProcessTreeStats:
+    states = Counter(stats.state for stats in cpu_stats.values())
+    root_stats = cpu_stats.get(root_pid)
+    return _ProcessTreeStats(
+        worker_cpu_seconds=root_stats.own_cpu_seconds if root_stats else 0.0,
+        descendant_cpu_seconds=(root_stats.children_cpu_seconds if root_stats else 0.0)
+        + sum(
+            stats.own_cpu_seconds + stats.children_cpu_seconds
+            for pid, stats in cpu_stats.items()
+            if pid != root_pid
+        ),
+        descendant_process_count=max(0, len(cpu_stats) - int(root_pid in cpu_stats)),
+        running_process_count=states["R"],
+        disk_sleep_process_count=states["D"],
+    )
+
+
+def _monitor_resources(
     pid: int,
     stop: threading.Event,
-    samples: list[tuple[float, float, float]],
+    samples: list[_ResourceSample],
     interval: float,
 ) -> None:
+    previous_cpu = _read_host_cpu_times()
     while not stop.is_set():
         pids = _descendant_pids(pid)
-        samples.append((time.time(), _rss_mib(pids), _gpu_mib(pids)))
+        current_cpu = _read_host_cpu_times()
+        host_cpu_percent, host_iowait_percent = _host_cpu_percentages(
+            previous_cpu, current_cpu
+        )
+        previous_cpu = current_cpu
+        try:
+            load1, load5, load15 = os.getloadavg()
+        except OSError:
+            load1 = load5 = load15 = 0.0
+        process_stats = _process_tree_stats(pid, pids)
+        samples.append(
+            _ResourceSample(
+                timestamp=time.time(),
+                host_rss_mib=_rss_mib(pids),
+                gpu_memory_mib=_gpu_mib(pids),
+                host_cpu_percent=host_cpu_percent,
+                host_iowait_percent=host_iowait_percent,
+                load1=load1,
+                load5=load5,
+                load15=load15,
+                worker_cpu_seconds=process_stats.worker_cpu_seconds,
+                descendant_cpu_seconds=process_stats.descendant_cpu_seconds,
+                descendant_process_count=process_stats.descendant_process_count,
+                running_process_count=process_stats.running_process_count,
+                disk_sleep_process_count=process_stats.disk_sleep_process_count,
+            )
+        )
         stop.wait(interval)
 
 
@@ -208,13 +353,12 @@ def _forward_pytest_output(
             log.flush()
         nodeid = str(event.get("nodeid", ""))
         if event.get("event") == "start":
-            function, should_print = progress.start(
+            _, should_print = progress.start(
                 nodeid, float(event.get("started_at", time.time()))
             )
             if should_print:
                 state.emit(
-                    f"PYTEST START worker={worker_index} batch={batch_id} "
-                    f"function={function} node={nodeid}"
+                    f"PYTEST START worker={worker_index} batch={batch_id} node={nodeid}"
                 )
         elif event.get("event") == "finish":
             outcome = str(event.get("outcome", "unknown"))
@@ -313,7 +457,7 @@ class _ProcessOutcome:
     aborted: bool
     termination_signal: str
     output_error: str
-    samples: tuple[tuple[float, float, float], ...]
+    samples: tuple[_ResourceSample, ...]
     progress: _BatchProgress
 
 
@@ -352,6 +496,15 @@ def _pytest_command(
     ]
 
 
+def _worker_master_port(worker_index: int) -> str:
+    if worker_index < 0:
+        raise ValueError("worker index must be non-negative")
+    port = _DEFAULT_MASTER_PORT + worker_index * _MASTER_PORT_STRIDE
+    if port + _MASTER_PORT_STRIDE - 1 > _MAX_TCP_PORT:
+        raise ValueError(f"worker {worker_index} has no valid rendezvous port block")
+    return str(port)
+
+
 def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
@@ -362,6 +515,10 @@ def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
     )
     if request.device is not None:
         env["CUDA_VISIBLE_DEVICES"] = request.device
+    # Isolate each concurrent worker's rendezvous and sibling TCPStore ports.
+    # Preserve explicit launcher configuration.
+    if "MASTER_PORT" not in env:
+        env["MASTER_PORT"] = _worker_master_port(request.worker_index)
     return env
 
 
@@ -371,7 +528,8 @@ def _run_pytest(
     command: list[str],
 ) -> _ProcessOutcome:
     launched_at = time.time()
-    samples: list[tuple[float, float, float]] = []
+    environment = _pytest_environment(request)
+    samples: list[_ResourceSample] = []
     stop_monitor = threading.Event()
     monitor: threading.Thread | None = None
     termination_signal = ""
@@ -380,13 +538,19 @@ def _run_pytest(
     aborted = False
     exited_at: float | None = None
     output_errors: list[str] = []
+    write_console(
+        f"PYTEST BATCH START worker={request.worker_index} "
+        f"batch={request.batch.id} source={request.batch.source_file} "
+        f"device={environment.get('CUDA_VISIBLE_DEVICES', 'all')} "
+        f"master_port={environment['MASTER_PORT']}"
+    )
     with artifacts.log.open("a", encoding="utf-8") as log:
         log.write(f"command: {' '.join(command)}\n")
         log.flush()
         process = subprocess.Popen(
             command,
             cwd=request.pytest_root,
-            env=_pytest_environment(request),
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -412,7 +576,7 @@ def _run_pytest(
         output_thread.start()
         if request.monitor_memory:
             monitor = threading.Thread(
-                target=_monitor_memory,
+                target=_monitor_resources,
                 args=(process.pid, stop_monitor, samples, request.memory_interval),
                 daemon=True,
             )
@@ -482,13 +646,49 @@ def _run_pytest(
     )
 
 
-def _memory_csv(samples: tuple[tuple[float, float, float], ...]) -> str:
-    memory_stream = io.StringIO(newline="")
-    memory_writer = csv.writer(memory_stream, lineterminator="\n")
-    memory_writer.writerow(["timestamp", "host_rss_mib", "gpu_memory_mib"])
-    for timestamp, rss_mib, gpu_mib in samples:
-        memory_writer.writerow([f"{timestamp:.6f}", f"{rss_mib:.3f}", f"{gpu_mib:.3f}"])
-    return memory_stream.getvalue()
+def _resource_csv(samples: tuple[_ResourceSample, ...]) -> str:
+    resource_stream = io.StringIO(newline="")
+    resource_writer = csv.writer(resource_stream, lineterminator="\n")
+    resource_writer.writerow(
+        [
+            "timestamp",
+            "host_rss_mib",
+            "gpu_memory_mib",
+            "host_cpu_percent",
+            "host_iowait_percent",
+            "load1",
+            "load5",
+            "load15",
+            "worker_cpu_seconds",
+            "descendant_cpu_seconds",
+            "descendant_process_count",
+            "running_process_count",
+            "disk_sleep_process_count",
+        ]
+    )
+    for sample in samples:
+        resource_writer.writerow(
+            [
+                f"{sample.timestamp:.6f}",
+                f"{sample.host_rss_mib:.3f}",
+                f"{sample.gpu_memory_mib:.3f}",
+                ""
+                if sample.host_cpu_percent is None
+                else f"{sample.host_cpu_percent:.3f}",
+                ""
+                if sample.host_iowait_percent is None
+                else f"{sample.host_iowait_percent:.3f}",
+                f"{sample.load1:.3f}",
+                f"{sample.load5:.3f}",
+                f"{sample.load15:.3f}",
+                f"{sample.worker_cpu_seconds:.3f}",
+                f"{sample.descendant_cpu_seconds:.3f}",
+                sample.descendant_process_count,
+                sample.running_process_count,
+                sample.disk_sleep_process_count,
+            ]
+        )
+    return resource_stream.getvalue()
 
 
 def _timeout_result(
@@ -554,7 +754,7 @@ def _promote_batch_artifacts(
         )
     atomic_write_text(
         artifacts.final_xml.with_name(f"{batch.id}.memory.csv"),
-        _memory_csv(outcome.samples),
+        _resource_csv(outcome.samples),
     )
     atomic_write_json(
         artifacts.final_xml.with_name(f"{batch.id}.meta.json"),

@@ -23,15 +23,19 @@ Kernel implementations are in ``flashinfer.kda_kernels``; callers may
 explicitly select Cake or use its narrow native auto-dispatch contract.
 """
 
+import inspect
+import os
+import warnings
 from typing import Literal, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.kda import (
+    packed_fused_kda_decode_trace,
     fused_kda_decode_trace,
     packed_kda_decode_trace,
-    recurrent_kda_trace,
+    recurrent_kda_decode_trace,
 )
 
 try:
@@ -45,14 +49,177 @@ except (ImportError, RuntimeError):
     _FUSED_KDA_DECODE_AVAILABLE = False
 
 from .kda_kernels import run_packed_kda_decode as _run_packed_kda_decode
+
+try:
+    from .kda_kernels.fused_kda_decode_multitoken import (
+        run_fused_kda_decode_multitoken as _run_packed_fused_kda_decode,
+    )
+
+    _FUSED_KDA_DECODE_PACKED_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _run_packed_fused_kda_decode = None
+    _FUSED_KDA_DECODE_PACKED_AVAILABLE = False
 from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
+
+try:
+    from .kda_kernels.kda_decode_wy_output_only import (
+        kda_wy_output_only as _run_kda_output_only,
+    )
+
+    _KDA_OUTPUT_ONLY_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _run_kda_output_only = None
+    _KDA_OUTPUT_ONLY_AVAILABLE = False
+
 
 # None when the CuTe DSL is missing or cannot target this device
 # (see flashinfer/kda_kernels/__init__.py).
 _RECURRENT_KDA_AVAILABLE = _run_recurrent_kda is not None
 
+# What an omitted backend on the deprecated decode facade resolves to. Held
+# separately from the signature default so the two stay distinguishable.
+_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-@flashinfer_api(trace=recurrent_kda_trace)
+
+def _caller_stacklevel() -> int:
+    """Depth of the nearest frame outside this package.
+
+    The decorator chain between the caller and this function grows when API
+    logging is enabled, so a fixed stacklevel blames an internal frame at
+    FLASHINFER_LOGLEVEL>0 -- useless for a warning whose job is to name the
+    call the caller has to change.
+    """
+
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None:
+        parent = frame.f_back
+        level += 1
+        if parent is not None and not os.path.abspath(
+            parent.f_code.co_filename
+        ).startswith(_PACKAGE_ROOT):
+            return level
+        frame = parent
+    return 3
+
+
+_RELEASED_DECODE_BACKEND: Literal["cute-dsl"] = "cute-dsl"
+
+
+def _dispatch_recurrent_kda_decode(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    scale: Optional[float],
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    lower_bound: Optional[float],
+    cu_seqlens: Optional[torch.Tensor],
+    ssm_state_indices: Optional[torch.Tensor],
+    num_spec_tokens: Optional[int],
+    num_accepted_tokens: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    initial_state_source: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
+    beta_is_logit: bool,
+    disable_state_update: bool,
+    correction_cache: Optional[torch.Tensor],
+    kg_cache: Optional[torch.Tensor],
+    backend: Literal["cute-dsl", "cake", "auto"],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """The one decode contract, shared by both public ``recurrent_kda`` facades.
+
+    Every parameter is keyword-only and without a default, so a caller that
+    forgets to forward one fails loudly instead of silently taking a default
+    that diverges from the other facade.
+
+    Backend validation stays with the callers: the phase-neutral facade accepts
+    ``"cudnn"`` and resolves it before reaching decode, while the decode facade
+    does not accept it at all.
+    """
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if output_final_state:
+            raise ValueError(
+                "output_final_state=True is incompatible with "
+                "disable_state_update=True (no state is produced)"
+            )
+        if num_accepted_tokens is not None:
+            raise ValueError(
+                "num_accepted_tokens applies to the state-updating fused "
+                "spec path, not the frozen-verify mode"
+            )
+        return _run_frozen_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            output=output,
+            initial_state=initial_state,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+        )
+    if _run_recurrent_kda is None:
+        raise NotImplementedError("recurrent KDA backend is unavailable")
+
+    return _run_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_spec_tokens=num_spec_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        output=output,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        beta_is_logit=beta_is_logit,
+        backend=backend,
+    )
+
+
+@flashinfer_api(trace=recurrent_kda_decode_trace)
 def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -76,9 +243,18 @@ def recurrent_kda(
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
     *,
-    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
+    disable_state_update: bool = False,
+    correction_cache: Optional[torch.Tensor] = None,
+    kg_cache: Optional[torch.Tensor] = None,
+    backend: Optional[Literal["cute-dsl", "cake", "auto"]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
+
+    .. deprecated:: 0.8
+        Call :func:`flashinfer.recurrent_kda` instead. It serves this same
+        decode contract, accepts a superset of what this entry point accepts,
+        and defaults to ``backend="auto"``. This facade remains a thin shim
+        and is scheduled for removal in a future release.
 
     This public API supports the existing CuTe DSL implementation and an
     explicit exported Cake backend in
@@ -153,13 +329,42 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
-        backend (Literal["cute-dsl", "cake", "auto"]):
+        disable_state_update (bool):
+            Frozen / speculative-verify mode (mirrors GDN's
+            ``gated_delta_rule_mtp`` flag): compute the outputs for up to 16
+            tokens per sequence from the committed state and never write any
+            state back; ``final_state`` is always ``None``. Dispatches
+            internally to the WY-parallel tensor-core kernel or a grouped
+            register recurrence by problem size. Supports the batched
+            ``[B, T, ...]`` form directly and the packed ``cu_seqlens`` form
+            (ragged per-sequence lengths). ``backend="cake"`` raises in this
+            mode (no frozen-state Cake kernels; no silent fallback), and
+            ``output_final_state=True`` is rejected. Requires ``K == V ==
+            128`` and a bf16 state pool.
+        correction_cache (Optional[torch.Tensor]):
+            Only with ``disable_state_update=True``. Slot-indexed float32
+            buffer ``[num_slots, HV, T_max, V]`` receiving the per-token
+            delta-rule corrections ``sigmoid-or-raw(beta) * (v - u)`` for a
+            downstream commit/recovery kernel (the analog of GDN's
+            slot-indexed ``intermediate_states_buffer``). Rows past each
+            sequence's length and null slots are left untouched.
+        kg_cache (Optional[torch.Tensor]):
+            Only with ``disable_state_update=True``. Slot-indexed bf16 buffer
+            ``[num_slots, HV, T_max, 2*K]`` receiving the raw (unnormalized) key
+            in ``[..., :K]`` and the raw gate in ``[..., K:]`` per token,
+            matching the vLLM RecoverSSM cache convention.
+        backend (Optional[Literal["cute-dsl", "cake", "auto"]]):
             Implementation backend. ``"cute-dsl"`` preserves the existing
             FlashInfer implementation. ``"cake"`` strictly selects an
             exported Cake kernel and raises when the call does not match one
             of its supported contracts. ``"auto"`` selects Cake only for its
             equal-head/D128/T1 unbounded-softplus contract, preserving CuTe
-            DSL for every other decode surface. Default: ``"cute-dsl"``.
+            DSL for every other decode surface. Omitting it resolves to
+            ``"cute-dsl"``, the released default for this facade; ``None`` is
+            recorded as "not requested" rather than as that choice, so a
+            future release can converge omitted calls onto
+            :func:`flashinfer.recurrent_kda`'s ``"auto"`` without overriding
+            callers who asked for ``"cute-dsl"`` by name.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -167,14 +372,30 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
+    warnings.warn(
+        "flashinfer.kda_decode.recurrent_kda is deprecated and is now a shim "
+        "over the shared decode dispatcher. Call flashinfer.recurrent_kda "
+        "instead: it serves this same decode contract, accepts a superset of "
+        "what this entry point accepts, and defaults to backend='auto'. "
+        "Scheduled for removal in a future release.",
+        DeprecationWarning,
+        stacklevel=_caller_stacklevel(),
+    )
+    if backend is None:
+        backend = _RELEASED_DECODE_BACKEND
+    if backend == "cudnn":
+        # Deliberately narrower than the phase-neutral facade's enum: cuDNN's
+        # engine serves ordinary multi-token prefill only.
+        raise ValueError(
+            "backend='cudnn' covers ordinary multi-token prefill only, so it is "
+            "reachable through flashinfer.recurrent_kda rather than this decode "
+            "entry point"
+        )
     if backend not in ("cute-dsl", "cake", "auto"):
         raise ValueError(
             f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
         )
-    if _run_recurrent_kda is None:
-        raise NotImplementedError("recurrent KDA backend is unavailable")
-
-    run_kwargs = dict(
+    return _dispatch_recurrent_kda_decode(
         q=q,
         k=k,
         v=v,
@@ -196,8 +417,11 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        disable_state_update=disable_state_update,
+        correction_cache=correction_cache,
+        kg_cache=kg_cache,
+        backend=backend,
     )
-    return _run_recurrent_kda(**run_kwargs, backend=backend)
 
 
 @flashinfer_api(trace=packed_kda_decode_trace)
@@ -287,6 +511,11 @@ def fused_kda_decode(
     lower_bound: Optional[float] = -5.0,
     norm_eps: float = 1e-5,
     output: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
+    state_indices_mode: Optional[
+        Literal["positive_unique", "unique_or_null", "repeated_positive"]
+    ] = None,
 ) -> torch.Tensor:
     r"""Run the fused Kimi KDA decode pipeline.
 
@@ -345,6 +574,22 @@ def fused_kda_decode(
         output:
             Optional preallocated contiguous bfloat16 output with shape
             ``[1, num_rows, H, 128]``.
+        backend:
+            Implementation backend. ``"cute-dsl"`` preserves the existing
+            FlashInfer implementation. ``"cake"`` strictly selects an
+            exported Cake kernel and raises when no registered route matches.
+            ``"auto"`` selects Cake only when ``state_indices_mode`` is
+            supplied and a route matches on SM100a or SM103a, otherwise
+            preserving CuTe DSL. Each architecture uses its own compiled module.
+            Default: ``"cute-dsl"``.
+        state_indices_mode:
+            Host-known assertion about ``state_indices`` used only by the Cake
+            dispatcher. ``"positive_unique"`` means every index is positive
+            and unique; ``"unique_or_null"`` means positive indices are unique
+            and non-positive null rows may be present; ``"repeated_positive"``
+            means at least one positive slot repeats (null rows may also be
+            present). Required for ``backend="cake"``. The dispatcher never
+            reads the CUDA tensor to infer this property.
 
     Returns:
         The bfloat16 output tensor with shape ``[1, num_rows, H, 128]``.
@@ -366,4 +611,428 @@ def fused_kda_decode(
         lower_bound=lower_bound,
         norm_eps=norm_eps,
         output=output,
+        backend=backend,
+        state_indices_mode=state_indices_mode,
     )
+
+
+def _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices):
+    """Validate remap metadata structure without reading device values."""
+    if query_start_loc.dtype != torch.int32:
+        raise TypeError(
+            f"query_start_loc must have dtype torch.int32, got {query_start_loc.dtype}"
+        )
+    if state_indices.dtype != torch.int32:
+        raise TypeError(
+            f"state_indices must have dtype torch.int32, got {state_indices.dtype}"
+        )
+    if state_indices.ndim != 2 or state_indices.shape[1] != 1:
+        raise ValueError("state_indices must have shape [N, 1]")
+    if (
+        query_start_loc.ndim != 1
+        or query_start_loc.shape[0] != state_indices.shape[0] + 1
+    ):
+        raise ValueError("query_start_loc must have shape [state_indices.shape[0] + 1]")
+    if not query_start_loc.is_contiguous():
+        raise ValueError("query_start_loc must be contiguous")
+    if not state_indices.is_contiguous():
+        raise ValueError("state_indices must be contiguous")
+    if query_start_loc.device != x.device or state_indices.device != x.device:
+        raise ValueError("T=1 remap metadata must be on the same device as x")
+
+
+@flashinfer_api(trace=packed_fused_kda_decode_trace)
+def packed_fused_kda_decode(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    lower_bound: Optional[float] = -5.0,
+    norm_eps: float = 1e-5,
+    output: Optional[torch.Tensor] = None,
+    *,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    t1_state_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run packed T>=1 fused KDA with per-token cache checkpoints.
+
+    Tokens use a packed ragged layout described by ``query_start_loc``.
+    ``state_indices`` has shape ``[N, T]``, where T is the maximum verification
+    length. ``num_accepted_tokens[n] - 1`` selects the source checkpoint and
+    convolution-history offset for sequence ``n``; token ``t`` writes its
+    recurrent checkpoint to ``state_indices[n, t]``. The convolution cache is
+    one rolling window of length ``T + 2`` in ``state_indices[n, 0]``.
+
+    This facade is CuTe-only: T=1 uses the CuTe DSL implementation underlying
+    ``fused_kda_decode`` (without Cake or backend selection), including
+    bfloat16-state and softplus-gate support. The optional
+    ``t1_state_indices`` optimization is strictly T=1-only; passing it for
+    T>1 fails closed. T>1 uses the SM10x CuTe DSL packed backend, which
+    accepts float32 or bfloat16 recurrent state and requires a finite negative
+    ``lower_bound``. Both paths require
+    head dimension 128, convolution width four, and 12, 24, 32, 48, or 96
+    heads. Other tensors follow :func:`fused_kda_decode`, with the packed row
+    count supplied by ``x``.
+
+    ``query_start_loc`` must be contiguous int32 of shape ``[N+1]``, start at
+    zero, and contain nondecreasing offsets within ``x`` with active lengths no
+    larger than T.
+    ``num_accepted_tokens`` must be contiguous int32 of shape ``[N]`` with
+    values in ``[1, T]``. For T=1, ``t1_state_indices`` may optionally provide
+    the already-resolved contiguous per-row cache slots with shape
+    ``[num_rows]``. When supplied, it is used by the direct fused T=1
+    specialization and ``query_start_loc`` is retained only as structural
+    metadata; its values are not read by the host or kernel. This is intended
+    for CUDA-Graph-stable caller-owned buffers updated in-place.
+    Active recurrent destinations must be positive cache
+    slots and must not alias destinations from another active sequence;
+    non-positive or zero-length rows are null rows and do not mutate either
+    cache. In T=1, packed rows beyond ``query_start_loc[-1]`` are trailing
+    unused capacity: they receive zero output and do not mutate either cache.
+    These value constraints are caller-owned so CUDA Graph replay never performs
+    a device-to-host validation sync.
+
+    Args:
+        x:
+            Packed QKV projection with shape ``[num_rows, 3 * H * 128]`` and
+            dtype bfloat16.
+        weight:
+            Depthwise convolution weights with shape ``[3, 4, H * 128]`` and
+            dtype float32.
+        conv_state:
+            Paged bfloat16 convolution cache. T=1 uses history length three;
+            T>1 uses the extended rolling history length ``T + 2``.
+        raw_gate:
+            Raw recurrence gate with shape ``[1, num_rows, H, 128]`` and dtype
+            bfloat16.
+        raw_beta:
+            Raw delta-rule learning-rate logits with shape
+            ``[1, num_rows, H]`` and dtype bfloat16.
+        A_log:
+            Log decay parameter with ``H`` elements and dtype float32.
+        dt_bias:
+            Per-channel decay bias with ``H * 128`` elements and dtype float32.
+        state_indices:
+            Contiguous int32 cache slots with shape ``[N, T]``. For T>1,
+            column ``t`` is the recurrent checkpoint destination for token
+            ``t``. Column zero also selects the rolling convolution cache.
+        query_start_loc:
+            Contiguous int32 packed-row offsets with shape ``[N + 1]``.
+        num_accepted_tokens:
+            Contiguous int32 accepted-token counts with shape ``[N]``.
+        t1_state_indices:
+            Optional contiguous int32 per-packed-row cache slots with shape
+            ``[num_rows]``. T=1 only; null and trailing rows must be zero or
+            non-positive. The tensor is never allocated or populated by this
+            function.
+        state:
+            Paged recurrent state with shape ``[num_slots, H, 128, 128]``.
+            float32 or bfloat16. T>1 keeps the recurrence in float32 and
+            rounds only when writing each bfloat16 checkpoint.
+        output_gate:
+            Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
+            ``[1, num_rows, H, 128]`` and dtype bfloat16.
+        norm_weight:
+            RMSNorm weight with 128 elements and dtype float32.
+        lower_bound:
+            Negative recurrence-gate lower bound. T=1 also accepts ``None``
+            for the softplus gate; T>1 requires a finite negative value.
+        norm_eps:
+            Non-negative RMSNorm epsilon.
+        output:
+            Optional preallocated contiguous bfloat16 output with shape
+            ``[1, num_rows, H, 128]``.
+
+    Returns:
+        The packed bfloat16 output with shape ``[1, num_rows, H, 128]``.
+    """
+    if state_indices.ndim < 2:
+        raise ValueError("state_indices must have shape [N, T]")
+    if t1_state_indices is not None:
+        if state_indices.ndim != 2 or state_indices.shape[1] != 1:
+            raise ValueError(
+                "t1_state_indices is only supported for T=1; T>1 uses the "
+                "multitoken kernel unchanged"
+            )
+        if (
+            t1_state_indices.ndim != 1
+            or t1_state_indices.shape != (x.shape[0],)
+            or t1_state_indices.dtype != torch.int32
+            or not t1_state_indices.is_contiguous()
+            or t1_state_indices.device != x.device
+        ):
+            raise ValueError(
+                "t1_state_indices must be contiguous int32 [num_rows] on x.device"
+            )
+        if _run_fused_kda_decode is None:
+            raise NotImplementedError("fused KDA decode backend is unavailable")
+        _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices)
+        return _run_fused_kda_decode(
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=t1_state_indices,
+            state=state,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+            output=output,
+        )
+    if state_indices.ndim == 2 and state_indices.shape[1] == 1:
+        if _run_fused_kda_decode is None:
+            raise NotImplementedError("fused KDA decode backend is unavailable")
+        _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices)
+        return _run_fused_kda_decode(
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            # T=1 does not need a remap buffer.  The direct ABI argument is
+            # unused by the packed constexpr specialization; pass the first
+            # packed destination as the compatible [N] view.
+            state_indices=state_indices[:, 0],
+            query_start_loc=query_start_loc,
+            packed_state_indices=state_indices,
+            state=state,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+            output=output,
+        )
+    if _run_packed_fused_kda_decode is None:
+        raise NotImplementedError("packed fused KDA decode backend is unavailable")
+    return _run_packed_fused_kda_decode(
+        x=x,
+        weight=weight,
+        conv_state=conv_state,
+        raw_gate=raw_gate,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_indices=state_indices,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        state=state,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        lower_bound=lower_bound,
+        norm_eps=norm_eps,
+        output=output,
+    )
+
+
+# Cached trivial metadata for the frozen mode's uniform batched form: the
+# arange cu_seqlens / slot indices are content-stable per (device, B, T), so
+# building them once keeps the hot path allocation- and launch-free (required
+# for CUDA-graph capture and honest kernel-time benchmarking).
+_FROZEN_META: dict = {}
+
+
+def _frozen_arange(device, n, step=1):
+    key = (str(device), int(n), int(step))
+    t = _FROZEN_META.get(key)
+    if t is None:
+        with torch.inference_mode(False):
+            t = torch.arange(0, n * step, step, dtype=torch.int32, device=device)
+        _FROZEN_META[key] = t
+    return t
+
+
+def _run_frozen_recurrent_kda(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    scale,
+    use_qk_l2norm_in_kernel,
+    use_gate_in_kernel,
+    lower_bound,
+    cu_seqlens,
+    ssm_state_indices,
+    num_spec_tokens,
+    output,
+    initial_state,
+    initial_state_source,
+    initial_state_indices,
+    beta_is_logit,
+    correction_cache,
+    kg_cache,
+):
+    """recurrent_kda's frozen / speculative-verify mode.
+
+    Dispatch, mirroring the GDN precedent (mode on the op, kernels internal):
+
+    - batched ``[B, T, ...]`` without caches -> the output-only dispatcher
+      (WY-parallel tensor-core kernel or grouped register recurrence by
+      problem size);
+    - any call requesting ``correction_cache``/``kg_cache``, and packed
+      ``cu_seqlens`` calls, -> the packed frozen-verify kernel (WY, ragged
+      lengths and null slots supported), which writes the slot-indexed fp32
+      correction and bf16 kg caches.
+
+    Never writes any state pool; returns ``(output, None)``.
+    """
+    if _run_kda_output_only is None:
+        raise NotImplementedError(
+            "disable_state_update=True requires the CuTe-DSL frozen-state "
+            "kernels (missing cutlass DSL deps)"
+        )
+    if not use_qk_l2norm_in_kernel:
+        raise ValueError(
+            "disable_state_update=True always applies Q/K L2 normalization "
+            "(use_qk_l2norm_in_kernel=False is not supported)"
+        )
+    pool = initial_state_source if initial_state_source is not None else initial_state
+    if pool is None:
+        raise ValueError(
+            "disable_state_update=True requires a committed state pool via "
+            "initial_state_source (preferred) or initial_state (read-only)"
+        )
+    slots = (
+        initial_state_indices
+        if initial_state_indices is not None
+        else ssm_state_indices
+    )
+    want_caches = correction_cache is not None or kg_cache is not None
+    if want_caches and (correction_cache is None or kg_cache is None):
+        raise ValueError("correction_cache and kg_cache must be provided together")
+
+    from .kda_kernels.kda_decode_wy_output_only import (
+        _dummy_f32,
+        kda_recoverssm_verify as _packed_frozen_verify,
+    )
+
+    if cu_seqlens is None and not want_caches:
+        # Batched [B, T, ...] frozen decode without verify caches.
+        out = _run_kda_output_only(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state_source=pool,
+            initial_state_indices=slots,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound if use_gate_in_kernel else None,
+            beta_is_logit=beta_is_logit,
+            output=output,
+            backend="auto",
+        )
+        return out, None
+
+    # Packed frozen verify (and every cache-requesting call): slot-indexed
+    # caches, ragged lengths, null slots.
+    if q.shape[-2] != v.shape[-2]:
+        raise NotImplementedError(
+            "GQA (HV != H) is not supported by the packed frozen-verify path "
+            "(correction/kg caches or cu_seqlens inputs) yet — the underlying "
+            "vLLM RecoverSSM contract is equal-head (Kimi K3). Use the "
+            "batched [B, T, ...] form without caches for GQA."
+        )
+    device = q.device
+    if cu_seqlens is None:
+        # Uniform batched form: build the trivial cu_seqlens and flatten to
+        # the packed [1, total, ...] views (free reshapes of contiguous
+        # tensors; .reshape falls back to a copy for non-contiguous inputs).
+        B, T_in = q.shape[0], q.shape[1]
+        H, HV = q.shape[2], v.shape[2]
+        qsl = _frozen_arange(device, B + 1, T_in)
+        qp = q.reshape(1, B * T_in, H, q.shape[3])
+        kp = k.reshape(1, B * T_in, H, k.shape[3])
+        vp = v.reshape(1, B * T_in, HV, v.shape[3])
+        gp = g.reshape(1, B * T_in, HV, g.shape[3])
+        bp = beta.reshape(1, B * T_in, HV)
+        outp = (
+            output.reshape(1, B * T_in, HV, v.shape[3]) if output is not None else None
+        )
+        spec_len = T_in
+        reshape_out = (B, T_in)
+    else:
+        if not want_caches:
+            raise ValueError(
+                "packed (cu_seqlens) frozen-verify calls currently require "
+                "correction_cache/kg_cache; for a plain frozen decode pass "
+                "batched [B, T, ...] tensors instead"
+            )
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError(
+                f"cu_seqlens must be 1-D with at least 2 entries; "
+                f"got {tuple(cu_seqlens.shape)}"
+            )
+        B = cu_seqlens.shape[0] - 1
+        qp, kp, vp, gp, bp, outp, qsl = q, k, v, g, beta, output, cu_seqlens
+        if num_spec_tokens is not None:
+            spec_len = num_spec_tokens + 1
+        elif correction_cache is not None:
+            spec_len = correction_cache.shape[2]
+        else:
+            raise ValueError(
+                "packed frozen-verify calls need the window size via "
+                "num_spec_tokens or the caches' token dimension"
+            )
+        reshape_out = None
+    if slots is None:
+        slots = _frozen_arange(device, B)
+    elif slots.ndim != 1 or slots.shape[0] != B:
+        raise ValueError(
+            f"state slot indices must be [B={B}]; got {tuple(slots.shape)}"
+        )
+    if want_caches:
+        corr_t, kg_t = correction_cache, kg_cache
+    else:
+        # Batched call without caches but through the packed kernel is not
+        # reachable (handled above); guard for completeness.
+        raise AssertionError("unreachable: packed path without caches")
+    H = qp.shape[2]
+    K_dim = qp.shape[3]
+    A_log_eff = A_log if A_log is not None else _dummy_f32(device, H)
+    dt_bias_eff = dt_bias if dt_bias is not None else _dummy_f32(device, H * K_dim)
+    out = _packed_frozen_verify(
+        qp,
+        kp,
+        vp,
+        gp,
+        bp,
+        A_log_eff,
+        dt_bias_eff,
+        lower_bound if use_gate_in_kernel else None,
+        pool,
+        corr_t,
+        kg_t,
+        qsl,
+        slots,
+        spec_len,
+        outp,
+        use_gate_in_kernel=use_gate_in_kernel,
+        beta_is_logit=beta_is_logit,
+        scale=scale,
+        # recurrent_kda slot convention: 0 is a valid slot; only negative
+        # slots are padding (the vLLM drop-in reserves slot 0 as null).
+        null_min=0,
+    )
+    if reshape_out is not None:
+        out = out.reshape(reshape_out[0], reshape_out[1], out.shape[2], out.shape[3])
+    return out, None

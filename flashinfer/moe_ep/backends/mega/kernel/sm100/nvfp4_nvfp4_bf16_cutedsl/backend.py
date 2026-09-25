@@ -51,7 +51,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
-        self._thunk_state: tuple | None = None
+        self._thunk_states: dict[tuple, tuple] = {}
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -119,7 +119,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import get_symm_buffer_for_mega_moe
 
         k = self._kernel_config
         fp = fleet_params
@@ -132,14 +132,37 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_resolve_gate_up_clamp(k),
+            swiglu_alpha=k.swiglu_alpha,
+            swiglu_beta=k.swiglu_beta,
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
-            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            defer_topk_reduce=self._uses_native_topk_reduce(fleet_params),
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+        )
+
+    def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
+        """Whether this exact workspace can use the frozen Cake reducer.
+
+        The reducer is published for the datacenter-Blackwell targets that
+        also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
+        """
+        from flashinfer.jit.cake_megamoe_topk_reduce import supported_capabilities
+
+        k = self._kernel_config
+        return (
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+            in supported_capabilities()
+            and fleet_params.max_tokens_per_rank in (256, 4096)
+            and fleet_params.token_hidden_size == 4096
+            and k.top_k == 6
+            and not k.enable_in_kernel_fc2_reduce
+            and k.combine_dtype == "bf16"
+            and k.apply_topk_in_fc1
         )
 
     def validate_forward(
@@ -180,7 +203,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-            from ......kernel_src.cutedsl_megamoe import (
+            from ......kernel_src.sm100.cutedsl_megamoe import (
                 Nvfp4BlockSize,
                 ceil_div,
                 round_up,
@@ -205,16 +228,115 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
-            from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+            from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
-        if t.fc1_alpha is not None:
-            workspace.fc1_alpha.copy_(t.fc1_alpha)
-        if t.fc2_alpha is not None:
-            workspace.fc2_alpha.copy_(t.fc2_alpha)
-        if t.fc1_norm_const is not None:
-            workspace.fc1_norm_const.copy_(t.fc1_norm_const)
+        destinations = []
+        sources = []
+        for source, destination in (
+            (t.fc1_alpha, workspace.fc1_alpha),
+            (t.fc2_alpha, workspace.fc2_alpha),
+            (t.fc1_norm_const, workspace.fc1_norm_const),
+        ):
+            if source is not None:
+                destinations.append(destination)
+                sources.append(source)
+        if sources:
+            # Workspace aliases preserve the ordering of the individual copies.
+            if any(
+                torch._C._overlaps(source, destination)
+                for source in sources
+                for destination in destinations
+            ):
+                for destination, source in zip(destinations, sources, strict=True):
+                    destination.copy_(source)
+            else:
+                # Batch the common contiguous CUDA copies into one launch.
+                torch._foreach_copy_(destinations, sources)
+
+    def validate_capture_ready(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> None:
+        frontend = workspace._frontend
+        mega = frontend._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "MegaMoE workspace is not warmed for CUDA graph capture; "
+                "call layer.warmup(..., workspace=workspace) first"
+            )
+        if frontend.config.defer_topk_reduce:
+            from flashinfer.jit.cake_megamoe_topk_reduce import (
+                is_cake_megamoe_topk_reduce_module_loaded,
+            )
+
+            if not is_cake_megamoe_topk_reduce_module_loaded():
+                raise RuntimeError(
+                    "MegaMoE terminal reducer is not warmed for CUDA graph capture; "
+                    "call layer.warmup(..., workspace=workspace) first"
+                )
+        # Materialize the thunk for the current capture stream before staging
+        # mutates workspace buffers or records any graph node.
+        self._prepared_thunk_state(workspace, transformed_weights)
+
+    @staticmethod
+    def _mega_inputs(
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> Any:
+        from ......kernel_src.sm100.cutedsl_megamoe import MegaMoENvfp4Inputs
+
+        return MegaMoENvfp4Inputs(
+            activation=workspace.x,
+            activation_sf=workspace.x_sf,
+            topk_idx=workspace.topk_idx,
+            topk_weights=workspace.topk_weights,
+            fc1_weight=transformed_weights[0][0],
+            fc1_weight_sf=transformed_weights[0][1],
+            fc2_weight=transformed_weights[1][0],
+            fc2_weight_sf=transformed_weights[1][1],
+            fc1_alpha=workspace.fc1_alpha,
+            fc2_alpha=workspace.fc2_alpha,
+            fc1_norm_const=workspace.fc1_norm_const,
+            output_activation=workspace.output_activation,
+        )
+
+    def _prepared_thunk_state(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple:
+        kcfg = self._kernel_config
+        fe = workspace._frontend
+        fe.set_swiglu_params(kcfg.swiglu_alpha, kcfg.swiglu_beta)
+        clamp = _resolve_gate_up_clamp(kcfg)
+        if clamp is not None:
+            fe.set_gate_up_clamp(clamp)
+        mega = fe._mega
+        stream = torch.cuda.current_stream().cuda_stream
+        weight_identity = tuple(
+            id(tensor) for transformed in transformed_weights for tensor in transformed
+        )
+        key = (
+            id(workspace),
+            weight_identity,
+            id(mega.compiled) if mega is not None and mega.compiled else None,
+            stream,
+        )
+        state = self._thunk_states.get(key)
+        if state is None or key[2] is None:
+            inputs = self._mega_inputs(workspace, transformed_weights)
+            # Full validation happens inside make_launch_thunk's
+            # _prepare_launch_inputs (run()'s slow-path validator).
+            thunk = fe.make_launch_thunk(inputs)
+            mega = fe._mega
+            assert mega is not None and mega.compiled is not None
+            key = (key[0], key[1], id(mega.compiled), stream)
+            state = (key, thunk, workspace.output_activation)
+            self._thunk_states[key] = state
+        return state
 
     def compute(
         self,
@@ -223,7 +345,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import staged_tokens
+        from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -245,7 +367,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from ......kernel_src.cutedsl_megamoe import autotune_nvfp4_mega_moe
+            from ......kernel_src.sm100.cutedsl_megamoe import autotune_nvfp4_mega_moe
 
             autotune_nvfp4_mega_moe(
                 output,
@@ -253,6 +375,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 transformed_weights[1],
                 workspace,
                 num_tokens=num_tokens,
+                swiglu_alpha=kcfg.swiglu_alpha,
+                swiglu_beta=kcfg.swiglu_beta,
                 gate_up_clamp=_resolve_gate_up_clamp(kcfg),
                 activation_clamp=kcfg.activation_clamp,
             )
@@ -267,50 +391,34 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # reuse. The stream is part of the key because the thunk's launch
         # kwargs bind it at build time — a graph capture runs on a capture
         # stream and must get its own thunk or the kernel launch escapes the
-        # graph. A knobs/clamp change nulls the frontend's compiled session,
+        # graph. A knobs/activation change nulls the compiled session,
         # changing the key and forcing a rebuild through the validated path.
-        fe = workspace._frontend
-        clamp = _resolve_gate_up_clamp(kcfg)
-        if clamp is not None:
-            fe.set_gate_up_clamp(clamp)
-        mega = fe._mega
-        stream = torch.cuda.current_stream().cuda_stream
-        key = (
-            id(workspace),
-            id(transformed_weights[0][0]),
-            id(mega.compiled) if mega is not None and mega.compiled else None,
-            stream,
-        )
-        state = self._thunk_state
-        if state is None or state[0] != key or key[2] is None:
-            from ......kernel_src.cutedsl_megamoe import (
-                MegaMoENvfp4Inputs,
+        state = self._prepared_thunk_state(workspace, transformed_weights)
+        key, thunk, out_buf = state
+        reducer_state = None
+        if workspace._frontend.config.defer_topk_reduce:
+            partials, workspace_root, _region = (
+                workspace._frontend.deferred_topk_reduce_workspace()
+            )
+            # Resolve/load the native module and borrowed view before the
+            # upstream launch.  The terminal interval below must contain only
+            # the two same-stream device launches—no lazy compilation,
+            # allocation, copy, event, or synchronization.
+            from flashinfer.jit.cake_megamoe_topk_reduce import (
+                get_cake_megamoe_topk_reduce_module,
             )
 
-            inputs = MegaMoENvfp4Inputs(
-                activation=workspace.x,
-                activation_sf=workspace.x_sf,
-                topk_idx=workspace.topk_idx,
-                topk_weights=workspace.topk_weights,
-                fc1_weight=transformed_weights[0][0],
-                fc1_weight_sf=transformed_weights[0][1],
-                fc2_weight=transformed_weights[1][0],
-                fc2_weight_sf=transformed_weights[1][1],
-                fc1_alpha=workspace.fc1_alpha,
-                fc2_alpha=workspace.fc2_alpha,
-                fc1_norm_const=workspace.fc1_norm_const,
-                output_activation=workspace.output_activation,
+            reducer_state = (
+                get_cake_megamoe_topk_reduce_module(partials.device),
+                partials,
+                workspace_root,
+                key[3],
             )
-            # Full validation happens inside make_launch_thunk's
-            # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(inputs)
-            mega = fe._mega
-            key = (key[0], key[1], id(mega.compiled), stream)
-            state = (key, thunk, workspace.output_activation)
-            self._thunk_state = state
-
-        _, thunk, out_buf = state
         thunk()
+        if reducer_state is not None:
+            reducer, partials, workspace_root, stream = reducer_state
+            reducer.run(partials, out_buf, num_tokens, stream)
+            del workspace_root
         if output is not None:
             output.copy_(out_buf[:num_tokens])
             return output
@@ -341,8 +449,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fp.token_hidden_size,
             2 * k.intermediate_size,
             _resolve_gate_up_clamp(k),
+            k.swiglu_alpha,
+            k.swiglu_beta,
             k.apply_topk_in_fc1,
-            k.in_kernel_fc2_reduce,
+            k.enable_in_kernel_fc2_reduce,
+            self._uses_native_topk_reduce(fleet_params),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
@@ -350,15 +461,23 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             knobs_pool_key(k.knobs),
         )
 
+    def _forget_local_workspace_state(self, workspace) -> None:
+        # Launch thunks close over this backend owner's workspace tensors.
+        # Drop them on every release, not only the final pooled release.
+        workspace_id = id(workspace)
+        self._thunk_states = {
+            key: state
+            for key, state in self._thunk_states.items()
+            if key[0] != workspace_id
+        }
+
     def _forget_workspace_state(self, workspace) -> None:
-        # The fused-stage memos key on topk_idx.data_ptr(); the symmetric
-        # heap reuses freed addresses, so evict before the buffer dies.
-        # sys.modules lookup (not an import): if the shim was never loaded,
-        # no memo exists and the heavy import must not happen.
+        # The fused-stage memo is process-global and keys on
+        # topk_idx.data_ptr(); evict only before the final physical free.
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

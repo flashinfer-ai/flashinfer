@@ -38,7 +38,7 @@ FlashInfer provides three packages:
 
 - **flashinfer-python**: Core package that compiles/downloads kernels on first use
 - **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
-- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+- **flashinfer-jit-cache**: CUDA-specific shim that installs architecture-specific pre-built kernel providers
 
 **For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
 
@@ -103,25 +103,24 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       cd flashinfer-cubin
-       python -m build --no-isolation --wheel
-       python -m pip install dist/*.whl
+       python -m build --no-isolation --wheel flashinfer-cubin
+       python -m pip install flashinfer-cubin/dist/*.whl
 
-   Build ``flashinfer-jit-cache`` (customize ``FLASHINFER_CUDA_ARCH_LIST`` for your target GPUs):
-
-   .. code-block:: bash
-
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f"
-
-   For DGX Spark / GB10, add the arch-specific SM121 target so JIT-cache
-   wheels include native ``121a`` artifacts for NVFP4/MXFP4 MMA:
+   Build one JIT-cache provider for the target GPU, then build a shim that
+   depends on that provider. The example below builds an SM90a provider; both
+   wheels must use the same version settings:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f 12.1a"
-       cd flashinfer-jit-cache
-       python -m build --no-isolation --wheel
-       python -m pip install dist/*.whl
+       export FLASHINFER_JIT_CACHE_PROVIDER_ARCH=9.0a
+       python -m build --no-isolation --wheel flashinfer-jit-cache-provider
+
+       export FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="9.0a"
+       python -m build --no-isolation --wheel flashinfer-jit-cache
+
+       python -m pip install \
+           flashinfer-jit-cache-provider/dist/*.whl \
+           flashinfer-jit-cache/dist/*.whl
 
 
 Install Nightly Build

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Script to build flashinfer-jit-cache wheel
+# Build one provider wheel or a provider shim wheel.
 # This script should be run inside the flashinfer container
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -10,8 +10,20 @@ source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
 finish_sccache_stats() {
   local exit_code=$?
+  collect_ninja_diagnostics || true
+  cleanup_jit_cache_python_build || true
   collect_sccache_stats || true
   return "${exit_code}"
+}
+
+collect_ninja_diagnostics() {
+  if [ "${BUILD_TARGET:-}" != "provider" ] || [ -z "${SCCACHE_STATS_DIR:-}" ]; then
+    return 0
+  fi
+
+  python3 "${SCRIPT_DIR}/collect_ninja_diagnostics.py" \
+    --build-root "${SCRIPT_DIR}/../build/aot-providers" \
+    --output-dir "${SCCACHE_STATS_DIR}/ninja"
 }
 
 trap finish_sccache_stats EXIT
@@ -24,9 +36,28 @@ if [[ ! "${PYTHON_VERSION}" =~ ^3\.[0-9]+$ ]]; then
 fi
 PYTHON_ABI="cp${PYTHON_VERSION//./}"
 
+BUILD_TARGET=${FLASHINFER_JIT_CACHE_BUILD_TARGET:-}
+case "${BUILD_TARGET}" in
+  provider)
+    : "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH:?provider builds require FLASHINFER_JIT_CACHE_PROVIDER_ARCH}"
+    PACKAGE_DIR=flashinfer-jit-cache-provider
+    export FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG="${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-manylinux_2_28_${ARCH}}"
+    ;;
+  shim)
+    : "${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS:?shim builds require FLASHINFER_JIT_CACHE_PROVIDER_ARCHS}"
+    PACKAGE_DIR=flashinfer-jit-cache
+    ;;
+  *)
+    echo "Invalid FLASHINFER_JIT_CACHE_BUILD_TARGET=${BUILD_TARGET}; expected provider or shim" >&2
+    exit 2
+    ;;
+esac
+
 echo "=========================================="
-echo "Building flashinfer-jit-cache wheel"
+echo "Building flashinfer-jit-cache ${BUILD_TARGET} wheel"
 echo "=========================================="
+
+: "${PYTORCH_INDEX:?PYTORCH_INDEX must be set}"
 
 compute_jit_cache_parallelism
 
@@ -37,8 +68,9 @@ echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
 echo "PyTorch Index: ${PYTORCH_INDEX}"
 echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
-echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
-echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
+echo "Provider Architecture: ${FLASHINFER_JIT_CACHE_PROVIDER_ARCH:-}"
+echo "Shim Provider Architectures: ${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS:-}"
+echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX:-}"
 echo "MAX_JOBS: ${MAX_JOBS}"
 echo "NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
 echo "Memory Budget per Job: ${MEM_PER_JOB} GB"
@@ -47,8 +79,8 @@ echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
 echo "Working directory: $(pwd)"
 echo ""
 
-# Navigate to the flashinfer-jit-cache directory
-cd flashinfer-jit-cache
+# Navigate to the selected package directory.
+cd "${PACKAGE_DIR}"
 
 export CONDA_pkgs_dirs="${FLASHINFER_CI_CACHE}/conda-pkgs"
 export XDG_CACHE_HOME="${FLASHINFER_CI_CACHE}/xdg-cache"
@@ -60,78 +92,50 @@ export PATH="/opt/python/${PYTHON_ABI}-${PYTHON_ABI}/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
 
 EXPECTED_CUDA_VERSION="${CUDA_MAJOR}.${CUDA_MINOR}"
-NVCC_CUDA_VERSION=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)
-if [ "${NVCC_CUDA_VERSION}" != "${EXPECTED_CUDA_VERSION}" ]; then
-  echo "ERROR: nvcc reports CUDA ${NVCC_CUDA_VERSION:-unknown}; expected ${EXPECTED_CUDA_VERSION}" >&2
-  exit 1
-fi
-echo "nvcc CUDA version check passed: ${NVCC_CUDA_VERSION}"
+validate_jit_cache_cuda_toolchain "${EXPECTED_CUDA_VERSION}"
 
 echo "::group::Install build system"
-pip install --upgrade build
-
-PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
-if python3 - "${EXPECTED_CUDA_VERSION}" <<'PY'
-import sys
-
-try:
-    import torch
-except ImportError:
-    raise SystemExit(1)
-
-raise SystemExit(0 if torch.version.cuda == sys.argv[1] else 1)
-PY
-then
-  echo "Using preinstalled PyTorch for CUDA ${EXPECTED_CUDA_VERSION}"
-else
-  TORCH_INSTALL_ARGS=(--upgrade torch --index-url "${PYTORCH_INDEX_URL}")
-  if [[ "${PYTORCH_INDEX}" == nightly/* ]]; then
-    TORCH_INSTALL_ARGS=(--pre "${TORCH_INSTALL_ARGS[@]}")
-  fi
-  pip install "${TORCH_INSTALL_ARGS[@]}"
-fi
-
-python3 - "${EXPECTED_CUDA_VERSION}" <<'PY'
-import importlib.metadata
-import sys
-import torch
-
-expected = sys.argv[1]
-if torch.version.cuda != expected:
-    raise SystemExit(
-        f"ERROR: PyTorch targets CUDA {torch.version.cuda}; expected CUDA {expected}"
-    )
-print(f"PyTorch CUDA version check passed: {torch.__version__} ({torch.version.cuda})")
-print(f"PyTorch distribution version: {importlib.metadata.version('torch')}")
-PY
-
-# The PEP 517 build runs in an isolated environment. Constrain its torch build
-# dependency to the version selected above and expose the matching stable or
-# nightly PyTorch index to that environment.
-TORCH_CONSTRAINT=$(mktemp)
-python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch"))' > "${TORCH_CONSTRAINT}"
-export PIP_CONSTRAINT="${TORCH_CONSTRAINT}"
-export PIP_EXTRA_INDEX_URL="${PYTORCH_INDEX_URL}"
-if [[ "${PYTORCH_INDEX}" == nightly/* ]]; then
-  export PIP_PRE=1
-fi
+setup_jit_cache_python_build python3 "${EXPECTED_CUDA_VERSION}" "${PYTORCH_INDEX}"
 echo "::endgroup::"
 
 # Optional: set up sccache for compiler caching with S3 backend
 if [ -n "$SCCACHE_BUCKET" ]; then
-  echo "::group::Install sccache"
   export SCCACHE_BUCKET
   setup_sccache "cuda${CUDA_MAJOR}${CUDA_MINOR}-$(uname -m)" "$(cd .. && pwd -P)"
-  echo "::endgroup::"
 fi
 
 # Clean any previous builds
 echo "Cleaning previous builds..."
 rm -rf -- dist build ./*.egg-info
+if [ "${BUILD_TARGET}" = "provider" ]; then
+  rm -rf -- flashinfer_jit_cache_provider/jit_cache
+  rm -f -- \
+    flashinfer_jit_cache_provider/manifest.json \
+    flashinfer_jit_cache_provider/_build_meta.py
+elif [ "${BUILD_TARGET}" = "shim" ]; then
+  rm -rf -- flashinfer_jit_cache/jit_cache
+  rm -f -- \
+    flashinfer_jit_cache/_build_meta.py \
+    flashinfer_jit_cache/_provider_requirements.txt
+fi
 
 # Build the wheel using the build module for better isolation
 echo "Building wheel..."
-python -m build --wheel
+if [ "${BUILD_TARGET}" = "provider" ]; then
+  JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS=${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS:-5400}
+  JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS=${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS:-120}
+  WATCHDOG_DIAGNOSTICS_FILE=${SCCACHE_STATS_DIR:-/tmp}/jit-cache-watchdog.txt
+  export NINJA_STATUS="${NINJA_STATUS:-[%e sec | %f/%t finished | %r running | %u queued] }"
+  echo "Provider build no-output timeout: ${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}s"
+  echo "Ninja status format: ${NINJA_STATUS}"
+  python "${SCRIPT_DIR}/run_with_output_watchdog.py" \
+    --timeout-seconds "${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}" \
+    --term-grace-seconds "${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS}" \
+    --diagnostics-file "${WATCHDOG_DIAGNOSTICS_FILE}" \
+    -- python -m build --wheel
+else
+  python -m build --wheel
+fi
 
 echo ""
 echo "✓ Build completed successfully"
@@ -139,15 +143,62 @@ echo ""
 echo "Built wheels:"
 ls -lh dist/
 
+if [ "${BUILD_TARGET}" = "provider" ]; then
+  PROVIDER_TAG=${FLASHINFER_JIT_CACHE_PROVIDER_ARCH,,}
+  PROVIDER_TAG=${PROVIDER_TAG#compute_}
+  PROVIDER_TAG=${PROVIDER_TAG#sm_}
+  PROVIDER_TAG=${PROVIDER_TAG#sm}
+  PROVIDER_TAG=${PROVIDER_TAG//./}
+  PROVIDER_TAG=${PROVIDER_TAG//_/}
+  PROVIDER_TAG="sm${PROVIDER_TAG}"
+  PACKAGE_VERSION=$(tr -d '[:space:]' < ../version.txt)
+  if [ -n "${FLASHINFER_DEV_RELEASE_SUFFIX:-}" ]; then
+    PACKAGE_VERSION="${PACKAGE_VERSION}.dev${FLASHINFER_DEV_RELEASE_SUFFIX}"
+  fi
+  PACKAGE_VERSION="${PACKAGE_VERSION}+${FLASHINFER_LOCAL_VERSION}"
+
+  python ../scripts/verify_jit_cache_provider_artifact.py \
+    --artifact-dir dist \
+    --provider "${PROVIDER_TAG}" \
+    --version "${PACKAGE_VERSION}" \
+    --provider-platform-tag "${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG}" \
+    --cuobjdump /usr/local/cuda/bin/cuobjdump \
+    --cuda-architecture-policy "${CUDA_ARCHITECTURE_POLICY:-strict}"
+fi
+
 # Verify version and git version
 echo ""
-echo "Verifying version and git version..."
-pip install dist/*.whl
-python -c "
+echo "Verifying built package metadata..."
+pip install --force-reinstall --no-deps dist/*.whl
+if [ "${BUILD_TARGET}" = "provider" ]; then
+  python - "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}" <<'PY'
+import importlib.metadata
+import re
+import sys
+
+provider = re.sub(r"[-_.]+", "", sys.argv[1].lower())
+provider = provider.removeprefix("compute").removeprefix("sm")
+distribution = f"flashinfer-jit-cache-sm{provider}"
+metadata = importlib.metadata.metadata(distribution)
+entry_points = [
+    entry_point
+    for entry_point in importlib.metadata.entry_points().select(
+        group="flashinfer.jit_cache.providers"
+    )
+    if entry_point.name == f"sm{provider}"
+]
+if len(entry_points) != 1:
+    raise SystemExit(f"Expected one provider entry point, found {entry_points}")
+print(f"Package version: {metadata['Version']}")
+print(f"Provider entry point: {entry_points[0].value}")
+PY
+else
+  python -c "
 import flashinfer_jit_cache
-print(f'📦 Package version: {flashinfer_jit_cache.__version__}')
-print(f'🔖 Git version: {flashinfer_jit_cache.__git_version__}')
+print(f'Package version: {flashinfer_jit_cache.__version__}')
+print(f'Git version: {flashinfer_jit_cache.__git_version__}')
 "
+fi
 
 # Copy wheels to output directory if specified
 if [ -n "${OUTPUT_DIR}" ]; then
