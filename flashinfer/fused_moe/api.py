@@ -46,6 +46,16 @@ from ..tllm_enums import (
     RoutingMethodType,
 )
 
+# ``NVFP44Over6Config`` / ``NVFP44Over6ErrMode`` are imported for their names
+# alone: ``QuantConfig.__repr__`` can emit either, and the ``eval(repr(cfg))``
+# round-trip this module guarantees is evaluated in *this* module's namespace.
+from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP44Over6Config,  # noqa: F401
+    NVFP44Over6ErrMode,  # noqa: F401
+    resolve_nvfp4_4over6,
+)
+
 # ---------------------------------------------------------------------------
 # Kernel ceilings
 # ---------------------------------------------------------------------------
@@ -164,6 +174,35 @@ class QuantConfig:
     per_token_scale : bool or None
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search for the **activation**
+        quantization the kernels perform at runtime. Weights are quantized
+        by the caller ahead of the call and are not affected.
+
+        - unset (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables on every call (byte-for-byte the old
+          behaviour).
+        - ``None``: 4over6 off. The environment is ignored.
+        - ``NVFP44Over6Config(...)``: on with exactly that recipe. The
+          environment is ignored, with no per-field merge.
+
+        Only NVFP4 activations accept an explicit value (``__post_init__``
+        raises otherwise). A runner that has not threaded the setting into
+        its quantizer rejects an explicit value instead of dropping it; see
+        ``MoERunner.supports_nvfp4_4over6``. A pinned recipe also pins the
+        GEMM2-input scale of the weight pack: build it with
+        ``CuteDslConfig.prepare_weights(..., nvfp4_4over6=<the same value>)``
+        or the call raises ``ValueError``. An unset field is not emitted by
+        ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.
+
+    Raises
+    ------
+    ValueError
+        If ``nvfp4_4over6`` is set (to ``None`` or a config) when
+        ``activation`` is not ``QuantFormat.NVFP4``.
+    TypeError
+        If ``nvfp4_4over6`` is neither ``None`` nor an
+        :class:`NVFP44Over6Config`.
     """
 
     weight: QuantFormat = QuantFormat.BF16
@@ -173,6 +212,7 @@ class QuantConfig:
     _: KW_ONLY
     swizzled_scale_factors: Optional[bool] = None
     per_token_scale: Optional[bool] = None
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET
 
     def __post_init__(self) -> None:
         for name in ("weight", "activation", "output"):
@@ -182,6 +222,19 @@ class QuantConfig:
                     f"QuantConfig.{name} must be a QuantFormat, got {value!r}. "
                     "Pass QuantFormat.FP16 rather than torch.float16."
                 )
+        if self.nvfp4_4over6 is _UNSET:
+            return
+        # Type-check where the value is written, not at launch.
+        resolve_nvfp4_4over6(self.nvfp4_4over6)
+        # Checked here rather than in a runner's _check_support(): MoELayer
+        # swallows those to filter candidates, which would report "no backend
+        # available" instead of naming the mistake.
+        if self.activation is not QuantFormat.NVFP4:
+            raise ValueError(
+                f"nvfp4_4over6={self.nvfp4_4over6!r} applies only to "
+                f"activation=QuantFormat.NVFP4, got "
+                f"activation=QuantFormat.{self.activation.name}."
+            )
 
     @property
     def pair(self) -> Tuple[QuantFormat, QuantFormat]:
@@ -198,6 +251,10 @@ class QuantConfig:
             parts.append(f"swizzled_scale_factors={self.swizzled_scale_factors!r}")
         if self.per_token_scale is not None:
             parts.append(f"per_token_scale={self.per_token_scale!r}")
+        # An unset field is not emitted; an explicit ``None`` is, because it
+        # means "4over6 off" and eliding it would break the round-trip.
+        if self.nvfp4_4over6 is not _UNSET:
+            parts.append(f"nvfp4_4over6={self.nvfp4_4over6!r}")
         return f"QuantConfig({', '.join(parts)})"
 
 
@@ -1698,12 +1755,18 @@ class CuteDslConfig:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
         Defaults to NVFP4×NVFP4.
+
+        ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
+        (see that field): it selects the NVFP4×NVFP4 pack's
+        ``fc2_input_scale``. The default keeps the historical
+        ``fc2_input_scale = 1.0``.
         """
         from .prepare import prepare_cute_dsl_weights
 
@@ -1716,6 +1779,7 @@ class CuteDslConfig:
             intermediate_size=intermediate_size,
             activation=activation,
             device=device,
+            nvfp4_4over6=nvfp4_4over6,
         )
 
     def __repr__(self) -> str:
