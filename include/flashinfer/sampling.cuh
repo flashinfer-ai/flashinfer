@@ -1000,7 +1000,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFro
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  float top_p = (top_p_arr == nullptr) ? top_p_val : top_p_arr[row_idx];
+  // Thresholds are per request, so index by the output slot, not by the shared probs row.
+  float top_p = (top_p_arr == nullptr) ? top_p_val : top_p_arr[bx];
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -1221,8 +1222,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
-  const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[bx];
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))

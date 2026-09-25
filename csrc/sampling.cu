@@ -156,7 +156,7 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
 
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
-  check_tensor_param(maybe_top_p_arr, probs);
+  check_tensor_param(maybe_top_p_arr, batch_size);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -202,7 +202,7 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output, TensorView v
 
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
-  check_tensor_param(maybe_top_k_arr, probs);
+  check_tensor_param(maybe_top_k_arr, batch_size);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -248,7 +248,7 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
 
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
-  check_tensor_param(maybe_min_p_arr, probs);
+  check_tensor_param(maybe_min_p_arr, batch_size);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -295,8 +295,8 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output, Tensor
 
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
-  check_tensor_param(maybe_top_k_arr, probs);
-  check_tensor_param(maybe_top_p_arr, probs);
+  check_tensor_param(maybe_top_k_arr, batch_size);
+  check_tensor_param(maybe_top_p_arr, batch_size);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
