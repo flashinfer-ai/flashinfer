@@ -35,23 +35,6 @@ only four tokens. The wrapper plans capacity outside CUDA Graph capture and
 runs live route metadata on the hot path.
 
 
-MiniMax-M3 Speculative Sparse Decode
-====================================
-
-The SM100/SM103 MiniMax-M3 decode API consumes independent per-query sparse
-selections and packed FP8 K/V, with BF16 query/output and device scalar K/V
-scales. Its caller-owned workspace supports CUDA graph replay with live
-page tables, sequence lengths, and sparse selections.
-
-.. currentmodule:: flashinfer.msa_ops
-
-.. autosummary::
-    :toctree: ../generated
-
-    MiniMaxM3SparseDecodeWorkspace
-    minimax_m3_sparse_attn_decode
-
-
 flashinfer.decode
 =================
 

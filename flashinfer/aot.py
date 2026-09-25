@@ -65,8 +65,8 @@ from .jit.blackwell_msa import (
     BLACKWELL_MSA_VARIANTS_BY_TARGET,
     BlackwellMSATarget,
     gen_blackwell_msa_module,
+    gen_msa_decode_metadata_module,
 )
-from .jit.minimax_m3 import gen_minimax_m3_module
 from .jit.cake_kda import (
     CAKE_KDA_AFFINE_ROLES,
     CakeKDATarget,
@@ -623,10 +623,9 @@ def gen_all_modules(
         ("sm100a", has_blackwell_msa_sm100a),
         ("sm103a", has_blackwell_msa_sm103a),
     )
-    if has_blackwell_msa_sm100a or has_blackwell_msa_sm103a:
-        jit_specs.append(gen_minimax_m3_module())
     for blackwell_msa_target, enabled in blackwell_msa_targets:
         if enabled:
+            jit_specs.append(gen_msa_decode_metadata_module(blackwell_msa_target))
             jit_specs.extend(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]

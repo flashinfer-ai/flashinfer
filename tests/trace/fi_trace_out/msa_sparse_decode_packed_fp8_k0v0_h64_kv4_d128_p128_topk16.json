@@ -1,0 +1,120 @@
+{
+  "name": "msa_sparse_decode_packed_fp8_k0v0_h64_kv4_d128_p128_topk16",
+  "description": "Causal packed-FP8 MSA decode with independent per-query sparse rows, BF16 Q/O and device scalar K/V scales of ranks 0/0. K/V are split HND views of one cache with token stride 256.",
+  "op_type": "msa_sparse",
+  "tags": [
+    "fi_api:flashinfer.msa_ops.sparse_decode.msa_sparse_decode_attention",
+    "stage:decode"
+  ],
+  "axes": {
+    "total_q": {
+      "type": "var"
+    },
+    "num_qo_heads": {
+      "type": "const",
+      "value": 64
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 4
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const",
+      "value": 128
+    },
+    "topk": {
+      "type": "const",
+      "value": 16
+    },
+    "batch_size": {
+      "type": "var"
+    },
+    "max_pages": {
+      "type": "var"
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "v": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "q2k_indices": {
+      "shape": [
+        "num_kv_heads",
+        "total_q",
+        "topk"
+      ],
+      "dtype": "int32"
+    },
+    "page_table": {
+      "shape": [
+        "batch_size",
+        "max_pages"
+      ],
+      "dtype": "int32"
+    },
+    "seqused_k": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    },
+    "k_scale": {
+      "shape": [],
+      "dtype": "float32"
+    },
+    "v_scale": {
+      "shape": [],
+      "dtype": "float32"
+    },
+    "seqlen_q": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "softmax_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def _msa_attention_check(\n    reference_outputs,\n    actual_outputs,\n    *,\n    rtol=None,\n    atol=None,\n    max_mismatch_pct=0.0,\n    min_cos_sim=None,\n):\n    from flashinfer.trace import default_check\n\n    # bf16 output tolerance, matching test_sparse_attention.\n    rtol = 2e-2 if rtol is None else rtol\n    atol = 2e-2 if atol is None else atol\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

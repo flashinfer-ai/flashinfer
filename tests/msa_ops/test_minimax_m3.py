@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from flashinfer.msa_ops import (
-    MiniMaxM3SparseDecodeWorkspace,
-    minimax_m3_sparse_attn_decode,
+    MSASparseAttentionWorkspace,
+    msa_sparse_decode_attention,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -59,39 +59,46 @@ def make_case(
     ).to(torch.float8_e4m3fn)
     return dict(
         q=q,
-        kv_cache=kv,
-        topk_idx=indices.cuda(),
-        block_table=table.cuda(),
-        seq_lens=lengths.cuda(),
+        k=kv[..., :128],
+        v=kv[..., 128:],
+        seqlen_q=qlen,
+        q2k_indices=indices.cuda(),
+        page_table=table.cuda(),
+        seqused_k=lengths.cuda(),
         k_scale=torch.tensor([0.7], device="cuda"),
         v_scale=torch.tensor([1.3], device="cuda"),
         out=torch.empty_like(q),
-        workspace=MiniMaxM3SparseDecodeWorkspace(batch, hkv * 16, hkv, qlen),
+        workspace=MSASparseAttentionWorkspace(q.device),
     )
+
+
+def packed_kv_cache(case):
+    """Recover the original packed allocation without copying K/V."""
+    k = case["k"]
+    return k.as_strided((*k.shape[:-1], 256), k.stride())
 
 
 def torch_reference(case):
     """Independent test oracle. Gathering/host reads are outside the tested API."""
-    q, kv = case["q"], case["kv_cache"]
-    w = case["workspace"]
+    q, kv = case["q"], packed_kv_cache(case)
     table, indices, lengths = (
-        case[n].cpu() for n in ("block_table", "topk_idx", "seq_lens")
+        case[n].cpu() for n in ("page_table", "q2k_indices", "seqused_k")
     )
     result = torch.zeros_like(q)
-    for t in range(w.total_q):
+    for t in range(case["q"].shape[0]):
         n = max(
             0,
-            int(lengths[t // w.decode_query_len])
-            - w.decode_query_len
-            + t % w.decode_query_len
+            int(lengths[t // case["seqlen_q"]])
+            - case["seqlen_q"]
+            + t % case["seqlen_q"]
             + 1,
         )
-        for h in range(w.num_kv_heads):
+        for h in range(case["k"].shape[1]):
             count = min(16, (n + 127) // 128)
             if count == 0:
                 continue
             selected = indices[h, t, :count].long()
-            physical = table[t // w.decode_query_len, selected].long().cuda()
+            physical = table[t // case["seqlen_q"], selected].long().cuda()
             # PyTorch's FP8 indexing is not implemented on all supported builds.
             cache = kv.view(torch.uint8)[physical, h].view(torch.float8_e4m3fn).float()
             positions = selected[:, None] * 128 + torch.arange(128)[None, :]
@@ -100,7 +107,7 @@ def torch_reference(case):
             k = (cache[:, :128] * case["k_scale"]).to(q.dtype).float()
             v = (cache[:, 128:] * case["v_scale"]).to(q.dtype).float()
             qq = q[t, h * 16 : (h + 1) * 16].float()
-            scale = case.get("sm_scale", 128**-0.5)
+            scale = case.get("softmax_scale", 128**-0.5)
             result[t, h * 16 : (h + 1) * 16] = ((qq @ k.T * scale).softmax(-1) @ v).to(
                 q.dtype
             )
@@ -140,8 +147,8 @@ def require_blackwell():
 @pytest.mark.parametrize("qlen", [2, 3, 4, 5, 6, 7, 8])
 def test_independent_rows(hkv, qlen):
     case = make_case(qlen=qlen, hkv=hkv, context=8193)
-    assert not torch.equal(case["topk_idx"][:, 0], case["topk_idx"][:, 1])
-    assert_numerics(minimax_m3_sparse_attn_decode(**case), torch_reference(case))
+    assert not torch.equal(case["q2k_indices"][:, 0], case["q2k_indices"][:, 1])
+    assert_numerics(msa_sparse_decode_attention(**case), torch_reference(case))
 
 
 @pytest.mark.parametrize(
@@ -150,27 +157,30 @@ def test_independent_rows(hkv, qlen):
 @pytest.mark.parametrize("hkv", [1, 4])
 def test_lengths_and_shared_pages(context, hkv):
     case = make_case(context=context, hkv=hkv)
-    result = minimax_m3_sparse_attn_decode(**case)
+    result = msa_sparse_decode_attention(**case)
     assert result is case["out"]
     assert_numerics(result, torch_reference(case))
     # Independently inspect the metadata; poisoned unused slots must be ignored.
     w = case["workspace"]
-    for t in range(w.total_q):
+    for t in range(case["q"].shape[0]):
         n = (
-            int(case["seq_lens"][t // w.decode_query_len])
-            - w.decode_query_len
-            + t % w.decode_query_len
+            int(case["seqused_k"][t // case["seqlen_q"]])
+            - case["seqlen_q"]
+            + t % case["seqlen_q"]
             + 1
         )
         count = min(16, (n + 127) // 128)
         for h in range(hkv):
-            sel = case["topk_idx"][h, t, :count].sort().values.long()
-            expected_pages = case["block_table"][t // w.decode_query_len, sel]
+            sel = case["q2k_indices"][h, t, :count].sort().values.long()
+            expected_pages = case["page_table"][t // case["seqlen_q"], sel]
             torch.testing.assert_close(
-                w.sparse_pages[h, t, :count], expected_pages, rtol=0, atol=0
+                w._buffers["packed_fp8_pages"][h, t, :count],
+                expected_pages,
+                rtol=0,
+                atol=0,
             )
             length = torch.clamp(n - sel * 128, min=0, max=128).sum()
-            assert int(w.sparse_lens[h, t]) == int(length)
+            assert int(w._buffers["packed_fp8_lengths"][h, t]) == int(length)
 
 
 @pytest.mark.parametrize("hkv", [1, 4])
@@ -180,20 +190,20 @@ def test_graph_replay_updates_every_metadata_input(hkv):
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            minimax_m3_sparse_attn_decode(**case)
+            msa_sparse_decode_attention(**case)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        minimax_m3_sparse_attn_decode(**case)
+        msa_sparse_decode_attention(**case)
     pointers = {k: v.data_ptr() for k, v in case.items() if isinstance(v, torch.Tensor)}
     original_q = case["q"].clone()
-    original_kv = case["kv_cache"].view(torch.uint8).clone()
+    original_kv = packed_kv_cache(case).view(torch.uint8).clone()
     previous = None
     for seed in [11, 23, 37, 51]:
         replacement = make_case(batch=4, hkv=hkv, context=262144, seed=seed)
         # Change tables, lengths and independently selected rows in place.
-        for name in ("block_table", "seq_lens", "topk_idx"):
-            if name == "seq_lens":
+        for name in ("page_table", "seqused_k", "q2k_indices"):
+            if name == "seqused_k":
                 continue
             case[name].copy_(replacement[name])
         # Cross the <16-page and partial-page boundaries without recapturing.
@@ -204,14 +214,14 @@ def test_graph_replay_updates_every_metadata_input(hkv):
             37: [5, 200001, 262143, 2031],
             51: [8193, 262144, 129, 8],
         }[seed]
-        case["seq_lens"].copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
-        case["topk_idx"].fill_(0x7FFFFFFF)
-        for t in range(case["workspace"].total_q):
-            n = int(case["seq_lens"][t // 4]) - 4 + t % 4 + 1
+        case["seqused_k"].copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
+        case["q2k_indices"].fill_(0x7FFFFFFF)
+        for t in range(case["q"].shape[0]):
+            n = int(case["seqused_k"][t // 4]) - 4 + t % 4 + 1
             pages = (n + 127) // 128
             for h in range(hkv):
                 count = min(16, pages)
-                case["topk_idx"][h, t, :count].copy_(
+                case["q2k_indices"][h, t, :count].copy_(
                     torch.randperm(pages, device="cuda")[:count]
                 )
         case["k_scale"].fill_(0.3 + seed / 100)
@@ -227,7 +237,7 @@ def test_graph_replay_updates_every_metadata_input(hkv):
         }
     torch.testing.assert_close(case["q"], original_q, rtol=0, atol=0)
     torch.testing.assert_close(
-        case["kv_cache"].view(torch.uint8), original_kv, rtol=0, atol=0
+        packed_kv_cache(case).view(torch.uint8), original_kv, rtol=0, atol=0
     )
 
 
@@ -235,11 +245,11 @@ def test_graph_replay_updates_every_metadata_input(hkv):
 def test_no_steady_state_tensor_allocations(monkeypatch, strided):
     case = make_case(hkv=4 if strided else 1)
     if strided:
-        total = case["workspace"].total_q
+        total = case["q"].shape[0]
         storage = torch.empty(4, total * 2 + 7, 16, dtype=torch.int32, device="cuda")
-        storage[:, :total].copy_(case["topk_idx"])
-        case["topk_idx"] = storage[:, :total]
-    minimax_m3_sparse_attn_decode(**case)
+        storage[:, :total].copy_(case["q2k_indices"])
+        case["q2k_indices"] = storage[:, :total]
+    msa_sparse_decode_attention(**case)
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
 
@@ -252,16 +262,16 @@ def test_no_steady_state_tensor_allocations(monkeypatch, strided):
         for name in ("item", "cpu", "tolist"):
             m.setattr(torch.Tensor, name, forbidden)
         for _ in range(4):
-            minimax_m3_sparse_attn_decode(**case)
+            msa_sparse_decode_attention(**case)
     torch.cuda.synchronize()
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
 
 
 def test_changing_one_row_does_not_change_other_tokens():
     case = make_case(hkv=4)
-    original = minimax_m3_sparse_attn_decode(**case).clone()
-    case["topk_idx"][2, 3] = torch.arange(16, device="cuda", dtype=torch.int32)
-    result = minimax_m3_sparse_attn_decode(**case).clone()
+    original = msa_sparse_decode_attention(**case).clone()
+    case["q2k_indices"][2, 3] = torch.arange(16, device="cuda", dtype=torch.int32)
+    result = msa_sparse_decode_attention(**case).clone()
     delta = (result != original).any(-1)
     expected_mask = torch.zeros_like(delta)
     expected_mask[3, 32:48] = True
@@ -271,36 +281,38 @@ def test_changing_one_row_does_not_change_other_tokens():
 
 
 @pytest.mark.parametrize(
-    "name", ["q", "kv_cache", "topk_idx", "seq_lens", "k_scale", "v_scale", "out"]
+    "name", ["q", "k", "v", "q2k_indices", "seqused_k", "k_scale", "v_scale", "out"]
 )
 def test_invalid_tensor_contract_rejected(name):
     case = make_case(context=129)
     case[name] = case[name].to(torch.float64)
     with pytest.raises(ValueError, match=name):
-        minimax_m3_sparse_attn_decode(**case)
+        msa_sparse_decode_attention(**case)
 
 
 def test_per_token_scale_rejected_explicitly():
     case = make_case(context=129)
     case["k_scale"] = torch.ones(1, 256, device="cuda")
     with pytest.raises(ValueError, match="scalar"):
-        minimax_m3_sparse_attn_decode(**case)
+        msa_sparse_decode_attention(**case)
 
 
 def test_zero_dimensional_scales():
     case = make_case(context=129)
     case["k_scale"] = case["k_scale"].reshape(())
     case["v_scale"] = case["v_scale"].reshape(())
-    assert_numerics(minimax_m3_sparse_attn_decode(**case), torch_reference(case))
+    assert_numerics(msa_sparse_decode_attention(**case), torch_reference(case))
 
 
 @pytest.mark.parametrize("scale_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("capturing", [False, True])
-def test_tensor_sm_scale_rejected_without_sync(monkeypatch, scale_device, capturing):
-    import flashinfer.msa_ops.minimax_m3 as m3
+def test_tensor_softmax_scale_rejected_without_sync(
+    monkeypatch, scale_device, capturing
+):
+    import flashinfer.jit.blackwell_msa as jit_msa
 
     case = make_case(context=129)
-    case["sm_scale"] = torch.tensor(0.1, device=scale_device)
+    case["softmax_scale"] = torch.tensor(0.1, device=scale_device)
 
     def forbidden(*args, **kwargs):
         raise AssertionError(
@@ -308,14 +320,14 @@ def test_tensor_sm_scale_rejected_without_sync(monkeypatch, scale_device, captur
         )
 
     monkeypatch.setattr(torch.Tensor, "__float__", forbidden)
-    monkeypatch.setattr(m3, "_get_metadata_module", forbidden)
+    monkeypatch.setattr(jit_msa, "load_msa_decode_metadata_module", forbidden)
 
     def reject():
         previous = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            with pytest.raises(TypeError, match="sm_scale must be a host float"):
-                minimax_m3_sparse_attn_decode(**case)
+            with pytest.raises(TypeError, match="softmax_scale must be a host float"):
+                msa_sparse_decode_attention(**case)
         finally:
             torch.cuda.set_sync_debug_mode(previous)
 
@@ -330,25 +342,25 @@ def test_tensor_sm_scale_rejected_without_sync(monkeypatch, scale_device, captur
         reject()
 
 
-@pytest.mark.parametrize("sm_scale", [0.0625, 0.125])
-def test_host_sm_scale_still_works(sm_scale):
+@pytest.mark.parametrize("softmax_scale", [0.0625, 0.125])
+def test_host_softmax_scale_still_works(softmax_scale):
     case = make_case(context=129)
-    case["sm_scale"] = sm_scale
-    assert_numerics(minimax_m3_sparse_attn_decode(**case), torch_reference(case))
+    case["softmax_scale"] = softmax_scale
+    assert_numerics(msa_sparse_decode_attention(**case), torch_reference(case))
 
 
-def test_noncontiguous_cache_rejected_without_copy():
+def test_unrelated_packed_views_rejected_without_copy():
     case = make_case(hkv=4, context=129)
-    case["kv_cache"] = case["kv_cache"].transpose(0, 1)
-    with pytest.raises(ValueError, match="kv_cache"):
-        minimax_m3_sparse_attn_decode(**case)
+    case["v"] = case["v"].clone()
+    with pytest.raises(ValueError, match="packed"):
+        msa_sparse_decode_attention(**case)
 
 
 @pytest.mark.parametrize("hkv", [1, 4])
 @pytest.mark.parametrize("layout", ["indexer", "stepped"])
 def test_strided_metadata_graph(hkv, layout):
     case = make_case(batch=4, hkv=hkv, context=4099)
-    total = case["workspace"].total_q
+    total = case["q"].shape[0]
     width = 32 if layout == "stepped" else 16
     storage = torch.full(
         (hkv, total * 2 + 7, width), 0x12345678, dtype=torch.int32, device="cuda"
@@ -356,29 +368,29 @@ def test_strided_metadata_graph(hkv, layout):
     indices = (
         storage[:, 3 : 3 + total, ::2] if layout == "stepped" else storage[:, :total, :]
     )
-    indices.copy_(case["topk_idx"])
-    case["topk_idx"] = indices
-    pages = case["block_table"].shape[1]
+    indices.copy_(case["q2k_indices"])
+    case["q2k_indices"] = indices
+    pages = case["page_table"].shape[1]
     table_storage = torch.full((8, pages + 11), -99, dtype=torch.int32, device="cuda")
     table = table_storage[::2, 5 : 5 + pages]
-    table.copy_(case["block_table"])
-    case["block_table"] = table
+    table.copy_(case["page_table"])
+    case["page_table"] = table
     if layout == "stepped":
         length_storage = torch.zeros(8, dtype=torch.int32, device="cuda")
-        length_storage[::2].copy_(case["seq_lens"])
-        case["seq_lens"] = length_storage[::2]
-    minimax_m3_sparse_attn_decode(**case)
-    assert_numerics(case["out"], torch_reference(case))
+        length_storage[::2].copy_(case["seqused_k"])
+        case["seqused_k"] = length_storage[::2]
     original_storage = storage.clone()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        minimax_m3_sparse_attn_decode(**case)
+        msa_sparse_decode_attention(**case)
     torch.cuda.current_stream().wait_stream(stream)
+    assert_numerics(case["out"], torch_reference(case))
+    stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        minimax_m3_sparse_attn_decode(**case)
-    case["block_table"].copy_(case["block_table"].roll(1, 1))
+        msa_sparse_decode_attention(**case)
+    case["page_table"].copy_(case["page_table"].roll(1, 1))
     case["k_scale"].fill_(0.9)
     graph.replay()
     torch.cuda.synchronize()
@@ -388,33 +400,32 @@ def test_strided_metadata_graph(hkv, layout):
 
 def test_graph_padding_rows_can_become_active():
     case = make_case(batch=4, context=8193, hkv=4)
-    minimax_m3_sparse_attn_decode(**case)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        minimax_m3_sparse_attn_decode(**case)
+        msa_sparse_decode_attention(**case)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        minimax_m3_sparse_attn_decode(**case)
+        msa_sparse_decode_attention(**case)
     for lengths in (
         [0, 8, 0, 129],
         [8193, 0, 17, 0],
         [0, 0, 0, 0],
         [17, 129, 4097, 8193],
     ):
-        case["seq_lens"].copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
-        case["topk_idx"].fill_(0x7FFFFFFF)
+        case["seqused_k"].copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
+        case["q2k_indices"].fill_(0x7FFFFFFF)
         for t in range(16):
             n = max(0, lengths[t // 4] - 4 + t % 4 + 1)
             count = min(16, (n + 127) // 128)
             if count:
                 for h in range(4):
-                    case["topk_idx"][h, t, :count].copy_(
+                    case["q2k_indices"][h, t, :count].copy_(
                         torch.randperm((n + 127) // 128, device="cuda")[:count]
                     )
         graph.replay()
         torch.cuda.synchronize()
-        active = (case["seq_lens"] > 0).repeat_interleave(4)
+        active = (case["seqused_k"] > 0).repeat_interleave(4)
         if any(lengths):
             assert_numerics(case["out"][active], torch_reference(case)[active])

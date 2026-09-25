@@ -18,6 +18,8 @@ The reference is the unmodified file at vLLM commit
 CUDA graph timing includes metadata, scale preparation, native attention and
 reduction, and all kernels in the complete Triton wrapper. It excludes Python
 dispatch and one-time workspace allocation/JIT. Repeated input buffers are warm.
+Each workspace is captured once; a timed sample replays that single-call graph
+32 times. This differs from the earlier standalone wrapper's 32-call capture.
 """
 
 import argparse
@@ -34,12 +36,16 @@ import torch
 import triton
 import triton.language as tl
 
-from flashinfer.msa_ops import minimax_m3_sparse_attn_decode
+from flashinfer.msa_ops import msa_sparse_decode_attention
 
 # The benchmark shares reproducible *input generation*, not its correctness
 # reference, with the tests. No CPU/GPU gathers occur in either timed callable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests.msa_ops.test_minimax_m3 import assert_numerics, make_case  # noqa: E402
+from tests.msa_ops.test_minimax_m3 import (  # noqa: E402
+    assert_numerics,
+    make_case,
+    packed_kv_cache,
+)
 
 
 def load_reference(path):
@@ -60,8 +66,8 @@ def load_reference(path):
     return module.minimax_m3_sparse_attn_decode
 
 
-def graph_times_us(fn, inner=32, repeats=12):
-    stream = torch.cuda.Stream()
+def capture_call(fn, stream):
+    """Capture once: an MSA workspace belongs to one captured invocation."""
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
@@ -70,8 +76,11 @@ def graph_times_us(fn, inner=32, repeats=12):
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        for _ in range(inner):
-            fn()
+        fn()
+    return graph
+
+
+def graph_times_us(graph, inner=32, repeats=12):
     for _ in range(5):
         graph.replay()
     torch.cuda.synchronize()
@@ -79,7 +88,8 @@ def graph_times_us(fn, inner=32, repeats=12):
     samples = []
     for _ in range(repeats):
         start.record()
-        graph.replay()
+        for _ in range(inner):
+            graph.replay()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) * 1000 / inner)
@@ -134,20 +144,21 @@ def main():
                             hkv, total * 2 + 7, 16, dtype=torch.int32, device="cuda"
                         )
                         view = storage[:, :total, :]
-                        view.copy_(case["topk_idx"])
-                        case["topk_idx"] = view
+                        view.copy_(case["q2k_indices"])
+                        case["q2k_indices"] = view
                     ref = torch.empty_like(case["out"])
+                    packed = packed_kv_cache(case)
 
                     def candidate(case=case):
-                        return minimax_m3_sparse_attn_decode(**case)
+                        return msa_sparse_decode_attention(**case)
 
-                    def baseline(case=case, ref=ref):
+                    def baseline(case=case, ref=ref, packed=packed):
                         return reference(
                             case["q"],
-                            case["kv_cache"],
-                            case["topk_idx"],
-                            case["block_table"],
-                            case["seq_lens"],
+                            packed,
+                            case["q2k_indices"],
+                            case["page_table"],
+                            case["seqused_k"],
                             hkv,
                             128**-0.5,
                             ref,
@@ -156,14 +167,19 @@ def main():
                             case["v_scale"],
                         )
 
-                    candidate()
-                    baseline()
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        candidate()
+                        baseline()
                     torch.cuda.synchronize()
                     assert_numerics(case["out"], ref)
-                    fi_a = graph_times_us(candidate)
-                    tr_a = graph_times_us(baseline)
-                    tr_b = graph_times_us(baseline)
-                    fi_b = graph_times_us(candidate)
+                    fi_graph = capture_call(candidate, stream)
+                    tr_graph = capture_call(baseline, stream)
+                    fi_a = graph_times_us(fi_graph)
+                    tr_a = graph_times_us(tr_graph)
+                    tr_b = graph_times_us(tr_graph)
+                    fi_b = graph_times_us(fi_graph)
                     fi_us, tr_us = (
                         statistics.median(fi_a + fi_b),
                         statistics.median(tr_a + tr_b),
@@ -176,9 +192,9 @@ def main():
                         context=context,
                         ragged=args.ragged,
                         prefix_shared=not args.no_prefix_sharing,
-                        seq_len_min=case["seq_lens"].min().item(),
-                        seq_len_max=case["seq_lens"].max().item(),
-                        topk_strides=list(case["topk_idx"].stride()),
+                        seq_len_min=case["seqused_k"].min().item(),
+                        seq_len_max=case["seqused_k"].max().item(),
+                        topk_strides=list(case["q2k_indices"].stride()),
                         flashinfer_us=fi_us,
                         triton_us=tr_us,
                         speedup=tr_us / fi_us,
@@ -193,13 +209,13 @@ def main():
                                 gpu=torch.cuda.get_device_name(),
                                 torch=torch.__version__,
                                 reference_commit="866fea2b9900bf49d552c205d2eaac4716fb63ac",
-                                timing="CUDA events, complete wrapper graphs, ABBA, warm repeated buffers",
+                                timing="CUDA events, single-call graphs replayed 32 times per sample, ABBA, warm repeated buffers",
                                 results=results,
                             ),
                             indent=2,
                         )
                     )
-                    del case, ref, candidate, baseline
+                    del case, packed, ref, candidate, baseline, fi_graph, tr_graph
                     torch.cuda.empty_cache()
 
 

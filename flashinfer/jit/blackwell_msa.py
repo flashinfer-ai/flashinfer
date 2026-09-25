@@ -243,6 +243,22 @@ def load_blackwell_msa_module(variant: BlackwellMSAVariant, target: BlackwellMSA
     return module
 
 
+@functools.cache
+def gen_msa_decode_metadata_module(target: BlackwellMSATarget) -> JitSpec:
+    """Prepare independent sparse rows for packed-FP8 MSA decode."""
+    return gen_jit_spec(
+        f"msa_decode_metadata_{target}",
+        [_get_blackwell_msa_csrc_dir().parent / "msa_decode_metadata.cu"],
+        extra_cuda_cflags=_BLACKWELL_MSA_NVCC_FLAGS[target],
+        extra_include_paths=[_get_blackwell_msa_include_dir()],
+    )
+
+
+@functools.cache
+def load_msa_decode_metadata_module(target: BlackwellMSATarget):
+    return gen_msa_decode_metadata_module(target).build_and_load()
+
+
 def get_blackwell_msa_module(variant: BlackwellMSAVariant, target: BlackwellMSATarget):
     """Return the loaded module used by the MSA backend dispatcher."""
 

@@ -7,12 +7,12 @@
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  */
-#include "flashinfer/minimax_m3.cuh"
+#include "flashinfer/attention/msa_decode_metadata.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
 
-void MiniMaxM3Prepare(TensorView topk, TensorView block_table, TensorView seq_lens,
+void PrepareMSADecode(TensorView topk, TensorView block_table, TensorView seq_lens,
                       TensorView k_scale, TensorView sparse_pages, TensorView sparse_lens,
                       TensorView qk_scale_log2, int64_t query_len, int64_t num_physical_pages,
                       double sm_scale) {
@@ -39,7 +39,7 @@ void MiniMaxM3Prepare(TensorView topk, TensorView block_table, TensorView seq_le
   TVM_FFI_ICHECK_EQ(sparse_pages.numel(), topk.numel());
   TVM_FFI_ICHECK_EQ(sparse_lens.numel(), topk.size(0) * topk.size(1));
   const int rows = topk.size(0) * topk.size(1);
-  MiniMaxM3PrepareSparseDecode<<<(rows + 3) / 4, 128, 0, get_stream(topk.device())>>>(
+  PrepareMSADecodeMetadata<<<(rows + 3) / 4, 128, 0, get_stream(topk.device())>>>(
       static_cast<const int32_t*>(topk.data_ptr()),
       static_cast<const int32_t*>(block_table.data_ptr()),
       static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -54,4 +54,4 @@ void MiniMaxM3Prepare(TensorView topk, TensorView block_table, TensorView seq_le
 
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare, flashinfer::MiniMaxM3Prepare);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare, flashinfer::PrepareMSADecode);

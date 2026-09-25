@@ -430,6 +430,70 @@ def test_sample_kwargs_include_zero_dimensional_tensors():
     assert kwargs["scale"].dtype == torch.float32
 
 
+def _packed_fp8_decode_trace_inputs(k_rank=0, v_rank=0):
+    packed = torch.empty(32, 4, 128, 256, dtype=torch.float8_e4m3fn)
+    return dict(
+        q=torch.empty(8, 64, 128, dtype=torch.bfloat16),
+        k=packed[..., :128],
+        v=packed[..., 128:],
+        q2k_indices=torch.empty(4, 8, 16, dtype=torch.int32),
+        page_table=torch.empty(2, 16, dtype=torch.int32),
+        seqused_k=torch.empty(2, dtype=torch.int32),
+        seqlen_q=4,
+        k_scale=torch.ones((1,) * k_rank),
+        v_scale=torch.ones((1,) * v_rank),
+    )
+
+
+@pytest.mark.parametrize("k_rank,v_rank", [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_msa_packed_fp8_trace_scale_ranks(k_rank, v_rank, tmp_path):
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    definition = msa_sparse_decode_attention.fi_trace(
+        save_dir=tmp_path, **_packed_fp8_decode_trace_inputs(k_rank, v_rank)
+    )
+    assert definition["name"] == (
+        f"msa_sparse_decode_packed_fp8_k{k_rank}v{v_rank}_h64_kv4_d128_p128_topk16"
+    )
+    for name, rank in (("k_scale", k_rank), ("v_scale", v_rank)):
+        assert definition["inputs"][name]["shape"] == ["scale_size"] * rank
+        assert definition["inputs"][name]["dtype"] == "float32"
+    assert definition["inputs"]["k"]["dtype"] == "float8_e4m3fn"
+    assert definition["outputs"]["output"]["dtype"] == "bfloat16"
+    assert (
+        json.loads((tmp_path / (definition["name"] + ".json")).read_text())
+        == definition
+    )
+    if (k_rank, v_rank) == (0, 0):
+        golden = Path(__file__).parent / "fi_trace_out" / (definition["name"] + ".json")
+        assert json.loads(golden.read_text()) == definition
+
+
+def test_msa_packed_fp8_trace_names_do_not_collide(tmp_path):
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    for kr, vr in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        msa_sparse_decode_attention.fi_trace(
+            save_dir=tmp_path, **_packed_fp8_decode_trace_inputs(kr, vr)
+        )
+    assert len(list(tmp_path.glob("*.json"))) == 4
+
+
+def test_msa_decode_trace_keeps_flat_schema_and_rejects_higher_scale_rank():
+    from flashinfer.trace.templates.msa import (
+        msa_sparse_decode_attention_trace,
+        msa_sparse_decode_attention_trace_dispatch,
+    )
+
+    assert (
+        msa_sparse_decode_attention_trace_dispatch()
+        is msa_sparse_decode_attention_trace
+    )
+    inputs = _packed_fp8_decode_trace_inputs()
+    inputs["k_scale"] = torch.ones(1, 1)
+    assert msa_sparse_decode_attention_trace_dispatch(**inputs) is None
+
+
 def assert_fi_trace_complete(
     func: Callable,
     template: TraceTemplate,
