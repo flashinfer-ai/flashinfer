@@ -3025,6 +3025,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
                 )
+
+                # fa3 pays for a fixed CTA_Q=128 tile regardless of how many
+                # query rows are valid, so MTP / speculative-decoding batches
+                # (few query rows per request) waste most of it. fa2 picks an
+                # adaptive tile (CTA_TILE_Q=16 for q_len=2, 64 for q_len=8).
+                # On H20 with KV=8192, fa2 is 6.4x faster at q_len=2 and still
+                # ahead at q_len=64; fa3 only wins from q_len=128.
+                if (
+                    self._backend == "fa3"
+                    and qo_indptr is not None
+                    and qo_indptr.numel() > 1
+                    # fp8 queries are only supported by fa3 (see run()), so
+                    # leave the backend untouched for them.
+                    and q_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    and int((qo_indptr[1:] - qo_indptr[:-1]).max().item()) <= 64
+                ):
+                    self._backend = "fa2"
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
