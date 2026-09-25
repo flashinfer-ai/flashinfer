@@ -154,12 +154,17 @@ def test_sincos_time_table():
 
 
 def test_select_tile_config_buckets():
+    # The K = 1024 norm GEMMs take the eight-warp epilogue above 1024 rows; the
+    # handoff forms follow their base variant's rule.
     expect = {
         "pos": ("xs", "xs", "s_e8", "s_e8"),
-        "norm_qkv_rope": ("xs", "s", "l", "l"),
+        "pos_sqxw": ("xs", "xs", "s_e8", "s_e8"),
+        "norm_qkv_rope": ("xs", "s", "l_e8", "l_e8"),
         "residual_wo": ("xs", "xs", "m", "m"),
+        "residual_wo_sqxw": ("xs", "xs", "m", "m"),
         "residual_fc1": ("xs_k4", "xs", "l_e8", "m"),
-        "norm_gelu": ("xs", "s", "l", "l"),
+        "residual_fc1_sqxw": ("xs_k4", "xs", "l_e8", "m"),
+        "norm_gelu": ("xs", "s", "l_e8", "l_e8"),
         "gelu_erf": ("xs", "s", "l", "l"),
         "rmsnorm": ("s", "s", "l", "l"),
     }
@@ -193,8 +198,13 @@ def test_required_kernel_keys():
     assert "merge" in REQUIRED_KERNEL_KEYS
     assert "rmsnorm_apply" in REQUIRED_KERNEL_KEYS
     gemm_keys = [k for k in REQUIRED_KERNEL_KEYS if k.startswith("gemm:")]
-    assert "gemm:pos:xs" in gemm_keys and "gemm:residual_fc1:xs_k4" in gemm_keys
-    assert len(gemm_keys) == len(set(gemm_keys)) == 19
+    assert "gemm:pos_sqxw:xs" in gemm_keys
+    assert "gemm:residual_fc1_sqxw:xs_k4" in gemm_keys
+    assert "gemm:residual_fc1:xs_k4" in gemm_keys
+    assert "gemm:norm_qkv_rope:l_e8" in gemm_keys and "gemm:gelu_erf:l" in gemm_keys
+    # Only the launched variants (the ``_sq``-only forms are not part of the tower).
+    assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
+    assert len(gemm_keys) == len(set(gemm_keys)) == 23
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
@@ -300,7 +310,7 @@ def _make_weights(device, layers, seed=6230, dtype=torch.bfloat16):
     return weights
 
 
-def test_prepare_weights_folding():
+def test_prepare_weights_no_folding():
     weights = _make_weights("cpu", layers=1)
     prepared = prepare_kimi_k3_vision_weights(weights)
     w_pe = weights["patch_proj"]
@@ -312,10 +322,11 @@ def test_prepare_weights_folding():
     assert not prepared.patch_proj[:HIDDEN, PATCH_DIM:].any()
     assert not prepared.patch_proj[HIDDEN:, :POS_SHIFT].any()
     lw = weights["layers"][0]
-    folded = (lw["wqkv"].float() * lw["norm0"].float()[None, :]).to(torch.bfloat16)
-    assert torch.equal(prepared.layers[0]["wqkv_folded"], folded)
-    folded = (lw["fc0"].float() * lw["norm1"].float()[None, :]).to(torch.bfloat16)
-    assert torch.equal(prepared.layers[0]["fc0_folded"], folded)
+    # The RMSNorm weights stay separate (applied on the activation side by the
+    # residual epilogues); every layer tensor is a contiguous copy of the input.
+    assert set(prepared.layers[0]) == {"norm0", "wqkv", "wo", "norm1", "fc0", "fc1"}
+    for name, tensor in prepared.layers[0].items():
+        assert torch.equal(tensor, lw[name]) and tensor.is_contiguous()
     assert prepared.num_layers == 1
     with pytest.raises(ValueError):
         prepare_kimi_k3_vision_weights(
@@ -350,16 +361,20 @@ def test_plan_on_cpu_device_needs_sm_count():
     plan = build_kimi_k3_vision_plan(grids, "cpu", num_layers=2, sm_count=SM_COUNT)
     assert plan.total_tokens == 264 and plan.merged_tokens == 62
     assert plan.gemm_configs == {
-        "pos": "xs",
+        "pos_sqxw": "xs",
         "norm_qkv_rope": "s",
-        "residual_wo": "xs",
-        "residual_fc1": "xs",
+        "residual_wo_sqxw": "xs",
         "norm_gelu": "s",
+        "residual_fc1_sqxw": "xs",
+        "residual_fc1": "xs",
         "gelu_erf": "xs",
         "rmsnorm": "s",
     }
     assert plan.attention.grid_clusters == GRID_CLUSTERS
     assert plan.workspace["x"].shape == (264, HIDDEN)
+    assert plan.workspace["xw"].shape == (264, HIDDEN)
+    assert plan.workspace["stats"].shape == (264, cb.STATS_PARTS)
+    assert plan.workspace["stats"].dtype == torch.float32
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +539,7 @@ def _close(actual, expected):
 def test_stages_match_fp32_oracles(grids):
     """Every stage on the reference chain's intermediates against the FP32 oracle of that operator."""
     _require_program()
-    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers=1, seed=11)
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers=2, seed=11)
     prev = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
@@ -534,7 +549,25 @@ def test_stages_match_fp32_oracles(grids):
         cu = cu_seqlens_of(grids)
         T = cu[-1]
         lw = weights["layers"][0]
+        lw1 = weights["layers"][1]
         f = lambda w: w.float()  # noqa: E731
+
+        def handoff(x, w_next):
+            """The residual epilogue's handoff of the BF16 row set ``x``: exact values."""
+            xw = (x.float() * w_next.float()[None, :]).to(torch.bfloat16)
+            stats = x.float().view(T, cb.STATS_PARTS, HIDDEN // cb.STATS_PARTS)
+            return xw, stats.square().sum(dim=-1)
+
+        def check_handoff(x, w_next):
+            xw, stats = handoff(x, w_next)
+            _close(ws["xw"], xw)
+            torch.testing.assert_close(ws["stats"], stats, atol=1e-2, rtol=1e-2)
+
+        def set_handoff(x, w_next):
+            xw, stats = handoff(x, w_next)
+            ws["x"].copy_(x)
+            ws["xw"].copy_(xw)
+            ws["stats"].copy_(stats)
 
         stages["patch_embed"]()
         torch.cuda.synchronize()
@@ -544,8 +577,9 @@ def test_stages_match_fp32_oracles(grids):
         )
         _close(ws["x"], x0_oracle)
         x0 = x0_oracle.to(torch.bfloat16)
+        check_handoff(ws["x"], lw["norm0"])
 
-        ws["x"].copy_(x0)
+        set_handoff(x0, lw["norm0"])
         stages["layer_norm_qkv_rope"]()
         torch.cuda.synchronize()
         n = _rms_norm(x0.float(), f(lw["norm0"]), NORM_EPS)
@@ -569,8 +603,9 @@ def test_stages_match_fp32_oracles(grids):
         x1_oracle = x0.float() + F.linear(a.float().view(T, QKV_HIDDEN), f(lw["wo"]))
         _close(ws["x"], x1_oracle)
         x1 = x1_oracle.to(torch.bfloat16)
+        check_handoff(ws["x"], lw["norm1"])
 
-        ws["x"].copy_(x1)
+        set_handoff(x1, lw["norm1"])
         stages["layer_norm_fc0_gelu"]()
         torch.cuda.synchronize()
         n1 = _rms_norm(x1.float(), f(lw["norm1"]), NORM_EPS)
@@ -585,6 +620,17 @@ def test_stages_match_fp32_oracles(grids):
         x2_oracle = x1.float() + F.linear(ffn.float(), f(lw["fc1"]))
         _close(ws["x"], x2_oracle)
         x2 = x2_oracle.to(torch.bfloat16)
+        check_handoff(ws["x"], lw1["norm0"])
+
+        # The last layer's FC1 (no consumer): plain residual form on layer 1's weights.
+        ws["ffn"].copy_(ffn)
+        ws["x"].copy_(x1)
+        ws["xw"].zero_()
+        ws["stats"].zero_()
+        stages["layer_fc1_last"]()
+        torch.cuda.synchronize()
+        _close(ws["x"], x1.float() + F.linear(ffn.float(), f(lw1["fc1"])))
+        assert not ws["xw"].any() and not ws["stats"].any()
 
         ws["x"].copy_(x2)
         stages["final_norm_merge"]()

@@ -39,10 +39,11 @@ def kimi_k3_vision_tower(
     The experimental Cake backend runs the ``nvidia/Kimi-K3-NVFP4`` vision path
     (``MoonViT3dPretrainedModel`` + ``PatchMergerMLPV2``) as one sequence of
     generated tcgen05 programs: the 14x14 patch embedding with positional rows,
-    27 encoder layers (RMSNorm folded into the QKV GEMM with the 2-D RoPE in
+    27 encoder layers (RMSNorm fused into the QKV GEMM with the 2-D RoPE in
     its epilogue, packed-varlen noncausal BF16 attention per ``grid_thw``
-    segment, out-projection and FC1 with fused residual adds, RMSNorm-folded
-    FC0 with GELU-tanh), the final RMSNorm with the 2x2 spatial / temporal-mean
+    segment, out-projection and FC1 with fused residual adds that also emit
+    the next norm's weighted activation and row statistics, RMSNorm-fused FC0
+    with GELU-tanh), the final RMSNorm with the 2x2 spatial / temporal-mean
     merge, and the projector GEMMs with GELU-erf and the post RMSNorm
     (flashinfer-ai/flashinfer#4568).
 
@@ -57,7 +58,7 @@ def kimi_k3_vision_tower(
     weights : dict or PreparedWeights
         The BF16 ``nn.Linear`` ``[out, in]`` parameters (see
         ``cake_backend.prepare_kimi_k3_vision_weights``) or their prepared form.
-        Prepare once per model; the dict form is folded on every call.
+        Prepare once per model; the dict form is prepared on every call.
     out : Optional[torch.Tensor]
         Optional caller-owned BF16 ``[N, 7168]`` output, ``N = sum (h/2)*(w/2)``.
     plan, pos_rows

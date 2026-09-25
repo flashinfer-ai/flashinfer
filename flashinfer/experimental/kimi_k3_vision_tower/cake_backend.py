@@ -24,13 +24,15 @@ weights, out)`` call of ``nvidia/Kimi-K3-NVFP4`` (``modeling_kimi_k3.py``:
 [N, 7168]`` with ``N = sum (h / 2) * (w / 2)``.  Every launch of the route is a
 generated Cake program::
 
-    patch_embed          gemm pos:            x  = bf16(pixels @ Wpe^T) + pos_rows          [T, 1024]
+    patch_embed          gemm pos_sqxw:       x  = bf16(pixels @ Wpe^T) + pos_rows          [T, 1024]
+                                              + handoff: xw = bf16(x * norm0[0]), stats = rowsumsq(x)
     27 x encoder layer:
-      layer_norm_qkv_rope gemm norm_qkv_rope: q, k, v = RoPE2D(bf16(RMSNorm(x) @ Wqkv^T)) 3 x [T, 12, 128]
+      layer_norm_qkv_rope gemm norm_qkv_rope: q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x))) 3 x [T, 12, 128]
       layer_attention     packed-varlen noncausal BF16 attention per grid_thw segment  [T, 12, 128]
-      layer_out_proj      gemm residual_wo:    x += bf16(a @ Wo^T)                          (in place)
-      layer_norm_fc0_gelu gemm norm_gelu:      f  = bf16(gelu_tanh(bf16(RMSNorm(x) @ Wfc0^T))) [T, 4096]
-      layer_fc1           gemm residual_fc1:   x += bf16(f @ Wfc1^T)                        (in place)
+      layer_out_proj      gemm residual_wo_sqxw: x += bf16(a @ Wo^T); xw = bf16(x * norm1), stats (in place)
+      layer_norm_fc0_gelu gemm norm_gelu:      f  = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x)))) [T, 4096]
+      layer_fc1           gemm residual_fc1_sqxw: x += bf16(f @ Wfc1^T); xw = bf16(x * norm0[l+1]), stats
+                          (in place; the last layer runs the plain residual_fc1 form: no handoff)
     final_norm_merge     final RMSNorm + 2x2 spatial / temporal-mean merge               [N, 4096]
     merger_gemm0         gemm gelu_erf:       h  = bf16(gelu_erf(bf16(m @ Wp0^T)))         [N, 4096]
     merger_gemm1         gemm rmsnorm:        y  = bf16(h @ Wp1^T)                         [N, 7168]
@@ -38,11 +40,15 @@ generated Cake program::
 
 Host work is split exactly like the Cake production launcher:
 
-* :func:`prepare_kimi_k3_vision_weights` -- once per model: the RMSNorm
-  weights are folded into ``wqkv`` / ``fc0`` (``bf16(W * norm_w[None, :])``)
-  and the patch projection is zero-padded / shifted for the pixel-row TMA
-  maps.  The kernels compute the row ``rstd`` in FP32 and scale the FP32
-  accumulator before the single BF16 rounding.
+* :func:`prepare_kimi_k3_vision_weights` -- once per model: the patch
+  projection is zero-padded / shifted for the pixel-row TMA maps and every
+  parameter copied contiguously.  The RMSNorm weights are NOT folded into the
+  GEMM weights: the residual-stream producers (``patch_embed``,
+  ``layer_out_proj``, ``layer_fc1``) also store ``xw = bf16(x * w_next)`` and
+  the FP32 ``[T, 16]`` per-64-column row sums of squares of ``x``; the norm
+  GEMMs read ``xw`` with the original weight, compute the row ``rstd`` in FP32
+  from those statistics and scale the FP32 accumulator before the single BF16
+  rounding.
 * :func:`build_kimi_k3_vision_plan` -- once per ``grid_thws`` batch: the
   ``cu_seqlens``, the 2-D RoPE ``cos``/``sin`` tables, the merge table, the
   attention segment plan (unit layout + LPT unit table), the GEMM tile
@@ -111,6 +117,7 @@ PATCH_DIM_PAD = 640  # 10 x 64
 POS_SHIFT = 4  # odd pixel rows start 8 bytes past a 16-byte boundary: TMA reads them 4 elements early
 GEMM_BLOCK_M = 128
 GEMM_BLOCK_K = 64
+STATS_PARTS = 16  # FP32 per-64-column partial sums of squares of a 1024-wide row
 RMS_ROWS_PER_CTA = 4  # rmsnorm_apply: one warp per 7168-wide row, four rows per CTA
 
 # Attention (kimi_k3_vision_attention, forked from minimax_h3_varlen_attention).
@@ -133,21 +140,31 @@ STAGE_NAMES = (
     "layer_out_proj",
     "layer_norm_fc0_gelu",
     "layer_fc1",
+    "layer_fc1_last",
     "final_norm_merge",
     "merger_gemm0",
     "merger_gemm1",
     "merger_rmsnorm_apply",
 )
 # GEMM variant launched by each GEMM stage and the token count it runs on.
+# The residual-stream producers run their ``_sqxw`` handoff form: the epilogue
+# also stores ``xw = bf16(x * w_next)`` (the next RMSNorm's weight applied on
+# the activation side) and the FP32 per-64-column row sums of squares that the
+# following norm GEMM consumes; the last layer's FC1 has no consumer and runs
+# the plain form.
 STAGE_GEMM_VARIANT = {
-    "patch_embed": ("pos", "T"),
+    "patch_embed": ("pos_sqxw", "T"),
     "layer_norm_qkv_rope": ("norm_qkv_rope", "T"),
-    "layer_out_proj": ("residual_wo", "T"),
+    "layer_out_proj": ("residual_wo_sqxw", "T"),
     "layer_norm_fc0_gelu": ("norm_gelu", "T"),
-    "layer_fc1": ("residual_fc1", "T"),
+    "layer_fc1": ("residual_fc1_sqxw", "T"),
+    "layer_fc1_last": ("residual_fc1", "T"),
     "merger_gemm0": ("gelu_erf", "N"),
     "merger_gemm1": ("rmsnorm", "N"),
 }
+PRODUCTION_GEMM_VARIANTS = tuple(
+    dict.fromkeys(variant for variant, _count in STAGE_GEMM_VARIANT.values())
+)
 
 # Exact keyword sets of the generated ``run`` entries (bound by the export's
 # argument plans); ``grid`` is expanded to ``grid_x/y/z``.
@@ -162,6 +179,8 @@ GEMM_KWARGS = (
     "COS",
     "SIN",
     "SQ",
+    "XW",
+    "WN",
     "M",
     "m_tiles",
     "eps",
@@ -541,7 +560,9 @@ TILE_CONFIGS: dict[str, TileConfig] = {
     )
 }
 
-# variant -> (N, K, pos-split pixel-row maps)
+# variant -> (N, K, pos-split pixel-row maps); ``_sq`` / ``_sqxw`` are the
+# handoff forms of the residual-stream producers (same GEMM, extra epilogue
+# stores), with the base variant's tile rule.
 GEMM_VARIANTS: dict[str, tuple[int, int, bool]] = {
     "pos": (HIDDEN, PATCH_DIM_PAD, True),
     "norm_qkv_rope": (QKV_N, HIDDEN, False),
@@ -551,6 +572,9 @@ GEMM_VARIANTS: dict[str, tuple[int, int, bool]] = {
     "gelu_erf": (MERGED_DIM, MERGED_DIM, False),
     "rmsnorm": (TEXT_HIDDEN, MERGED_DIM, False),
 }
+for _base in ("pos", "residual_wo", "residual_fc1"):
+    GEMM_VARIANTS[_base + "_sq"] = GEMM_VARIANTS[_base]
+    GEMM_VARIANTS[_base + "_sqxw"] = GEMM_VARIANTS[_base]
 # Production tile selection thresholds (kimi_k3_vision_gemm.select_tile_config).
 TINY_M_LIMIT = 256
 SMALL_M_LIMIT = 1024
@@ -573,7 +597,9 @@ def select_tile_config(variant: str, M: int) -> TileConfig:
         return cfg["s"] if n_total == TEXT_HIDDEN else cfg["xs"]
     if M <= SMALL_M_LIMIT:
         return cfg["s"]
-    return cfg["l"]
+    # The K = 1024 norm GEMMs (statistics handoff on the critical path) take the
+    # eight-warp epilogue; the projector GEMMs the four-warp pair tile.
+    return cfg["l_e8"] if k_total == HIDDEN else cfg["l"]
 
 
 def launch_tile_config(variant: str, cfg: TileConfig) -> TileConfig:
@@ -606,9 +632,9 @@ def gemm_launch_geometry(
 
 
 def gemm_configs_for(total_tokens: int, merged: int) -> dict[str, str]:
-    """Physical tile config name per GEMM variant for one ``(T, N)``."""
+    """Physical tile config name per launched GEMM variant for one ``(T, N)``."""
     configs: dict[str, str] = {}
-    for variant in GEMM_VARIANTS:
+    for variant in PRODUCTION_GEMM_VARIANTS:
         count = total_tokens if variant not in ("gelu_erf", "rmsnorm") else merged
         configs[variant] = launch_tile_config(
             variant, select_tile_config(variant, count)
@@ -619,7 +645,7 @@ def gemm_configs_for(total_tokens: int, merged: int) -> dict[str, str]:
 def required_kernel_keys() -> tuple[str, ...]:
     """Every logical kernel the production plan can select (all token-count buckets)."""
     keys: list[str] = []
-    for variant in GEMM_VARIANTS:
+    for variant in PRODUCTION_GEMM_VARIANTS:
         for count in (1, TINY_M_LIMIT + 1, SMALL_M_LIMIT + 1, MID_M_LIMIT + 1):
             key = gemm_kernel_key(
                 variant,
@@ -665,9 +691,12 @@ class PreparedWeights:
     ``patch_proj`` is ``[2048, 640]``: rows ``[0, 1024)`` the ``[1024, 588]``
     patch projection zero-padded along K to 640, rows ``[1024, 2048)`` the same
     weight shifted right by four elements (odd pixel rows are streamed by TMA
-    from a 16-byte-aligned start four elements early).  Per layer
-    ``wqkv_folded = bf16(wqkv * norm0[None, :])`` and ``fc0_folded = bf16(fc0 *
-    norm1[None, :])``; ``wo`` / ``fc1`` are the checkpoint tensors.
+    from a 16-byte-aligned start four elements early).  Per layer the six
+    checkpoint tensors ``norm0``, ``wqkv``, ``wo``, ``norm1``, ``fc0``, ``fc1``
+    as contiguous copies: the RMSNorm weights are NOT folded into the GEMM
+    weights (a folded ``bf16(W * w_norm)`` is a fixed weight perturbation the
+    HF chain does not have); they are applied on the activation side by the
+    residual epilogues (``xw = bf16(x * w_next)``).
     """
 
     patch_proj: torch.Tensor
@@ -699,7 +728,7 @@ def _check_weight(t: torch.Tensor, shape: tuple[int, ...], name: str) -> torch.T
 
 
 def prepare_kimi_k3_vision_weights(weights: dict[str, Any]) -> PreparedWeights:
-    """Fold the RMSNorm weights into ``wqkv``/``fc0`` and pad ``patch_proj`` (once per model).
+    """Pad ``patch_proj`` and copy every parameter contiguously (once per model; no folding).
 
     ``weights`` uses ``nn.Linear`` ``[out, in]`` BF16 tensors without biases:
     ``patch_proj [1024, 588]`` (the 14x14 Conv2d flattened), ``pos_emb [64, 64,
@@ -719,9 +748,14 @@ def prepare_kimi_k3_vision_weights(weights: dict[str, Any]) -> PreparedWeights:
     w_pe_pad[:HIDDEN, :PATCH_DIM] = w_pe
     w_pe_pad[HIDDEN:, POS_SHIFT : POS_SHIFT + PATCH_DIM] = w_pe
 
-    def fold(w: torch.Tensor, norm_w: torch.Tensor) -> torch.Tensor:
-        return (w.float() * norm_w.float()[None, :]).to(torch.bfloat16).contiguous()
-
+    layer_shapes = {
+        "norm0": (HIDDEN,),
+        "wqkv": (QKV_N, HIDDEN),
+        "wo": (HIDDEN, QKV_HIDDEN),
+        "norm1": (HIDDEN,),
+        "fc0": (FFN, HIDDEN),
+        "fc1": (HIDDEN, FFN),
+    }
     layers = []
     for index, lw in enumerate(weights["layers"]):
         missing = [k for k in LAYER_WEIGHT_KEYS if k not in lw]
@@ -729,18 +763,8 @@ def prepare_kimi_k3_vision_weights(weights: dict[str, Any]) -> PreparedWeights:
             raise ValueError(f"weights['layers'][{index}] lacks {missing}")
         layers.append(
             {
-                "wqkv_folded": fold(
-                    _check_weight(lw["wqkv"], (QKV_N, HIDDEN), f"layers[{index}].wqkv"),
-                    _check_weight(lw["norm0"], (HIDDEN,), f"layers[{index}].norm0"),
-                ),
-                "wo": _check_weight(
-                    lw["wo"], (HIDDEN, QKV_HIDDEN), f"layers[{index}].wo"
-                ),
-                "fc0_folded": fold(
-                    _check_weight(lw["fc0"], (FFN, HIDDEN), f"layers[{index}].fc0"),
-                    _check_weight(lw["norm1"], (HIDDEN,), f"layers[{index}].norm1"),
-                ),
-                "fc1": _check_weight(lw["fc1"], (HIDDEN, FFN), f"layers[{index}].fc1"),
+                name: _check_weight(lw[name], shape, f"layers[{index}].{name}")
+                for name, shape in layer_shapes.items()
             }
         )
     if not layers:
@@ -817,6 +841,11 @@ def vision_workspace_shapes(
     bf16 = torch.bfloat16
     return {
         "x": ((total_tokens, HIDDEN), bf16),
+        # RMSNorm handoff written by the residual epilogues and read by the next
+        # norm GEMM: xw = bf16(x * w_norm_next) and the FP32 [T, 16] row sums of
+        # squares of x (per 64 columns).
+        "xw": ((total_tokens, HIDDEN), bf16),
+        "stats": ((total_tokens, STATS_PARTS), torch.float32),
         "q": ((total_tokens, HEADS, HEAD_DIM), bf16),
         "k": ((total_tokens, HEADS, HEAD_DIM), bf16),
         "v": ((total_tokens, HEADS, HEAD_DIM), bf16),
@@ -827,7 +856,8 @@ def vision_workspace_shapes(
         "rowsumsq": ((merged,), torch.float32),
         # Bound to unused pointer parameters (never dereferenced for the tiles
         # the kernels run): FP32 dummy for COS/SIN/SQ, the odd-row pixel map
-        # when T == 1, and the attention kernel's diagnostic probe buffer.
+        # when T == 1 (XW / WN default to C / B like the Cake launcher), and
+        # the attention kernel's diagnostic probe buffer.
         "f32_dummy": ((16,), torch.float32),
         "pixel_dummy": ((2, PATCH_DIM), bf16),
         "probe_dummy": ((PROBE_WORDS,), torch.uint64),
@@ -962,10 +992,11 @@ class KimiK3VisionTowerRunner:
 
     @property
     def stages(self) -> dict[str, Callable[[], None]]:
-        """One zero-argument launch per stage (encoder stages bound to layer 0)."""
+        """One zero-argument launch per stage: encoder stages bound to layer 0,
+        ``layer_fc1_last`` to the last layer (its only occurrence)."""
         result: dict[str, Callable[[], None]] = {}
         for item in self.launches:
-            if item.stage in result or item.layer > 0:
+            if item.stage in result:
                 continue
 
             def run(item: _Launch = item) -> None:
@@ -1031,6 +1062,9 @@ def _gemm_launch(
     R: Optional[torch.Tensor] = None,
     COS: Optional[torch.Tensor] = None,
     SIN: Optional[torch.Tensor] = None,
+    SQ: Optional[torch.Tensor] = None,
+    XW: Optional[torch.Tensor] = None,
+    WN: Optional[torch.Tensor] = None,
     eps: float = 0.0,
 ) -> _Launch:
     ws = plan.workspace
@@ -1053,7 +1087,9 @@ def _gemm_launch(
         R=R if R is not None else C,
         COS=COS if COS is not None else ws["f32_dummy"],
         SIN=SIN if SIN is not None else ws["f32_dummy"],
-        SQ=ws["f32_dummy"],
+        SQ=SQ if SQ is not None else ws["f32_dummy"],
+        XW=XW if XW is not None else C,
+        WN=WN if WN is not None else B,
         M=M,
         m_tiles=int(m_tiles),
         eps=float(eps),
@@ -1133,33 +1169,38 @@ def _launch_sequence(
     ws = plan.workspace
     T = plan.total_tokens
     pixels2d = pixel_values.view(T, PATCH_DIM)
+    layers = weights.layers
+    stats, xw = ws["stats"], ws["xw"]
     launches = [
         _gemm_launch(
             "patch_embed",
             -1,
             plan,
-            "pos",
+            "pos_sqxw",
             pixels2d,
             weights.patch_proj,
             C=ws["x"],
             R=pos_rows,
+            SQ=stats,
+            XW=xw,
+            WN=layers[0]["norm0"],
         )
     ]
-    for index, lw in enumerate(weights.layers):
+    for index, lw in enumerate(layers):
         launches.append(
             _gemm_launch(
                 "layer_norm_qkv_rope",
                 index,
                 plan,
                 "norm_qkv_rope",
-                ws["x"],
-                lw["wqkv_folded"],
+                xw,
+                lw["wqkv"],
                 C=ws["q"],
                 C2=ws["k"],
                 C3=ws["v"],
-                R=ws["x"],
                 COS=plan.cos,
                 SIN=plan.sin,
+                SQ=stats,
                 eps=NORM_EPS,
             )
         )
@@ -1169,11 +1210,14 @@ def _launch_sequence(
                 "layer_out_proj",
                 index,
                 plan,
-                "residual_wo",
+                "residual_wo_sqxw",
                 ws["attn_out"].view(T, QKV_HIDDEN),
                 lw["wo"],
                 C=ws["x"],
                 R=ws["x"],
+                SQ=stats,
+                XW=xw,
+                WN=lw["norm1"],
             )
         )
         launches.append(
@@ -1182,25 +1226,43 @@ def _launch_sequence(
                 index,
                 plan,
                 "norm_gelu",
-                ws["x"],
-                lw["fc0_folded"],
+                xw,
+                lw["fc0"],
                 C=ws["ffn"],
-                R=ws["x"],
+                SQ=stats,
                 eps=NORM_EPS,
             )
         )
-        launches.append(
-            _gemm_launch(
-                "layer_fc1",
-                index,
-                plan,
-                "residual_fc1",
-                ws["ffn"],
-                lw["fc1"],
-                C=ws["x"],
-                R=ws["x"],
+        if index + 1 < len(layers):
+            launches.append(
+                _gemm_launch(
+                    "layer_fc1",
+                    index,
+                    plan,
+                    "residual_fc1_sqxw",
+                    ws["ffn"],
+                    lw["fc1"],
+                    C=ws["x"],
+                    R=ws["x"],
+                    SQ=stats,
+                    XW=xw,
+                    WN=layers[index + 1]["norm0"],
+                )
             )
-        )
+        else:
+            # No consumer after the last layer: the merge kernel reads x directly.
+            launches.append(
+                _gemm_launch(
+                    "layer_fc1_last",
+                    index,
+                    plan,
+                    "residual_fc1",
+                    ws["ffn"],
+                    lw["fc1"],
+                    C=ws["x"],
+                    R=ws["x"],
+                )
+            )
     launches.append(_merge_launch(plan, weights))
     launches.append(
         _gemm_launch(

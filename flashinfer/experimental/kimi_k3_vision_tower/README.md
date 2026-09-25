@@ -14,12 +14,12 @@ sequence of generated tcgen05 programs:
 
 | Stage | Program | Math (BF16 tensors, FP32 accumulation) |
 | --- | --- | --- |
-| `patch_embed` | `gemm:pos:*` | `x = bf16(pixels[T, 588] @ Wpe^T) + pos_rows` (Conv2d 14x14/14 as a GEMM, bilinear-resized 64x64 positional table + sincos time rows) |
-| `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*` | `q, k, v = RoPE2D(bf16(RMSNorm(x, norm0) @ Wqkv^T))`, RMSNorm folded into the weight, row `rstd` in FP32 in the kernel, interleaved-pair 2-D RoPE in the epilogue, head-split outputs |
+| `patch_embed` | `gemm:pos_sqxw:*` | `x = bf16(pixels[T, 588] @ Wpe^T) + pos_rows` (Conv2d 14x14/14 as a GEMM, bilinear-resized 64x64 positional table + sincos time rows) + handoff `xw = bf16(x * norm0[0])`, `stats = rowsumsq(x)` |
+| `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*` | `q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x)))`: the RMSNorm weight applied on the activation side by the producer (`xw`), row `rstd` from the FP32 `stats` handoff, original `Wqkv`, interleaved-pair 2-D RoPE in the epilogue, head-split outputs |
 | `layer_attention` (x27) | `attention:tiles2` / `attention:tiles1` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding |
-| `layer_out_proj` (x27) | `gemm:residual_wo:*` | `x += bf16(a @ Wo^T)` |
-| `layer_norm_fc0_gelu` (x27) | `gemm:norm_gelu:*` | `f = bf16(gelu_tanh(bf16(RMSNorm(x, norm1) @ Wfc0^T)))` |
-| `layer_fc1` (x27) | `gemm:residual_fc1:*` | `x += bf16(f @ Wfc1^T)` |
+| `layer_out_proj` (x27) | `gemm:residual_wo_sqxw:*` | `x += bf16(a @ Wo^T)` + handoff `xw = bf16(x * norm1)`, `stats` |
+| `layer_norm_fc0_gelu` (x27) | `gemm:norm_gelu:*` | `f = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x))))`, original `Wfc0` |
+| `layer_fc1` (x26) / `layer_fc1_last` (x1) | `gemm:residual_fc1_sqxw:*` / `gemm:residual_fc1:*` | `x += bf16(f @ Wfc1^T)` + handoff `xw = bf16(x * norm0[l+1])`, `stats`; the last layer runs the plain form (the merge reads `x` directly) |
 | `final_norm_merge` | `merge` | `m = mean_t(bf16(RMSNorm(x, final_norm)))` over 2x2 spatial windows, `[N, 4096]` |
 | `merger_gemm0` | `gemm:gelu_erf:*` | `h = bf16(gelu_erf(bf16(m @ Wp0^T)))` |
 | `merger_gemm1` + `merger_rmsnorm_apply` | `gemm:rmsnorm:*`, `rmsnorm_apply` | `out = bf16(RMSNorm(bf16(h @ Wp1^T), post_norm, eps = 1e-5))` |
@@ -45,8 +45,11 @@ per `grid_thws` batch from the LPT makespans of both layouts
 [4096, 4096]`, `merger_proj1 [7168, 4096]`, `post_norm [7168]` and `layers`
 = 27 x `{"norm0": [1024], "wqkv": [4608, 1024], "wo": [1024, 1536], "norm1":
 [1024], "fc0": [4096, 1024], "fc1": [1024, 4096]}`. Prepare it once per model
-with `prepare_kimi_k3_vision_weights` (norm folding, patch-projection
-padding); the dict form is folded on every call.
+with `prepare_kimi_k3_vision_weights` (patch-projection padding, contiguous
+copies; the RMSNorm weights are not folded into the GEMM weights: a folded
+`bf16(W * w_norm)` is a fixed weight perturbation the HF chain does not have,
+so the norm weight is applied on the activation side, `xw = bf16(x * w_next)`,
+by the residual epilogues); the dict form is prepared on every call.
 
 ```python
 import torch
