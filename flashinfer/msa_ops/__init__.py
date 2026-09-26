@@ -21,7 +21,10 @@ from .proxy_score import (
     msa_proxy_score_fp4,
 )
 from .sparse_prefill import msa_sparse_attention
-from .sparse_decode import msa_sparse_decode_attention
+from .sparse_decode import (
+    msa_sparse_decode_attention,
+    prepare_msa_nvfp4_sparse_decode,
+)
 from .sparse_topk_select import msa_topk_select
 
 # Legacy aggregate capability flag retained for callers that only target
@@ -50,5 +53,6 @@ __all__ = [
     "msa_sparse_attention",
     "msa_sparse_decode_attention",
     "msa_topk_select",
+    "prepare_msa_nvfp4_sparse_decode",
     "supports_packed_kv",
 ]

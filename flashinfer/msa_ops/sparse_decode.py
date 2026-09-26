@@ -23,7 +23,7 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
+from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
 from ._blackwell_sm100 import (
     MSASparseAttentionWorkspace,
@@ -658,3 +658,109 @@ def msa_sparse_decode_attention(
     if return_softmax_lse:
         return out, lse_out
     return out
+
+
+@flashinfer_experimental_api(feature="NVFP4 paged-KV MSA decode (Cake backend)")
+def prepare_msa_nvfp4_sparse_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    *,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    k_global_scale: float,
+    v_global_scale: float,
+    workspace_buffer: Optional[torch.Tensor] = None,
+    seqlen_q: int = 1,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    backend: str = "cake",
+):
+    r"""Prepare NVFP4 paged-KV sparse decode with the generated Cake program (SM100/SM103).
+
+    The experimental Cake backend serves the same problem surface as the
+    packed-NVFP4 paged-KV route of :func:`msa_sparse_decode_attention` -- the
+    planar page pool of ``docs/design_docs/nvfp4_msa_paged_kv_layout.md``,
+    top-k 16, right-aligned causal decode tokens -- with one persistent kernel
+    that keeps the K tiles resident in tensor memory and runs both MMAs in the
+    swapped orientation.  Preparation validates and binds the tensors; the
+    returned runner launches with no allocation and no host synchronization
+    and can be captured into a CUDA Graph.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        BF16 ``[batch * seqlen_q, num_q_heads, 128]``; request ``b`` owns rows
+        ``[b * seqlen_q, (b + 1) * seqlen_q)`` and query head ``h`` attends to
+        KV head ``h // (num_q_heads // num_kv_heads)`` (at most sixteen query
+        heads per KV head).
+    k, v : torch.Tensor
+        uint8 ``[num_pages, num_kv_heads, 128, 64]`` strided views of the
+        planar page pool (packed E2M1, two values per byte).
+    q2k_indices : torch.Tensor
+        int32 ``[num_kv_heads, batch * seqlen_q, 16]`` selected page indices
+        per KV head and query token, ascending and ``-1`` padded, as
+        :func:`msa_topk_select` produces them.
+    k_scale, v_scale : torch.Tensor
+        ``[num_pages, num_kv_heads, 128, 8]`` strided views of the E4M3 block
+        scales (uint8 or float8_e4m3fn); K scales linear, V scales in the
+        cache writer's swizzled order.
+    page_table : torch.Tensor
+        int32 ``[batch, max_pages]`` physical page ids per request.
+    seqused_k : torch.Tensor
+        int32 ``[batch]`` KV tokens per request including the new tokens.
+    k_global_scale, v_global_scale : float
+        Positive per-side global scales; the K scale is folded into the
+        softmax scale and the V scale is applied in the epilogue.
+    workspace_buffer : Optional[torch.Tensor]
+        Caller-owned CUDA bytes for the split-KV partials, at least
+        :func:`flashinfer.experimental.msa_nvfp4_decode.cake_backend.msa_nvfp4_decode_workspace_size`;
+        required only when the batch is small enough to split (the runner
+        reports the chosen factor as ``splits``).  The kernel resets its
+        completion counters after every merge, so the region must not be
+        shared with other work between launches.
+    seqlen_q : int
+        Query tokens per request, in ``[1, 32]``; token ``i`` sits at KV
+        position ``seqused_k[b] - seqlen_q + i`` and attends causally.
+    softmax_scale : Optional[float]
+        Defaults to ``1 / sqrt(128)``.
+    out, lse : Optional[torch.Tensor]
+        Optional caller-owned BF16 output ``[batch * seqlen_q, num_q_heads, 128]``
+        and float32 natural-log softmax normalizer ``[batch * seqlen_q, num_q_heads]``.
+    backend : str
+        Only ``"cake"`` is supported.
+
+    Returns
+    -------
+    MSANvfp4DecodeRunner
+        Calling it launches the decode on the current stream and returns
+        ``out``.  See ``flashinfer/experimental/msa_nvfp4_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("NVFP4 MSA decode currently supports backend='cake'")
+    from ..experimental.msa_nvfp4_decode.cake_backend import (
+        prepare_msa_nvfp4_sparse_decode as prepare,
+    )
+
+    return prepare(
+        q,
+        k,
+        v,
+        q2k_indices,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        workspace_buffer=workspace_buffer,
+        seqlen_q=seqlen_q,
+        softmax_scale=softmax_scale,
+        out=out,
+        lse=lse,
+        backend="cake",
+    )
