@@ -107,7 +107,7 @@ __device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) 
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
+kernel_cake_minimax_h3_varlen_attention_fb5d4ed2aeabea63cc94(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -115,8 +115,7 @@ kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __re
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -126,6 +125,7 @@ kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __re
     const int v_smem_bf16_addr = smem + 0;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int bid_0 = bid;
     int tile = bid_0 / 4;
     int sub = bid_0 - tile * 4;
@@ -417,10 +417,14 @@ kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __re
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_7[0]) : "f"(normalized_6[0]), "f"(normalized_6[1]), "f"(normalized_6[2]), "f"(normalized_6[3]), "f"(normalized_6[4]), "f"(normalized_6[5]), "f"(normalized_6[6]), "f"(normalized_6[7]));
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_7[1]) : "f"(normalized_6[8]), "f"(normalized_6[9]), "f"(normalized_6[10]), "f"(normalized_6[11]), "f"(normalized_6[12]), "f"(normalized_6[13]), "f"(normalized_6[14]), "f"(normalized_6[15]));
         long long output_offset = ((long long)tile * 128 + (long long)row128) * 64 + (long long)(group_1 * 8);
-        *(reinterpret_cast<int*>(q_fp4 + output_offset) + (0)) = packed[0];
-        *(reinterpret_cast<int*>(q_fp4 + (output_offset + 4)) + (0)) = packed[1];
-        *(reinterpret_cast<int*>(k_fp4 + output_offset) + (0)) = packed_7[0];
-        *(reinterpret_cast<int*>(k_fp4 + (output_offset + 4)) + (0)) = packed_7[1];
+        {
+            int2 _iv2 = make_int2(packed[0 + 0], packed[0 + 1]);
+            *reinterpret_cast<int2*>(q_fp4 + output_offset + 0) = _iv2;
+        }
+        {
+            int2 _iv2 = make_int2(packed_7[0 + 0], packed_7[0 + 1]);
+            *reinterpret_cast<int2*>(k_fp4 + output_offset + 0) = _iv2;
+        }
         int row_outer = row128 / 32;
         int row_inner = row128 - row_outer * 32;
         int row_quad = row_inner / 8;
@@ -429,15 +433,46 @@ kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __re
         int group_lane = group_1 - group_pair * 4;
         int scale_offset = (((row_quad * 2 + group_pair) * 8 + row_lane) * 4 + row_outer) * 4 + group_lane;
         long long scale_tile_offset = (long long)tile * 1024;
+        float q_sf4[4];
+        float k_sf4[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float _shfl_0 = __shfl_sync(4294967295, raw_scale, j, 4);
+            q_sf4[j] = _shfl_0;
+            float _shfl_1 = __shfl_sync(4294967295, raw_scale_3, j, 4);
+            k_sf4[j] = _shfl_1;
+        }
+        unsigned int q_sf_word[1];
+        unsigned int k_sf_word[1];
         {
-            unsigned short _sf_pair;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(raw_scale));
-            *(reinterpret_cast<unsigned char*>(q_scale + (scale_tile_offset + (long long)scale_offset)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(q_sf4[0]), "f"(q_sf4[1]),
+                                   "f"(q_sf4[2]), "f"(q_sf4[3]));
+            q_sf_word[0] = _packed;
         }
         {
-            unsigned short _sf_pair;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(raw_scale_3));
-            *(reinterpret_cast<unsigned char*>(k_scale + (scale_tile_offset + (long long)scale_offset)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+            uint32_t _packed;
+            asm volatile("{\n\t"
+                ".reg .b16 _lo;\n\t"
+                ".reg .b16 _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}"
+                : "=r"(_packed) : "f"(k_sf4[0]), "f"(k_sf4[1]),
+                                   "f"(k_sf4[2]), "f"(k_sf4[3]));
+            k_sf_word[0] = _packed;
+        }
+        if (group_lane == 0) {
+            *(reinterpret_cast<unsigned int*>(q_scale + (scale_tile_offset + (long long)scale_offset)) + (0)) = q_sf_word[0];
+            *(reinterpret_cast<unsigned int*>(k_scale + (scale_tile_offset + (long long)scale_offset)) + (0)) = k_sf_word[0];
         }
         unsigned int packed_v_bf16[8];
         #pragma unroll
@@ -499,8 +534,10 @@ kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __re
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_1[1]) : "f"(normalized_1[8]), "f"(normalized_1[9]), "f"(normalized_1[10]), "f"(normalized_1[11]), "f"(normalized_1[12]), "f"(normalized_1[13]), "f"(normalized_1[14]), "f"(normalized_1[15]));
         int group_2 = sub * 2 + v_group;
         long long output_offset_1 = ((long long)head * 128 + (long long)dim) * ((long long)PB * 64) + (long long)(pblock * 64) + (long long)(group_2 * 8);
-        *(reinterpret_cast<int*>(v_fp4_t + output_offset_1) + (0)) = packed_1[0];
-        *(reinterpret_cast<int*>(v_fp4_t + (output_offset_1 + 4)) + (0)) = packed_1[1];
+        {
+            int2 _iv2 = make_int2(packed_1[0 + 0], packed_1[0 + 1]);
+            *reinterpret_cast<int2*>(v_fp4_t + output_offset_1 + 0) = _iv2;
+        }
         int row_outer_1 = dim / 32;
         int row_inner_1 = dim - row_outer_1 * 32;
         int row_quad_1 = row_inner_1 / 8;
@@ -522,7 +559,6 @@ kernel_cake_minimax_h3_varlen_attention_c330e02790f956ad0b08(__nv_bfloat16* __re
             }
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 } // extern "C"
