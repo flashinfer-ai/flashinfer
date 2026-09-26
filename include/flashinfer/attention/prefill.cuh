@@ -3030,7 +3030,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
-    const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
@@ -3085,6 +3084,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                             (kv_head_idx * group_size) * o_stride_h
                                       : o + o_indptr[request_idx] * o_stride_n +
                                             (kv_head_idx * group_size) * o_stride_h;
+    // PrefillSplitQOKVIndptr lays out the partial output as
+    // o_indptr[b + 1] - o_indptr[b] == qo_len * num_kv_chunks, so the plan already carries
+    // the row stride. Recomputing it from the device-side KV length makes the kernel and
+    // the merge disagree whenever plan() reserved a longer KV span than the kernel sees.
+    const uint32_t plan_num_kv_chunks =
+        partition_kv ? (o_indptr[request_idx + 1] - o_indptr[request_idx]) / max(qo_len, 1U) : 1U;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -3365,8 +3370,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       finalize_m<KTraits>(variant, m);
 
-      const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+      const uint32_t num_kv_chunks = plan_num_kv_chunks;
       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
@@ -3819,7 +3823,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
-    const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
 
@@ -3873,6 +3876,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                             (kv_head_idx * group_size) * o_stride_h
                                       : o + o_indptr[request_idx] * o_stride_n +
                                             (kv_head_idx * group_size) * o_stride_h;
+    // PrefillSplitQOKVIndptr lays out the partial output as
+    // o_indptr[b + 1] - o_indptr[b] == qo_len * num_kv_chunks, so the plan already carries
+    // the row stride. Recomputing it from the device-side KV length makes the kernel and
+    // the merge disagree whenever plan() reserved a longer KV span than the kernel sees.
+    const uint32_t plan_num_kv_chunks =
+        partition_kv ? (o_indptr[request_idx + 1] - o_indptr[request_idx]) / max(qo_len, 1U) : 1U;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -4290,8 +4299,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       finalize_m<KTraits>(variant, m);
 
-      const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+      const uint32_t num_kv_chunks = plan_num_kv_chunks;
 
       if constexpr (KTraits::USE_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
