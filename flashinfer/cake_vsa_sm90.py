@@ -751,6 +751,9 @@ class CakeVsaSm90Plan:
                     self.counters = torch.zeros(
                         (self.num_tiles,), dtype=torch.int32, device=self.device
                     )
+                    # The rendered binding takes ``u32`` arrival counters; keep the
+                    # int32 storage (uint32 lacks most reductions) and pass a view.
+                    self.counters_u32 = self.counters.view(torch.uint32)
                     self.ready = torch.cuda.Event(external=True)
                     self.ready.record(torch.cuda.current_stream(self.device))
             return
@@ -876,7 +879,7 @@ class CakeVsaSm90Plan:
                         float(self.scale_log2),
                         self.partial_o,
                         self.partial_stats,
-                        self.counters,
+                        self.counters_u32,
                         int(self.num_items),
                         1,
                         1,
