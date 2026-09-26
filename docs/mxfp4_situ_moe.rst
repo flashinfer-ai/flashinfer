@@ -116,11 +116,15 @@ sorting. The fused sort covers every T with ``T * top_k <= 8192``
 runs (see "Kernel selection" below); above that the same conversion + output-
 clear kernel runs without the fused sort (it is grid-strided over any token
 count), followed by the native ``moe_sort``; PDL-enabled prefill keeps the
-torch conversion and a separate zero-fill of the output, which since round 15
-runs on an auxiliary stream forked after the native sort and joined before
-GEMM2 on expert-parallel ranks (``MXFP4_DENSE_ASYNC_MEMSET``: ``ep`` default,
-``1`` every layout, ``0`` never; the shard keeps the in-order launch, see the
-roofline subsection); the native sort's single-cluster permutation kernel
+torch conversion and a zero-fill of the output: from T = 8192 the gather
+GEMM1's epilogue warps zero it themselves (round 17;
+``MXFP4_DENSE_FILL_IN_GEMM1``: ``1`` default, ``ep`` expert-parallel ranks
+only, ``0`` never, floor ``MXFP4_DENSE_FILL_IN_GEMM1_MIN_TOKENS`` = 8192),
+below that a separate memset runs on an auxiliary stream forked after the
+native sort and joined before GEMM2 on expert-parallel ranks
+(``MXFP4_DENSE_ASYNC_MEMSET``: ``ep`` default, ``1`` every layout, ``0`` never;
+the shard keeps the in-order launch, see the roofline subsection); the native
+sort's single-cluster permutation kernel
 serves ``T <= 1024`` and the cooperative histogram + offsets path every larger
 ``T`` (round 15; it was the cluster kernel up to 8192 tokens). The split form
 of the MoE-TP shard (T = 128..1024, below) adds two launches to the chain.
@@ -1249,7 +1253,8 @@ the same node, and every row of the tables below is either at or under
 * the dense form's zero-fill of the T x H BF16 output before the
   reduce-add finalize, T x H x 2 bytes at 6.3 TB/s standalone (5.6 us at
   T=2048, 74.7 us at T=32768). Overlapped with the routing kernels and
-  GEMM1 (round 15) it shares HBM with them, so only its excess over
+  GEMM1 (round 15) or done inside GEMM1 by its epilogue warps (round
+  17, T >= 8192) it shares HBM with them, so only its excess over
   GEMM1 counts.
 
 The MMA term uses the node's best measured tcgen05 rate (3726 TFLOPS)
@@ -1950,6 +1955,46 @@ next to a long tail of small ones (one giant expert plus 895 small: +4.5-6 %;
 scheduler warp now picks the raster per launch from the routing (a run of at
 least 1/32 of the valid 128-row groups while more than 32 experts are active
 keeps N-fastest) for shards up to 512 columns from 16384 tokens.
+
+*Dense zero-fill and the SM budget (round 17, B300).* The fused finalize
+reduce-adds into a zeroed output, and since round 15 the zero-fill
+(``cudaMemsetAsync``, 20 us at T = 8192 and 74 us at T = 32768 for the 117 /
+470 MB output) ran on an auxiliary stream forked after the sort so it
+overlaps GEMM1. On the expert-parallel rank's empty routing GEMM1 is one
+128-row group, a single tile chain of 24 us, and the memset still gated the
+row: it takes every SM, so the lone GEMM1 CTA waits behind it and the T =
+8192 / 32768 rows read 74 / 146 us against a 3.2 / 5.4 us kernel-sum floor
+without the output write. Same-GPU micro-benchmarks fix the constants: a
+fill kernel's store rate is capped per SM at about 64 GB/s (32 B per clock;
+8 SMs 0.51 TB/s, 148 SMs 6.3-6.4 TB/s, the HBM write ceiling), so a fill
+grid small enough to leave GEMM1 its SMs is 12-18x slower than the
+full-device memset, and every host-side variant (fork before the routing,
+fork first, persistent 8-64 CTA fill grids) measured 0.997-1.15 of the
+round-16 chain; per-thread 16 B stores from the four epilogue warps of every
+SM reach only 3.3 TB/s whatever the chunk size (32 KB-512 KB, dynamic or
+static split), because a warp's store issue, not the atomics, bounds them.
+The fill therefore moved into GEMM1 (``MXFP4_DENSE_FILL_IN_GEMM1`` = ``1``
+from ``MXFP4_DENSE_FILL_IN_GEMM1_MIN_TOKENS`` = 8192 tokens; below that the
+memset hides beside GEMM1 anyway). Work is claimed from a global counter in
+16 KB units. During the tile loop one epilogue warp per tile (round robin)
+claims a unit and stores it with 16 B stores while the MMA warp builds the
+next accumulator (0.25 us at the per-SM cap, hidden in that wait), so a
+dense routing's fill is spread over the loop; after its tiles are stored
+each epilogue warp zeroes the 24 KB C staging smem and streams it out with
+``cp.async.bulk`` (four 16 KB copies per claim, the next claim issued
+before the copies), which reaches the per-SM cap with one issuing lane, so
+the CTAs without tiles, most of the grid on a sparse routing, fill at the
+HBM write ceiling while the others compute. The last of the grid's epilogue
+warps resets the two counters for the next replay, and of a dual-tile pair
+only the primary launch fills unless it has no tiles. Paired on the same
+GPU against the round-16 revision (graph, 10 repeats, two passes): EP8 empty T = 8192 /
+16384 / 32768 0.931 / 0.970 / 0.959, balanced 0.994 / 1.009 / 1.000, hot 0.994 / 1.032 / 1.018,
+remote-dominated 1.023 / 0.999 / 1.018; the shard T = 8192 / 16384 / 32768 empty
+0.993 / 0.982 / 0.968, balanced 0.993 / 0.985 / 1.010, hot 0.995 / 1.018 / 0.978. The hybrid rank's GEMM1 is not slower
+than the dense GEMM1 of the same rows (round-9 timelines, 0.99-1.01); the
+6-13 % the hybrid chain adds at T <= 1024 is its two extra launches (swap
+GEMM1 + swap GEMM2, 15.7 us at T = 128), already counted in the
+fixed-overhead floor.
 
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
