@@ -876,6 +876,7 @@ def _make_dual_tile_wrapper_pdl(case, dense_dual_tile):
     )
 
 
+@pytest.mark.parametrize("dense_dual_tile", [False, True])
 @pytest.mark.parametrize("fill_in_gemm1", [False, True])
 def test_dense_route_preprocess_pdl_matches_torch(
     monkeypatch, dense_dual_tile, fill_in_gemm1
