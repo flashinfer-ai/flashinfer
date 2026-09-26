@@ -1990,7 +1990,11 @@ only the primary launch fills unless it has no tiles. Paired on the same
 GPU against the round-16 revision (graph, 10 repeats, two passes): EP8 empty T = 8192 /
 16384 / 32768 0.931 / 0.970 / 0.959, balanced 0.994 / 1.009 / 1.000, hot 0.994 / 1.032 / 1.018,
 remote-dominated 1.023 / 0.999 / 1.018; the shard T = 8192 / 16384 / 32768 empty
-0.993 / 0.982 / 0.968, balanced 0.993 / 0.985 / 1.010, hot 0.995 / 1.018 / 0.978. The hybrid rank's GEMM1 is not slower
+0.993 / 0.982 / 0.968, balanced 0.993 / 0.985 / 1.010, hot 0.995 / 1.018 / 0.978. An L2 evict-first policy on the fill's stores and bulk copies
+(``createpolicy.fractional.L2::evict_first``) measured neutral against
+this revision on the same GPU (EP8 rows 0.993-1.021, TP8 0.969-1.004, two
+passes), so the dense hot rows' 1-3 % is not L2 displacement of the
+giant expert's weight tiles; it stays closed. The hybrid rank's GEMM1 is not slower
 than the dense GEMM1 of the same rows (round-9 timelines, 0.99-1.01); the
 6-13 % the hybrid chain adds at T <= 1024 is its two extra launches (swap
 GEMM1 + swap GEMM2, 15.7 us at T = 128), already counted in the
