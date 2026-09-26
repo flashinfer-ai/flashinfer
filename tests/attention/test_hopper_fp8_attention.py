@@ -573,6 +573,75 @@ def test_batch_prefill_paged(batch_size, num_heads, head_dim, causal, dtype):
     assert mse < 1.0, f"MSE too high: {mse.item()}"
 
 
+@pytest.mark.parametrize("page_size", [8, 16, 32, 64])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_batch_prefill_paged_fp8_tma_partial_page(page_size, kv_layout):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
+    torch.manual_seed(20260925)
+    dtype = torch.float8_e4m3fn
+    qo_lens = [37, 19]
+    kv_lens = [2 * page_size + 3, 3 * page_size - 5]
+    num_qo_heads, num_kv_heads, head_dim = 6, 2, 256
+    page_counts = [(length + page_size - 1) // page_size for length in kv_lens]
+    used_pages = sum(page_counts)
+    total_pages = used_pages + 5
+
+    qo_indptr = torch.tensor(
+        [0, qo_lens[0], sum(qo_lens)], dtype=torch.int32, device="cuda"
+    )
+    kv_indptr = torch.tensor(
+        [0, page_counts[0], used_pages], dtype=torch.int32, device="cuda"
+    )
+    kv_indices = torch.randperm(total_pages, device="cuda", dtype=torch.int32)[
+        :used_pages
+    ]
+    kv_last_page_len = torch.tensor(
+        [(length - 1) % page_size + 1 for length in kv_lens],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    q = torch.randn(sum(qo_lens), num_qo_heads, head_dim, device="cuda").to(dtype)
+    if kv_layout == "NHD":
+        kv_shape = (total_pages, page_size, num_kv_heads, head_dim)
+    else:
+        kv_shape = (total_pages, num_kv_heads, page_size, head_dim)
+    k = (torch.randn(kv_shape, device="cuda") * 0.5).to(dtype)
+    v = (torch.randn(kv_shape, device="cuda") * 0.5).to(dtype)
+    v_with_nan_tail = v.clone()
+    for batch_idx, valid_rows in enumerate(kv_last_page_len.tolist()):
+        physical_page = int(kv_indices[int(kv_indptr[batch_idx + 1]) - 1])
+        if kv_layout == "NHD":
+            v_with_nan_tail[physical_page, valid_rows:, :, :] = float("nan")
+        else:
+            v_with_nan_tail[physical_page, :, valid_rows:, :] = float("nan")
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        _workspace_buffer(), kv_layout, backend="fa3"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        o_data_type=torch.bfloat16,
+    )
+    scales = {"q_scale": 1.0, "k_scale": 1.0, "v_scale": 1.0}
+    expected = wrapper.run(q, (k, v), **scales)
+    actual = wrapper.run(q, (k, v_with_nan_tail), **scales)
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # Test batch prefill with paged KV cache and GQA (grouped query attention)
 # GQA has num_qo_heads > num_kv_heads, this tests the head offset calculation more thoroughly
 @pytest.mark.parametrize("batch_size", [2])
