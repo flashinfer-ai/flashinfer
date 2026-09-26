@@ -56,8 +56,10 @@ Validation
 Run ``pytest tests/attention/test_vdn_window.py --full`` for independent FP32
 masked attention checks, tile boundaries, strided projections, anchor
 deduplication, plan reuse, stream/device handling and input validation.
-The full suite includes sampled FP32 references at 22,493 and 58,193 tokens
-and a copy-kernel regression beyond the signed int32 element-offset boundary.
+The full suite checks every output element against a chunked FP32 reference
+at 22,493 and 58,193 tokens, with TF32 disabled. It also covers CPU planner
+invariants, repeated calls, independent wrappers, and a copy-kernel regression
+beyond the signed int32 element-offset boundary.
 The latter requires 18 GiB of free device memory; multi-device checks require
 two visible CUDA devices.
 

@@ -22,7 +22,7 @@ import weakref
 import pytest
 import torch
 
-from flashinfer.vdn import VDNWindowAttentionWrapper
+from flashinfer.vdn import VDNWindowAttentionWrapper, _query_groups
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -120,11 +120,78 @@ def _sampled_oracle(
 def _assert_output(actual, expected):
     assert actual.dtype == torch.bfloat16
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.015)
+    assert bool(actual.isfinite().all())
+    torch.testing.assert_close(actual.float(), expected, rtol=0.01, atol=0.01)
     relative_error = (actual.float() - expected).norm() / expected.norm().clamp_min(
         1e-8
     )
     assert relative_error.item() < 0.006
+
+
+def _full_oracle(query, key, value, start, frames, spatial, bounds, anchors, scale):
+    """Check every row in bounded FP32 chunks, without the production planner."""
+    length, heads, _ = query.shape
+    end = start + frames * spatial
+    intervals = (
+        [(0, start)]
+        + [
+            (start + frame * spatial, start + (frame + 1) * spatial)
+            for frame in range(frames)
+        ]
+        + [(end, length)]
+    )
+    expected = torch.empty(query.shape, dtype=torch.float32, device=query.device)
+    for lo, hi in intervals:
+        if lo == hi:
+            continue
+        indices = _visible_indices(
+            length, start, frames, spatial, bounds, anchors, lo, query.device
+        )
+        for head in range(0, heads, 7):
+            k = (
+                key[:, head : head + 7]
+                .index_select(0, indices)
+                .float()
+                .permute(1, 2, 0)
+            )
+            v = (
+                value[:, head : head + 7]
+                .index_select(0, indices)
+                .float()
+                .transpose(0, 1)
+            )
+            for row in range(lo, hi, 128):
+                stop = min(row + 128, hi)
+                q = query[row:stop, head : head + 7].float().transpose(0, 1)
+                expected[row:stop, head : head + 7] = (
+                    (q @ k * scale).softmax(-1) @ v
+                ).transpose(0, 1)
+    return expected
+
+
+@pytest.mark.parametrize("anchors", ["none", "rows", "columns", "both"])
+@pytest.mark.parametrize("frames", [0, 1, 7, 13])
+@pytest.mark.parametrize("seed", [0, 71])
+def test_query_groups_partition_cpu(anchors, frames, seed):
+    rng = random.Random(seed)
+    start, spatial, suffix = 3, rng.randint(1, 5), 2
+    length = start + frames * spatial + suffix
+    bounds = [
+        tuple(sorted(rng.sample(range(-3, frames + 4), 2))) for _ in range(frames)
+    ]
+    groups = _query_groups(length, start, frames, spatial, bounds, anchors)
+    covered = []
+    for lo, hi, ranges in groups:
+        assert 0 <= lo < hi <= length
+        keys = [key for begin, end in ranges for key in range(begin, end)]
+        assert keys == sorted(set(keys))
+        for row in range(lo, hi):
+            expected = _visible_indices(
+                length, start, frames, spatial, bounds, anchors, row, "cpu"
+            ).tolist()
+            assert keys == expected
+            covered.append(row)
+    assert sorted(covered) == list(range(length))
 
 
 @pytest.mark.parametrize("anchors", ["none", "rows", "columns", "both"])
@@ -534,6 +601,95 @@ def test_nonconsecutive_equal_windows(workspace, anchors):
     )
 
 
+@pytest.mark.parametrize("layout", [128, 386, 514])
+def test_repeatability_and_independent_wrappers(workspace, layout):
+    torch.manual_seed(5539)
+    length, heads, start, frames, spatial = 257, 7, 9, 7, 34
+    query, key, value = _strided_inputs(length, heads, layout)
+    snapshots = [tensor.clone() for tensor in (query, key, value)]
+    first = VDNWindowAttentionWrapper(workspace)
+    second = VDNWindowAttentionWrapper(torch.empty_like(workspace))
+    bounds = [(frame, frame) for frame in range(frames)]
+    first.plan(length, heads, start, frames, spatial, bounds, anchor_frames="none")
+    second.plan(length, heads, start, frames, spatial, bounds, anchor_frames="both")
+    expected_first = first.run(query, key, value).clone()
+    expected_second = second.run(query, key, value).clone()
+    for wrapper, expected, anchors in (
+        (first, expected_first, "none"),
+        (second, expected_second, "both"),
+    ):
+        _assert_output(
+            expected,
+            _oracle(
+                query, key, value, start, frames, spatial, bounds, anchors, 128**-0.5
+            ),
+        )
+        out = torch.full_like(expected, float("nan"))
+        assert wrapper.run(query, key, value, out=out) is out
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    first.plan(length, heads, start, frames, spatial, bounds, anchor_frames="both")
+    torch.testing.assert_close(
+        first.run(query, key, value), expected_second, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        second.run(query, key, value), expected_second, rtol=0, atol=0
+    )
+    for tensor, original in zip((query, key, value), snapshots, strict=True):
+        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "length,heads", [(1, 1), (63, 7), (64, 56), (65, 7), (4097, 7)]
+)
+def test_dense_boundary_and_prescaled_query(workspace, length, heads):
+    torch.manual_seed(length + heads)
+    query, key, value = _strided_inputs(length, heads, 514)
+    query.mul_(torch.tensor(128**-0.5, dtype=torch.bfloat16, device=query.device))
+    wrapper = VDNWindowAttentionWrapper(workspace)
+    wrapper.plan(length, heads, 0, 1, length, [(0, 0)], sm_scale=1.0)
+    expected = _full_oracle(query, key, value, 0, 1, length, [(0, 0)], "both", 1.0)
+    _assert_output(wrapper.run(query, key, value), expected)
+
+
+@pytest.mark.parametrize("anchors", ["none", "rows", "columns", "both"])
+@pytest.mark.parametrize(
+    "seed,qk_amplitude,scale", [(29, 0.25, 1e-7), (131, 3.0, 0.125)]
+)
+def test_held_out_fp32_reference(workspace, anchors, seed, qk_amplitude, scale):
+    torch.manual_seed(seed)
+    length, heads, start, frames, spatial = 353, 3, 11, 19, 17
+    rng = random.Random(seed)
+    bounds = [
+        tuple(sorted(rng.sample(range(-3, frames + 4), 2))) for _ in range(frames)
+    ]
+    query, key, value = _strided_inputs(length, heads, 386)
+    query.mul_(qk_amplitude)
+    key.mul_(qk_amplitude)
+    expected = _full_oracle(
+        query, key, value, start, frames, spatial, bounds, anchors, scale
+    )
+    # Cross-check the chunked oracle against the token-pair mask before using it
+    # for full long-sequence outputs that cannot materialize an S-by-S mask.
+    torch.testing.assert_close(
+        expected,
+        _oracle(query, key, value, start, frames, spatial, bounds, anchors, scale),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    wrapper = VDNWindowAttentionWrapper(workspace)
+    wrapper.plan(
+        length,
+        heads,
+        start,
+        frames,
+        spatial,
+        bounds,
+        anchor_frames=anchors,
+        sm_scale=scale,
+    )
+    _assert_output(wrapper.run(query, key, value), expected)
+
+
 @pytest.mark.parametrize("anchors", ["none", "rows", "columns", "both"])
 @pytest.mark.parametrize("kind", ["uniform", "constant_value", "peaked"])
 def test_analytic_inputs(workspace, anchors, kind):
@@ -623,9 +779,9 @@ def test_masked_value_sentinel(workspace, anchors):
 
 @pytest.mark.parametrize("frames,heads", [(37, 56), (107, 7)])
 @pytest.mark.parametrize("layout", [386, 514])
-def test_long_sequence_sampled_fp32(workspace, request, frames, heads, layout):
+def test_long_sequence_full_fp32(workspace, request, frames, heads, layout):
     if not request.config.getoption("--full"):
-        pytest.skip("long-sequence sampled FP32 oracle requires --full")
+        pytest.skip("long-sequence full FP32 oracle requires --full")
     torch.manual_seed(frames + layout)
     start, spatial = 3623, 510
     length = start + frames * spatial
@@ -635,32 +791,16 @@ def test_long_sequence_sampled_fp32(workspace, request, frames, heads, layout):
     query, key, value = _strided_inputs(length, heads, layout)
     wrapper = VDNWindowAttentionWrapper(workspace)
     wrapper.plan(length, heads, start, frames, spatial, bounds)
-    rows = sorted(
-        {
-            0,
-            start - 1,
-            start,
-            start + spatial - 1,
-            start + spatial,
-            start + 2 * spatial - 1,
-            start + (frames // 2) * spatial,
-            start + (frames // 2 + 1) * spatial - 1,
-            start + (frames - 2) * spatial,
-            start + (frames - 1) * spatial - 1,
-            start + (frames - 1) * spatial,
-            length - 1,
-        }
-    )
     actual = wrapper.run(query, key, value)
-    assert bool(torch.isfinite(actual).all())
-    expected = _sampled_oracle(
-        query, key, value, start, frames, spatial, bounds, "both", 128**-0.5, rows
+    expected = _full_oracle(
+        query, key, value, start, frames, spatial, bounds, "both", 128**-0.5
     )
-    _assert_output(actual[rows], expected)
-    difference = actual[rows].float() - expected
+    _assert_output(actual, expected)
+    difference = actual.float() - expected
     request.node.user_properties.extend(
         [
-            ("sampled_query_rows", rows),
+            ("checked_query_rows", length),
+            ("checked_output_elements", actual.numel()),
             ("relative_l2_error", (difference.norm() / expected.norm()).item()),
             ("max_abs_error", difference.abs().max().item()),
         ]
