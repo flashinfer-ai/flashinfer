@@ -50,9 +50,6 @@ struct CakeParamArray {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define SMEM_FLAG_OFF 50176
-#define SMEM_FLAG_STAGE_BYTES 16
-#define SMEM_FLAG_STRIDE 16
 #define SMEM_Q_SMEM_OFF 1024
 #define SMEM_Q_SMEM_STAGE_BYTES 16384
 #define SMEM_Q_SMEM_STRIDE 16384
@@ -62,7 +59,7 @@ struct CakeParamArray {
 #define SMEM_VT_SMEM_OFF 33792
 #define SMEM_VT_SMEM_STAGE_BYTES 16384
 #define SMEM_VT_SMEM_STRIDE 16384
-#define SMEM_TOTAL 50304
+#define SMEM_TOTAL 50176
 #define THREADS 128
 
 #include <math_constants.h>
@@ -368,7 +365,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 4) void
-kernel_cake_vsa_sm90_2037990bf4e488ecfa17(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
+kernel_cake_vsa_sm90_048f30d97142487fb33c(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -389,8 +386,6 @@ kernel_cake_vsa_sm90_2037990bf4e488ecfa17(const __grid_constant__ CUtensorMap Q,
     const int cta_rank = 0;
 
     // Kernel setup ops
-    int* flag = reinterpret_cast<int*>(smem_raw + 50176);
-    const int flag_addr = smem + 50176;
     __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_smem_addr = smem + 1024;
     __nv_bfloat16* k_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
