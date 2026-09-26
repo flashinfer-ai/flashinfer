@@ -803,12 +803,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         if self.zero_fill:
             # Zero-fill staging: the bulk copies stream a zeroed prefix of the
-            # C staging smem (whole 2 KB multiples, at most 32 KB per copy).
+            # C staging smem (largest power of two that fits, at most 32 KB
+            # per copy).
             sc_bytes = (
                 cute.cosize(self.c_smem_layout_staged.outer) * self.c_dtype.width // 8
             )
-            zb = min(sc_bytes, 32768)
-            zb -= zb % 2048
+            zb = 1 << (min(sc_bytes, 32768).bit_length() - 1)
             if zb < 2048 or self.zero_fill_chunk_bytes % zb != 0:
                 raise ValueError(
                     f"zero_fill: C staging smem of {sc_bytes} B cannot tile a "
