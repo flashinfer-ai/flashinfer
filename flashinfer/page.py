@@ -419,8 +419,8 @@ def append_paged_mla_kv_cache(
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
 ) -> None:
-    r"""Append a batch of key-value pairs to a paged key-value cache,
-    Note: current only support ckv=512 and kpe=64
+    r"""Append a batch of key-value pairs to a paged key-value cache.
+    Note: currently supports only ckv=512 and kpe=64.
 
     Parameters
     ----------

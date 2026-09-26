@@ -60,7 +60,7 @@ def get_batch_pod_module(*args):
 
 class PODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
-    `<https://arxiv.org/abs/2410.18038>`_) for batch of requests.
+    `<https://arxiv.org/abs/2410.18038>`_) for a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -119,7 +119,7 @@ class PODWithPagedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's POD-Attention creates some
-    auxiliary data structures, these data structures can be reused across multiple
+    auxiliary data structures that can be reused across multiple
     batch decode attention calls (e.g. different Transformer layers). This wrapper class
     manages the lifecycle of these data structures.
     """
@@ -140,7 +140,7 @@ class PODWithPagedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
@@ -285,14 +285,14 @@ class PODWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         non_blocking: bool = True,
     ) -> None:
-        r"""Plan POD's batch decode for given problem specification.
+        r"""Plan POD's batch decode for a given problem specification.
 
         Parameters
         ----------
         indptr : torch.Tensor
             The indptr of the paged kv cache, shape: ``[batch_size + 1]``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[indptr[-1]]``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``
@@ -314,7 +314,7 @@ class PODWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the key/value tensor. If None, will be set to
+            The data type of the key/value tensor. If None, it will be set to
             ``q_data_type``. Defaults to ``None``.
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
@@ -727,7 +727,7 @@ class PODWithPagedKVCacheWrapper:
 
 class BatchPODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
-    `<https://arxiv.org/abs/2410.18038>`_) for batch of requests.
+    `<https://arxiv.org/abs/2410.18038>`_) for a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -825,7 +825,7 @@ class BatchPODWithPagedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's POD-Attention creates some
-    auxiliary data structures, these data structures can be reused across multiple
+    auxiliary data structures that can be reused across multiple
     batch decode attention calls (e.g. different Transformer layers). This wrapper class
     manages the lifecycle of these data structures.
     """
@@ -841,7 +841,7 @@ class BatchPODWithPagedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
@@ -932,7 +932,7 @@ class BatchPODWithPagedKVCacheWrapper:
         kv_indptr_p : torch.Tensor
             The prefill indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         kv_indices_p : torch.Tensor
-            The prefill page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
+            The prefill page indices of the paged kv-cache, shape: ``[kv_indptr_p[-1]]``.
         last_page_len_p : torch.Tensor
             The number of entries in the last page of each prefill request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -941,7 +941,7 @@ class BatchPODWithPagedKVCacheWrapper:
         kv_indptr_d : torch.Tensor
             The decode indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         kv_indices_d : torch.Tensor
-            The decode page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
+            The decode page indices of the paged kv-cache, shape: ``[kv_indptr_d[-1]]``.
         last_page_len_d : torch.Tensor
             The number of entries in the last page of each decode request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -963,7 +963,7 @@ class BatchPODWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the key/value tensor. If None, will be set to
+            The data type of the key/value tensor. If None, it will be set to
             ``q_data_type``. Defaults to ``None``.
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
@@ -1148,9 +1148,9 @@ class BatchPODWithPagedKVCacheWrapper:
         Fused single-shot attention that runs batched paged prefill (``q_p`` against
         ``paged_kv_cache_p``) and batched paged decode (``q_d`` against
         ``paged_kv_cache_d``) in the same kernel launch, sharing scheduling and
-        execution resources.  All prefill / decode shape and policy parameters
-        (pos-encoding, sliding window, sm_scale, RoPE, etc.) are taken from the
-        cached values supplied to :meth:`plan`.
+        execution resources. The prefill/decode shape and most policy parameters
+        are taken from the cached values supplied to :meth:`plan`; ``causal_p``
+        and the decode scale parameters are supplied to this method.
 
         Parameters
         ----------

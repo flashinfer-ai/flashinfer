@@ -416,8 +416,8 @@ def block_sparse_attention(
         Required in BSR mode.
     q_block_size : int
         Positive number of logical query tokens represented by one BSR row.
-        The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
-        tile does not cross row boundaries.
+        The product of ``q_block_size`` and ``Hq / Hkv`` must be divisible by
+        8 so a physical Q tile does not cross row boundaries.
     kv_block_size : int
         Number of logical KV tokens represented by one BSR block ID; it must
         be 8, 16, 32, or a positive multiple of 64.
@@ -806,8 +806,8 @@ def block_sparse_attention_with_paged_kv_cache(
         Contiguous Int32 logical KV-block IDs referenced by ``block_indptr``.
     q_block_size : int
         Positive number of logical query tokens represented by one BSR row.
-        The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
-        tile does not cross row boundaries.
+        The product of ``q_block_size`` and ``Hq / Hkv`` must be divisible by
+        8 so a physical Q tile does not cross row boundaries.
     kv_block_size : int
         Number of logical KV tokens represented by one BSR block ID; it must
         be 8, 16, 32, or a positive multiple of 64.

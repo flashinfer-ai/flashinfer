@@ -991,7 +991,7 @@ def nvfp4_quantize_smooth(
     enable_pdl: Optional[bool] = None,
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Smooth + NVFP4 quantize: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
+    r"""Smooth + NVFP4 quantization: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
 
     The SM100/SM103 CUTLASS backend applies the SVDQuant per-input-channel smoothing scale
     and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL backend also

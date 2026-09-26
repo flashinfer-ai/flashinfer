@@ -16,7 +16,7 @@ precise benchmark suite that reflects your actual model and serving scenario.
 Quick Start
 -----------
 
-Set two environment variables **before** importing FlashInfer:
+Set two environment variables **before** making FlashInfer API calls:
 
 .. code-block:: bash
 

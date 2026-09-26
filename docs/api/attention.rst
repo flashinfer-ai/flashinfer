@@ -116,7 +116,7 @@ XQA
 flashinfer.prefill
 ==================
 
-Attention kernels for prefill & append attention in both single request and batch serving setting.
+Attention kernels for prefill and append attention in both single-request and batch-serving settings.
 
 .. currentmodule:: flashinfer.prefill
 

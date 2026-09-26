@@ -127,8 +127,8 @@ def split_device_green_ctx(
     dev: torch.device, num_groups: int, min_count: int
 ) -> Tuple[List[torch.Stream], List[CUdevResource]]:
     r"""
-    Split the device into multiple `green contexts <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html>`_,
-    return the corresponding streams and `CUdevResource` for each group and the remaining SMs.
+    Split the device into multiple `green contexts <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html>`_
+    and return the corresponding streams and `CUdevResource` for each group and the remaining SMs.
     Green contexts allow concurrent execution of multiple kernels on different SM partitions.
 
     Args:
@@ -198,7 +198,7 @@ def split_device_green_ctx_by_sm_count(
 ) -> Tuple[List[torch.Stream], List[CUdevResource]]:
     r"""
     Split the device into multiple green contexts, each with a fixed number of SMs,
-    return the corresponding streams and `CUdevResource` for each group and the remaining SMs.
+    and return the corresponding streams and `CUdevResource` for each group and the remaining SMs.
     Green contexts allow concurrent execution of multiple kernels on different SM partitions.
 
     Args:

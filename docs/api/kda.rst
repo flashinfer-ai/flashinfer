@@ -65,7 +65,7 @@ behavior or performance is changed by this optimization.
 
 Pass ``backend="cake"`` to select the exported Cake backend. On SM100-family
 SM100a (B200/GB200) and SM103a (B300/GB300) devices, its D128 ``T=1..6``
-family with in-kernel QK normalization exports 25 frozen CUDA bodies:
+family with in-kernel QK normalization exports 27 frozen CUDA bodies:
 
 * ``T=3`` with raw gates, ``use_gate_in_kernel=True``, a negative
   ``lower_bound``, float32 ``A_log`` and ``dt_bias``, ``H=HV=16``, and
@@ -77,7 +77,7 @@ family with in-kernel QK normalization exports 25 frozen CUDA bodies:
   splits 16 and 8. ``T=1`` keeps the standard decode API and is normalized
   to the packed frozen ABI with zero-copy views and cached identity metadata;
   explicit ``T=1`` ``cu_seqlens`` metadata is outside the Cake contract.
-* two Kimi-Linear ``T=1`` equal-head direct-state schedules for
+* four Kimi-Linear ``T=1`` equal-head direct-state schedules for
   ``lower_bound=None``. They accept any positive runtime head count, including
   production per-rank ``H=HV=32/16/8/4`` for TP1/2/4/8, and evaluate
   ``-exp(A_log) * softplus(g + dt_bias)`` and beta sigmoid in-kernel. Q, K,
@@ -102,7 +102,7 @@ split-1 island at ``3S/4<W<=S``. T6 selects split 8 through ``W<=3S/8``, split
 2 through ``W<=S/2``, and split 1 above it. T3 uses its sole exact lower-bound
 split-4 specialization on both architectures.
 
-With CUDA 12.9 or newer, JIT and AOT compile all 25 checked-in bodies once for
+With CUDA 12.9 or newer, JIT and AOT compile all 27 checked-in bodies once for
 the ``sm_100f`` family target. The family module URI and cubin artifact can run
 on both CC 10.0 and CC 10.3; build workspaces may still materialize separate
 cache directories for their local architecture context. Runtime split
@@ -113,7 +113,7 @@ cubins measured no aggregate change on B200 (``1.0000x`` exact/family) and
 cubins while every other GB300 route uses ``sm_100f``.
 
 CUDA 12.8 cannot compile ``sm_100f``. On B200 it therefore retains exact
-``sm_100a`` modules for all 25 bodies. SM103a requires CUDA 12.9 or newer.
+``sm_100a`` modules for all 27 bodies. SM103a requires CUDA 12.9 or newer.
 Every binding validates its family or exact-device contract before launch, and
 the frozen generated body bytes are identical across all physical targets.
 
@@ -207,8 +207,8 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
     specific to the CuTe DSL backend, and fixes the sequence count and packed
     token extent after the first warmup run. Its planning implementation lives
     in ``flashinfer.experimental.kda_prefill_wrapper``; it contains no kernels
-    of its own, and the kernels it dispatches to are the stable AOT-registered
-    ones, alongside a package README. ``examples/experimental/kda_prefill_wrapper.py``
+    of its own and dispatches to stable AOT-registered kernels. The package
+    also includes a README. ``examples/experimental/kda_prefill_wrapper.py``
     is a runnable plan-and-run example. See
     `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for the
     graduation plan.
@@ -286,7 +286,7 @@ allowlist.
 The dense beta-TMA BT16 one-wave route uses the S9 chain schedule when both
 value-split CTAs for every task fit in one device wave.
 
-At maximum sequence length 16 or below, generic head counts use a one-stage
+At a maximum sequence length of 16 or fewer, generic head counts use a one-stage
 N16 retrace with one four-warp prepare owner. It preserves the variable-shape
 N16 arithmetic while reducing the CTA from 32 to 16 warps. H12 keeps its
 dedicated scalar-beta N16 schedule.
@@ -408,8 +408,8 @@ diagonal factors, and independent prepare/chain descriptor storage. The
 workspace binds to the device and CUDA stream of its first ``recurrent_kda``
 call.
 Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
-beta, and output tensors, then synchronize that stream before capture. Packed
-graphs must also pass preallocated int64 ``cu_seqlens`` and int32
+beta, and output tensors, then synchronize that stream before capture. For the SM100-family Cake path,
+packed graphs must also pass preallocated int64 ``cu_seqlens`` and int32
 ``seq_order``. The warm call prepares descriptors; capture accepts only the
 exact warmed pointer, shape, stride, and dtype signature and performs no
 descriptor preparation. Warm the largest intended small-BH shape before
@@ -463,8 +463,8 @@ refused rather than silently executed by another backend.
 * Q, K, V and G are contiguous BF16 ``[B,T,H,128]`` tensors sharing one head
   count, and beta is contiguous BF16 ``[B,T,H]``. GQA and ``V != K`` are not
   supported;
-* the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which is
-  16383 tokens at H=1024 and no constraint at ordinary head counts. Larger is
+* the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which permits up to
+  16,383 tokens at H=1024 and imposes no practical constraint at ordinary head counts. Larger is
   refused with the backend's own error, because the two things that stop there
   — a device index built in INT32, and the DSL packing a memref extent as one —
   otherwise fail as a silent negative offset and as a compile-time overflow

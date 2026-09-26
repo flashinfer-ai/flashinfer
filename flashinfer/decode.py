@@ -784,7 +784,7 @@ def single_decode_with_kv_cache(
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode attention with KV Cache for single request, return attention output.
+    r"""Decode attention with a KV cache for a single request and return the attention output.
 
     Parameters
     ----------
@@ -964,8 +964,8 @@ def single_decode_with_kv_cache(
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
-    r"""Wrapper class for decode attention with paged kv-cache (first proposed in
-    `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
+    r"""Wrapper class for decode attention with a paged KV cache (first proposed in
+    `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
 
     Check :ref:`our tutorial<kv-layout>` for page table layout.
 
@@ -1047,7 +1047,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-            The user reserved float workspace buffer used to store intermediate attention results
+            The user-reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors. The buffer must be
             16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
@@ -2973,8 +2973,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
 
 class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWrapper):
-    r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first
-    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
+    r"""CUDAGraph-compatible wrapper class for decode attention with a paged KV cache (first
+    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
 
     Note that this wrapper may not be as efficient as :class:`BatchDecodeWithPagedKVCacheWrapper`
     because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
@@ -3382,7 +3382,7 @@ def trtllm_batch_decode_with_kv_cache(
 
         **Contiguity requirements (trtllm-gen backend):**
 
-        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
+        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint.
         - The head and batch/page dims can have arbitrary strides.
 
     workspace_buffer : torch.Tensor
@@ -3409,8 +3409,8 @@ def trtllm_batch_decode_with_kv_cache(
         max sequence length for kv_cache
 
     bmm1_scale : Union[float, torch.Tensor]
-        fused scale for bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        Fused scale for bmm1 input.
+        When using the trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
 
     bmm1_scale_log2 : Optional[torch.Tensor] = None
         Optional precomputed log2-form bmm1 scale for ``trtllm-gen``. When provided,
@@ -4271,7 +4271,7 @@ def xqa_batch_decode_with_kv_cache(
         draft-block attention mask for xqa speculative decoding.
 
     kv_cache_sf : Optional[torch.Tensor] = None
-        KV cache scaling factors. Must provide when NVFP4 KV cache is used.
+        KV cache scaling factors. Must be provided when an NVFP4 KV cache is used.
 
     q_cu_seq_lens : Optional[torch.Tensor] = None
         cumulative draft lengths [batch_size + 1] (int32, on device) enabling
