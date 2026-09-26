@@ -44,7 +44,7 @@ import json
 import os
 import pathlib
 import tempfile
-from typing import Any, Dict, Optional, Set, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Set, Tuple, Union
 
 from .jit.core import logger
 
@@ -252,6 +252,21 @@ def _atomic_write_json(path: pathlib.Path, obj: Any) -> None:
         raise
 
 
+class ManagedCacheEntry(NamedTuple):
+    runner: str
+    tactic: Any
+    profiling_policy: Optional[tuple] = None
+
+    @classmethod
+    def from_json(cls, entry):
+        policy = entry.get("profiling_policy")
+        return cls(
+            entry["runner"],
+            entry["tactic"],
+            tuple(policy) if isinstance(policy, list) else None,
+        )
+
+
 class ManagedAutotuneCache:
     """Per-entry, environment-hashed persistence for autotune winners.
 
@@ -278,7 +293,7 @@ class ManagedAutotuneCache:
         # Positive/negative lookup memos: at most one filesystem probe per
         # key per process.  A concurrent process's publish becomes visible
         # on the next attach.
-        self._hits: Dict[str, Tuple[str, Any]] = {}
+        self._hits: Dict[str, ManagedCacheEntry] = {}
         self._missing: Set[str] = set()
 
     def _entry_path(self, file_key: str) -> pathlib.Path:
@@ -292,8 +307,8 @@ class ManagedAutotuneCache:
         if not manifest_path.exists():
             _atomic_write_json(manifest_path, self.manifest)
 
-    def lookup(self, file_key: str) -> Optional[Tuple[str, Any]]:
-        """Return ``(runner_class_name, json_tactic)`` for *file_key*, or None.
+    def lookup(self, file_key: str) -> Optional[ManagedCacheEntry]:
+        """Return the winner and optional profiling provenance, or None.
 
         Any failure (missing file, malformed JSON, embedded-key mismatch)
         is a cache miss.
@@ -311,7 +326,7 @@ class ManagedAutotuneCache:
             # entry must embed the exact canonical key it was stored under.
             if entry["key"] != file_key:
                 raise ValueError(f"embedded key mismatch (found {entry['key']!r})")
-            hit = (entry["runner"], entry["tactic"])
+            hit = ManagedCacheEntry.from_json(entry)
             self._hits[file_key] = hit
             return hit
         except FileNotFoundError:
@@ -331,12 +346,15 @@ class ManagedAutotuneCache:
         runner_name: str,
         json_tactic: Any,
         key_fields: Any = None,
+        profiling_policy: Optional[tuple] = None,
     ) -> None:
         """Atomically persist the tuned winner for *file_key* (best-effort).
 
         *key_fields* is the structural form of the same key; when supplied and
         encodable it is stored alongside, enabling preload().  Optional so that
         callers that predate preloading keep working unchanged.
+        *profiling_policy* records effective per-entry measurement provenance;
+        absent provenance permits replay but not reuse during tuning.
         """
         try:
             self._ensure_dirs()
@@ -345,6 +363,8 @@ class ManagedAutotuneCache:
                 "runner": runner_name,
                 "tactic": json_tactic,
             }
+            if profiling_policy is not None:
+                entry["profiling_policy"] = list(profiling_policy)
             # Structural, round-trippable form of the same key so the store can
             # be preloaded into memory (see preload()).  Additive: readers that
             # predate this field ignore it, and an entry without it is simply
@@ -354,7 +374,9 @@ class ManagedAutotuneCache:
                 if encoded is not None:
                     entry["key_fields"] = encoded
             _atomic_write_json(self._entry_path(file_key), entry)
-            self._hits[file_key] = (runner_name, json_tactic)
+            self._hits[file_key] = ManagedCacheEntry(
+                runner_name, json_tactic, profiling_policy
+            )
             self._missing.discard(file_key)
         except Exception as e:
             logger.warning(
@@ -366,8 +388,8 @@ class ManagedAutotuneCache:
     def preload(self) -> Tuple[list, int, int]:
         """Read every entry once, returning what can be served from memory.
 
-        Returns ``(triples, n_total, n_skipped)`` where each triple is
-        ``(key_fields_tuple, runner_name, json_tactic)``.  Entries written
+        Returns ``(entries, n_total, n_skipped)`` where each item is
+        ``(key_fields_tuple, ManagedCacheEntry)``.  Entries written
         before the ``key_fields`` field existed, or whose extras have no
         round-trippable encoding, are counted in *n_skipped* and left to the
         normal lazy path -- preloading is an optimisation, never a
@@ -377,12 +399,12 @@ class ManagedAutotuneCache:
         fewer preloaded entries, never an exception: the cache must not be able
         to break correctness.
         """
-        triples: list = []
+        entries: list = []
         total = skipped = 0
         try:
             paths = sorted(self.entries_dir.glob("*.json"))
         except Exception:
-            return triples, 0, 0
+            return entries, 0, 0
         for path in paths:
             total += 1
             try:
@@ -410,13 +432,14 @@ class ManagedAutotuneCache:
                 if path.stem != expect:
                     skipped += 1
                     continue
-                triples.append((fields, entry["runner"], entry["tactic"]))
+                hit = ManagedCacheEntry.from_json(entry)
+                entries.append((fields, hit))
                 # Warm the string-keyed memo too, so a lookup that does build a
                 # file_key (cold-miss path, load_from_file) also avoids the read.
-                self._hits[entry["key"]] = (entry["runner"], entry["tactic"])
+                self._hits[entry["key"]] = hit
             except Exception:
                 skipped += 1
-        return triples, total, skipped
+        return entries, total, skipped
 
     def clear_memo(self) -> None:
         """Forget memoized lookups (e.g. after AutoTuner.clear_cache)."""
@@ -494,16 +517,16 @@ def _hydrate_from_store(tuner, store) -> None:
     try:
         from .autotuner.autotuner import _json_to_tactic
 
-        triples, total, skipped = store.preload()
-        for key_fields, runner_name, json_tactic in triples:
+        entries, total, skipped = store.preload()
+        for key_fields, entry in entries:
             memo_key = (*marker, key_fields)
             tuner._managed_decoded.setdefault(
-                memo_key, (runner_name, _json_to_tactic(json_tactic))
+                memo_key, entry._replace(tactic=_json_to_tactic(entry.tactic))
             )
         tuner._preloaded_stores.add(marker)
         if total:
             logger.info(
-                f"[Autotuner]: Preloaded {len(triples)}/{total} managed cache "
+                f"[Autotuner]: Preloaded {len(entries)}/{total} managed cache "
                 f"entries into memory"
                 + (f" ({skipped} not preloadable, served lazily)" if skipped else "")
             )
@@ -536,6 +559,7 @@ def autotune_v2_reload() -> None:
     with tuner._lock:
         tuner.profiling_cache.clear()
         tuner._winner_partitions.clear()
+        tuner._profiling_cache_policies.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.
