@@ -1,0 +1,261 @@
+{
+  "validation": "single-GPU smoke only; not multi-GPU performance acceptance",
+  "native": [
+    {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "torch": "2.15.0.dev20260915+cu134",
+      "world_size": 1,
+      "config": {
+        "attention": "sm120-bf16",
+        "sequence": 256,
+        "used": 193,
+        "heads": 4,
+        "schedule": "1,3",
+        "fp8_scale": 0.03125,
+        "warmup": 2,
+        "iterations": 8
+      },
+      "wire_dtype": "bfloat16",
+      "scope": "QKV -> input A2A -> native quantization/layout/attention -> output A2A -> local O",
+      "correctness_passed": true,
+      "median_ms": {
+        "ordinary": 0.3774559944868088,
+        "whole_fused": 0.485727995634079,
+        "chunk_serial": 1.0090879797935486,
+        "chunk_overlap": 1.0185120105743408
+      },
+      "speedup_vs_ordinary": {
+        "ordinary": 1,
+        "whole_fused": 0.7770933482927419,
+        "chunk_serial": 0.37405657588353525,
+        "chunk_overlap": 0.3705955261872274
+      },
+      "samples_ms": {
+        "ordinary": [
+          0.4047679901123047,
+          0.38383999466896057,
+          0.3691200017929077,
+          0.38447999954223633,
+          0.43187201023101807,
+          0.3578239977359772,
+          0.371071994304657,
+          0.3682880103588104
+        ],
+        "whole_fused": [
+          0.5040000081062317,
+          0.4986560046672821,
+          0.5834239721298218,
+          0.47993600368499756,
+          0.470335990190506,
+          0.44550400972366333,
+          0.47619199752807617,
+          0.4915199875831604
+        ],
+        "chunk_serial": [
+          1.0385279655456543,
+          1.0254080295562744,
+          1.040992021560669,
+          0.9530559778213501,
+          0.9602559804916382,
+          0.9475839734077454,
+          1.0052800178527832,
+          1.012895941734314
+        ],
+        "chunk_overlap": [
+          1.0820159912109375,
+          1.0702719688415527,
+          1.021407961845398,
+          1.0558079481124878,
+          0.9348480105400085,
+          0.9433599710464478,
+          0.984607994556427,
+          1.0156160593032837
+        ]
+      },
+      "distributed_transport_exercised": false,
+      "max_rank_relative_rmse_vs_bf16": 0.0018354232888668776
+    },
+    {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "torch": "2.15.0.dev20260915+cu134",
+      "world_size": 1,
+      "config": {
+        "attention": "sm120-fp8",
+        "sequence": 256,
+        "used": 193,
+        "heads": 4,
+        "schedule": "1,3",
+        "fp8_scale": 0.03125,
+        "warmup": 2,
+        "iterations": 8
+      },
+      "wire_dtype": "bfloat16",
+      "scope": "QKV -> input A2A -> native quantization/layout/attention -> output A2A -> local O",
+      "correctness_passed": true,
+      "median_ms": {
+        "ordinary": 0.2659200131893158,
+        "whole_fused": 0.3527360111474991,
+        "chunk_serial": 0.7813119888305664,
+        "chunk_overlap": 0.774944007396698
+      },
+      "speedup_vs_ordinary": {
+        "ordinary": 1,
+        "whole_fused": 0.7538782681253359,
+        "chunk_serial": 0.34035061152374385,
+        "chunk_overlap": 0.3431473895548042
+      },
+      "samples_ms": {
+        "ordinary": [
+          0.2693119943141937,
+          0.26678401231765747,
+          0.26371198892593384,
+          0.2617279887199402,
+          0.2619520127773285,
+          0.35340800881385803,
+          0.2650560140609741,
+          0.2693440020084381
+        ],
+        "whole_fused": [
+          0.37462401390075684,
+          0.3696640133857727,
+          0.3633280098438263,
+          0.35392001271247864,
+          0.35155200958251953,
+          0.3468799889087677,
+          0.3501119911670685,
+          0.34995201230049133
+        ],
+        "chunk_serial": [
+          0.7911999821662903,
+          0.7953600287437439,
+          0.779263973236084,
+          0.7708160281181335,
+          0.7771199941635132,
+          0.7734400033950806,
+          0.8288000226020813,
+          0.7833600044250488
+        ],
+        "chunk_overlap": [
+          0.7673280239105225,
+          0.788096010684967,
+          0.7868160009384155,
+          0.7710400223731995,
+          0.7657920122146606,
+          0.764959990978241,
+          0.7788479924201965,
+          0.781823992729187
+        ]
+      },
+      "distributed_transport_exercised": false,
+      "max_rank_relative_rmse_vs_bf16": 0.05109631270170212
+    },
+    {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "torch": "2.15.0.dev20260915+cu134",
+      "world_size": 1,
+      "config": {
+        "attention": "sm120-sage",
+        "sequence": 256,
+        "used": 193,
+        "heads": 4,
+        "schedule": "1,3",
+        "fp8_scale": 0.03125,
+        "warmup": 2,
+        "iterations": 8
+      },
+      "wire_dtype": "bfloat16",
+      "scope": "QKV -> input A2A -> native quantization/layout/attention -> output A2A -> local O",
+      "correctness_passed": true,
+      "median_ms": {
+        "ordinary": 0.623744010925293,
+        "whole_fused": 0.6854559779167175,
+        "chunk_serial": 1.4046399593353271,
+        "chunk_overlap": 1.4752479791641235
+      },
+      "speedup_vs_ordinary": {
+        "ordinary": 1,
+        "whole_fused": 0.9099694670706884,
+        "chunk_serial": 0.44405970852519916,
+        "chunk_overlap": 0.42280621274174307
+      },
+      "samples_ms": {
+        "ordinary": [
+          0.5926079750061035,
+          0.63919997215271,
+          0.6277440190315247,
+          0.6377279758453369,
+          0.6197440028190613,
+          0.5759999752044678,
+          0.6167680025100708,
+          0.6300479769706726
+        ],
+        "whole_fused": [
+          0.6744319796562195,
+          0.6700479984283447,
+          0.7060480117797852,
+          0.6950079798698425,
+          0.6759039759635925,
+          0.6445760130882263,
+          0.7201279997825623,
+          0.7173439860343933
+        ],
+        "chunk_serial": [
+          1.3732479810714722,
+          1.474560022354126,
+          1.4642560482025146,
+          1.3732160329818726,
+          1.404863953590393,
+          1.3481600284576416,
+          1.4044159650802612,
+          1.4475200176239014
+        ],
+        "chunk_overlap": [
+          1.3512959480285645,
+          1.5039039850234985,
+          1.485983967781067,
+          1.541632056236267,
+          1.3789759874343872,
+          1.3696000576019287,
+          1.4645119905471802,
+          1.5570240020751953
+        ]
+      },
+      "distributed_transport_exercised": false,
+      "max_rank_relative_rmse_vs_bf16": 0.03646126389503479
+    }
+  ],
+  "producer": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "world": 1,
+    "shape": {
+      "seq": 128,
+      "heads": 4,
+      "dim": 128,
+      "hidden": 64,
+      "schedule": "1,3",
+      "iterations": 5,
+      "attention": "sm120-sage"
+    },
+    "scope": "projection + selected attention pipeline, no norm/RoPE/output projection",
+    "median_ms": {
+      "whole_projection": 1.5870720148086548,
+      "coarse_projection": 1.6312320232391357
+    },
+    "samples_ms": {
+      "whole_projection": [
+        1.626688003540039,
+        1.611840009689331,
+        1.5870720148086548,
+        1.4729599952697754,
+        1.4775999784469604
+      ],
+      "coarse_projection": [
+        1.7984639406204224,
+        1.7756479978561401,
+        1.6312320232391357,
+        1.6216959953308105,
+        1.6306560039520264
+      ]
+    }
+  }
+}
