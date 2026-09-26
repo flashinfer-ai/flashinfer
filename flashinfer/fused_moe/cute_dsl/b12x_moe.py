@@ -37,13 +37,16 @@ Example (Wrapper API with CUDA Graph):
     >>> output = moe.run(x=hidden_states_bf16, ...)
 """
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
 from ...api_logging import flashinfer_api
 from ...trace.templates.moe import b12x_fused_moe_trace, b12x_moe_wrapper_run_trace
 from ...utils import supported_compute_capability
+
+if TYPE_CHECKING:
+    from .blackwell_sm12x.moe_w4a16_prepare import W4A16PackedWeights
 
 
 def _is_cuda_graph_capturing() -> bool:
@@ -558,6 +561,289 @@ class B12xMoEWrapper:
                 device=self.device,
             )
 
+    def _check_run_capacity(self, num_tokens: int) -> None:
+        if self.use_cuda_graph and num_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"num_tokens ({num_tokens}) exceeds max_num_tokens "
+                f"({self.max_num_tokens})"
+            )
+        if not self.use_cuda_graph and _is_cuda_graph_capturing():
+            raise RuntimeError(
+                "B12xMoEWrapper must be constructed with use_cuda_graph=True "
+                "to run during CUDA graph capture."
+            )
+
+    def _get_output(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        self._check_run_capacity(num_tokens)
+        if self.use_cuda_graph:
+            return self._moe_output[:num_tokens]
+        return torch.empty(
+            (num_tokens, self.hidden_size),
+            dtype=self.output_dtype,
+            device=x.device,
+        )
+
+    def _get_workspace(self, num_tokens: int):
+        if not self.use_cuda_graph:
+            return None
+        if self.quant_mode == "w4a16":
+            return self._static_workspace
+
+        from .blackwell_sm12x.moe_dispatch import select_sm120_moe_backend
+
+        if (
+            self._dynamic_workspace is not None
+            and select_sm120_moe_backend(
+                num_tokens=num_tokens,
+                num_topk=self.top_k,
+                activation_precision=self.activation_precision,
+                quant_mode=self.quant_mode,
+            )
+            == "dynamic"
+        ):
+            return self._dynamic_workspace
+        return self._static_workspace
+
+    def prepare_weights(
+        self,
+        w1_weight: torch.Tensor,
+        w1_weight_sf: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_sf: torch.Tensor,
+        *,
+        w1_alpha: torch.Tensor,
+        w2_alpha: torch.Tensor,
+        reuse_input_storage: bool = False,
+    ) -> "W4A16PackedWeights":
+        r"""Prepare caller-owned W4A16 weights outside the execution path.
+
+        Unlike :meth:`run`, this method does not populate or consult the
+        process-global source-tensor cache. The returned object owns every
+        tensor needed by :meth:`run_prepared`, so source arguments are not
+        required during execution.
+
+        Set ``reuse_input_storage=True`` only if this wrapper exclusively owns
+        the checkpoint weights. Their storage is destructively repacked and
+        cannot subsequently be used by another backend or fallback path.
+
+        Parameters
+        ----------
+        w1_weight : torch.Tensor
+            FP4-packed FC1 checkpoint weights.
+        w1_weight_sf : torch.Tensor
+            Block scale factors for ``w1_weight``.
+        w2_weight : torch.Tensor
+            FP4-packed FC2 checkpoint weights.
+        w2_weight_sf : torch.Tensor
+            Block scale factors for ``w2_weight``.
+        w1_alpha : torch.Tensor
+            Per-expert global scale for FC1.
+        w2_alpha : torch.Tensor
+            Per-expert global scale for FC2.
+        reuse_input_storage : bool
+            Whether to destructively repack W1 and W2 into their source
+            allocations. Defaults to ``False``.
+
+        Returns
+        -------
+        W4A16PackedWeights
+            Caller-owned packed weights accepted by :meth:`run_prepared`.
+        """
+        if self.quant_mode != "w4a16":
+            raise ValueError(
+                "prepare_weights is only available when quant_mode='w4a16'"
+            )
+        if _is_cuda_graph_capturing():
+            raise RuntimeError("prepare_weights must be called before graph capture")
+
+        from .blackwell_sm12x.moe_w4a16_prepare import (
+            prepare_w4a16_packed_weights,
+        )
+
+        prepared = prepare_w4a16_packed_weights(
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            activation=self.activation,
+            params_dtype=self.output_dtype,
+            source_format=self.source_format,
+            reuse_input_storage=reuse_input_storage,
+        )
+        self._validate_prepared_weights(prepared)
+        return prepared
+
+    def _validate_prepared_weights(self, prepared_weights: Any) -> None:
+        from .blackwell_sm12x.moe_activation import is_gated_activation
+        from .blackwell_sm12x.moe_w4a16_prepare import W4A16PackedWeights
+
+        if not isinstance(prepared_weights, W4A16PackedWeights):
+            raise TypeError("prepared_weights must be a W4A16PackedWeights instance")
+        expected = (
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_local_experts,
+            is_gated_activation(self.activation),
+            self.output_dtype,
+        )
+        actual = (
+            prepared_weights.hidden_size,
+            prepared_weights.intermediate_size,
+            prepared_weights.num_experts,
+            prepared_weights.is_gated,
+            prepared_weights.params_dtype,
+        )
+        if actual != expected:
+            raise ValueError(
+                "prepared W4A16 weight geometry does not match this wrapper: "
+                f"got {actual}, expected {expected}"
+            )
+
+    def _validate_prepared_output(
+        self,
+        out: torch.Tensor,
+        x: torch.Tensor,
+        prepared_weights: "W4A16PackedWeights",
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        workspace: Any,
+    ) -> None:
+        expected_shape = (token_selected_experts.size(0), self.hidden_size)
+        if out.shape != expected_shape:
+            raise ValueError(f"out must have shape {expected_shape}, got {out.shape}")
+        if out.dtype != self.output_dtype:
+            raise TypeError(f"out must have dtype {self.output_dtype}, got {out.dtype}")
+        if out.device != x.device:
+            raise ValueError(f"out must be on {x.device}, got {out.device}")
+        out_start = out.data_ptr()
+        if not out.is_contiguous() or out_start % 16:
+            raise ValueError("out must be contiguous and 16-byte aligned")
+        if out.requires_grad:
+            raise ValueError("out must not require gradients")
+        if not out.numel():
+            return
+
+        out_end = out_start + out.numel() * out.element_size()
+        inputs = (
+            ("x", x),
+            ("token_selected_experts", token_selected_experts),
+            ("token_final_scales", token_final_scales),
+        )
+        for prefix, tensors in (
+            ("", inputs),
+            ("prepared_weights.", vars(prepared_weights).items()),
+            ("workspace.", vars(workspace).items() if workspace is not None else ()),
+        ):
+            for name, value in tensors:
+                if not isinstance(value, torch.Tensor):
+                    continue
+                # Most buffers have separate allocations. Only inspect strides
+                # when their storage address ranges could intersect the output.
+                # Address ranges also cover aliases with distinct Storage objects.
+                storage = value.untyped_storage()
+                storage_start = storage.data_ptr()
+                if (
+                    out_end <= storage_start
+                    or out_start >= storage_start + storage.nbytes()
+                ):
+                    continue
+                if value.device != out.device or not value.numel():
+                    continue
+                span = sum(
+                    (size - 1) * stride
+                    for size, stride in zip(value.shape, value.stride(), strict=True)
+                )
+                start = value.data_ptr()
+                end = start + (span + 1) * value.element_size()
+                if out_start < end and start < out_end:
+                    raise ValueError(f"out must not overlap {prefix}{name}")
+
+    def run_prepared(
+        self,
+        x: torch.Tensor,
+        prepared_weights: "W4A16PackedWeights",
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        r"""Run W4A16 MoE from an explicit caller-owned prepared object.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input activations of shape ``[num_tokens, hidden_size]``.
+        prepared_weights : W4A16PackedWeights
+            Packed weights returned by :meth:`prepare_weights`.
+        token_selected_experts : torch.Tensor
+            Expert assignments of shape ``[num_tokens, top_k]``.
+        token_final_scales : torch.Tensor
+            Routing weights of shape ``[num_tokens, top_k]``.
+        out : Optional[torch.Tensor]
+            Caller-owned output with shape ``[num_tokens, hidden_size]``, the
+            wrapper's output dtype and the input device. Must be contiguous,
+            16-byte aligned, and disjoint from inputs, prepared weights and
+            workspace. Must not require gradients. If provided, this exact
+            tensor is written and returned. For CUDA graphs, keep its storage
+            alive at the captured address through every replay. Omitting it
+            preserves the wrapper-owned output path and allocation policy.
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape ``[num_tokens, hidden_size]``.
+        """
+        # fi_trace cannot currently flatten W4A16PackedWeights into tensor
+        # inputs. Keep this structured ownership API undecorated rather than
+        # emit an incomplete trace that omits the prepared weights.
+        if self.quant_mode != "w4a16":
+            raise ValueError("run_prepared is only available when quant_mode='w4a16'")
+        self._validate_prepared_weights(prepared_weights)
+        if x.dtype != prepared_weights.params_dtype:
+            raise TypeError(
+                f"x has dtype {x.dtype}, expected {prepared_weights.params_dtype}"
+            )
+        if x.device != prepared_weights.w13.device:
+            raise ValueError(
+                f"x is on {x.device}, prepared weights are on "
+                f"{prepared_weights.w13.device}"
+            )
+
+        num_tokens = token_selected_experts.size(0)
+        workspace = self._get_workspace(num_tokens)
+        if out is None:
+            moe_output = self._get_output(x, num_tokens)
+        else:
+            self._check_run_capacity(num_tokens)
+            self._validate_prepared_output(
+                out,
+                x,
+                prepared_weights,
+                token_selected_experts,
+                token_final_scales,
+                workspace,
+            )
+            moe_output = out
+
+        from .blackwell_sm12x.moe_dispatch import (
+            launch_sm120_w4a16_moe_prepared,
+        )
+
+        return launch_sm120_w4a16_moe_prepared(
+            a=x,
+            topk_ids=token_selected_experts,
+            topk_weights=token_final_scales,
+            prepared_weights=prepared_weights,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
+            scatter_output=moe_output,
+            activation=self.activation,
+            _workspace=workspace,
+        )
+
     @flashinfer_api(trace=b12x_moe_wrapper_run_trace)
     def run(
         self,
@@ -612,29 +898,10 @@ class B12xMoEWrapper:
         """
         num_tokens = token_selected_experts.size(0)
 
-        if self.use_cuda_graph and num_tokens > self.max_num_tokens:
-            raise ValueError(
-                f"num_tokens ({num_tokens}) exceeds max_num_tokens "
-                f"({self.max_num_tokens})"
-            )
-
-        if self.use_cuda_graph:
-            moe_output = self._moe_output[:num_tokens]
-        else:
-            if _is_cuda_graph_capturing():
-                raise RuntimeError(
-                    "B12xMoEWrapper must be constructed with use_cuda_graph=True "
-                    "to run during CUDA graph capture."
-                )
-            moe_output = torch.empty(
-                (num_tokens, self.hidden_size),
-                dtype=self.output_dtype,
-                device=x.device,
-            )
+        moe_output = self._get_output(x, num_tokens)
 
         from .blackwell_sm12x.moe_dispatch import (
             launch_sm120_moe,
-            select_sm120_moe_backend,
             _get_weight_views as _get_sm120_weight_views,
             _pad_intermediate_to_tile,
             _LEVEL_TILE_N,
@@ -644,23 +911,7 @@ class B12xMoEWrapper:
         # Pick the right pre-allocated workspace for this call's token
         # count. launch_sm120_moe otherwise infers backend from workspace
         # type, which would lock us to whichever one was allocated at init.
-        workspace = None
-        if self.use_cuda_graph:
-            if self.quant_mode == "w4a16":
-                workspace = self._static_workspace
-            elif (
-                self._dynamic_workspace is not None
-                and select_sm120_moe_backend(
-                    num_tokens=num_tokens,
-                    num_topk=self.top_k,
-                    activation_precision=self.activation_precision,
-                    quant_mode=self.quant_mode,
-                )
-                == "dynamic"
-            ):
-                workspace = self._dynamic_workspace
-            else:
-                workspace = self._static_workspace
+        workspace = self._get_workspace(num_tokens)
 
         if self.quant_mode == "nvfp4" and input_global_scale is not None:
             # Fold once and reuse; launch_sm120_moe skips its fold when
