@@ -207,6 +207,20 @@ from .cudnn_frost_selected import (  # noqa: F401
     cudnn_frost_grouped_gemm1_swiglu_workspace_size,
 )
 
+from .alphamoe_nvfp4_sm100 import (  # noqa: F401
+    alphamoe_nvfp4_aligned_moe as alphamoe_nvfp4_aligned_moe,
+    alphamoe_nvfp4_routed_moe as alphamoe_nvfp4_routed_moe,
+    AlphaMoeNvfp4DeferredOutput as AlphaMoeNvfp4DeferredOutput,
+    alphamoe_nvfp4_routed_moe_deferred as alphamoe_nvfp4_routed_moe_deferred,
+    alphamoe_nvfp4_finalize_deferred as alphamoe_nvfp4_finalize_deferred,
+    prepare_nvfp4_w1_scales as prepare_nvfp4_w1_scales,
+    prepare_nvfp4_w1_data as prepare_nvfp4_w1_data,
+    prepare_nvfp4_w2_data as prepare_nvfp4_w2_data,
+    prepare_nvfp4_w1_gate_up_data as prepare_nvfp4_w1_gate_up_data,
+    prepare_nvfp4_w1_gate_up_scales as prepare_nvfp4_w1_gate_up_scales,
+    prepare_nvfp4_w2_scales as prepare_nvfp4_w2_scales,
+)
+
 from .bgmv_moe import (  # noqa: F401
     BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     bgmv_moe as bgmv_moe,
@@ -411,6 +425,17 @@ __all__ = [
     "kimi_k3_fused_router",
     "prepare_kimi_k3_fused_router",
     "hash_topk",
+    "alphamoe_nvfp4_aligned_moe",
+    "alphamoe_nvfp4_routed_moe",
+    "AlphaMoeNvfp4DeferredOutput",
+    "alphamoe_nvfp4_routed_moe_deferred",
+    "alphamoe_nvfp4_finalize_deferred",
+    "prepare_nvfp4_w1_scales",
+    "prepare_nvfp4_w1_data",
+    "prepare_nvfp4_w2_data",
+    "prepare_nvfp4_w1_gate_up_data",
+    "prepare_nvfp4_w1_gate_up_scales",
+    "prepare_nvfp4_w2_scales",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
     "cudnn_frost_grouped_gemm1_swiglu",
