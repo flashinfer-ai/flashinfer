@@ -494,9 +494,7 @@ def _assert_replay_close(out, lse, other_out, other_lse):
     torch.testing.assert_close(
         lse.float()[finite], other_lse.float()[finite], atol=4e-3, rtol=0
     )
-    assert torch.equal(
-        out.float()[neg_inf], torch.zeros_like(out.float()[neg_inf])
-    )
+    assert torch.equal(out.float()[neg_inf], torch.zeros_like(out.float()[neg_inf]))
 
 
 def _launch_rank(

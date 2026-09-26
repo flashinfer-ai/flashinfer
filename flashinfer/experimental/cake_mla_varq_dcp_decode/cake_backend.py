@@ -153,7 +153,9 @@ def _fast_divmod(divisor: int) -> tvm_ffi.Shape:
     the kernel's single-warp prologue passes divide with one umulhi + shift)."""
     divisor = int(divisor)
     if not 1 <= divisor <= 0x7FFF_FFFF:
-        raise ValueError(f"fast divmod divisor must be in [1, 2147483647], got {divisor}")
+        raise ValueError(
+            f"fast divmod divisor must be in [1, 2147483647], got {divisor}"
+        )
     if divisor == 1:
         return tvm_ffi.Shape((1, 0, 0))
     p = 31 + (divisor - 1).bit_length()
