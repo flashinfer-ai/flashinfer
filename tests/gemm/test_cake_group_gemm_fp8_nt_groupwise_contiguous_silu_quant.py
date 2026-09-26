@@ -100,18 +100,60 @@ def _reference_gemm(a, b, a_scale, b_scale, m_indices):
     return out.to(torch.bfloat16)
 
 
-def _reference_activation_quant(y_bf16):
-    """FlashInfer chain arithmetic in torch: silu_and_mul round points, then group quant."""
+def _reference_activation(y_bf16):
+    """FlashInfer chain arithmetic in torch: BF16 gate/up halves, FP32 SwiGLU, BF16 activation."""
     h = y_bf16.shape[1] // 2
     g = y_bf16[:, :h].float()
     u = y_bf16[:, h:].float()
     act = (g * torch.sigmoid(g) * u).to(torch.bfloat16).float()
-    m = act.shape[0]
-    grouped = act.reshape(m, h // GROUP_SIZE, GROUP_SIZE)
-    absmax = grouped.abs().amax(dim=-1).clamp_min(EPS)
-    scale = absmax / 448.0
-    q = (grouped / scale.unsqueeze(-1)).clamp(-448.0, 448.0).reshape(m, h)
-    return q.to(torch.float8_e4m3fn), scale.contiguous()
+    return g, u, act
+
+
+def _reference_group_scales(act):
+    m, h = act.shape
+    absmax = act.reshape(m, h // GROUP_SIZE, GROUP_SIZE).abs().amax(dim=-1)
+    return (absmax.clamp_min(EPS) / 448.0).contiguous()
+
+
+def _e4m3_spacing(q):
+    """Distance between adjacent E4M3 values at |q| (subnormal spacing 2**-9 below 2**-6)."""
+    _, exponent = torch.frexp(q.float().abs().clamp_min(2.0**-6))
+    return torch.pow(2.0, exponent.float() - 4.0)
+
+
+def _assert_quantizes_reference(out_q, out_s, g, u, act):
+    """Definition check against the torch reference, independent of any FlashInfer kernel.
+
+    The reference GEMM accumulates in a different order, so its BF16 gate/up halves may differ
+    from the kernel's by one BF16 ulp: the group scales move by at most 2**-7 relative and the
+    activation by 2**-6 * |g| * |u| + 2**-7 * |act|.  Round-to-nearest quantization then places
+    the dequantized value within half an E4M3 spacing of the activation, whichever side of a
+    rounding boundary the kernel lands on.
+    """
+    m, h = out_q.shape
+    ref_s = _reference_group_scales(act)
+    assert torch.isfinite(out_s).all()
+    torch.testing.assert_close(
+        out_s, ref_s.reshape(out_s.shape), atol=0.0, rtol=2.0**-7
+    )
+    s = (
+        out_s.reshape(m, h // GROUP_SIZE, 1)
+        .expand(m, h // GROUP_SIZE, GROUP_SIZE)
+        .reshape(m, h)
+    )
+    dequantized = out_q.float() * s
+    assert torch.isfinite(dequantized).all()
+    bound = (
+        0.5 * _e4m3_spacing(out_q) * s
+        + 2.0**-6 * g.abs() * u.abs()
+        + 2.0**-7 * act.abs()
+    )
+    excess = (dequantized - act).abs() - bound
+    violations = int((excess > 0).sum())
+    assert violations == 0, (
+        f"{violations} elements exceed the quantization bound "
+        f"(max excess {float(excess.max()):.3e})"
+    )
 
 
 def _chain(a, b, a_scale, b_scale, m_indices):
@@ -187,10 +229,10 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     assert prepared.route == FUSED_ROUTE
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
-    ref_q, ref_s = _reference_activation_quant(
+    g, u, act = _reference_activation(
         _reference_gemm(a, b, a_scale, b_scale, m_indices)
     )
-    _assert_matches(out_q, out_s, ref_q, ref_s)
+    _assert_quantizes_reference(out_q, out_s, g, u, act)
     # Contents may change between launches of the same prepared object.
     a.copy_(torch.randn(a.shape, device=device).to(torch.float8_e4m3fn))
     out_q2, out_s2 = prepared()
@@ -198,10 +240,10 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     assert (
         out_q2.data_ptr() == out_q.data_ptr() and out_s2.data_ptr() == out_s.data_ptr()
     )
-    ref_q, ref_s = _reference_activation_quant(
+    g, u, act = _reference_activation(
         _reference_gemm(a, b, a_scale, b_scale, m_indices)
     )
-    _assert_matches(out_q2, out_s2, ref_q, ref_s)
+    _assert_quantizes_reference(out_q2, out_s2, g, u, act)
 
 
 @pytest.mark.parametrize("group_counts,n2,k,arbitrary_scales", ROUTING_CASES)
@@ -251,9 +293,7 @@ def test_cuda_graph_replay_after_first_launch():
     )
     prepared.launch()  # initializes the private descriptor storage
     torch.cuda.synchronize()
-    ref_q, ref_s = _reference_activation_quant(
-        _reference_gemm(a, b, a_scale, b_scale, m_indices)
-    )
+    ref_q, ref_s = _chain(a, b, a_scale, b_scale, m_indices)
     stream = torch.cuda.Stream(device=device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
