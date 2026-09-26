@@ -2770,6 +2770,26 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            if cutlass.const_expr(self.zero_fill):
+                # Zero-fill of the finalize output (see the tail block below):
+                # decide once per launch which launch of a dual-tile pair
+                # fills, and set up the chunk claims shared by the in-loop
+                # and the tail phase.
+                zf_my_tiles = num_non_exiting_tiles[0]
+                zf_other_tiles = zero_fill_other_tiles[0]
+                if cutlass.const_expr(self.zero_fill_secondary):
+                    zf_do_fill = (zf_my_tiles > 0) & (zf_other_tiles == 0)
+                else:
+                    zf_do_fill = (zf_my_tiles > 0) | (zf_other_tiles == 0)
+                zf_lane = cute.arch.lane_idx()
+                zf_claim_addr = zero_fill_counters.iterator.toint()
+                zf_chunk_vec = self.zero_fill_chunk_bytes // 16
+                zf_num_vec = cute.size(zero_fill_words) // 4
+                zf_num_chunks = cute.ceil_div(zf_num_vec, zf_chunk_vec)
+                zf_zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                for i in cutlass.range_constexpr(4):
+                    zf_zeros[i] = cutlass.Uint32(0)
+                zf_tile = cutlass.Int32(0)
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 mma_tile_coord_mnl = (
@@ -3456,6 +3476,32 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
+                if cutlass.const_expr(self.zero_fill):
+                    # In-loop phase of the zero-fill: while the MMA warp
+                    # builds the next accumulator, one epilogue warp per tile
+                    # (round robin) claims a chunk and stores it with plain
+                    # 16 B stores, so a dense routing's fill is spread over
+                    # the tile loop instead of being exposed at the end.
+                    if zf_do_fill:
+                        if (zf_tile % len(self.epilog_warp_id)) == warp_idx:
+                            zf_c = cutlass.Int32(0)
+                            if zf_lane == 0:
+                                zf_c = atomic_add_global_i32(
+                                    zf_claim_addr, cutlass.Int32(1)
+                                )
+                            zf_c = cute.arch.shuffle_sync(zf_c, 0)
+                            if zf_c < zf_num_chunks:
+                                zf_base = zf_c * zf_chunk_vec + zf_lane
+                                for it in cutlass.range(0, zf_chunk_vec // 32, 1, unroll=8):
+                                    zf_vec = zf_base + it * 32
+                                    if zf_vec < zf_num_vec:
+                                        zf_out = cute.make_tensor(
+                                            zero_fill_words.iterator
+                                            + cute.assume(zf_vec * 4, divby=4),
+                                            layout=cute.make_layout((4,)),
+                                        )
+                                        cute.autovec_copy(zf_zeros, zf_out)
+                    zf_tile = zf_tile + 1
                 #
                 # Advance to next tile
                 #
@@ -3503,40 +3549,28 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # a dual-tile pair only one launch fills: the primary unless
                 # it has no tiles, then the secondary (both empty: primary).
                 #
-                my_tiles = num_non_exiting_tiles[0]
-                other_tiles = zero_fill_other_tiles[0]
-                if cutlass.const_expr(self.zero_fill_secondary):
-                    do_fill = (my_tiles > 0) & (other_tiles == 0)
-                else:
-                    do_fill = (my_tiles > 0) | (other_tiles == 0)
-                if do_fill:
+                if zf_do_fill:
                     zb = self.zero_fill_bulk_bytes
                     copies_per_chunk = self.zero_fill_chunk_bytes // zb
                     sZ = storage.sC.get_tensor(
                         cute.make_layout((zb // 4,)), dtype=cutlass.Uint32
                     )
-                    zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
-                    for i in cutlass.range_constexpr(4):
-                        zeros[i] = cutlass.Uint32(0)
                     for i in cutlass.range_constexpr(zb // 16 // 128):
                         s_out = cute.make_tensor(
                             sZ.iterator + (epi_tidx + i * 128) * 4,
                             layout=cute.make_layout((4,)),
                         )
-                        cute.autovec_copy(zeros, s_out)
+                        cute.autovec_copy(zf_zeros, s_out)
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.epilog_sync_barrier.arrive_and_wait()
-                    lane = cute.arch.lane_idx()
+                    lane = zf_lane
                     grid_x, grid_y, grid_z = cute.arch.grid_dim()
-                    claim_addr = zero_fill_counters.iterator.toint()
+                    claim_addr = zf_claim_addr
                     done_addr = (zero_fill_counters.iterator + 1).toint()
                     src_addr = sZ.iterator.toint()
                     dst_base = zero_fill_words.iterator.toint()
-                    num_bytes = cutlass.Int64(cute.size(zero_fill_words)) * 4
-                    num_chunks = cutlass.Int32(
-                        (num_bytes + (self.zero_fill_chunk_bytes - 1))
-                        // self.zero_fill_chunk_bytes
-                    )
+                    num_bytes = cutlass.Int64(zf_num_vec) * 16
+                    num_chunks = zf_num_chunks
                     claimed = cutlass.Int32(0)
                     if lane == 0:
                         claimed = atomic_add_global_i32(claim_addr, cutlass.Int32(1))
