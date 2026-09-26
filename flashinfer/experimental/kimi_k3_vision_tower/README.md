@@ -15,7 +15,7 @@ sequence of generated tcgen05 programs:
 | Stage | Program | Math (BF16 tensors, FP32 accumulation) |
 | --- | --- | --- |
 | `patch_embed` | `gemm:pos_sqxw:*` | `x = bf16(pixels[T, 588] @ Wpe^T) + pos_rows` (Conv2d 14x14/14 as a GEMM, bilinear-resized 64x64 positional table + sincos time rows) + handoff `xw = bf16(x * norm0[0])`, `stats = rowsumsq(x)` |
-| `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*` | `q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x)))`: the RMSNorm weight applied on the activation side by the producer (`xw`), row `rstd` from the FP32 `stats` handoff, original `Wqkv`, interleaved-pair 2-D RoPE in the epilogue, head-split outputs |
+| `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*_cs` | `q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x)))`: the RMSNorm weight applied on the activation side by the producer (`xw`), row `rstd` from the FP32 `stats` handoff, original `Wqkv`, interleaved-pair 2-D RoPE in the epilogue from the packed f16x2 `(cos, sin)` table of the plan (`pack_rope_table`; FP32 rotation), head-split outputs |
 | `layer_attention` (x27) | `attention:tiles2` / `attention:tiles1` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding |
 | `layer_out_proj` (x27) | `gemm:residual_wo_sqxw:*` | `x += bf16(a @ Wo^T)` + handoff `xw = bf16(x * norm1)`, `stats` |
 | `layer_norm_fc0_gelu` (x27) | `gemm:norm_gelu:*` | `f = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x))))`, original `Wfc0` |
@@ -26,11 +26,24 @@ sequence of generated tcgen05 programs:
 
 `RMSNorm` uses `eps = 2^-7` (`nn.RMSNorm(eps=None)` on BF16) except the
 projector's post norm (`1e-5`). `*` is the production tile configuration the
-host selects per token count (`cake_backend.select_tile_config`: 128x64 /
-128x128 single-CTA tiles and a split-K cluster for small `T`, 256x256 /
-256x128 2-CTA pair tiles above 1024 rows); the attention unit layout is chosen
-per `grid_thws` batch from the LPT makespans of both layouts
-(`cake_backend.select_tiles_per_cta`).
+host selects per token count (`cake_backend.select_tile_config`, the Cake
+`kimi_k3_vision_gemm` policy: 128x64 / 128x128 single-CTA tiles and a split-K
+cluster for small `T`, 256x256 / 256x128 2-CTA pair tiles above 1024 rows; the
+residual / pos forms run their packed bf16x2-epilogue twins `*_p` / `*_pf`
+with the pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table
+twins `*_cs`); the attention unit layout is chosen per `grid_thws` batch from
+the LPT makespans of both layouts (`cake_backend.select_tiles_per_cta`).
+
+Programmatic dependent launch: the registered programs follow the Cake
+production PDL default (`KIMI_K3_VISION_TOWER_PDL`, on since the round-2
+route), so every binding launches its kernel with the
+programmatic-stream-serialization attribute (owned by the generated binding,
+not by this host code): the kernel
+runs its mbarrier / TMEM prologue while the previous launch drains, waits on
+`griddepcontrol.wait` before touching a route buffer and signals
+`launch_dependents` before its epilogue. The host launch sequence is the same
+either way, the attribute is captured into the CUDA graph as a programmatic
+dependency edge, and the numerics are identical.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
@@ -70,9 +83,10 @@ graph.replay()                                               # new pixel values 
 ```
 
 `prepare_kimi_k3_vision_tower` derives everything a serving runtime keeps per
-`grid_thws` batch (`cu_seqlens`, RoPE `cos`/`sin`, positional rows, the merge
-table, the attention segment plan and unit table, the tile selection and all
-workspaces) and binds the 27 x 5 + 5 launches; `launch()` performs no
+`grid_thws` batch (`cu_seqlens`, RoPE `cos`/`sin` and their packed f16x2
+table, positional rows, the merge table, the attention segment plan and unit
+table, the tile selection and all workspaces) and binds the 27 x 5 + 5
+launches; `launch()` performs no
 allocation and no host synchronization. Pass a cached
 `build_kimi_k3_vision_plan(...)` / `pos_emb_rows(...)` to skip the derivation.
 Per-stage launches for tests and profiling: `runner.stages[name]()`.
