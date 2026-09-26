@@ -6266,7 +6266,7 @@ ROUTES = {('sm_100a', 'm1'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_61
  ('sm_100a', 8): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_2f4ec6b932967d358600:sequence',
  ('sm_100a', 16): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_01a7555e0c5e22c8058a:sequence',
  ('sm_100a', 32): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_95761718583408bcb1b6:sequence',
- ('sm_100a', 128): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_c904b5b12454eb7e618e:sequence',
+ ('sm_100a', 128): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_cd8e4f84b7b9390638c6:sequence',
  ('sm_103a', 'm1'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_0a3cad53e4bd391550e3:sequence',
  ('sm_103a', 'n8_feature'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_e2e84e59d271784bcac5:sequence',
  ('sm_103a', 'm64_claim8'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_f2d1b8ae02790f3e0609:sequence',
@@ -6275,7 +6275,7 @@ ROUTES = {('sm_100a', 'm1'): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_61
  ('sm_103a', 8): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_336198a3891a1ed16ef3:sequence',
  ('sm_103a', 16): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_2d95bc60f5555d34c176:sequence',
  ('sm_103a', 32): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_b08e9dc74259fe95637b:sequence',
- ('sm_103a', 128): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_f77952772d3a62965641:sequence'}
+ ('sm_103a', 128): 'sequence:cake_kimi_k3_nvfp4_situ_routed_moe_seq_f25936cae5221cab3236:sequence'}
 
 
 def _source_path(relative):
