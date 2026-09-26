@@ -39,10 +39,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_ee5ceecd9d07a3b62bf4",
+            "module": "cake_kimi_k3_fused_router_07cdba1397d2b574f330",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_ee5ceecd9d07a3b62bf4_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_ee5ceecd9d07a3b62bf4_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_07cdba1397d2b574f330_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_07cdba1397d2b574f330_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -62,7 +62,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "403ce28682c93ae49754793be5af4384d51eee01226f4ae864bcc02a0a8643eb",
+            "closure_sha256": "0baf4c94e0127821a78f48cc6060bca2b4281a5d211277f444d25442ad470c02",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -71,7 +71,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 32768,
             },
         },
-        "closure_sha256": "403ce28682c93ae49754793be5af4384d51eee01226f4ae864bcc02a0a8643eb",
+        "closure_sha256": "0baf4c94e0127821a78f48cc6060bca2b4281a5d211277f444d25442ad470c02",
     },
     "cake_kimi_k3_fused_router_gw_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -79,10 +79,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_eba0da520bfae74745f3",
+            "module": "cake_kimi_k3_fused_router_b6c760c9dde2e5748c0e",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_eba0da520bfae74745f3_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_eba0da520bfae74745f3_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_b6c760c9dde2e5748c0e_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_b6c760c9dde2e5748c0e_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -102,7 +102,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "802e2f93dd842e8236bad9e8bc6fa55c02721090cfb8c07b98531c0247b00ada",
+            "closure_sha256": "85d7455cbdd760d8db953337426ad73234b94002b6d3391c853b3bf50a4806d8",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -111,7 +111,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 32768,
             },
         },
-        "closure_sha256": "802e2f93dd842e8236bad9e8bc6fa55c02721090cfb8c07b98531c0247b00ada",
+        "closure_sha256": "85d7455cbdd760d8db953337426ad73234b94002b6d3391c853b3bf50a4806d8",
     },
     "cake_kimi_k3_fused_router_gw_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -119,10 +119,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_ef42df39862269c07a1d",
+            "module": "cake_kimi_k3_fused_router_6a3d908b990127be087f",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_ef42df39862269c07a1d_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_ef42df39862269c07a1d_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_6a3d908b990127be087f_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_6a3d908b990127be087f_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -142,7 +142,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "79422e1f30971decae07ddfce667bb834d42616d085512e2e8666c45bb32cb47",
+            "closure_sha256": "80ece14f6702aa4047dc91e68504cdd202f3b26368dfd4622745fa263f6d59de",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -151,7 +151,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 32768,
             },
         },
-        "closure_sha256": "79422e1f30971decae07ddfce667bb834d42616d085512e2e8666c45bb32cb47",
+        "closure_sha256": "80ece14f6702aa4047dc91e68504cdd202f3b26368dfd4622745fa263f6d59de",
     },
     "cake_kimi_k3_fused_router_gw_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -159,10 +159,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_e7b548f804a751cb0c4a",
+            "module": "cake_kimi_k3_fused_router_4072c7b378c9b8db1932",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_e7b548f804a751cb0c4a_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_e7b548f804a751cb0c4a_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_4072c7b378c9b8db1932_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_4072c7b378c9b8db1932_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -182,7 +182,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "71badf070e5466b766b94c6e393d422fd36f3950ba4c2b5b4f2779518dd33f0e",
+            "closure_sha256": "f5bfe7cfe3e79f42eaf7418e4a8a16639128615b27b1d033e1ec23cf47dd1335",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -191,7 +191,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 32768,
             },
         },
-        "closure_sha256": "71badf070e5466b766b94c6e393d422fd36f3950ba4c2b5b4f2779518dd33f0e",
+        "closure_sha256": "f5bfe7cfe3e79f42eaf7418e4a8a16639128615b27b1d033e1ec23cf47dd1335",
     },
     "cake_kimi_k3_fused_router_l_bm16_sm_100a": {
         "arch": "sm_100a",
@@ -199,10 +199,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_b0aaa1c292a0cd36af7a",
+            "module": "cake_kimi_k3_fused_router_102f058bbcaff298dd00",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_b0aaa1c292a0cd36af7a_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_b0aaa1c292a0cd36af7a_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_102f058bbcaff298dd00_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_102f058bbcaff298dd00_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -222,7 +222,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "5a811a41acc1bd708f6f623fbf7baebfcc2293f5b7f18c45ceb1096ade332307",
+            "closure_sha256": "cec84952ecfcfbcf3571317052bb775cfd805b7ac4d5549d2cddaaee63077bb1",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -231,7 +231,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 40960,
             },
         },
-        "closure_sha256": "5a811a41acc1bd708f6f623fbf7baebfcc2293f5b7f18c45ceb1096ade332307",
+        "closure_sha256": "cec84952ecfcfbcf3571317052bb775cfd805b7ac4d5549d2cddaaee63077bb1",
     },
     "cake_kimi_k3_fused_router_l_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -239,10 +239,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_ba18b31a2d8e9f0b6dd0",
+            "module": "cake_kimi_k3_fused_router_4c989bb14b58d901b14f",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_ba18b31a2d8e9f0b6dd0_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_ba18b31a2d8e9f0b6dd0_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_4c989bb14b58d901b14f_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_4c989bb14b58d901b14f_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -262,7 +262,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "6788ffe5e5d6e60e103863d637b886b040abd885fe27a1343266802fe79188a6",
+            "closure_sha256": "ab553e43ee5bda5f0c6add564c96c2abff36a051aa0a06e50430d27f739d7e21",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -271,7 +271,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 40960,
             },
         },
-        "closure_sha256": "6788ffe5e5d6e60e103863d637b886b040abd885fe27a1343266802fe79188a6",
+        "closure_sha256": "ab553e43ee5bda5f0c6add564c96c2abff36a051aa0a06e50430d27f739d7e21",
     },
     "cake_kimi_k3_fused_router_l_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -279,10 +279,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_b0dbf6b1a3d313907bc4",
+            "module": "cake_kimi_k3_fused_router_6db942769fab64daf439",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_b0dbf6b1a3d313907bc4_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_b0dbf6b1a3d313907bc4_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_6db942769fab64daf439_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_6db942769fab64daf439_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -302,7 +302,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "8db99021316a901734d82bf802e3a34ffc90f585d19c1f9bb3a3af345c7858cc",
+            "closure_sha256": "a4cd6b3f9685389435aaeae3bf939c80815334e94c1d24cf0db30059765cee15",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -311,7 +311,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 40960,
             },
         },
-        "closure_sha256": "8db99021316a901734d82bf802e3a34ffc90f585d19c1f9bb3a3af345c7858cc",
+        "closure_sha256": "a4cd6b3f9685389435aaeae3bf939c80815334e94c1d24cf0db30059765cee15",
     },
     "cake_kimi_k3_fused_router_l_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -319,10 +319,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_7a7b6e6201edd47f584e",
+            "module": "cake_kimi_k3_fused_router_dedd9cbf2a2e54aeb71a",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_7a7b6e6201edd47f584e_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_7a7b6e6201edd47f584e_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_dedd9cbf2a2e54aeb71a_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_dedd9cbf2a2e54aeb71a_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -342,7 +342,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "5e2ace57051b3189cdf86fdc665abb12515e269a3266bf4846909513d62a7a4c",
+            "closure_sha256": "61a52cf158a1d9ec0a376d4f2ca90d28a183282786a33085c4fd08c3fcb2daf0",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -351,7 +351,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 40960,
             },
         },
-        "closure_sha256": "5e2ace57051b3189cdf86fdc665abb12515e269a3266bf4846909513d62a7a4c",
+        "closure_sha256": "61a52cf158a1d9ec0a376d4f2ca90d28a183282786a33085c4fd08c3fcb2daf0",
     },
     "cake_kimi_k3_fused_router_lc2_bm16_sm_100a": {
         "arch": "sm_100a",
@@ -359,10 +359,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": 2,
         "main": {
-            "module": "cake_kimi_k3_fused_router_d25730ea5c4d228ae7d9",
+            "module": "cake_kimi_k3_fused_router_e638b2fbb73d168afa50",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_d25730ea5c4d228ae7d9_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_d25730ea5c4d228ae7d9_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_e638b2fbb73d168afa50_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_e638b2fbb73d168afa50_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -382,7 +382,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "925eb5d5a64e9e517a58bbb806c05453883d1385f05498ee8b45054067649e3d",
+            "closure_sha256": "449aae3c40afa3b811f1e57acacb2f6cd9c270143f4a8348cdd185486ba4a79c",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -391,7 +391,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "925eb5d5a64e9e517a58bbb806c05453883d1385f05498ee8b45054067649e3d",
+        "closure_sha256": "449aae3c40afa3b811f1e57acacb2f6cd9c270143f4a8348cdd185486ba4a79c",
     },
     "cake_kimi_k3_fused_router_lc2_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -399,10 +399,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": 2,
         "main": {
-            "module": "cake_kimi_k3_fused_router_b88e6859fedc60bbe0ac",
+            "module": "cake_kimi_k3_fused_router_37a7df3b444c308ca945",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_b88e6859fedc60bbe0ac_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_b88e6859fedc60bbe0ac_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_37a7df3b444c308ca945_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_37a7df3b444c308ca945_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -422,7 +422,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "02d774c866e5b27e324f98f7c064842ae36e4bcc94ec1d3c7f6bfd283edb6926",
+            "closure_sha256": "6e4b4510997495b2061ad4b50bf69b8a9c599ee0aeac938e89d07b653090d551",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -431,7 +431,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "02d774c866e5b27e324f98f7c064842ae36e4bcc94ec1d3c7f6bfd283edb6926",
+        "closure_sha256": "6e4b4510997495b2061ad4b50bf69b8a9c599ee0aeac938e89d07b653090d551",
     },
     "cake_kimi_k3_fused_router_lc2_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -439,10 +439,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": 2,
         "main": {
-            "module": "cake_kimi_k3_fused_router_0380cba8e73d67bb4ab9",
+            "module": "cake_kimi_k3_fused_router_0bde7b0a06e6f38ab4e5",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_0380cba8e73d67bb4ab9_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_0380cba8e73d67bb4ab9_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_0bde7b0a06e6f38ab4e5_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_0bde7b0a06e6f38ab4e5_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -462,7 +462,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "95ec8cec021d57c159bd57cc58acb07c4d32d3c423aeb6c22b63bf33b427a398",
+            "closure_sha256": "bb35e76d17c9cf7f8e38857ae0e84f773ba099fd4afe37027efbc192e27990b3",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -471,7 +471,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "95ec8cec021d57c159bd57cc58acb07c4d32d3c423aeb6c22b63bf33b427a398",
+        "closure_sha256": "bb35e76d17c9cf7f8e38857ae0e84f773ba099fd4afe37027efbc192e27990b3",
     },
     "cake_kimi_k3_fused_router_lc2_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -479,10 +479,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": 2,
         "main": {
-            "module": "cake_kimi_k3_fused_router_484c77b4884ede5f52a2",
+            "module": "cake_kimi_k3_fused_router_55ae849337547eff3ce7",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_484c77b4884ede5f52a2_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_484c77b4884ede5f52a2_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_55ae849337547eff3ce7_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_55ae849337547eff3ce7_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -502,7 +502,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "18d5a640be4c56b28359c70be4ed731d39dee73238b59053c3ae4bfbfd2a22d4",
+            "closure_sha256": "29157516ee58d20a734e77adc2e52eadb6fb3a759da5335274db5f09095d6f42",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -511,7 +511,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "18d5a640be4c56b28359c70be4ed731d39dee73238b59053c3ae4bfbfd2a22d4",
+        "closure_sha256": "29157516ee58d20a734e77adc2e52eadb6fb3a759da5335274db5f09095d6f42",
     },
     "cake_kimi_k3_fused_router_lc4_bm16_sm_100a": {
         "arch": "sm_100a",
@@ -519,10 +519,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": 4,
         "main": {
-            "module": "cake_kimi_k3_fused_router_421b8a75d822521d2144",
+            "module": "cake_kimi_k3_fused_router_517fe5089b9f0d78e2f9",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_421b8a75d822521d2144_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_421b8a75d822521d2144_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_517fe5089b9f0d78e2f9_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_517fe5089b9f0d78e2f9_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -542,7 +542,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "79a23a71a04c3a89278b5b33d08872454c29b6c1c2e3b002ad188872720b453d",
+            "closure_sha256": "fbee6cb9eeef23a5a0732e934c01ecec654b61a7060f13354561b946a2b62431",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -551,7 +551,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "79a23a71a04c3a89278b5b33d08872454c29b6c1c2e3b002ad188872720b453d",
+        "closure_sha256": "fbee6cb9eeef23a5a0732e934c01ecec654b61a7060f13354561b946a2b62431",
     },
     "cake_kimi_k3_fused_router_lc4_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -559,10 +559,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": 4,
         "main": {
-            "module": "cake_kimi_k3_fused_router_bf4f02b31c3d3ee7603f",
+            "module": "cake_kimi_k3_fused_router_ac4edc568d53b5cf835a",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_bf4f02b31c3d3ee7603f_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_bf4f02b31c3d3ee7603f_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_ac4edc568d53b5cf835a_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_ac4edc568d53b5cf835a_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -582,7 +582,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "bd3647ab8a97d11f92c15e64be3a1926a9c5081a3130c65e0fbf3c884faf8412",
+            "closure_sha256": "05b406add3977ef49a0f91af82d8b21e6afc738d1fef944428ac58df92616c4d",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -591,7 +591,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "bd3647ab8a97d11f92c15e64be3a1926a9c5081a3130c65e0fbf3c884faf8412",
+        "closure_sha256": "05b406add3977ef49a0f91af82d8b21e6afc738d1fef944428ac58df92616c4d",
     },
     "cake_kimi_k3_fused_router_lc4_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -599,10 +599,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": 4,
         "main": {
-            "module": "cake_kimi_k3_fused_router_038a86148244206306e8",
+            "module": "cake_kimi_k3_fused_router_3ca5b129f78f00dd429b",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_038a86148244206306e8_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_038a86148244206306e8_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_3ca5b129f78f00dd429b_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_3ca5b129f78f00dd429b_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -622,7 +622,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "1c5cd09964c5fe921f8078b6dd50bc23b7af4ea2e0fd0dada05c3027d7396119",
+            "closure_sha256": "7a70db5f1f59030fe4d6493a4c5011645affe77856112e78b627fdbdab2ee56b",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -631,7 +631,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "1c5cd09964c5fe921f8078b6dd50bc23b7af4ea2e0fd0dada05c3027d7396119",
+        "closure_sha256": "7a70db5f1f59030fe4d6493a4c5011645affe77856112e78b627fdbdab2ee56b",
     },
     "cake_kimi_k3_fused_router_lc4_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -639,10 +639,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": 4,
         "main": {
-            "module": "cake_kimi_k3_fused_router_72095cb0854773f74d00",
+            "module": "cake_kimi_k3_fused_router_44360f10d432f153db00",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_72095cb0854773f74d00_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_72095cb0854773f74d00_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_44360f10d432f153db00_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_44360f10d432f153db00_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -662,7 +662,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "62a2537d9be3e5ad15dce6d8ef229246d963357b8a6b622e4540ee687bfd7975",
+            "closure_sha256": "ef3e28a9fbd3c282c0657ac1da0f3a92b72a94de5bf7d0f84f46316767ca13a0",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -671,7 +671,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "62a2537d9be3e5ad15dce6d8ef229246d963357b8a6b622e4540ee687bfd7975",
+        "closure_sha256": "ef3e28a9fbd3c282c0657ac1da0f3a92b72a94de5bf7d0f84f46316767ca13a0",
     },
     "cake_kimi_k3_fused_router_lc8_bm16_sm_100a": {
         "arch": "sm_100a",
@@ -679,10 +679,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": 8,
         "main": {
-            "module": "cake_kimi_k3_fused_router_92e1d780d24dc73598a0",
+            "module": "cake_kimi_k3_fused_router_dfc0cf64a925d85827ea",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_92e1d780d24dc73598a0_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_92e1d780d24dc73598a0_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_dfc0cf64a925d85827ea_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_dfc0cf64a925d85827ea_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -702,7 +702,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "cdf8d8d6ebce5e7e21c7567ad016203a286648cb3d613decdcbd192383876a1c",
+            "closure_sha256": "0bc7a753771d68833253e45e57b72cb0350b6cbfcc091cfc0d77f1eb01bad73c",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -711,7 +711,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "cdf8d8d6ebce5e7e21c7567ad016203a286648cb3d613decdcbd192383876a1c",
+        "closure_sha256": "0bc7a753771d68833253e45e57b72cb0350b6cbfcc091cfc0d77f1eb01bad73c",
     },
     "cake_kimi_k3_fused_router_lc8_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -719,10 +719,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": 8,
         "main": {
-            "module": "cake_kimi_k3_fused_router_babfef5ddc8cad6731ad",
+            "module": "cake_kimi_k3_fused_router_739c0acfedb22a837166",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_babfef5ddc8cad6731ad_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_babfef5ddc8cad6731ad_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_739c0acfedb22a837166_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_739c0acfedb22a837166_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -742,7 +742,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "7d0f7d966a3be39fb1474610c5f8b5556b869946209c669b7d0320820f743e67",
+            "closure_sha256": "c3d56122dfcacd919f5fe1726f5f760a38601509cbb0ae9444f08f024c66d175",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -751,7 +751,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "7d0f7d966a3be39fb1474610c5f8b5556b869946209c669b7d0320820f743e67",
+        "closure_sha256": "c3d56122dfcacd919f5fe1726f5f760a38601509cbb0ae9444f08f024c66d175",
     },
     "cake_kimi_k3_fused_router_lc8_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -759,10 +759,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": 8,
         "main": {
-            "module": "cake_kimi_k3_fused_router_687d3eb31e88dd3d4fe4",
+            "module": "cake_kimi_k3_fused_router_7d3b45a1a4beac9477e2",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_687d3eb31e88dd3d4fe4_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_687d3eb31e88dd3d4fe4_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_7d3b45a1a4beac9477e2_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_7d3b45a1a4beac9477e2_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -782,7 +782,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "ef39c0d9349d852e3222c3faad46bd69b8eb0b399b017eb6b0d6d20c95e7c494",
+            "closure_sha256": "f51d27b8c921356cba70204b87cc235500274f8432d47a5382ba0577dfc3ac4d",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -791,7 +791,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "ef39c0d9349d852e3222c3faad46bd69b8eb0b399b017eb6b0d6d20c95e7c494",
+        "closure_sha256": "f51d27b8c921356cba70204b87cc235500274f8432d47a5382ba0577dfc3ac4d",
     },
     "cake_kimi_k3_fused_router_lc8_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -799,10 +799,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": 8,
         "main": {
-            "module": "cake_kimi_k3_fused_router_4b77f12f97bdf73aace5",
+            "module": "cake_kimi_k3_fused_router_8e28449694e1a739dabf",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_4b77f12f97bdf73aace5_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_4b77f12f97bdf73aace5_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_8e28449694e1a739dabf_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_8e28449694e1a739dabf_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -822,7 +822,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "d3b9baa76ac41171e2d0247bf0bcef2393485eecde0f56a5cbf8c70ab97d2782",
+            "closure_sha256": "f76361e81b2c8490593795cbac9913cc0976371a00f663a7308ca6da573939ce",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -831,7 +831,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 16896,
             },
         },
-        "closure_sha256": "d3b9baa76ac41171e2d0247bf0bcef2393485eecde0f56a5cbf8c70ab97d2782",
+        "closure_sha256": "f76361e81b2c8490593795cbac9913cc0976371a00f663a7308ca6da573939ce",
     },
     "cake_kimi_k3_fused_router_m_bm16_sm_100a": {
         "arch": "sm_100a",
@@ -839,10 +839,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_e0cc8f0932d5baed8fe1",
+            "module": "cake_kimi_k3_fused_router_e4f337433abc128800e4",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_e0cc8f0932d5baed8fe1_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_e0cc8f0932d5baed8fe1_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_e4f337433abc128800e4_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_e4f337433abc128800e4_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -862,7 +862,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "19369612b7f68289c6d9026daed61aa3871fee0300ff68683ab3daa81444446f",
+            "closure_sha256": "cce4f0b8917b1f27d21da4e7a48ed32d299b5876bd9a87711b6465babedc6942",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -871,7 +871,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 17152,
             },
         },
-        "closure_sha256": "19369612b7f68289c6d9026daed61aa3871fee0300ff68683ab3daa81444446f",
+        "closure_sha256": "cce4f0b8917b1f27d21da4e7a48ed32d299b5876bd9a87711b6465babedc6942",
     },
     "cake_kimi_k3_fused_router_m_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -879,10 +879,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_87037221a467ba60ef3e",
+            "module": "cake_kimi_k3_fused_router_d42ceac9854c7a339581",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_87037221a467ba60ef3e_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_87037221a467ba60ef3e_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_d42ceac9854c7a339581_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_d42ceac9854c7a339581_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -902,7 +902,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "d52448105d66c5a0db316a2e0890256966006eb467cfbbd621121a4caf2e6b17",
+            "closure_sha256": "14f1846b6949c68dd44bb146e76fd5cfc6a9ac20b6c6c65257b6018b4d29578d",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -911,7 +911,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 17152,
             },
         },
-        "closure_sha256": "d52448105d66c5a0db316a2e0890256966006eb467cfbbd621121a4caf2e6b17",
+        "closure_sha256": "14f1846b6949c68dd44bb146e76fd5cfc6a9ac20b6c6c65257b6018b4d29578d",
     },
     "cake_kimi_k3_fused_router_m_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -919,10 +919,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_8df07d0382f0a9cc0018",
+            "module": "cake_kimi_k3_fused_router_421da233b459c4da3f96",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_8df07d0382f0a9cc0018_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_8df07d0382f0a9cc0018_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_421da233b459c4da3f96_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_421da233b459c4da3f96_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -942,7 +942,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "1982d8f2f6a5edf0b033ba7112b35d0be86cd29c498522e31ffd3bf3c104991a",
+            "closure_sha256": "89cdebf236f7b3ba684e456dc74c0324be76f25e76f02c9249f62404b6428a38",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -951,7 +951,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 17152,
             },
         },
-        "closure_sha256": "1982d8f2f6a5edf0b033ba7112b35d0be86cd29c498522e31ffd3bf3c104991a",
+        "closure_sha256": "89cdebf236f7b3ba684e456dc74c0324be76f25e76f02c9249f62404b6428a38",
     },
     "cake_kimi_k3_fused_router_m_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -959,10 +959,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_d9b2d4218bb4f5ed1681",
+            "module": "cake_kimi_k3_fused_router_c7aec6c7cb086f97540e",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_d9b2d4218bb4f5ed1681_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_d9b2d4218bb4f5ed1681_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_c7aec6c7cb086f97540e_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_c7aec6c7cb086f97540e_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -982,7 +982,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "53c6e08c5d81e9ab080c387b7032c63d844cbfe1c7c24dfdc29d51ef2918b1fb",
+            "closure_sha256": "242abe44526dd4e30087479ab88a6e8c2aabe997b53f4a0a7002503b696c3ca6",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -991,7 +991,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 17152,
             },
         },
-        "closure_sha256": "53c6e08c5d81e9ab080c387b7032c63d844cbfe1c7c24dfdc29d51ef2918b1fb",
+        "closure_sha256": "242abe44526dd4e30087479ab88a6e8c2aabe997b53f4a0a7002503b696c3ca6",
     },
     "cake_kimi_k3_fused_router_q4s_bm16_sm_100a": {
         "arch": "sm_100a",
@@ -999,10 +999,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_f2f835f5e1255ba2f435",
+            "module": "cake_kimi_k3_fused_router_0313c6cbad861be08246",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_f2f835f5e1255ba2f435_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_f2f835f5e1255ba2f435_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_0313c6cbad861be08246_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_0313c6cbad861be08246_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -1022,7 +1022,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "3e8f6a8609e067ea4434e71f1fcf05417a7d6e6c92c97ad261369bb9833b8df5",
+            "closure_sha256": "3e3fc9f5eb2df916c8feec929fed077fdd1ef959ddacbdc3f63bfabf7662933a",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -1031,7 +1031,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 49408,
             },
         },
-        "closure_sha256": "3e8f6a8609e067ea4434e71f1fcf05417a7d6e6c92c97ad261369bb9833b8df5",
+        "closure_sha256": "3e3fc9f5eb2df916c8feec929fed077fdd1ef959ddacbdc3f63bfabf7662933a",
     },
     "cake_kimi_k3_fused_router_q4s_bm16_sm_103a": {
         "arch": "sm_103a",
@@ -1039,10 +1039,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 16,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_79711f0ec38a6d1cde59",
+            "module": "cake_kimi_k3_fused_router_0abb4bf1a75075608fa0",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_79711f0ec38a6d1cde59_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_79711f0ec38a6d1cde59_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_0abb4bf1a75075608fa0_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_0abb4bf1a75075608fa0_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -1062,7 +1062,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "18296e39dda320050af7b85e35a37deea9b4e5f1197116fcc8179b6acf13d8db",
+            "closure_sha256": "788c7883836084c712ba8ad961b304d755130745b9af20db6aa1babb8add73e0",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -1071,7 +1071,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 49408,
             },
         },
-        "closure_sha256": "18296e39dda320050af7b85e35a37deea9b4e5f1197116fcc8179b6acf13d8db",
+        "closure_sha256": "788c7883836084c712ba8ad961b304d755130745b9af20db6aa1babb8add73e0",
     },
     "cake_kimi_k3_fused_router_q4s_bm8_sm_100a": {
         "arch": "sm_100a",
@@ -1079,10 +1079,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_f2a8eeb7288f49a287ab",
+            "module": "cake_kimi_k3_fused_router_cf56795d077b30cd1733",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_f2a8eeb7288f49a287ab_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_f2a8eeb7288f49a287ab_binding.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_cf56795d077b30cd1733_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_100a/cake_kimi_k3_fused_router_cf56795d077b30cd1733_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -1102,7 +1102,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "f81df76a6284a6f2d7bba4b6ca78d438db9ff66437c20f87e774b870cc46e5ce",
+            "closure_sha256": "d8ce8d3fa24f41254bf56e80524446013ee0a0c1766e1629c9b7b0a5d7921c1e",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -1111,7 +1111,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 49408,
             },
         },
-        "closure_sha256": "f81df76a6284a6f2d7bba4b6ca78d438db9ff66437c20f87e774b870cc46e5ce",
+        "closure_sha256": "d8ce8d3fa24f41254bf56e80524446013ee0a0c1766e1629c9b7b0a5d7921c1e",
     },
     "cake_kimi_k3_fused_router_q4s_bm8_sm_103a": {
         "arch": "sm_103a",
@@ -1119,10 +1119,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "block_m": 8,
         "num_tokens": None,
         "main": {
-            "module": "cake_kimi_k3_fused_router_3c1cb22024b4758cfadb",
+            "module": "cake_kimi_k3_fused_router_939c478d3e1895f177ee",
             "sources": [
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_3c1cb22024b4758cfadb_kernel.cu",
-                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_3c1cb22024b4758cfadb_binding.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_939c478d3e1895f177ee_kernel.cu",
+                "cake_kimi_k3_fused_router/sm_103a/cake_kimi_k3_fused_router_939c478d3e1895f177ee_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -1142,7 +1142,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "416de1a8c549bf0a2e9963a4e5caf90f4469cfdc5a34dc0b5157eb86a210d911",
+            "closure_sha256": "0d92399e989a244b66e6dffa74760d35e12467af9db08758029ad84b7e313875",
             "tma_workspace_bytes": 0,
             "launch": {
                 "block": [224, 1, 1],
@@ -1151,7 +1151,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 "dynamic_smem_bytes": 49408,
             },
         },
-        "closure_sha256": "416de1a8c549bf0a2e9963a4e5caf90f4469cfdc5a34dc0b5157eb86a210d911",
+        "closure_sha256": "0d92399e989a244b66e6dffa74760d35e12467af9db08758029ad84b7e313875",
     },
 }
 
