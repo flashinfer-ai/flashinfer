@@ -148,7 +148,7 @@ MERGE_KWARGS = (
 
 
 def _fast_divmod(divisor: int) -> tvm_ffi.Shape:
-    """Three-field carrier of a generated ``LoomFastDivmod`` parameter: the
+    """Three-field carrier of a generated fast-divmod kernel parameter: the
     divisor with its CUTLASS FastDivmod multiplier and shift (host-derived so
     the kernel's single-warp prologue passes divide with one umulhi + shift)."""
     divisor = int(divisor)
@@ -166,7 +166,7 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Host plan (port of loom.examples.weave.mla_varq_dcp_decode.plan_varq_dcp_decode)
+# Host plan (port of the Cake kernel module's plan_varq_dcp_decode)
 # ---------------------------------------------------------------------------
 
 
