@@ -23,7 +23,10 @@ import pytest
 import torch
 
 from flashinfer.cake_vsa_sm90 import (
+    MAX_NSPLIT,
     PLAN_HALFWORDS,
+    PLAN_META,
+    SMALL_KMAX_VARIANTS,
     SMALL_OCCUPANCY,
     CakeVsaSm90Plan,
     MAX_OWN,
@@ -38,6 +41,7 @@ from flashinfer.cake_vsa_sm90 import (
     plan_small,
     plan_vsa_sm90,
     small_route,
+    split_kmax,
 )
 
 
@@ -70,43 +74,103 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
 @pytest.mark.parametrize(
     "h,mb,nb,capacity,expected",
     [
-        (1, 1, 1, 1, 1),  # one tile, one block
-        (4, 4, 4, 1, 1),  # 16 tiles
-        (8, 4, 4, 3, 3),
-        (8, 16, 16, 4, 4),  # 128 tiles at 1 CTA/SM
-        (8, 17, 16, 4, None),  # 136 tiles > 132 SMs at 1 CTA/SM
-        (8, 64, 64, 1, 1),  # 512 tiles at 4 CTAs/SM
-        (8, 32, 32, 8, None),  # 8 blocks > KMAX 6
-        (2, 128, 32, 6, None),  # 256 x 7 halfwords > PLAN_HALFWORDS
+        (1, 1, 1, 1, (1, False)),  # one tile, one block
+        (4, 4, 4, 1, (1, False)),  # 16 tiles
+        (8, 4, 4, 3, (3, False)),
+        (8, 16, 16, 4, (4, False)),  # 128 tiles at 1 CTA/SM
+        (8, 17, 16, 4, None),  # 136 tiles > 132 SMs at 1 CTA/SM, too many for the split rule
+        (8, 64, 64, 1, (1, False)),  # 512 tiles at 4 CTAs/SM
+        (8, 32, 32, 8, None),  # 8 blocks > KMAX 6, 256 tiles fill the persistent kernel
+        (2, 128, 32, 6, None),  # 256 x 8 halfwords > PLAN_HALFWORDS
+        (1, 16, 16, 16, "split"),  # one head, 16 x 16 blocks: 32 warpgroups < 132 SMs -> split-KV
+        (2, 8, 64, 32, "split"),  # 16 tiles x 32 blocks: 6 slices of KMAX 6 = 96 items
+        (2, 8, 64, 64, None),  # 16 tiles x 64 blocks: no one-wave variant fits the plan budget
     ],
 )
 def test_small_route_rule(h, mb, nb, capacity, expected):
     mask = _random_mask(h, mb, nb, capacity, ragged=False)
-    assert small_route(mask, sms=132) == expected
-    if expected is not None:
-        assert h * mb <= SMALL_OCCUPANCY[expected] * 132
-        assert h * mb * (expected + 1) <= PLAN_HALFWORDS
+    route = small_route(mask, sms=132)
+    if expected == "split":
+        assert route is not None and route[1] is True
+        kmax = route[0]
+        assert kmax in SMALL_KMAX_VARIANTS and 2 * h * mb <= 132
+        items = h * mb * -(-capacity // kmax)
+        assert items <= SMALL_OCCUPANCY[kmax] * 132
+        assert items * (kmax + PLAN_META) <= PLAN_HALFWORDS
+        assert kmax == split_kmax([capacity] * (h * mb), sms=132)
+    else:
+        assert route == expected
+    if expected not in (None, "split"):
+        assert h * mb <= SMALL_OCCUPANCY[expected[0]] * 132
+        assert h * mb * (expected[0] + PLAN_META) <= PLAN_HALFWORDS
+
+
+def _decode_small_rows(plan):
+    stride = plan["kmax"] + PLAN_META
+    rows = plan["plan"][: plan["num_items"] * stride].view(-1, stride).int()
+    out = []
+    for i in range(rows.shape[0]):
+        meta = int(rows[i, 0])
+        out.append(
+            {
+                "count": meta & 15,
+                "split": (meta >> 4) & 63,
+                "nsplit": meta >> 10,
+                "tile": int(rows[i, 1]),
+                "blocks": [int(b) for b in rows[i, PLAN_META:] if int(b) >= 0],
+            }
+        )
+    return out
 
 
 def test_plan_small_layout_and_padding():
     mask = _random_mask(3, 5, 9, 4, seed=3, ragged=True)
     plan = plan_small(mask)
-    assert plan["kmax"] == 4 and plan["num_tiles"] == 15
+    assert plan["kmax"] == 4 and plan["num_tiles"] == plan["num_items"] == 15
+    assert not plan["split"] and plan["max_nsplit"] == 1
     rows = plan["plan"]
     assert rows.dtype == torch.int16 and rows.numel() == PLAN_HALFWORDS
-    stride = plan["kmax"] + 1
-    for tile in range(15):
+    stride = plan["kmax"] + PLAN_META
+    for tile, row in enumerate(_decode_small_rows(plan)):
         head, qb = divmod(tile, 5)
-        row = rows[tile * stride : (tile + 1) * stride].tolist()
         selected = mask[head, qb].nonzero().flatten().tolist()
-        assert row[0] == len(selected)
-        assert row[1 : 1 + len(selected)] == selected
-        assert all(v == -1 for v in row[1 + len(selected) :])
+        assert row["tile"] == tile and row["nsplit"] == 1 and row["split"] == 0
+        assert row["count"] == len(selected) and row["blocks"] == selected
+        raw = rows[tile * stride : (tile + 1) * stride].tolist()
+        assert all(v == -1 for v in raw[PLAN_META + len(selected) :])
     assert bool((rows[15 * stride :] == -1).all())
     with pytest.raises(ValueError, match="cannot hold"):
         plan_small(mask, kmax=3)
     with pytest.raises(ValueError, match="exceed"):
         plan_small(_random_mask(2, 128, 32, 6, ragged=False))
+
+
+@pytest.mark.parametrize("kmax", [1, 3, 4, 6])
+def test_plan_small_split_slices_cover_each_selection_once(kmax):
+    mask = _random_mask(1, 16, 64, 16, seed=5, ragged=True)
+    plan = plan_small(mask, kmax=kmax, split=True)
+    rows = _decode_small_rows(plan)
+    assert plan["split"] and plan["num_items"] == len(rows) and plan["num_tiles"] == 16
+    for tile in range(16):
+        selected = mask[0, tile].nonzero().flatten().tolist()
+        slices = [r for r in rows if r["tile"] == tile]
+        nsplit = -(-len(selected) // kmax)
+        assert len(slices) == nsplit and all(r["nsplit"] == nsplit for r in slices)
+        assert [r["split"] for r in slices] == list(range(nsplit))
+        assert all(1 <= r["count"] == len(r["blocks"]) <= kmax for r in slices)
+        assert max(r["count"] for r in slices) - min(r["count"] for r in slices) <= 1
+        assert sorted(b for r in slices for b in r["blocks"]) == selected
+    # Slices of one query block are consecutive items (the merge derives the
+    # first item as ``item - split``).
+    firsts = [i for i, r in enumerate(rows) if r["split"] == 0]
+    assert all(
+        rows[i + j]["tile"] == rows[i]["tile"]
+        for i in firsts
+        for j in range(rows[i]["nsplit"])
+    )
+    assert plan["max_nsplit"] == max(r["nsplit"] for r in rows) <= MAX_NSPLIT
+    with pytest.raises(ValueError, match="slices"):
+        plan_small(torch.ones((1, 1, 64), dtype=torch.bool), kmax=1, split=True)
 
 
 def _decode_tiles(plan):
@@ -328,6 +392,77 @@ def test_small_and_persistent_routes_agree(h, mb, nb, capacity, scale):
     # Auto routing picks the small kernel for every one of these problems.
     auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
     assert auto.mode == "small"
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "h,mb,nb,capacity,scale,ragged",
+    [
+        (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row
+        (1, 16, 64, 16, 0.5, True),
+        (2, 8, 64, 64, None, True),  # 64 blocks -> up to 11 slices at KMAX 6
+        (1, 1, 2, 2, 1e-7, False),  # two slices of one block
+        (3, 5, 10, 9, 0.0, True),
+        (3, 5, 10, 9, -0.125, True),
+    ],
+)
+def test_split_route_against_persistent(h, mb, nb, capacity, scale, ragged):
+    """The split-KV small kernel matches the persistent kernel and the reference; runs twice."""
+    mask = _random_mask(h, mb, nb, capacity, seed=13, ragged=ragged, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(h, mb, nb)
+    split = CakeVsaSm90Plan(
+        "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="smallsplit"
+    )
+    assert split.mode == "smallsplit" and split.small_split
+    assert split.num_items > split.num_tiles
+    first = split.run(q, k, v).float()
+    second = split.run(q, k, v).float()
+    torch.cuda.synchronize()
+    # The last-arriving CTA resets its query block's counter: the plan replays.
+    assert int(split.counters.abs().sum()) == 0
+    torch.testing.assert_close(first, second, atol=0, rtol=0)
+    persistent = CakeVsaSm90Plan(
+        "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="persistent"
+    )
+    reference = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale).float()
+    for name, out in (("smallsplit", first), ("persistent", persistent.run(q, k, v).float())):
+        torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
+        assert float((out - reference).abs().max()) <= 0.03, name
+    auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
+    expected_mode = "smallsplit" if 2 * h * mb <= torch.cuda.get_device_properties(0).multi_processor_count else auto.mode
+    assert auto.mode == expected_mode
+
+
+@requires_hopper
+def test_split_plan_stream_and_graph_lifetime():
+    """Split workspace built on another stream; graph replays reuse the reset counters."""
+    h, mb, nb = 1, 16, 16
+    mask = _random_mask(h, mb, nb, 16, seed=17, ragged=False, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    producer = torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        plan = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128)
+    assert plan.mode == "smallsplit"
+    q, k, v = _inputs(h, mb, nb)
+    expected = plan.run(q, k, v).clone()
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    plan.run(q, k, v, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(q, k, v, out=out)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.view_as(q), expected, atol=0, rtol=0)
+    assert int(plan.counters.abs().sum()) == 0
+    q.normal_()
+    graph.replay()
+    torch.testing.assert_close(
+        out.view_as(q), _reference(q, k, v, mask, 128**-0.5), atol=0.01, rtol=0.01
+    )
 
 
 @requires_hopper

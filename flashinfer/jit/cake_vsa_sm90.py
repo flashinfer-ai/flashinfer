@@ -37,8 +37,19 @@ _GENERATED_ROOT = "csrc/cake_vsa_sm90"
 _MANIFEST_NAME = "cake_vsa_sm90_manifest.json"
 _ARCH = "sm_90a"
 # Persistent pair/split route plus the small-selection route (one CTA per query
-# block, plan in the kernel-parameter constant bank) in four KMAX variants.
-STAGES = ("attention", "small_k1", "small_k3", "small_k4", "small_k6")
+# block, plan in the kernel-parameter constant bank) in four KMAX variants, each
+# also as a split-KV variant (selections sliced across CTAs, last-CTA merge).
+STAGES = (
+    "attention",
+    "small_k1",
+    "small_k3",
+    "small_k4",
+    "small_k6",
+    "small_k1s",
+    "small_k3s",
+    "small_k4s",
+    "small_k6s",
+)
 
 
 def _get_csrc_dir() -> Path:
