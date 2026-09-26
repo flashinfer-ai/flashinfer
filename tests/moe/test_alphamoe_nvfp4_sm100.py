@@ -593,6 +593,7 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
         top_k=_COMPLETE_TOP_K, block_m=_COMPLETE_BLOCK_M, routed_scaling_factor=1.0,
         w1_scale_prepared=api.prepare_nvfp4_w1_scales(w1_scale), w2_scale_prepared=api.prepare_nvfp4_w2_scales(w2_scale),
         w1_data_prepared=api.prepare_nvfp4_w1_data(w1) if prepared_data else None,
+        w1_scale_prepared_interleaved=api.prepare_nvfp4_w1_scales_interleaved(w1_scale) if prepared_data else None,
     )
     seed_out = torch.randn((m, _COMPLETE_K), device=device, generator=generator).to(torch.bfloat16)
 
@@ -609,8 +610,8 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
 
 @pytest.mark.parametrize(
     "m,prepared_data,expected_route",
-    [(1, False, 1), (4, False, 8), (8, False, 2), (8, True, 9), (16, False, 7), (128, False, 3)],
-    ids=["m1_route1", "m4_route8", "m8_route2", "m8_route9", "m16_route7", "m128_route3_not_deferrable"],
+    [(1, False, 1), (4, False, 8), (8, False, 2), (8, True, 9), (16, False, 7), (16, True, 9), (128, False, 3)],
+    ids=["m1_route1", "m4_route8", "m8_route2", "m8_route9", "m16_route7", "m16_route9", "m128_route3_not_deferrable"],
 )
 def test_alphamoe_nvfp4_deferred_finalize_matches_routed(m, prepared_data, expected_route):
     _skip_if_not_supported()
@@ -621,6 +622,7 @@ def test_alphamoe_nvfp4_deferred_finalize_matches_routed(m, prepared_data, expec
         case["hidden_states"], case["hidden_states_scale"], case["gemm1_weights"], case["gemm1_weights_scale"],
         case["gemm2_weights_scale"], case["topk_ids"], seed_out, case["top_k"], case["block_m"],
         case["w1_scale_prepared"], case["w1_data_prepared"],
+        w1_scale_prepared_interleaved=case.get("w1_scale_prepared_interleaved"), w2_scale_prepared=case["w2_scale_prepared"],
     )
     assert route_id == expected_route, route_id
 

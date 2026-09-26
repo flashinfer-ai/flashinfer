@@ -90,6 +90,15 @@ static bool DeferrableCompleteRoute(int64_t route_id) {
   return route_id == 1 || route_id == 2 || route_id == 7 || route_id == 8 || route_id == 9;
 }
 
+// Largest token count the route-9 decode chain (c416p up + c405v5 down + c402 r9 finalize) admits beyond
+// M=8. Its in-kernel alignment holds M * top_k <= 256 pairs; the admitted band is set from measurement and
+// mirrors ``_ROUTE9_MAX_M`` on the host.
+constexpr int64_t kRoute9MaxTokens = 16;
+
+inline bool Route9TokenBand(int64_t route_id, int64_t m, bool route9_fast) {
+  return route_id == 9 && (m == 8 || (route9_fast && m > 8 && m <= kRoute9MaxTokens));
+}
+
 static float* SeedWorkspacePtr(const tvm::ffi::Optional<TensorView>& initial_out) {
   return initial_out.has_value() ? static_cast<float*>(initial_out.value().data_ptr()) : nullptr;
 }
@@ -78983,6 +78992,16 @@ void RunCompleteRoutedImpl(
   const bool packed_scales = reinterpret_cast<uintptr_t>(hidden_states_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
+  // Route-9 fast chain (c416p up with in-kernel alignment, c405v5 persistent down, c402 r9 finalize): selected
+  // when the caller owns the prepared W1 data panels, the interleaved W1 scale panels and the prepared W2 scale
+  // panels. M=8 without them falls back to the c307/c338 chain; 9..kRoute9MaxTokens tokens require the fast chain.
+  const bool route9_fast = owner_plan.has_value() && owner_count.has_value() && act_workspace.has_value() && sf_workspace.has_value() &&
+        HasPreparedScale(w1_data_prepared, gemm1_weights,
+                         gemm1_weights.size(0) * (dims.n / 128) * (dims.k / 256), 128) &&
+        HasPreparedScale(w1_scale_prepared_interleaved, gemm1_weights_scale,
+                         gemm1_weights.size(0) * (dims.n / 128) * (dims.k / 256), 16) &&
+        HasPreparedScale(w2_scale_prepared, gemm2_weights_scale,
+                         gemm1_weights.size(0) * (dims.k / 128) * blocks, 8);
   if (route_id == 1) {
     TVM_FFI_ICHECK(dims.m == 1 || dims.m == 8) << "split-K route requires one or eight tokens";
     TVM_FFI_ICHECK(partial_workspace.has_value()) << "missing split-K workspace";
@@ -78990,7 +79009,7 @@ void RunCompleteRoutedImpl(
     CheckSameDevice(partial_workspace.value(), device_id, "partial_workspace");
     CheckShape2(partial_workspace.value(), capacity * blocks, 8192, "partial_workspace");
   } else {
-    TVM_FFI_ICHECK(((route_id == 2 || route_id == 9) && dims.m == 8) || ((route_id == 3 || route_id == 10 || route_id == 11) && dims.m == 128) ||
+    TVM_FFI_ICHECK((route_id == 2 && dims.m == 8) || Route9TokenBand(route_id, dims.m, route9_fast) || ((route_id == 3 || route_id == 10 || route_id == 11) && dims.m == 128) ||
         ((route_id == 4 || route_id == 5 || route_id == 12 || route_id == 13 || route_id == 14 || route_id == 15) && dims.m == 512) ||
         (route_id == 6 && dims.m >= 128 && dims.m != 128 && dims.m != 512) ||
         (route_id == 7 && dims.m >= 8 && dims.m < 128 && dims.m != 8) ||
@@ -79032,14 +79051,7 @@ void RunCompleteRoutedImpl(
   // S7: the route-9 fast path (c402r9ns) and every c368-finalized route have a no-seed finalizer twin; with
   // accumulate == false they write the weighted route sum directly. Every other route seeds from `out`, so the
   // caller-visible semantics (result == seeded path on a zero output) are kept with one zero fill here.
-  const bool s7_m8_fast = dims.m == 8 && owner_plan.has_value() && owner_count.has_value() && act_workspace.has_value() && sf_workspace.has_value() &&
-        HasPreparedScale(w1_data_prepared, gemm1_weights,
-                         gemm1_weights.size(0) * (dims.n / 128) * (dims.k / 256), 128) &&
-        HasPreparedScale(w1_scale_prepared_interleaved, gemm1_weights_scale,
-                         gemm1_weights.size(0) * (dims.n / 128) * (dims.k / 256), 16) &&
-        HasPreparedScale(w2_scale_prepared, gemm2_weights_scale,
-                         gemm1_weights.size(0) * (dims.k / 128) * blocks, 8);
-  const bool s7_direct_write = route_id == 10 || route_id == 12 || route_id == 14 || (route_id == 9 && s7_m8_fast);
+  const bool s7_direct_write = route_id == 10 || route_id == 12 || route_id == 14 || (route_id == 9 && route9_fast);
   if (!accumulate && !deferred && !s7_direct_write) {
     CheckCuda(cudaMemsetAsync(out.data_ptr(), 0, static_cast<size_t>(out.numel()) * sizeof(__nv_bfloat16), stream), "accumulate=false output fill");
   }
@@ -79288,11 +79300,11 @@ void RunCompleteRoutedImpl(
       ? EncodePreparedScaleTma(w1_gate_up_scale_prepared.value(), 32)
       : EncodePreparedScaleTma(w1_scale_prepared.value(), 16);
   if (route_id == 9) {
-    // ---- S5b fast path (M=8): c416p up (in-kernel alignment; existing prepared W1 panels read as two 64-row boxes per
+    // ---- S5b fast path (M=8, and 9..kRoute9MaxTokens tokens with every carrier): c416p up (in-kernel alignment; existing prepared W1 panels read as two 64-row boxes per
     // stage + interleaved CP scale panels), c405v5 persistent down (prepared W2 scale panels, 32 z-slices) and the c402 r9
     // BF16-seed finalize (skipped when deferred). Selected only when the caller supplies the prepared W1 data panels, the
     // interleaved W1 scale panels and the prepared W2 scale panels. ----
-    if (s7_m8_fast) {
+    if (route9_fast) {
       TVM_FFI_ICHECK(blocks == 4) << "S5 M=8 route requires N = 1024 (eight 64-feature panels)";
       TVM_FFI_ICHECK(topk_ids.numel() <= 256 && gemm1_weights.size(0) + 1 <= 257) << "S5 M=8 in-kernel alignment capacity";
       CheckNoOverlap(out, w1_data_prepared.value(), "w1_data_prepared");
@@ -80446,7 +80458,7 @@ void RunCompleteRoutedFinalize(TensorView route_accumulator, TensorView route_ex
   const int64_t m = out.size(0);
   const int64_t k = out.size(1);
   TVM_FFI_ICHECK(top_k == 8 && k == 6144 && m >= 1) << "deferred finalize requires the complete route geometry";
-  TVM_FFI_ICHECK((route_id == 1 && (m == 1 || m == 8)) || ((route_id == 2 || route_id == 9) && m == 8) ||
+  TVM_FFI_ICHECK((route_id == 1 && (m == 1 || m == 8)) || (route_id == 2 && m == 8) || (route_id == 9 && m >= 8 && m <= kRoute9MaxTokens) ||
                  (route_id == 8 && m >= 2 && m < 8) || (route_id == 7 && m >= 8 && m < 128))
       << "deferred finalize route id does not match token count";
   CheckShape2(seed, m, k, "seed");

@@ -34,6 +34,9 @@ from ..utils import (
 _SUPPORTED_CC = [100, 103]
 _ROUTE_SUBTILE = 8
 _UP_BLOCK_K = 256
+# Largest token count the route-9 decode chain admits beyond M=8. The in-kernel alignment of its up
+# kernel holds M * top_k <= 256 pairs (M <= 32 for top-8); the admitted band is set from measurement.
+_ROUTE9_MAX_M = 16
 _W1_ROWS = 256
 _INT32_MAX = 2**31 - 1
 
@@ -950,6 +953,8 @@ def alphamoe_nvfp4_routed_moe(
             w1_data_prepared,
             w1_gate_up_data_prepared,
             w1_gate_up_scale_prepared,
+            w1_scale_prepared_interleaved,
+            w2_scale_prepared,
         )
     ):
         raise ValueError("routed companion requires supported route metadata")
@@ -1279,8 +1284,15 @@ def _alphamoe_complete_route_id(
     w1_data_prepared=None,
     w1_gate_up_data_prepared=None,
     w1_gate_up_scale_prepared=None,
+    w1_scale_prepared_interleaved=None,
+    w2_scale_prepared=None,
 ):
-    """Select complete routes from immutable host metadata and owned sidecars."""
+    """Select complete routes from immutable host metadata and owned sidecars.
+
+    Route 9 (in-kernel-aligned prepared-W1 up + persistent BF16-route down) covers the eight-token
+    decode shape and, when the caller also owns the interleaved W1 scale panels and the prepared W2
+    scale panels its kernels read, the 9..``_ROUTE9_MAX_M``-token decode shapes as well.
+    """
     m, packed_k = hidden_states.shape
     e, n, _ = gemm1_weights.shape
     k = packed_k * 2
@@ -1335,6 +1347,13 @@ def _alphamoe_complete_route_id(
         return 0
     if m == 8:
         return 9 if w1_data_prepared is not None else 2
+    if (
+        8 < m <= _ROUTE9_MAX_M
+        and w1_data_prepared is not None
+        and w1_scale_prepared_interleaved is not None
+        and w2_scale_prepared is not None
+    ):
+        return 9
     if m == 128:
         if w1_data_prepared is not None:
             return 10 if out.data_ptr() % 16 == 0 else 11
@@ -1390,6 +1409,8 @@ def _alphamoe_try_complete_routed(
         w1_data_prepared,
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
+        w1_scale_prepared_interleaved,
+        w2_scale_prepared,
     )
     if route_id == 0:
         return False
@@ -1772,6 +1793,8 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w1_data_prepared,
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
+        w1_scale_prepared_interleaved,
+        w2_scale_prepared,
     )
     topk_weights = topk_weights.contiguous()
     if route_id not in _DEFERRABLE_COMPLETE_ROUTES:
