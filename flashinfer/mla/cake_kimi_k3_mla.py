@@ -42,6 +42,9 @@ WIDE_MIN_KV = 16384
 WIDE_TILE_Q = 128  # packed rows per two-CTA cluster
 WIDE_CLUSTER = 2  # CTAs per cluster: one SM pair per work item
 WIDE_MIN_TILES_PER_SPLIT = 2
+# Per-wave fixed cost (prologue + drain of a work item) in 128-token tile periods; mirrors Cake
+# ``WIDE_WAVE_COST_TILES`` (calibrated on B200: one wave of 305 tiles beat three waves of 99).
+WIDE_WAVE_COST_TILES = 8
 
 
 def _target_arch(device: torch.device) -> str:
@@ -75,12 +78,14 @@ def plan_num_split_wide(
     sm_count: int,
     min_tiles_per_split: int = WIDE_MIN_TILES_PER_SPLIT,
     max_splits: int = MAX_SPLITS,
+    wave_cost_tiles: int = WIDE_WAVE_COST_TILES,
 ) -> int:
     """KV splits per cluster of the wide route (mirrors Cake ``plan_num_split_wide``).
 
     Work items (clusters x splits) run one per SM pair; the cost of ``s`` splits in 128-token
-    tile periods is ``ceil(items / pairs) * ceil(tiles / s)`` plus ~0.05 tile periods per item for
-    the split merge.  A split is taken only when that model predicts at least 15 %.
+    tile periods is ``ceil(items / pairs) * (ceil(tiles / s) + wave_cost_tiles)`` plus ~0.05 tile
+    periods per item for the split merge.  The per-wave term is the prologue + drain every work
+    item pays.  A split is taken only when that model predicts at least 15 %.
     """
     pairs = max(1, sm_count // WIDE_CLUSTER)
     tiles = max(1, (max_seq_len + TILE_TOK - 1) // TILE_TOK)
@@ -88,7 +93,7 @@ def plan_num_split_wide(
     best_s, best_cost, cost_one = 1, None, None
     for s in range(1, max_s + 1):
         items = clusters * s
-        cost = -(-items // pairs) * (-(-tiles // s)) + 0.05 * items
+        cost = -(-items // pairs) * (-(-tiles // s) + wave_cost_tiles) + 0.05 * items
         if s == 1:
             cost_one = cost
         if best_cost is None or cost < best_cost:

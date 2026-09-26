@@ -329,3 +329,32 @@ def test_unsupported_options_rejected():
             backend="cake",
             return_lse=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("clusters", "max_seq_len", "sm_count", "expected"),
+    [
+        # B200 (148 SMs = 74 pairs): the measured-best plan of every long decode row is the largest
+        # split count that still fits one wave; the per-wave cost term keeps the planner there.
+        (6, 467751, 148, 12),
+        (7, 299613, 148, 10),
+        (8, 342305, 148, 9),
+        (48, 342305, 148, 3),
+        # B300 (160 SMs = 80 pairs).
+        (6, 467751, 160, 13),
+        (8, 342305, 160, 10),
+    ],
+)
+def test_wide_split_plan_fills_one_wave(clusters, max_seq_len, sm_count, expected):
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        WIDE_CLUSTER,
+        WIDE_WAVE_COST_TILES,
+        plan_num_split_wide,
+    )
+
+    assert WIDE_WAVE_COST_TILES == 8
+    splits = plan_num_split_wide(clusters, max_seq_len, sm_count)
+    assert splits == expected
+    assert -(-(clusters * splits) // (sm_count // WIDE_CLUSTER)) <= 2
+    # Without the per-wave term the pure wave model prefers three waves of 99 tiles on this row.
+    assert plan_num_split_wide(6, 467751, 148, wave_cost_tiles=0) == 37
