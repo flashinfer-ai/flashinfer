@@ -38,9 +38,11 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   shared-intermediate width (TP1 6144, TP8 768);
 # * ``tail_norm:e<0|1>`` the one-pass RMSNorm kernel with the late / early
 #   ``griddepcontrol.launch_dependents`` trigger the host plan selects;
-# * ``tail_gemm:tp<1|8>e<0|1>`` the persistent 2-CTA prefill tail GEMM (PDL launch,
-#   trailing-wave stream-K) per tensor-parallel degree; ``e1`` loads the weight
-#   boxes with the ``evict_first`` L2 policy (single-wave grids).
+# * ``tail_gemm:tp<1|8>e<0|1>f<0|1>`` the persistent 2-CTA prefill tail GEMM (PDL
+#   launch, trailing-wave stream-K) per tensor-parallel degree; ``e1`` loads the
+#   weight boxes with the ``evict_first`` L2 policy (single-wave grids); ``f1``
+#   fuses the RMSNorm into the launch (the epilogue warps normalise the latent
+#   rows, no ``tail_norm`` launch; TP1 T = 256 / 512).
 #
 # Every module is an exact-architecture program (tcgen05 / TMEM / TMA).  Both
 # literals are populated verbatim by the generated-program export; do not

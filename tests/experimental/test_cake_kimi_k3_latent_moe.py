@@ -147,6 +147,12 @@ def test_prefill_tail_plan_and_trigger():
     assert tp1["gemm_grid"] == (tp1["num_items"]) * 2 and not tp1["early_trigger"]
     assert plan["weights_evict_first"] and tp1["weights_evict_first"]
     assert not prefill_tail_plan(2048, 1)["weights_evict_first"]
+    # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
+    assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
+    assert not plan["fused_norm"] and not prefill_tail_plan(1024, 1)["fused_norm"]
+    assert cb.use_fused_norm(256, 112, SM_COUNT, 96) and not cb.use_fused_norm(
+        256, 56, SM_COUNT, 12
+    )
     assert cb.weights_evict_first(112, SM_COUNT) and not cb.weights_evict_first(
         224, SM_COUNT
     )
@@ -168,18 +174,20 @@ def test_route_keys_cover_the_row_set():
     }
     assert "front:i6144" in keys and "front:i768" in keys
     assert {k for k in keys if k.startswith("tail_gemm:")} == {
-        "tail_gemm:tp1e0",
-        "tail_gemm:tp1e1",
-        "tail_gemm:tp8e0",
-        "tail_gemm:tp8e1",
+        "tail_gemm:tp1e0f0",
+        "tail_gemm:tp1e1f1",
+        "tail_gemm:tp8e0f0",
+        "tail_gemm:tp8e1f0",
     }
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
     assert route_kernel_keys("front", 1, 256) == ("front:i6144",)
-    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1")
+    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
+    # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel).
+    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1",)
     # Single-wave grids (T = 256 / 512) stream the weights evict_first; persistent grids keep the default policy.
-    assert route_kernel_keys("tail", 1, 512)[1] == "tail_gemm:tp1e1"
-    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0"
-    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0"
+    assert route_kernel_keys("tail", 1, 512) == ("tail_gemm:tp1e1f1",)
+    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0f0"
+    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0f0"
     assert len(route_kernel_keys("tail", 1, 16384)) == 2
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
@@ -455,7 +463,9 @@ def test_tail_matches_reference(tp, tokens):
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
     assert runner.kernel_keys == route_kernel_keys("tail", tp, tokens)
-    assert runner.launch_count == (1 if tokens <= DECODE_MAX_T else 2)
+    assert runner.launch_count == (
+        1 if tokens <= DECODE_MAX_T or runner.plan.get("fused_norm") else 2
+    )
     runner()
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)
