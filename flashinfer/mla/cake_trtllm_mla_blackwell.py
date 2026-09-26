@@ -1264,7 +1264,12 @@ def supports_dimension_tuple(
     ``backend="cake"`` dispatch uses this to leave other MLA families (for example the
     Kimi-K3 FP8 paged-cache route, ``flashinfer.mla.cake_kimi_k3_mla``) to their own kernels.
     """
-    key = (int(qk_nope_head_dim), int(kv_lora_rank), int(qk_rope_head_dim), int(num_heads))
+    key = (
+        int(qk_nope_head_dim),
+        int(kv_lora_rank),
+        int(qk_rope_head_dim),
+        int(num_heads),
+    )
     if int(sparse_mla_top_k) > 0:
         return key in TOPK_DIMENSION_TUPLES
     return key in DENSE_DIMENSION_TUPLES

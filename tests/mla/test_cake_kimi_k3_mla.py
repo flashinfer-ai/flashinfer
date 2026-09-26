@@ -10,6 +10,7 @@ import math
 import pytest
 import torch
 
+from flashinfer.jit.cake_kimi_k3_mla import ROUTES, route_key
 from flashinfer.utils import get_compute_capability
 
 LATENT = 512
@@ -21,9 +22,12 @@ PAGE = 64
 def _skip_unless_sm100_family():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    major, _minor = get_compute_capability(torch.device("cuda"))
-    if major != 10:
-        pytest.skip("CAKE Kimi-K3 MLA requires SM100 / SM103")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    arch = f"sm_{major}{minor}a"
+    # Only architectures with generated programs (sm_100a, sm_103a); other SM100-family parts
+    # such as sm_107a have no route in the registry.
+    if route_key("main_rt16", arch) not in ROUTES:
+        pytest.skip(f"CAKE Kimi-K3 MLA has no generated programs for {arch}")
 
 
 def _fp8(x: torch.Tensor) -> torch.Tensor:
