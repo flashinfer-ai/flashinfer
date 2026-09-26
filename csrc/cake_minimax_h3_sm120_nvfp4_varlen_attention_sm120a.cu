@@ -7194,6 +7194,11 @@ DeviceInfo ConfigureKernels() {
                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kAttentionSmemBytes);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to opt in to dynamic shared memory: " << cudaGetErrorString(status);
+  status = cudaFuncSetAttribute(
+      h3_varlen_attention_nvfp4_short_sm120a::kernel_minimax_h3_sm120_varlen_attention_nvfp4_short,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, kAttentionSmemBytes);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "failed to opt in to dynamic shared memory (short variant): " << cudaGetErrorString(status);
   DeviceInfo info{properties.multiProcessorCount};
   configured.emplace_back(device, info);
   return info;
