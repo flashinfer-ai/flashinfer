@@ -54,6 +54,11 @@ class TileScheduler(IntEnum):
     PERSISTENT = 1
 
 
+class CtaRasterOrder(IntEnum):
+    ALONG_M = 0
+    ALONG_N = 1
+
+
 class ActKind(IntEnum):
     NONE = 0
     SWIGLU = 1
@@ -209,10 +214,17 @@ class BatchedGemmConfig:
     """
 
     epi_tile_n: int = 8
-    """Epilogue tile N (output columns per epilogue call), in elements.
+    """Epilogue TMA-store tile N, in elements.
 
-    When smaller than :attr:`tile_n` the epilogue loops ``tile_n // epi_tile_n``
-    times; also drives the TMEM-to-register (T2R) fragment layout.
+    The TMEM-to-register fragment is the largest supported divisor of this
+    tile that does not exceed :attr:`tmem_ldst_max_num_regs`.
+    """
+
+    tmem_ldst_max_num_regs: int = 32
+    """Maximum register count for one TMEM load; either ``32`` or ``64``.
+
+    Matches TRTLLM-gen's ``tmemLdstMaxNumRegs`` control. The non-transposed
+    ``32x32b`` epilogue selects the largest legal load width up to this cap.
     """
 
     mma_k: int = 64
@@ -622,6 +634,14 @@ class BatchedGemmConfig:
 
     ``STATIC`` (fixed hardware grid) or ``PERSISTENT`` (dynamic CLC work queue).
     See :attr:`is_persistent`.
+    """
+
+    cta_raster_order: int = int(CtaRasterOrder.ALONG_M)
+    """Persistent CTA rasterization order, as a :class:`CtaRasterOrder` value.
+
+    ``ALONG_M`` visits M tiles first; ``ALONG_N`` visits N tiles first. TRTLLM-gen
+    exposes these as ``ctaSwizzleType=rasterizeAlongM/rasterizeAlongN``, but no
+    additional CTA swizzle is applied here.
     """
 
     transpose_mma_output: int = 1
@@ -1433,6 +1453,51 @@ class BatchedGemmConfig:
         return self.epi_tile_m * self.epi_tile_n * self.dtype_c_bits // 8
 
     @property
+    def non_swap_tma_store_cols(self) -> int:
+        """Columns staged by one non-swap C TMA store.
+
+        The four-warp tile256 overlap epilogue can accumulate one complete
+        ``epi_tile_n`` stripe in its C scratch stage before issuing TMA. A
+        swizzled TMA box may span at most 128 contiguous bytes, so a wider
+        stripe is emitted as multiple stores sized for the output element
+        width. Other schedules retain the conservative staging width unless
+        one T2R fragment is wider, in which case the row and TMA box must cover
+        the complete fragment.
+        """
+        if (
+            self.use_tile256_tmem_overlap
+            and self.num_epilogue_warps == 4
+            and self.epi_tile_m == self.tile_m
+        ):
+            max_swizzled_cols = 128 * 8 // self.dtype_c_bits
+            return min(self.epi_tile_n, max_swizzled_cols)
+        fragment_cols = max(1, self.epi_tile_n // 4)
+        return max(fragment_cols, min(16, max(8, self.tile_n)))
+
+    @property
+    def non_swap_tmem_load_num_regs(self) -> int:
+        """Largest legal non-swap ``32x32b`` TMEM load under the configured cap."""
+        # The DeepSeek epilogue carries a same-sized FP32 dequant accumulator
+        # through the K loop and retains its existing conservative fragment.
+        # Non-overlap schedules likewise retain the established four-fragment
+        # layout; the wider load control belongs to the tile256 overlap path.
+        if self.has_deepseek_fp8 or not self.use_tile256_tmem_overlap:
+            return max(1, self.epi_tile_n // 4)
+
+        width_limit = min(self.epi_tile_n, self.tmem_ldst_max_num_regs)
+        if self.use_tma_store:
+            width_limit = min(width_limit, self.non_swap_tma_store_cols)
+        for num_regs in (64, 32, 16, 8, 4, 2, 1):
+            if num_regs <= width_limit and self.epi_tile_n % num_regs == 0:
+                return num_regs
+        return 1
+
+    @property
+    def non_swap_tmem_overlap_loads(self) -> int:
+        """T2R loads needed to preserve the ping-pong window intersection."""
+        return self.epi_tile_n // self.non_swap_tmem_load_num_regs
+
+    @property
     def num_bytes_c_tma_store_per_group(self) -> int:
         """Bytes staged by one TMA-store epilogue warpgroup (halved for a gated epilogue)."""
         stage_bytes = self.num_bytes_c_per_stage
@@ -1699,6 +1764,11 @@ class BatchedGemmConfig:
     def is_persistent(self) -> bool:
         """True for dynamic persistent CLC scheduling (:attr:`tile_scheduler` == PERSISTENT)."""
         return self.tile_scheduler == int(TileScheduler.PERSISTENT)
+
+    @property
+    def raster_along_m(self) -> bool:
+        """Whether the persistent CLC scheduler rasterizes along M."""
+        return self.cta_raster_order == int(CtaRasterOrder.ALONG_M)
 
     @property
     def use_work_throttle_barrier(self) -> bool:
@@ -2597,6 +2667,16 @@ def validate_config(
             f"tile_scheduler must be STATIC or PERSISTENT, got {cfg.tile_scheduler}"
         )
 
+    if cfg.cta_raster_order not in (
+        int(CtaRasterOrder.ALONG_M),
+        int(CtaRasterOrder.ALONG_N),
+    ):
+        raise ValueError(
+            f"cta_raster_order must be ALONG_M or ALONG_N, got {cfg.cta_raster_order}"
+        )
+    if cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N) and not cfg.is_persistent:
+        raise ValueError("cta_raster_order=ALONG_N requires persistent scheduling")
+
     if cfg.cluster_m not in (1, 2):
         raise ValueError(
             "cluster_m must be 1 or 2; the kernel only implements CTA_1/CTA_2 "
@@ -2815,6 +2895,12 @@ def validate_config(
                 f"prefetch_depth={sfb_prefetch_depth}, "
                 f"num_stages_b={cfg.num_stages_b}"
             )
+
+    if cfg.tmem_ldst_max_num_regs not in (32, 64):
+        raise ValueError(
+            f"tmem_ldst_max_num_regs must be 32 or 64, got {cfg.tmem_ldst_max_num_regs}"
+        )
+
     if cfg.use_tma_oob_opt not in (0, 1):
         raise ValueError(f"use_tma_oob_opt must be 0 or 1, got {cfg.use_tma_oob_opt}")
 
@@ -3088,6 +3174,16 @@ def validate_config(
                 f"256 C columns, got total={cfg.tmem_total_cols}, "
                 f"c_cols={cfg.tmem_c_cols_per_stage}"
             )
+        if not cfg.is_swap_ab:
+            overlap_loads = cfg.non_swap_tmem_overlap_loads
+            if overlap_loads not in (1, 2):
+                raise ValueError(
+                    "non-swapped use_max_tmem_overlap supports one or two T2R "
+                    "loads for the shared TMEM region, got "
+                    f"{overlap_loads} (epi_tile_n={cfg.epi_tile_n}, "
+                    "tmem_load_regs="
+                    f"{cfg.non_swap_tmem_load_num_regs})"
+                )
 
     _validate_route_config_option("route_act", cfg.route_act)
     _validate_route_config_option("route_sfs_act", cfg.route_sfs_act)
