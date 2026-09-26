@@ -309,6 +309,21 @@ def _get_static_compact_cutover_pairs(
     return cached
 
 
+def _fixed_order_chunk_tokens(num_topk: int, quant_mode: str) -> int:
+    """Tokens per static launch when the fixed-order finalize is requested.
+
+    Sized from the default static band rather than the env-tunable cutover:
+    the band is what the static kernel's tile and MAC schedule cover, and its
+    workspace grows quadratically with routed rows.
+    """
+    band = (
+        _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
+        if quant_mode == "nvfp4"
+        else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+    )
+    return max(1, band // max(1, int(num_topk)))
+
+
 def _select_moe_mma_tiler_mn(
     routed_rows: int,
     n: int,
@@ -1525,6 +1540,7 @@ def launch_sm120_static_moe(
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
+    use_fused_finalize: bool = True,
 ) -> torch.Tensor:
     """Launch the SM120 static, micro, or direct micro MoE kernel.
 
@@ -1533,6 +1549,11 @@ def launch_sm120_static_moe(
     its band (routed_rows <= 20-40), and the static kernel takes the rest.
     The MMA micro path runs a Triton pre-pass to compact routing IDs before
     launching; direct micro routes on global expert ids directly.
+
+    ``use_fused_finalize=False`` keeps every launch on the static kernel and
+    its fixed-order finalize. The MMA micro kernel adds FC2 partials into the
+    BF16 output atomically; direct micro is skipped too so the mode has one
+    numeric path.
     """
     _check_memref_limit("scatter_output", scatter_output.numel())
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1603,6 +1624,8 @@ def launch_sm120_static_moe(
             use_direct_micro = True
         else:
             use_direct_micro = False
+    if not use_fused_finalize:
+        use_direct_micro = False
     if use_direct_micro:
         compiled, grid_x, block_ok = _get_direct_micro_kernel(
             num_experts,
@@ -1690,6 +1713,8 @@ def launch_sm120_static_moe(
             use_micro = True
         else:
             use_micro = False
+    if not use_fused_finalize:
+        use_micro = False
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
@@ -3401,6 +3426,7 @@ def launch_sm120_moe(
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
     source_format: str = "modelopt",
+    use_fused_finalize: bool = True,
     _workspace=None,
     _weight_views=None,
     _prepared_weights=None,
@@ -3415,6 +3441,9 @@ def launch_sm120_moe(
     across calls to avoid per-call allocation overhead (wrapper path).
     When not provided (functional API path), a module-level workspace cache
     is used to avoid re-allocating on every call.
+
+    use_fused_finalize=False selects the fixed-order finalize: every launch
+    goes to the static kernel, in token chunks that stay inside its band.
     """
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
@@ -3452,9 +3481,13 @@ def launch_sm120_moe(
             quant_mode,
         )
 
-    routed_rows = num_tokens * top_k
-
     if quant_mode == "w4a16":
+        if not use_fused_finalize:
+            raise NotImplementedError(
+                "use_fused_finalize=False is not supported for "
+                "quant_mode='w4a16': the W4A16 kernels have no fixed-order "
+                "finalize."
+            )
         return _launch_sm120_w4a16_moe(
             a=a,
             topk_ids=topk_ids,
@@ -3531,6 +3564,21 @@ def launch_sm120_moe(
         if backend == "dynamic" and num_local_experts != num_experts:
             backend = "static"
 
+    # The static kernel reduces in a fixed order (route-major BF16 store, then
+    # an FP32 sum over top-k); the MMA micro and dynamic kernels add partials
+    # into the BF16 output atomically. MoE output is per token, so larger
+    # inputs run as token chunks inside the static band, which also bounds the
+    # static workspace.
+    chunk_tokens = num_tokens
+    if not use_fused_finalize:
+        if backend == "dynamic" and _workspace is not None:
+            raise ValueError(
+                "use_fused_finalize=False requires a static SM120 MoE workspace."
+            )
+        backend = "static"
+        chunk_tokens = min(num_tokens, _fixed_order_chunk_tokens(top_k, quant_mode))
+    launch_rows = chunk_tokens * top_k
+
     # retained2 always consumes two adjacent N128 slices. Keep that physical
     # padding inside the static dispatch path; the wrapper remains unaware of
     # the schedule and dynamic keeps its native N128 geometry.
@@ -3589,7 +3637,7 @@ def launch_sm120_moe(
             backend=backend,
             state_E=num_local_experts,
             weight_E=num_experts,
-            routed_rows=routed_rows,
+            routed_rows=launch_rows,
             k=k,
             n=n,
             num_topk=top_k,
@@ -3604,7 +3652,7 @@ def launch_sm120_moe(
             workspace,
             state_E=num_local_experts,
             weight_E=num_experts,
-            routed_rows=routed_rows,
+            routed_rows=launch_rows,
             k=k,
             n=n,
             num_topk=top_k,
@@ -3637,27 +3685,42 @@ def launch_sm120_moe(
             activation_precision=activation_precision,
             quant_mode=quant_mode,
         )
-    else:
+    static_kwargs: Dict[str, Any] = dict(
+        workspace=workspace,
+        weights=weights,
+        input_gs=input_gs,
+        down_input_scale=down_input_scale,
+        num_experts=num_experts,
+        k=k,
+        n=n,
+        top_k=top_k,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        activation_precision=activation_precision,
+        quant_mode=quant_mode,
+        use_fused_finalize=use_fused_finalize,
+    )
+    if chunk_tokens >= num_tokens:
         return launch_sm120_static_moe(
-            workspace=workspace,
-            weights=weights,
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            input_gs=input_gs,
-            down_input_scale=down_input_scale,
             scatter_output=scatter_output,
-            num_experts=num_experts,
             num_tokens=num_tokens,
-            k=k,
-            n=n,
-            top_k=top_k,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            activation=activation,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            activation_precision=activation_precision,
-            quant_mode=quant_mode,
+            **static_kwargs,
         )
+    for start in range(0, num_tokens, chunk_tokens):
+        end = min(start + chunk_tokens, num_tokens)
+        launch_sm120_static_moe(
+            a=a[start:end],
+            topk_ids=topk_ids[start:end],
+            topk_weights=topk_weights[start:end],
+            scatter_output=scatter_output[start:end],
+            num_tokens=end - start,
+            **static_kwargs,
+        )
+    return scatter_output

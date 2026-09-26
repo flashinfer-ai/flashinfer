@@ -290,6 +290,37 @@ class TestB12xUnifiedValidation:
         with pytest.raises(NotImplementedError, match="do_finalize"):
             runner.check_support()
 
+    def test_b12x_w4a16_rejects_fixed_order_finalize(self, monkeypatch):
+        config = self._config(
+            B12xW4A16Config(),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            finalize=MoEFinalizeConfig(use_fused_finalize=False),
+        )
+        self._mock_environment(monkeypatch)
+        runner = self._runner(config, B12xW4A16Runner)
+        with pytest.raises(NotImplementedError, match="fixed-order finalize"):
+            runner.check_support()
+
+    @pytest.mark.parametrize("use_fused_finalize", (True, False))
+    def test_b12x_nvfp4_passes_finalize_mode_to_wrapper(
+        self, monkeypatch, use_fused_finalize
+    ):
+        config = self._config(
+            B12xNvfp4Config(),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            finalize=MoEFinalizeConfig(use_fused_finalize=use_fused_finalize),
+        )
+        self._mock_environment(monkeypatch)
+        runner = self._runner(config)
+        assert runner.check_support() is None
+
+        created = []
+        runner._built = True
+        runner._inner = None
+        runner._wrapper_cls = lambda **kwargs: created.append(kwargs) or object()
+        runner._ensure_inner(hidden_size=256, num_tokens=16)
+        assert created[0]["use_fused_finalize"] is use_fused_finalize
+
     def test_layer_skips_runner_when_support_check_fails(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
@@ -463,6 +494,7 @@ def _make_b12x_layer_and_packs(
     num_experts: int,
     top_k: int,
     source_format: str = "modelopt",
+    finalize: MoEFinalizeConfig | None = None,
 ):
     activation_config = _B12X_ACTIVATIONS[activation]
     hidden_size = tensors["x_bf16"].shape[1]
@@ -516,6 +548,7 @@ def _make_b12x_layer_and_packs(
         activation=activation_config,
         backend=BackendOptions((backend_config,)),
         execution=ExecutionConfig(tune_max_num_tokens=tensors["x_bf16"].shape[0]),
+        finalize=finalize or MoEFinalizeConfig(),
     )
     return MoELayer(config), act_pack, weight_pack
 
@@ -943,6 +976,49 @@ class TestUnifiedB12xConformance:
         assert output.shape == tensors["x_bf16"].shape
         assert torch.isfinite(output).all()
         assert not (output == 0).all()
+
+    @pytest.mark.parametrize("num_tokens,top_k", ((4, 8), (300, 8)))
+    def test_fixed_order_finalize_is_bitwise_repeatable(self, num_tokens, top_k):
+        """MoEFinalizeConfig(use_fused_finalize=False) reaches the b12x kernels.
+
+        The default path takes the micro kernel at 4 tokens and the dynamic
+        kernel at 300; neither repeats bit for bit.
+        """
+        quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        hidden_size, intermediate_size, num_experts = 256, 512, 32
+        tensors = _make_b12x_tensors(
+            activation="silu",
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+        layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
+            tensors,
+            quant=quant,
+            activation="silu",
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            finalize=MoEFinalizeConfig(use_fused_finalize=False),
+        )
+        baseline = _run_b12x_unified(layer, act_pack, weight_pack).clone()
+        assert layer.runners[0]._inner.use_fused_finalize is False
+        for _ in range(3):
+            repeat = _run_b12x_unified(layer, act_pack, weight_pack)
+            assert torch.equal(repeat.view(torch.int16), baseline.view(torch.int16))
+        _assert_b12x_accurate(
+            baseline,
+            _b12x_reference(
+                tensors,
+                quant=quant,
+                activation="silu",
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                top_k=top_k,
+            ),
+        )
 
     @pytest.mark.parametrize(
         "variant,source_format",

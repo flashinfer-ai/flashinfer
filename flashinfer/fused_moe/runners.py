@@ -7450,6 +7450,11 @@ class _B12xRunner(MoERunner):
 
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
+        if (
+            not self.config.finalize.use_fused_finalize
+            and self._get_quant_mode_name() == "w4a16"
+        ):
+            raise NotImplementedError("b12x W4A16 has no fixed-order finalize.")
 
         # super()._check_support() already rejected activations outside the
         # declared capability set; translate any residual gap in the name table
@@ -7530,6 +7535,7 @@ class _B12xRunner(MoERunner):
             activation=self.activation,
             quant_mode=self._get_quant_mode_name(),
             source_format="modelopt",
+            use_fused_finalize=self.config.finalize.use_fused_finalize,
         )
 
     def pack_inputs(
