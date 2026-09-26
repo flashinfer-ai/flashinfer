@@ -549,11 +549,14 @@ def test_affine_fp32_rows_in_place_match_the_window_merge_bitwise(monkeypatch, l
     # (red.global.add.v4.f32), replacing the staged windows plus merging
     # epilogue.  Both paths perform the same single FP32 addition per element,
     # so rows, output and final state must be bitwise identical.
+    # Both arms run the correction chain: the apply route (below) reorders the
+    # BF16 operators and is compared with a tolerance instead.
     d = _inputs(lengths, 16, seed=13)
     d["state_checkpoints"] = torch.zeros_like(
         d["state_checkpoints"], dtype=torch.float32
     )
     pool = d["pool"].clone()
+    monkeypatch.setenv("CAKE_KDA_AFFINE_APPLY", "0")
     monkeypatch.setenv("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "0")
     windows = _run(d)
     assert "affine" in str(windows.schedule) and "rows_in_place" not in str(
@@ -566,8 +569,48 @@ def test_affine_fp32_rows_in_place_match_the_window_merge_bitwise(monkeypatch, l
     monkeypatch.setenv("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "1")
     in_place = _run(d)
     assert "rows_in_place" in str(in_place.schedule)
+    assert "apply" not in str(in_place.schedule)
     _assert_same(_snapshot(d), want)
     assert torch.isfinite(d["state_checkpoints"]).all()
+
+
+@pytest.mark.parametrize(
+    "lengths,checkpoints",
+    [
+        ([8192], True),
+        ([3000, 13384], True),
+        ([1000, 12000, 3384], True),
+        ([4096], False),
+        ([8192, 4096], False),
+    ],
+)
+def test_affine_apply_route_matches_the_correction_chain(
+    monkeypatch, lengths, checkpoints
+):
+    # The apply route replaces the composite's correction and map chains with
+    # the exported chunk operators (pair-map producer, prefix-product chain and
+    # the fused apply kernel).  Same math, different BF16 operator order: the
+    # output agrees with the chain to one BF16 ulp, the FP32 pool and rows to
+    # a few 1e-3 on window-boundary rows, never bitwise by construction.
+    d = _inputs(lengths, 16, seed=13)
+    d["state_checkpoints"] = torch.zeros_like(
+        d["state_checkpoints"], dtype=torch.float32
+    )
+    pool = d["pool"].clone()
+    monkeypatch.setenv("CAKE_KDA_AFFINE_APPLY", "0")
+    chain = _run(d, checkpoints=checkpoints)
+    assert "affine" in str(chain.schedule) and "apply" not in str(chain.schedule)
+    want = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["out"].zero_()
+    d["state_checkpoints"].zero_()
+    monkeypatch.delenv("CAKE_KDA_AFFINE_APPLY")
+    apply = _run(d, checkpoints=checkpoints)
+    assert "apply" in str(apply.schedule)
+    got = _snapshot(d)
+    for name, a, b in zip(("out", "state", "checkpoints"), got, want, strict=True):
+        assert torch.isfinite(a).all(), name
+        torch.testing.assert_close(a.float(), b.float(), atol=1e-2, rtol=1e-2, msg=name)
 
 
 def test_plan_cache_accounting_never_queries_the_allocator(monkeypatch):
