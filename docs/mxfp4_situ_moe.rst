@@ -1257,7 +1257,9 @@ the same node, and every row of the tables below is either at or under
   T=2048, 74.7 us at T=32768). Overlapped with the routing kernels and
   GEMM1 (round 15) or done inside GEMM1 by its epilogue warps (round
   17, T >= 8192) it shares HBM with them, so only its excess over
-  GEMM1 counts.
+  GEMM1 counts -- an optimistic term on the single-wave ``empty``
+  rows, where the round-20 stamps below show the fill and the
+  single-tile chain serialising.
 
 The MMA term uses the node's best measured tcgen05 rate (3726 TFLOPS)
 rather than the plain-GEMM figures of the floors probe at each GEMM's
@@ -2075,6 +2077,55 @@ and none, with registers (168 per thread) and shared memory (228352 B)
 unchanged, i.e. a per-launch prologue and instruction-footprint cost.
 The TP8 shard's 96-tile ``empty`` launches (T = 128 / 256) cannot pair on 148
 SMs and are unchanged.
+
+*Round 20 (B300, same node as round 19).* Two levers on the dense long
+rows were measured on one B300 (pool0-0232, graph replay, CUPTI medians,
+FP64-checked, same-GPU pairs against the round-19 revision).
+
+L2 policy on the fused finalize (lever b): the finalize GEMM2's
+``cp.reduce.async.bulk`` reduce-adds were issued with an ``evict_last``
+cache-policy descriptor (the token rows a later tile of the same token
+re-reads stay in L2) and, separately, the activation TMA loads with
+``evict_first``. At T=8192 balanced the GEMM2 kernel reads
+1.000-1.004 x (TP8 877 us, EP8 431 us; four knob combinations) of the round-19 kernel on both layouts (bit-identical output);
+on the paired two-pass timelines (10 replays each) the setting reads 0.996-1.006 x at T=8192 and T=16384 on both layouts but 1.020-1.045 x on the shard's T=32768 rows and 1.08-1.12 x on the wide rank's T=32768 ``empty`` row (470 MB output, four times the L2).
+The reduce-add traffic of the fused finalize is therefore not an L2 residency problem: the token rows a later tile re-reads are already served from L2 where the output fits, and where it does not, keeping them resident evicts the weight tiles. The knobs stay at their neutral default and the direction is closed.
+
+Mainloop phase of the GEMM1 zero-fill (lever for the expert-parallel
+``empty`` rows at T >= 8192, 1.79 / 1.45 / 1.30 x of the reachable floor):
+the fill-carrying GEMM1 launch was decomposed on the same
+GPU (10 replays, FP64-checked). Without the fill (aux-stream memset) the
+launch is 20.0 / 22.1 / 74.0 us at T=8192 / 16384 / 32768; with it 37.3 /
+52.8 / 91.9 us, and the memset itself, scheduled after or beside GEMM1,
+makes the rows 10 / 7.5 / 6 % slower than the in-kernel fill. Per-CTA
+``%globaltimer`` stamps of the epilogue warps inside the fill-carrying
+launch (graph replay, 148 CTAs) place the time: at T=8192 (24 two-CTA
+tiles, 100 tile-less CTAs) the tile-less CTAs enter the fill at 0.4-0.8
+us, take 16-20 claims of 64 KB each and finish at 19.5 / 20.3 / 23.5 us
+(min / median / max: 117 MB at about 5.5 TB/s, the write ceiling), while
+the 48 busy CTAs see their first accumulator only at 25.4-26.3 us and
+finish their tile at 29.3-30.4 us -- the 56-stage single-tile chain,
+16 us of mainloop in the launch without the fill, is inflated by the
+saturating write stream and ends about 2 us after the fill. At T=32768
+(72 tiles, 144 busy CTAs) the chain ends at 22.5 us and the 470 MB fill
+runs after it at about 7.3 TB/s until 85-88 us, with only 4 SMs filling
+during the chain; at T=16384 (36 tiles, 76 tile-less CTAs) the 76 tile-less CTAs take 40-44 claims each and finish at 45.5 / 47.2 / 49.2 us (234 MB at about 4.4 TB/s, i.e. 58 GB/s per tile-less SM, the per-SM write cap of round 17), while the 72 busy CTAs' first accumulator lands at 31.6-34.0 us and their tile ends at 35.7-38.2 us, after which they join the fill for its last 10 us.
+Three levers were measured against this on the same GPU and closed: the
+busy CTAs' epilogue warps streaming zero chunks during their own mainloop
+(bulk copies of the untouched C staging smem until the first accumulator
+is ready; GEMM1 +2.8 / +10.4 / +5.2 us, the stores share the async-copy
+unit with the operand loads and lengthen the chain), a second store path
+in the tile-less CTAs (all 32 lanes storing a second 64 KB chunk with
+16 B stores beside lane 0's bulk copies; 37.5 -> 37.4 us at T=8192, +5
+us at T=16384: the per-SM issue path is not the cap), and, from round 19,
+the cluster split-K on a fill-carrying launch (+5 %). The ``empty`` rows
+at T >= 8192 are therefore bound by the zero-fill of the ``T x H`` BF16
+output -- at the per-SM write cap of about 58 GB/s times the tile-less
+SMs while the chain runs, then at the HBM write ceiling -- serialised
+with the single-tile weight chain that the same write stream slows; the
+reachable floor charges the fill only as its excess over GEMM1 and so
+understates these three rows by the chain's inflation (about 10 us at
+T=8192) and by the fill share that only the tile-less SMs can move.
 
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
