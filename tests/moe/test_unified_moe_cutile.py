@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -293,6 +296,71 @@ def _config(
     )
     values.update(overrides)
     return MoEConfig(**values)
+
+
+@pytest.mark.parametrize("precompile_fails", (False, True))
+def test_cutile_single_runner_precompiles_bucket_before_caching(
+    monkeypatch, precompile_fails
+):
+    from flashinfer.testing import utils as testing_utils
+
+    inputs = [torch.empty((17, 128), dtype=torch.bfloat16)]
+    tactic = (32, 1, 128, 64, 2, 128, 64, 2)
+    output = object()
+    launch_kwargs = {"enable_pdl": False}
+    tuning_config = object()
+    runner = SimpleNamespace(
+        backend_key=CuTileBf16Runner.backend_key,
+        supported_routing_modes=("pre_routed",),
+        pack_inputs=Mock(return_value=inputs),
+        launch_kwargs_for=Mock(return_value=launch_kwargs),
+        tuning_config_for=Mock(return_value=tuning_config),
+        forward=Mock(return_value=output),
+    )
+    layer = MoELayer.__new__(MoELayer)
+    layer.config = _config()
+    layer.runners = [runner]
+    layer.tuner = SimpleNamespace(choose_one=Mock(return_value=(runner, tactic)))
+    layer._winners = OrderedDict()
+    monkeypatch.setattr(layer, "_additional_candidates", lambda *_: [])
+
+    def precompile(packed_inputs, selected_tactic):
+        assert packed_inputs is inputs
+        assert selected_tactic is tactic
+        assert not layer._winners
+        if precompile_fails:
+            raise RuntimeError("bucket compilation failed")
+
+    runner._precompile_bucket_variants = Mock(side_effect=precompile)
+    benchmark = Mock(
+        side_effect=AssertionError("single runner must not be benchmarked")
+    )
+    monkeypatch.setattr(testing_utils, "bench_gpu_time", benchmark)
+    activations = SimpleNamespace(num_tokens=17, routing_input_mode="pre_routed")
+    weights = object()
+
+    if precompile_fails:
+        with pytest.raises(RuntimeError, match="bucket compilation failed"):
+            layer(activations, weights)
+        assert not layer._winners
+        runner.forward.assert_not_called()
+    else:
+        assert layer(activations, weights) is output
+        assert list(layer._winners.values()) == [(runner, tactic)]
+        # Reusing the winner must not repeat either tuning or compilation.
+        assert layer(activations, weights) is output
+        assert runner.forward.call_count == 2
+        runner.forward.assert_called_with(inputs, tactic=tactic, **launch_kwargs)
+
+    runner._precompile_bucket_variants.assert_called_once_with(inputs, tactic)
+    layer.tuner.choose_one.assert_called_once_with(
+        custom_op=f"moe_{runner.backend_key}",
+        runners=[runner],
+        tuning_config=tuning_config,
+        inputs=inputs,
+        **launch_kwargs,
+    )
+    benchmark.assert_not_called()
 
 
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))

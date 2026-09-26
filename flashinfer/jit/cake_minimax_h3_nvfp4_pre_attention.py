@@ -12,7 +12,7 @@ import torch
 MiniMaxH3Nvfp4Target = Literal["sm100a", "sm103a"]
 MiniMaxH3Nvfp4Stage = Literal[
     "norm_adaln_nvfp4_quantize",
-    "qk_rope_destination_nvfp4_pack",
+    "qkv_nvfp4_gemm_fused_pack",
 ]
 
 
@@ -64,7 +64,7 @@ def load_minimax_h3_nvfp4_route(device: torch.device, P: int):
     module = minimax_h3_nvfp4_physical_module(device)
     return (
         module.load_minimax_h3_nvfp4_stage_module(P, "norm_adaln_nvfp4_quantize"),
-        module.load_minimax_h3_nvfp4_stage_module(P, "qk_rope_destination_nvfp4_pack"),
+        module.load_minimax_h3_nvfp4_stage_module(P, "qkv_nvfp4_gemm_fused_pack"),
     )
 
 

@@ -764,21 +764,20 @@ class CakeWarpDecodeRunner(MoERunner):
 
     The runner consumes the physical tensor view produced by
     :class:`TrtllmFp4Config`: packed E2M1 weights and activations, E4M3 block
-    scales, and per-expert FP32 epilogue scales. Supported SwiGLU geometries fix
-    ``alpha=1`` and ``beta=0``. The SM100 H4096/I2048/E256/top-k6 route
-    additionally supports ``SwiGLU(limit=10.0)`` and forwards the physical
-    per-expert alpha, beta and clamp tensors through its clamped launch entry.
-    Existing default-activation routes retain their original tensor ABI.
-    Clamped SM100 weights must use matched NVFP4 shuffled MajorK data and
-    R128c4 E4M3 block scales; activations use NVFP4 with linear E4M3 scales.
-    An FP4 dtype label alone does not establish this layout or quantization
-    contract. Checkpoint conversion belongs before weight-pack preparation.
+    scales, and per-expert FP32 epilogue scales. Default SwiGLU geometries fix
+    ``alpha=1`` and ``beta=0``. Parameterized SwiGLU and SiTU use an extended
+    launch entry point that consumes the prepared per-expert activation tensors.
+    Activation is identified by the exact geometry.
+    The SM100 H4096/I2048/E256/top-k6 route keeps its dedicated clamped
+    entry and raw-accumulator parameter units. Its weights require matched
+    NVFP4 shuffled MajorK data and R128c4 E4M3 block scales, not merely an
+    FP4 dtype label; checkpoint conversion precedes weight-pack preparation.
     """
 
     backend_key = "cake"
     supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
-    supported_activation_classes = (SwiGLU, SiLU)
+    supported_activation_classes = (SwiGLU, SiLU, SiTU)
     supports_expert_parallelism = False
 
     _SUPPORTED_CONFIGURATIONS: ClassVar[
@@ -787,8 +786,16 @@ class CakeWarpDecodeRunner(MoERunner):
         # activation, hidden_size, intermediate_size, num_experts, top_k
         (SwiGLU(), 2048, 512, 512, 10),
         (SwiGLU(), 2048, 1536, 60, 4),
+        (SwiGLU(), 2560, 768, 384, 4),
         (SiLU(), 6144, 1536, 192, 4),
         (SwiGLU(limit=10.0), 4096, 2048, 256, 6),
+        (SwiGLU(), 2048, 768, 128, 8),
+        (SwiGLU(), 4096, 1536, 128, 8),
+        (SwiGLU(), 2048, 512, 256, 8),
+        (SwiGLU(), 4096, 1024, 512, 10),
+        (SwiGLU(), 3072, 1536, 256, 8),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4),
+        (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16),
     }
     _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
         "gemm1_weights",
@@ -800,11 +807,15 @@ class CakeWarpDecodeRunner(MoERunner):
         "output2_scale_scalar",
     )
     _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
-    _CLAMPED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
-        "gemm1_alpha",
-        "gemm1_beta",
-        "gemm1_clamp_limit",
-    )
+    _ACTIVATION_PARAMETER_KEYS: ClassVar[dict[ActivationConfig, tuple[str, ...]]] = {
+        SwiGLU(limit=10.0): ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0): (
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+        ),
+        SiTU(gate_scale=4.0, linear_scale=25.0): ("gemm1_alpha", "gemm1_beta"),
+    }
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
     _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
@@ -897,9 +908,14 @@ class CakeWarpDecodeRunner(MoERunner):
         if configuration_without_hidden not in supported_without_hidden:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner supports only default SwiGLU() with "
-                "(intermediate_size, num_experts, top_k) = (512, 512, 10) or "
-                "(1536, 60, 4), SiLU() with (1536, 192, 4), or "
-                "SwiGLU(limit=10.0) with (2048, 256, 6) on SM100; got "
+                "(intermediate_size, num_experts, top_k) = (512, 512, 10), "
+                "(1536, 60, 4), (768, 384, 4), (768, 128, 8), "
+                "(1536, 128, 8), (512, 256, 8), (1024, 512, 10), or "
+                "(1536, 256, 8), and SiLU() with "
+                "(1536, 192, 4), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
+                "with (3072, 128, 4), or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3072, 896, 16), or SwiGLU(limit=10.0) with "
+                "(2048, 256, 6) on SM100; got "
                 f"{configuration_without_hidden}."
             )
 
@@ -1277,9 +1293,15 @@ class CakeWarpDecodeRunner(MoERunner):
             raise ValueError(
                 "CakeWarpDecodeRunner supports only default SwiGLU() with "
                 "(hidden_size, intermediate_size, num_experts, top_k) = "
-                "(2048, 512, 512, 10) or (2048, 1536, 60, 4), and SiLU() "
-                "with (6144, 1536, 192, 4), or SwiGLU(limit=10.0) "
-                "with (4096, 2048, 256, 6) on SM100; got "
+                "(2048, 512, 512, 10), (2048, 1536, 60, 4), "
+                "(2560, 768, 384, 4), (2048, 768, 128, 8), "
+                "(4096, 1536, 128, 8), (2048, 512, 256, 8), "
+                "(4096, 1024, 512, 10), or (3072, 1536, 256, 8), and SiLU() "
+                "with (6144, 1536, 192, 4), "
+                "SwiGLU(alpha=1.702, beta=1.0, limit=7.0) with (6144, 3072, 128, 4), "
+                "or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3584, 3072, 896, 16), or SwiGLU(limit=10.0) with "
+                "(4096, 2048, 256, 6) on SM100; got "
                 f"{configuration}."
             )
 
@@ -1319,10 +1341,9 @@ class CakeWarpDecodeRunner(MoERunner):
         activation = self.config.activation
         if self._uses_clamped_swiglu() and self._device_arch != 100:
             raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
+        activation_parameter_keys = self._ACTIVATION_PARAMETER_KEYS.get(activation, ())
         gated_weight_keys = (
-            self._CLAMPED_WEIGHT_KEYS
-            if self._uses_clamped_swiglu()
-            else self._GATED_WEIGHT_KEYS
+            activation_parameter_keys or self._GATED_WEIGHT_KEYS
             if activation.is_gated
             else ()
         )
@@ -1421,7 +1442,7 @@ class CakeWarpDecodeRunner(MoERunner):
         output = torch.empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
         )
-        packed = [
+        inputs = [
             output,
             workspace,
             act.hidden_states_q,
@@ -1436,9 +1457,12 @@ class CakeWarpDecodeRunner(MoERunner):
             view["output1_scale_gate_scalar"],
             view["output2_scale_scalar"],
         ]
-        if self._uses_clamped_swiglu():
-            packed.extend(view[name] for name in self._CLAMPED_WEIGHT_KEYS)
-        return packed
+        if activation_parameter_keys:
+            inputs.extend(
+                view.get(name)
+                for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+            )
+        return inputs
 
     def forward(
         self,
@@ -1450,7 +1474,8 @@ class CakeWarpDecodeRunner(MoERunner):
         self._require_built()
         if tactic != -1:
             raise ValueError("CakeWarpDecodeRunner supports only tactic -1.")
-        expected_inputs = 16 if self._uses_clamped_swiglu() else 13
+        parameterized = self.config.activation in self._ACTIVATION_PARAMETER_KEYS
+        expected_inputs = 16 if parameterized else 13
         if len(inputs) != expected_inputs:
             raise ValueError(
                 f"CakeWarpDecodeRunner expects {expected_inputs} flattened tensor inputs, "
@@ -1483,12 +1508,18 @@ class CakeWarpDecodeRunner(MoERunner):
             self._stream_token(stream),
         )
         try:
-            invoke = (
-                self._module.cake_fused_moe_warp_decode_clamped_swiglu
-                if self._uses_clamped_swiglu()
-                else self._module.cake_fused_moe_warp_decode
-            )
-            invoke(*launch_inputs, prepared[1], True)
+            if self._uses_clamped_swiglu():
+                self._module.cake_fused_moe_warp_decode_clamped_swiglu(
+                    *launch_inputs, prepared[1], True
+                )
+            elif parameterized:
+                self._module.cake_fused_moe_warp_decode_with_activation_params(
+                    *launch_inputs, prepared[1], True
+                )
+            else:
+                self._module.cake_fused_moe_warp_decode(
+                    *launch_inputs, prepared[1], True
+                )
         except Exception:
             finalizer = self._workspace_receipt_finalizers.pop(identity, None)
             if finalizer is not None and finalizer.alive:

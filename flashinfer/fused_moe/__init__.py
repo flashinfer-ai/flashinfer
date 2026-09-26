@@ -188,6 +188,12 @@ from .alphamoe_fused_router import (  # noqa: F401
     alphamoe_fused_router as alphamoe_fused_router,
 )
 
+from .kimi_k3_fused_router import (  # noqa: F401
+    allocate_kimi_k3_route_plan as allocate_kimi_k3_route_plan,
+    kimi_k3_fused_router as kimi_k3_fused_router,
+    prepare_kimi_k3_fused_router as prepare_kimi_k3_fused_router,
+)
+
 from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
 )
@@ -195,6 +201,10 @@ from .hash_topk import (  # noqa: F401
 from .trtllm_gen_routing import (  # noqa: F401
     TrtllmGenRoutingResult as TrtllmGenRoutingResult,
     trtllm_gen_routing as trtllm_gen_routing,
+)
+from .cudnn_frost_selected import (  # noqa: F401
+    cudnn_frost_grouped_gemm1_swiglu,
+    cudnn_frost_grouped_gemm1_swiglu_workspace_size,
 )
 
 from .bgmv_moe import (  # noqa: F401
@@ -397,9 +407,14 @@ __all__ = [
     "AlphaMoERoutePlan",
     "allocate_alphamoe_route_plan",
     "alphamoe_fused_router",
+    "allocate_kimi_k3_route_plan",
+    "kimi_k3_fused_router",
+    "prepare_kimi_k3_fused_router",
     "hash_topk",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
+    "cudnn_frost_grouped_gemm1_swiglu",
+    "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
     "BGMVMoEBlackwellPlan",
     "bgmv_moe_shrink",
