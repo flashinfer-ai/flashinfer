@@ -16,7 +16,7 @@
 """JIT loader for the generated Cake SM90 (Hopper) variable block-sparse attention kernel.
 
 One source-only manifest lives under ``csrc/cake_vsa_sm90``
-(``cake_vsa_sm90_manifest.json``, schema ``cake.library_export.v4``): a single
+(``cake_vsa_sm90_manifest.json``, schema ``cake.library_export.v5``): a single
 ``sm_90a`` module rendered from the Cake Weave kernel ``vsa_sm90_bf16_fwd`` (BF16 HND,
 head_dim 128, 64-token blocks) plus its tvm-ffi binding.  The Python planner that
 produces the kernel's tile metadata lives in :mod:`flashinfer.cake_vsa_sm90`.
@@ -76,7 +76,7 @@ def _manifest() -> dict[str, Any]:
     path = _get_csrc_dir() / _MANIFEST_NAME
     value = json.loads(path.read_text(encoding="utf-8"))
     if (
-        value.get("schema") != "cake.library_export.v4"
+        value.get("schema") != "cake.library_export.v5"
         or value.get("producer") != "cake"
         or value.get("library") != "flashinfer"
         or value.get("name") != "cake_vsa_sm90"
