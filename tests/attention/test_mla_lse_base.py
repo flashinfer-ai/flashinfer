@@ -353,7 +353,10 @@ def test_planned_monolithic_launch_lse_scale():
         _BatchMLAPagedAttentionCuteDslMonolithicBackend
     )
     backend._execution_state = SimpleNamespace(
-        Int32=int, Float32=float, compiled_kernel=lambda *args: calls.append(args)
+        Int32=int,
+        Float32=float,
+        compiled_kernel=lambda *args: calls.append(args),
+        cum_seq_lens_q=None,
     )
     launch_args = tuple(object() for _ in range(13))
     backend._launch_compiled_kernel(launch_args, sinks=None)

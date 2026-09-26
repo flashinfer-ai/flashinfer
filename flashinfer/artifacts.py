@@ -14,15 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import logging
 import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Generator
-import requests  # type: ignore[import-untyped]
 import shutil
+import time
+from typing import Generator
+
+import requests  # type: ignore[import-untyped]
 
 # Create logger for artifacts module to avoid circular import with jit.core
 logger = logging.getLogger("flashinfer.artifacts")
@@ -37,9 +39,6 @@ from .jit.cubin_loader import (
     download_file,
     verify_cubin,
 )
-
-
-from contextlib import contextmanager
 
 
 @contextmanager
@@ -357,6 +356,29 @@ def download_artifacts() -> None:
         local_path = FLASHINFER_CUBIN_DIR / name
         if not verify_cubin(str(local_path), checksum):
             raise RuntimeError("Failed to download cubins: checksum mismatch")
+
+    # A restore-key fallback may seed this download with a cache produced for an
+    # older artifact manifest. Remove anything that is not in the current,
+    # checksum-verified file list so stale kernels cannot leak into the wheel.
+    expected_files = {name for name, _ in cubin_files}
+    stale_files = []
+    for local_path in FLASHINFER_CUBIN_DIR.rglob("*"):
+        if local_path.is_file():
+            relative_path = local_path.relative_to(FLASHINFER_CUBIN_DIR).as_posix()
+            if relative_path not in expected_files:
+                local_path.unlink()
+                stale_files.append(relative_path)
+
+    for local_path in sorted(
+        (path for path in FLASHINFER_CUBIN_DIR.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        with suppress(OSError):
+            local_path.rmdir()
+
+    if stale_files:
+        logger.info("Removed %d stale cached artifacts", len(stale_files))
 
 
 def get_artifacts_status() -> tuple[tuple[str, bool], ...]:

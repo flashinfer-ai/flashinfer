@@ -248,6 +248,12 @@ class MegaKernelBackend(ABC):
         """Release durable workspace resources (pool-aware, refcounted)."""
         if workspace is None:
             return
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mega workspace release cannot run during CUDA graph capture"
+            )
         from .workspace_pool import release_workspace
 
         # Backend-local launch state belongs to this owner even when the

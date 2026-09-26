@@ -425,7 +425,7 @@ def _patch_validated_run(monkeypatch, cake_variant):
     monkeypatch.setattr(
         fused,
         "_get_compiled_kernel",
-        lambda *args: lambda *kernel_args: fallback_calls.append(kernel_args),
+        lambda *args, **kwargs: lambda *kernel_args: fallback_calls.append(kernel_args),
     )
     return cake_calls, fallback_calls
 
