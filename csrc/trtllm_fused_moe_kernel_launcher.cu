@@ -5159,10 +5159,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
-
-    for (int32_t tile_N : selected_tile_nums) {
+    // With expert parallelism, input tokens can route to experts on other GPUs.
+    // Estimating tokens per local expert as num_tokens * top_k / num_local_experts
+    // counts those assignments as local work and can exclude useful small tiles.
+    // Let autotuning try every supported tile size; getValidConfigIndices below
+    // still filters out configurations that are invalid for the input shape.
+    // Dispatch without an autotuned choice still uses the default tile heuristic.
+    for (int32_t tile_N : tile_sizes) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
