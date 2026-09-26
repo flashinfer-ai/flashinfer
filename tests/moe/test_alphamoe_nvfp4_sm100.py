@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from flashinfer.fused_moe.alphamoe_nvfp4_sm100 import prepare_nvfp4_w2_data
 
 
 _SF_VEC = 16
@@ -593,6 +594,7 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
         top_k=_COMPLETE_TOP_K, block_m=_COMPLETE_BLOCK_M, routed_scaling_factor=1.0,
         w1_scale_prepared=api.prepare_nvfp4_w1_scales(w1_scale), w2_scale_prepared=api.prepare_nvfp4_w2_scales(w2_scale),
         w1_data_prepared=api.prepare_nvfp4_w1_data(w1) if prepared_data else None,
+        w2_data_prepared=api.prepare_nvfp4_w2_data(w2) if prepared_data else None,
         w1_scale_prepared_interleaved=api.prepare_nvfp4_w1_scales_interleaved(w1_scale) if prepared_data else None,
     )
     seed_out = torch.randn((m, _COMPLETE_K), device=device, generator=generator).to(torch.bfloat16)
@@ -623,6 +625,7 @@ def test_alphamoe_nvfp4_deferred_finalize_matches_routed(m, prepared_data, expec
         case["gemm2_weights_scale"], case["topk_ids"], seed_out, case["top_k"], case["block_m"],
         case["w1_scale_prepared"], case["w1_data_prepared"],
         w1_scale_prepared_interleaved=case.get("w1_scale_prepared_interleaved"), w2_scale_prepared=case["w2_scale_prepared"],
+        w2_data_prepared=case["w2_data_prepared"],
     )
     assert route_id == expected_route, route_id
 
@@ -656,3 +659,20 @@ def test_alphamoe_nvfp4_deferred_finalize_matches_routed(m, prepared_data, expec
 
     with pytest.raises(ValueError):
         api.alphamoe_nvfp4_finalize_deferred(deferred, seed_out.float())
+
+
+def test_prepare_nvfp4_w2_data_is_a_panel_permutation():
+    experts, k, packed_n = 3, 256, 128
+    w2 = torch.randint(0, 256, (experts, k, packed_n), dtype=torch.uint8)
+    prepared = prepare_nvfp4_w2_data(w2)
+    blocks = packed_n // 64
+    assert prepared.shape == (experts * (k // 128) * blocks, 128, 64)
+    for e in range(experts):
+        for ob in range(k // 128):
+            for j in range(blocks):
+                panel = prepared[(e * (k // 128) + ob) * blocks + j]
+                assert torch.equal(panel, w2[e, ob * 128:(ob + 1) * 128, j * 64:(j + 1) * 64])
+    with pytest.raises(ValueError):
+        prepare_nvfp4_w2_data(w2[:, :100].contiguous())
+    with pytest.raises(TypeError):
+        prepare_nvfp4_w2_data(w2.view(torch.int8))

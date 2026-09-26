@@ -728,6 +728,7 @@ def _alphamoe_nvfp4_routed_moe_impl(
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
     w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    w2_data_prepared: Optional[torch.Tensor] = None,
     accumulate: bool = True,
 ) -> None:
     if _alphamoe_try_complete_routed(
@@ -756,6 +757,7 @@ def _alphamoe_nvfp4_routed_moe_impl(
         w1_gate_up_scale_prepared,
         w2_scale_prepared,
         w1_scale_prepared_interleaved,
+        w2_data_prepared,
         accumulate,
     ):
         return
@@ -849,6 +851,7 @@ def _alphamoe_nvfp4_routed_moe_fake(
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
     w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    w2_data_prepared: Optional[torch.Tensor] = None,
     accumulate: bool = True,
 ) -> None:
     pass
@@ -881,6 +884,7 @@ def alphamoe_nvfp4_routed_moe(
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
     w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    w2_data_prepared: Optional[torch.Tensor] = None,
     accumulate: bool = True,
 ) -> torch.Tensor:
     """Run route alignment, complete expert computation and weighted accumulation.
@@ -897,7 +901,10 @@ def alphamoe_nvfp4_routed_moe(
     tensors remain optional immutable model-load inputs; this function performs
     no weight preparation, host device-count read or automatic model fetching.
     For the selected 8-, 128- and 512-token routes, pass ``w1_data_prepared`` from
-    :func:`prepare_nvfp4_w1_data`; omitting it retains the existing path.
+    :func:`prepare_nvfp4_w1_data`; omitting it retains the existing path. The
+    128- and 512-token routes also take ``w2_data_prepared`` from
+    :func:`prepare_nvfp4_w2_data`; without both prepared data tensors those
+    token counts retain the existing path.
     For the adjacent gate/up M512 route, pass both
     ``w1_gate_up_data_prepared`` and ``w1_gate_up_scale_prepared`` from the
     matching model-load preparation helpers. They use a distinct layout
@@ -929,6 +936,7 @@ def alphamoe_nvfp4_routed_moe(
         w2_scale_prepared,
     )
     _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
+    _check_prepared_w2_data(gemm2_weights, w2_data_prepared)
     _check_prepared_w1_gate_up(
         gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
     )
@@ -984,6 +992,7 @@ def alphamoe_nvfp4_routed_moe(
         w1_gate_up_data_prepared,
         w1_gate_up_scale_prepared,
         w1_scale_prepared_interleaved,
+        w2_data_prepared,
         accumulate,
     )
     return out
@@ -1085,6 +1094,46 @@ def _check_prepared_w1_data(w1, prepared):
         or prepared.data_ptr() % 16 != 0
     ):
         raise ValueError("Prepared W1 data must match the raw weights and panel layout")
+
+
+def prepare_nvfp4_w2_data(w2):
+    """Prepare immutable packed W2 panels once during model loading.
+
+    The contiguous uint8 input is [E,K,N/4] (K output rows of N/2 packed FP4
+    intermediate values per expert). The result is [E*(K/128)*(N/256),128,64],
+    an exact byte permutation with no dequantization: panel
+    ``(e*(K/128)+ob)*(N/256)+j`` holds rows ``ob*128..+128`` and bytes
+    ``j*64..+64`` of expert ``e``. Keep the raw weights and this tensor alive and
+    immutable while using the routed operator. Preparation is outside routed
+    execution.
+    """
+    if w2.dtype != torch.uint8:
+        raise TypeError("W2 data must contain original packed uint8 bytes")
+    if w2.ndim != 3 or not w2.is_contiguous():
+        raise ValueError("W2 data must be contiguous [E,K,N/4]")
+    experts, k, packed_n = map(int, w2.shape)
+    if min(experts, k, packed_n) <= 0 or k % 128 or packed_n % 64:
+        raise ValueError("Prepared W2 data requires K%128=0 and N%256=0")
+    return (
+        w2.view(experts, k // 128, 128, packed_n // 64, 64)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(-1, 128, 64)
+    )
+
+
+def _check_prepared_w2_data(w2, prepared):
+    if prepared is None:
+        return
+    _require_cuda_tensor("w2_data_prepared", prepared, dtype=torch.uint8, ndim=3)
+    e, k, packed_n = w2.shape
+    expected = (e * (k // 128) * (packed_n // 64), 128, 64)
+    if (
+        prepared.device != w2.device
+        or tuple(prepared.shape) != expected
+        or prepared.data_ptr() % 16 != 0
+    ):
+        raise ValueError("Prepared W2 data must match the raw weights and panel layout")
 
 
 def prepare_nvfp4_w1_scales(w1_scale):
@@ -1286,6 +1335,7 @@ def _alphamoe_complete_route_id(
     w1_gate_up_scale_prepared=None,
     w1_scale_prepared_interleaved=None,
     w2_scale_prepared=None,
+    w2_data_prepared=None,
 ):
     """Select complete routes from immutable host metadata and owned sidecars.
 
@@ -1355,11 +1405,11 @@ def _alphamoe_complete_route_id(
     ):
         return 9
     if m == 128:
-        if w1_data_prepared is not None:
+        if w1_data_prepared is not None and w2_data_prepared is not None:
             return 10 if out.data_ptr() % 16 == 0 else 11
         return 3
     if m == 512:
-        if w1_data_prepared is not None:
+        if w1_data_prepared is not None and w2_data_prepared is not None:
             return 12 if out.data_ptr() % 16 == 0 else 13
         return 4 if out.data_ptr() % 16 == 0 else 5
     if m >= 128:
@@ -1393,6 +1443,7 @@ def _alphamoe_try_complete_routed(
     w1_gate_up_scale_prepared=None,
     w2_scale_prepared=None,
     w1_scale_prepared_interleaved=None,
+    w2_data_prepared=None,
     accumulate=True,
 ):
     route_id = _alphamoe_complete_route_id(
@@ -1411,6 +1462,7 @@ def _alphamoe_try_complete_routed(
         w1_gate_up_scale_prepared,
         w1_scale_prepared_interleaved,
         w2_scale_prepared,
+        w2_data_prepared,
     )
     if route_id == 0:
         return False
@@ -1550,6 +1602,7 @@ def _alphamoe_try_complete_routed(
         w2_scale_prepared,
         w1_scale_prepared_interleaved,
         merge_counters,
+        w2_data_prepared,
         accumulate,
     )
     return True
@@ -1737,6 +1790,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
     w1_gate_up_data_prepared: Optional[torch.Tensor] = None,
     w1_gate_up_scale_prepared: Optional[torch.Tensor] = None,
     w1_scale_prepared_interleaved: Optional[torch.Tensor] = None,
+    w2_data_prepared: Optional[torch.Tensor] = None,
 ) -> AlphaMoeNvfp4DeferredOutput:
     """Run alignment and the expert GEMMs now; finalize later with a BF16 seed.
 
@@ -1773,6 +1827,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w2_scale_prepared,
     )
     _check_prepared_w1_data(gemm1_weights, w1_data_prepared)
+    _check_prepared_w2_data(gemm2_weights, w2_data_prepared)
     _check_prepared_w1_gate_up(
         gemm1_weights, w1_gate_up_data_prepared, w1_gate_up_scale_prepared
     )
@@ -1795,6 +1850,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w1_gate_up_scale_prepared,
         w1_scale_prepared_interleaved,
         w2_scale_prepared,
+        w2_data_prepared,
     )
     topk_weights = topk_weights.contiguous()
     if route_id not in _DEFERRABLE_COMPLETE_ROUTES:
@@ -1825,6 +1881,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
             w1_gate_up_data_prepared,
             w1_gate_up_scale_prepared,
             w1_scale_prepared_interleaved,
+            w2_data_prepared=w2_data_prepared,
         )
         return AlphaMoeNvfp4DeferredOutput(
             route_id, None, None, topk_weights, output2_scale_scalar,
@@ -1954,6 +2011,7 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w2_scale_prepared,
         w1_scale_prepared_interleaved,
         merge_counters,
+        w2_data_prepared,
     )
     return AlphaMoeNvfp4DeferredOutput(
         route_id, route_accumulator, route_experts, topk_weights,
