@@ -67,7 +67,7 @@ LOAD_COST = 1.0
 # every head's K and V fit this many bytes of L2; larger working sets keep the
 # head-major order so the CTAs running concurrently share one head's blocks.
 TILE_ORDER_L2_BUDGET = 24 << 20
-PAIRING_WINDOW = 16
+PAIRING_WINDOW = 64
 LOG2E = 1.4426950408889634
 _FP32_MAX = 3.4028234663852886e38
 
