@@ -63,7 +63,10 @@ from flashinfer.fused_moe.runners import (
     _cutile_fp8_gemm_candidates,
     _validate_cutile_int32_routing,
 )
-from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
+from flashinfer.fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket,
+)
 from flashinfer.tllm_enums import ActivationType
 
 from .utils import compute_reference_activation, compute_reference_moe
@@ -154,6 +157,26 @@ def test_cutile_autotune_uses_bounded_dispatch_representatives():
     assert len(counts) < max_num_tokens // 16
     assert len(counts) == len(set(counts))
     assert all(1 <= count <= max_num_tokens for count in counts)
+
+
+def test_cutile_bucket_representatives_split_on_runner_variant_key():
+    common = dict(
+        tune_max_num_tokens=256,
+        num_experts=8,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=512,
+        block_size=16,
+    )
+    base = _cutile_bucket_compile_token_counts(64, **common)
+    # A key that changes inside the bucket must add representatives for every
+    # value it takes, and never drop the shape-only ones.
+    keyed = _cutile_bucket_compile_token_counts(
+        64, variant_key=lambda num_tokens: (num_tokens > 48,), **common
+    )
+    assert set(base).issubset(keyed)
+    assert any(count > 48 for count in keyed) and any(count <= 48 for count in keyed)
+    assert len(keyed) > len(base)
 
 
 @pytest.mark.parametrize("arch", (80, 86, 89, 90, 100, 103, 120, 121))
@@ -1721,6 +1744,161 @@ def test_cutile_mxfp4_quantization_covers_tail(scale_row_major):
             rtol=0,
             atol=0,
         )
+
+
+@cutile_nvfp4_required
+def test_cutile_nvfp4_bucket_variant_key_tracks_split_counts():
+    config, activations, weights, _ = _make_nvfp4_case(
+        ReLU2(), num_tokens=2, num_experts=4, top_k=2, hidden_size=512
+    )
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    tactic = (16, 1, 128, 64, 2, 128, 64, 2)
+    hidden_size = inputs[1].shape[1]
+    keys = {
+        num_tokens: runner._bucket_variant_key(num_tokens, hidden_size, tactic)
+        for num_tokens in (1, 2, 8, 16, 64)
+    }
+    for num_tokens, key in keys.items():
+        g1 = runner._fp4_k_splits_for_shape(
+            num_tokens, hidden_size, stage=1, block_size=16, config=(128, 64, 2)
+        )
+        g2 = runner._fp4_k_splits_for_shape(
+            num_tokens, hidden_size, stage=2, block_size=16, config=(128, 64, 2)
+        )
+        row_tile = runner._kernel_module.split_k_reduce_row_tile(num_tokens * 2)
+        assert key == (g1, g2, row_tile if g1 > 1 else None)
+    # Small batches split while a batch whose grid covers the SMs does not, so
+    # the key must differ across the counts a bucket precompilation would see.
+    assert keys[1][0] > 1
+    assert len(set(keys.values())) > 1
+
+
+@cutile_nvfp4_required
+def test_cutile_nvfp4_bucket_precompile_adds_split_variant_inside_bucket():
+    # 16 experts x top_k 2 at block 16: the padded row-block count grows at
+    # 50 assignments (25 tokens), which shares its shape fingerprint with the
+    # 32-token bucket's existing representatives. With 148 SMs the split-K
+    # heuristic drops from 4 to 2 splits exactly there, so a precompilation
+    # keyed on shape alone would never warm the 2-split variant.
+    config, activations, weights, _ = _make_nvfp4_case(
+        ReLU2(),
+        num_tokens=2,
+        num_experts=16,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=512,
+    )
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    runner._num_sms = 148
+    tactic = (16, 0, 128, 64, 2, 128, 64, 2)
+    hidden_size = inputs[1].shape[1]
+    ceiling = config.execution.tune_max_num_tokens
+    assert map_to_hybrid_bucket(24, ceiling) == map_to_hybrid_bucket(25, ceiling) == 32
+
+    def variant_key(num_tokens: int):
+        return runner._bucket_variant_key(num_tokens, hidden_size, tactic)
+
+    assert variant_key(24)[:2] == (4, 4)
+    assert variant_key(25)[:2] == (2, 2)
+    common = dict(
+        tune_max_num_tokens=ceiling,
+        num_experts=16,
+        top_k=2,
+        hidden_size=hidden_size,
+        intermediate_size=config.experts.intermediate_size,
+        block_size=16,
+    )
+    base = _cutile_bucket_compile_token_counts(32, **common)
+    keyed = _cutile_bucket_compile_token_counts(32, variant_key=variant_key, **common)
+    assert 24 in base and 25 not in base
+    assert set(base).issubset(keyed)
+    assert 25 in keyed
+    assert {variant_key(count)[:2] for count in keyed} == {(4, 4), (2, 2)}
+
+
+@cutile_nvfp4_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("k_splits", (2, 4))
+def test_cutile_nvfp4_split_k_matches_unsplit_and_reference(
+    activation, k_splits, monkeypatch
+):
+    from flashinfer.fused_moe import runners as runners_module
+
+    # hidden_size = intermediate_size = 512 gives 8 K tiles at tile_k 64, so
+    # both GEMMs can split 4 with the explicit tactic below.
+    config, activations, weights, expected = _make_nvfp4_case(
+        activation, num_tokens=3, hidden_size=512, intermediate_size=512
+    )
+    tactic = (16, 0, 128, 64, 2, 128, 64, 2)
+    applied: list[int] = []
+
+    def run(splits: int) -> torch.Tensor:
+        def forced_splits(self, inputs, *, stage, block_size, config):
+            applied.append(splits)
+            return splits
+
+        monkeypatch.setattr(
+            runners_module._CuTileFp4Runner,
+            "_fp4_max_k_splits",
+            lambda self, n: max(splits, 1),
+        )
+        monkeypatch.setattr(
+            runners_module._CuTileFp4Runner, "_fp4_k_splits", forced_splits
+        )
+        runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+        runner.check_support()
+        runner.build()
+        inputs = runner.pack_inputs(activations, weights)
+        applied.clear()
+        out = runner.forward(inputs, tactic=tactic).clone()
+        assert applied == [splits, splits]
+        assert (runner._workspace.partial is not None) is (splits > 1)
+        return out
+
+    unsplit = run(1)
+    split = run(k_splits)
+    assert torch.isfinite(split).all()
+    # Partial sums change the fp32 accumulation order ahead of the BF16
+    # boundary, so a few FP4 codes may flip; the reference bound below is the
+    # one the unsplit path is held to.
+    torch.testing.assert_close(split, unsplit, rtol=5e-2, atol=2.5e-1)
+    torch.testing.assert_close(split, expected, rtol=0.25, atol=1.0)
+
+
+@cutile_nvfp4_required
+def test_cutile_nvfp4_split_k_follows_the_workspace_bucket():
+    from flashinfer.fused_moe.utils import map_to_hybrid_bucket
+
+    # 33 tokens x top_k 6 = 198 live assignments would qualify for split-K,
+    # but the workspace is sized for the 128-token config's bucket, whose
+    # capacity exceeds the split-K limit and therefore carries no partial
+    # buffer. The split decision has to follow the bucket, not the live batch.
+    config, activations, weights, expected = _make_nvfp4_case(
+        ReLU2(), num_tokens=33, num_experts=8, top_k=6, hidden_size=512
+    )
+    capacity = map_to_hybrid_bucket(33, config.execution.tune_max_num_tokens)
+    assert 33 * 6 <= 256 < capacity * 6
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    tactic = runner._fp4_fallback_tactic(inputs)
+    actual = runner.forward(inputs, tactic=tactic).clone()
+    assert runner._workspace.partial is None
+    for stage, config_slice in ((1, tactic[2:5]), (2, tactic[5:8])):
+        assert (
+            runner._fp4_k_splits(
+                inputs, stage=stage, block_size=tactic[0], config=tuple(config_slice)
+            )
+            == 1
+        )
+    torch.testing.assert_close(actual, expected, rtol=0.25, atol=1.0)
 
 
 @cutile_nvfp4_required
