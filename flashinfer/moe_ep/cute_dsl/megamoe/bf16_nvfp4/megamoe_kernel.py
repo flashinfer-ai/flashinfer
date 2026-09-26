@@ -1238,7 +1238,9 @@ class Sm100W4A16MegaMoEKernel:
 
         if warp >= 4 and warp < 8:
             # A warpgroup must execute the same register-redistribution instruction.
+            iket.range_push("register_donate_96_to_80")
             cute.arch.setmaxregister_decrease(80)
+            iket.range_pop()
 
         if warp == 7:
             iket.range_push("sched_wait_dispatch_metadata")
@@ -1448,7 +1450,9 @@ class Sm100W4A16MegaMoEKernel:
 
         if warp < 4:
             consumer = scheduler.make_consumer()
+            iket.range_push("register_acquire_96_to_144")
             cute.arch.setmaxregister_increase(144)
+            iket.range_pop()
             self.epilogue.run(
                 tmem_ptr=tmem.retrieve_ptr(cutlass.Float32),
                 acc_pipeline=acc_pipe,
@@ -1470,7 +1474,9 @@ class Sm100W4A16MegaMoEKernel:
             tmem.free(tmem.retrieve_ptr(cutlass.Float32), 512)
 
         if warp >= 8 and warp < 12:
+            iket.range_push("register_donate_96_to_64")
             cute.arch.setmaxregister_decrease(64)
+            iket.range_pop()
             if cutlass.const_expr(staging_inputs is not None):
                 iket.range_push("dispatch_stage_local_inputs")
                 self.token_comm.stage_inputs(
