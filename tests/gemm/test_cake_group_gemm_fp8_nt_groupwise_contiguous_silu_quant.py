@@ -168,6 +168,34 @@ def _chain(a, b, a_scale, b_scale, m_indices):
     return per_token_group_quant_8bit(act, GROUP_SIZE, EPS, torch.float8_e4m3fn)
 
 
+def _chain_or_skip(a, b, a_scale, b_scale, m_indices):
+    """The chain reference, or a skip when one of its kernels cannot run here.
+
+    ``per_token_group_quant_8bit`` is a cuTile kernel: without the ``tileiras``
+    compiler it raises ``FileNotFoundError`` at JIT time.  The torch-reference
+    tests cover the prepared program on such configurations.
+    """
+    try:
+        from flashinfer.cutile import is_cuda_tile_available
+    except ImportError:
+        is_cuda_tile_available = None
+    if is_cuda_tile_available is not None and not is_cuda_tile_available():
+        pytest.skip(
+            "cuTile unavailable: the chain reference per_token_group_quant_8bit "
+            "needs cuda-tile with the tileiras compiler"
+        )
+    try:
+        return _chain(a, b, a_scale, b_scale, m_indices)
+    except (
+        ValueError,
+        ImportError,
+        RuntimeError,
+        NotImplementedError,
+        FileNotFoundError,
+    ) as exc:
+        pytest.skip(f"FlashInfer gate_up chain unavailable: {exc}")
+
+
 def _dequantize(q, s):
     m, h = q.shape
     return (
@@ -273,10 +301,7 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
         device=device,
         arbitrary_scales=arbitrary_scales,
     )
-    try:
-        chain_q, chain_s = _chain(a, b, a_scale, b_scale, m_indices)
-    except (ValueError, ImportError, RuntimeError, NotImplementedError) as exc:
-        pytest.skip(f"FlashInfer gate_up chain unavailable: {exc}")
+    chain_q, chain_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     out_q, out_s = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices
     ).launch()
@@ -331,7 +356,8 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     )
     prepared.launch()  # initializes the private descriptor storage
     torch.cuda.synchronize()
-    ref_q, ref_s = _chain(a, b, a_scale, b_scale, m_indices)
+    eager_q = prepared.out_q.clone()
+    eager_s = prepared.out_s.clone()
     stream = torch.cuda.Stream(device=device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
@@ -341,6 +367,11 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
+    # the replay reproduces the eager launch bit for bit (same kernels, same inputs) ...
+    assert torch.equal(prepared.out_q.view(torch.uint8), eager_q.view(torch.uint8))
+    assert torch.equal(prepared.out_s, eager_s)
+    # ... and matches the chain where the chain can run
+    ref_q, ref_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     _assert_matches(prepared.out_q, prepared.out_s, ref_q, ref_s)
 
 
