@@ -323,3 +323,75 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
     )
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+@pytest.mark.parametrize("change", ["policy", "layout", "tactic"])
+def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
+    """Policy selection may change without rebuilding an unchanged specialization."""
+    from pathlib import Path
+
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl as helpers
+    from flashinfer.gemm.kernels.sm12x_cute import policy, runner
+    from flashinfer.jit import cute_dsl_core
+
+    policy_file = tmp_path / "policy.py"
+    layout_file = tmp_path / "layout.py"
+    policy_file.write_text("PREFERRED_TILE_K = 256\n")
+    layout_file.write_text("SF_LAYOUT_REVISION = 1\n")
+    monkeypatch.setattr(policy, "__file__", str(policy_file))
+    monkeypatch.setattr(cute_dsl_utils, "__file__", str(layout_file))
+    monkeypatch.setattr(cute_dsl_utils, "get_max_active_clusters", lambda _: 48)
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_121a")
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    builds = []
+
+    class ExportedKernel:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def export_to_c(self, path, function_name):
+            Path(path).write_bytes(self.payload)
+
+    def make_compile_fn(kernel, *args):
+        def compile_kernel():
+            builds.append(kernel)
+            return ExportedKernel(str(len(builds)).encode())
+
+        return compile_kernel
+
+    monkeypatch.setattr(helpers, "_make_blockscaled_gemm_compile_fn", make_compile_fn)
+    monkeypatch.setattr(
+        cute_dsl_core.JitSpecCuteDsl,
+        "_load_from_disk",
+        lambda spec: spec.object_path.read_bytes(),
+    )
+    tactic = policy.RAW_TACTICS[0]
+
+    def load(choice):
+        # Bypass the in-process cache so every call checks the persisted artifact.
+        return runner._compile(128, 34816, 5120, choice, compute_capability=(12, 1))
+
+    first = load(tactic)
+    assert load(tactic) == first
+    assert len(builds) == 1
+    choice = tactic
+    if change == "policy":
+        policy_file.write_text("PREFERRED_TILE_K = 512\n")
+    elif change == "layout":
+        layout_file.write_text("SF_LAYOUT_REVISION = 2\n")
+    else:
+        choice = policy.RAW_TACTICS[1]
+
+    updated = load(choice)
+    if change == "policy":
+        assert updated == first
+        assert len(builds) == 1
+    else:
+        assert updated != first
+        assert len(builds) == 2
+    assert load(tactic) == (updated if change == "layout" else first)
+    assert len(builds) == (1 if change == "policy" else 2)
