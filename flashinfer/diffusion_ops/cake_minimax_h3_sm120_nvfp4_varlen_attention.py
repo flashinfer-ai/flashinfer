@@ -130,6 +130,15 @@ def _plan_rows(plan, device: torch.device) -> tuple:
     return cached[0], cached[1], cached[2]
 
 
+def _longest_segment(bounds: Sequence[int]) -> int:
+    """Tokens of the longest segment (0 when all are empty); the TU picks the attention variant with it."""
+
+    return max(
+        (int(b) - int(a) for a, b in zip(bounds[:-1], bounds[1:], strict=False)),
+        default=0,
+    )
+
+
 def _token_segment_ids(
     bounds: Sequence[int], padded_tokens: int, device: torch.device
 ) -> torch.Tensor:
@@ -216,6 +225,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     num_tiles: int,
     num_units: int,
     attention_grid: int,
+    longest_segment: int,
     softmax_scale: float,
 ) -> None:
     _get_module().minimax_h3_sm120_varlen_attention_nvfp4(
@@ -242,6 +252,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         num_tiles,
         num_units,
         attention_grid,
+        longest_segment,
         softmax_scale,
     )
 
@@ -271,6 +282,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     num_tiles: int,
     num_units: int,
     attention_grid: int,
+    longest_segment: int,
     softmax_scale: float,
 ) -> None:
     pass
@@ -411,6 +423,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
         num_stats_tiles,
         plan.num_units,
         plan.grid,
+        _longest_segment(plan.bounds),
         float(softmax_scale),
     )
     return out
