@@ -92,13 +92,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SM100_DEFER_ROW_SUM 0
 #define SM100_CORRECTION_BATCH 1
 #define SM100_F16X2_EXP 0
-#define SM100_EXP2_EMU25 1
+#define SM100_EXP2_EMU25 0
 #define SM100_EXP2_EMU44 0
 #define SM100_EXP2_EMU62 0
 #define SM100_DROP_PROXY_FENCES 1
 #define SM100_EXP2_EMU31 0
 #define SM100_EXP2_EMU41 0
-#define SM100_PACKED_MATH 1
+#define SM100_PACKED_MATH 0
 #define SM100_KO_NO_EXP 0
 #define SM100_KO_NO_RESCALE 0
 #define SM100_KO_NO_EXCHANGE 0
@@ -1153,7 +1153,7 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_kr, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_11658d29da8d74e847ed(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_kr, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1707,22 +1707,10 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                 float safe_max = ((ref_new == -CAKE_INF) ? 0.0f : ref_new);
                 float max_scaled = safe_max * softmax_scale_log2 - 6.8073549220576f;
                 {
-                    float neg_max_scaled = -max_scaled;
-                    const float2 _fma_b2_2 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_3 = {neg_max_scaled, neg_max_scaled};
                     #pragma unroll
-                    for (int _lf = 0; _lf < 32; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(sv)[_lf], _fma_b2_2, _fma_c2_3);
-                    #pragma unroll
-                    for (int _le = 0; _le < 32; _le++) {
-                        if (SM100_EXP2_EMU25 && _le >= 24) {
-                            float2 _exp2_pair_4 = ex2_emulation_f32x2_value(make_float2(sv[_le*2], sv[_le*2 + 1]));
-                            sv[_le*2] = _exp2_pair_4.x;
-                            sv[_le*2 + 1] = _exp2_pair_4.y;
-                        } else {
-                            sv[_le*2] = approx_exp2(sv[_le*2]);
-                            sv[_le*2 + 1] = approx_exp2(sv[_le*2 + 1]);
-                        }
+                    for (int i = 0; i < 64; i++) {
+                        float _exp2_2 = approx_exp2(sv[i] * softmax_scale_log2 - max_scaled);
+                        sv[i] = _exp2_2;
                     }
                 }
                 float sum_c0 = sv[0];
@@ -1734,15 +1722,15 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                 float sum_c6 = sv[6];
                 float sum_c7 = sv[7];
                 #pragma unroll
-                for (int i = 8; i < 64; i += 8) {
-                    sum_c0 = sum_c0 + sv[i];
-                    sum_c1 = sum_c1 + sv[i + 1];
-                    sum_c2 = sum_c2 + sv[i + 2];
-                    sum_c3 = sum_c3 + sv[i + 3];
-                    sum_c4 = sum_c4 + sv[i + 4];
-                    sum_c5 = sum_c5 + sv[i + 5];
-                    sum_c6 = sum_c6 + sv[i + 6];
-                    sum_c7 = sum_c7 + sv[i + 7];
+                for (int i_1 = 8; i_1 < 64; i_1 += 8) {
+                    sum_c0 = sum_c0 + sv[i_1];
+                    sum_c1 = sum_c1 + sv[i_1 + 1];
+                    sum_c2 = sum_c2 + sv[i_1 + 2];
+                    sum_c3 = sum_c3 + sv[i_1 + 3];
+                    sum_c4 = sum_c4 + sv[i_1 + 4];
+                    sum_c5 = sum_c5 + sv[i_1 + 5];
+                    sum_c6 = sum_c6 + sv[i_1 + 6];
+                    sum_c7 = sum_c7 + sv[i_1 + 7];
                 }
                 float sum_c01 = sum_c0 + sum_c1;
                 float sum_c23 = sum_c2 + sum_c3;
@@ -1982,14 +1970,11 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                                 : "r"(o_rs_base + oc + 32));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             {
-                                const float2 _scale2_5 = {o_scale, o_scale};
                                 #pragma unroll
-                                for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_ls], _scale2_5);
-                                const float2 _scale2_6 = {o_scale, o_scale};
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_6);
+                                for (int j = 0; j < 32; j++) {
+                                    _tmem_load_0[j] = _tmem_load_0[j] * o_scale;
+                                    _tmem_load_1[j] = _tmem_load_1[j] * o_scale;
+                                }
                             }
                             tmem_st_x32_f32(o_rs_base + oc, _tmem_load_0);
                             tmem_st_x32_f32(o_rs_base + oc + 32, _tmem_load_1);
@@ -2087,23 +2072,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                         : "r"(o_base_epi + c2 + 64 + 32));
                     {
                         unsigned int packed_epi[16];
-                        const float2 _scale2_7 = {output_scale, output_scale};
+                        const float2 _scale2_2 = {output_scale, output_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_2 + 0))[_ls], _scale2_7);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_2 + 0))[_ls], _scale2_2);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_2[_lp*2 + 0], _tmem_load_2[_lp*2+1 + 0]));
                             packed_epi[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j = 0; j < 16; j += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j / 4) * 16)), "r"(packed_epi[j]), "r"(packed_epi[j + 1]), "r"(packed_epi[j + 2]), "r"(packed_epi[j + 3]) : "memory");
+                        for (int j_1 = 0; j_1 < 16; j_1 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_1 / 4) * 16)), "r"(packed_epi[j_1]), "r"(packed_epi[j_1 + 1]), "r"(packed_epi[j_1 + 2]), "r"(packed_epi[j_1 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_1 = 0; i_1 < 4; i_1++) {
-                            int epi_r = i_1 * 8 + epi_rq;
+                        for (int i_2 = 0; i_2 < 4; i_2++) {
+                            int epi_r = i_2 * 8 + epi_rq;
                             unsigned int _smem_epi_reg_0[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -2118,23 +2103,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                             }
                         }
                         __syncwarp();
-                        const float2 _scale2_8 = {output_scale, output_scale};
+                        const float2 _scale2_3 = {output_scale, output_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_2 + 32))[_ls], _scale2_8);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_2 + 32))[_ls], _scale2_3);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_2[_lp*2 + 32], _tmem_load_2[_lp*2+1 + 32]));
                             packed_epi[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_1 = 0; j_1 < 16; j_1 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_1 / 4) * 16)), "r"(packed_epi[j_1]), "r"(packed_epi[j_1 + 1]), "r"(packed_epi[j_1 + 2]), "r"(packed_epi[j_1 + 3]) : "memory");
+                        for (int j_2 = 0; j_2 < 16; j_2 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_2 / 4) * 16)), "r"(packed_epi[j_2]), "r"(packed_epi[j_2 + 1]), "r"(packed_epi[j_2 + 2]), "r"(packed_epi[j_2 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_2 = 0; i_2 < 4; i_2++) {
-                            int epi_r_1 = i_2 * 8 + epi_rq;
+                        for (int i_3 = 0; i_3 < 4; i_3++) {
+                            int epi_r_1 = i_3 * 8 + epi_rq;
                             unsigned int _smem_epi_reg_1[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -2152,23 +2137,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                     }
                     {
                         unsigned int packed_epi_1[16];
-                        const float2 _scale2_9 = {output_scale, output_scale};
+                        const float2 _scale2_4 = {output_scale, output_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_3 + 0))[_ls], _scale2_9);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_3 + 0))[_ls], _scale2_4);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_3[_lp*2 + 0], _tmem_load_3[_lp*2+1 + 0]));
                             packed_epi_1[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_2 = 0; j_2 < 16; j_2 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_2 / 4) * 16)), "r"(packed_epi_1[j_2]), "r"(packed_epi_1[j_2 + 1]), "r"(packed_epi_1[j_2 + 2]), "r"(packed_epi_1[j_2 + 3]) : "memory");
+                        for (int j_3 = 0; j_3 < 16; j_3 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_3 / 4) * 16)), "r"(packed_epi_1[j_3]), "r"(packed_epi_1[j_3 + 1]), "r"(packed_epi_1[j_3 + 2]), "r"(packed_epi_1[j_3 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_3 = 0; i_3 < 4; i_3++) {
-                            int epi_r_2 = i_3 * 8 + epi_rq;
+                        for (int i_4 = 0; i_4 < 4; i_4++) {
+                            int epi_r_2 = i_4 * 8 + epi_rq;
                             unsigned int _smem_epi_reg_2[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -2183,23 +2168,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                             }
                         }
                         __syncwarp();
-                        const float2 _scale2_10 = {output_scale, output_scale};
+                        const float2 _scale2_5 = {output_scale, output_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_3 + 32))[_ls], _scale2_10);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_3 + 32))[_ls], _scale2_5);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_3[_lp*2 + 32], _tmem_load_3[_lp*2+1 + 32]));
                             packed_epi_1[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_3 = 0; j_3 < 16; j_3 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_3 / 4) * 16)), "r"(packed_epi_1[j_3]), "r"(packed_epi_1[j_3 + 1]), "r"(packed_epi_1[j_3 + 2]), "r"(packed_epi_1[j_3 + 3]) : "memory");
+                        for (int j_4 = 0; j_4 < 16; j_4 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase + (epi_wkey ^ j_4 / 4) * 16)), "r"(packed_epi_1[j_4]), "r"(packed_epi_1[j_4 + 1]), "r"(packed_epi_1[j_4 + 2]), "r"(packed_epi_1[j_4 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_4 = 0; i_4 < 4; i_4++) {
-                            int epi_r_3 = i_4 * 8 + epi_rq;
+                        for (int i_5 = 0; i_5 < 4; i_5++) {
+                            int epi_r_3 = i_5 * 8 + epi_rq;
                             unsigned int _smem_epi_reg_3[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -2647,22 +2632,10 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                 float safe_max_1 = ((ref_new_1 == -CAKE_INF) ? 0.0f : ref_new_1);
                 float max_scaled_1 = safe_max_1 * softmax_scale_log2 - 6.8073549220576f;
                 {
-                    float neg_max_scaled_1 = -max_scaled_1;
-                    const float2 _fma_b2_2 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_3 = {neg_max_scaled_1, neg_max_scaled_1};
                     #pragma unroll
-                    for (int _lf = 0; _lf < 32; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(sv_1)[_lf], _fma_b2_2, _fma_c2_3);
-                    #pragma unroll
-                    for (int _le = 0; _le < 32; _le++) {
-                        if (SM100_EXP2_EMU25 && _le >= 24) {
-                            float2 _exp2_pair_4 = ex2_emulation_f32x2_value(make_float2(sv_1[_le*2], sv_1[_le*2 + 1]));
-                            sv_1[_le*2] = _exp2_pair_4.x;
-                            sv_1[_le*2 + 1] = _exp2_pair_4.y;
-                        } else {
-                            sv_1[_le*2] = approx_exp2(sv_1[_le*2]);
-                            sv_1[_le*2 + 1] = approx_exp2(sv_1[_le*2 + 1]);
-                        }
+                    for (int i_6 = 0; i_6 < 64; i_6++) {
+                        float _exp2_7 = approx_exp2(sv_1[i_6] * softmax_scale_log2 - max_scaled_1);
+                        sv_1[i_6] = _exp2_7;
                     }
                 }
                 float sum_c0_1 = sv_1[0];
@@ -2674,15 +2647,15 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                 float sum_c6_1 = sv_1[6];
                 float sum_c7_1 = sv_1[7];
                 #pragma unroll
-                for (int i_5 = 8; i_5 < 64; i_5 += 8) {
-                    sum_c0_1 = sum_c0_1 + sv_1[i_5];
-                    sum_c1_1 = sum_c1_1 + sv_1[i_5 + 1];
-                    sum_c2_1 = sum_c2_1 + sv_1[i_5 + 2];
-                    sum_c3_1 = sum_c3_1 + sv_1[i_5 + 3];
-                    sum_c4_1 = sum_c4_1 + sv_1[i_5 + 4];
-                    sum_c5_1 = sum_c5_1 + sv_1[i_5 + 5];
-                    sum_c6_1 = sum_c6_1 + sv_1[i_5 + 6];
-                    sum_c7_1 = sum_c7_1 + sv_1[i_5 + 7];
+                for (int i_7 = 8; i_7 < 64; i_7 += 8) {
+                    sum_c0_1 = sum_c0_1 + sv_1[i_7];
+                    sum_c1_1 = sum_c1_1 + sv_1[i_7 + 1];
+                    sum_c2_1 = sum_c2_1 + sv_1[i_7 + 2];
+                    sum_c3_1 = sum_c3_1 + sv_1[i_7 + 3];
+                    sum_c4_1 = sum_c4_1 + sv_1[i_7 + 4];
+                    sum_c5_1 = sum_c5_1 + sv_1[i_7 + 5];
+                    sum_c6_1 = sum_c6_1 + sv_1[i_7 + 6];
+                    sum_c7_1 = sum_c7_1 + sv_1[i_7 + 7];
                 }
                 float sum_c01_1 = sum_c0_1 + sum_c1_1;
                 float sum_c23_1 = sum_c2_1 + sum_c3_1;
@@ -2922,14 +2895,11 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                                 : "r"(o_rs_base_1 + oc_1 + 32));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             {
-                                const float2 _scale2_5 = {o_scale_1, o_scale_1};
                                 #pragma unroll
-                                for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_4)[_ls], _scale2_5);
-                                const float2 _scale2_6 = {o_scale_1, o_scale_1};
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_5)[_ls], _scale2_6);
+                                for (int j_5 = 0; j_5 < 32; j_5++) {
+                                    _tmem_load_4[j_5] = _tmem_load_4[j_5] * o_scale_1;
+                                    _tmem_load_5[j_5] = _tmem_load_5[j_5] * o_scale_1;
+                                }
                             }
                             tmem_st_x32_f32(o_rs_base_1 + oc_1, _tmem_load_4);
                             tmem_st_x32_f32(o_rs_base_1 + oc_1 + 32, _tmem_load_5);
@@ -3036,23 +3006,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                         : "r"(o_base_epi_1 + c2_1 + 64 + 32));
                     {
                         unsigned int packed_epi_2[16];
-                        const float2 _scale2_7 = {output_scale_1, output_scale_1};
+                        const float2 _scale2_2 = {output_scale_1, output_scale_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_6 + 0))[_ls], _scale2_7);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_6 + 0))[_ls], _scale2_2);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_6[_lp*2 + 0], _tmem_load_6[_lp*2+1 + 0]));
                             packed_epi_2[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_4 = 0; j_4 < 16; j_4 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_4 / 4) * 16)), "r"(packed_epi_2[j_4]), "r"(packed_epi_2[j_4 + 1]), "r"(packed_epi_2[j_4 + 2]), "r"(packed_epi_2[j_4 + 3]) : "memory");
+                        for (int j_6 = 0; j_6 < 16; j_6 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_6 / 4) * 16)), "r"(packed_epi_2[j_6]), "r"(packed_epi_2[j_6 + 1]), "r"(packed_epi_2[j_6 + 2]), "r"(packed_epi_2[j_6 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_6 = 0; i_6 < 4; i_6++) {
-                            int epi_r_4 = i_6 * 8 + epi_rq_1;
+                        for (int i_8 = 0; i_8 < 4; i_8++) {
+                            int epi_r_4 = i_8 * 8 + epi_rq_1;
                             unsigned int _smem_epi_reg_4[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -3067,23 +3037,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                             }
                         }
                         __syncwarp();
-                        const float2 _scale2_8 = {output_scale_1, output_scale_1};
+                        const float2 _scale2_3 = {output_scale_1, output_scale_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_6 + 32))[_ls], _scale2_8);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_6 + 32))[_ls], _scale2_3);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_6[_lp*2 + 32], _tmem_load_6[_lp*2+1 + 32]));
                             packed_epi_2[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_5 = 0; j_5 < 16; j_5 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_5 / 4) * 16)), "r"(packed_epi_2[j_5]), "r"(packed_epi_2[j_5 + 1]), "r"(packed_epi_2[j_5 + 2]), "r"(packed_epi_2[j_5 + 3]) : "memory");
+                        for (int j_7 = 0; j_7 < 16; j_7 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_7 / 4) * 16)), "r"(packed_epi_2[j_7]), "r"(packed_epi_2[j_7 + 1]), "r"(packed_epi_2[j_7 + 2]), "r"(packed_epi_2[j_7 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_7 = 0; i_7 < 4; i_7++) {
-                            int epi_r_5 = i_7 * 8 + epi_rq_1;
+                        for (int i_9 = 0; i_9 < 4; i_9++) {
+                            int epi_r_5 = i_9 * 8 + epi_rq_1;
                             unsigned int _smem_epi_reg_5[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -3101,23 +3071,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                     }
                     {
                         unsigned int packed_epi_3[16];
-                        const float2 _scale2_9 = {output_scale_1, output_scale_1};
+                        const float2 _scale2_4 = {output_scale_1, output_scale_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_7 + 0))[_ls], _scale2_9);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_7 + 0))[_ls], _scale2_4);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_7[_lp*2 + 0], _tmem_load_7[_lp*2+1 + 0]));
                             packed_epi_3[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_6 = 0; j_6 < 16; j_6 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_6 / 4) * 16)), "r"(packed_epi_3[j_6]), "r"(packed_epi_3[j_6 + 1]), "r"(packed_epi_3[j_6 + 2]), "r"(packed_epi_3[j_6 + 3]) : "memory");
+                        for (int j_8 = 0; j_8 < 16; j_8 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_8 / 4) * 16)), "r"(packed_epi_3[j_8]), "r"(packed_epi_3[j_8 + 1]), "r"(packed_epi_3[j_8 + 2]), "r"(packed_epi_3[j_8 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_8 = 0; i_8 < 4; i_8++) {
-                            int epi_r_6 = i_8 * 8 + epi_rq_1;
+                        for (int i_10 = 0; i_10 < 4; i_10++) {
+                            int epi_r_6 = i_10 * 8 + epi_rq_1;
                             unsigned int _smem_epi_reg_6[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
@@ -3132,23 +3102,23 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_014eb1e88911ef84175f(const __grid_co
                             }
                         }
                         __syncwarp();
-                        const float2 _scale2_10 = {output_scale_1, output_scale_1};
+                        const float2 _scale2_5 = {output_scale_1, output_scale_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_7 + 32))[_ls], _scale2_10);
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_7 + 32))[_ls], _scale2_5);
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_7[_lp*2 + 32], _tmem_load_7[_lp*2+1 + 32]));
                             packed_epi_3[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
-                        for (int j_7 = 0; j_7 < 16; j_7 += 4) {
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_7 / 4) * 16)), "r"(packed_epi_3[j_7]), "r"(packed_epi_3[j_7 + 1]), "r"(packed_epi_3[j_7 + 2]), "r"(packed_epi_3[j_7 + 3]) : "memory");
+                        for (int j_9 = 0; j_9 < 16; j_9 += 4) {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_epi_addr + (unsigned int)(epi_wbase_1 + (epi_wkey_1 ^ j_9 / 4) * 16)), "r"(packed_epi_3[j_9]), "r"(packed_epi_3[j_9 + 1]), "r"(packed_epi_3[j_9 + 2]), "r"(packed_epi_3[j_9 + 3]) : "memory");
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_9 = 0; i_9 < 4; i_9++) {
-                            int epi_r_7 = i_9 * 8 + epi_rq_1;
+                        for (int i_11 = 0; i_11 < 4; i_11++) {
+                            int epi_r_7 = i_11 * 8 + epi_rq_1;
                             unsigned int _smem_epi_reg_7[4];
                             {
                                 const unsigned int* _smem_ptr = reinterpret_cast<const unsigned int*>(smem_epi);
