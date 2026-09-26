@@ -81,7 +81,6 @@ from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
-    moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
 )
@@ -508,6 +507,8 @@ def _moe_core_impl(
 
     # Step 4: Deterministic routing-weight reduction
     if not use_fused_finalize:
+        from .blackwell.moe_finalize import moe_unpermute
+
         moe_unpermute(
             permuted_input=gemm2_output,
             output=moe_output,

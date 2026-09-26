@@ -1396,6 +1396,13 @@ class Sm100W4A16GroupedGemmKernel:
             )
             if cutlass.const_expr(self.enable_pdl):
                 griddepcontrol_wait()
+                # Let the standalone finalizer prepare routing metadata while
+                # FC2 runs; its own dependency wait protects every output load.
+                if cutlass.const_expr(
+                    not self.fuse_activation and not self.use_fused_finalize
+                ):
+                    with cute.arch.elect_one():
+                        griddepcontrol_launch_dependents()
 
             while work_tile.is_valid_tile:
                 coord_n_offset = (
@@ -2327,7 +2334,9 @@ class Sm100W4A16GroupedGemmKernel:
             if cutlass.const_expr(not self.use_fused_finalize):
                 c_pipeline.producer_tail()
 
-        if cutlass.const_expr(self.enable_pdl and not self.fuse_activation):
+        if cutlass.const_expr(
+            self.enable_pdl and not self.fuse_activation and self.use_fused_finalize
+        ):
             if warp_idx == self.mma_warp_id:
                 with cute.arch.elect_one():
                     griddepcontrol_launch_dependents()
