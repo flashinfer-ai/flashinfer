@@ -1346,7 +1346,10 @@ class CudnnPrefillGraph:
         lse_base,
         tensor_uids=None,
     ):
-        handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+        device = q.device
+        handle = _create_cudnn_handle(
+            torch.cuda.current_stream(device.index if device.type == "cuda" else device)
+        )
         if tensor_uids is None:
             self.graph.execute(
                 var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs

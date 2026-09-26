@@ -486,7 +486,10 @@ def _execute_decode(
     execution_bindings=None,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
-    handle_ = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+    device = q.device
+    handle_ = _create_cudnn_handle(
+        torch.cuda.current_stream(device.index if device.type == "cuda" else device)
+    )
 
     if execution_bindings is not None:
         # UIDs are fixed by preparation; tensor observation remains FE's job.
