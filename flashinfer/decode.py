@@ -1356,6 +1356,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if q_len_per_req < 1:
+            raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -1481,7 +1483,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
-                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+                args.append(
+                    q_len_per_req if q_len_per_req > 1 or disable_split_kv else 0
+                )  # uniform_q_len
         else:
             if self._jit_module is not None:
                 module = self._jit_module
@@ -2075,7 +2079,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
-                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+                args.append(
+                    q_len_per_req if q_len_per_req > 1 or disable_split_kv else 0
+                )  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -4563,7 +4569,7 @@ def fast_decode_plan(
                     args.append(disable_split_kv)
                     args.append(0)  # num_colocated_ctas
                     args.append(
-                        q_len_per_req if q_len_per_req > 1 else 0
+                        q_len_per_req if q_len_per_req > 1 or disable_split_kv else 0
                     )  # uniform_q_len
                 self._plan_info = self._cached_module.plan(
                     *args,
