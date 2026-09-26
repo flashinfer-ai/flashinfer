@@ -1416,6 +1416,8 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         partial_ML=tiles.partial_ML,
         num_tiles=total_tiles,
     )
+    dense_names: tuple[str, ...]
+    split_names: tuple[str, ...]
     if pv_mode == "fp4":
         pv_operands = dict(
             Vt=workspace["v_fp4_t"],
