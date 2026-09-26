@@ -29,7 +29,6 @@ from .cake_minimax_h3_sm120_quant_varlen_attention import (
     _BLOCK_M,
     _BLOCK_N,
     _MAX_HEADS,
-    _PARTIAL_FLOATS,
     MINIMAX_H3_HEAD_DIM,
     MINIMAX_H3_NUM_HEADS,
     _ceil_div,
@@ -40,12 +39,12 @@ from .cake_minimax_h3_sm120_quant_varlen_attention import (
     normalize_cu_seqlens,
 )
 
-# NVFP4 operand geometry: 16 channels per UE4M3 block scale, two E2M1 codes per byte.
+# NVFP4 operand geometry: 16 elements per UE4M3 block scale, two E2M1 codes per byte.
 _FP4_BLOCK = 16
 _BLOCKS_PER_ROW = MINIMAX_H3_HEAD_DIM // _FP4_BLOCK
 _ROW_BYTES4 = MINIMAX_H3_HEAD_DIM // 2
-# One contiguous 1 KiB tile of K block scales per (head, 128-key block).
-_KSF_TILE_BYTES = _BLOCK_N * _BLOCKS_PER_ROW
+# One contiguous 1 KiB tile of K (per key) or V (per channel) block scales per (head, 128-key block).
+_SCALE_TILE_BYTES = _BLOCK_N * _BLOCKS_PER_ROW
 
 
 @functools.cache
@@ -60,17 +59,27 @@ def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int
     padded = num_kblocks * _BLOCK_N
     q4 = k4 = tokens * num_heads * _ROW_BYTES4
     q_sf = tokens * num_heads * _BLOCKS_PER_ROW
-    k_sf = num_heads * num_kblocks * _KSF_TILE_BYTES
-    vt8 = num_heads * MINIMAX_H3_HEAD_DIM * padded
-    scales = (
-        tokens * num_heads
-        + max(1, num_segments) * num_heads
-        + 2 * num_segments * num_heads * MINIMAX_H3_HEAD_DIM
-    )
-    num_tiles = _ceil_div(tokens, _BLOCK_M)
-    partials = num_tiles * num_heads * _PARTIAL_FLOATS + num_tiles * num_heads
+    k_sf = v_sf = num_heads * num_kblocks * _SCALE_TILE_BYTES
+    vt4 = num_heads * MINIMAX_H3_HEAD_DIM * (padded // 2)
+    # One quantized block-mean row (+ scales) and one FP32 channel-mean row per (Q block, head): at most one
+    # extra block per segment beyond tokens / 128.
+    qtiles = _ceil_div(tokens, _BLOCK_M) + max(1, num_segments)
+    qm = qtiles * num_heads * (_ROW_BYTES4 + _BLOCKS_PER_ROW)
+    q_mean = qtiles * num_heads * MINIMAX_H3_HEAD_DIM
+    mean_k = num_segments * num_heads * MINIMAX_H3_HEAD_DIM
+    num_tiles = _ceil_div(tokens, _BLOCK_M) + max(1, num_segments)
+    partials = num_tiles * num_heads * MINIMAX_H3_HEAD_DIM
     counters = max(1, num_segments) * num_heads
-    return q4 + k4 + q_sf + k_sf + vt8 + 4 * (scales + partials + counters)
+    return (
+        q4
+        + k4
+        + q_sf
+        + k_sf
+        + v_sf
+        + vt4
+        + qm
+        + 4 * (q_mean + mean_k + partials + counters)
+    )
 
 
 _ZERO_WORKSPACES: dict[tuple[int, str], torch.Tensor] = {}
@@ -130,15 +139,6 @@ def _plan_rows(plan, device: torch.device) -> tuple:
     return cached[0], cached[1], cached[2]
 
 
-def _longest_segment(bounds: Sequence[int]) -> int:
-    """Tokens of the longest segment (0 when all are empty); the TU picks the attention variant with it."""
-
-    return max(
-        (int(b) - int(a) for a, b in zip(bounds[:-1], bounds[1:], strict=False)),
-        default=0,
-    )
-
-
 def _token_segment_ids(
     bounds: Sequence[int], padded_tokens: int, device: torch.device
 ) -> torch.Tensor:
@@ -191,13 +191,13 @@ def _zero_workspace(
         "k4",
         "q_sf",
         "k_sf",
-        "vt8",
-        "q_scale",
-        "k_scale",
-        "v_scale",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+        "q_mean",
         "mean_k",
         "partials",
-        "knorm_part",
         "counters",
     ),
 )
@@ -206,6 +206,8 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     tok_seg: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seg_tile_begin: torch.Tensor,
     out: torch.Tensor,
     tile_table: torch.Tensor,
     unit_table: torch.Tensor,
@@ -213,19 +215,19 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     k4: torch.Tensor,
     q_sf: torch.Tensor,
     k_sf: torch.Tensor,
-    vt8: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
+    qm4: torch.Tensor,
+    qm_sf: torch.Tensor,
+    vt4: torch.Tensor,
+    v_sf: torch.Tensor,
+    q_mean: torch.Tensor,
     mean_k: torch.Tensor,
     partials: torch.Tensor,
-    knorm_part: torch.Tensor,
     counters: torch.Tensor,
     num_segments: int,
     num_tiles: int,
+    num_qtiles: int,
     num_units: int,
     attention_grid: int,
-    longest_segment: int,
     softmax_scale: float,
 ) -> None:
     _get_module().minimax_h3_sm120_varlen_attention_nvfp4(
@@ -233,6 +235,8 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         k,
         v,
         tok_seg,
+        cu_seqlens,
+        seg_tile_begin,
         out,
         tile_table,
         unit_table,
@@ -240,19 +244,19 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         k4,
         q_sf,
         k_sf,
-        vt8,
-        q_scale,
-        k_scale,
-        v_scale,
+        qm4,
+        qm_sf,
+        vt4,
+        v_sf,
+        q_mean,
         mean_k,
         partials,
-        knorm_part,
         counters,
         num_segments,
         num_tiles,
+        num_qtiles,
         num_units,
         attention_grid,
-        longest_segment,
         softmax_scale,
     )
 
@@ -263,6 +267,8 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     tok_seg: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seg_tile_begin: torch.Tensor,
     out: torch.Tensor,
     tile_table: torch.Tensor,
     unit_table: torch.Tensor,
@@ -270,19 +276,19 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     k4: torch.Tensor,
     q_sf: torch.Tensor,
     k_sf: torch.Tensor,
-    vt8: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
+    qm4: torch.Tensor,
+    qm_sf: torch.Tensor,
+    vt4: torch.Tensor,
+    v_sf: torch.Tensor,
+    q_mean: torch.Tensor,
     mean_k: torch.Tensor,
     partials: torch.Tensor,
-    knorm_part: torch.Tensor,
     counters: torch.Tensor,
     num_segments: int,
     num_tiles: int,
+    num_qtiles: int,
     num_units: int,
     attention_grid: int,
-    longest_segment: int,
     softmax_scale: float,
 ) -> None:
     pass
@@ -299,28 +305,30 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     cu_seqlens_host: Optional[Sequence[int]] = None,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    r"""Experimental NVFP4-QK / FP8-PV non-causal packed-varlen self-attention for MiniMax-H3 on SM120 (GB202).
+    r"""Experimental NVFP4 non-causal packed-varlen self-attention for MiniMax-H3 on SM120 (GB202),
+    following the SageAttention3 FP4 recipe.
 
     Computes, for every segment ``[a, b)`` of ``cu_seqlens`` and every head ``h``::
 
         out[a:b, h] = softmax(q[a:b, h] @ k[a:b, h]^T * softmax_scale) @ v[a:b, h]
 
-    with NVFP4 tensor-core operands for the scores and FP8 operands for the value product, and
-    an FP32 softmax.  Q and K rows are centred by the segment's per-channel K mean (an exact
-    softmax shift), rotated by a fixed orthonormal signed Hadamard transform (which spreads
-    channel outliers over the row without changing any dot product), prescaled per token (Q) /
-    per 128-key block (K) and stored as E2M1 codes with one UE4M3 scale per 16 channels; QK^T
-    runs ``mma.sync.m16n8k64 kind::mxf4nvf4 block_scale scale_vec::4X``.  The probabilities are
-    stored as E4M3 with a 2^8 exponent bias, V per (segment, channel) as E4M3, and PV runs
-    ``mma.sync.m16n8k32 kind::f8f6f4``; the output is rounded to BF16 once.  One
-    runtime-variable kernel set serves any ``tokens`` and any segment lengths (including empty
-    segments and lengths below one tile); the quantized operands live in a grow-only per-device
-    workspace (``workspace_bytes_nvfp4``) shared with :func:`minimax_h3_sm120_varlen_attention_fp8`.
+    with block-scaled NVFP4 tensor-core operands for both the scores and the value product and an
+    FP32 softmax, as in SageAttention3 (``sageattention3_blackwell``): K rows are centred by the
+    segment's per-channel mean and Q rows by their 128-row block's mean (the block-mean term
+    ``qm K^T`` is added back inside the kernel, so the softmax is unchanged), Q / K / V are stored
+    as E2M1 codes with one UE4M3 scale per 16 elements (block amax / 6; V transposed with per-16-key
+    scales), QK^T and PV both run ``mma.sync.m16n8k64 kind::mxf4nvf4 block_scale scale_vec::4X``,
+    and the probabilities use Sage3's two-level scheme (row maximum brought to 448 * 6, one UE4M3
+    scale per 16 keys, E2M1 codes); the output is rounded to BF16 once.  One runtime-variable
+    kernel set serves any ``tokens`` and any segment lengths (including empty segments and lengths
+    below one tile); the quantized operands live in a grow-only per-device workspace
+    (``workspace_bytes_nvfp4``) shared with :func:`minimax_h3_sm120_varlen_attention_fp8`.
 
-    The E2M1 scores carry a larger quantization error than the FP8 operator (about 3x the
-    relative L2 error on Gaussian inputs); this route is an experimental precision/latency
-    trade-off and is validated against the FP32 oracle with the FP4 block-scaled tolerance
-    ``atol = 1.0, rtol = 0.1`` (see the tests), not the FP8 operator's ``0.1``.
+    The E2M1 scores and probabilities carry a larger quantization error than the FP8 operator
+    (about 4x the relative L2 error on Gaussian inputs, the same as SageAttention3's own); this
+    route is an experimental precision/latency trade-off and is validated against the FP32 oracle
+    with the FP4 block-scaled tolerance ``atol = 1.0, rtol = 0.1`` (see the tests), not the FP8
+    operator's ``0.1``.
 
     Parameters
     ----------
@@ -372,29 +380,23 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     tile_rows, num_stats_tiles, unit_rows = _plan_rows(plan, q.device)
     index = _device_index(q.device)
     hd = MINIMAX_H3_HEAD_DIM
+    qtiles = max(1, plan.num_tiles)
     q4 = _workspace(index, "q4", tokens * heads * _ROW_BYTES4, torch.uint8)
     k4 = _workspace(index, "k4", tokens * heads * _ROW_BYTES4, torch.uint8)
     q_sf = _workspace(index, "q_sf", tokens * heads * _BLOCKS_PER_ROW, torch.uint8)
     k_sf = _workspace(
-        index, "k_sf", heads * plan.num_kblocks * _KSF_TILE_BYTES, torch.uint8
+        index, "k_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
     )
-    vt8 = _workspace(index, "vt8", heads * hd * plan.padded_tokens, torch.uint8)
-    q_scale = _workspace(index, "q_scale", tokens * heads, torch.float32)
-    k_scale = _workspace(
-        index, "k_scale", max(1, plan.num_segments) * heads, torch.float32
+    qm4 = _workspace(index, "qm4", qtiles * heads * _ROW_BYTES4, torch.uint8)
+    qm_sf = _workspace(index, "qm_sf", qtiles * heads * _BLOCKS_PER_ROW, torch.uint8)
+    vt4 = _workspace(index, "vt4", heads * hd * (plan.padded_tokens // 2), torch.uint8)
+    v_sf = _workspace(
+        index, "v_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
     )
-    v_scale = _workspace(
-        index, "v_scale", plan.num_segments * heads * hd, torch.float32
-    )
+    q_mean = _workspace(index, "q_mean", qtiles * heads * hd, torch.float32)
     mean_k = _workspace(index, "mean_k", plan.num_segments * heads * hd, torch.float32)
     partials = _workspace(
-        index,
-        "partials",
-        max(1, plan.num_tiles * heads * _PARTIAL_FLOATS),
-        torch.float32,
-    )
-    knorm_part = _workspace(
-        index, "knorm_part", max(1, plan.num_tiles * heads), torch.float32
+        index, "partials", max(1, num_stats_tiles * heads * hd), torch.float32
     )
     counters = _zero_workspace(
         index, "counters", max(1, plan.num_segments) * heads, torch.uint32
@@ -404,6 +406,8 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
         k,
         v,
         _token_segment_ids(plan.bounds, plan.padded_tokens, q.device),
+        plan.cu_seqlens,
+        plan.seg_tile_begin,
         out,
         tile_rows,
         unit_rows,
@@ -411,19 +415,19 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
         k4,
         q_sf,
         k_sf,
-        vt8,
-        q_scale,
-        k_scale,
-        v_scale,
+        qm4,
+        qm_sf,
+        vt4,
+        v_sf,
+        q_mean,
         mean_k,
         partials,
-        knorm_part,
         counters,
         plan.num_segments,
         num_stats_tiles,
+        plan.num_tiles,
         plan.num_units,
         plan.grid,
-        _longest_segment(plan.bounds),
         float(softmax_scale),
     )
     return out

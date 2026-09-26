@@ -25,8 +25,8 @@ from .core import (
 )
 
 _CUDA_SOURCE_NAME = "cake_minimax_h3_sm120_nvfp4_varlen_attention_sm120a.cu"
-# GB202 only: the device code uses mma.sync kind::mxf4nvf4 (block-scaled QK^T) + kind::f8f6f4 (PV)
-# + TMA (no tcgen05), and the register schedule is tuned for the SM120 tensor-pipe / SMEM budget.
+# GB202 only: the device code uses mma.sync kind::mxf4nvf4 (block-scaled QK^T and PV) + TMA (no tcgen05),
+# and the register schedule is tuned for the SM120 tensor-pipe / SMEM budget.
 _SUPPORTED_MAJOR_VERSIONS = [12]
 
 
@@ -48,7 +48,7 @@ def _cuda_source() -> Path:
 
 
 def gen_minimax_h3_sm120_nvfp4_varlen_attention_module() -> JitSpec:
-    """JIT spec for the SM120 (GB202) NVFP4-QK / FP8-PV MiniMax-H3 packed-varlen attention kernels."""
+    """JIT spec for the SM120 (GB202) NVFP4 (SageAttention3-recipe) MiniMax-H3 packed-varlen attention kernels."""
 
     compilation_context = current_compilation_context
     if not compilation_context.TARGET_CUDA_ARCHS:

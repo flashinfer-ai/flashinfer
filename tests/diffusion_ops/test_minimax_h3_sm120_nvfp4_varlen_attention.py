@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the SM120 (GB202) experimental NVFP4-QK / FP8-PV MiniMax-H3 packed-varlen attention.
+"""Tests for the SM120 (GB202) experimental NVFP4 (SageAttention3-recipe) MiniMax-H3 packed-varlen attention.
 
-The operator evaluates ``softmax(Q K^T * scale) V`` per ``cu_seqlens`` segment with E2M1 Q / K
-(one UE4M3 scale per 16 channels after the segment-mean shift and a fixed orthonormal Hadamard
-rotation), E4M3 P / V and an FP32 softmax.  The E2M1 scores carry the FP4 block-scaled error
-budget: the package tolerance is ``atol = 1.0, rtol = 0.1`` on every element (the same contract as
-the SM100 NVFP4 attention routes) plus a relative-L2 bound about three times the FP8 operator's,
+The operator evaluates ``softmax(Q K^T * scale) V`` per ``cu_seqlens`` segment with E2M1 Q / K / V / P
+operands and one UE4M3 scale per 16 elements (SageAttention3's recipe: per-segment K mean and
+per-128-row Q block mean removal with in-kernel compensation, block amax / 6 scales, two-level P
+quantization) and an FP32 softmax.  The E2M1 scores and probabilities carry the FP4 block-scaled
+error budget: the package tolerance is ``atol = 1.0, rtol = 0.1`` on every element (the same contract
+as the SM100 NVFP4 attention routes) plus a relative-L2 bound about four times the FP8 operator's,
 checked on packed boundaries, tails, empty segments and multi-segment streams.  Every test needs
 an SM120 GPU (the JIT module only builds for compute capability 12.x).
 """
@@ -43,9 +44,9 @@ from flashinfer.utils import get_compute_capability
 
 ATOL = 1.0
 RTOL = 0.1
-# Measured relative L2 error on Gaussian inputs is 0.14-0.15 (FP8 operator: 0.05); the bound leaves
-# headroom for the boundary shapes without accepting a broken kernel.
-REL_L2_MAX = 0.25
+# Measured relative L2 error on Gaussian inputs is 0.186-0.193 (SageAttention3 itself: 0.19-0.24; the FP8
+# operator: 0.05); the bound leaves headroom for the boundary shapes without accepting a broken kernel.
+REL_L2_MAX = 0.30
 # Packed boundaries: single tokens, exact / one-past tile edges, empty segments, ragged
 # multi-segment streams, and a multi-tile single segment.
 CU_SEQLENS = [
@@ -227,9 +228,9 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_bad_inputs() -> None:
 def test_minimax_h3_sm120_varlen_attention_nvfp4_workspace_is_smaller_than_fp8() -> (
     None
 ):
-    # E2M1 codes + UE4M3 block scales are 9/16 of the E4M3 rows; the V^T tile and the scale /
-    # partial buffers are shared with the FP8 operator.  The K block scales are stored as full
-    # 1 KiB (128-key) tiles, so only streams below ~8 tokens per 128-key block pay more.
+    # E2M1 codes + UE4M3 block scales are 9/16 of the E4M3 rows for Q / K and V^T; the block-mean
+    # rows and channel means add one row per (Q block, head).  The K / V block scales are stored as
+    # full 1 KiB (128-key) tiles, so only streams below ~8 tokens per 128-key block pay more.
     assert workspace_bytes_nvfp4(1, 1, 1) > 0
     for tokens, heads, segments in ((128, 1, 1), (4824, 56, 3), (109952, 56, 1)):
         assert (
@@ -260,4 +261,4 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_error_vs_fp8_operator() -> None
     _check(out4, expected)
     rel4 = ((out4.float() - expected).norm() / expected.norm()).item()
     rel8 = ((out8.float() - expected).norm() / expected.norm()).item()
-    assert rel8 < rel4 < 5.0 * rel8, (rel4, rel8)
+    assert rel8 < rel4 < 6.0 * rel8, (rel4, rel8)

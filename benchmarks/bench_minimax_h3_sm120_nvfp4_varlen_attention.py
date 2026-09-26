@@ -16,9 +16,10 @@
 MiniMax-H3 (video DiT) runs one non-causal 56-head, head_dim-128 self-attention per block over a
 packed token stream ``[T, 56, 128]`` with ``int32`` ``cu_seqlens`` segment bounds.  On GB202
 (RTX 5090 / RTX PRO 6000 Blackwell) the tensor pipe is the bound, so
-``flashinfer.diffusion_ops.minimax_h3_sm120_varlen_attention_nvfp4`` (experimental) quantizes
-Q / K to NVFP4 (E2M1 + UE4M3 block scales) for the block-scaled ``mma.sync kind::mxf4nvf4``
-scores and P / V to E4M3 for the value product (FP32 softmax), in three PDL-chained launches.  This
+``flashinfer.diffusion_ops.minimax_h3_sm120_varlen_attention_nvfp4`` (experimental) follows the
+SageAttention3 FP4 recipe: Q / K / V and the probabilities are NVFP4 (E2M1 + UE4M3 block scales)
+and both the scores and the value product run block-scaled ``mma.sync kind::mxf4nvf4`` (FP32
+softmax, per-segment K mean and per-128-row Q block mean removal), in three PDL-chained launches.  This
 script times that operator against the shipped FP8 operator
 (``minimax_h3_sm120_varlen_attention_fp8``) and the FlashInfer BF16 ragged routes (``fa2``,
 ``cudnn`` and ``auto``) with ``bench_gpu_time`` (CUPTI, cold L2), reports the error of every
