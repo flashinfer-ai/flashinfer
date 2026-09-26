@@ -72087,8 +72087,8 @@ constexpr int kGeneratedSmemTotal = 9088;
 #undef kernel_alpha_moe_nvfp4_down_m1_gemv_slot_per_warp_actws_seedbf16_v26
 }  // namespace nvfp4_s5_c426v26_gemv
 
-namespace nvfp4_s5_c416p_up {
-#define kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_nvfp4_s5_c416p_up
+namespace nvfp4_s11_c416s_up {
+#define kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up
 #define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
@@ -72153,7 +72153,10 @@ namespace nvfp4_s5_c416p_up {
 #define SMEM_SMEM_OWNER_TOTAL_OFF 194740
 #define SMEM_SMEM_OWNER_TOTAL_STAGE_BYTES 4
 #define SMEM_SMEM_OWNER_TOTAL_STRIDE 4
-#define SMEM_TOTAL 194816
+#define SMEM_SMEM_BIN_MASK_OFF 194800
+#define SMEM_SMEM_BIN_MASK_STAGE_BYTES 12288
+#define SMEM_SMEM_BIN_MASK_STRIDE 12288
+#define SMEM_TOTAL 207104
 #define THREADS 192
 #define PACKED_SCALE_LOADS 1
 
@@ -72577,7 +72580,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(192, 1) void
-kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align(const __grid_constant__ CUtensorMap x, const __grid_constant__ CUtensorMap W1, uint8_t* __restrict__ x_scale, const __grid_constant__ CUtensorMap w1_scale_prepared, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ compact_owner_plan, int* __restrict__ compact_owner_count, uint8_t* __restrict__ act_workspace, uint8_t* __restrict__ sf_workspace, int* __restrict__ topk_ids, int* __restrict__ route_experts, int* __restrict__ cumsum_buffer, __nv_bfloat16* __restrict__ initial_out, float* __restrict__ seeded_accumulator, int num_experts, int num_pairs, int sorted_capacity, long long output_numel, int M, int K, int top_k, int route_block_m)
+kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank(const __grid_constant__ CUtensorMap x, const __grid_constant__ CUtensorMap W1, uint8_t* __restrict__ x_scale, const __grid_constant__ CUtensorMap w1_scale_prepared, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ compact_owner_plan, int* __restrict__ compact_owner_count, uint8_t* __restrict__ act_workspace, uint8_t* __restrict__ sf_workspace, int* __restrict__ topk_ids, int* __restrict__ route_experts, int* __restrict__ cumsum_buffer, __nv_bfloat16* __restrict__ initial_out, float* __restrict__ seeded_accumulator, int num_experts, int num_pairs, int sorted_capacity, long long output_numel, int M, int K, int top_k, int route_block_m)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -72636,6 +72639,8 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
     const int smem_scan_addr = smem + 194672;
     int* smem_owner_total = reinterpret_cast<int*>(smem_raw + 194740);
     const int smem_owner_total_addr = smem + 194740;
+    int* smem_bin_mask = reinterpret_cast<int*>(smem_raw + 194800);
+    const int smem_bin_mask_addr = smem + 194800;
 
     // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 15 barriers)
     // Mbarriers at smem_raw[0..120)
@@ -72689,11 +72694,16 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
     for (int bin_zero = tid; bin_zero < 384; bin_zero += 192) {
         smem_counts[bin_zero] = 0;
     }
+    for (int mask_zero = tid; mask_zero < 3072; mask_zero += 192) {
+        smem_bin_mask[mask_zero] = 0;
+    }
     __syncthreads();
+    int one_bit = 1;
     for (int pair_load = tid; pair_load < num_pairs; pair_load += 192) {
         int pair_bin = topk_ids[pair_load] + 1;
         smem_pair_bins[pair_load] = pair_bin;
         atomicAdd(&smem_counts[pair_bin], 1);
+        atomicAdd(&smem_bin_mask[pair_bin * 8 + (pair_load >> 5)], one_bit << (pair_load & 31));
     }
     __syncthreads();
     int padded_a[2];
@@ -72830,12 +72840,17 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
     for (int pair = tid; pair < num_pairs; pair += 192) {
         int bin_p = smem_pair_bins[pair];
         int rank = 0;
-        #pragma unroll 4
-        for (int earlier = 0; earlier < pair; earlier++) {
-            if (smem_pair_bins[earlier] == bin_p) {
-                rank = rank + 1;
-            }
+        int mask_base = bin_p * 8;
+        int word_index = pair >> 5;
+        #pragma unroll 1
+        for (int mask_word = 0; mask_word < word_index; mask_word++) {
+            int _popc_0 = __popc(smem_bin_mask[mask_base + mask_word]);
+            rank = rank + _popc_0;
         }
+        int own_word = smem_bin_mask[mask_base + word_index];
+        int below_bits = own_word & (one_bit << (pair & 31)) - 1;
+        int _popc_1 = __popc(below_bits);
+        rank = rank + _popc_1;
         int destination = smem_offsets[bin_p] + rank;
         smem_sorted_ids[destination] = pair;
         if (is_publisher) {
@@ -73675,7 +73690,7 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
 } // extern "C"
 
 constexpr int kGeneratedThreads = 192;
-constexpr int kGeneratedSmemTotal = 194816;
+constexpr int kGeneratedSmemTotal = 207104;
 #undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
@@ -73740,17 +73755,20 @@ constexpr int kGeneratedSmemTotal = 194816;
 #undef SMEM_SMEM_OWNER_TOTAL_OFF
 #undef SMEM_SMEM_OWNER_TOTAL_STAGE_BYTES
 #undef SMEM_SMEM_OWNER_TOTAL_STRIDE
+#undef SMEM_SMEM_BIN_MASK_OFF
+#undef SMEM_SMEM_BIN_MASK_STAGE_BYTES
+#undef SMEM_SMEM_BIN_MASK_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
 #undef PACKED_SCALE_LOADS
 #undef up_full_addr
 #undef up_free_addr
 #undef up_ready_addr
-#undef kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align
-}  // namespace nvfp4_s5_c416p_up
+#undef kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank
+}  // namespace nvfp4_s11_c416s_up
 
-namespace nvfp4_s5_c405v5_down {
-#define kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5 kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5_nvfp4_s5_c405v5_down
+namespace nvfp4_s11_c407_down {
+#define kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down
 #define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
@@ -74048,6 +74066,13 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
+__device__ __forceinline__ float max_noftz(float a, float b) {
+    float c;
+    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+    return c;
+}
+
+
 __device__ __forceinline__ void fence_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
@@ -74131,7 +74156,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(192, 2) void
-kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_constant__ CUtensorMap W2, const __grid_constant__ CUtensorMap w2_scale_prepared, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ out, int* __restrict__ route_experts, uint8_t* __restrict__ act_workspace, uint8_t* __restrict__ sf_workspace, int M, int K, int top_k, int route_block_m, float scaling_factor, int intermediate_blocks_total, int z_slices)
+kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz(const __grid_constant__ CUtensorMap W2, const __grid_constant__ CUtensorMap w2_scale_prepared, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ out, int* __restrict__ route_experts, uint8_t* __restrict__ act_workspace, uint8_t* __restrict__ sf_workspace, int M, int K, int top_k, int route_block_m, float scaling_factor, int intermediate_blocks_total, int z_slices)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -74218,13 +74243,10 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_
             unsigned int down_stage = 0;
             int ntp_l = num_tokens_post_padded[0];
             int route_blocks_l = (ntp_l + 8 - 1) / 8;
-            int z_eff_l = z_slices;
-            if (route_blocks_l > 8) {
-                z_eff_l = 16;
-            }
-            if (route_blocks_l > 16) {
-                z_eff_l = 8;
-            }
+            int _max_0 = ((route_blocks_l) > (1) ? (route_blocks_l) : (1));
+            int _max_1 = ((1) > (gridDim.x / _max_0) ? (1) : (gridDim.x / _max_0));
+            int _min_0 = ((z_slices) < (_max_1) ? (z_slices) : (_max_1));
+            int z_eff_l = _min_0;
             int n_items_l = route_blocks_l * z_eff_l;
             unsigned int _phase_down_free = 1;
             #pragma unroll 1
@@ -74243,8 +74265,8 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_
                     expert = expert_ids[route_block];
                 }
                 int first_panel_l = blockIdx.y * 4;
-                int _min_0 = ((4) < (intermediate_blocks - first_panel_l) ? (4) : (intermediate_blocks - first_panel_l));
-                int group_width_l = _min_0;
+                int _min_1 = ((4) < (intermediate_blocks - first_panel_l) ? (4) : (intermediate_blocks - first_panel_l));
+                int group_width_l = _min_1;
                 int output_tiles_l = (K / 128 - z_item_l + z_eff_l - 1) / z_eff_l;
                 int panel_count_l = output_tiles_l * group_width_l;
                 int w2_sf_cols = intermediate_blocks * 8;
@@ -74280,13 +74302,10 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_
             unsigned int output_stage_mma = 0;
             int ntp_m = num_tokens_post_padded[0];
             int route_blocks_m = (ntp_m + 8 - 1) / 8;
-            int z_eff_m = z_slices;
-            if (route_blocks_m > 8) {
-                z_eff_m = 16;
-            }
-            if (route_blocks_m > 16) {
-                z_eff_m = 8;
-            }
+            int _max_2 = ((route_blocks_m) > (1) ? (route_blocks_m) : (1));
+            int _max_3 = ((1) > (gridDim.x / _max_2) ? (1) : (gridDim.x / _max_2));
+            int _min_2 = ((z_slices) < (_max_3) ? (z_slices) : (_max_3));
+            int z_eff_m = _min_2;
             int n_items_m = route_blocks_m * z_eff_m;
             unsigned int _phase_output_free = 1;
             unsigned int _phase_down_full = 0;
@@ -74295,8 +74314,8 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_
                 int route_item_m = item_m / z_eff_m;
                 int z_item_m = item_m % z_eff_m;
                 asm volatile("barrier.sync 14, 192;" ::: "memory");
-                int _min_1 = ((4) < (intermediate_blocks_total - blockIdx.y * 4) ? (4) : (intermediate_blocks_total - blockIdx.y * 4));
-                int group_width_m = _min_1;
+                int _min_3 = ((4) < (intermediate_blocks_total - blockIdx.y * 4) ? (4) : (intermediate_blocks_total - blockIdx.y * 4));
+                int group_width_m = _min_3;
                 #pragma unroll 1
                 for (int _ob_mma = z_item_m; _ob_mma < K / 128; _ob_mma += z_eff_m) {
                     mbarrier_wait(output_free_addr + (output_stage_mma) * 8, _phase_output_free);
@@ -74344,13 +74363,10 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_
             unsigned int output_stage_c = 0;
             int ntp_c = num_tokens_post_padded[0];
             int route_blocks_c = (ntp_c + 8 - 1) / 8;
-            int z_eff_c = z_slices;
-            if (route_blocks_c > 8) {
-                z_eff_c = 16;
-            }
-            if (route_blocks_c > 16) {
-                z_eff_c = 8;
-            }
+            int _max_4 = ((route_blocks_c) > (1) ? (route_blocks_c) : (1));
+            int _max_5 = ((1) > (gridDim.x / _max_4) ? (1) : (gridDim.x / _max_4));
+            int _min_4 = ((z_slices) < (_max_5) ? (z_slices) : (_max_5));
+            int z_eff_c = _min_4;
             int n_items_c = route_blocks_c * z_eff_c;
             unsigned int _phase_output_ready = 0;
             #pragma unroll 1
@@ -74370,8 +74386,8 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5(const __grid_
                 const int consumer_warp = warp % 4;
                 const int physical_feature = (unsigned int)(consumer_warp * 32) + lane;
                 int first_panel_c = blockIdx.y * 4;
-                int _min_2 = ((4) < (intermediate_blocks_total - first_panel_c) ? (4) : (intermediate_blocks_total - first_panel_c));
-                int group_width_c = _min_2;
+                int _min_5 = ((4) < (intermediate_blocks_total - first_panel_c) ? (4) : (intermediate_blocks_total - first_panel_c));
+                int group_width_c = _min_5;
                 #pragma unroll 1
                 for (int preload_j = 0; preload_j < group_width_c; preload_j++) {
                     int workspace_record_c = route_item_c * intermediate_blocks_total + first_panel_c + preload_j;
@@ -74527,8 +74543,8 @@ constexpr int kGeneratedSmemTotal = 38912;
 #undef down_free_addr
 #undef output_ready_addr
 #undef output_free_addr
-#undef kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5
-}  // namespace nvfp4_s5_c405v5_down
+#undef kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz
+}  // namespace nvfp4_s11_c407_down
 
 namespace nvfp4_s7_c402r9ns_finalize {
 #define kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_noseed kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_noseed_nvfp4_s7_c402r9ns_finalize
@@ -79313,13 +79329,13 @@ void RunCompleteRoutedImpl(
       const int64_t panels64 = 2 * blocks;
       const int64_t up_grid_x = std::max<int64_t>(1, std::min<int64_t>(owner_capacity, sm_count / panels64));
       const int64_t z_slices = 32;
-      const int64_t down_grid_x = std::max<int64_t>(1, std::min<int64_t>(capacity * z_slices, static_cast<int64_t>(sm_count) * 3));
+      const int64_t down_grid_x = std::max<int64_t>(1, std::min<int64_t>(capacity * z_slices, static_cast<int64_t>(sm_count) * 4));
       const CUtensorMap w1_map_i = EncodePreparedW1DataHalfTma(w1_data_prepared.value());
       const CUtensorMap w1_scale_map_i = EncodePreparedScaleTma(w1_scale_prepared_interleaved.value(), 16);
       const CUtensorMap w2_scale_map_p = EncodePreparedScaleTma(w2_scale_prepared.value(), 8);
-      CheckCuda(cudaFuncSetAttribute(nvfp4_s5_c416p_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_nvfp4_s5_c416p_up, cudaFuncAttributeMaxDynamicSharedMemorySize, 194816),
+      CheckCuda(cudaFuncSetAttribute(nvfp4_s11_c416s_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up, cudaFuncAttributeMaxDynamicSharedMemorySize, 207104),
                 "cudaFuncSetAttribute(S5 M=8 up)");
-      nvfp4_s5_c416p_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_nvfp4_s5_c416p_up<<<dim3(static_cast<unsigned>(up_grid_x), static_cast<unsigned>(panels64), 1), dim3(192, 1, 1), 194816, stream>>>(
+      nvfp4_s11_c416s_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up<<<dim3(static_cast<unsigned>(up_grid_x), static_cast<unsigned>(panels64), 1), dim3(192, 1, 1), 207104, stream>>>(
           hidden_states_map,
           w1_map_i,
           static_cast<uint8_t*>(hidden_states_scale.data_ptr()),
@@ -79347,9 +79363,9 @@ void RunCompleteRoutedImpl(
           dims.top_k,
           dims.block_m);
       CheckCuda(cudaGetLastError(), "S5 M=8 up launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_s5_c405v5_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5_nvfp4_s5_c405v5_down, cudaFuncAttributeMaxDynamicSharedMemorySize, 38912),
+      CheckCuda(cudaFuncSetAttribute(nvfp4_s11_c407_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down, cudaFuncAttributeMaxDynamicSharedMemorySize, 38912),
                 "cudaFuncSetAttribute(S5 M=8 down)");
-      nvfp4_s5_c405v5_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v5_nvfp4_s5_c405v5_down<<<dim3(static_cast<unsigned>(down_grid_x), static_cast<unsigned>((blocks + 3) / 4), 1), dim3(192, 1, 1), 38912, stream>>>(
+      nvfp4_s11_c407_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down<<<dim3(static_cast<unsigned>(down_grid_x), static_cast<unsigned>((blocks + 3) / 4), 1), dim3(192, 1, 1), 38912, stream>>>(
           gemm2_map,
           w2_scale_map_p,
           static_cast<float*>(output2_scale_scalar.data_ptr()),
