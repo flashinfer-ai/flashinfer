@@ -275,7 +275,7 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
-    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
+    # Compiler launchers (e.g., sccache, ccache) 閳?empty string when unset
     cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
     nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
@@ -431,3 +431,29 @@ def run_ninja(
         if e.output:
             msg += " Ninja output:\n" + e.output
         raise RuntimeError(msg) from e
+
+
+@functools.lru_cache(maxsize=None)
+def is_nvcc_at_least(nvcc_path: str, version_str: str) -> bool:
+    """Whether the nvcc that will actually run reports a CUDA version >= ``version_str``.
+
+    ``is_cuda_version_at_least`` inspects the default toolkit, but the JIT build uses
+    ``FLASHINFER_NVCC`` when set. Gate version-dependent flags (e.g.
+    ``--compress-mode``) on the selected compiler so an explicit override to an
+    older nvcc does not receive a flag its nvcc rejects. When the selected compiler
+    cannot be queried (missing, non-zero exit, unparseable, or a stalled wrapper)
+    we conservatively report ``False`` and omit the flag, rather than trusting the
+    default toolkit -- the override, not the default, is what will run.
+    """
+    try:
+        txt = subprocess.check_output([nvcc_path, "--version"], text=True, timeout=10)
+        matches = re.findall(r"release (\d+\.\d+),", txt)
+        if matches:
+            return Version(matches[0]) >= Version(version_str)
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
+        pass
+    return False
