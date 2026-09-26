@@ -335,7 +335,7 @@ __device__ __forceinline__ void fence_async_shared() {
 extern "C" {
 
 __global__ __launch_bounds__(128, 1) __cluster_dims__(8,1,1) void
-kernel_cake_msa_nvfp4_decode_2de357fbc4b45f0c3621(__nv_bfloat16* __restrict__ Q, uint8_t* __restrict__ K, uint8_t* __restrict__ K_scale, uint8_t* __restrict__ V, uint8_t* __restrict__ V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages, int k_page_stride, int k_head_stride, int ks_page_stride, int ks_head_stride, int v_page_stride, int v_head_stride, int vs_page_stride, int vs_head_stride)
+kernel_cake_msa_nvfp4_decode_4ccf4bb3f41cf8a00195(__nv_bfloat16* __restrict__ Q, uint8_t* __restrict__ K, uint8_t* __restrict__ K_scale, uint8_t* __restrict__ V, uint8_t* __restrict__ V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages, int k_page_stride, int k_head_stride, int ks_page_stride, int ks_head_stride, int v_page_stride, int v_head_stride, int vs_page_stride, int vs_head_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -3776,10 +3776,6 @@ kernel_cake_msa_nvfp4_decode_2de357fbc4b45f0c3621(__nv_bfloat16* __restrict__ Q,
             asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         }
     }
-
-    // Cleanup
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
 }
 
 } // extern "C"
