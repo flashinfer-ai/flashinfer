@@ -4416,6 +4416,131 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     )
 
 
+@flashinfer_experimental_api(feature="Cake MLA variable-query DCP decode")
+def cake_mla_varq_dcp_decode(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    softmax_scale: float,
+    *,
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: int,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = True,
+    backend: str = "cake",
+):
+    """Compact variable-query MLA decode of one decode-context-parallel rank.
+
+    The experimental Cake backend serves DeepSeek MLA decode (576 = 512 latent
+    + 64 rope per key, 512-wide value) over a rank-local paged BF16 or FP8
+    (e4m3) KV cache with 32-, 64- or 128-token pages, compact variable-length
+    queries ``[total_q, num_heads, 576]`` (``cum_seq_lens_q`` / ``max_q_len``,
+    ``num_heads <= 128``) and the static cyclic DCP visibility rule of
+    ``cute_dsl_mla_decode(..., is_var_seq=True, enable_dcp=True)``: rank
+    ``cp_rank`` of ``cp_world`` holds the global positions ``cp_world * k +
+    cp_rank`` and ``causal_seqlens_kv_global`` bounds each request.  It writes
+    BF16 ``out [total_q, num_heads, 512]`` and natural-log FP32 ``lse
+    [total_q, num_heads]`` (``O = 0`` / ``LSE = -inf`` for rows without a
+    visible key) and requires compute capability 10.0 or 10.3.  The caller
+    owns ``workspace_buffer`` (uint8; size from
+    ``flashinfer.experimental.cake_mla_varq_dcp_decode.cake_backend
+    .cake_mla_varq_dcp_decode_workspace_size``).  ``max_seq_len`` is the
+    caller-known largest rank-local length; nothing reads device tensor
+    contents on the host.  Returns ``(out, lse)`` with ``return_lse=True``.
+    ``prepare_cake_mla_varq_dcp_decode`` returns a launch-only runner for
+    repeated calls with fixed bindings.  See
+    ``flashinfer/experimental/cake_mla_varq_dcp_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("Cake MLA var-Q DCP decode currently supports backend='cake'")
+    from ..experimental.cake_mla_varq_dcp_decode.cake_backend import (
+        cake_mla_varq_dcp_decode as run,
+    )
+
+    return run(
+        query,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        softmax_scale,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+        out=out,
+        lse=lse,
+        return_lse=return_lse,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="Prepared Cake MLA variable-query DCP decode")
+def prepare_cake_mla_varq_dcp_decode(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: int,
+    *,
+    max_seq_len: int,
+    softmax_scale: float,
+    workspace_buffer: torch.Tensor,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    backend: str = "cake",
+):
+    """Plan and bind one Cake compact var-Q (+DCP) MLA decode problem.
+
+    Validation, the host plan, the workspace carve and every allocation happen
+    here; the returned ``CakeMLAVarQDcpDecodeRunner`` launches the persistent
+    decode kernel (and, when the plan splits items, the split-KV merge kernel
+    behind it) with no CUDA allocation and no host synchronization and returns
+    ``(out, lse)``.  Prepare a new runner when shapes, ``max_seq_len`` or the
+    tensor bindings change; never share one workspace between two live
+    runners.  CUDA Graph ownership remains with the caller.  See
+    ``cake_mla_varq_dcp_decode`` for the semantics.
+    """
+    if backend != "cake":
+        raise ValueError("Cake MLA var-Q DCP decode currently supports backend='cake'")
+    from ..experimental.cake_mla_varq_dcp_decode.cake_backend import (
+        prepare_cake_mla_varq_dcp_decode as prepare,
+    )
+
+    return prepare(
+        query,
+        kv_cache,
+        page_table,
+        seq_lens,
+        cum_seq_lens_q,
+        max_q_len,
+        max_seq_len=max_seq_len,
+        softmax_scale=softmax_scale,
+        workspace_buffer=workspace_buffer,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        out=out,
+        lse=lse,
+        backend="cake",
+    )
+
+
 @flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
 def trtllm_prefill_with_kv_cache_mla(
     query: torch.Tensor,
