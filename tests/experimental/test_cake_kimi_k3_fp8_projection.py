@@ -69,6 +69,8 @@ GPU_ROWS = [
     ("tp8", "q_proj", 1000, 0),
     ("tp8", "q_b", 4096, 0),
     ("tp1", "o_proj", 4097, 4),
+    ("tp8", "f_a", 4096, 0),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
+    ("tp1", "b_proj", 4097, 4),
 ]
 
 
@@ -210,15 +212,20 @@ def test_decode_table_covers_every_family(arch):
             num_k_iters = -(-K // 256)
             for bucket in DECODE_TABLE_BUCKETS:
                 entry = cb.decode_table_entry(bucket, n_tiles128, num_k_iters, arch)
+                if bucket > DECODE_MAX_M:
+                    # Large buckets list only the families measured faster on the decode kernel.
+                    assert entry is None or entry["route"] == "decode"
+                    continue
                 assert entry is not None, f"{arch} {tp}:{name} bucket {bucket}"
                 assert entry["route"] in ("decode", "gemm")
 
 
 @pytest.mark.parametrize("arch", ARCHES)
 def test_decode_config_rules(arch):
-    # M > 256 never takes the decode route; the table decides below.
+    # Above DECODE_MAX_M only tabulated (narrow-N) families take the decode route; the table decides below.
     assert decode_config(257, 12, 28, arch, SM_COUNT) is None
     assert decode_config(4096, 12, 28, arch, SM_COUNT) is None
+    assert decode_config(4096, 1, 28, arch, SM_COUNT) is not None
     for key, entry in DECODE_TABLE[arch].items():
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
@@ -320,10 +327,10 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         tp, module, M, stride_pad, seed=622
     )
     plan = runner.plan
-    if M > DECODE_MAX_M:
-        assert plan.route == "gemm" and plan.kernels[-1] == "gemm"
-    else:
-        assert plan.route in ("decode", "gemm")
+    assert plan.route in ("decode", "gemm")
+    if plan.route == "gemm":
+        aligned = cb.gemm_tma_store_eligible(_out.data_ptr(), _out.stride(0))
+        assert plan.kernels[-1] == ("gemm_tstore" if aligned else "gemm")
     if plan.route == "decode" and plan.decode.fused:
         assert runner.launch_count == 1
     else:
