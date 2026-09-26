@@ -271,10 +271,12 @@ def test_choose_kv_splits_policy():
     assert choose_kv_splits([48] * 84, 74, program_cost=1.21) != [1] * 84
     assert choose_kv_splits([66] * 238, 74, program_cost=1.0) != [1] * 238
     assert choose_kv_splits([66] * 238, 74, program_cost=1.21) == [1] * 238
-    # The production sm_103a fp8pv cost keeps the 1.42-wave row (105 units of
-    # 58 blocks) dense and still splits the 1.14-wave row (84 units of 48).
+    # The production sm_103a fp8pv cost (1.01: the split program runs at parity
+    # with the dense program) splits both the 1.42-wave row (105 units of 58
+    # blocks) and the 1.14-wave row (84 units of 48).
     cost = SPLIT_PROGRAM_COST[("fp8", "sm_103a")]
-    assert choose_kv_splits([58] * 105, 74, program_cost=cost) == [1] * 105
+    assert cost <= 1.05
+    assert choose_kv_splits([58] * 105, 74, program_cost=cost) != [1] * 105
     assert choose_kv_splits([48] * 84, 74, program_cost=cost) != [1] * 84
     assert split_chunks(10, 4) == [(0, 3), (3, 3), (6, 2), (8, 2)]
     assert split_chunks(2, 8) == [(0, 1), (1, 1)]
