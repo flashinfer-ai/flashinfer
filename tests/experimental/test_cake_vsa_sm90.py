@@ -25,7 +25,8 @@ import torch
 from flashinfer.cake_vsa_sm90 import (
     MAX_NSPLIT,
     PLAN_HALFWORDS,
-    PLAN_META,
+    PLAN_META_SPLIT,
+    PLAN_META_UNSPLIT,
     SMALL_KMAX_VARIANTS,
     SMALL_OCCUPANCY,
     CakeVsaSm90Plan,
@@ -114,28 +115,40 @@ def test_small_route_rule(h, mb, nb, capacity, expected):
         assert kmax in SMALL_KMAX_VARIANTS and 2 * h * mb <= 132
         items = h * mb * -(-capacity // kmax)
         assert items <= SMALL_OCCUPANCY[kmax] * 132
-        assert items * (kmax + PLAN_META) <= PLAN_HALFWORDS
+        assert items * (kmax + PLAN_META_SPLIT) <= PLAN_HALFWORDS
         assert kmax == split_kmax([capacity] * (h * mb), sms=132)
     else:
         assert route == expected
     if expected not in (None, "split"):
         assert h * mb <= SMALL_OCCUPANCY[expected[0]] * 132
-        assert h * mb * (expected[0] + PLAN_META) <= PLAN_HALFWORDS
+        assert h * mb * (expected[0] + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
 
 
 def _decode_small_rows(plan):
-    stride = plan["kmax"] + PLAN_META
+    stride, meta_halfwords = plan["stride"], plan["meta_halfwords"]
+    assert stride == plan["kmax"] + meta_halfwords
     rows = plan["plan"][: plan["num_items"] * stride].view(-1, stride).int()
     out = []
     for i in range(rows.shape[0]):
         meta = int(rows[i, 0])
+        if meta_halfwords == PLAN_META_UNSPLIT:  # [count, blk...] per query block
+            out.append(
+                {
+                    "count": meta,
+                    "split": 0,
+                    "nsplit": 1,
+                    "tile": i,
+                    "blocks": [int(b) for b in rows[i, 1:] if int(b) >= 0],
+                }
+            )
+            continue
         out.append(
             {
                 "count": meta & 15,
                 "split": (meta >> 4) & 63,
                 "nsplit": meta >> 10,
                 "tile": int(rows[i, 1]),
-                "blocks": [int(b) for b in rows[i, PLAN_META:] if int(b) >= 0],
+                "blocks": [int(b) for b in rows[i, meta_halfwords:] if int(b) >= 0],
             }
         )
     return out
@@ -148,14 +161,14 @@ def test_plan_small_layout_and_padding():
     assert not plan["split"] and plan["max_nsplit"] == 1
     rows = plan["plan"]
     assert rows.dtype == torch.int16 and rows.numel() == PLAN_HALFWORDS
-    stride = plan["kmax"] + PLAN_META
+    stride = plan["stride"]
     for tile, row in enumerate(_decode_small_rows(plan)):
         head, qb = divmod(tile, 5)
         selected = mask[head, qb].nonzero().flatten().tolist()
         assert row["tile"] == tile and row["nsplit"] == 1 and row["split"] == 0
         assert row["count"] == len(selected) and row["blocks"] == selected
         raw = rows[tile * stride : (tile + 1) * stride].tolist()
-        assert all(v == -1 for v in raw[PLAN_META + len(selected) :])
+        assert all(v == -1 for v in raw[plan["meta_halfwords"] + len(selected) :])
     assert bool((rows[15 * stride :] == -1).all())
     with pytest.raises(ValueError, match="cannot hold"):
         plan_small(mask, kmax=3)

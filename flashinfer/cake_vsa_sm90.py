@@ -67,7 +67,7 @@ LOAD_COST = 1.0
 # every head's K and V fit this many bytes of L2; larger working sets keep the
 # head-major order so the CTAs running concurrently share one head's blocks.
 TILE_ORDER_L2_BUDGET = 24 << 20
-PAIRING_WINDOW = 64
+PAIRING_WINDOW = 16
 LOG2E = 1.4426950408889634
 _FP32_MAX = 3.4028234663852886e38
 
@@ -90,7 +90,8 @@ SMALL_OCCUPANCY = {
     6: 1,
 }  # CTAs per SM on H100 (49/113/145/209 KB SMEM)
 PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
-PLAN_META = 2  # halfwords per item before the block ids: [meta, qtile]
+PLAN_META_UNSPLIT = 1  # unsplit rows: [count, blk...] per query block
+PLAN_META_SPLIT = 2  # split rows: [meta, qtile, blk...] per item
 MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign clear)
 SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # BF16 partial accumulator per split item
 SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
@@ -99,6 +100,11 @@ SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
 # CAKE-671).  Same constants as the Cake planner (``vsa_sm90_small``).
 SPLIT_BLOCK_COST = 1.0
 SPLIT_MERGE_COST = 0.8
+
+
+def plan_meta(split: bool) -> int:
+    """Halfwords before the block ids in one plan row of the given kernel family."""
+    return PLAN_META_SPLIT if split else PLAN_META_UNSPLIT
 
 
 def small_kmax_for(capacity: int) -> int:
@@ -123,7 +129,10 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
     for kmax in SMALL_KMAX_VARIANTS:
         nsplits = [max(1, -(-c // kmax)) for c in counts]
         items = sum(nsplits)
-        if max(nsplits) > MAX_NSPLIT or items * (kmax + PLAN_META) > PLAN_HALFWORDS:
+        if (
+            max(nsplits) > MAX_NSPLIT
+            or items * (kmax + PLAN_META_SPLIT) > PLAN_HALFWORDS
+        ):
             continue
         if sms is not None and items > SMALL_OCCUPANCY[kmax] * sms:
             continue
@@ -155,7 +164,7 @@ def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[tuple[int, bo
         kmax = small_kmax_for(capacity)
         if (
             tiles <= SMALL_OCCUPANCY[kmax] * sms
-            and tiles * (kmax + PLAN_META) <= PLAN_HALFWORDS
+            and tiles * (kmax + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
         ):
             return kmax, False
     if 2 * tiles <= sms:
@@ -181,7 +190,7 @@ def _balanced_chunks(ids: list[int], nsplit: int) -> list[list[int]]:
 def plan_small(
     block_mask: torch.Tensor, *, kmax: Optional[int] = None, split: bool = False
 ) -> dict:
-    """Per-item plan rows ``[meta, qtile, blk0, ...]`` as int16 halfwords (``kmax + PLAN_META`` per item).
+    """Plan rows as int16 halfwords: ``[count, blk...]`` per tile (unsplit) or ``[meta, qtile, blk...]`` per item (split).
 
     Without ``split`` every query block is one item (``nsplit = 1``) and
     ``kmax`` must hold the largest selection.  With ``split`` a query block
@@ -214,7 +223,8 @@ def plan_small(
     tiles = h * mb
     if tiles > 32767:
         raise ValueError("query-block ids must fit int16")
-    stride = kmax + PLAN_META
+    meta_halfwords = plan_meta(split)
+    stride = kmax + meta_halfwords
     nsplits = [max(1, -(-c // kmax)) for c in flat_counts]
     if max(nsplits) > MAX_NSPLIT:
         raise ValueError(
@@ -231,9 +241,12 @@ def plan_small(
     for tile in range(tiles):
         ids = order[tile, : flat_counts[tile]].tolist()
         for j, chunk in enumerate(_balanced_chunks(ids, nsplits[tile])):
-            rows[item, 0] = len(chunk) | (j << 4) | (nsplits[tile] << 10)
-            rows[item, 1] = tile
-            rows[item, PLAN_META : PLAN_META + len(chunk)] = torch.tensor(
+            if split:
+                rows[item, 0] = len(chunk) | (j << 4) | (nsplits[tile] << 10)
+                rows[item, 1] = tile
+            else:
+                rows[item, 0] = len(chunk)
+            rows[item, meta_halfwords : meta_halfwords + len(chunk)] = torch.tensor(
                 chunk, dtype=torch.int16
             )
             item += 1
@@ -250,6 +263,8 @@ def plan_small(
         "num_items": num_items,
         "max_nsplit": max(nsplits),
         "split": max(nsplits) > 1,
+        "stride": stride,
+        "meta_halfwords": meta_halfwords,
     }
 
 
