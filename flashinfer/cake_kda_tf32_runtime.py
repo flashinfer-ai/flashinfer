@@ -1242,6 +1242,76 @@ def _should_use_bt16_dense_wavefront(
     )
 
 
+CHUNK = 32  # apply/pair-map kernel chunk (tokens)
+
+
+def build_affine_apply_items(
+    *,
+    tail_lengths: list[int],
+    cu_chunk_offsets: list[int],
+    snap_starts: list[int],
+    tail_offsets: list[int],
+    num_heads: int,
+    rows_enabled: bool,
+    sm_count: int = 148,
+    pairmap: bool = False,
+) -> list[list[int]]:
+    """Work items for the apply kernel, one per (window, head, block run).
+
+    ``tail_lengths[w]`` is the token count of tail window ``w`` (composite part
+    ``w + 1``), ``cu_chunk_offsets`` the main pass's per-part chunk prefix,
+    ``snap_starts[w]`` the first snapshot row of the window,
+    ``tail_offsets[w]`` its first tail token.  Each window-head is cut into
+    enough equal block runs to occupy every SM at least once; the run owning
+    the window's last block also evaluates ``S_w^in · M_final``.
+    """
+
+    items: list[list[int]] = []
+    window_heads = max(1, len(tail_lengths) * num_heads)
+    runs_per_window = max(1, -(-sm_count // window_heads))
+    for w, length in enumerate(tail_lengths):
+        chunks = (length + CHUNK - 1) // CHUNK
+        blocks = (chunks + 1) // 2
+        runs = min(runs_per_window, blocks)
+        per_run = -(-blocks // runs)
+        for head in range(num_heads):
+            for p_begin in range(0, blocks, per_run):
+                p_end = min(blocks, p_begin + per_run)
+                owns_final = p_end == blocks and not pairmap
+                items.append(
+                    [
+                        w * num_heads + head,
+                        snap_starts[w] * num_heads + head,
+                        cu_chunk_offsets[w + 1] * num_heads + head,
+                        p_begin,
+                        p_end,
+                        chunks,
+                        tail_offsets[w],
+                        w + 1,
+                        (w * num_heads + head) if owns_final else -1,
+                        head,
+                        length,
+                        1 if (rows_enabled and not pairmap) else 0,
+                    ]
+                )
+    return items
+
+
+def build_map_prefix_items(
+    *, tail_lengths: list[int], snap_starts: list[int], num_heads: int
+) -> list[list[int]]:
+    """One item per (tail window, head): snapshot row of block 0, block count, window-map row."""
+
+    items: list[list[int]] = []
+    for w, length in enumerate(tail_lengths):
+        blocks = (length + 63) // 64
+        for head in range(num_heads):
+            items.append(
+                [snap_starts[w] * num_heads + head, blocks, w * num_heads + head, 0]
+            )
+    return items
+
+
 @cache
 def _device_sm_count(device: torch.device) -> int:
     """Resolve and cache the launch device's physical SM count."""
@@ -2247,6 +2317,7 @@ class FlashKDABlackwellBF16FusedLaunch:
     _force_bt16_beta_tma = False
     _state_dtype_is_fp32 = False
     _n32_ft_slab = False
+    _affine_operator_export = False
     _pdl_wait_initial_state_f32 = False
     _pdl_publish_final_state = False
     _checkpoint_accumulate = False
@@ -3440,6 +3511,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 tensor_state_decay=use_n32_tensor_state_decay,
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 n32_ft_slab=self._n32_ft_slab and (not use_direct_m128_n16),
+                affine_operator_export=self._affine_operator_export,
                 pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32,
                 pdl_publish_final_state=self._pdl_publish_final_state,
                 affine_main_indexed_initial=self._affine_main_indexed_initial,
@@ -3936,16 +4008,26 @@ class FlashKDABlackwellBF16FusedLaunch:
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
         if uses_default_fused_m128:
+            op_export = (
+                _allocate_operator_export(offsets, num_heads, q.device)
+                if self._affine_operator_export
+                else None
+            )
+            self.operator_export = op_export
             self.args.update(
                 g_token_stride=g_flat.stride(0),
-                cu_chunk_offsets=empty_chunk_offsets,
+                cu_chunk_offsets=(
+                    op_export["cu_chunk_offsets"] if op_export else empty_chunk_offsets
+                ),
                 chunk_state=empty_state,
                 state_checkpoint_needed=empty_u32,
-                tape_qd=empty_state,
-                tape_kd=empty_state,
-                tape_kr=empty_state,
-                tape_j=empty_state,
-                tape_restore_factor=empty_f32,
+                tape_qd=(op_export["qd_raw"] if op_export else empty_state),
+                tape_kd=(op_export["kd_raw"] if op_export else empty_state),
+                tape_kr=(op_export["ft_raw"] if op_export else empty_state),
+                tape_j=(op_export["inv_raw"] if op_export else empty_state),
+                tape_restore_factor=(
+                    op_export["decay_beta"] if op_export else empty_f32
+                ),
                 tape_e=empty_state,
                 tape_x=empty_state,
                 tape_r=empty_state,
@@ -3959,8 +4041,16 @@ class FlashKDABlackwellBF16FusedLaunch:
                 zero_workspace=empty_u32,
                 zero_words=0,
                 num_sequences=num_seqs,
+                # The rank-three panel descriptor is typed like the rows the
+                # module carries (FP32 carrier -> FP32 rows).
                 state_checkpoints_tma=state_checkpoints
-                if state_checkpoints is not None and not fp32_checkpoints
+                if state_checkpoints is not None
+                else torch.empty(
+                    (1, 1, HEAD_DIM, HEAD_DIM),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                if fp32_carrier
                 else empty_checkpoint_tma,
             )
         if use_small_bh_owner_helper:
@@ -4347,6 +4437,47 @@ class FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerLaunch(
     _affine_main_indexed_initial_bf16 = True
 
 
+class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch(
+    FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
+):
+    """Main windows that also export their chunk operators for the apply kernel (§4e)."""
+
+    _affine_operator_export = True
+
+
+class FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerExportLaunch(
+    FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerLaunch
+):
+    """BF16-pool main windows that export their chunk operators for the apply kernel (§4e)."""
+
+    _affine_operator_export = True
+
+
+def _affine_lean_map_enabled() -> bool:
+    """Kernel round 2: build the prefix maps with the pair-map producer + prefix chain instead of the map pass.
+
+    Default on the apply route; ``CAKE_KDA_AFFINE_LEAN_MAP=0`` restores the map
+    pass (the control for the paired comparison).  The map pass stays
+    constructed for the plan-cache ABI and the reference comparison.
+    """
+
+    import os
+
+    return os.environ.get("CAKE_KDA_AFFINE_LEAN_MAP", "1") != "0"
+
+
+def _affine_apply_route_enabled() -> bool:
+    """Kernel round 2: evaluate the correction with the fused apply kernel instead of a chain.
+
+    ``CAKE_KDA_AFFINE_APPLY=0`` keeps the correction chain (A/B and bitwise
+    control).  The route needs BF16 compute and either no checkpoint rows or
+    FP32 rows merged in place.
+    """
+    import os
+
+    return os.environ.get("CAKE_KDA_AFFINE_APPLY", "1") != "0"
+
+
 class FlashKDABlackwellBF16DirectM128PDLBridgeLaunch(
     FlashKDABlackwellBF16DirectM128Launch
 ):
@@ -4372,6 +4503,55 @@ class FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch(
     """Correction windows that add their FP32 rows onto the main pass's rows in place."""
 
     _checkpoint_accumulate = True
+
+
+def _allocate_operator_export(offsets, num_heads: int, device):
+    """Per-chunk-head operator slabs for the affine operator export (kernel round 2).
+
+    Raw shared-memory images as the kernel copies them: ``qd_raw`` / ``kd_raw``
+    are 128B-swizzled K-major (32 tokens x 128) BF16 tiles, ``ft_raw`` the
+    128B-swizzled MN-major [Kr | MQK] slab (32 x 192), ``inv_raw`` the
+    32B-swizzled (32 x 32) inverse, ``decay_beta`` the per-column state decay
+    (128 f32) followed by the prep restore-factor block (129 restore factors,
+    32 sigmoid beta at word offset 128 + 129, gate rate, pad).  Slab ``s`` belongs to
+    chunk-head ``(cu_chunk_offsets[seq] + chunk) * num_heads + head``.
+    """
+    import torch
+
+    OPERATOR_EXPORT_VEC_WORDS = (
+        292  # HEAD_DIM + OPERATOR_EXPORT_RF_BLOCK_BYTES // 4 (source fused M128 kernel)
+    )
+
+    chunk = BF16_M128_CHUNK
+    counts = [
+        (end - start + chunk - 1) // chunk
+        for start, end in zip(offsets, offsets[1:], strict=False)
+    ]
+    cu = [0]
+    for count in counts:
+        cu.append(cu[-1] + count)
+    slabs = max(cu[-1] * num_heads, 1)
+    bf16 = torch.bfloat16
+    return {
+        "chunk_counts": counts,
+        "cu_chunk_offsets": torch.tensor(cu, dtype=torch.int64, device=device),
+        "qd_raw": torch.empty(slabs, chunk, HEAD_DIM, dtype=bf16, device=device),
+        "kd_raw": torch.empty(slabs, chunk, HEAD_DIM, dtype=bf16, device=device),
+        "ft_raw": torch.empty(slabs, chunk, 192, dtype=bf16, device=device),
+        "inv_raw": torch.empty(slabs, chunk, chunk, dtype=bf16, device=device),
+        "decay_beta": torch.empty(
+            slabs, OPERATOR_EXPORT_VEC_WORDS, dtype=torch.float32, device=device
+        ),
+    }
+
+
+class FlashKDABlackwellBF16DirectM128N32OperatorExportLaunch(
+    FlashKDABlackwellBF16DirectM128N32Launch
+):
+    """Round-2 probe: the affine-part N32 body that also publishes its chunk operators."""
+
+    _n32_ft_slab = True
+    _affine_operator_export = True
 
 
 def _affine_rows_in_place_enabled() -> bool:
@@ -4762,11 +4942,31 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 _affine_cache_part_offset=1,
             )
             self.schedule += "_shared_factors"
-        main_launch_cls = (
-            FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
-            if self._external_state_is_fp32
-            else FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerLaunch
+        # The exported chunk operators (gate total, restore factors) are the
+        # unbounded body's tile-anchored decay images; the bounded gate body
+        # keeps the correction chain until its operators are exported too.
+        self._apply_route = (
+            _affine_apply_route_enabled()
+            and compute_dtype == "bf16"
+            and lower_bound is None
+            and not self._use_output_projection
+            and (state_checkpoints is None or self._checkpoint_in_place)
         )
+        main_launch_cls: type[
+            FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
+        ]
+        if self._apply_route:
+            main_launch_cls = (
+                FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
+                if self._external_state_is_fp32
+                else FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerExportLaunch
+            )
+        else:
+            main_launch_cls = (
+                FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
+                if self._external_state_is_fp32
+                else FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerLaunch
+            )
         self._main = main_launch_cls(
             q,
             k,
@@ -4803,7 +5003,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         else:
             self._main.args["initial_state"] = self._initial_pool_pointer
         self._correction = None
-        if not self._use_output_projection:
+        if not self._use_output_projection and not self._apply_route:
             correction_cls = (
                 FlashKDABlackwellFP32SlabM128PDLConsumerAccumulateLaunch
                 if self._checkpoint_in_place
@@ -4837,6 +5037,31 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     )
                 ),
             )
+        map_snapshot_kwargs = {}
+        tail_lengths = [
+            end - begin
+            for begin, end in zip(tail_offsets, tail_offsets[1:], strict=False)
+        ]
+        if self._apply_route:
+            # The map pass publishes its prefix maps (state entering every
+            # 64-token block, row 0 = identity) for the apply kernel.
+            snap_counts = [(length + 63) // 64 for length in tail_lengths]
+            snap_starts = [0]
+            for count in snap_counts:
+                snap_starts.append(snap_starts[-1] + count)
+            self._map_snapshots = torch.empty(
+                (snap_starts[-1], heads, HEAD_DIM, HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            self._map_snapshot_starts = snap_starts
+            map_snapshot_kwargs = dict(
+                state_checkpoints=self._map_snapshots,
+                checkpoint_cu_starts=torch.tensor(
+                    snap_starts, dtype=torch.int64, device=q.device
+                ),
+                checkpoint_every_n_tokens=64,
+            )
         map_launch_cls = (
             FlashKDABlackwellFP32SlabM128PDLProducerLaunch
             if compute_dtype == "tf32"
@@ -4861,6 +5086,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             _affine_active_beta_f32=active_beta_f32,
             _affine_map_only=compute_dtype == "tf32",
             _affine_map_output=self._use_output_projection,
+            **map_snapshot_kwargs,
             **tail_factor_kwargs,
             sequence_lengths=tuple(
                 (
@@ -4869,14 +5095,115 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 )
             ),
         )
+        self._apply_module = None
+        if self._apply_route:
+            self._apply_module = _build_kda_module(
+                partial(_factory, "compiled_flashkda_affine_apply_m128")
+            )
+            export = self._main.operator_export
+            cu_chunks = [0]
+            for count in export["chunk_counts"]:
+                cu_chunks.append(cu_chunks[-1] + count)
+            items = build_affine_apply_items(
+                tail_lengths=tail_lengths,
+                cu_chunk_offsets=cu_chunks,
+                snap_starts=self._map_snapshot_starts,
+                tail_offsets=tail_offsets[:-1],
+                num_heads=heads,
+                rows_enabled=self._checkpoint_in_place,
+                sm_count=_device_sm_count(q.device),
+            )
+            self._apply_items = torch.tensor(
+                items, dtype=torch.int32, device=q.device
+            ).contiguous()
+            self._apply_grid = (len(items), 1, 1)
+            # Lean map chain: pair-map producer (this kernel, PAIRMAP mode) +
+            # prefix-product chain replace the map pass.
+            self._lean_map = _affine_lean_map_enabled()
+            snap_total = self._map_snapshot_starts[-1]
+            self._pair = torch.empty(
+                (snap_total, heads, HEAD_DIM, HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            self._dpair = torch.empty(
+                (snap_total, heads, HEAD_DIM), dtype=torch.float32, device=q.device
+            )
+            pairmap_items = build_affine_apply_items(
+                tail_lengths=tail_lengths,
+                cu_chunk_offsets=cu_chunks,
+                snap_starts=self._map_snapshot_starts,
+                tail_offsets=tail_offsets[:-1],
+                num_heads=heads,
+                rows_enabled=False,
+                sm_count=_device_sm_count(q.device),
+                pairmap=True,
+            )
+            self._pairmap_items = torch.tensor(
+                pairmap_items, dtype=torch.int32, device=q.device
+            ).contiguous()
+            self._pairmap_grid = (len(pairmap_items), 1, 1)
+            self._pairmap_module = _build_kda_module(
+                partial(_factory, "compiled_flashkda_affine_apply_m128"), pairmap=True
+            )
+            prefix_items = build_map_prefix_items(
+                tail_lengths=tail_lengths,
+                snap_starts=self._map_snapshot_starts,
+                num_heads=heads,
+            )
+            self._prefix_items = torch.tensor(
+                prefix_items, dtype=torch.int32, device=q.device
+            ).contiguous()
+            self._prefix_grid = (len(prefix_items), 1, 1)
+            self._prefix_module = _build_kda_module(
+                partial(_factory, "compiled_flashkda_map_prefix_m128")
+            )
+            # The scan kernel writes the BF16 hi/lo carry pair in place of a
+            # host split pass (CARRY_HILO schedule).
+            self._carry_hi = torch.empty_like(self._carry, dtype=torch.bfloat16)
+            self._carry_lo = torch.empty_like(self._carry, dtype=torch.bfloat16)
+            if not self._checkpoint_in_place:
+                self._part_row_starts = torch.zeros(
+                    (num_parts + 1,), dtype=torch.int64, device=q.device
+                )
+            self._apply_dummy_rows = torch.zeros(
+                (1, heads, HEAD_DIM, HEAD_DIM), dtype=torch.float32, device=q.device
+            )
+            # Pair-map outputs of the shared kernel ABI (unused by the apply mode).
+            self._apply_dummy_pair = torch.zeros(
+                (1, heads, HEAD_DIM, HEAD_DIM), dtype=torch.bfloat16, device=q.device
+            )
+            self._apply_dummy_dpair = torch.zeros(
+                (1, heads, HEAD_DIM), dtype=torch.float32, device=q.device
+            )
+            self._apply_head_offsets = torch.arange(
+                heads, dtype=torch.int64, device=q.device
+            )
+            self._apply_row0_index = torch.empty(
+                (num_parts - 1) * heads, dtype=torch.int64, device=q.device
+            )
+            # The apply kernel reduce-adds the correction into the output tail
+            # itself (no correction buffer, no host add).
+            self._apply_out_fused = True
+            self.schedule += "_apply"
+            if self._lean_map:
+                self.schedule += "_leanmap"
         if compute_dtype == "bf16":
             self._map.args["initial_state_f32"] = self._main_final
+        # The hi/lo carry variant is keyed only on the apply route so the
+        # published plain scan programs (bf16 and tf32) keep their build key.
+        scan_kwargs = dict(carry_hilo=True) if self._apply_route else {}
         self._scan_module = _build_kda_module(
             partial(_factory, "compiled_flashkda_split_scan_bf16_m128"),
             use_pdl=True,
             compute_dtype=compute_dtype,
             backend=backend,
+            **scan_kwargs,
         )
+        if not self._apply_route:
+            # Unused by the plain schedule; the kernel ABI still carries the pointers.
+            self._carry_hi = self._carry.view(torch.bfloat16)
+            self._carry_lo = self._carry_hi
         self._out_tail = out[:, first_part_tokens:]
         self._projection_module = None
         if self._use_output_projection:
@@ -4964,6 +5291,9 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 sub = getattr(self, sub_name, None)
                 if sub is not None:
                     sub._descriptors_stale = True
+            # The apply-route kernels hold prepared TMA descriptors of caller
+            # storage (output tail, checkpoint rows): re-prepare them too.
+            self._apply_descriptors_stale = bool(self._apply_route)
             self._descriptors_stale = False
         with _ffi_stream_context(self._launch_device):
             for destination, source in self._affine_input_refreshes:
@@ -5004,12 +5334,28 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 # The int64 index copy is only consumed by the final-state
                 # scatter, so it follows the first chain kernel.
                 self._state_indices_long.copy_(self._state_indices)
-            self._map._launch_in_stream()
+            if self._apply_route and getattr(self, "_apply_descriptors_stale", False):
+                self._pairmap_module.prepare(
+                    grid=self._pairmap_grid, **self._pairmap_bindings()
+                )
+                self._prefix_module.prepare(
+                    grid=self._prefix_grid, **self._prefix_bindings()
+                )
+                self._apply_module.prepare(
+                    grid=self._apply_grid, **self._apply_bindings()
+                )
+                self._apply_descriptors_stale = False
+            if self._apply_route and self._lean_map:
+                self._launch_lean_map()
+            else:
+                self._map._launch_in_stream()
             self._scan_module.launch(
                 grid=(self._num_sequences * int(self._main_final.shape[1]) * 32, 1, 1),
                 split_state=self._main_final,
                 map_state_bf16=self._map_state,
                 carry=self._carry,
+                carry_hi=self._carry_hi,
+                carry_lo=self._carry_lo,
                 num_heads=int(self._main_final.shape[1]),
                 part_cu_seqlens=self._part_cu_seqlens,
                 final_state=self._final_compact,
@@ -5019,6 +5365,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._projection_module.launch(
                     grid=self._projection_grid, **self._projection_args
                 )
+            elif self._apply_route:
+                self._launch_apply()
             else:
                 self._correction._launch_in_stream()
             if self._fused_epilogue is not None:
@@ -5048,7 +5396,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._checkpoint_output.index_copy_(
                     0, self._checkpoint_indices, self._checkpoint_merged
                 )
-            self._out_tail.add_(self._correction_out)
+            if not (self._apply_route and self._apply_out_fused):
+                self._out_tail.add_(self._correction_out)
             if not self._use_output_projection:
                 if self._num_sequences == 1:
                     torch.add(
@@ -5128,8 +5477,137 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._state_indices_long,
             self._num_sequences,
             fused.heads,
-            fused.tail_elems,
+            # The apply kernel already reduce-added the correction into the
+            # output tail; the epilogue then skips the tail add.
+            0 if getattr(self, "_apply_out_fused", False) else fused.tail_elems,
             int(merge_rows),
+        )
+
+    def _launch_lean_map(self, *, maps=None, map_final=None) -> None:
+        """Pair-map producer + prefix chain: the 64-token prefix maps and window maps from the exported operators."""
+
+        self._pairmap_module.launch(
+            grid=self._pairmap_grid,
+            **self._pairmap_bindings(maps=maps, map_final=map_final),
+        )
+        self._prefix_module.launch(
+            grid=self._prefix_grid,
+            **self._prefix_bindings(maps=maps, map_final=map_final),
+        )
+
+    def _pairmap_bindings(self, *, maps=None, map_final=None) -> dict:
+        """Kernel arguments of the pair-map producer (apply kernel ABI, PAIRMAP mode)."""
+
+        export = self._main.operator_export
+        heads = int(self._carry.shape[1])
+        maps = self._map_snapshots if maps is None else maps
+        map_final = self._map_state if map_final is None else map_final
+        return dict(
+            items=self._pairmap_items,
+            num_heads=heads,
+            carry_hi=self._carry_hi,
+            carry_hi_tma=self._carry_hi.view(1, -1, 1, HEAD_DIM),
+            carry_lo=self._carry_lo,
+            carry_lo_tma=self._carry_lo.view(1, -1, 1, HEAD_DIM),
+            maps=maps,
+            maps_tma=maps.view(1, -1, 1, HEAD_DIM),
+            map_final=map_final,
+            map_final_tma=map_final.view(1, -1, 1, HEAD_DIM),
+            op_qd=export["qd_raw"],
+            op_kd=export["kd_raw"],
+            op_ft=export["ft_raw"],
+            op_inv=export["inv_raw"],
+            op_vec=export["decay_beta"],
+            out=self._out_tail,
+            out_tma=self._out_tail.reshape(-1, heads, HEAD_DIM),
+            rows=self._apply_dummy_rows,
+            rows_tma=self._apply_dummy_rows,
+            row_starts=self._part_row_starts,
+            final=self._correction_final,
+            final_tma=self._correction_final,
+            pair=self._pair,
+            pair_tma=self._pair,
+            dpair=self._dpair,
+        )
+
+    def _prefix_bindings(self, *, maps=None, map_final=None) -> dict:
+        """Kernel arguments of the prefix-product chain."""
+
+        maps = self._map_snapshots if maps is None else maps
+        map_final = self._map_state if map_final is None else map_final
+        return dict(
+            items=self._prefix_items,
+            num_heads=int(self._carry.shape[1]),
+            pair=self._pair,
+            pair_tma=self._pair.view(1, -1, 1, HEAD_DIM),
+            dpair=self._dpair,
+            maps=maps,
+            maps_tma=maps,
+            map_final=map_final,
+            map_final_tma=map_final,
+        )
+
+    def _launch_apply(self) -> None:
+        """Fused apply kernel: S_w^in (BF16 hi/lo) x prefix maps x exported chunk operators."""
+        import torch
+
+        heads = int(self._carry.shape[1])
+        if self._checkpoint_in_place:
+            rows = self._checkpoint_output
+            # Row 0 of every tail window is the state entering the window: the
+            # main window wrote its zero start, the correction adds the exact
+            # FP32 carry (the chain added its initial state the same way).
+            starts = self._part_row_starts[1 : self.num_parts]
+            torch.add(
+                starts.unsqueeze(1) * heads,
+                self._apply_head_offsets,
+                out=self._apply_row0_index.view(-1, heads),
+            )
+            rows.view(-1, HEAD_DIM, HEAD_DIM).index_add_(
+                0, self._apply_row0_index, self._carry.view(-1, HEAD_DIM, HEAD_DIM)
+            )
+        self._apply_module.launch(grid=self._apply_grid, **self._apply_bindings())
+
+    def _apply_bindings(self) -> dict:
+        """Kernel arguments of the fused apply kernel.
+
+        hi + lo (written by the scan kernel) reproduces the FP32 carry to about
+        16 mantissa bits.
+        """
+
+        export = self._main.operator_export
+        heads = int(self._carry.shape[1])
+        rows = (
+            self._checkpoint_output
+            if self._checkpoint_in_place
+            else self._apply_dummy_rows
+        )
+        return dict(
+            items=self._apply_items,
+            num_heads=heads,
+            carry_hi=self._carry_hi,
+            carry_hi_tma=self._carry_hi.view(1, -1, 1, HEAD_DIM),
+            carry_lo=self._carry_lo,
+            carry_lo_tma=self._carry_lo.view(1, -1, 1, HEAD_DIM),
+            maps=self._map_snapshots,
+            maps_tma=self._map_snapshots.view(1, -1, 1, HEAD_DIM),
+            map_final=self._map_state,
+            map_final_tma=self._map_state.view(1, -1, 1, HEAD_DIM),
+            op_qd=export["qd_raw"],
+            op_kd=export["kd_raw"],
+            op_ft=export["ft_raw"],
+            op_inv=export["inv_raw"],
+            op_vec=export["decay_beta"],
+            out=self._out_tail,
+            out_tma=self._out_tail.reshape(-1, heads, HEAD_DIM),
+            rows=rows,
+            rows_tma=rows,
+            row_starts=self._part_row_starts,
+            final=self._correction_final,
+            final_tma=self._correction_final,
+            pair=self._apply_dummy_pair,
+            pair_tma=self._apply_dummy_pair,
+            dpair=self._apply_dummy_dpair,
         )
 
     def close(self) -> None:
