@@ -32,8 +32,8 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(page64_keeps_gmem_separate_reduce_cea01a87e9);
-TVM_FFI_EMBED_CUBIN(trtllm_mla_decode_fp8_6fe1e0de09);
+TVM_FFI_EMBED_CUBIN(page64_keeps_gmem_separate_reduce_0950d7b7c7);
+TVM_FFI_EMBED_CUBIN(trtllm_mla_decode_fp8_2bc5f62066);
 
 namespace mla_host_shim {
 
@@ -365,7 +365,7 @@ static inline void* TmaDeviceSlot(
   return pointer;
 }
 
-namespace variant_trtllm_mla_decode_fp8_6fe1e0de09_c0f86ac47133 {
+namespace variant_trtllm_mla_decode_fp8_2bc5f62066_3c287ec7c97d {
 
 // 2D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -535,7 +535,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_work_batch_indices, arg_tmap_q, "work_batch_indices", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -564,10 +563,10 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   int32_t v_max_pages_per_seq = (int32_t)arg_max_pages_per_seq;
   void* kargs[] = {&p_tmap_q, &p_tmap_k, &p_tmap_v, &p_partial_O, &p_partial_stats, &p_O, &p_LSE, &p_seq_lens_kv, &p_work_batch_indices, &p_page_table, &v_softmax_scale_log2, &v_bmm2_scale, &v_num_split, &v_num_queries, &v_max_pages_per_seq};
 
-  static auto kernel = EmbedCubinModule_trtllm_mla_decode_fp8_6fe1e0de09::Global()->mod.GetKernel("kernel_trtllm_mla_decode_fp8");
+  static auto kernel = EmbedCubinModule_trtllm_mla_decode_fp8_2bc5f62066::Global()->mod.GetKernel("kernel_trtllm_mla_decode_fp8");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
-      kernel, (int)arg_tmap_q.device().device_id, 190976,
+      kernel, (int)arg_tmap_q.device().device_id, 226304,
       mla_smem_mode_cache, 64);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(384u, 1u, 1u);
@@ -598,7 +597,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
   config.blockDimX = block.x;
   config.blockDimY = block.y;
   config.blockDimZ = block.z;
-  config.sharedMemBytes = 190976u;
+  config.sharedMemBytes = 226304u;
   config.hStream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
@@ -621,16 +620,16 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 #endif
   config.gridDim = {grid.x, grid.y, grid.z};
   config.blockDim = {block.x, block.y, block.z};
-  config.dynamicSmemBytes = 190976u;
+  config.dynamicSmemBytes = 226304u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_trtllm_mla_decode_fp8_6fe1e0de09_c0f86ac47133
+}  // namespace variant_trtllm_mla_decode_fp8_2bc5f62066_3c287ec7c97d
 
-namespace variant_page64_keeps_gmem_separate_reduce_cea01a87e9_dde077f61656 {
+namespace variant_page64_keeps_gmem_separate_reduce_0950d7b7c7_693d255a5c86 {
 
 void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_O, TensorView arg_LSE, int64_t arg_num_split, int64_t arg_num_reduce_ctas, int64_t arg_num_queries, double arg_bmm2_scale, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   DLDevice dev = arg_partial_O.device();
@@ -659,7 +658,6 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_
   CheckSameCudaDevice(arg_partial_stats, arg_partial_O, "partial_stats", "partial_O");
   CheckSameCudaDevice(arg_O, arg_partial_O, "O", "partial_O");
   CheckSameCudaDevice(arg_LSE, arg_partial_O, "LSE", "partial_O");
-  CheckCurrentCudaDevice(arg_partial_O, "partial_O");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -675,7 +673,7 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_
   float v_bmm2_scale = (float)arg_bmm2_scale;
   void* kargs[] = {&p_partial_O, &p_partial_stats, &p_O, &p_LSE, &v_num_split, &v_num_reduce_ctas, &v_num_queries, &v_bmm2_scale};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(page64_keeps_gmem_separate_reduce_cea01a87e9, "kernel_page64_keeps_gmem_separate_reduce");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(page64_keeps_gmem_separate_reduce_0950d7b7c7, "kernel_page64_keeps_gmem_separate_reduce");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(512u, 1u, 1u);
 
@@ -711,7 +709,7 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_page64_keeps_gmem_separate_reduce_cea01a87e9_dde077f61656
+}  // namespace variant_page64_keeps_gmem_separate_reduce_0950d7b7c7_693d255a5c86
 
 int SelectVariant(float softmax_scale_log2, float bmm2_scale, int32_t num_split, int32_t num_queries, int32_t max_pages_per_seq, int32_t num_reduce_ctas) {
   if ((num_split > 1)) return 0;
@@ -744,13 +742,13 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
         int64_t gx = (num_split * 2);
         int64_t gy = num_queries;
         int64_t gz = 1;
-        mla_host_shim::variant_trtllm_mla_decode_fp8_6fe1e0de09_c0f86ac47133::Run(arg_query, arg_kv, arg_kv, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, arg_seq_lens, arg_work_batch_indices, arg_page_table, softmax_scale_log2, bmm2_scale, num_split, num_queries, max_pages_per_seq, gx, gy, gz, stream);
+        mla_host_shim::variant_trtllm_mla_decode_fp8_2bc5f62066_3c287ec7c97d::Run(arg_query, arg_kv, arg_kv, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, arg_seq_lens, arg_work_batch_indices, arg_page_table, softmax_scale_log2, bmm2_scale, num_split, num_queries, max_pages_per_seq, gx, gy, gz, stream);
       }
       {
         int64_t gx = num_reduce_ctas;
         int64_t gy = 2;
         int64_t gz = num_queries;
-        mla_host_shim::variant_page64_keeps_gmem_separate_reduce_cea01a87e9_dde077f61656::Run(arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, num_split, num_reduce_ctas, num_queries, bmm2_scale, gx, gy, gz, stream);
+        mla_host_shim::variant_page64_keeps_gmem_separate_reduce_0950d7b7c7_693d255a5c86::Run(arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, num_split, num_reduce_ctas, num_queries, bmm2_scale, gx, gy, gz, stream);
       }
       return;
     }

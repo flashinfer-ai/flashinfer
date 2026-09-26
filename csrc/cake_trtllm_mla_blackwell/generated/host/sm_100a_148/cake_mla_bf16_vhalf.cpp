@@ -32,7 +32,7 @@
 #include <vector>
 #include <algorithm>
 
-TVM_FFI_EMBED_CUBIN(mla_decode_value_split_paged_bf16_fa7b59f3a7);
+TVM_FFI_EMBED_CUBIN(mla_decode_value_split_paged_bf16_f167f8d7bb);
 
 namespace mla_host_shim {
 
@@ -364,7 +364,7 @@ static inline void* TmaDeviceSlot(
   return pointer;
 }
 
-namespace variant_mla_decode_value_split_paged_bf16_fa7b59f3a7_ed851bc7fbe4 {
+namespace variant_mla_decode_value_split_paged_bf16_f167f8d7bb_b0b029b00c5d {
 
 // 3D TMA descriptor for buffer 'tmap_q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -642,7 +642,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   CheckSameCudaDevice(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   CheckSameCudaDevice(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   CheckSameCudaDevice(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
-  CheckCurrentCudaDevice(arg_tmap_q, "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -671,7 +670,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
   void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
-  static auto kernel = EmbedCubinModule_mla_decode_value_split_paged_bf16_fa7b59f3a7::Global()->mod.GetKernel("kernel_mla_decode_value_split_paged_bf16");
+  static auto kernel = EmbedCubinModule_mla_decode_value_split_paged_bf16_f167f8d7bb::Global()->mod.GetKernel("kernel_mla_decode_value_split_paged_bf16");
   static signed char mla_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = MlaConfigureDynamicSmem(
       kernel, (int)arg_tmap_q.device().device_id, 231424,
@@ -729,7 +728,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
 #endif
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
-}  // namespace variant_mla_decode_value_split_paged_bf16_fa7b59f3a7_ed851bc7fbe4
+}  // namespace variant_mla_decode_value_split_paged_bf16_f167f8d7bb_b0b029b00c5d
 
 int SelectVariant(float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z) {
   if ((((total_work_items > 0) && (grid_x > 0)) && (grid_z > 0))) return 0;
@@ -751,7 +750,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
         int64_t gx = grid_x;
         int64_t gy = 1;
         int64_t gz = grid_z;
-        mla_host_shim::variant_mla_decode_value_split_paged_bf16_fa7b59f3a7_ed851bc7fbe4::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+        mla_host_shim::variant_mla_decode_value_split_paged_bf16_f167f8d7bb_b0b029b00c5d::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
       }
       return;
     }

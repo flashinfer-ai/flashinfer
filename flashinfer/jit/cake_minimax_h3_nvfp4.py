@@ -23,15 +23,15 @@ from .core import JitSpec
 
 MiniMaxH3Nvfp4Target = Literal["sm100a", "sm103a"]
 
-# Destination partition counts of the generated stage-3 pack program. The
-# token count M is a runtime parameter of both stages, so the inventory is
-# one route per partition count (five programs per target: one norm stage
-# shared by every route plus one pack stage per P).
+# Destination partition counts of the prepared operation. The token count M
+# is a runtime parameter of both stages and the fused QKV GEMM takes the
+# destination geometry at launch, so the four partition routes of one target
+# deduplicate to two programs: the norm stage and the fused GEMM + pack stage.
 MINIMAX_H3_NVFP4_PARTITIONS = (1, 2, 4, 8)
 
 _STAGES = (
     "norm_adaln_nvfp4_quantize",
-    "qk_rope_destination_nvfp4_pack",
+    "qkv_nvfp4_gemm_fused_pack",
 )
 
 

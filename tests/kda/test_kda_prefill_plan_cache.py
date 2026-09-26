@@ -173,6 +173,74 @@ def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
         _assert_same(want, _snapshot(d))
 
 
+def test_repeat_call_on_unchanged_tensors_skips_the_rebind_and_stays_bitwise():
+    """The same tensors, addresses and scalars as the previous hit take the memo path."""
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192], 16, seed=11)
+    pool = d["pool"].clone()
+    _run(d, cache)  # miss: prepare + put (bound to these tensors)
+    _run(d, cache)  # hit: still bound, no rebind (memo armed)
+    _run(d, cache)  # hit: memo, no rebind
+    assert (cache.misses, cache.hits, cache.fast_hits) == (1, 2, 2)
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    for _ in range(3):
+        _run(d)
+    _assert_same(got, _snapshot(d))
+    # A different token count on the same buffers must not take the memo.
+    other = _inputs([4096], 16, seed=12)
+    _run(other, cache)
+    assert cache.fast_hits == 2 and cache.misses == 2
+    # Coming back to the first tensors: the memo belongs to the other entry
+    # now, but this entry is still bound to these tensors, so no rebind.
+    _run(d, cache)
+    assert cache.fast_hits == 3 and cache.hits == 3
+
+
+def test_hit_with_a_fresh_output_only_repoints_the_output_and_stays_bitwise():
+    """Serving allocates the output per call; the hit rebinds that input only."""
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192], 16, seed=13)
+    pool = d["pool"].clone()
+    _run(d, cache)
+    for _ in range(3):
+        d = dict(d, out=torch.empty_like(d["out"]))
+        _run(d, cache)
+    assert (cache.misses, cache.hits, cache.fast_hits) == (1, 3, 0)
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    for _ in range(4):
+        _run(d)
+    _assert_same(got, _snapshot(d))
+
+
+def test_deferred_part_rebinds_flush_before_another_hit_and_land_in_the_newest_output():
+    """A composite hit defers its map/correction rebinds past the first chain kernel.
+
+    A second hit before any launch must flush the pending set first, and the
+    launch must land in the newest output only; the result stays bitwise.
+    """
+    cache = KDAPrefillPlanCache(8)
+    d = _inputs([8192, 8192], 16, seed=23)
+    pool = d["pool"].clone()
+    miss = _run(d, cache)
+    assert "affine" in str(miss.schedule)
+    skipped = dict(d, out=torch.zeros_like(d["out"]))
+    _prepare(skipped, cache)  # hit: map/correction rebinds pending, never launched
+    newest = dict(d, out=torch.zeros_like(d["out"]))
+    call = _prepare(newest, cache)  # hit: flushes the pending set, defers its own
+    call.launch()
+    assert (cache.misses, cache.hits) == (1, 2)
+    assert not skipped["out"].any(), "a skipped binding received output rows"
+    got = _snapshot(newest)
+    # Two launches updated the in-place pool (the miss and the newest hit);
+    # replay both from the original pool without the cache.
+    newest["pool"].copy_(pool)
+    for _ in range(2):
+        _run(newest)
+    _assert_same(got, _snapshot(newest))
+
+
 def test_split_sequence_affine_route_caches_and_rebinds():
     # A long bounded-gate sequence without a checkpoint request takes the
     # affine split route.  Its main/map/correction part launches and the
@@ -269,6 +337,34 @@ def test_bf16_checkpoint_rows_keep_the_bf16_carrier_on_fp32_state():
     assert (
         torch.isfinite(d["out"]).all() and torch.isfinite(d["state_checkpoints"]).all()
     )
+
+
+@pytest.mark.parametrize(
+    "lengths,checkpoints",
+    [([2048], True), ([4096], False), ([8128, 64], True), ([8192], True)],
+)
+def test_dense_h12_beta_matches_the_strided_carrier_on_the_unbounded_gate(
+    lengths, checkpoints
+):
+    # Serving hands beta over as a strided slice of a wider allocation; a dense
+    # [tokens, 12] beta (token stride == heads) selects the pair-packed beta
+    # TensorMap instead of the padded carrier.  Both layouts must be exported
+    # for the unbounded gate (Kimi-Linear) and produce the same bits, on the
+    # sequential body and on the affine split alike.
+    d = _inputs(lengths, 12, seed=31)
+    if kda_prefill_supports_fp32_checkpoints(lower_bound=None):
+        d["state_checkpoints"] = torch.zeros_like(
+            d["state_checkpoints"], dtype=torch.float32
+        )
+    pool = d["pool"].clone()
+    assert d["beta"].stride(1) != 12
+    _run(d, checkpoints=checkpoints)
+    want = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["beta"] = d["beta"].contiguous()
+    assert d["beta"].stride(1) == 12
+    _run(d, checkpoints=checkpoints)
+    _assert_same(_snapshot(d), want)
 
 
 def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
@@ -391,7 +487,7 @@ def test_affine_fused_epilogue_keeps_subnormal_sums():
     from flashinfer.jit.cake_kda_affine_epilogue import load_for_device
 
     device = torch.device("cuda", torch.cuda.current_device())
-    run = load_for_device(device)
+    run = load_for_device(device).run
     heads, elems, tail_elems = 1, 128 * 128, 1024
     gen = torch.Generator(device=device).manual_seed(3)
 
@@ -453,11 +549,14 @@ def test_affine_fp32_rows_in_place_match_the_window_merge_bitwise(monkeypatch, l
     # (red.global.add.v4.f32), replacing the staged windows plus merging
     # epilogue.  Both paths perform the same single FP32 addition per element,
     # so rows, output and final state must be bitwise identical.
+    # Both arms run the correction chain: the apply route (below) reorders the
+    # BF16 operators and is compared with a tolerance instead.
     d = _inputs(lengths, 16, seed=13)
     d["state_checkpoints"] = torch.zeros_like(
         d["state_checkpoints"], dtype=torch.float32
     )
     pool = d["pool"].clone()
+    monkeypatch.setenv("CAKE_KDA_AFFINE_APPLY", "0")
     monkeypatch.setenv("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "0")
     windows = _run(d)
     assert "affine" in str(windows.schedule) and "rows_in_place" not in str(
@@ -470,8 +569,48 @@ def test_affine_fp32_rows_in_place_match_the_window_merge_bitwise(monkeypatch, l
     monkeypatch.setenv("CAKE_KDA_AFFINE_ROWS_IN_PLACE", "1")
     in_place = _run(d)
     assert "rows_in_place" in str(in_place.schedule)
+    assert "apply" not in str(in_place.schedule)
     _assert_same(_snapshot(d), want)
     assert torch.isfinite(d["state_checkpoints"]).all()
+
+
+@pytest.mark.parametrize(
+    "lengths,checkpoints",
+    [
+        ([8192], True),
+        ([3000, 13384], True),
+        ([1000, 12000, 3384], True),
+        ([4096], False),
+        ([8192, 4096], False),
+    ],
+)
+def test_affine_apply_route_matches_the_correction_chain(
+    monkeypatch, lengths, checkpoints
+):
+    # The apply route replaces the composite's correction and map chains with
+    # the exported chunk operators (pair-map producer, prefix-product chain and
+    # the fused apply kernel).  Same math, different BF16 operator order: the
+    # output agrees with the chain to one BF16 ulp, the FP32 pool and rows to
+    # a few 1e-3 on window-boundary rows, never bitwise by construction.
+    d = _inputs(lengths, 16, seed=13)
+    d["state_checkpoints"] = torch.zeros_like(
+        d["state_checkpoints"], dtype=torch.float32
+    )
+    pool = d["pool"].clone()
+    monkeypatch.setenv("CAKE_KDA_AFFINE_APPLY", "0")
+    chain = _run(d, checkpoints=checkpoints)
+    assert "affine" in str(chain.schedule) and "apply" not in str(chain.schedule)
+    want = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["out"].zero_()
+    d["state_checkpoints"].zero_()
+    monkeypatch.delenv("CAKE_KDA_AFFINE_APPLY")
+    apply = _run(d, checkpoints=checkpoints)
+    assert "apply" in str(apply.schedule)
+    got = _snapshot(d)
+    for name, a, b in zip(("out", "state", "checkpoints"), got, want, strict=True):
+        assert torch.isfinite(a).all(), name
+        torch.testing.assert_close(a.float(), b.float(), atol=1e-2, rtol=1e-2, msg=name)
 
 
 def test_plan_cache_accounting_never_queries_the_allocator(monkeypatch):
