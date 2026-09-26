@@ -276,6 +276,15 @@ def _lazy_calibrated_profile(request, device) -> Optional[dict]:
 
 
 def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]:
+    """Select from a timing profile, or return None for ordinary policy planning.
+
+    Tuning mode may populate or refine profiles. Strict BF16-QK bypasses this
+    path because its fixed SG route has no phase or CPB choice.
+    """
+    if precision == "bf16_qk":
+        # This route has one SG specialization and no split-K/CPB choice.
+        # Legacy FP8 profiles must not select its arithmetic or execution phase.
+        return None
     if not canonical_profile_layout(metadata):
         return None
     m = metadata
@@ -609,6 +618,24 @@ def plan(
     Compiled capabilities define eligibility; analytical constants only estimate
     decode CPB. Forced prefill preferences do not change a legal decode phase.
     """
+    if compute_precision == "bf16_qk":
+        if (
+            model_type != _MODEL_TYPE_GLM53_NOPE
+            or num_tokens <= 0
+            or num_heads != 16
+            or topk not in (2112, 2176)
+            or page_block_size != 64
+            or has_extra
+            or extra_topk
+            or extra_fp4
+        ):
+            raise ValueError(
+                "bf16_qk requires GLM53 NoPE, T>0, H=16, PBS=64, "
+                "topk=2112/2176 and a single cache"
+            )
+        if prefill_impl_pref != _PREFILL_IMPL_AUTO:
+            raise ValueError("bf16_qk prefill_impl must be None or auto")
+        return PlannedCall(KernelVariant.PREFILL_SG, -1)
     if compute_precision != "default":
         if compute_precision not in ("fp8", "bf16"):
             raise ValueError(f"unsupported compute_precision={compute_precision!r}")

@@ -97,7 +97,14 @@ auto visit_decode_heads(int heads, F&& call) {
 
 constexpr int decode_scratch_heads(int heads) { return heads == 8 ? 8 : (heads + 15) / 16 * 16; }
 
-enum class NumericRoute : int64_t { FP8, QkBF16PvFP8, FullBF16, NVFP4 };
+enum class NumericRoute : int64_t {
+  FP8,
+  QkBF16PvFP8,
+  FullBF16,
+  NVFP4,
+  // Request only: unlike QkBF16PvFP8, this must not resolve to FP8 QK.
+  RequireQkBF16PvFP8
+};
 enum class Implementation : int64_t {
   Ordinary,
   MixedCache,

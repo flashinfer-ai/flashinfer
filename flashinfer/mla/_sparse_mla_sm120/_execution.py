@@ -55,7 +55,7 @@ def query(name: str, *args, is_dsv4_nvfp4: bool = False):
 
 KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32", "ue8m0_g32"})
 
-_PRECISION_CODES = {"fp8": 0, "default": 1, "bf16": 2}
+_PRECISION_CODES = {"fp8": 0, "default": 1, "bf16": 2, "bf16_qk": 4}
 
 
 def _precision_code(precision: str) -> int:
