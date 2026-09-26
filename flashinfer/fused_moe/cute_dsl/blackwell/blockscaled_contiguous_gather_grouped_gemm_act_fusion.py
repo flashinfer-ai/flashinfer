@@ -59,6 +59,7 @@ from ..moe_utils import (
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     UnalignedNamedBarrier,
+    blk_copy_raw,
     f32_reciprocal,
     fmin,
     gelu_tanh_f32,
@@ -442,7 +443,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         weight_l2_hint: Optional[int] = None,
         pdl_trigger_early: bool = False,
         zero_fill: bool = False,
-        zero_fill_iters: int = 64,
+        zero_fill_secondary: bool = False,
+        zero_fill_chunk_bytes: int = 65536,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -510,9 +512,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # wide GEMM1), so the dependent grid is resident during the wait.
         self.pdl_trigger_early = bool(pdl_trigger_early)
         # Zero-fill of the finalize output by the epilogue warps (see the
-        # kernel body): 32 lanes x 16 B x zero_fill_iters (32 KB) per claimed chunk.
+        # kernel body): bulk copies of a zeroed smem tile, zero_fill_chunk_bytes
+        # per claimed chunk. The secondary launch of a dual-tile pair fills
+        # only when the primary has no tiles.
         self.zero_fill = bool(zero_fill)
-        self.zero_fill_iters = int(zero_fill_iters)
+        self.zero_fill_secondary = bool(zero_fill_secondary)
+        self.zero_fill_chunk_bytes = int(zero_fill_chunk_bytes)
         self.use_a_per_token_scale = use_a_per_token_scale
         self.topk = topk
         self.gated = gated
@@ -3471,30 +3476,66 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # once their tiles are stored: the CTAs without tiles (most
                 # of them on a sparse routing) reach this point at once and
                 # fill while the others compute, the busy CTAs' share hides
-                # in the tail imbalance, and no separate kernel takes the SMs. Warps claim
-                # 32 KB chunks from a global counter, the next claim issued
-                # before the current chunk's stores (per-SM store throughput
-                # is capped at ~64 GB/s on B300, a claim costs a ~1 us
-                # round trip). The (claim, done) counters live in a caller
-                # buffer zeroed once; the last warp of the launch resets
-                # both, and every later launch touches them only after its
-                # griddepcontrol.wait. A launch whose tile variant the
-                # routing did not choose leaves the fill to the chosen one
-                # unless neither has tiles (nothing routed to this rank).
+                # in the tail imbalance, and no separate kernel takes the SMs.
+                # The C staging smem (free after producer_tail) is zeroed
+                # and streamed out with cp.async.bulk by one lane per warp,
+                # which reaches the per-SM store cap without the LSU issue
+                # limit of per-thread stores; warps claim
+                # zero_fill_chunk_bytes chunks from a global counter, the next
+                # claim issued before the current chunk's copies. The (claim,
+                # done) counters live in a caller buffer zeroed once; the last
+                # of the grid's epilogue warps resets both, and every later
+                # launch touches them only after its griddepcontrol.wait. Of
+                # a dual-tile pair only one launch fills: the primary unless
+                # it has no tiles, then the secondary (both empty: primary).
                 #
                 my_tiles = num_non_exiting_tiles[0]
                 other_tiles = zero_fill_other_tiles[0]
-                if (my_tiles > 0) | (other_tiles == 0):
-                    lane = cute.arch.lane_idx()
-                    grid_x, _, _ = cute.arch.grid_dim()
-                    claim_addr = zero_fill_counters.iterator.toint()
-                    done_addr = (zero_fill_counters.iterator + 1).toint()
-                    num_vec = cute.size(zero_fill_words) // 4
-                    chunk_vec = 32 * self.zero_fill_iters
-                    num_chunks = cute.ceil_div(num_vec, chunk_vec)
+                if cutlass.const_expr(self.zero_fill_secondary):
+                    do_fill = (my_tiles > 0) & (other_tiles == 0)
+                else:
+                    do_fill = (my_tiles > 0) | (other_tiles == 0)
+                if do_fill:
+                    sc_bytes = (
+                        cute.cosize(self.c_smem_layout_staged.outer)
+                        * self.c_dtype.width
+                        // 8
+                    )
+                    zb = min(sc_bytes, 32768)
+                    zb = zb - zb % 2048
+                    if cutlass.const_expr(
+                        zb < 2048 or self.zero_fill_chunk_bytes % zb != 0
+                    ):
+                        raise ValueError(
+                            f"zero_fill: C staging smem of {sc_bytes} B cannot "
+                            f"tile a {self.zero_fill_chunk_bytes} B chunk"
+                        )
+                    copies_per_chunk = self.zero_fill_chunk_bytes // zb
+                    sZ = storage.sC.get_tensor(
+                        cute.make_layout((zb // 4,)), dtype=cutlass.Uint32
+                    )
                     zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
                     for i in cutlass.range_constexpr(4):
                         zeros[i] = cutlass.Uint32(0)
+                    for i in cutlass.range_constexpr(zb // 16 // 128):
+                        s_out = cute.make_tensor(
+                            sZ.iterator + (epi_tidx + i * 128) * 4,
+                            layout=cute.make_layout((4,)),
+                        )
+                        cute.autovec_copy(zeros, s_out)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    lane = cute.arch.lane_idx()
+                    grid_x, grid_y, grid_z = cute.arch.grid_dim()
+                    claim_addr = zero_fill_counters.iterator.toint()
+                    done_addr = (zero_fill_counters.iterator + 1).toint()
+                    src_addr = sZ.iterator.toint()
+                    dst_base = zero_fill_words.iterator.toint()
+                    num_bytes = cutlass.Int64(cute.size(zero_fill_words)) * 4
+                    num_chunks = cutlass.Int32(
+                        (num_bytes + (self.zero_fill_chunk_bytes - 1))
+                        // self.zero_fill_chunk_bytes
+                    )
                     claimed = cutlass.Int32(0)
                     if lane == 0:
                         claimed = atomic_add_global_i32(claim_addr, cutlass.Int32(1))
@@ -3505,20 +3546,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             next_claim = atomic_add_global_i32(
                                 claim_addr, cutlass.Int32(1)
                             )
-                        base_vec = claimed * chunk_vec + lane
-                        for it in cutlass.range_constexpr(self.zero_fill_iters):
-                            vec = base_vec + it * 32
-                            if vec < num_vec:
-                                g_out = cute.make_tensor(
-                                    zero_fill_words.iterator
-                                    + cute.assume(vec * 4, divby=4),
-                                    layout=cute.make_layout((4,)),
-                                )
-                                cute.autovec_copy(zeros, g_out)
+                            off = cutlass.Int64(claimed) * self.zero_fill_chunk_bytes
+                            for j in cutlass.range_constexpr(copies_per_chunk):
+                                rem = num_bytes - off
+                                if rem > 0:
+                                    sz = cutlass.Int32(cutlass.min(rem, cutlass.Int64(zb)))
+                                    blk_copy_raw(dst_base + off, src_addr, sz)
+                                off = off + zb
+                            cute.arch.cp_async_bulk_commit_group()
                         claimed = cute.arch.shuffle_sync(next_claim, 0)
+                    if lane == 0:
+                        cute.arch.cp_async_bulk_wait_group(0)
                     threadfence()
                     if lane == 0:
-                        total_warps = grid_x * len(self.epilog_warp_id)
+                        total_warps = (
+                            grid_x * grid_y * grid_z * len(self.epilog_warp_id)
+                        )
                         finished = atomic_add_global_i32(done_addr, cutlass.Int32(1))
                         if finished == total_warps - 1:
                             zero_fill_counters[0] = cutlass.Int32(0)

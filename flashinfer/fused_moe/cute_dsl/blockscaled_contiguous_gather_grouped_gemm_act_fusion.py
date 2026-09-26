@@ -281,6 +281,7 @@ def _get_compiled_gather_kernel(
     zero_fill_num_words: int = 0,
     zero_fill_counters_ptr=None,
     zero_fill_other_tiles_ptr=None,
+    zero_fill_secondary: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -340,6 +341,7 @@ def _get_compiled_gather_kernel(
         row_group_ptr is not None,
         pdl_trigger_early,
         zero_fill_words_ptr is not None,
+        zero_fill_secondary,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -402,6 +404,7 @@ def _get_compiled_gather_kernel(
                 weight_l2_hint=weight_l2_hint,
                 pdl_trigger_early=pdl_trigger_early,
                 zero_fill=zero_fill_words_ptr is not None,
+                zero_fill_secondary=zero_fill_secondary,
             )
         wrapper_fn = gemm.wrapper
 
@@ -506,6 +509,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     zero_fill_output: Optional[torch.Tensor] = None,
     zero_fill_counters: Optional[torch.Tensor] = None,
     zero_fill_other_tiles: Optional[torch.Tensor] = None,
+    zero_fill_secondary: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
@@ -1032,6 +1036,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         zero_fill_num_words=zero_fill_num_words,
         zero_fill_counters_ptr=zero_fill_counters_ptr,
         zero_fill_other_tiles_ptr=zero_fill_other_tiles_ptr,
+        zero_fill_secondary=zero_fill_secondary,
     )
 
     # Execute kernel with runtime parameters.

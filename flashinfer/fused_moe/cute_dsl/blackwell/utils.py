@@ -178,6 +178,28 @@ def blk_copy(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_copy_raw(dst_gmem_addr, src_smem_addr, size, loc=None, ip=None):
+    """``cp.async.bulk`` shared::cta -> global of ``size`` bytes (multiple of 16)
+    from raw addresses: ``dst_gmem_addr`` Int64 generic, ``src_smem_addr`` Int32
+    shared-window. Completion is tracked by the issuing thread's bulk group."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem_addr.ir_value(loc=loc, ip=ip),
+            src_smem_addr.ir_value(loc=loc, ip=ip),
+            size.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_bf16x2_pair_pred(dst_gmem, lo_f32, hi_f32, pred_i32, loc=None, ip=None):
     """Predicated ``red.global.add.bf16x2`` of two F32 values rounded to BF16.
 

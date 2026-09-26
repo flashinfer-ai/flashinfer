@@ -554,6 +554,7 @@ def _moe_core_impl(
             zero_fill_output=moe_output if gemm1_zero_fill else None,
             zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
             zero_fill_other_tiles=base_num_tiles if gemm1_zero_fill else None,
+            zero_fill_secondary=True,
             _prepared_launches=alt_launches,
         )
         if _prepared_launches is not None:
