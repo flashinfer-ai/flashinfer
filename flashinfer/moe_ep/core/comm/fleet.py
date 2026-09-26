@@ -1,4 +1,9 @@
-"""Fleet — abstract Expert-Parallel transport endpoint.
+"""Fleet — transport endpoint of the NCCL-EP and NIXL-EP backends.
+
+The Fleet/Handle pair mirrors those libraries' own object model: a long-lived
+group that owns the transport buffers, and a per-step handle carrying one
+dispatch's routing state. The MoE-level interface built on top of it is
+:class:`~flashinfer.moe_ep.core.comm.communication.MoEEpCommunication`.
 
 Backends register themselves in :data:`_BACKEND_REGISTRY` at import time
 (see :mod:`flashinfer.moe_ep.backends.split.comm.nccl_ep` and

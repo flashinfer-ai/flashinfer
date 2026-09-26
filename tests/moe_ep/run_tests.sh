@@ -5,6 +5,7 @@
 #   bash tests/moe_ep/run_tests.sh
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
+#   bash tests/moe_ep/run_tests.sh comm          # MoEEpCommunication backends (NVLink one-/two-sided, NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
@@ -159,6 +160,14 @@ run_unit() {
   # their own interpreter.
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm90_pull_fp8_tuner.py
+}
+
+# MoEEpCommunication dispatch/combine on NPROC_MULTIRANK GPUs. Backends that
+# are unavailable on the host (no NVLink fabric, no nccl.ep) skip.
+run_comm() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_communication_multirank.py -v
 }
 
 run_multirank() {
@@ -462,6 +471,7 @@ run_all() {
   run_section "unit + mock (no multirank)" run_unit
   run_section "torch-oracle correctness (1 GPU)" run_oracle
   run_section "split-path multirank (NCCL-EP)" run_multirank
+  run_section "MoEEpCommunication multirank" run_comm
   run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16
   run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4
   run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht
@@ -479,6 +489,7 @@ case "${1:-all}" in
   oracle_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
   oracle_sm107) run_section "sm107 block-scaled torch-oracle correctness (1 Rubin GPU)" run_oracle_sm107; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
+  comm) run_section "MoEEpCommunication multirank" run_comm; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
@@ -492,7 +503,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm120|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm120|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

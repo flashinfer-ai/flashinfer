@@ -24,10 +24,18 @@ from ..config import (
     CombineInputParams,
     DispatchInputParams,
     DispatchOutput,
+    EpAlgorithm,
+    EpLayout,
     FleetParams,
     HandleParams,
 )
-from ..core.comm.fleet import Fleet, create_fleet
+from ..core.comm.communication import (
+    MoEEpCommParams,
+    MoEEpCommunication,
+    create_communication,
+    is_communication_backend,
+)
+from ..core.comm.fleet import _BACKEND_REGISTRY, Fleet, create_fleet
 from ..core.kernel.base import SplitKernelBackend, SplitKernelContext
 from ..core.kernel.registry import create_split_kernel
 from ..core.runtime import (
@@ -246,8 +254,17 @@ class MoEEpSplitGraphState:
             layer._graph_state = None
 
 
+_TOKEN_DTYPE_BY_BYTES = {1: torch.uint8, 2: torch.bfloat16, 4: torch.float32}
+
+
 class MoEEpSplitLayer(nn.Module):
-    """Expert-Parallel layer: dispatch → inner kernel → combine."""
+    """Expert-Parallel layer: dispatch → inner kernel → combine.
+
+    The comm backend is either a Fleet transport (``nccl_ep``, ``nixl_ep``),
+    driven through per-forward handles, or a :class:`MoEEpCommunication`
+    backend (e.g. ``nvlink_one_sided``), which must use the low-latency
+    RANK_MAJOR layout.
+    """
 
     def __init__(
         self,
@@ -305,6 +322,7 @@ class MoEEpSplitLayer(nn.Module):
         self._weights = None
 
         self._fleet: Fleet | None = None
+        self._communication: MoEEpCommunication | None = None
         # Set by create_graph_state(); the layer keeps at most one live state
         # so destroy() can tear it down with the fleet it borrows buffers from.
         self._graph_state: MoEEpSplitGraphState | None = None
@@ -338,12 +356,35 @@ class MoEEpSplitLayer(nn.Module):
             )
         return name
 
+    def _uses_communication(self) -> bool:
+        """Whether the comm backend is a MoEEpCommunication rather than a Fleet."""
+        return self._comm_backend_name() not in _BACKEND_REGISTRY and (
+            is_communication_backend(self._comm_backend)
+        )
+
     def _validate_at_init(self) -> None:
         backend_name = self._comm_backend_name()
         validate_bootstrap_world_size(self._bootstrap)
         validate_fleet_weights(
             self._weights, self._fleet_params, self._bootstrap.world_size
         )
+        if self._uses_communication():
+            if (
+                self._fleet_params.algorithm is not EpAlgorithm.LOW_LATENCY
+                or self._fleet_params.layout is not EpLayout.RANK_MAJOR
+            ):
+                raise MoEEpConfigError(
+                    f"comm backend {backend_name!r} exchanges tokens rank-major; "
+                    "set FleetParams(algorithm=EpAlgorithm.LOW_LATENCY, "
+                    "layout=EpLayout.RANK_MAJOR)."
+                )
+            if self._fleet_params.dtype_bytes not in _TOKEN_DTYPE_BY_BYTES:
+                raise MoEEpConfigError(
+                    f"comm backend {backend_name!r} supports dtype_bytes in "
+                    f"{sorted(_TOKEN_DTYPE_BY_BYTES)}, got "
+                    f"{self._fleet_params.dtype_bytes}."
+                )
+            return
         # nixl_ep rendezvous-store validation is deferred to fleet creation
         # (first forward): layers are routinely constructed before
         # torch.distributed is initialized, and NixlEpFleet._resolve_store
@@ -375,6 +416,82 @@ class MoEEpSplitLayer(nn.Module):
                 backend=self._comm_backend,
             )
         return self._fleet
+
+    def _ensure_communication(self, top_k: int) -> MoEEpCommunication:
+        if self._communication is None:
+            fp = self._fleet_params
+            self._communication = create_communication(
+                self._bootstrap,
+                MoEEpCommParams(
+                    num_experts=fp.num_experts,
+                    top_k=top_k,
+                    max_tokens_per_rank=fp.max_tokens_per_rank,
+                    hidden_size=fp.token_hidden_size,
+                    dtype=_TOKEN_DTYPE_BY_BYTES[fp.dtype_bytes],
+                ),
+                self._comm_backend,
+            )
+        elif self._communication.params.top_k != top_k:
+            raise MoEEpConfigError(
+                f"top_k changed from {self._communication.params.top_k} to "
+                f"{top_k}; a MoEEpSplitLayer serves a single top_k."
+            )
+        return self._communication
+
+    def _communication_round_trip(
+        self, t: "MoEEpTensors", out: torch.Tensor
+    ) -> torch.Tensor:
+        """dispatch -> inner kernel -> combine over a MoEEpCommunication."""
+        comm = self._ensure_communication(t.topk_ids.shape[1])
+        timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+
+        @contextlib.contextmanager
+        def stage(name: str):
+            if not self.enable_timing:
+                yield
+                return
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            yield
+            end.record()
+            timings[name] = (start, end)
+
+        with stage("dispatch"):
+            received = comm.dispatch(
+                self._kernel.pack_dispatch_payload(t.hidden_states),
+                t.topk_ids,
+                t.topk_weights,
+            )
+        with stage("compute"):
+            rows = comm.ep_size * received.tokens_per_rank
+            # The inner kernels take RANK_MAJOR routing as ids local to this
+            # rank, with -1 for picks this rank does not own.
+            first_local = comm.ep_rank * comm.num_local_experts
+            ids = received.topk_ids
+            is_local = (ids >= first_local) & (
+                ids < first_local + comm.num_local_experts
+            )
+            ctx = SplitKernelContext(
+                expert_tensors=received.hidden_states.view(
+                    comm.ep_size, received.tokens_per_rank, -1
+                ),
+                num_tokens=rows,
+                fleet_params=self._fleet_params,
+                recv_topk_idx=torch.where(
+                    is_local, ids - first_local, torch.full_like(ids, -1)
+                ),
+                recv_topk_weights=received.topk_weights,
+            )
+            expert_out = self._kernel.compute(ctx)
+        with stage("combine"):
+            result = comm.combine(expert_out.reshape(rows, -1), output=out)
+        if timings:
+            torch.cuda.synchronize()
+            self.last_timings_ms = {
+                k: start.elapsed_time(end) for k, (start, end) in timings.items()
+            }
+        return result
 
     def create_graph_state(
         self,
@@ -422,6 +539,11 @@ class MoEEpSplitLayer(nn.Module):
                 "MoEEpSplitLayer.create_graph_state() allocates transport "
                 "buffers and cannot run during CUDA graph capture; call it "
                 "(and one warmup forward) on all EP ranks before capturing."
+            )
+        if self._uses_communication():
+            raise MoEEpConfigError(
+                f"comm backend {self._comm_backend_name()!r} does not support "
+                "MoEEpSplitLayer graph states yet."
             )
         ensure_bootstrap_dist_validated(self._bootstrap)
         validate_split_forward_inputs(
@@ -626,6 +748,16 @@ class MoEEpSplitLayer(nn.Module):
                 self._warmed = True
             return out
 
+        if self._uses_communication():
+            if _is_capturing():
+                raise MoEEpConfigError(
+                    f"comm backend {self._comm_backend_name()!r} does not "
+                    "support CUDA graph capture of MoEEpSplitLayer yet."
+                )
+            out = self._communication_round_trip(t, torch.empty_like(t.hidden_states))
+            self._warmed = True
+            return out
+
         if _is_capturing():
             raise MoEEpConfigError(
                 "MoEEpSplitLayer.forward() creates a Handle per call and "
@@ -678,6 +810,9 @@ class MoEEpSplitLayer(nn.Module):
         # when that raises, or the bootstrap ref_count leaks and the layer keeps
         # serving forward() on a half-destroyed fleet.
         try:
+            if self._communication is not None:
+                self._communication.destroy()
+                self._communication = None
             if self._fleet is not None:
                 self._fleet.destroy()
                 self._fleet = None

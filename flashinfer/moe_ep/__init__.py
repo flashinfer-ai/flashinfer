@@ -6,7 +6,8 @@ Package layout::
       core/                 shared comm + kernel abstractions and validation
       backends/
         split/
-          comm/             NCCL-EP, NIXL-EP transport
+          comm/             MoE communication backends (NVLink one-/two-sided,
+                            NCCL-EP) and the NCCL-EP / NIXL-EP Fleet transports
           kernel/           post-dispatch inner kernels
         mega/
           kernel/           fused comm + local MoE kernels
@@ -136,6 +137,14 @@ from .core.bootstrap_utils import (
     bootstrap_ep_rank_world,
     bootstrap_ep_world_size,
 )
+from .core.comm.communication import (
+    MoEEpCommParams,
+    MoEEpCommunication,
+    MoEEpDispatchResult,
+    available_communication_backends,
+    create_communication,
+    register_communication,
+)
 from .core.comm.fleet import Fleet, create_fleet
 from .core.comm.handle import Handle
 from .core.runtime import (
@@ -167,6 +176,8 @@ from .modes import (
     MoEEpSplitGraphState,
     MoEEpSplitLayer,
     NCCLEPConfig,
+    NVLinkOneSidedConfig,
+    NVLinkTwoSidedConfig,
     NcclEpConfig,
     NvepConfig,
     SplitConfig,
@@ -223,7 +234,10 @@ __all__ = [
     "IdentityConfig",
     "MegaConfig",
     "MoEEpArchError",
+    "MoEEpCommParams",
+    "MoEEpCommunication",
     "MoEEpConfigError",
+    "MoEEpDispatchResult",
     "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
     "MoEEpMegaLayer",
@@ -240,6 +254,11 @@ __all__ = [
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
+    "NVLinkOneSidedAlltoAll",
+    "NVLinkOneSidedConfig",
+    "NVLinkTwoSidedAlltoAll",
+    "NVLinkTwoSidedConfig",
+    "NcclEpCommunication",
     "NcclEpConfig",
     "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NvepConfig",
@@ -251,10 +270,12 @@ __all__ = [
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
+    "available_communication_backends",
     "bootstrap_comm_group",
     "bootstrap_ep_rank_world",
     "bootstrap_ep_world_size",
     "bootstrap_moe_ep_runtime",
+    "create_communication",
     "create_fleet",
     "dummy_moe_weights",
     "ensure_bootstrap_dist_validated",
@@ -273,6 +294,7 @@ __all__ = [
     "preprocess_sm107_nvfp4_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
+    "register_communication",
     "run_split_kernel",
     "supports_fault_tolerance",
     "validate_arch_for_backend",
@@ -404,3 +426,12 @@ if _set_build_flags and not available_backends():
 from . import backends as _backends  # noqa: E402,F401
 from .backends.split.comm.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
 from .backends.split.comm.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
+from .backends.split.comm.nccl_ep.communication import (  # noqa: E402
+    NcclEpCommunication,
+)
+from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
+    NVLinkOneSidedAlltoAll,
+)
+from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
+    NVLinkTwoSidedAlltoAll,
+)

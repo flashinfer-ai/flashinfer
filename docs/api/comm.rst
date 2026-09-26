@@ -489,6 +489,11 @@ TensorRT-LLM MNNVL AllReduce
 MNNVL A2A (Throughput Backend)
 -------------------------------
 
+These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
+The ``nvlink_one_sided`` backend of :class:`flashinfer.moe_ep.MoEEpCommunication`
+builds on them and exposes the same dispatch/combine interface as the other
+expert-parallel communication backends.
+
 .. currentmodule:: flashinfer.comm
 
 .. autosummary::
