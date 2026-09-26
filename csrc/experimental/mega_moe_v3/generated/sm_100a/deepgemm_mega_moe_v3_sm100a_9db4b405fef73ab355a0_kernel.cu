@@ -987,7 +987,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes)
+kernel_deepgemm_mega_moe_v3_sm100a_9db4b405fef73ab355a0(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1190,34 +1190,23 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
             unsigned int prefix_addend = ((bid == 0) ? sync_tag - (prefix_participants - 1) : (unsigned int)1);
             unsigned int done_participants = (unsigned int)NUM_CTAS;
             unsigned int done_addend = ((bid == 0) ? sync_tag - (done_participants - 1) : (unsigned int)1);
-            #pragma unroll 1
-            for (int i = disp_tid; i < num_experts; i += 128) {
-                smem_hist[i] = 0;
-            }
-            asm volatile("barrier.sync 10, 128;" ::: "memory");
             int grid_stride = num_bids * 128;
             int cta_base = bid * 128;
             #pragma unroll 1
             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
                 int e_h = topk_idx_i32[idx * 2];
-                atomicAdd(&smem_hist[e_h], 1);
-            }
-            asm volatile("barrier.sync 10, 128;" ::: "memory");
-            #pragma unroll 1
-            for (int i_1 = disp_tid; i_1 < num_experts; i_1 += 128) {
-                int c_h = smem_hist[i_1];
-                if (c_h > 0) {
-                    atomicAdd(&expert_counts[i_1], c_h);
-                }
+                int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                int slot_h = _atomic_old_0;
+                expert_scatter_offsets[e_h * 16 + slot_h] = idx;
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
             unsigned int hist_ticket = 0;
             if (warp == 0) {
                 if (elect_sync()) {
-                    unsigned int _atomic_old_0;
+                    unsigned int _atomic_old_1;
                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_0) : "l"(histogram_done), "r"(static_cast<uint32_t>(hist_addend)) : "memory");
-                    hist_ticket = _atomic_old_0;
+                        : "=r"(_atomic_old_1) : "l"(histogram_done), "r"(static_cast<uint32_t>(hist_addend)) : "memory");
+                    hist_ticket = _atomic_old_1;
                     unsigned int _wait_acquire_mask_0;
                     do {
                     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_0) : "l"(reinterpret_cast<unsigned int*>(histogram_done)) : "memory");
@@ -1229,13 +1218,24 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                 if (warp == 0) {
                     unsigned int public_prior = 0;
                     unsigned int source_prior = 0;
-                    #pragma unroll 1
+                    unsigned int prefetched[12];
+                    prefetched[0] = (unsigned int)expert_counts[lane];
+                    prefetched[1] = (unsigned int)expert_counts[32 + lane];
+                    prefetched[2] = (unsigned int)expert_counts[64 + lane];
+                    prefetched[3] = (unsigned int)expert_counts[96 + lane];
+                    prefetched[4] = (unsigned int)expert_counts[128 + lane];
+                    prefetched[5] = (unsigned int)expert_counts[160 + lane];
+                    prefetched[6] = (unsigned int)expert_counts[192 + lane];
+                    prefetched[7] = (unsigned int)expert_counts[224 + lane];
+                    prefetched[8] = (unsigned int)expert_counts[256 + lane];
+                    prefetched[9] = (unsigned int)expert_counts[288 + lane];
+                    prefetched[10] = (unsigned int)expert_counts[320 + lane];
+                    prefetched[11] = (unsigned int)expert_counts[352 + lane];
+                    #pragma unroll
                     for (int stripe = 0; stripe < 12; stripe++) {
                         unsigned int expert = (unsigned int)(stripe * 32) + lane;
                         unsigned int prefix_count = 0;
-                        if (expert < (unsigned int)num_experts) {
-                            prefix_count = (unsigned int)expert_counts[expert];
-                        }
+                        prefix_count = prefetched[stripe];
                         unsigned int public_tiles = (prefix_count + 256 - 1) / 256 * 2;
                         unsigned int source_blocks = (prefix_count + 16 - 1) / 16;
                         unsigned int public_inclusive = public_tiles;
@@ -1307,10 +1307,10 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
             unsigned int prefix_ticket = 0;
             if (warp == 0) {
                 if (elect_sync()) {
-                    unsigned int _atomic_old_1;
+                    unsigned int _atomic_old_2;
                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_1) : "l"(prefix_done), "r"(static_cast<uint32_t>(prefix_addend)) : "memory");
-                    prefix_ticket = _atomic_old_1;
+                        : "=r"(_atomic_old_2) : "l"(prefix_done), "r"(static_cast<uint32_t>(prefix_addend)) : "memory");
+                    prefix_ticket = _atomic_old_2;
                     unsigned int _wait_acquire_mask_1;
                     do {
                     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_1) : "l"(reinterpret_cast<unsigned int*>(prefix_done)) : "memory");
@@ -1321,24 +1321,28 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
             unsigned int pull_phase = 0;
             int global_warp_idx = bid * 4 + disp_warp;
             int warps_per_grid = NUM_CTAS * 4;
+            int pull_expert = -1;
+            int expert_start = 0;
+            int expert_end = 0;
             #pragma unroll 1
             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
-                int e_s = topk_idx_i32[pair_idx * 2];
-                int t_s = pair_idx / top_k;
-                int k_s = pair_idx - t_s * top_k;
+                while (expert_end <= pair_idx) {
+                    pull_expert += 1;
+                    expert_start = expert_end;
+                    expert_end += expert_counts[pull_expert];
+                }
+                int e_s = pull_expert;
+                int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                int source_pair = expert_scatter_offsets[e_s * 16 + pair_idx - expert_start];
+                int t_s = source_pair / 6;
+                int k_s = source_pair - t_s * 6;
                 if (lane == 0) {
-                    float cached_rw = topk_weights[pair_idx];
-                    int _atomic_old_2 = atomicAdd(&expert_scatter_offsets[e_s], 1);
-                    int claim = _atomic_old_2;
-                    int dst_row_e = expert_row_offsets[e_s] + claim;
-                    smem_dst_row[disp_warp] = dst_row_e;
-                    token_to_permuted[pair_idx] = dst_row_e;
-                    meta_token[dst_row_e] = t_s;
-                    meta_slot[dst_row_e] = k_s;
-                    routing_weight_pool[dst_row_e] = cached_rw;
+                    token_to_permuted[source_pair] = dst_row;
+                    meta_token[dst_row] = t_s;
+                    meta_slot[dst_row] = k_s;
+                    routing_weight_pool[dst_row] = topk_weights[source_pair];
                 }
                 __syncwarp();
-                int dst_row = smem_dst_row[disp_warp];
                 unsigned long long src_u32_off = (unsigned long long)t_s * (unsigned long long)hidden_u32;
                 unsigned long long dst_u32_off = (unsigned long long)dst_row * (unsigned long long)hidden_u32;
                 if (elect_sync()) {
@@ -1374,7 +1378,6 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                     asm volatile("cp.async.bulk.commit_group;");
                     asm volatile("cp.async.bulk.wait_group 0;");
                 }
-                __threadfence();
                 __syncwarp();
                 if (elect_sync()) {
                     unsigned int arrivals = 1;
@@ -1397,9 +1400,8 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
             asm volatile("barrier.sync 1, 384;" ::: "memory");
             if (bid == 0) {
                 #pragma unroll 1
-                for (int i_2 = disp_tid; i_2 < num_experts; i_2 += 128) {
-                    expert_counts[i_2] = 0;
-                    expert_scatter_offsets[i_2] = 0;
+                for (int i = disp_tid; i < num_experts; i += 128) {
+                    expert_counts[i] = 0;
                 }
                 if (disp_tid == 0) {
                     PrivateCounters[0] = (unsigned int)0;
@@ -2482,8 +2484,8 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             break;
                         }
                         #pragma unroll
-                        for (int i_3 = 0; i_3 < 1; i_3++) {
-                            unsigned int j = s + i_3;
+                        for (int i_1 = 0; i_1 < 1; i_1++) {
+                            unsigned int j = s + i_1;
                             if (task_4[0] == 1 && j * 8 % 32 == 0) {
                                 if (j * 8 + lane < 8) {
                                     cached_weight = routing_weight_pool[block_1 * 16 + epi_wg * 8 + j * 8 + lane];
@@ -2546,8 +2548,8 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             float2 _f2_1 = make_float2(first_weight, second_weight);
                             float2 _mul_f32x2_2;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_2) : "l"(*(const unsigned long long*)&_mul_f32x2_1), "l"(*(const unsigned long long*)&_f2_1));
-                            activation[i_3 * 4] = _mul_f32x2_2.x;
-                            activation[i_3 * 4 + 1] = _mul_f32x2_2.y;
+                            activation[i_1 * 4] = _mul_f32x2_2.x;
+                            activation[i_1 * 4 + 1] = _mul_f32x2_2.y;
                             __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(_tmem_load_1[0], _tmem_load_1[1]));
                             __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(_tmem_load_1[2], _tmem_load_1[3]));
                             __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
@@ -2579,16 +2581,16 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             float2 _f2_3 = make_float2(first_weight, second_weight);
                             float2 _mul_f32x2_5;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_5) : "l"(*(const unsigned long long*)&_mul_f32x2_4), "l"(*(const unsigned long long*)&_f2_3));
-                            activation[i_3 * 4 + 2] = _mul_f32x2_5.x;
-                            activation[i_3 * 4 + 3] = _mul_f32x2_5.y;
-                            float _fabs_0 = fabsf(activation[i_3 * 4]);
+                            activation[i_1 * 4 + 2] = _mul_f32x2_5.x;
+                            activation[i_1 * 4 + 3] = _mul_f32x2_5.y;
+                            float _fabs_0 = fabsf(activation[i_1 * 4]);
                             float _fmax_0 = fmaxf(0.0f, _fabs_0);
-                            float _fabs_1 = fabsf(activation[i_3 * 4 + 2]);
+                            float _fabs_1 = fabsf(activation[i_1 * 4 + 2]);
                             float _fmax_1 = fmaxf(_fmax_0, _fabs_1);
                             float first_max = _fmax_1;
-                            float _fabs_2 = fabsf(activation[i_3 * 4 + 1]);
+                            float _fabs_2 = fabsf(activation[i_1 * 4 + 1]);
                             float _fmax_2 = fmaxf(0.0f, _fabs_2);
-                            float _fabs_3 = fabsf(activation[i_3 * 4 + 3]);
+                            float _fabs_3 = fabsf(activation[i_1 * 4 + 3]);
                             float _fmax_3 = fmaxf(_fmax_2, _fabs_3);
                             float second_max = _fmax_3;
                             float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, first_max, 4);
@@ -2609,11 +2611,11 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, second_max, 16);
                             float _max_8 = max_noftz(second_max, _shfl_xor_5);
                             second_max = _max_8;
-                            amax[i_3 * 2] = first_max;
-                            amax[i_3 * 2 + 1] = second_max;
+                            amax[i_1 * 2] = first_max;
+                            amax[i_1 * 2 + 1] = second_max;
                             if (lane < 4) {
-                                amax_reduction[epi_warp * 8 + (unsigned int)(i_3 * 8) + lane * 2] = first_max;
-                                amax_reduction[epi_warp * 8 + (unsigned int)(i_3 * 8) + lane * 2 + 1] = second_max;
+                                amax_reduction[epi_warp * 8 + (unsigned int)(i_1 * 8) + lane * 2] = first_max;
+                                amax_reduction[epi_warp * 8 + (unsigned int)(i_1 * 8) + lane * 2 + 1] = second_max;
                             }
                             __syncwarp();
                         }
@@ -2622,11 +2624,11 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                         asm volatile("cp.async.bulk.wait_group 1;");
                         asm volatile("barrier.sync %0, 128;" :: "r"(3 + epi_wg) : "memory");
                         #pragma unroll
-                        for (int i_4 = 0; i_4 < 1; i_4++) {
-                            unsigned int paired_index = (epi_warp ^ 1) * 8 + (unsigned int)(i_4 * 8) + lane % 4 * 2;
-                            float _max_9 = max_noftz(amax[i_4 * 2], amax_reduction[paired_index]);
+                        for (int i_2 = 0; i_2 < 1; i_2++) {
+                            unsigned int paired_index = (epi_warp ^ 1) * 8 + (unsigned int)(i_2 * 8) + lane % 4 * 2;
+                            float _max_9 = max_noftz(amax[i_2 * 2], amax_reduction[paired_index]);
                             float first_max_1 = _max_9;
-                            float _max_10 = max_noftz(amax[i_4 * 2 + 1], amax_reduction[paired_index + 1]);
+                            float _max_10 = max_noftz(amax[i_2 * 2 + 1], amax_reduction[paired_index + 1]);
                             float second_max_1 = _max_10;
                             unsigned int first_bits = __as_u32(first_max_1);
                             unsigned int second_bits = __as_u32(second_max_1);
@@ -2638,10 +2640,10 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             unsigned int second_inverse_bits = 254 - second_exp << 23;
                             float first_inverse = __uint_as_float(first_inverse_bits);
                             float second_inverse = __uint_as_float(second_inverse_bits);
-                            quantized[0] = activation[i_4 * 4] * first_inverse;
-                            quantized[1] = activation[i_4 * 4 + 1] * second_inverse;
-                            quantized[2] = activation[i_4 * 4 + 2] * first_inverse;
-                            quantized[3] = activation[i_4 * 4 + 3] * second_inverse;
+                            quantized[0] = activation[i_2 * 4] * first_inverse;
+                            quantized[1] = activation[i_2 * 4 + 1] * second_inverse;
+                            quantized[2] = activation[i_2 * 4 + 2] * first_inverse;
+                            quantized[3] = activation[i_2 * 4 + 3] * second_inverse;
                             uint32_t _fp8_0[1];
                             {
                                 uint32_t _packed;
@@ -2656,7 +2658,7 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                                                        "f"(quantized[2]), "f"(quantized[3]));
                                 _fp8_0[0] = _packed;
                             }
-                            unsigned int stsm_address = store_address + (unsigned int)(i_4 * 8 * 64) + lane * 64 + (warp_in_wg ^ lane / 2) * 16;
+                            unsigned int stsm_address = store_address + (unsigned int)(i_2 * 8 * 64) + lane * 64 + (warp_in_wg ^ lane / 2) * 16;
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
                             uint32_t _stmatrix_b8_x1_addr_2 = static_cast<uint32_t>(stsm_address);
                             asm volatile("stmatrix.sync.aligned.m16n8.x1.trans.shared.b8 [%0], {%1};\n"
@@ -2666,7 +2668,7 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             #endif
                             if (warp_in_wg % 2 == 0 && lane < 4) {
                                 unsigned int sf_k = n_block * 2 + warp_in_wg / 2;
-                                unsigned int token_base = epi_wg * 8 + (unsigned int)(s * 8) + (unsigned int)(i_4 * 8);
+                                unsigned int token_base = epi_wg * 8 + (unsigned int)(s * 8) + (unsigned int)(i_2 * 8);
                                 unsigned int sf_address = (block_1 * 16 + token_base + lane * 2) * 72 + sf_k;
                                 SF_I_w[sf_address] = (uint8_t)first_exp;
                                 SF_I_w[sf_address + 72] = (uint8_t)second_exp;
@@ -2739,8 +2741,8 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                         }
                         __syncwarp();
                         #pragma unroll
-                        for (int i_5 = 0; i_5 < 1; i_5++) {
-                            unsigned int address_1 = accum_stage_1 * 16 + epi_wg_1 * 8 + (unsigned int)(s_1 * 8) + (unsigned int)(i_5 * 8);
+                        for (int i_3 = 0; i_3 < 1; i_3++) {
+                            unsigned int address_1 = accum_stage_1 * 16 + epi_wg_1 * 8 + (unsigned int)(s_1 * 8) + (unsigned int)(i_3 * 8);
                             float _tmem_load_2[4];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
@@ -2754,10 +2756,10 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                                 : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[3]))
                                 : "r"(address_1 | 1048576));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
-                            if (i_5 == 0 && s_1 > 0) {
+                            if (i_3 == 0 && s_1 > 0) {
                                 asm volatile("barrier.sync %0, 128;" :: "r"(3 + epi_wg_1) : "memory");
                             }
-                            if (s_1 == 0 && i_5 == 0) {
+                            if (s_1 == 0 && i_3 == 0) {
                                 asm volatile("tcgen05.fence::before_thread_sync;");
                                 asm volatile(
                                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
@@ -2777,7 +2779,7 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                             }
                             unsigned int row_1 = lane % 8;
                             unsigned int col = epi_warp_1 % 2 * 4 + lane / 8;
-                            unsigned int write_address = output_base + warp_in_wg_1 / 2 * 8 * 128 + (unsigned int)(i_5 * 8 * 128) + row_1 * 128 + (col ^ row_1) * 16;
+                            unsigned int write_address = output_base + warp_in_wg_1 / 2 * 8 * 128 + (unsigned int)(i_3 * 8 * 128) + row_1 * 128 + (col ^ row_1) * 16;
                             uint32_t _stmatrix_addr_3 = static_cast<uint32_t>(write_address);
                             asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                 :: "r"(_stmatrix_addr_3), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_bf16[1]))
@@ -2847,12 +2849,12 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                     stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
                 }
                 #pragma unroll 1
-                for (unsigned int i_6 = 0; i_6 < 6; i_6++) {
-                    unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_6);
+                for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                    unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
                     unsigned int row_3 = _shfl_56;
                     if (elect_sync()) {
-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_6) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8);
-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8, 2560);
+                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
                     }
                     __syncwarp();
                 }
@@ -2897,13 +2899,13 @@ kernel_deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94(int* __restrict__ topk_i
                 reduced[38] = 0.0f;
                 reduced[39] = 0.0f;
                 #pragma unroll 1
-                for (unsigned int i_7 = 0; i_7 < 6; i_7++) {
-                    mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_7) * 8, phase_1);
+                for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                    mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
                     #pragma unroll
                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&values[0])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 3]))
-                            : "r"(combine_smem_addr + (epi_warp_2 * 6 + i_7) * 2560 + (j_3 * 32 + lane) * 16));
+                            : "r"(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560 + (j_3 * 32 + lane) * 16));
                         float _bf16x2_add_f32_0[2];
                         asm volatile(
                             "{\n\t"

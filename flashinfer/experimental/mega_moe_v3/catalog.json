@@ -222,252 +222,6 @@
             "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_01d240f896e38dc91d29_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm100a_2856fcdc53f86fa6d9c7_kernel": {
-          "ffi_entry": "run",
-          "arg_plan": [
-            [
-              "buffer",
-              "topk_idx_i32"
-            ],
-            [
-              "buffer",
-              "topk_weights"
-            ],
-            [
-              "buffer",
-              "x_fp8"
-            ],
-            [
-              "buffer",
-              "x_sf"
-            ],
-            [
-              "tma_buffer",
-              "A"
-            ],
-            [
-              "buffer",
-              "pool_fp8"
-            ],
-            [
-              "buffer",
-              "pool_sf"
-            ],
-            [
-              "buffer",
-              "routing_weight_pool"
-            ],
-            [
-              "buffer",
-              "token_to_permuted"
-            ],
-            [
-              "buffer",
-              "meta_token"
-            ],
-            [
-              "buffer",
-              "meta_slot"
-            ],
-            [
-              "buffer",
-              "expert_counts"
-            ],
-            [
-              "buffer",
-              "expert_row_offsets"
-            ],
-            [
-              "buffer",
-              "expert_scatter_offsets"
-            ],
-            [
-              "buffer",
-              "tile_expert"
-            ],
-            [
-              "buffer",
-              "tile_m_local"
-            ],
-            [
-              "buffer",
-              "total_m_tiles_out"
-            ],
-            [
-              "tma_buffer",
-              "B1"
-            ],
-            [
-              "tma_buffer",
-              "SFB1"
-            ],
-            [
-              "tma_buffer",
-              "I_fp8_w"
-            ],
-            [
-              "buffer",
-              "SF_I_w"
-            ],
-            [
-              "buffer",
-              "l1_bf16_capture"
-            ],
-            [
-              "tma_buffer",
-              "A2"
-            ],
-            [
-              "buffer",
-              "SFA2"
-            ],
-            [
-              "tma_buffer",
-              "B2"
-            ],
-            [
-              "tma_buffer",
-              "SFB2"
-            ],
-            [
-              "buffer",
-              "expert_output"
-            ],
-            [
-              "buffer",
-              "y"
-            ],
-            [
-              "buffer",
-              "histogram_done"
-            ],
-            [
-              "buffer",
-              "prefix_done"
-            ],
-            [
-              "buffer",
-              "dispatch_done"
-            ],
-            [
-              "buffer",
-              "l1_arrival"
-            ],
-            [
-              "buffer",
-              "l2_done"
-            ],
-            [
-              "parameter",
-              "num_tokens"
-            ],
-            [
-              "parameter",
-              "top_k"
-            ],
-            [
-              "parameter",
-              "num_experts"
-            ],
-            [
-              "parameter",
-              "N1"
-            ],
-            [
-              "parameter",
-              "K1"
-            ],
-            [
-              "parameter",
-              "grid_n1"
-            ],
-            [
-              "parameter",
-              "K1_tiles"
-            ],
-            [
-              "parameter",
-              "N2"
-            ],
-            [
-              "parameter",
-              "K2"
-            ],
-            [
-              "parameter",
-              "grid_n2"
-            ],
-            [
-              "parameter",
-              "K2_tiles"
-            ],
-            [
-              "parameter",
-              "total_m_tiles"
-            ],
-            [
-              "parameter",
-              "M_total"
-            ],
-            [
-              "parameter",
-              "activation_clamp"
-            ],
-            [
-              "buffer",
-              "PrivateCounters"
-            ],
-            [
-              "buffer",
-              "PrivateMasks"
-            ],
-            [
-              "buffer",
-              "PublicExpertOutput"
-            ],
-            [
-              "buffer",
-              "PrivateSFBlockOffsets"
-            ],
-            [
-              "tma_buffer",
-              "PrivateSF1"
-            ],
-            [
-              "tma_buffer",
-              "PrivateSF2"
-            ],
-            [
-              "buffer",
-              "PrivateSF1Words"
-            ],
-            [
-              "buffer",
-              "PrivateSF2Bytes"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "closure_sha256": "dd34401d8e3946d09c877119eeadd7c4cd775815f0ad8aa948ae32afb0717900",
-          "tma_workspace_bytes": 0,
-          "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_2856fcdc53f86fa6d9c7_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_2856fcdc53f86fa6d9c7_binding.cu"
-          ]
-        },
         "deepgemm_mega_moe_v3_sm100a_333eda5441496d1d8a6c_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
@@ -603,6 +357,252 @@
             "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_333eda5441496d1d8a6c_binding.cu"
           ]
         },
+        "deepgemm_mega_moe_v3_sm100a_342d563cb4135d239d4b_kernel": {
+          "ffi_entry": "run",
+          "arg_plan": [
+            [
+              "buffer",
+              "topk_idx_i32"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "x_fp8"
+            ],
+            [
+              "buffer",
+              "x_sf"
+            ],
+            [
+              "tma_buffer",
+              "A"
+            ],
+            [
+              "buffer",
+              "pool_fp8"
+            ],
+            [
+              "buffer",
+              "pool_sf"
+            ],
+            [
+              "buffer",
+              "routing_weight_pool"
+            ],
+            [
+              "buffer",
+              "token_to_permuted"
+            ],
+            [
+              "buffer",
+              "meta_token"
+            ],
+            [
+              "buffer",
+              "meta_slot"
+            ],
+            [
+              "buffer",
+              "expert_counts"
+            ],
+            [
+              "buffer",
+              "expert_row_offsets"
+            ],
+            [
+              "buffer",
+              "expert_scatter_offsets"
+            ],
+            [
+              "buffer",
+              "tile_expert"
+            ],
+            [
+              "buffer",
+              "tile_m_local"
+            ],
+            [
+              "buffer",
+              "total_m_tiles_out"
+            ],
+            [
+              "tma_buffer",
+              "B1"
+            ],
+            [
+              "tma_buffer",
+              "SFB1"
+            ],
+            [
+              "tma_buffer",
+              "I_fp8_w"
+            ],
+            [
+              "buffer",
+              "SF_I_w"
+            ],
+            [
+              "buffer",
+              "l1_bf16_capture"
+            ],
+            [
+              "tma_buffer",
+              "A2"
+            ],
+            [
+              "buffer",
+              "SFA2"
+            ],
+            [
+              "tma_buffer",
+              "B2"
+            ],
+            [
+              "tma_buffer",
+              "SFB2"
+            ],
+            [
+              "buffer",
+              "expert_output"
+            ],
+            [
+              "buffer",
+              "y"
+            ],
+            [
+              "buffer",
+              "histogram_done"
+            ],
+            [
+              "buffer",
+              "prefix_done"
+            ],
+            [
+              "buffer",
+              "dispatch_done"
+            ],
+            [
+              "buffer",
+              "l1_arrival"
+            ],
+            [
+              "buffer",
+              "l2_done"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "top_k"
+            ],
+            [
+              "parameter",
+              "num_experts"
+            ],
+            [
+              "parameter",
+              "N1"
+            ],
+            [
+              "parameter",
+              "K1"
+            ],
+            [
+              "parameter",
+              "grid_n1"
+            ],
+            [
+              "parameter",
+              "K1_tiles"
+            ],
+            [
+              "parameter",
+              "N2"
+            ],
+            [
+              "parameter",
+              "K2"
+            ],
+            [
+              "parameter",
+              "grid_n2"
+            ],
+            [
+              "parameter",
+              "K2_tiles"
+            ],
+            [
+              "parameter",
+              "total_m_tiles"
+            ],
+            [
+              "parameter",
+              "M_total"
+            ],
+            [
+              "parameter",
+              "activation_clamp"
+            ],
+            [
+              "buffer",
+              "PrivateCounters"
+            ],
+            [
+              "buffer",
+              "PrivateMasks"
+            ],
+            [
+              "buffer",
+              "PublicExpertOutput"
+            ],
+            [
+              "buffer",
+              "PrivateSFBlockOffsets"
+            ],
+            [
+              "tma_buffer",
+              "PrivateSF1"
+            ],
+            [
+              "tma_buffer",
+              "PrivateSF2"
+            ],
+            [
+              "buffer",
+              "PrivateSF1Words"
+            ],
+            [
+              "buffer",
+              "PrivateSF2Bytes"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "closure_sha256": "69eb6f623c5320164932cc63d6280e9fee0dbe6cc3cb8bd511645c0e19eadf41",
+          "tma_workspace_bytes": 0,
+          "sources": [
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_342d563cb4135d239d4b_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_342d563cb4135d239d4b_binding.cu"
+          ]
+        },
         "deepgemm_mega_moe_v3_sm100a_3ab803ce076b754b1afa_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
@@ -690,7 +690,7 @@
             "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_3ab803ce076b754b1afa_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm100a_3fb68932b3c5db474d30_kernel": {
+        "deepgemm_mega_moe_v3_sm100a_474314596e7afe86efb7_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -929,14 +929,14 @@
           "compile_flags": [
             "--use_fast_math"
           ],
-          "closure_sha256": "5f2fc091493a3c3fe6ec084a879aa770fa9c72a3225a1a786a9b10886f38112b",
+          "closure_sha256": "f9a9bddc974fadfd5ca91e458de089c203fe13b5b0de9a72de142151ea21d0e1",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_3fb68932b3c5db474d30_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_3fb68932b3c5db474d30_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_474314596e7afe86efb7_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_474314596e7afe86efb7_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm100a_74ab30926ec4ad796aec_kernel": {
+        "deepgemm_mega_moe_v3_sm100a_9db4b405fef73ab355a0_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -1175,14 +1175,14 @@
           "compile_flags": [
             "--use_fast_math"
           ],
-          "closure_sha256": "e7e6ff09a4737905187ed4ac389a15c091be5769ba4890dfba2c4660648bb9eb",
+          "closure_sha256": "176cf609e6e8e28bd3c15ff7f7615a8a2bde59e4a481edd74a33c91e0e3c8c46",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_74ab30926ec4ad796aec_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_74ab30926ec4ad796aec_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_9db4b405fef73ab355a0_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_9db4b405fef73ab355a0_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm100a_8f9a704954ddacd3adf5_kernel": {
+        "deepgemm_mega_moe_v3_sm100a_a095e66904e88a756d1e_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -1421,11 +1421,11 @@
           "compile_flags": [
             "--use_fast_math"
           ],
-          "closure_sha256": "b64b8be4dc5c93d5491b6a4cf74c2ae4d08bb68f7b91e3d9e2286790219bd419",
+          "closure_sha256": "02d616e1e3aa594256406fb524f5ccdeca00a3b8262cd3c7803f6ee01945ddfb",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_8f9a704954ddacd3adf5_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_8f9a704954ddacd3adf5_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_a095e66904e88a756d1e_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_a095e66904e88a756d1e_binding.cu"
           ]
         },
         "deepgemm_mega_moe_v3_sm100a_b09c1f1ec03985f6edd4_kernel": {
@@ -1486,7 +1486,7 @@
             "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_b09c1f1ec03985f6edd4_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94_kernel": {
+        "deepgemm_mega_moe_v3_sm100a_b3eafd5b737e92ca1409_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -1725,11 +1725,11 @@
           "compile_flags": [
             "--use_fast_math"
           ],
-          "closure_sha256": "91d70232acf9a4b400a85fd355f9af21db15edd0f0d0bb44def5c78c7def694c",
+          "closure_sha256": "fe904fe34a0851815c7fb36a9feea63a0a73739ec72637357da574e135a1292b",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_b3eafd5b737e92ca1409_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_100a/deepgemm_mega_moe_v3_sm100a_b3eafd5b737e92ca1409_binding.cu"
           ]
         },
         "deepgemm_mega_moe_v3_sm100a_e943ae2fb702ca9692b4_kernel": {
@@ -2078,7 +2078,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm100a_8f9a704954ddacd3adf5_kernel"
+              "program": "deepgemm_mega_moe_v3_sm100a_b3eafd5b737e92ca1409_kernel"
             }
           ]
         },
@@ -2112,7 +2112,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm100a_2856fcdc53f86fa6d9c7_kernel"
+              "program": "deepgemm_mega_moe_v3_sm100a_474314596e7afe86efb7_kernel"
             }
           ]
         },
@@ -2146,7 +2146,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm100a_3fb68932b3c5db474d30_kernel"
+              "program": "deepgemm_mega_moe_v3_sm100a_a095e66904e88a756d1e_kernel"
             }
           ]
         },
@@ -2180,7 +2180,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm100a_74ab30926ec4ad796aec_kernel"
+              "program": "deepgemm_mega_moe_v3_sm100a_342d563cb4135d239d4b_kernel"
             }
           ]
         },
@@ -2214,7 +2214,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm100a_c063ce0adfc0a1025e94_kernel"
+              "program": "deepgemm_mega_moe_v3_sm100a_9db4b405fef73ab355a0_kernel"
             }
           ]
         },
@@ -2559,65 +2559,7 @@
     },
     "sm_103a": {
       "programs": {
-        "deepgemm_mega_moe_v3_sm103a_2cca3344a19322a12bf6_kernel": {
-          "ffi_entry": "run",
-          "arg_plan": [
-            [
-              "buffer",
-              "src_a"
-            ],
-            [
-              "buffer",
-              "src_b"
-            ],
-            [
-              "buffer",
-              "dst_a"
-            ],
-            [
-              "buffer",
-              "dst_b"
-            ],
-            [
-              "parameter",
-              "a_rows"
-            ],
-            [
-              "parameter",
-              "b_rows"
-            ],
-            [
-              "parameter",
-              "b_group_rows"
-            ],
-            [
-              "parameter",
-              "words"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "closure_sha256": "c2f015b444cde930416ad86d443f4ad045b0e46b14e586616d9a865e1aa2f22f",
-          "tma_workspace_bytes": 0,
-          "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_2cca3344a19322a12bf6_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_2cca3344a19322a12bf6_binding.cu"
-          ]
-        },
-        "deepgemm_mega_moe_v3_sm103a_2e3cad4a3e7cf9544c19_kernel": {
+        "deepgemm_mega_moe_v3_sm103a_12e3cc39401ad8601ae3_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -2854,14 +2796,71 @@
             ]
           ],
           "compile_flags": [
-            "--use_fast_math",
-            "--ptxas-options=--register-usage-level=10"
+            "--use_fast_math"
           ],
-          "closure_sha256": "760f1259fb4fa69f6582357016e47b18ff53369f7c033607fc0f6b6bb4ef9cb3",
+          "closure_sha256": "1d8645da6f21a197683e6c356646e319e351b7c0b29b81e1f4655656c9d7cc53",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_2e3cad4a3e7cf9544c19_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_2e3cad4a3e7cf9544c19_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_12e3cc39401ad8601ae3_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_12e3cc39401ad8601ae3_binding.cu"
+          ]
+        },
+        "deepgemm_mega_moe_v3_sm103a_2cca3344a19322a12bf6_kernel": {
+          "ffi_entry": "run",
+          "arg_plan": [
+            [
+              "buffer",
+              "src_a"
+            ],
+            [
+              "buffer",
+              "src_b"
+            ],
+            [
+              "buffer",
+              "dst_a"
+            ],
+            [
+              "buffer",
+              "dst_b"
+            ],
+            [
+              "parameter",
+              "a_rows"
+            ],
+            [
+              "parameter",
+              "b_rows"
+            ],
+            [
+              "parameter",
+              "b_group_rows"
+            ],
+            [
+              "parameter",
+              "words"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "closure_sha256": "c2f015b444cde930416ad86d443f4ad045b0e46b14e586616d9a865e1aa2f22f",
+          "tma_workspace_bytes": 0,
+          "sources": [
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_2cca3344a19322a12bf6_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_2cca3344a19322a12bf6_binding.cu"
           ]
         },
         "deepgemm_mega_moe_v3_sm103a_38039844e705897b9516_kernel": {
@@ -3083,7 +3082,7 @@
             "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_38039844e705897b9516_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm103a_79b4a92ec4ef7aeaaa70_kernel": {
+        "deepgemm_mega_moe_v3_sm103a_519b00ac5d4617414c44_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -3322,11 +3321,11 @@
           "compile_flags": [
             "--use_fast_math"
           ],
-          "closure_sha256": "f4d6ac3d29977b992be5c66ad13c23edabaa8e1bfaa09cc2d249b99dccdfaf0d",
+          "closure_sha256": "a8007a76348826f50bcc9fb5ebf2107f1f3d822bf9aeb25ea907e07c16d21ca9",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_79b4a92ec4ef7aeaaa70_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_79b4a92ec4ef7aeaaa70_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_519b00ac5d4617414c44_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_519b00ac5d4617414c44_binding.cu"
           ]
         },
         "deepgemm_mega_moe_v3_sm103a_8a4cce86e7b391cb9c9a_kernel": {
@@ -3464,7 +3463,226 @@
             "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_8a4cce86e7b391cb9c9a_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm103a_8c8c7cea08b0005976a7_kernel": {
+        "deepgemm_mega_moe_v3_sm103a_b09799b980825c970415_kernel": {
+          "ffi_entry": "run",
+          "arg_plan": [
+            [
+              "buffer",
+              "topk_idx_i32"
+            ],
+            [
+              "buffer",
+              "topk_weights"
+            ],
+            [
+              "buffer",
+              "x_fp8"
+            ],
+            [
+              "buffer",
+              "x_sf"
+            ],
+            [
+              "tma_buffer",
+              "A"
+            ],
+            [
+              "buffer",
+              "pool_fp8"
+            ],
+            [
+              "buffer",
+              "pool_sf"
+            ],
+            [
+              "buffer",
+              "routing_weight_pool"
+            ],
+            [
+              "buffer",
+              "token_to_permuted"
+            ],
+            [
+              "buffer",
+              "meta_token"
+            ],
+            [
+              "buffer",
+              "meta_slot"
+            ],
+            [
+              "buffer",
+              "expert_counts"
+            ],
+            [
+              "buffer",
+              "expert_row_offsets"
+            ],
+            [
+              "buffer",
+              "expert_scatter_offsets"
+            ],
+            [
+              "buffer",
+              "tile_expert"
+            ],
+            [
+              "buffer",
+              "tile_m_local"
+            ],
+            [
+              "buffer",
+              "total_m_tiles_out"
+            ],
+            [
+              "tma_buffer",
+              "B1"
+            ],
+            [
+              "buffer",
+              "SFB1"
+            ],
+            [
+              "buffer",
+              "I_fp8_w"
+            ],
+            [
+              "buffer",
+              "SF_I_w"
+            ],
+            [
+              "buffer",
+              "l1_bf16_capture"
+            ],
+            [
+              "tma_buffer",
+              "A2"
+            ],
+            [
+              "buffer",
+              "SFA2"
+            ],
+            [
+              "tma_buffer",
+              "B2"
+            ],
+            [
+              "buffer",
+              "SFB2"
+            ],
+            [
+              "buffer",
+              "expert_output"
+            ],
+            [
+              "buffer",
+              "y"
+            ],
+            [
+              "buffer",
+              "histogram_done"
+            ],
+            [
+              "buffer",
+              "prefix_done"
+            ],
+            [
+              "buffer",
+              "dispatch_done"
+            ],
+            [
+              "buffer",
+              "l1_arrival"
+            ],
+            [
+              "buffer",
+              "l2_done"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "parameter",
+              "top_k"
+            ],
+            [
+              "parameter",
+              "num_experts"
+            ],
+            [
+              "parameter",
+              "N1"
+            ],
+            [
+              "parameter",
+              "K1"
+            ],
+            [
+              "parameter",
+              "grid_n1"
+            ],
+            [
+              "parameter",
+              "K1_tiles"
+            ],
+            [
+              "parameter",
+              "N2"
+            ],
+            [
+              "parameter",
+              "K2"
+            ],
+            [
+              "parameter",
+              "grid_n2"
+            ],
+            [
+              "parameter",
+              "K2_tiles"
+            ],
+            [
+              "parameter",
+              "total_m_tiles"
+            ],
+            [
+              "parameter",
+              "M_total"
+            ],
+            [
+              "parameter",
+              "activation_clamp"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "closure_sha256": "53161441e040515261a9cb82032b54cd2f443ddfdc3f7c9745bbdec1c4f02957",
+          "ffi_prepare_entry": "run_prepare",
+          "tma_workspace_bytes": 512,
+          "sources": [
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_b09799b980825c970415_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_b09799b980825c970415_binding.cu"
+          ]
+        },
+        "deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -3703,14 +3921,109 @@
           "compile_flags": [
             "--use_fast_math"
           ],
-          "closure_sha256": "d3962cd1fa0502413300848dda9f910d7bf4f9ae002e5565c912529af39c1138",
+          "closure_sha256": "ec97d3a8069a1282a72f9e3bc9481635a09d9313a6fdd4ec71f6da3b5b488c8e",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_8c8c7cea08b0005976a7_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_8c8c7cea08b0005976a7_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm103a_94fba9a4cfe0a632251c_kernel": {
+        "deepgemm_mega_moe_v3_sm103a_cc72f64fa47eb43c0dc1_kernel": {
+          "ffi_entry": "run",
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "A"
+            ],
+            [
+              "tma_buffer",
+              "B"
+            ],
+            [
+              "buffer",
+              "SFA"
+            ],
+            [
+              "buffer",
+              "SFB"
+            ],
+            [
+              "buffer",
+              "C_fp8"
+            ],
+            [
+              "buffer",
+              "SF_out"
+            ],
+            [
+              "buffer",
+              "routing_weights"
+            ],
+            [
+              "buffer",
+              "tile_expert"
+            ],
+            [
+              "buffer",
+              "tile_m_local"
+            ],
+            [
+              "buffer",
+              "expert_row_offsets"
+            ],
+            [
+              "parameter",
+              "M_total"
+            ],
+            [
+              "parameter",
+              "N"
+            ],
+            [
+              "parameter",
+              "K"
+            ],
+            [
+              "parameter",
+              "grid_n"
+            ],
+            [
+              "parameter",
+              "K_tiles"
+            ],
+            [
+              "parameter",
+              "total_m_tiles"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "closure_sha256": "4c00712052519c81953c35ebfbff73ad7bfec784f8656d960c662ea4fe8e9710",
+          "ffi_prepare_entry": "run_prepare",
+          "tma_workspace_bytes": 256,
+          "sources": [
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_cc72f64fa47eb43c0dc1_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_cc72f64fa47eb43c0dc1_binding.cu"
+          ]
+        },
+        "deepgemm_mega_moe_v3_sm103a_d083c3cd9214e553a957_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -3950,325 +4263,11 @@
             "--use_fast_math",
             "--ptxas-options=--register-usage-level=10"
           ],
-          "closure_sha256": "ab5250494eb66d029050769faec2385a1e313ea5aa00227b6cadf8b0d734a778",
+          "closure_sha256": "7ad84ddb8f81e27809fa8dc3266775f49cd9e65a2e77af8083cd9953167bc356",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_94fba9a4cfe0a632251c_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_94fba9a4cfe0a632251c_binding.cu"
-          ]
-        },
-        "deepgemm_mega_moe_v3_sm103a_b09799b980825c970415_kernel": {
-          "ffi_entry": "run",
-          "arg_plan": [
-            [
-              "buffer",
-              "topk_idx_i32"
-            ],
-            [
-              "buffer",
-              "topk_weights"
-            ],
-            [
-              "buffer",
-              "x_fp8"
-            ],
-            [
-              "buffer",
-              "x_sf"
-            ],
-            [
-              "tma_buffer",
-              "A"
-            ],
-            [
-              "buffer",
-              "pool_fp8"
-            ],
-            [
-              "buffer",
-              "pool_sf"
-            ],
-            [
-              "buffer",
-              "routing_weight_pool"
-            ],
-            [
-              "buffer",
-              "token_to_permuted"
-            ],
-            [
-              "buffer",
-              "meta_token"
-            ],
-            [
-              "buffer",
-              "meta_slot"
-            ],
-            [
-              "buffer",
-              "expert_counts"
-            ],
-            [
-              "buffer",
-              "expert_row_offsets"
-            ],
-            [
-              "buffer",
-              "expert_scatter_offsets"
-            ],
-            [
-              "buffer",
-              "tile_expert"
-            ],
-            [
-              "buffer",
-              "tile_m_local"
-            ],
-            [
-              "buffer",
-              "total_m_tiles_out"
-            ],
-            [
-              "tma_buffer",
-              "B1"
-            ],
-            [
-              "buffer",
-              "SFB1"
-            ],
-            [
-              "buffer",
-              "I_fp8_w"
-            ],
-            [
-              "buffer",
-              "SF_I_w"
-            ],
-            [
-              "buffer",
-              "l1_bf16_capture"
-            ],
-            [
-              "tma_buffer",
-              "A2"
-            ],
-            [
-              "buffer",
-              "SFA2"
-            ],
-            [
-              "tma_buffer",
-              "B2"
-            ],
-            [
-              "buffer",
-              "SFB2"
-            ],
-            [
-              "buffer",
-              "expert_output"
-            ],
-            [
-              "buffer",
-              "y"
-            ],
-            [
-              "buffer",
-              "histogram_done"
-            ],
-            [
-              "buffer",
-              "prefix_done"
-            ],
-            [
-              "buffer",
-              "dispatch_done"
-            ],
-            [
-              "buffer",
-              "l1_arrival"
-            ],
-            [
-              "buffer",
-              "l2_done"
-            ],
-            [
-              "parameter",
-              "num_tokens"
-            ],
-            [
-              "parameter",
-              "top_k"
-            ],
-            [
-              "parameter",
-              "num_experts"
-            ],
-            [
-              "parameter",
-              "N1"
-            ],
-            [
-              "parameter",
-              "K1"
-            ],
-            [
-              "parameter",
-              "grid_n1"
-            ],
-            [
-              "parameter",
-              "K1_tiles"
-            ],
-            [
-              "parameter",
-              "N2"
-            ],
-            [
-              "parameter",
-              "K2"
-            ],
-            [
-              "parameter",
-              "grid_n2"
-            ],
-            [
-              "parameter",
-              "K2_tiles"
-            ],
-            [
-              "parameter",
-              "total_m_tiles"
-            ],
-            [
-              "parameter",
-              "M_total"
-            ],
-            [
-              "parameter",
-              "activation_clamp"
-            ],
-            [
-              "workspace",
-              "tma_descriptor_workspace"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "closure_sha256": "53161441e040515261a9cb82032b54cd2f443ddfdc3f7c9745bbdec1c4f02957",
-          "ffi_prepare_entry": "run_prepare",
-          "tma_workspace_bytes": 512,
-          "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_b09799b980825c970415_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_b09799b980825c970415_binding.cu"
-          ]
-        },
-        "deepgemm_mega_moe_v3_sm103a_cc72f64fa47eb43c0dc1_kernel": {
-          "ffi_entry": "run",
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "A"
-            ],
-            [
-              "tma_buffer",
-              "B"
-            ],
-            [
-              "buffer",
-              "SFA"
-            ],
-            [
-              "buffer",
-              "SFB"
-            ],
-            [
-              "buffer",
-              "C_fp8"
-            ],
-            [
-              "buffer",
-              "SF_out"
-            ],
-            [
-              "buffer",
-              "routing_weights"
-            ],
-            [
-              "buffer",
-              "tile_expert"
-            ],
-            [
-              "buffer",
-              "tile_m_local"
-            ],
-            [
-              "buffer",
-              "expert_row_offsets"
-            ],
-            [
-              "parameter",
-              "M_total"
-            ],
-            [
-              "parameter",
-              "N"
-            ],
-            [
-              "parameter",
-              "K"
-            ],
-            [
-              "parameter",
-              "grid_n"
-            ],
-            [
-              "parameter",
-              "K_tiles"
-            ],
-            [
-              "parameter",
-              "total_m_tiles"
-            ],
-            [
-              "workspace",
-              "tma_descriptor_workspace"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "closure_sha256": "4c00712052519c81953c35ebfbff73ad7bfec784f8656d960c662ea4fe8e9710",
-          "ffi_prepare_entry": "run_prepare",
-          "tma_workspace_bytes": 256,
-          "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_cc72f64fa47eb43c0dc1_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_cc72f64fa47eb43c0dc1_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_d083c3cd9214e553a957_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_d083c3cd9214e553a957_binding.cu"
           ]
         },
         "deepgemm_mega_moe_v3_sm103a_d2d74261620912455c3d_kernel": {
@@ -4358,7 +4357,7 @@
             "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_d2d74261620912455c3d_binding.cu"
           ]
         },
-        "deepgemm_mega_moe_v3_sm103a_dd83d60daaa09b880ab8_kernel": {
+        "deepgemm_mega_moe_v3_sm103a_fe11dedbf666eaada0a3_kernel": {
           "ffi_entry": "run",
           "arg_plan": [
             [
@@ -4595,13 +4594,14 @@
             ]
           ],
           "compile_flags": [
-            "--use_fast_math"
+            "--use_fast_math",
+            "--ptxas-options=--register-usage-level=10"
           ],
-          "closure_sha256": "06371993489294a1a0a62a7531f6ac235c8efc8aba5982b138b16fb44c00b34b",
+          "closure_sha256": "5decb75eb88aa394af348e515c3370be58e80754d18d4bed1d2a133c1f624ead",
           "tma_workspace_bytes": 0,
           "sources": [
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_dd83d60daaa09b880ab8_kernel.cu",
-            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_dd83d60daaa09b880ab8_binding.cu"
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_fe11dedbf666eaada0a3_kernel.cu",
+            "csrc/experimental/mega_moe_v3/generated/sm_103a/deepgemm_mega_moe_v3_sm103a_fe11dedbf666eaada0a3_binding.cu"
           ]
         }
       },
@@ -4636,7 +4636,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm103a_79b4a92ec4ef7aeaaa70_kernel"
+              "program": "deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0_kernel"
             }
           ]
         },
@@ -4670,7 +4670,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm103a_dd83d60daaa09b880ab8_kernel"
+              "program": "deepgemm_mega_moe_v3_sm103a_12e3cc39401ad8601ae3_kernel"
             }
           ]
         },
@@ -4704,7 +4704,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm103a_94fba9a4cfe0a632251c_kernel"
+              "program": "deepgemm_mega_moe_v3_sm103a_fe11dedbf666eaada0a3_kernel"
             }
           ]
         },
@@ -4738,7 +4738,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm103a_2e3cad4a3e7cf9544c19_kernel"
+              "program": "deepgemm_mega_moe_v3_sm103a_d083c3cd9214e553a957_kernel"
             }
           ]
         },
@@ -4772,7 +4772,7 @@
           "stages": [
             {
               "name": "pipeline",
-              "program": "deepgemm_mega_moe_v3_sm103a_8c8c7cea08b0005976a7_kernel"
+              "program": "deepgemm_mega_moe_v3_sm103a_519b00ac5d4617414c44_kernel"
             }
           ]
         },

@@ -194,11 +194,16 @@ def prepare_pipeline_bindings(inputs, num_sms):
         else torch.zeros(E, dtype=torch.int32, device="cuda")
     )
     expert_row_offsets = torch.zeros(E, dtype=torch.int32, device="cuda")
-    expert_scatter_offsets = (
-        reset_storage[E : 2 * E].view(torch.int32)
-        if reset_storage is not None
-        else torch.zeros(E, dtype=torch.int32, device="cuda")
-    )
+    if source_schedule and residual_readiness:
+        # Round-7 slot-list dispatch: per-expert slot list [E, T] (native
+        # src_token_topk_idx), fully rewritten by every launch, never reset.
+        expert_scatter_offsets = torch.empty(E * T, dtype=torch.int32, device="cuda")
+    else:
+        expert_scatter_offsets = (
+            reset_storage[E : 2 * E].view(torch.int32)
+            if reset_storage is not None
+            else torch.zeros(E, dtype=torch.int32, device="cuda")
+        )
     tile_expert = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
     tile_m_local = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
     total_m_tiles_out = torch.zeros(1, dtype=torch.int32, device="cuda")
