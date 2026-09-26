@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1725,6 +1726,7 @@ def test_public_cake_gdn_decode_invalid_cuda_slots_fail_in_isolated_process(case
         capture_output=True,
         text=True,
         timeout=120,
+        env={**os.environ, "FLASHINFER_CAKE_GDN_VALIDATE_SLOTS": "1"},
     )
     combined = completed.stdout + completed.stderr
     device_asserted = any(

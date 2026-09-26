@@ -524,6 +524,9 @@ def test_download_artifacts_reuses_checksum_verified_cache(monkeypatch, tmp_path
     cached_path.parent.mkdir(parents=True)
     cached_path.write_bytes(payloads["pin/cached.cubin"])
     (cubin_dir / "pin/corrupt.cubin").write_bytes(b"bad cache entry")
+    stale_path = cubin_dir / "old-pin/stale.cubin"
+    stale_path.parent.mkdir(parents=True)
+    stale_path.write_bytes(b"stale cache entry")
 
     downloads = []
 
@@ -541,6 +544,8 @@ def test_download_artifacts_reuses_checksum_verified_cache(monkeypatch, tmp_path
     assert downloads == ["pin/corrupt.cubin", "pin/missing.cubin"]
     for name, payload in payloads.items():
         assert (cubin_dir / name).read_bytes() == payload
+    assert not stale_path.exists()
+    assert not stale_path.parent.exists()
 
 
 def test_download_artifacts_rejects_bad_download_after_cache_miss(

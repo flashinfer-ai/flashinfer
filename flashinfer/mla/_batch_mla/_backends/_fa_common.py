@@ -12,8 +12,19 @@ from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union
 import torch
 
 from ....jit import gen_batch_mla_module
-from ....utils import MaskMode, check_shape_dtype_device, get_compute_capability
-from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
+from ....utils import (
+    MaskMode,
+    check_shape_dtype_device,
+    get_compute_capability,
+    get_device_properties,
+    get_device_sm_count,
+    is_sm90a_supported,
+)
+from ._capabilities import (
+    MLAPlanCapabilities,
+    _BackendPlanUnsupportedError,
+    plan_capability_rejection_reason,
+)
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 
 
@@ -48,6 +59,44 @@ def get_batch_mla_module(
     ).build_and_load()
 
 
+def _get_fa_shared_memory_limits(device: torch.device) -> tuple[int, int]:
+    """Return per-SM and opt-in per-block limits, including on older PyTorch."""
+    properties = get_device_properties(device)
+    per_sm = getattr(properties, "shared_memory_per_multiprocessor", None)
+    per_block = getattr(properties, "shared_memory_per_block_optin", None)
+    if per_sm is not None and per_block is not None:
+        return per_sm, per_block
+
+    # PyTorch < 2.7 does not expose these CUDA device attributes. Keep FA
+    # available there instead of treating missing Python bindings as hardware
+    # incompatibility. Support both cuda-python import layouts.
+    try:
+        from cuda.bindings import driver
+    except ImportError:
+        from cuda import cuda as driver
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+
+    def query(attribute):
+        status, value = driver.cuDeviceGetAttribute(attribute, index)
+        if int(status):
+            raise RuntimeError(
+                f"MLA cuDeviceGetAttribute({attribute}) failed: {status}"
+            )
+        return int(value)
+
+    attributes = driver.CUdevice_attribute
+    if per_sm is None:
+        per_sm = query(
+            attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+        )
+    if per_block is None:
+        per_block = query(
+            attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+        )
+    return per_sm, per_block
+
+
 def _validate_generated_fa_plan(
     *,
     backend: str,
@@ -71,45 +120,266 @@ def _validate_generated_fa_plan(
     ):
         if tensor.dtype != torch.int32:
             raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}.")
+    if kv_indptr.numel() < kv_len_arr.numel() + 1:
+        raise _BackendPlanUnsupportedError(
+            "FA MLA requires KV offsets for every request."
+        )
+    for name, value, minimum in (
+        ("head_dim_ckv", head_dim_ckv, 1),
+        ("head_dim_kpe", head_dim_kpe, 0),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}.")
+    for name, dtype in (("q_data_type", q_data_type), ("kv_data_type", kv_data_type)):
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"{name} must be a torch.dtype, got {dtype!r}.")
     if q_data_type not in (torch.float16, torch.bfloat16):
-        raise ValueError(
+        raise _BackendPlanUnsupportedError(
             f"MLA q_data_type {q_data_type} is not supported by the {backend} backend."
         )
     supported_kv_dtypes = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
     if kv_data_type not in supported_kv_dtypes:
-        raise ValueError(
+        raise _BackendPlanUnsupportedError(
             f"MLA kv_data_type {kv_data_type} is not supported by the {backend} "
             f"backend. Supported dtypes: {list(supported_kv_dtypes)}."
         )
     if output_dtype != q_data_type:
-        raise ValueError(
+        raise _BackendPlanUnsupportedError(
             f"{backend} backend output_dtype must match q_data_type, got "
             f"{output_dtype} and {q_data_type}."
         )
-    if head_dim_kpe < 0:
-        raise ValueError(f"head_dim_kpe must be >= 0, got {head_dim_kpe}.")
     if kv_data_type == torch.float8_e4m3fn:
         major, minor = get_compute_capability(device)
         if major != 9:
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                 f"got SM{major}{minor}."
             )
         if q_data_type != torch.bfloat16:
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "FP8 kv_data_type for MLA currently only supports "
                 f"q_data_type=torch.bfloat16, got {q_data_type}."
             )
         if head_dim_ckv != 512 or head_dim_kpe not in (0, 64):
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "FP8 kv_data_type for MLA currently only supports "
                 "head_dim_ckv=512 and head_dim_kpe in (0, 64), got "
                 f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
             )
         if scale_mode != "kv-per-tensor":
-            raise ValueError("FP8 MLA plans require scale_mode='kv-per-tensor'.")
+            raise _BackendPlanUnsupportedError(
+                "FP8 MLA plans require scale_mode='kv-per-tensor'."
+            )
+    elif kv_data_type != q_data_type:
+        raise _BackendPlanUnsupportedError(
+            f"{backend} non-FP8 KV dtype must match query dtype, got "
+            f"{kv_data_type} and {q_data_type}."
+        )
     elif scale_mode != "default":
-        raise ValueError("non-FP8 MLA plans require scale_mode='default'.")
+        raise _BackendPlanUnsupportedError(
+            "non-FP8 MLA plans require scale_mode='default'."
+        )
+
+    if head_dim_ckv % 128 or head_dim_kpe % 64:
+        raise _BackendPlanUnsupportedError(
+            f"{backend} requires head_dim_ckv to be a multiple of 128 and "
+            "head_dim_kpe to be a multiple of 64 (including zero)."
+        )
+    major, minor = get_compute_capability(device)
+    if backend == "fa3":
+        if not is_sm90a_supported(device):
+            raise _BackendPlanUnsupportedError(
+                "fa3 MLA requires SM90 and CUDA >= 12.3."
+            )
+        # PV uses WGMMA N=CKV/2; hopper.cuh implements N=64,128,256
+        # among the widths compatible with MLA's 128-wide output stores.
+        if head_dim_ckv not in (128, 256, 512):
+            raise _BackendPlanUnsupportedError(
+                "fa3 MLA requires head_dim_ckv in (128, 256, 512)."
+            )
+    elif major < 8:
+        raise _BackendPlanUnsupportedError(
+            f"fa2 MLA requires SM80 or newer, got SM{major}{minor}."
+        )
+    smem_per_sm, smem_per_block = _get_fa_shared_memory_limits(device)
+    shared_bytes = _generated_fa_shared_bytes(
+        backend,
+        head_dim_ckv,
+        head_dim_kpe,
+        kv_data_type == torch.float8_e4m3fn,
+        smem_per_sm,
+    )
+    if shared_bytes > smem_per_block:
+        raise _BackendPlanUnsupportedError(
+            f"{backend} MLA needs {shared_bytes} shared-memory bytes per block, "
+            f"but this device supports {smem_per_block}."
+        )
+
+
+def _generated_fa_shared_bytes(backend, ckv, kpe, fp8_kv, smem_per_sm):
+    """Sizes of SharedStorageQKVO / HopperSharedStorageQKVO, including padding."""
+    align16 = lambda size: (size + 15) // 16 * 16
+    q_bytes = 64 * (ckv + kpe) * 2
+    if backend == "fa3":
+        stage = 64 * ckv * (1 if fp8_kv else 2) + max(
+            64 * kpe * (1 if fp8_kv else 2), 64 * 64 * 2
+        )
+        repack = align16(64 * ckv * 2) + align16(max(64 * kpe, 1) * 2) if fp8_kv else 32
+        # o_scale/m/d each have 64 float elements. Two PipelineAsync<2>
+        # instances each contain four 8-byte ClusterBarrier objects.
+        return q_bytes + max(2 * stage + repack, 64 * ckv * 2) + 3 * 64 * 4 + 64
+    if smem_per_sm >= 221696:
+        stages, tile_kv = 2, 64
+    elif smem_per_sm >= 147968:
+        stages, tile_kv = 2, 32
+    elif smem_per_sm >= 92672:
+        stages, tile_kv = 1, 16
+    else:
+        raise _BackendPlanUnsupportedError(
+            f"fa2 MLA requires at least 92672 shared-memory bytes per SM, got {smem_per_sm}."
+        )
+    if fp8_kv:
+        tile_kv = 32
+    kv_bytes = stages * tile_kv * (ckv + max(kpe, 64)) * (1 if fp8_kv else 2)
+    repack = (
+        align16(stages * tile_kv * ckv * 2)
+        + align16(stages * tile_kv * max(kpe, 1) * 2)
+        if fp8_kv
+        else 32
+    )
+    return max(q_bytes + kv_bytes + repack + 2 * 64 * 4, 64 * ckv * 2)
+
+
+_FA_MAX_WORK_ITEMS = 16384
+
+
+def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
+    """Mirror scheduler.cuh MLAPlan, excluding its heap ordering (not its splits).
+
+    Raise early when the unsplit tile count already exceeds native capacity;
+    otherwise return the exact split-aware count. Never allocate O(totalQ).
+    """
+    if not q_lens:
+        raise _BackendPlanUnsupportedError(
+            "FA MLA native planning requires a nonempty batch."
+        )
+    if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+        raise ValueError(f"num_heads must be a positive integer, got {num_heads!r}.")
+    cluster = 2 if sum(q_lens) * num_heads // len(q_lens) > 64 else 1
+    clusters = num_sm // cluster
+    if clusters <= 0:
+        raise _BackendPlanUnsupportedError(
+            "FA MLA device has insufficient SMs for its cluster size."
+        )
+    tile = 64 * cluster
+    tile_counts = [(q * num_heads + tile - 1) // tile for q in q_lens]
+    if sum(tile_counts) > _FA_MAX_WORK_ITEMS:
+        raise _BackendPlanUnsupportedError(
+            f"FA MLA needs at least {sum(tile_counts)} work items; native capacity is {_FA_MAX_WORK_ITEMS}."
+        )
+    effective = []
+    for q, kv, count in zip(q_lens, kv_lens, tile_counts, strict=True):
+        for index in range(count):
+            effective.append(
+                max(
+                    min(kv - q + ((index + 1) * tile + num_heads - 1) // num_heads, kv),
+                    0,
+                )
+                if causal and index + 1 != count
+                else kv
+            )
+    average = max((sum(effective) + clusters - 1) // clusters, 1)
+    if average > 2**31 - 1:
+        raise _BackendPlanUnsupportedError(
+            "FA MLA KV split limit exceeds the native int32 range."
+        )
+    limit = (
+        32
+        if average <= 8
+        else 64
+        if average <= 16
+        else 128
+        if average <= 32
+        else 192
+        if average <= 64
+        else (average + 255) // 256 * 256
+    )
+    if average > 64 and average + 256 > 2**31 - 1:
+        # Native ceil_div spells (x + y - 1) / y in signed int32: the
+        # intermediate x + y must fit before the subtraction takes place.
+        raise _BackendPlanUnsupportedError(
+            "FA MLA rounded KV split limit exceeds the native int32 range."
+        )
+    if any(
+        kv > limit and (kv * cluster > 2**31 - 1 or kv + limit > 2**31 - 1)
+        for kv in effective
+    ):
+        # The native split branch computes both remaining_len * cluster_size
+        # and ceil_div(remaining_len, kv_len_limit) with signed int32 operands.
+        raise _BackendPlanUnsupportedError(
+            "FA MLA KV split arithmetic exceeds the native int32 range."
+        )
+    return sum(max(1, (kv + limit - 1) // limit) for kv in effective)
+
+
+def _validate_fa_causal_tile_bound(
+    q_lens, kv_lens, num_heads, backend, kv_data_type, device
+):
+    """Reject the native floor/ceil mismatch, after the work-count bound.
+
+    scheduler.cuh uses ceil(cluster_end / heads), while mla.cuh and
+    mla_hopper.cuh use floor in their causal KV iteration bound. A partial
+    query at a cluster end loses its last visible key exactly when that key
+    starts a native KV tile. KV split starts are subtracted *after* absolute
+    ceil_div, so this is an absolute key boundary, not a split-relative one.
+    """
+    tile_q = 64 * (2 if sum(q_lens) * num_heads // len(q_lens) > 64 else 1)
+    if tile_q % num_heads == 0:
+        return
+    if backend == "fa3":
+        # Hopper's tile is fixed at 64, including its FP8 repack path.
+        tile_kv = 64
+    elif kv_data_type == torch.float8_e4m3fn:
+        tile_kv = 32
+    else:
+        smem, _ = _get_fa_shared_memory_limits(device)
+        # Match mla.cuh DISPATCH_SMEM_CONFIG (dimensions do not select tiles).
+        tile_kv = 64 if smem >= 221696 else 32 if smem >= 147968 else 16
+    for request, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True)):
+        for end in range(tile_q, q_len * num_heads, tile_q):
+            query, remainder = divmod(end, num_heads)
+            key = kv_len - q_len + query
+            if remainder and query < q_len and 0 <= key < kv_len and key % tile_kv == 0:
+                raise _BackendPlanUnsupportedError(
+                    f"{backend} MLA causal tile boundary is unsupported: request "
+                    f"{request}, num_heads={num_heads}, query={query}, key={key}, "
+                    f"native KV tile={tile_kv}; native execution would omit a visible key."
+                )
+
+
+def _validate_fa_plan_workload(
+    qo_indptr, kv_len_arr, num_heads, causal, device, backend, kv_data_type
+):
+    offsets = qo_indptr.to(device="cpu", dtype=torch.int64).tolist()
+    kv_lens = kv_len_arr.to(device="cpu", dtype=torch.int64).tolist()
+    # Legacy flat CSR can have extra offsets; native MLAPlan uses the KV batch
+    # length. Preserve that behavior, but refuse a short offset array before OOB.
+    if len(offsets) < len(kv_lens) + 1:
+        raise _BackendPlanUnsupportedError(
+            "FA MLA requires query offsets for every KV request."
+        )
+    q_lens = [offsets[i + 1] - offsets[i] for i in range(len(kv_lens))]
+    count = _fa_plan_work_count(
+        q_lens, kv_lens, num_heads, get_device_sm_count(device), causal
+    )
+    if count > _FA_MAX_WORK_ITEMS:
+        raise _BackendPlanUnsupportedError(
+            f"FA MLA needs {count} work items including KV splits; native capacity is {_FA_MAX_WORK_ITEMS}."
+        )
+    if causal:
+        _validate_fa_causal_tile_bound(
+            q_lens, kv_lens, num_heads, backend, kv_data_type, device
+        )
 
 
 class _BatchMLAGeneratedFaMechanics:
@@ -171,19 +441,30 @@ class _BatchMLAGeneratedFaMechanics:
             ("kv_indices", self._kv_indices_buf, kv_indices, True),
             ("kv_len_arr", self._kv_len_arr_buf, kv_len_arr, False),
         )
+        self._validate_graph_metadata_buffers(self.device, named)
+        if any(reserved is None for _, reserved, _, _ in named):
+            raise ValueError(
+                "CUDA graph mode requires reserved qo_indptr, kv_indptr, "
+                "kv_indices, and kv_len_arr buffers."
+            )
+
+    @classmethod
+    def _validate_graph_metadata_buffers(
+        cls,
+        device: torch.device,
+        named: tuple[tuple[str, Optional[torch.Tensor], torch.Tensor, bool], ...],
+    ) -> None:
+        """Validate supplied buffers before classifying any missing buffers."""
         for name, reserved, source, allow_larger in named:
             if reserved is None:
-                raise ValueError(
-                    "CUDA graph mode requires reserved qo_indptr, kv_indptr, "
-                    "kv_indices, and kv_len_arr buffers."
-                )
+                continue
             if reserved.dtype != torch.int32:
                 raise ValueError(
                     f"CUDA graph reserved {name} buffer must have dtype torch.int32."
                 )
-            if reserved.device != self.device:
+            if reserved.device != device:
                 raise ValueError(
-                    f"CUDA graph reserved {name} buffer must be on {self.device}."
+                    f"CUDA graph reserved {name} buffer must be on {device}."
                 )
             if not reserved.is_contiguous():
                 raise ValueError(
@@ -201,7 +482,7 @@ class _BatchMLAGeneratedFaMechanics:
                     "incompatible capacity."
                 )
         intervals = [
-            (name, self._storage_interval(reserved))
+            (name, cls._storage_interval(reserved))
             for name, reserved, _, _ in named
             if reserved is not None
         ]
@@ -224,9 +505,9 @@ class _BatchMLAGeneratedFaMechanics:
             if reserved is not None
         }
         for source_name, _, source, _ in named:
-            source_interval = self._storage_interval(source)
+            source_interval = cls._storage_interval(source)
             for target_name, target in copy_targets.items():
-                target_interval = self._storage_interval(target)
+                target_interval = cls._storage_interval(target)
                 overlaps = source_interval[0] == target_interval[0] and max(
                     source_interval[1], target_interval[1]
                 ) < min(source_interval[2], target_interval[2])
@@ -299,6 +580,15 @@ class _BatchMLAGeneratedFaMechanics:
         # ---------------------------------------------------------------------------
         # Build the generated backend plan
         # ---------------------------------------------------------------------------
+        _validate_fa_plan_workload(
+            qo_indptr,
+            kv_len_arr,
+            num_heads,
+            causal,
+            self.device,
+            self._backend,
+            kv_data_type,
+        )
         cached_module = module_loader()
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
@@ -554,50 +844,114 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         raise NotImplementedError
 
     @classmethod
-    @_audit_plan_from_wrapper_arguments
-    def plan_from_wrapper(
-        cls: type[_FaBackendT], args: _MLAPlanArguments
-    ) -> _FaBackendT:
+    def preflight_plan_from_wrapper(cls, args: _MLAPlanArguments) -> None:
         assert cls._plan_capabilities is not None
+        csr = args.csr()  # Malformed caller metadata is never a support refusal.
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
-            raise ValueError(reason)
-        csr = args.csr()
-        backend = cls(
-            float_workspace_buffer=args._float_workspace_buffer,
-            use_cuda_graph=args._use_cuda_graph,
-            qo_indptr_buf=args._qo_indptr_buf,
-            kv_indptr_buf=args._kv_indptr_buf,
-            kv_indices_buf=args._kv_indices_buf,
-            kv_len_arr_buf=args._kv_len_arr_buf,
-            query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
-            kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
-            int_workspace_buffer=args._graph_plan_int_workspace_buffer,
-        )
+            raise _BackendPlanUnsupportedError(reason)
         if args._use_cuda_graph:
-            backend._preflight_graph_metadata_buffers(
-                qo_indptr=csr.qo_indptr,
-                kv_indptr=csr.kv_indptr,
-                kv_indices=csr.kv_indices,
-                kv_len_arr=csr.kv_len_arr,
+            named = (
+                ("qo_indptr", args._qo_indptr_buf, csr.qo_indptr, False),
+                ("kv_indptr", args._kv_indptr_buf, csr.kv_indptr, False),
+                ("kv_indices", args._kv_indices_buf, csr.kv_indices, True),
+                ("kv_len_arr", args._kv_len_arr_buf, csr.kv_len_arr, False),
             )
-        backend.plan(
+            cls._validate_graph_metadata_buffers(
+                args._float_workspace_buffer.device, named
+            )
+            # Absence is an FA-specific support limit; malformed supplied
+            # buffers above remain hard errors rather than enabling fallback.
+            if any(reserved is None for _, reserved, _, _ in named):
+                raise _BackendPlanUnsupportedError(
+                    f"{cls._plan_capabilities.backend_name} CUDA graph mode requires reserved "
+                    "qo_indptr, kv_indptr, kv_indices, and kv_len_arr buffers."
+                )
+        _validate_generated_fa_plan(
+            backend=cls._plan_capabilities.backend_name,
+            device=args._float_workspace_buffer.device,
             qo_indptr=csr.qo_indptr,
             kv_indptr=csr.kv_indptr,
             kv_indices=csr.kv_indices,
             kv_len_arr=csr.kv_len_arr,
-            num_heads=args.num_heads,
             head_dim_ckv=args.head_dim_ckv,
             head_dim_kpe=args.head_dim_kpe,
-            page_size=args.page_size,
-            causal=args.causal,
-            sm_scale=args.sm_scale,
             q_data_type=args.q_data_type,
             kv_data_type=args.kv_data_type,
             output_dtype=args.output_dtype,
             scale_mode=args.scale_mode,
-            use_profiler=args.use_profiler,
         )
-        return backend
+        _validate_fa_plan_workload(
+            csr.qo_indptr,
+            csr.kv_len_arr,
+            args.num_heads,
+            args.causal,
+            args._float_workspace_buffer.device,
+            cls._plan_capabilities.backend_name,
+            args.kv_data_type,
+        )
+
+    @classmethod
+    @_audit_plan_from_wrapper_arguments
+    def plan_from_wrapper(
+        cls: type[_FaBackendT], args: _MLAPlanArguments
+    ) -> _FaBackendT:
+        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        try:
+            assert cls._plan_capabilities is not None
+            cls.preflight_plan_from_wrapper(args)
+            csr = args.csr()
+            backend = cls(
+                float_workspace_buffer=args._float_workspace_buffer,
+                use_cuda_graph=args._use_cuda_graph,
+                qo_indptr_buf=args._qo_indptr_buf,
+                kv_indptr_buf=args._kv_indptr_buf,
+                kv_indices_buf=args._kv_indices_buf,
+                kv_len_arr_buf=args._kv_len_arr_buf,
+                query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
+                kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
+                int_workspace_buffer=args._graph_plan_int_workspace_buffer,
+            )
+            if args._use_cuda_graph:
+                backend._preflight_graph_metadata_buffers(
+                    qo_indptr=csr.qo_indptr,
+                    kv_indptr=csr.kv_indptr,
+                    kv_indices=csr.kv_indices,
+                    kv_len_arr=csr.kv_len_arr,
+                )
+            # Native FA planning writes shared integer storage and graph metadata.
+            # Float workspace and source metadata are read-only during planning.
+            if args._use_cuda_graph:
+                for buffer in (
+                    args._graph_plan_int_workspace_buffer,
+                    args._qo_indptr_buf,
+                    args._kv_indptr_buf,
+                    args._kv_indices_buf,
+                    args._kv_len_arr_buf,
+                ):
+                    if buffer is not None:
+                        snapshots.append((buffer, buffer.clone()))
+            backend.plan(
+                qo_indptr=csr.qo_indptr,
+                kv_indptr=csr.kv_indptr,
+                kv_indices=csr.kv_indices,
+                kv_len_arr=csr.kv_len_arr,
+                num_heads=args.num_heads,
+                head_dim_ckv=args.head_dim_ckv,
+                head_dim_kpe=args.head_dim_kpe,
+                page_size=args.page_size,
+                causal=args.causal,
+                sm_scale=args.sm_scale,
+                q_data_type=args.q_data_type,
+                kv_data_type=args.kv_data_type,
+                output_dtype=args.output_dtype,
+                scale_mode=args.scale_mode,
+                use_profiler=args.use_profiler,
+            )
+            return backend
+        except BaseException:
+            for buffer, original in snapshots:
+                buffer.copy_(original)
+            raise
 
     def run_from_wrapper(
         self,
