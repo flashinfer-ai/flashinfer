@@ -28,6 +28,7 @@ generated Cake program::
                                               + handoff: xw = bf16(x * norm0[0]), stats = rowsumsq(x)
     27 x encoder layer:
       layer_norm_qkv_rope gemm norm_qkv_rope: q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x))) 3 x [T, 12, 128]
+                          (``*_cs`` tiles: cos/sin from the packed f16x2 table ``rope_cs`` of the plan)
       layer_attention     packed-varlen noncausal BF16 attention per grid_thw segment  [T, 12, 128]
       layer_out_proj      gemm residual_wo_sqxw: x += bf16(a @ Wo^T); xw = bf16(x * norm1), stats (in place)
       layer_norm_fc0_gelu gemm norm_gelu:      f  = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x)))) [T, 4096]
@@ -37,6 +38,20 @@ generated Cake program::
     merger_gemm0         gemm gelu_erf:       h  = bf16(gelu_erf(bf16(m @ Wp0^T)))         [N, 4096]
     merger_gemm1         gemm rmsnorm:        y  = bf16(h @ Wp1^T)                         [N, 7168]
     merger_rmsnorm_apply out = bf16(RMSNorm(y, post_norm, eps = 1e-5))                    (in place)
+
+Programmatic dependent launch: the exported programs follow the Cake
+production PDL default (``kimi_k3_vision_tower.default_use_pdl``, env
+``KIMI_K3_VISION_TOWER_PDL``; on since the round-2 route), so every launch
+of the sequence carries the
+``cudaLaunchAttributeProgrammaticStreamSerialization`` attribute.  The
+generated bindings own it: the attribute is emitted into each binding's
+launch (``loom/runtime/host_shim.py``), the kernel runs its prologue
+(mbarrier / TMEM setup, descriptor prefetch) while its predecessor drains,
+``griddepcontrol.wait``s before its first access to a route buffer and
+signals ``launch_dependents`` so the successor's prologue overlaps its tail.
+The host only calls the bindings in order; under CUDA-graph capture the
+attribute becomes a programmatic dependency edge.  Programs exported with
+PDL off are ordinary serial launches.  The numerics are identical either way.
 
 Host work is split exactly like the Cake production launcher:
 
@@ -50,9 +65,11 @@ Host work is split exactly like the Cake production launcher:
   from those statistics and scale the FP32 accumulator before the single BF16
   rounding.
 * :func:`build_kimi_k3_vision_plan` -- once per ``grid_thws`` batch: the
-  ``cu_seqlens``, the 2-D RoPE ``cos``/``sin`` tables, the merge table, the
-  attention segment plan (unit layout + LPT unit table), the GEMM tile
-  configurations for the token counts and every workspace.  The positional
+  ``cu_seqlens``, the 2-D RoPE ``cos``/``sin`` tables and their packed f16x2
+  ``rope_cs`` table (:func:`pack_rope_table`: one ``(cos, sin)`` word per pair,
+  read by the ``*_cs`` QKV tiles), the merge table, the attention segment plan
+  (unit layout + LPT unit table), the GEMM tile configurations for the token
+  counts and every workspace.  The positional
   rows depend on the weights and are derived by
   :func:`prepare_kimi_k3_vision_tower` (or passed in by a serving runtime that
   caches them per grid).
@@ -70,7 +87,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, NamedTuple, Optional, Sequence, Union
 
 import torch
 import tvm_ffi
@@ -167,7 +184,13 @@ PRODUCTION_GEMM_VARIANTS = tuple(
 )
 
 # Exact keyword sets of the generated ``run`` entries (bound by the export's
-# argument plans); ``grid`` is expanded to ``grid_x/y/z``.
+# argument plans, in the kernels' parameter order); ``grid`` is expanded to
+# ``grid_x/y/z``.  The GEMM template takes the packed RoPE table ``CS``
+# (bf16 view of the u32 words; defaults to ``B``), the tail split-K workspace
+# ``WS`` (f32) / arrival counters ``FLAGS`` (u32) with ``full_tiles`` /
+# ``tail_split``; the production tiles have no tail paths, so the host binds
+# the Cake launcher's dummies (``WS`` = f32 zeros[16], ``FLAGS`` = u32
+# zeros[16], ``full_tiles`` = cluster tiles, ``tail_split`` = 1).
 GEMM_KWARGS = (
     "A",
     "A2",
@@ -178,11 +201,16 @@ GEMM_KWARGS = (
     "R",
     "COS",
     "SIN",
+    "CS",
     "SQ",
     "XW",
     "WN",
+    "WS",
+    "FLAGS",
     "M",
     "m_tiles",
+    "full_tiles",
+    "tail_split",
     "eps",
     "grid",
 )
@@ -525,40 +553,105 @@ def build_attention_plan(
 
 @dataclass(frozen=True)
 class TileConfig:
+    """One instance of the ``kimi_k3_vision_gemm`` template (its ``TileConfig``)."""
+
     name: str
     cta_group: int
     acc_n: int
     num_stages: int
     group_m: int
-    ksplit: int = 1
-    epi_warps: int = 4
+    ksplit: int = 1  # > 1: split-K cluster of single-CTA tiles (non-persistent)
+    epi_warps: int = (
+        4  # 4 (one warp per TMEM lane quadrant) or 8 (two per quadrant, column halves)
+    )
+    tail: bool = (
+        False  # tail split-K paths compiled in (opt-in in Cake, never selected here)
+    )
+    packed: bool = False  # packed bf16x2 residual epilogue (EPI_PACKED)
+    prefetch: bool = False  # residual / norm-weight rows loaded before the mainloop wait (EPI_PREFETCH)
+    rope: bool = False  # RoPE cos/sin from the packed f16x2 table CS (ROPE_PACKED; norm_qkv_rope only)
+
+    @property
+    def b_rows(self) -> int:
+        return self.acc_n // self.cta_group
+
+    @property
+    def stage_bytes(self) -> int:
+        return GEMM_BLOCK_M * GEMM_BLOCK_K * 2 + self.b_rows * GEMM_BLOCK_K * 2
 
     @property
     def cluster_x(self) -> int:
         return self.cta_group * self.ksplit
 
 
+def _cfg(
+    name: str, cta_group: int, acc_n: int, num_stages: int, **kw: Any
+) -> TileConfig:
+    return TileConfig(name, cta_group, acc_n, num_stages, 32, **kw)
+
+
+# The Cake catalogue (``kimi_k3_vision_gemm.TILE_CONFIGS``): pair tile 256 x 256
+# (``l``), single-CTA 128 x 128 / 128 x 64 (``s`` / ``xs``) and their split-K
+# clusters, the wave-balance / epilogue-width tiles (``m`` 256 x 128 pair,
+# ``w``, ``l_g8``, ``l_e8`` / ``s_e8`` eight epilogue warps) and the twins:
+# ``*_t`` tail split-K (opt-in in Cake; never selected by the production
+# policy), ``*_p`` / ``*_pf`` packed residual epilogue (+ pre-mainloop
+# residual / norm-weight prefetch) and ``*_cs`` packed f16x2 RoPE table.
 TILE_CONFIGS: dict[str, TileConfig] = {
     c.name: c
     for c in (
-        TileConfig("l", cta_group=2, acc_n=256, num_stages=7, group_m=32),
-        TileConfig("s", cta_group=1, acc_n=128, num_stages=7, group_m=32),
-        TileConfig("xs", cta_group=1, acc_n=64, num_stages=9, group_m=32),
-        TileConfig("s_k2", cta_group=1, acc_n=128, num_stages=7, group_m=32, ksplit=2),
-        TileConfig("s_k4", cta_group=1, acc_n=128, num_stages=7, group_m=32, ksplit=4),
-        TileConfig("xs_k2", cta_group=1, acc_n=64, num_stages=9, group_m=32, ksplit=2),
-        TileConfig("xs_k4", cta_group=1, acc_n=64, num_stages=9, group_m=32, ksplit=4),
-        TileConfig("m", cta_group=2, acc_n=128, num_stages=9, group_m=32),
-        TileConfig("w", cta_group=1, acc_n=256, num_stages=4, group_m=32),
+        _cfg("l", 2, 256, 7),
+        _cfg("s", 1, 128, 7),
+        _cfg("xs", 1, 64, 9),
+        _cfg("s_k2", 1, 128, 7, ksplit=2),
+        _cfg("s_k4", 1, 128, 7, ksplit=4),
+        _cfg("xs_k2", 1, 64, 9, ksplit=2),
+        _cfg("xs_k4", 1, 64, 9, ksplit=4),
+        _cfg("m", 2, 128, 9),
+        _cfg("w", 1, 256, 4),
         TileConfig("l_g8", cta_group=2, acc_n=256, num_stages=7, group_m=8),
-        TileConfig(
-            "l_e8", cta_group=2, acc_n=256, num_stages=7, group_m=32, epi_warps=8
-        ),
-        TileConfig(
-            "s_e8", cta_group=1, acc_n=128, num_stages=7, group_m=32, epi_warps=8
-        ),
+        _cfg("l_e8", 2, 256, 7, epi_warps=8),
+        _cfg("s_e8", 1, 128, 7, epi_warps=8),
+        _cfg("l_t", 2, 256, 7, tail=True),
+        _cfg("l_e8_t", 2, 256, 7, epi_warps=8, tail=True),
+        _cfg("m_t", 2, 128, 9, tail=True),
+        _cfg("s_t", 1, 128, 7, tail=True),
+        _cfg("xs_t", 1, 64, 9, tail=True),
+        _cfg("s_e8_t", 1, 128, 7, epi_warps=8, tail=True),
+        _cfg("m_p", 2, 128, 9, packed=True),
+        _cfg("l_e8_p", 2, 256, 7, epi_warps=8, packed=True),
+        _cfg("s_e8_p", 1, 128, 7, epi_warps=8, packed=True),
+        _cfg("xs_p", 1, 64, 9, packed=True),
+        _cfg("xs_k4_p", 1, 64, 9, ksplit=4, packed=True),
+        _cfg("m_pf", 2, 128, 9, packed=True, prefetch=True),
+        _cfg("l_e8_pf", 2, 256, 7, epi_warps=8, packed=True, prefetch=True),
+        _cfg("s_e8_pf", 1, 128, 7, epi_warps=8, packed=True, prefetch=True),
+        _cfg("xs_pf", 1, 64, 9, packed=True, prefetch=True),
+        _cfg("xs_k4_pf", 1, 64, 9, ksplit=4, packed=True, prefetch=True),
+        _cfg("l_e8_cs", 2, 256, 7, epi_warps=8, rope=True),
+        _cfg("s_cs", 1, 128, 7, rope=True),
+        _cfg("xs_cs", 1, 64, 9, rope=True),
+        _cfg("xs_cs_pf", 1, 64, 9, rope=True, prefetch=True),
     )
 }
+# norm_qkv_rope: the packed f16x2 cos/sin twin of each base tile (Cake
+# ``_ROPE_TWIN``; the pre-mainloop table prefetch only on the one-drain-group
+# ``xs`` tile) and the FP32-table config the launcher falls back to when no
+# table is passed (``_ROPE_BASE``).  The host always passes ``rope_cs``.
+ROPE_TWIN = {"l_e8": "l_e8_cs", "s": "s_cs", "xs": "xs_cs_pf"}
+ROPE_BASE = {twin: base for base, twin in ROPE_TWIN.items()}
+ROPE_BASE["xs_cs"] = "xs"
+# residual / pos forms: the packed epilogue twin everywhere, with the residual
+# prefetch on the one-drain-group configs and on ``l_e8`` (Cake ``_PACKED_TWIN``).
+PACKED_TWIN = {
+    "m": "m_p",
+    "l_e8": "l_e8_pf",
+    "s_e8": "s_e8_pf",
+    "xs": "xs_pf",
+    "xs_k4": "xs_k4_pf",
+}
+for _name in (*ROPE_TWIN, *ROPE_TWIN.values(), *PACKED_TWIN, *PACKED_TWIN.values()):
+    assert _name in TILE_CONFIGS, _name
 
 # variant -> (N, K, pos-split pixel-row maps); ``_sq`` / ``_sqxw`` are the
 # handoff forms of the residual-stream producers (same GEMM, extra epilogue
@@ -576,34 +669,63 @@ for _base in ("pos", "residual_wo", "residual_fc1"):
     GEMM_VARIANTS[_base + "_sq"] = GEMM_VARIANTS[_base]
     GEMM_VARIANTS[_base + "_sqxw"] = GEMM_VARIANTS[_base]
 # Production tile selection thresholds (kimi_k3_vision_gemm.select_tile_config).
-TINY_M_LIMIT = 256
-SMALL_M_LIMIT = 1024
-MID_M_LIMIT = 8192
+TINY_M_LIMIT = (
+    256  # M <= this -> 128 x 64 tiles for every shape but the 7168-wide projector GEMM
+)
+SMALL_M_LIMIT = (
+    1024  # M <= this -> single-CTA tiles (128 x 64 for N = 1024, 128 x 128 otherwise)
+)
+MID_M_LIMIT = 8192  # residual_fc1: 256 x 256 (8 epilogue warps) up to here, 256 x 128 pair tile above
+
+
+def _rope_twin(name: str, n_total: int) -> str:
+    """norm_qkv_rope (N = 4608) takes the packed f16x2 cos/sin twin (Cake ``_ROPE_POLICY`` auto)."""
+    return ROPE_TWIN.get(name, name) if n_total == QKV_N else name
 
 
 def select_tile_config(variant: str, M: int) -> TileConfig:
-    """Production tile config for ``(variant, M)``; mirrors ``kimi_k3_vision_gemm.select_tile_config``."""
+    """Production tile config for ``(variant, M)``; mirrors ``kimi_k3_vision_gemm.select_tile_config``
+    with its production policies (packed residual twins on, RoPE table twins on, tail twins off).
+
+    Small M is bound by the per-CTA operand stream, so the smallest tile wins:
+    128 x 64 up to ``SMALL_M_LIMIT`` for the N = 1024 shapes and up to
+    ``TINY_M_LIMIT`` for the wide ones (the 7168-wide projector GEMM prefers
+    128 x 128); split-K only for the K = 4096 residual GEMM at M <= 256.
+    Large M runs the 256 x 256 pair tile; the K = 1024 norm GEMMs and
+    ``pos`` take the eight-warp epilogue, the N = 1024 residual GEMMs the
+    256 x 128 pair tile except ``residual_fc1`` up to ``MID_M_LIMIT``.
+    """
     n_total, k_total, pos_split = GEMM_VARIANTS[variant]
     cfg = TILE_CONFIGS
     if pos_split:
-        return cfg["xs"] if M <= SMALL_M_LIMIT else cfg["s_e8"]
+        return cfg[PACKED_TWIN["xs" if M <= SMALL_M_LIMIT else "s_e8"]]
     if n_total == HIDDEN:  # residual_wo (K = 1536), residual_fc1 (K = 4096)
         if M <= TINY_M_LIMIT and k_total == FFN:
-            return cfg["xs_k4"]
+            return cfg[PACKED_TWIN["xs_k4"]]
         if M <= SMALL_M_LIMIT:
-            return cfg["xs"]
-        return cfg["l_e8"] if (k_total == FFN and M <= MID_M_LIMIT) else cfg["m"]
+            return cfg[PACKED_TWIN["xs"]]
+        return cfg[
+            PACKED_TWIN["l_e8" if (k_total == FFN and M <= MID_M_LIMIT) else "m"]
+        ]
     if M <= TINY_M_LIMIT:
-        return cfg["s"] if n_total == TEXT_HIDDEN else cfg["xs"]
-    if M <= SMALL_M_LIMIT:
-        return cfg["s"]
-    # The K = 1024 norm GEMMs (statistics handoff on the critical path) take the
-    # eight-warp epilogue; the projector GEMMs the four-warp pair tile.
-    return cfg["l_e8"] if k_total == HIDDEN else cfg["l"]
+        base = "s" if n_total == TEXT_HIDDEN else "xs"
+    elif M <= SMALL_M_LIMIT:
+        base = "s"
+    else:
+        # The K = 1024 norm GEMMs (statistics handoff on the critical path)
+        # take the eight-warp epilogue; the projector GEMMs the four-warp pair tile.
+        base = "l_e8" if k_total == HIDDEN else "l"
+    return cfg[_rope_twin(base, n_total)]
 
 
-def launch_tile_config(variant: str, cfg: TileConfig) -> TileConfig:
-    """The physical config the launcher runs: ``pos`` requires single-CTA tiles and a K split of 10 K-steps."""
+def launch_tile_config(
+    variant: str, cfg: TileConfig, *, rope_table: bool = True
+) -> TileConfig:
+    """The physical config the launcher runs (``kimi_k3_vision_gemm._launch_gemm``): a ``*_cs``
+    tile without a packed table falls back to its FP32-table base (the host always passes the
+    table); ``pos`` requires single-CTA tiles and a K split of 10 K-steps."""
+    if cfg.rope and not rope_table:
+        cfg = TILE_CONFIGS[ROPE_BASE[cfg.name]]
     if GEMM_VARIANTS[variant][2]:
         if cfg.cta_group != 1:
             cfg = TILE_CONFIGS["s"]
@@ -612,10 +734,31 @@ def launch_tile_config(variant: str, cfg: TileConfig) -> TileConfig:
     return cfg
 
 
+class GemmLaunchGeometry(NamedTuple):
+    """Grid and the geometry parameters of one GEMM launch (``_launch_gemm``)."""
+
+    grid: tuple[int, int, int]
+    m_tiles: int
+    cluster_tiles: int
+    full_tiles: int  # cluster tiles before the tail split-K rounds (= cluster_tiles without a tail)
+    tail_split: int  # K-slices per tail tile (1: no tail split)
+
+
 def gemm_launch_geometry(
     variant: str, cfg: TileConfig, M: int, sm_count: int
-) -> tuple[tuple[int, int, int], int]:
-    """``(grid, m_tiles)`` of one GEMM launch; mirrors ``kimi_k3_vision_gemm._launch_gemm``."""
+) -> GemmLaunchGeometry:
+    """Geometry of one GEMM launch; mirrors ``kimi_k3_vision_gemm._launch_gemm``.
+
+    The production tiles carry no tail split-K paths, so ``full_tiles`` is the
+    cluster tile count and ``tail_split`` is 1 (the Cake launcher's values for
+    non-tail configs).  The ``*_t`` twins are opt-in in Cake and outside the
+    exported plan.
+    """
+    if cfg.tail:
+        raise NotImplementedError(
+            f"tile config {cfg.name!r} is a tail split-K twin: opt-in in Cake and not part of "
+            "the exported production plan"
+        )
     n_total, _k_total, pos_split = GEMM_VARIANTS[variant]
     if pos_split:
         m_tiles = 2 * ((M + 2 * GEMM_BLOCK_M - 1) // (2 * GEMM_BLOCK_M))
@@ -628,7 +771,9 @@ def gemm_launch_geometry(
         clusters = cluster_tiles  # non-persistent: one cluster per output tile
     else:
         clusters = min(cluster_tiles, int(sm_count) // cfg.cta_group)
-    return (clusters * cfg.cluster_x, 1, 1), m_tiles
+    return GemmLaunchGeometry(
+        (clusters * cfg.cluster_x, 1, 1), m_tiles, cluster_tiles, cluster_tiles, 1
+    )
 
 
 def gemm_configs_for(total_tokens: int, merged: int) -> dict[str, str]:
@@ -828,6 +973,9 @@ class VisionTowerPlan:
     gemm_configs: dict[str, str]
     cos: torch.Tensor
     sin: torch.Tensor
+    rope_cs: (
+        torch.Tensor
+    )  # pack_rope_table(cos, sin): u32 [T, 64] f16x2 (cos, sin) words
     workspace: dict[str, torch.Tensor] = field(repr=False)
 
     @property
@@ -855,13 +1003,30 @@ def vision_workspace_shapes(
         "h": ((merged, MERGED_DIM), bf16),
         "rowsumsq": ((merged,), torch.float32),
         # Bound to unused pointer parameters (never dereferenced for the tiles
-        # the kernels run): FP32 dummy for COS/SIN/SQ, the odd-row pixel map
-        # when T == 1 (XW / WN default to C / B like the Cake launcher), and
-        # the attention kernel's diagnostic probe buffer.
+        # the kernels run): FP32 dummy for COS/SIN/SQ and the tail workspace
+        # WS, u32 zeros for the tail arrival counters FLAGS, the odd-row pixel
+        # map when T == 1 (CS / XW / WN default to B / C / B like the Cake
+        # launcher), and the attention kernel's diagnostic probe buffer.
         "f32_dummy": ((16,), torch.float32),
+        "u32_dummy": ((16,), torch.uint32),
         "pixel_dummy": ((2, PATCH_DIM), bf16),
         "probe_dummy": ((PROBE_WORDS,), torch.uint64),
     }
+
+
+def pack_rope_table(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Pack the FP32 ``[T, 64]`` cos/sin tables into one ``uint32`` ``[T, 64]`` table of f16x2
+    words (low half = cos, high half = sin) for the ``*_cs`` QKV tiles: half the table bytes per
+    q/k column tile (``kimi_k3_vision_gemm.pack_rope_table``).  f16 rounds cos/sin to 2^-11
+    relative; the rotation stays FP32 and the q/k outputs are BF16.  Built once per plan."""
+    if cos.shape != sin.shape or cos.dim() != 2 or cos.shape[1] != ROPE_PAIRS:
+        raise ValueError(
+            f"cos/sin must be [T, {ROPE_PAIRS}] tables, got {tuple(cos.shape)} / {tuple(sin.shape)}"
+        )
+    packed = torch.stack([cos.float().half(), sin.float().half()], dim=-1).reshape(
+        cos.shape[0], 2 * ROPE_PAIRS
+    )
+    return packed.contiguous().view(torch.uint32)
 
 
 def build_kimi_k3_vision_plan(
@@ -878,7 +1043,8 @@ def build_kimi_k3_vision_plan(
 
     ``sm_count`` / ``grid_clusters`` default to the device's SM count (and its
     half); pass them to build a plan for another device (CPU tests).  ``cos`` /
-    ``sin`` may be supplied by a runtime that caches them per grid.
+    ``sin`` may be supplied by a runtime that caches them per grid; the packed
+    f16x2 ``rope_cs`` table the QKV GEMM reads is derived from them here.
     """
     device = torch.device(device)
     grids = tuple(validate_grid_thws(grid_thws))
@@ -921,6 +1087,7 @@ def build_kimi_k3_vision_plan(
         gemm_configs=gemm_configs_for(total, merged),
         cos=cos,
         sin=sin,
+        rope_cs=pack_rope_table(cos, sin),
         workspace=workspace,
     )
 
@@ -1062,6 +1229,7 @@ def _gemm_launch(
     R: Optional[torch.Tensor] = None,
     COS: Optional[torch.Tensor] = None,
     SIN: Optional[torch.Tensor] = None,
+    CS: Optional[torch.Tensor] = None,
     SQ: Optional[torch.Tensor] = None,
     XW: Optional[torch.Tensor] = None,
     WN: Optional[torch.Tensor] = None,
@@ -1070,7 +1238,9 @@ def _gemm_launch(
     ws = plan.workspace
     M = int(A.shape[0])
     cfg = TILE_CONFIGS[plan.gemm_configs[variant]]
-    grid, m_tiles = gemm_launch_geometry(variant, cfg, M, plan.sm_count)
+    if cfg.rope and CS is None:
+        raise ValueError(f"{variant} on {cfg.name!r} requires the packed RoPE table CS")
+    geometry = gemm_launch_geometry(variant, cfg, M, plan.sm_count)
     if GEMM_VARIANTS[variant][2]:
         # Odd-row map over the same pixel tensor; M == 1 has no odd row but the
         # descriptor needs floor(rows / 2) >= 1.
@@ -1087,13 +1257,18 @@ def _gemm_launch(
         R=R if R is not None else C,
         COS=COS if COS is not None else ws["f32_dummy"],
         SIN=SIN if SIN is not None else ws["f32_dummy"],
+        CS=CS if CS is not None else B,
         SQ=SQ if SQ is not None else ws["f32_dummy"],
         XW=XW if XW is not None else C,
         WN=WN if WN is not None else B,
+        WS=ws["f32_dummy"],
+        FLAGS=ws["u32_dummy"],
         M=M,
-        m_tiles=int(m_tiles),
+        m_tiles=int(geometry.m_tiles),
+        full_tiles=int(geometry.full_tiles),
+        tail_split=int(geometry.tail_split),
         eps=float(eps),
-        grid=grid,
+        grid=geometry.grid,
     )
     assert tuple(kwargs) == GEMM_KWARGS
     module = kernel_module_name(plan.arch, gemm_kernel_key(variant, cfg.name))
@@ -1200,6 +1375,8 @@ def _launch_sequence(
                 C3=ws["v"],
                 COS=plan.cos,
                 SIN=plan.sin,
+                # The kernel's CS pointer is bf16-typed: the u32 words viewed as bf16 pairs.
+                CS=plan.rope_cs.view(torch.bfloat16),
                 SQ=stats,
                 eps=NORM_EPS,
             )

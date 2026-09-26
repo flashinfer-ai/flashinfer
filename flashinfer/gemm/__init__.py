@@ -43,6 +43,16 @@ from .cake_grouped_fp8_fused_silu_quant import (
 from .cake_grouped_fp8_fused_silu_quant import (
     prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant as prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant,
 )
+from .kimi_k3_fp8_projection import (
+    allocate_kimi_k3_fp8_projection_workspace as allocate_kimi_k3_fp8_projection_workspace,
+)
+from .kimi_k3_fp8_projection import kimi_k3_fp8_projection as kimi_k3_fp8_projection
+from .kimi_k3_fp8_projection import (
+    prepare_kimi_k3_fp8_projection as prepare_kimi_k3_fp8_projection,
+)
+from .kimi_k3_fp8_projection import (
+    prepare_kimi_k3_fp8_projection_weights as prepare_kimi_k3_fp8_projection_weights,
+)
 
 from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
@@ -162,6 +172,10 @@ __all__ = (
         "PreparedGroupGemmFp8NtGroupwiseContiguous",
         "prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant",
         "PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant",
+        "allocate_kimi_k3_fp8_projection_workspace",
+        "kimi_k3_fp8_projection",
+        "prepare_kimi_k3_fp8_projection",
+        "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",

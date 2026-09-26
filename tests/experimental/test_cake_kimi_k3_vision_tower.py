@@ -49,6 +49,7 @@ from flashinfer.experimental.kimi_k3_vision_tower.cake_backend import (
     build_merge_table_host,
     cu_seqlens_of,
     gemm_launch_geometry,
+    launch_tile_config,
     merged_tokens,
     pos_emb_rows,
     prepare_kimi_k3_vision_tower,
@@ -155,15 +156,17 @@ def test_sincos_time_table():
 
 def test_select_tile_config_buckets():
     # The K = 1024 norm GEMMs take the eight-warp epilogue above 1024 rows; the
-    # handoff forms follow their base variant's rule.
+    # handoff forms follow their base variant's rule.  Production twins: the
+    # residual / pos forms run the packed epilogue (``_p`` / ``_pf`` with the
+    # residual prefetch), norm_qkv_rope the packed f16x2 RoPE table (``_cs``).
     expect = {
-        "pos": ("xs", "xs", "s_e8", "s_e8"),
-        "pos_sqxw": ("xs", "xs", "s_e8", "s_e8"),
-        "norm_qkv_rope": ("xs", "s", "l_e8", "l_e8"),
-        "residual_wo": ("xs", "xs", "m", "m"),
-        "residual_wo_sqxw": ("xs", "xs", "m", "m"),
-        "residual_fc1": ("xs_k4", "xs", "l_e8", "m"),
-        "residual_fc1_sqxw": ("xs_k4", "xs", "l_e8", "m"),
+        "pos": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
+        "pos_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
+        "norm_qkv_rope": ("xs_cs_pf", "s_cs", "l_e8_cs", "l_e8_cs"),
+        "residual_wo": ("xs_pf", "xs_pf", "m_p", "m_p"),
+        "residual_wo_sqxw": ("xs_pf", "xs_pf", "m_p", "m_p"),
+        "residual_fc1": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
+        "residual_fc1_sqxw": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "norm_gelu": ("xs", "s", "l_e8", "l_e8"),
         "gelu_erf": ("xs", "s", "l", "l"),
         "rmsnorm": ("s", "s", "l", "l"),
@@ -173,23 +176,40 @@ def test_select_tile_config_buckets():
         assert got == names, (variant, got)
     for cfg in TILE_CONFIGS.values():
         assert cfg.cluster_x == cfg.cta_group * cfg.ksplit
+        assert not cfg.tail or cfg.ksplit == 1
+    # The tail split-K twins are opt-in in Cake and never selected.
+    for variant in expect:
+        for m in (4, 256, 257, 1024, 1025, 8192, 8193, 153088):
+            assert not select_tile_config(variant, m).tail
+    # Without a packed table the ``_cs`` tiles fall back to their FP32-table base.
+    assert (
+        launch_tile_config("norm_qkv_rope", TILE_CONFIGS["xs_cs_pf"]).name == "xs_cs_pf"
+    )
+    assert (
+        launch_tile_config(
+            "norm_qkv_rope", TILE_CONFIGS["xs_cs_pf"], rope_table=False
+        ).name
+        == "xs"
+    )
 
 
 def test_gemm_launch_geometry():
     # pos at T = 4: two 128-row parity tiles of one 256-row block, 16 column tiles.
-    grid, m_tiles = gemm_launch_geometry("pos", TILE_CONFIGS["xs"], 4, SM_COUNT)
-    assert (grid, m_tiles) == ((32, 1, 1), 2)
+    geo = gemm_launch_geometry("pos", TILE_CONFIGS["xs_pf"], 4, SM_COUNT)
+    assert (geo.grid, geo.m_tiles) == ((32, 1, 1), 2)
+    # No tail split-K on the production tiles: full_tiles = cluster tiles, tail_split = 1.
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (32, 32, 1)
     # Split-K residual GEMM: one 4-CTA cluster per output tile (non-persistent).
-    grid, m_tiles = gemm_launch_geometry(
-        "residual_fc1", TILE_CONFIGS["xs_k4"], 256, SM_COUNT
-    )
-    assert (grid, m_tiles) == ((2 * 16 * 4, 1, 1), 2)
+    geo = gemm_launch_geometry("residual_fc1", TILE_CONFIGS["xs_k4_pf"], 256, SM_COUNT)
+    assert (geo.grid, geo.m_tiles) == ((2 * 16 * 4, 1, 1), 2)
     # Pair tile at large M: persistent grid of SM/2 clusters x 2 CTAs, even m_tiles.
-    grid, m_tiles = gemm_launch_geometry(
-        "norm_qkv_rope", TILE_CONFIGS["l"], 4144, SM_COUNT
-    )
-    assert m_tiles == _ceil_div(4144, GEMM_BLOCK_M) + 1
-    assert grid == (2 * min((m_tiles // 2) * (QKV_N // 256), SM_COUNT // 2), 1, 1)
+    geo = gemm_launch_geometry("norm_qkv_rope", TILE_CONFIGS["l_e8_cs"], 4144, SM_COUNT)
+    assert geo.m_tiles == _ceil_div(4144, GEMM_BLOCK_M) + 1
+    assert geo.cluster_tiles == (geo.m_tiles // 2) * (QKV_N // 256)
+    assert geo.grid == (2 * min(geo.cluster_tiles, SM_COUNT // 2), 1, 1)
+    assert (geo.full_tiles, geo.tail_split) == (geo.cluster_tiles, 1)
+    with pytest.raises(NotImplementedError):
+        gemm_launch_geometry("norm_qkv_rope", TILE_CONFIGS["l_e8_t"], 4144, SM_COUNT)
 
 
 def test_required_kernel_keys():
@@ -198,10 +218,12 @@ def test_required_kernel_keys():
     assert "merge" in REQUIRED_KERNEL_KEYS
     assert "rmsnorm_apply" in REQUIRED_KERNEL_KEYS
     gemm_keys = [k for k in REQUIRED_KERNEL_KEYS if k.startswith("gemm:")]
-    assert "gemm:pos_sqxw:xs" in gemm_keys
-    assert "gemm:residual_fc1_sqxw:xs_k4" in gemm_keys
-    assert "gemm:residual_fc1:xs_k4" in gemm_keys
-    assert "gemm:norm_qkv_rope:l_e8" in gemm_keys and "gemm:gelu_erf:l" in gemm_keys
+    assert "gemm:pos_sqxw:xs_pf" in gemm_keys
+    assert "gemm:residual_fc1_sqxw:xs_k4_pf" in gemm_keys
+    assert "gemm:residual_fc1:xs_k4_pf" in gemm_keys
+    assert "gemm:norm_qkv_rope:l_e8_cs" in gemm_keys and "gemm:gelu_erf:l" in gemm_keys
+    # Every registered GEMM tile is a production (non-tail) config.
+    assert not any(TILE_CONFIGS[k.split(":")[2]].tail for k in gemm_keys)
     # Only the launched variants (the ``_sq``-only forms are not part of the tower).
     assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
     assert len(gemm_keys) == len(set(gemm_keys)) == 23
@@ -361,16 +383,25 @@ def test_plan_on_cpu_device_needs_sm_count():
     plan = build_kimi_k3_vision_plan(grids, "cpu", num_layers=2, sm_count=SM_COUNT)
     assert plan.total_tokens == 264 and plan.merged_tokens == 62
     assert plan.gemm_configs == {
-        "pos_sqxw": "xs",
-        "norm_qkv_rope": "s",
-        "residual_wo_sqxw": "xs",
+        "pos_sqxw": "xs_pf",
+        "norm_qkv_rope": "s_cs",
+        "residual_wo_sqxw": "xs_pf",
         "norm_gelu": "s",
-        "residual_fc1_sqxw": "xs",
-        "residual_fc1": "xs",
+        "residual_fc1_sqxw": "xs_pf",
+        "residual_fc1": "xs_pf",
         "gelu_erf": "xs",
         "rmsnorm": "s",
     }
     assert plan.attention.grid_clusters == GRID_CLUSTERS
+    # Packed f16x2 (cos, sin) words of the FP32 tables, one per pair.
+    assert (
+        plan.rope_cs.shape == (264, cb.ROPE_PAIRS)
+        and plan.rope_cs.dtype == torch.uint32
+    )
+    halves = plan.rope_cs.view(torch.float16).float().view(264, cb.ROPE_PAIRS, 2)
+    torch.testing.assert_close(halves[..., 0], plan.cos.half().float())
+    torch.testing.assert_close(halves[..., 1], plan.sin.half().float())
+    assert plan.workspace["u32_dummy"].dtype == torch.uint32
     assert plan.workspace["x"].shape == (264, HIDDEN)
     assert plan.workspace["xw"].shape == (264, HIDDEN)
     assert plan.workspace["stats"].shape == (264, cb.STATS_PARTS)
