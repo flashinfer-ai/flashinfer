@@ -50,6 +50,7 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
     float_to_ue8m0_fast,
     ue8m0_to_inv_scale_fast,
 )
+from flashinfer.cute_dsl.fp4_common import atomic_add_global_i32, threadfence
 
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
@@ -440,6 +441,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         runtime_situ_linear_beta: bool = False,
         weight_l2_hint: Optional[int] = None,
         pdl_trigger_early: bool = False,
+        zero_fill: bool = False,
+        zero_fill_iters: int = 16,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -506,6 +509,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # the end (launches that usually find no tiles: the split form's
         # wide GEMM1), so the dependent grid is resident during the wait.
         self.pdl_trigger_early = bool(pdl_trigger_early)
+        # Zero-fill of the finalize output by the epilogue warps (see the
+        # kernel body): 32 lanes x 16 B x zero_fill_iters per claimed chunk.
+        self.zero_fill = bool(zero_fill)
+        self.zero_fill_iters = int(zero_fill_iters)
         self.use_a_per_token_scale = use_a_per_token_scale
         self.topk = topk
         self.gated = gated
@@ -843,6 +850,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_beta_tensor: Optional[cute.Tensor] = None,
         situ_linear_beta_tensor: Optional[cute.Tensor] = None,
         tile_idx_to_row_group: Optional[cute.Tensor] = None,
+        zero_fill_words: Optional[cute.Tensor] = None,
+        zero_fill_counters: Optional[cute.Tensor] = None,
+        zero_fill_other_tiles: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -1206,6 +1216,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             a_per_token_scale,
             situ_beta_tensor,
             situ_linear_beta_tensor,
+            zero_fill_words,
+            zero_fill_counters,
+            zero_fill_other_tiles,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1296,6 +1309,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         a_per_token_scale: Optional[cute.Tensor],
         situ_beta_tensor: Optional[cute.Tensor],
         situ_linear_beta_tensor: Optional[cute.Tensor],
+        zero_fill_words: Optional[cute.Tensor],
+        zero_fill_counters: Optional[cute.Tensor],
+        zero_fill_other_tiles: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -3448,6 +3464,64 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+            if cutlass.const_expr(self.zero_fill):
+                #
+                # Zero-fill of the finalize GEMM2's token output (the fused
+                # finalize reduce-adds into it). The epilogue warps of every
+                # CTA claim 16 KB chunks from a global counter once their own
+                # tiles are stored, so CTAs without tiles (most of them on a
+                # sparse routing) fill while the others compute and no extra
+                # kernel takes the SMs. Per-SM store throughput is capped at
+                # ~64 GB/s on B300 (measured), so the fill needs ~100 SMs for
+                # the HBM rate. The counters (claim, done) live in a caller
+                # buffer zeroed once; the last warp to finish resets both so
+                # the next launch starts clean (every launch enqueued after
+                # this one only touches them after its griddepcontrol.wait).
+                # A launch whose tile variant the routing did not choose
+                # leaves the fill to the chosen variant unless neither has
+                # tiles (nothing routed to this rank).
+                #
+                my_tiles = num_non_exiting_tiles[0]
+                other_tiles = zero_fill_other_tiles[0]
+                if (my_tiles > 0) | (other_tiles == 0):
+                    lane = cute.arch.lane_idx()
+                    grid_x, _, _ = cute.arch.grid_dim()
+                    claim_addr = zero_fill_counters.iterator.toint()
+                    done_addr = (zero_fill_counters.iterator + 1).toint()
+                    num_vec = cute.size(zero_fill_words) // 4
+                    chunk_vec = 32 * self.zero_fill_iters
+                    num_chunks = cute.ceil_div(num_vec, chunk_vec)
+                    zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                    for i in cutlass.range_constexpr(4):
+                        zeros[i] = cutlass.Uint32(0)
+                    claimed = cutlass.Int32(0)
+                    if lane == 0:
+                        claimed = atomic_add_global_i32(claim_addr, cutlass.Int32(1))
+                    claimed = cute.arch.shuffle_sync(claimed, 0)
+                    while claimed < num_chunks:
+                        base_vec = claimed * chunk_vec + lane
+                        for it in cutlass.range_constexpr(self.zero_fill_iters):
+                            vec = base_vec + it * 32
+                            if vec < num_vec:
+                                g_out = cute.make_tensor(
+                                    zero_fill_words.iterator
+                                    + cute.assume(vec * 4, divby=4),
+                                    layout=cute.make_layout((4,)),
+                                )
+                                cute.autovec_copy(zeros, g_out)
+                        if lane == 0:
+                            claimed = atomic_add_global_i32(
+                                claim_addr, cutlass.Int32(1)
+                            )
+                        claimed = cute.arch.shuffle_sync(claimed, 0)
+                    threadfence()
+                    if lane == 0:
+                        total_warps = grid_x * len(self.epilog_warp_id)
+                        finished = atomic_add_global_i32(done_addr, cutlass.Int32(1))
+                        if finished == total_warps - 1:
+                            zero_fill_counters[0] = cutlass.Int32(0)
+                            zero_fill_counters[1] = cutlass.Int32(0)
+                            threadfence()
 
         if cutlass.const_expr(not self.pdl_trigger_early):
             griddepcontrol_launch_dependents()
@@ -4190,6 +4264,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_beta_stride: cutlass.Int32 = 0,
         situ_linear_beta_stride: cutlass.Int32 = 0,
         tile_idx_to_row_group_ptr: Optional[cute.Pointer] = None,
+        zero_fill_words_ptr: Optional[cute.Pointer] = None,
+        zero_fill_num_words: cutlass.Int32 = 0,
+        zero_fill_counters_ptr: Optional[cute.Pointer] = None,
+        zero_fill_other_tiles_ptr: Optional[cute.Pointer] = None,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
@@ -4281,6 +4359,27 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             if cutlass.const_expr(global_sf_ptr is not None)
             else None
         )
+        # Optional zero-fill of the finalize output (32-bit words), its
+        # (claim, done) counters and the other tile variant's tile count.
+        zero_fill_words = (
+            cute.make_tensor(
+                zero_fill_words_ptr, layout=cute.make_layout((zero_fill_num_words,))
+            )
+            if cutlass.const_expr(zero_fill_words_ptr is not None)
+            else None
+        )
+        zero_fill_counters = (
+            cute.make_tensor(zero_fill_counters_ptr, layout=cute.make_layout((2,)))
+            if cutlass.const_expr(zero_fill_counters_ptr is not None)
+            else None
+        )
+        zero_fill_other_tiles = (
+            cute.make_tensor(
+                zero_fill_other_tiles_ptr, layout=cute.make_layout((1,))
+            )
+            if cutlass.const_expr(zero_fill_other_tiles_ptr is not None)
+            else None
+        )
 
         return self(
             a,
@@ -4302,6 +4401,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             situ_beta_tensor=situ_beta_tensor,
             situ_linear_beta_tensor=situ_linear_beta_tensor,
             tile_idx_to_row_group=tile_idx_to_row_group,
+            zero_fill_words=zero_fill_words,
+            zero_fill_counters=zero_fill_counters,
+            zero_fill_other_tiles=zero_fill_other_tiles,
         )
 
 

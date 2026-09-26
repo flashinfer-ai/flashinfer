@@ -258,6 +258,9 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[Union[float, torch.Tensor]] = None,
     situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
+    # int32 (claim, done) counters, zeroed once: the gather GEMM1's epilogue
+    # warps zero-fill ``moe_output`` for the fused finalize (no memset launch).
+    zero_fill_counters: Optional[torch.Tensor] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
     _enable_decode_specialization: bool = False,
 ) -> torch.Tensor:
@@ -429,6 +432,17 @@ def _moe_core_impl(
         moe_output.record_stream(aux_stream)
 
     # Step 2: GEMM1 + activation
+    gemm1_zero_fill = (
+        zero_fill_counters is not None and use_fused_finalize and moe_output is not None
+    )
+    base_num_tiles = (
+        moe_sort_kwargs["out_base_active_num_non_exiting_tiles"]
+        if dual_tile_size
+        else num_non_exiting_tiles
+    )
+    alt_num_tiles = (
+        moe_sort_kwargs["out_alt_num_non_exiting_tiles"] if dual_tile_size else None
+    )
     a_dtype = "float8_e4m3fn" if is_mxfp8 else "float4_e2m1fn"
     sf_dtype = "float8_e8m0fnu" if is_mxfp8 else "float8_e4m3fn"
     sf_vec_size = 32 if is_mxfp8 else 16
@@ -483,6 +497,13 @@ def _moe_core_impl(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             gated=gated,
+            zero_fill_output=moe_output if gemm1_zero_fill else None,
+            zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
+            zero_fill_other_tiles=(
+                (alt_num_tiles if dual_tile_size else base_num_tiles)
+                if gemm1_zero_fill
+                else None
+            ),
             _prepared_launches=_prepared_launches,
         )
     )
@@ -530,6 +551,9 @@ def _moe_core_impl(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             gated=gated,
+            zero_fill_output=moe_output if gemm1_zero_fill else None,
+            zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
+            zero_fill_other_tiles=base_num_tiles if gemm1_zero_fill else None,
             _prepared_launches=alt_launches,
         )
         if _prepared_launches is not None:
@@ -554,7 +578,9 @@ def _moe_core_impl(
     # Atomic finalize requires a zeroed token output. Deterministic finalize
     # writes each route to a unique expanded row.
     if use_fused_finalize:
-        if use_async_memset:
+        if gemm1_zero_fill:
+            pass  # GEMM1's epilogue warps zero-filled the output.
+        elif use_async_memset:
             with torch.cuda.stream(aux_stream):
                 main_event.wait()
                 moe_output_memset_inplace(

@@ -277,6 +277,10 @@ def _get_compiled_gather_kernel(
     situ_linear_beta_stride: int = 0,
     weight_l2_hint: Optional[int] = None,
     pdl_trigger_early: bool = False,
+    zero_fill_words_ptr=None,
+    zero_fill_num_words: int = 0,
+    zero_fill_counters_ptr=None,
+    zero_fill_other_tiles_ptr=None,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -335,6 +339,7 @@ def _get_compiled_gather_kernel(
         weight_l2_hint,
         row_group_ptr is not None,
         pdl_trigger_early,
+        zero_fill_words_ptr is not None,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -396,6 +401,7 @@ def _get_compiled_gather_kernel(
                 runtime_situ_linear_beta=runtime_situ and situ_linear_beta is not None,
                 weight_l2_hint=weight_l2_hint,
                 pdl_trigger_early=pdl_trigger_early,
+                zero_fill=zero_fill_words_ptr is not None,
             )
         wrapper_fn = gemm.wrapper
 
@@ -441,6 +447,10 @@ def _get_compiled_gather_kernel(
                     "situ_beta_stride": situ_beta_stride,
                     "situ_linear_beta_stride": situ_linear_beta_stride,
                     "tile_idx_to_row_group_ptr": row_group_ptr,
+                    "zero_fill_words_ptr": zero_fill_words_ptr,
+                    "zero_fill_num_words": zero_fill_num_words,
+                    "zero_fill_counters_ptr": zero_fill_counters_ptr,
+                    "zero_fill_other_tiles_ptr": zero_fill_other_tiles_ptr,
                 }
                 if not is_rubin
                 else {}
@@ -493,6 +503,9 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
     tile_idx_to_row_group: Optional[torch.Tensor] = None,
+    zero_fill_output: Optional[torch.Tensor] = None,
+    zero_fill_counters: Optional[torch.Tensor] = None,
+    zero_fill_other_tiles: Optional[torch.Tensor] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
@@ -905,6 +918,58 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         row_group_ptr = make_ptr(
             cutlass.Int32, tile_idx_to_row_group.data_ptr(), cute.AddressSpace.gmem
         )
+    # Optional zero-fill of a 16-bit token output by the epilogue warps (the
+    # dense chain's fused finalize reduce-adds into it): the output, an int32
+    # (claim, done) counter pair zeroed once by the caller, and the tile count
+    # of the other tile variant (this launch's own count when there is none).
+    zero_fill_words_ptr = zero_fill_counters_ptr = zero_fill_other_tiles_ptr = None
+    zero_fill_num_words = 0
+    if zero_fill_output is not None:
+        if is_rubin:
+            raise NotImplementedError(
+                "zero_fill_output is not supported by the Rubin (SM107) gather "
+                "grouped GEMM kernel"
+            )
+        if (
+            zero_fill_output.dtype not in (torch.bfloat16, torch.float16)
+            or zero_fill_output.dim() != 2
+            or not zero_fill_output.is_contiguous()
+            or zero_fill_output.device != a.device
+            or zero_fill_output.shape[1] % 8
+            or zero_fill_output.data_ptr() % 16
+            or zero_fill_output.numel() // 2 >= 2**31
+        ):
+            raise ValueError(
+                "zero_fill_output must be a contiguous 16-bit 2-D tensor on the "
+                "input device with 16-byte aligned rows"
+            )
+        if (
+            zero_fill_counters is None
+            or zero_fill_counters.dtype != torch.int32
+            or zero_fill_counters.numel() < 2
+            or zero_fill_counters.device != a.device
+            or zero_fill_other_tiles is None
+            or zero_fill_other_tiles.dtype != torch.int32
+            or zero_fill_other_tiles.numel() < 1
+            or zero_fill_other_tiles.device != a.device
+        ):
+            raise ValueError(
+                "zero_fill_output needs int32 zero_fill_counters (2 entries) and "
+                "zero_fill_other_tiles (1 entry) on the input device"
+            )
+        zero_fill_words_ptr = make_ptr(
+            cutlass.Uint32,
+            zero_fill_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        zero_fill_num_words = zero_fill_output.numel() // 2
+        zero_fill_counters_ptr = make_ptr(
+            cutlass.Int32, zero_fill_counters.data_ptr(), cute.AddressSpace.gmem
+        )
+        zero_fill_other_tiles_ptr = make_ptr(
+            cutlass.Int32, zero_fill_other_tiles.data_ptr(), cute.AddressSpace.gmem
+        )
 
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
@@ -963,6 +1028,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_beta_stride=situ_beta_stride,
         situ_linear_beta_stride=situ_linear_beta_stride,
         row_group_ptr=row_group_ptr,
+        zero_fill_words_ptr=zero_fill_words_ptr,
+        zero_fill_num_words=zero_fill_num_words,
+        zero_fill_counters_ptr=zero_fill_counters_ptr,
+        zero_fill_other_tiles_ptr=zero_fill_other_tiles_ptr,
     )
 
     # Execute kernel with runtime parameters.
@@ -1000,6 +1069,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             "situ_beta_stride": situ_beta_stride,
             "situ_linear_beta_stride": situ_linear_beta_stride,
             "tile_idx_to_row_group_ptr": row_group_ptr,
+            "zero_fill_words_ptr": zero_fill_words_ptr,
+            "zero_fill_num_words": zero_fill_num_words,
+            "zero_fill_counters_ptr": zero_fill_counters_ptr,
+            "zero_fill_other_tiles_ptr": zero_fill_other_tiles_ptr,
         }
         if not is_rubin
         else {}

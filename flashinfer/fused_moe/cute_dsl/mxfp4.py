@@ -339,6 +339,25 @@ def _dense_async_memset(num_experts: int, num_local_experts: int) -> bool:
     return False
 
 
+# Dense chain with the fused finalize: let the gather GEMM1's epilogue warps
+# zero-fill the output (dynamic 16 KB chunks claimed from a counter once a
+# CTA's tiles are stored) instead of a separate ``cudaMemsetAsync``. The
+# memset takes every SM, so a GEMM1 launch enqueued behind it waits for the
+# whole fill (B300: 20 / 54 / 74 us at T = 8192 / 16384 / 32768); inside GEMM1
+# the CTAs without tiles fill while the others compute. Same vocabulary as
+# DENSE_ASYNC_MEMSET: "ep" = expert-parallel ranks only, "1" = every layout,
+# "0" = off (the memset path above).
+DENSE_FILL_IN_GEMM1 = os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1", "0")
+
+
+def _dense_fill_in_gemm1(num_experts: int, num_local_experts: int) -> bool:
+    if DENSE_FILL_IN_GEMM1 == "1":
+        return True
+    if DENSE_FILL_IN_GEMM1 == "ep":
+        return num_local_experts < num_experts
+    return False
+
+
 B300_SITU_DENSE_DUAL_TACTIC = _T256_N256_C1
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
 # applies the route weights (no bulk reduce-add into the output).
@@ -763,6 +782,7 @@ class Mxfp4MoEPlan:
                 route_ids=self._route_ids,
                 route_weights=self._route_weights,
                 output=self.output,
+                clear_output=self._kwargs.get("zero_fill_counters") is None,
             )
             self.run()
 
@@ -2316,6 +2336,14 @@ class CuteDslMxfp4MoEWrapper:
                 moe_output=output,
                 output_dtype=torch.bfloat16,
                 use_async_memset=False,
+                zero_fill_counters=(
+                    torch.zeros(2, dtype=torch.int32, device=output.device)
+                    if not dense_two_stage
+                    and _dense_fill_in_gemm1(
+                        self.num_experts, self.num_local_experts
+                    )
+                    else None
+                ),
                 use_fused_finalize=not dense_two_stage,
                 gemm2_partial_out=buffers["partial_rows"] if dense_two_stage else None,
                 skip_unpermute=dense_two_stage,
