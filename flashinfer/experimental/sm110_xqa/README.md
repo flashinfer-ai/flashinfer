@@ -1,8 +1,11 @@
 # Experimental SM110 XQA attention
 
-This opt-in module provides native `tcgen05` attention for NVIDIA Thor GPUs
-with the exact SM110a target. Call `flashinfer.sm110_xqa.prepare`
-for prepared replay or `attention` for a single invocation. It uses frozen
+This opt-in module provides native attention for NVIDIA Thor GPUs with the
+exact SM110a target in two physical kernel families: `tcgen05` (tensor memory,
+D128 decode and D512 tree) and `register_mma` (the register `mma.sync` XQA
+schedule, D512 tree only, selected with `kernel="register_mma"`). Call
+`flashinfer.sm110_xqa.prepare` for prepared replay or `attention` for a single
+invocation. It uses frozen
 CUDA sources, FlashInfer's JIT compiler and native TVM-FFI stream handling.
 Both entry points use FlashInfer's standard experimental API decorator:
 calling either is explicit opt-in and emits `ExperimentalWarning` once per
@@ -102,14 +105,21 @@ Neither API substitutes a kernel for another GPU architecture.
 
 The module requires CUDA 13.0 or newer and physical capability 11.0; the tested
 toolchain is CUDA 13.4. The frozen source manifest under `csrc/sm110_xqa/`
-specifies compiler flags and route geometry for six base routes, plus the
-single-partition specialization when required. Its `validation_status` field
+specifies compiler flags and route geometry for ten base routes (six
+`tcgen05` routes and the four `register_mma` D512 tree routes `tree_*_mma`),
+plus the single-partition specialization when required. Its `validation_status` field
 is an immutable source-generation record captured at freeze. Subsequent
 execution validation is documented separately in [RESULTS.md](RESULTS.md).
 The frozen D512 route declares a 128- or 256-column output tile and four or
 eight cooperating copy warps. Grid geometry comes from that manifest; native
 bindings use the traced thread block, shared memory and tensor-memory layout
 of the same physical candidate.
+The `register_mma` tree routes launch one 32-row Q tile per CTA over all 512
+output columns with eight QK warps and eight PV warps (512 threads, grid
+`(1, Hkv * ceil(Q * ratio / 32), B)`), the same tensor layouts, mask contract,
+dequantization scales and tolerances as the `tcgen05` tree routes, and no
+tensor memory. The two families are selected explicitly; nothing is dispatched
+automatically between them. D128 decode has only the `tcgen05` family.
 Each route also records whether it stages raw FP8 bytes asynchronously before
 widening to FP16. This physical option applies only to E4M3 cache routes; FP16
 routes always record it as disabled. Raw prefetch is enabled only when that

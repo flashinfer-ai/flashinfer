@@ -29,3 +29,48 @@ The source manifest is immutable and records status at generation time. Executio
 An independently installed wheel contains every manifest-listed CUDA file, native headers and the thin public API. Fresh native JIT and two replays each pass for D128 P=1/P=4 and paged FP8 tree attention with the source checkout absent from Python's import path. Packaging/install/native smoke takes 83.37 s (39.55/5.17/26.35 s for those phases); the full final-entry-point/benchmark/package step takes 121.04 s.
 
 This is a scoped sparse-source packaging smoke in the existing development environment. It uses TVM-FFI `0.1.dev1+gd1fd51222`, which is outside the declared `>=0.1.11,<0.2` dependency range, with dependency resolution disabled. It does not establish a dependency-resolved installation or complete release-wheel readiness.
+
+## Register-MMA D512 tree routes (`kernel="register_mma"`)
+
+The four `tree_*_mma` routes wrap the register `mma.sync` XQA schedule (one 32-row Q tile per CTA over all 512 output columns, eight QK warps and eight PV warps, no tensor memory) behind the same public API. Validation ran on the same NVIDIA Thor class of machine (20 SMs, compute capability 11.0), node `sr250v3-0681`, CUDA 13.4, PyTorch 2.15.0a0+875d815502.nvinternal.main, cupti-python 13.4.0, with the frozen sources compiled by FlashInfer's native JIT.
+
+Artifact parity uses the frozen schedule's own launcher and the exported TVM-FFI entry on identical tensors in one process: six alternating paired rounds (round order alternates schedule-first / export-first), 250 ms warmup and 256 CUPTI cold-L2 samples per round, no timer fallback, correctness against the FP32 oracle before and after timing. Values are medians of round medians; the acceptance rule is `abs(export / schedule - 1) <= 0.03` per row.
+
+| Shape | Frozen schedule (us) | Native export (us) | Absolute difference | Cake-first | Export-first |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tree_fp16_contiguous_mma | 29.5198 | 29.6645 | 0.490% | 1.0033 | 1.0071 |
+| tree_fp16_paged_mma | 34.5525 | 34.8003 | 0.717% | 1.0055 | 1.0088 |
+| tree_fp8_contiguous_mma | 23.9682 | 23.9520 | 0.068% | 1.0000 | 0.9986 |
+| tree_fp8_paged_mma | 25.7523 | 25.6400 | 0.436% | 0.9975 | 0.9950 |
+
+**All 4 register-MMA rows pass; maximum difference is 0.717%.**
+
+Public ledger benchmark (`benchmarks/bench_sm110_xqa.py`, 250.0 ms warmup, 256 CUPTI cold-L2 samples per row, one process for all 11 rows). The register-MMA rows are listed next to the tcgen05 rows of the same shape measured in the same process; the ratio is the tcgen05 latency over the register-MMA latency and describes these two frozen schedules only.
+
+| Ledger row | Kernel family | Native latency (us) | Ratio to the tcgen05 row |
+| --- | --- | ---: | ---: |
+| tree_fp16_contiguous | tcgen05 | 69.216 | 1 (reference row) |
+| tree_fp16_paged | tcgen05 | 73.152 | 1 (reference row) |
+| tree_fp8_contiguous | tcgen05 | 61.361 | 1 (reference row) |
+| tree_fp8_paged | tcgen05 | 61.008 | 1 (reference row) |
+| tree_fp16_contiguous_mma | register_mma | 31.585 | 2.191x faster |
+| tree_fp16_paged_mma | register_mma | 38.112 | 1.919x faster |
+| tree_fp8_contiguous_mma | register_mma | 24.000 | 2.557x faster |
+| tree_fp8_paged_mma | register_mma | 26.080 | 2.339x faster |
+
+Correctness: JIT metadata suite 35 passed, 19 warnings in 1.24s; GPU suite 89 passed, 21 warnings in 61.15s (0:01:01) (the register-MMA cases reuse the tcgen05 numerical ledger, packed and paged inputs, replay and rejection checks at `atol=rtol=0.01`).
+
+Synchronization: separate Compute Sanitizer `synccheck` and `racecheck` invocations per route, each under a hard 20 s process-tree wall-clock limit (a timeout would be recorded as skipped, never retried; `memcheck` is not run). Every `synccheck` run reports 0 errors. `racecheck` completes on every route with 0 errors and reports warning-level hazards (fp16_contiguous 144, fp16_paged 125, fp8_contiguous 4, fp8_paged 12); the flagged sites are the schedule's mbarrier-ordered shared-memory handoffs (`racecheck` does not model `mbarrier` waits), see `validation.json` for the per-route opcode summary.
+
+| Route | Tool | Verdict | Wall | Summary |
+| --- | --- | --- | ---: | --- |
+| fp16_contiguous | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| fp16_contiguous | racecheck | pass_with_warnings | 19 s | ========= RACECHECK SUMMARY: 100 hazards displayed (0 errors, 144 warnings) |
+| fp16_paged | synccheck | pass | 7 s | ========= ERROR SUMMARY: 0 errors |
+| fp16_paged | racecheck | pass_with_warnings | 19 s | ========= RACECHECK SUMMARY: 100 hazards displayed (0 errors, 125 warnings) |
+| fp8_contiguous | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| fp8_contiguous | racecheck | pass_with_warnings | 12 s | ========= RACECHECK SUMMARY: 4 hazards displayed (0 errors, 4 warnings) |
+| fp8_paged | synccheck | pass | 7 s | ========= ERROR SUMMARY: 0 errors |
+| fp8_paged | racecheck | pass_with_warnings | 13 s | ========= RACECHECK SUMMARY: 12 hazards displayed (0 errors, 12 warnings) |
+
+Physical turnaround (managed step seconds on the Thor node): patch apply 2, hook tooling and environment 8, upstream pre-commit hooks 5, JIT metadata tests 9, GPU suite 69, ledger benchmark 12 (5.4 s payload), artifact parity 127 (124.8 s payload), sanitizers 13. GPU kernel runtime is shown separately in the tables.

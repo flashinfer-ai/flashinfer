@@ -15,14 +15,32 @@ from ...jit.core import JitSpec, gen_jit_spec, sm110a_nvcc_flags
 
 SCHEMA = "flashinfer.sm110_xqa.v1"
 DECODE_SINGLE_PARTITION_ROUTE = "decode_fp16_contiguous_single_partition"
+TREE_KERNELS = ("tcgen05", "register_mma")
+MMA_ROUTE_SUFFIX = "_mma"
 ROUTE_ENTRIES = {
     "tree_fp16_contiguous": "run_tree",
     "tree_fp16_paged": "run_tree",
     "tree_fp8_contiguous": "run_tree",
     "tree_fp8_paged": "run_tree",
+    "tree_fp16_contiguous_mma": "run_tree",
+    "tree_fp16_paged_mma": "run_tree",
+    "tree_fp8_contiguous_mma": "run_tree",
+    "tree_fp8_paged_mma": "run_tree",
     "decode_fp16_contiguous": "run_decode",
     "decode_merge": "run_decode_merge",
 }
+
+
+def route_kernel(name: str, route: dict[str, Any]) -> str:
+    """Physical kernel family of a route: ``register_mma`` for the ``*_mma`` tree routes, else ``tcgen05``."""
+    kernel = route.get("kernel", "tcgen05")
+    if kernel not in TREE_KERNELS:
+        raise ValueError(f"unknown kernel family for {name}")
+    if name.startswith("tree_") and name.endswith(MMA_ROUTE_SUFFIX) != (
+        kernel == "register_mma"
+    ):
+        raise ValueError(f"route name and kernel family disagree for {name}")
+    return kernel
 
 
 def _source_root() -> Path:
@@ -42,7 +60,7 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
     routes = manifest.get("routes")
     if not isinstance(routes, dict) or not set(ROUTE_ENTRIES).issubset(routes):
         raise ValueError(
-            "SM110 XQA manifest must enumerate all six base physical routes"
+            "SM110 XQA manifest must enumerate all ten base physical routes"
         )
     producer = routes["decode_fp16_contiguous"]
     expected_entries = dict(ROUTE_ENTRIES)
@@ -95,12 +113,26 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
             raise ValueError("route options must not override the exact SM110a target")
         if name.startswith("tree_"):
             rows, columns = route.get("tile_rows"), route.get("output_tile_columns")
-            if (
+            if route_kernel(name, route) == "register_mma":
+                # Register-MMA tree route: one 32-row Q tile per CTA covering all 512 output
+                # columns, eight QK warps and eight PV warps (512 threads).
+                if (
+                    rows != 32
+                    or columns != 512
+                    or route.get("qk_warps") != 8
+                    or route.get("pv_warps") != 8
+                ):
+                    raise ValueError(
+                        f"unsupported register-MMA tree launch geometry for {name}"
+                    )
+            elif (
                 rows not in (64, 128)
                 or columns not in (128, 256)
                 or route.get("copy_warps") not in (4, 8)
             ):
                 raise ValueError(f"unsupported tree launch geometry for {name}")
+        elif route_kernel(name, route) != "tcgen05":
+            raise ValueError(f"decode routes have a single kernel family: {name}")
         elif name in ("decode_fp16_contiguous", DECODE_SINGLE_PARTITION_ROUTE):
             tokens = route.get("partition_tokens")
             if (

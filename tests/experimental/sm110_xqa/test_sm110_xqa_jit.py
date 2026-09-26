@@ -29,7 +29,15 @@ def _package(tmp_path):
                 "sources": ["integrity.cu"],
                 "nvcc_options": [],
                 **(
-                    {"tile_rows": 64, "output_tile_columns": 128, "copy_warps": 8}
+                    {
+                        "kernel": "register_mma",
+                        "tile_rows": 32,
+                        "output_tile_columns": 512,
+                        "qk_warps": 8,
+                        "pv_warps": 8,
+                    }
+                    if name.startswith("tree_") and name.endswith("_mma")
+                    else {"tile_rows": 64, "output_tile_columns": 128, "copy_warps": 8}
                     if name.startswith("tree_")
                     else {}
                 ),
@@ -99,7 +107,7 @@ def test_incomplete_route_inventory_is_rejected(tmp_path):
     manifest = _package(tmp_path)
     del manifest["routes"]["decode_merge"]
     _write(tmp_path, manifest)
-    with pytest.raises(ValueError, match="all six"):
+    with pytest.raises(ValueError, match="all ten"):
         _read_manifest(tmp_path)
 
 

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Seven native SM110 XQA rows using FlashInfer's CUPTI cold-L2 timer.
+"""Native SM110 XQA ledger rows (tcgen05 and register-MMA routes) using FlashInfer's CUPTI cold-L2 timer.
 
 This reports native latency samples, not a source/export equivalence audit.
 Compilation, allocation, and the FP32 oracle run outside measured replay.
@@ -115,6 +115,7 @@ def inputs_and_reference(shape, recipes):
         outputs.append(value)
     expected = torch.stack(outputs).to(torch.float16)
     kwargs = dict(
+        kernel=shape.get("kernel", "tcgen05"),
         mask=mask,
         page_table=pages,
         page_size=shape["page_size"],
@@ -184,12 +185,13 @@ def main():
     ledger = json.loads(ledger_bytes)
     if (
         ledger["architecture"] != "sm_110a"
-        or ledger["shape_count"] != 7
-        or len(ledger["shapes"]) != 7
+        or ledger["shape_count"] != len(ledger["shapes"])
         or [row["name"] for row in ledger["shapes"]] != manifest["shape_denominator"]
         or hashlib.sha256(ledger_bytes).hexdigest() != manifest["shape_ledger_sha256"]
     ):
-        raise ValueError("benchmark ledger must match the frozen seven-row manifest")
+        raise ValueError(
+            "benchmark ledger must match the frozen manifest shape denominator"
+        )
     if ledger["inputs"] != {
         "tree": {"distribution": "uniform", "minimum": -1.0, "maximum": 1.0, "seed": 0},
         "decode": {"distribution": "normal", "mean": 0.0, "std": 1.0, "seed": 0},
@@ -257,7 +259,7 @@ def main():
         }
         report["rows"].append(row)
         report.update(
-            complete=len(report["rows"]) == 7,
+            complete=len(report["rows"]) == len(ledger["shapes"]),
             physical_seconds=time.monotonic() - started,
         )
         save(args.output, report)

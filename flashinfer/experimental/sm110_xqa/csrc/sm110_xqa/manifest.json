@@ -25,11 +25,23 @@
     "sm_110a/sm110_xqa_tree_fp16_contiguous_kernel.cu": {
       "sha256": "ca8ca959534144b18756cab5c5288e4a9cef88153786e7ac742b55f475f9ac18"
     },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_mma_binding.cu": {
+      "sha256": "a2afb7b447272d95e826f20856fc371b2775ca615e9cd24807dc03a829167973"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_mma_kernel.cu": {
+      "sha256": "3435e1351208b58bd38dbec71acb51b5d45d4cede7b540e75db046441d68ddf6"
+    },
     "sm_110a/sm110_xqa_tree_fp16_paged_binding.cu": {
       "sha256": "a291f25e709abbd60aa74f60eb6bc9c11b508ef352184fd3f4a0803ca026dc48"
     },
     "sm_110a/sm110_xqa_tree_fp16_paged_kernel.cu": {
       "sha256": "2213de7d2f75879529a8bb223e23131c51d283659286d936f3c0e8d5f9082348"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_mma_binding.cu": {
+      "sha256": "02301e1fe61e01092718856d7526fcb14fb1969fbb9f5056b04b307e8d757e43"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_mma_kernel.cu": {
+      "sha256": "9ab2a47db873e6f05e17ce40c06296e7198020fe905a9e06981a124677ff5dd5"
     },
     "sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu": {
       "sha256": "f114800fff81ec7092824080927b505326be0472842ab159d13fc7e331a6be76"
@@ -37,11 +49,23 @@
     "sm_110a/sm110_xqa_tree_fp8_contiguous_kernel.cu": {
       "sha256": "094c8e88f8a32ffbccb9390ef352127f05fb163a6f50de94fc4838fbbedfd052"
     },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_mma_binding.cu": {
+      "sha256": "d223d6388e1166cb017b5a94137141ec3154d7254da6d3a17525faa76a91b2a4"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_mma_kernel.cu": {
+      "sha256": "5e28b7d80817db1cf8007ace12ed5645c7eee530fee18eb314542a96273b57a6"
+    },
     "sm_110a/sm110_xqa_tree_fp8_paged_binding.cu": {
       "sha256": "59a4b291c580b8b3a423c06db4038ce0af9dd7d9875bd9524954d2b6601941b1"
     },
     "sm_110a/sm110_xqa_tree_fp8_paged_kernel.cu": {
       "sha256": "5bf260c9792e85fd1ed6679b57fb4c525a9c23416732a47cfd0e7d1b90842e5f"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_mma_binding.cu": {
+      "sha256": "f9336e5104a3b5642e758e5eb55a3a5750f3d3d15a8e26ccc821ee869371d88f"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_mma_kernel.cu": {
+      "sha256": "f3a53f957ece731f3c60e6c2054ae2e520bc9c14e323bff43f8508c02242f0d1"
     }
   },
   "routes": {
@@ -400,6 +424,115 @@
       "tmem_columns": 512,
       "use_pdl": false
     },
+    "tree_fp16_contiguous_mma": {
+      "kernel": "register_mma",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_mma_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_mma_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous_mma",
+      "block": [
+        256,
+        1,
+        2
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 199936,
+      "tile_rows": 32,
+      "output_tile_columns": 512,
+      "qk_warps": 8,
+      "pv_warps": 8,
+      "kv_l2_prefetch": true,
+      "qk_split_idle_warps": true,
+      "source_cubin_sha256": "34f4520a9fbd19a93dedf5f9013936a6380e995df2b827eb3b6652f6628e744b",
+      "device_parameters": [
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "ctype": "const __half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_sinks",
+          "ctype": "const float*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "semaphores",
+          "ctype": "uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "scratch",
+          "ctype": "void*",
+          "kind": "pointer"
+        }
+      ]
+    },
     "tree_fp16_paged": {
       "block": [
         256,
@@ -510,6 +643,115 @@
       "tile_rows": 64,
       "tmem_columns": 512,
       "use_pdl": false
+    },
+    "tree_fp16_paged_mma": {
+      "kernel": "register_mma",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_paged_mma_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_mma_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_mma",
+      "block": [
+        256,
+        1,
+        2
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 199936,
+      "tile_rows": 32,
+      "output_tile_columns": 512,
+      "qk_warps": 8,
+      "pv_warps": 8,
+      "kv_l2_prefetch": true,
+      "qk_split_idle_warps": true,
+      "source_cubin_sha256": "4270ff0b05c966efc564189e2dee04b5c00d03e459b56757ce308e56e46bdae3",
+      "device_parameters": [
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "ctype": "const __half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_sinks",
+          "ctype": "const float*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "semaphores",
+          "ctype": "uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "scratch",
+          "ctype": "void*",
+          "kind": "pointer"
+        }
+      ]
     },
     "tree_fp8_contiguous": {
       "block": [
@@ -622,6 +864,115 @@
       "tmem_columns": 512,
       "use_pdl": false
     },
+    "tree_fp8_contiguous_mma": {
+      "kernel": "register_mma",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_mma_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_mma_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous_mma",
+      "block": [
+        256,
+        1,
+        2
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 167168,
+      "tile_rows": 32,
+      "output_tile_columns": 512,
+      "qk_warps": 8,
+      "pv_warps": 8,
+      "kv_l2_prefetch": true,
+      "qk_split_idle_warps": false,
+      "source_cubin_sha256": "f09054b3e0cb6ef838ace6fd078f1cc526b3703c5c374b9d98f0ee3aec41b5db",
+      "device_parameters": [
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "ctype": "const __half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_sinks",
+          "ctype": "const float*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "semaphores",
+          "ctype": "uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "scratch",
+          "ctype": "void*",
+          "kind": "pointer"
+        }
+      ]
+    },
     "tree_fp8_paged": {
       "block": [
         256,
@@ -732,19 +1083,132 @@
       "tile_rows": 64,
       "tmem_columns": 512,
       "use_pdl": false
+    },
+    "tree_fp8_paged_mma": {
+      "kernel": "register_mma",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_paged_mma_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_mma_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged_mma",
+      "block": [
+        256,
+        1,
+        2
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 167168,
+      "tile_rows": 32,
+      "output_tile_columns": 512,
+      "qk_warps": 8,
+      "pv_warps": 8,
+      "kv_l2_prefetch": true,
+      "qk_split_idle_warps": true,
+      "source_cubin_sha256": "dd1e634960136b2093563aa120aab81daeabb0794e7fa92094555ba7740eab57",
+      "device_parameters": [
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "ctype": "const __half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_sinks",
+          "ctype": "const float*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "semaphores",
+          "ctype": "uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "scratch",
+          "ctype": "void*",
+          "kind": "pointer"
+        }
+      ]
     }
   },
   "schema": "flashinfer.sm110_xqa.v1",
-  "shape_count": 7,
+  "shape_count": 11,
   "shape_denominator": [
     "tree_fp16_contiguous",
     "tree_fp16_paged",
     "tree_fp8_contiguous",
     "tree_fp8_paged",
+    "tree_fp16_contiguous_mma",
+    "tree_fp16_paged_mma",
+    "tree_fp8_contiguous_mma",
+    "tree_fp8_paged_mma",
     "decode_b1_c1024",
     "decode_b2_c512",
     "decode_b4_c256"
   ],
-  "shape_ledger_sha256": "a23f0c1a390d8feb860b7cdbd4c99f17b9f806d70cb429602c86d094a88c4b8d",
+  "shape_ledger_sha256": "c0179de0baba2503a52411dbfef1bcec53d9bc107da9336c5a6548289ffa64ea",
   "validation_status": "source_only_unvalidated"
 }

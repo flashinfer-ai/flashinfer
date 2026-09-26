@@ -232,8 +232,20 @@ CACHE_CASES = [
 ]
 
 
+KERNELS = ("tcgen05", "register_mma")
+
+
 def _tree_case(
-    batch, queries, capacity, ratio, lengths, distribution, mask_kind, fp8, paged
+    batch,
+    queries,
+    capacity,
+    ratio,
+    lengths,
+    distribution,
+    mask_kind,
+    fp8,
+    paged,
+    kernel="tcgen05",
 ):
     q = _sample((batch, queries, 4 * ratio, 512), distribution)
     kv = _sample((batch, 2, 4, capacity, 512), distribution, seed=29)
@@ -257,26 +269,42 @@ def _tree_case(
         page_size=128 if paged else 0,
         k_scale=k_scale,
         v_scale=v_scale,
+        kernel=kernel,
     )
     torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
     for tensor, original in zip(inputs, originals, strict=True):
         torch.testing.assert_close(tensor.view(torch.uint8), original, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize(
     "batch,queries,capacity,ratio,mask_kind,distribution", CONTIGUOUS_CASES
 )
-def test_tree_contiguous(batch, queries, capacity, ratio, mask_kind, distribution):
+def test_tree_contiguous(
+    batch, queries, capacity, ratio, mask_kind, distribution, kernel
+):
     _tree_case(
-        batch, queries, capacity, ratio, None, distribution, mask_kind, False, False
+        batch,
+        queries,
+        capacity,
+        ratio,
+        None,
+        distribution,
+        mask_kind,
+        False,
+        False,
+        kernel,
     )
 
 
+@pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("fp8,paged", [(False, True), (True, False), (True, True)])
 @pytest.mark.parametrize(
     "batch,queries,capacity,ratio,lengths,distribution", CACHE_CASES
 )
-def test_tree_cache(batch, queries, capacity, ratio, lengths, distribution, fp8, paged):
+def test_tree_cache(
+    batch, queries, capacity, ratio, lengths, distribution, fp8, paged, kernel
+):
     _tree_case(
         batch,
         queries,
@@ -287,13 +315,31 @@ def test_tree_cache(batch, queries, capacity, ratio, lengths, distribution, fp8,
         "causal" if lengths is None else "binary_tree",
         fp8,
         paged,
+        kernel,
     )
 
 
+def test_decode_rejects_register_mma_kernel():
+    q = _sample((1, 32, 128))
+    kv = _sample((1, 2, 4, 256, 128), seed=23)
+    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="tcgen05 kernel family"):
+        prepare(q, kv, seq, kernel="register_mma")
+
+
+def test_tree_rejects_unknown_kernel():
+    q = _sample((1, 4, 32, 512))
+    kv = _sample((1, 2, 4, 256, 512), seed=23)
+    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="kernel must be one of"):
+        prepare(q, kv, seq, mask=_mask(4, 1, "causal"), kernel="wgmma")
+
+
+@pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize(
     "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
 )
-def test_packed_tree(fp8, paged):
+def test_packed_tree(fp8, paged, kernel):
     counts, lengths = (7, 33), (129, 257)
     uniform_q = _sample((2, 33, 32, 512), "normal")
     kv = _sample((2, 2, 4, 384, 512), "normal", seed=31)
@@ -335,6 +381,7 @@ def test_packed_tree(fp8, paged):
         max_q_len=33,
         k_scale=k_scale,
         v_scale=v_scale,
+        kernel=kernel,
     )
     torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
     for tensor, original in zip(inputs, originals, strict=True):
