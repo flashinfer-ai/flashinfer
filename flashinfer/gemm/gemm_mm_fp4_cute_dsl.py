@@ -41,6 +41,16 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
     )
 
 
+def _blockscaled_mxfp8_gemm_cache_key_files() -> tuple:
+    """Source files whose content invalidates the on-disk mm_mxfp8 kernels."""
+    from .kernels import dense_blockscaled_gemm_sm100_splitk
+
+    return (
+        *_blockscaled_gemm_cache_key_files(),
+        dense_blockscaled_gemm_sm100_splitk.__file__,
+    )
+
+
 def _compile_block_scaled_gemm(
     cache,
     cache_key,
@@ -58,6 +68,8 @@ def _compile_block_scaled_gemm(
     cluster_shape_k=1,
     cache_module_name=None,
     device_index=None,
+    disk_kernel_name_fn=None,
+    cache_key_files_fn=None,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -107,11 +119,15 @@ def _compile_block_scaled_gemm(
     else:
         from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
+        if disk_kernel_name_fn is None:
+            disk_kernel_name_fn = _blockscaled_kernel_disk_name
+        if cache_key_files_fn is None:
+            cache_key_files_fn = _blockscaled_gemm_cache_key_files
         compiled_gemm = build_and_load_cute_dsl_kernel(
             cache_module_name,
-            _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters),
+            disk_kernel_name_fn(cache_key, batch_size, max_active_clusters),
             compile_kernel,
-            extra_key_files=_blockscaled_gemm_cache_key_files(),
+            extra_key_files=cache_key_files_fn(),
         )
 
     result = (compiled_gemm, max_active_clusters)
@@ -155,6 +171,51 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
         f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_{kernel_type}"
         f"_tma{tma}_pdl{int(enable_pdl)}_{dtype}"
+        f"_b{batch_size}_mac{max_active_clusters}"
+    )
+
+
+def _mm_mxfp8_cache_key(
+    sf_vec_size,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    swap_ab,
+    use_prefetch,
+    enable_pdl,
+    out_dtype,
+    split_k_slices,
+):
+    """In-memory and on-disk specialization key for SM100 mm_mxfp8."""
+    return (
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        swap_ab,
+        use_prefetch,
+        enable_pdl,
+        out_dtype,
+        split_k_slices,
+    )
+
+
+def _mxfp8_blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
+    """On-disk kernel name encoding every SM100 mm_mxfp8 codegen parameter."""
+    (
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        swap_ab,
+        use_prefetch,
+        enable_pdl,
+        out_dtype,
+        split_k_slices,
+    ) = cache_key
+    dtype = str(out_dtype).removeprefix("torch.")
+    return (
+        f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+        f"_swap{int(swap_ab)}_pf{int(use_prefetch)}"
+        f"_pdl{int(enable_pdl)}_{dtype}_splitk{split_k_slices}"
         f"_b{batch_size}_mac{max_active_clusters}"
     )
 
