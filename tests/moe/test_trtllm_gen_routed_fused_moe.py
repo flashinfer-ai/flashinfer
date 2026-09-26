@@ -437,7 +437,7 @@ def test_trtllm_gen_routed_fused_moe_unpacked_fp32(
 def test_prims_ts_fp4_nvfp4_routed_renormalize_smoke():
     """Representative PrimTS FP4 routed case after env-switch removal."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3)]:
+    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")
@@ -476,7 +476,7 @@ def test_prims_ts_fp4_nvfp4_routed_renormalize_smoke():
 
 def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3)]:
+    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")

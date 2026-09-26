@@ -92,21 +92,22 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
-inline void CheckExactSM100(int32_t device_id) {
+inline void CheckSM100Family(int32_t device_id) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 0)
-      << "Blackwell BGMV MoE requires exact compute capability 10.0, got " << major << "." << minor;
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
+      << "Blackwell BGMV MoE requires compute capability 10.0, 10.3 or 10.7, got " << major << "."
+      << minor;
 }
 
 void Configure() {
   int32_t device_id = 0;
   CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
-  CheckExactSM100(device_id);
+  CheckSM100Family(device_id);
 
   int32_t max_dynamic_smem = 0;
   CheckCuda(
@@ -136,7 +137,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CHECK_CUDA(x);
   const int32_t device_id = x.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckExactSM100(device_id);
+  CheckSM100Family(device_id);
 
   CHECK_CUDA(y_accum);
   CHECK_CUDA(shrink_out);

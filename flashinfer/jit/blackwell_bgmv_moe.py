@@ -20,11 +20,30 @@ import functools
 from pathlib import Path
 from typing import Literal, NamedTuple
 
+import torch
+
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
 from .utils import write_if_different
 
 BlackwellBGMVMoEDType = Literal["bfloat16", "float16"]
+BlackwellBGMVMoETarget = Literal["sm100a", "sm103a", "sm107a"]
+# The generated sources under csrc/blackwell_bgmv_moe/sm100a/ contain no
+# architecture-specific instructions (cp.async + shfl + TMA descriptors), so
+# the same bodies are compiled once per SM100-family target. The directory
+# name records where they were first generated, not where they run.
+_TARGET_FLAGS = {
+    "sm100a": sm100a_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
+    "sm107a": sm107a_nvcc_flags,
+}
 BlackwellBGMVMoESchedule = Literal[
     "token_owned_t64",
     "token_owned",
@@ -144,16 +163,43 @@ def _get_include_dir() -> Path:
     )
 
 
+def select_blackwell_bgmv_moe_target(
+    device: torch.device,
+) -> BlackwellBGMVMoETarget:
+    """Map a CUDA device to the nvcc target its BGMV MoE module is built for."""
+    from .cpp_ext import is_cuda_version_at_least
+
+    capability = tuple(int(v) for v in torch.cuda.get_device_capability(device))
+    if capability == (10, 0):
+        return "sm100a"
+    if capability == (10, 3):
+        return "sm103a"
+    if capability == (10, 7):
+        if not is_cuda_version_at_least("13.0"):
+            raise RuntimeError(
+                "Blackwell BGMV MoE on compute capability 10.7 requires CUDA 13.0 "
+                "or newer for the sm_107a target"
+            )
+        return "sm107a"
+    raise RuntimeError(
+        "Blackwell BGMV MoE requires compute capability 10.0, 10.3 or 10.7, "
+        f"got {capability[0]}.{capability[1]}"
+    )
+
+
 def get_blackwell_bgmv_moe_uri(
     hidden_size: int,
     dtype: BlackwellBGMVMoEDType,
+    target: BlackwellBGMVMoETarget = "sm100a",
 ) -> str:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Blackwell BGMV MoE target: {target}")
     tag = _dtype_tag(dtype)
     if hidden_size not in BLACKWELL_BGMV_MOE_HIDDEN_SIZES:
         raise ValueError(
             f"Blackwell BGMV MoE hidden_size must be 2688 or 3072, got {hidden_size}"
         )
-    return f"blackwell_bgmv_moe_{tag}_h{hidden_size}_sm100a"
+    return f"blackwell_bgmv_moe_{tag}_h{hidden_size}_{target}"
 
 
 def _binding_source(metadata: BlackwellBGMVMoEMetadata, hidden_size: int) -> str:
@@ -181,6 +227,7 @@ def _binding_source(metadata: BlackwellBGMVMoEMetadata, hidden_size: int) -> str
 def gen_blackwell_bgmv_moe_module(
     hidden_size: int,
     dtype: BlackwellBGMVMoEDType,
+    target: BlackwellBGMVMoETarget = "sm100a",
 ) -> JitSpec:
     metadata = _metadata(hidden_size, dtype)
     csrc_dir = _get_csrc_dir()
@@ -194,13 +241,13 @@ def gen_blackwell_bgmv_moe_module(
             f"Blackwell BGMV MoE binding header not found: {binding_header}"
         )
 
-    uri = get_blackwell_bgmv_moe_uri(hidden_size, dtype)
+    uri = get_blackwell_bgmv_moe_uri(hidden_size, dtype, target)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "blackwell_bgmv_moe_binding.cu"
     write_if_different(binding, _binding_source(metadata, hidden_size))
     spec = gen_jit_spec(
         name=uri,
         sources=[binding],
-        extra_cuda_cflags=[*sm100a_nvcc_flags, "-use_fast_math"],
+        extra_cuda_cflags=[*_TARGET_FLAGS[target], "-use_fast_math"],
         extra_include_paths=[csrc_dir, csrc_dir.parents[1], include_dir],
     )
     logger.info("Generated Blackwell BGMV MoE JIT spec: %s", spec.name)
@@ -211,13 +258,15 @@ def gen_blackwell_bgmv_moe_module(
 def load_blackwell_bgmv_moe_module(
     hidden_size: int,
     dtype: BlackwellBGMVMoEDType,
+    target: BlackwellBGMVMoETarget = "sm100a",
 ):
-    module = gen_blackwell_bgmv_moe_module(hidden_size, dtype).build_and_load()
+    module = gen_blackwell_bgmv_moe_module(hidden_size, dtype, target).build_and_load()
     module.configure()
     logger.info(
-        "Loaded Blackwell BGMV MoE module for hidden_size=%d, dtype=%s",
+        "Loaded Blackwell BGMV MoE module for hidden_size=%d, dtype=%s, target=%s",
         hidden_size,
         dtype,
+        target,
     )
     return module
 
@@ -225,8 +274,9 @@ def load_blackwell_bgmv_moe_module(
 def get_blackwell_bgmv_moe_module(
     hidden_size: int,
     dtype: BlackwellBGMVMoEDType,
+    target: BlackwellBGMVMoETarget = "sm100a",
 ):
-    return load_blackwell_bgmv_moe_module(hidden_size, dtype)
+    return load_blackwell_bgmv_moe_module(hidden_size, dtype, target)
 
 
 __all__ = [
@@ -236,9 +286,11 @@ __all__ = [
     "BlackwellBGMVMoEDType",
     "BlackwellBGMVMoEMetadata",
     "BlackwellBGMVMoESchedule",
+    "BlackwellBGMVMoETarget",
     "gen_blackwell_bgmv_moe_module",
     "get_blackwell_bgmv_moe_module",
     "get_blackwell_bgmv_moe_uri",
     "load_blackwell_bgmv_moe_module",
     "select_blackwell_bgmv_moe_schedule",
+    "select_blackwell_bgmv_moe_target",
 ]

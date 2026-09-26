@@ -177,8 +177,8 @@ def test_packed_mxfp8_dispatch_width_uses_supported_transport_rows():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="MXFP8 quantization needs SM100/SM103",
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="MXFP8 quantization needs SM100/SM103/SM107",
 )
 def test_mxfp8_pre_dispatch_payload_matches_post_dispatch_quantization():
     num_local_experts, cap, hidden = 2, 3, 256
