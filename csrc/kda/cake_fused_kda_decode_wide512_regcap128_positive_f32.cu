@@ -598,8 +598,8 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 
 extern "C" {
 
-__global__ __launch_bounds__(512, 2) void
-kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_fused_kda_decode_wide512_regcap128_positive_f32(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -656,21 +656,20 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
         int channel_pair = tid_0 - qkv_idx * 64;
         int channel = channel_pair * 2;
         int channel_base = qkv_idx * hidden + head * 128 + channel;
-        __nv_bfloat16* conv_src = conv_state + ((long long)slot * (long long)conv_slot_stride);
-        int conv_base = channel_base;
+        int conv_base = slot * conv_slot_stride + channel_base;
         {
             uint32_t _bf16x2_bits_0;
-            _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(conv_src + conv_base);
+            _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base);
             state_carriers[0] = _bf16x2_bits_0;
         }
         {
             uint32_t _bf16x2_bits_1;
-            _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_src + conv_base + qkv_size);
+            _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + qkv_size);
             state_carriers[1] = _bf16x2_bits_1;
         }
         {
             uint32_t _bf16x2_bits_2;
-            _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_src + conv_base + 2 * qkv_size);
+            _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + 2 * qkv_size);
             state_carriers[2] = _bf16x2_bits_2;
         }
         int x_base = row * x_row_stride + channel_base;
@@ -713,12 +712,12 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
         sMixed[qkv_idx * 192 + smem_channel] = (float)(__nv_bfloat16)silu0;
         sMixed[qkv_idx * 192 + smem_channel + 1] = (float)(__nv_bfloat16)silu1;
         if (is_live != 0) {
-            conv_src[conv_base] = r_q[2];
-            conv_src[conv_base + 1] = r_q[3];
-            conv_src[conv_base + qkv_size] = r_q[4];
-            conv_src[conv_base + qkv_size + 1] = r_q[5];
-            conv_src[conv_base + 2 * qkv_size] = r_q[6];
-            conv_src[conv_base + 2 * qkv_size + 1] = r_q[7];
+            conv_state[conv_base] = r_q[2];
+            conv_state[conv_base + 1] = r_q[3];
+            conv_state[conv_base + qkv_size] = r_q[4];
+            conv_state[conv_base + qkv_size + 1] = r_q[5];
+            conv_state[conv_base + 2 * qkv_size] = r_q[6];
+            conv_state[conv_base + 2 * qkv_size + 1] = r_q[7];
         }
     }
     if (tid_0 >= 384) {
@@ -757,8 +756,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
             sBeta[0] = _tanh_approx_4 * 0.5f + 0.5f;
         }
     }
-    float* state_src = state + ((long long)slot * (long long)state_slot_stride);
-    int state_head_base = head * 128 * 128;
+    int state_head_base = slot * state_slot_stride + head * 128 * 128;
     int state_group_base = state_head_base + state_owner_row_base * 128 + k_start;
     #pragma unroll
     for (int local_row = 0; local_row < 4; local_row++) {
@@ -772,7 +770,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
             unsigned _ldv8_3_6;
             unsigned _ldv8_3_7;
             asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(state_src + (state_group_base + local_row * 128))) : "memory");
+                : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(state + (state_group_base + local_row * 128))) : "memory");
             state_regs[local_row * 8 + 0] = __uint_as_float(_ldv8_3_0);
             state_regs[local_row * 8 + 1] = __uint_as_float(_ldv8_3_1);
             state_regs[local_row * 8 + 2] = __uint_as_float(_ldv8_3_2);
@@ -871,7 +869,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _ldv8_4_6;
                     unsigned _ldv8_4_7;
                     asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(state_src + (state_tile_base + local_row_1 * 128))) : "memory");
+                        : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(state + (state_tile_base + local_row_1 * 128))) : "memory");
                     state_regs[local_row_1 * 8 + 0] = __uint_as_float(_ldv8_4_0);
                     state_regs[local_row_1 * 8 + 1] = __uint_as_float(_ldv8_4_1);
                     state_regs[local_row_1 * 8 + 2] = __uint_as_float(_ldv8_4_2);
@@ -1116,7 +1114,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _stv8_5_7 = __float_as_uint(state_regs[local_row_a * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_a * 128))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + local_row_a * 128))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
                 }
                 {
                     unsigned _stv8_6_0 = __float_as_uint(state_regs[local_row_b * 8 + 0]);
@@ -1129,7 +1127,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _stv8_6_7 = __float_as_uint(state_regs[local_row_b * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_b * 128))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + local_row_b * 128))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
                 }
                 {
                     unsigned _stv8_7_0 = __float_as_uint(state_regs[local_row_c * 8 + 0]);
@@ -1142,7 +1140,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _stv8_7_7 = __float_as_uint(state_regs[local_row_c * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_c * 128))), "r"(_stv8_7_0), "r"(_stv8_7_1), "r"(_stv8_7_2), "r"(_stv8_7_3), "r"(_stv8_7_4), "r"(_stv8_7_5), "r"(_stv8_7_6), "r"(_stv8_7_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + local_row_c * 128))), "r"(_stv8_7_0), "r"(_stv8_7_1), "r"(_stv8_7_2), "r"(_stv8_7_3), "r"(_stv8_7_4), "r"(_stv8_7_5), "r"(_stv8_7_6), "r"(_stv8_7_7) : "memory");
                 }
                 {
                     unsigned _stv8_8_0 = __float_as_uint(state_regs[local_row_d * 8 + 0]);
@@ -1155,7 +1153,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _stv8_8_7 = __float_as_uint(state_regs[local_row_d * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_d * 128))), "r"(_stv8_8_0), "r"(_stv8_8_1), "r"(_stv8_8_2), "r"(_stv8_8_3), "r"(_stv8_8_4), "r"(_stv8_8_5), "r"(_stv8_8_6), "r"(_stv8_8_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + local_row_d * 128))), "r"(_stv8_8_0), "r"(_stv8_8_1), "r"(_stv8_8_2), "r"(_stv8_8_3), "r"(_stv8_8_4), "r"(_stv8_8_5), "r"(_stv8_8_6), "r"(_stv8_8_7) : "memory");
                 }
             }
             if (lane_group == 0) {

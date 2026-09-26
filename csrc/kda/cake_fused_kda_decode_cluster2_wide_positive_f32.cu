@@ -53,31 +53,285 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define SMEM_SMIXED_OFF 0
+#define SMEM_SMIXED_OFF 1024
 #define SMEM_SMIXED_STAGE_BYTES 2048
 #define SMEM_SMIXED_STRIDE 2048
-#define SMEM_SRECURRENCE_OFF 2048
+#define SMEM_SRECURRENCE_OFF 3072
 #define SMEM_SRECURRENCE_STAGE_BYTES 256
 #define SMEM_SRECURRENCE_STRIDE 256
-#define SMEM_SOUTPUTSCALE_OFF 2304
+#define SMEM_SOUTPUTSCALE_OFF 3328
 #define SMEM_SOUTPUTSCALE_STAGE_BYTES 512
 #define SMEM_SOUTPUTSCALE_STRIDE 512
-#define SMEM_SGATEDECAY_OFF 2816
+#define SMEM_SGATEDECAY_OFF 3840
 #define SMEM_SGATEDECAY_STAGE_BYTES 768
 #define SMEM_SGATEDECAY_STRIDE 768
-#define SMEM_SBETA_OFF 3584
+#define SMEM_SBETA_OFF 4608
 #define SMEM_SBETA_STAGE_BYTES 12
 #define SMEM_SBETA_STRIDE 12
-#define SMEM_SFIRSTSLABRMSPARTIAL_OFF 0
+#define SMEM_SFIRSTSLABRMSPARTIAL_OFF 1024
 #define SMEM_SFIRSTSLABRMSPARTIAL_STAGE_BYTES 4
 #define SMEM_SFIRSTSLABRMSPARTIAL_STRIDE 4
-#define SMEM_SASYNCSTATE_OFF 0
+#define SMEM_SASYNCSTATE_OFF 1024
 #define SMEM_SASYNCSTATE_STAGE_BYTES 4
 #define SMEM_SASYNCSTATE_STRIDE 4
-#define SMEM_TOTAL 3712
+#define SMEM_SCLUSTERRMS_OFF 4624
+#define SMEM_SCLUSTERRMS_STAGE_BYTES 16
+#define SMEM_SCLUSTERRMS_STRIDE 16
+#define SMEM_SCONVNEW_OFF 4640
+#define SMEM_SCONVNEW_STAGE_BYTES 4608
+#define SMEM_SCONVNEW_STRIDE 4608
+#define SMEM_TOTAL 9344
 #define THREADS 512
 
 #include <math_constants.h>
+
+__device__ __forceinline__ uint32_t elect_sync() {
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred %%px;\n\t"
+        "elect.sync _|%%px, %1;\n\t"
+        "@%%px mov.s32 %0, 1;\n\t"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+
+__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+        :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
+    asm volatile("mbarrier.init.b64 [%0], %1;"
+        :: "l"(mbar_addr), "r"(count));
+}
+
+
+__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
+__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
+__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
+
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
+__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1;\n\t"
+        "@P1 bra.uni DONE;\n\t"
+        "bra.uni LAB_WAIT;\n\t"
+        "DONE:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+// Source-faithful relaxed CTA wait used only by a typed protocol that does
+// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
+__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, 10000000;\n\t"
+        "@P1 bra.uni DONE_RELAXED;\n\t"
+        "bra.uni LAB_WAIT_RELAXED;\n\t"
+        "DONE_RELAXED:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+// Exact source ports may request the PTX suspendTimeHint operand explicitly.
+// The hint is expressed in nanoseconds and is kept separate from the canonical
+// no-hint CTA helper so unrelated schedules retain their existing retry path.
+__device__ __forceinline__ void mbarrier_wait_suspend(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_SUSPEND:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_SUSPEND;\n\t"
+        "bra.uni LAB_WAIT_SUSPEND;\n\t"
+        "DONE_SUSPEND:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1;\n\t"
+        "@P1 bra.uni DONE_CLUSTER;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER;\n\t"
+        "DONE_CLUSTER:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        ".reg .u32 WAIT_ADDR;\n\t"
+        "mov.u32 WAIT_ADDR, %0;\n\t"
+        "LAB_WAIT_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [WAIT_ADDR], %1, %2;\n\t"
+        "@P1 bra.uni DONE_HINT;\n\t"
+        "bra.uni LAB_WAIT_HINT;\n\t"
+        "DONE_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
+// Exact unqualified CTA wait used by source schedules whose PTX intentionally
+// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED_HINT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra DONE_RELAXED_HINT;\n\t"
+        "bra LAB_WAIT_RELAXED_HINT;\n\t"
+        "DONE_RELAXED_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+        "DONE_CLUSTER_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
+    if (token == 0) {
+        mbarrier_wait(mbar_addr, phase);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_suspend(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
+    if (token == 0) {
+        mbarrier_wait_cluster(mbar_addr, phase);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
+
+__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+        :: "r"(mbar_addr) : "memory");
+}
+
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :: "r"(mbar_addr), "r"(bytes) : "memory");
+}
+
+
+__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
+    uint32_t addr;
+    asm("{\n\t"
+        ".reg .u64 u64addr;\n\t"
+        "cvta.to.shared.u64 u64addr, %1;\n\t"
+        "cvt.u32.u64 %0, u64addr;\n\t"
+        "}\n" : "=r"(addr) : "l"(ptr));
+    return addr;
+}
+
+
+__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
+    uint32_t remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+        : "=r"(remote) : "r"(local_addr), "r"(rank));
+    return remote;
+}
+
 
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
@@ -596,10 +850,15 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
     return r;
 }
 
+
+__device__ __forceinline__ void fence_async_shared() {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 extern "C" {
 
-__global__ __launch_bounds__(512, 2) void
-kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+__global__ __launch_bounds__(512, 2) __cluster_dims__(2,1,1) void
+kernel_cake_fused_kda_decode_cluster2_wide_positive_f32(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -610,37 +869,62 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
 
+    const int mbar_base = smem;
+    #define cluster_rms_partial_addr (mbar_base + 0)
+
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 2;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    float* sMixed = reinterpret_cast<float*>(smem_raw + 0);
-    const int sMixed_addr = smem + 0;
-    __nv_bfloat16* sRecurrence = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
-    const int sRecurrence_addr = smem + 2048;
-    float* sOutputScale = reinterpret_cast<float*>(smem_raw + 2304);
-    const int sOutputScale_addr = smem + 2304;
-    float* sGateDecay = reinterpret_cast<float*>(smem_raw + 2816);
-    const int sGateDecay_addr = smem + 2816;
-    float* sBeta = reinterpret_cast<float*>(smem_raw + 3584);
-    const int sBeta_addr = smem + 3584;
-    float* sFirstSlabRmsPartial = reinterpret_cast<float*>(smem_raw + 0);
-    const int sFirstSlabRmsPartial_addr = smem + 0;
-    unsigned int* sAsyncState = reinterpret_cast<unsigned int*>(smem_raw + 0);
-    const int sAsyncState_addr = smem + 0;
+    float* sMixed = reinterpret_cast<float*>(smem_raw + 1024);
+    const int sMixed_addr = smem + 1024;
+    __nv_bfloat16* sRecurrence = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3072);
+    const int sRecurrence_addr = smem + 3072;
+    float* sOutputScale = reinterpret_cast<float*>(smem_raw + 3328);
+    const int sOutputScale_addr = smem + 3328;
+    float* sGateDecay = reinterpret_cast<float*>(smem_raw + 3840);
+    const int sGateDecay_addr = smem + 3840;
+    float* sBeta = reinterpret_cast<float*>(smem_raw + 4608);
+    const int sBeta_addr = smem + 4608;
+    float* sFirstSlabRmsPartial = reinterpret_cast<float*>(smem_raw + 1024);
+    const int sFirstSlabRmsPartial_addr = smem + 1024;
+    unsigned int* sAsyncState = reinterpret_cast<unsigned int*>(smem_raw + 1024);
+    const int sAsyncState_addr = smem + 1024;
+    float* sClusterRms = reinterpret_cast<float*>(smem_raw + 4624);
+    const int sClusterRms_addr = smem + 4624;
+    float* sConvNew = reinterpret_cast<float*>(smem_raw + 4640);
+    const int sConvNew_addr = smem + 4640;
+
+    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
+    // Mbarriers at smem_raw[0..8)
+
+    if (warp == 0) {
+        uint32_t leader = elect_sync();
+        if (leader) {
+            // cluster_rms_partial: 1 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
+    }
 
     // === Task calls (dependency order) ===
     int row = blockIdx.y;
-    int head = blockIdx.x;
+    int head = blockIdx.x / 2;
     int tid_0 = tid;
     int lane_1 = lane;
     int group = tid_0 / 16;
     int lane_group = tid_0 - group * 16;
     int k_start = lane_group * 8;
     int qk_smem_start = lane_group * 12;
-    int state_owner_row_base = group * 4;
-    int cluster_rank = 0;
-    int cluster_tile_base = 0;
+    int state_owner_row_base = group * 2;
+    int cluster_rank = cta_rank;
+    int cluster_tile_base = cluster_rank * 64;
     int hidden = H * 128;
     int qkv_size = 3 * hidden;
     int requested_slot = state_indices[row];
@@ -656,21 +940,20 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
         int channel_pair = tid_0 - qkv_idx * 64;
         int channel = channel_pair * 2;
         int channel_base = qkv_idx * hidden + head * 128 + channel;
-        __nv_bfloat16* conv_src = conv_state + ((long long)slot * (long long)conv_slot_stride);
-        int conv_base = channel_base;
+        int conv_base = slot * conv_slot_stride + channel_base;
         {
             uint32_t _bf16x2_bits_0;
-            _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(conv_src + conv_base);
+            _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base);
             state_carriers[0] = _bf16x2_bits_0;
         }
         {
             uint32_t _bf16x2_bits_1;
-            _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_src + conv_base + qkv_size);
+            _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + qkv_size);
             state_carriers[1] = _bf16x2_bits_1;
         }
         {
             uint32_t _bf16x2_bits_2;
-            _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_src + conv_base + 2 * qkv_size);
+            _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + 2 * qkv_size);
             state_carriers[2] = _bf16x2_bits_2;
         }
         int x_base = row * x_row_stride + channel_base;
@@ -712,13 +995,9 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
         int smem_channel = channel + channel / 8 * 4 * qk_segment;
         sMixed[qkv_idx * 192 + smem_channel] = (float)(__nv_bfloat16)silu0;
         sMixed[qkv_idx * 192 + smem_channel + 1] = (float)(__nv_bfloat16)silu1;
-        if (is_live != 0) {
-            conv_src[conv_base] = r_q[2];
-            conv_src[conv_base + 1] = r_q[3];
-            conv_src[conv_base + qkv_size] = r_q[4];
-            conv_src[conv_base + qkv_size + 1] = r_q[5];
-            conv_src[conv_base + 2 * qkv_size] = r_q[6];
-            conv_src[conv_base + 2 * qkv_size + 1] = r_q[7];
+        #pragma unroll
+        for (int tap_idx = 0; tap_idx < 6; tap_idx++) {
+            sConvNew[tid_0 * 6 + tap_idx] = r_q[2 + tap_idx];
         }
     }
     if (tid_0 >= 384) {
@@ -757,11 +1036,10 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
             sBeta[0] = _tanh_approx_4 * 0.5f + 0.5f;
         }
     }
-    float* state_src = state + ((long long)slot * (long long)state_slot_stride);
-    int state_head_base = head * 128 * 128;
-    int state_group_base = state_head_base + state_owner_row_base * 128 + k_start;
+    int state_head_base = slot * state_slot_stride + head * 128 * 128;
+    int state_group_base = state_head_base + (state_owner_row_base + cluster_tile_base) * 128 + k_start;
     #pragma unroll
-    for (int local_row = 0; local_row < 4; local_row++) {
+    for (int local_row = 0; local_row < 2; local_row++) {
         {
             unsigned _ldv8_3_0;
             unsigned _ldv8_3_1;
@@ -772,7 +1050,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
             unsigned _ldv8_3_6;
             unsigned _ldv8_3_7;
             asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(state_src + (state_group_base + local_row * 128))) : "memory");
+                : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(state + (state_group_base + local_row * 128))) : "memory");
             state_regs[local_row * 8 + 0] = __uint_as_float(_ldv8_3_0);
             state_regs[local_row * 8 + 1] = __uint_as_float(_ldv8_3_1);
             state_regs[local_row * 8 + 2] = __uint_as_float(_ldv8_3_2);
@@ -783,13 +1061,12 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
             state_regs[local_row * 8 + 7] = __uint_as_float(_ldv8_3_7);
         }
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     __syncthreads();
     float2 _f2_0 = make_float2(0.0f, 0.0f);
     float2 q_sq_pair = _f2_0;
     float2 _f2_1 = make_float2(0.0f, 0.0f);
     float2 k_sq_pair = _f2_1;
-    float2 _f2_2 = make_float2(0.0f, 0.0f);
-    float2 qk_pair = _f2_2;
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         r_q[i] = 0.0f;
@@ -799,53 +1076,60 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
     for (int i_pair = 0; i_pair < 4; i_pair++) {
         int i0 = i_pair * 2;
         int i1 = i0 + 1;
-        float2 _f2_3 = make_float2(sMixed[qk_smem_start + i0], sMixed[qk_smem_start + i1]);
-        float2 q_pair = _f2_3;
-        float2 _f2_4 = make_float2(sMixed[192 + qk_smem_start + i0], sMixed[192 + qk_smem_start + i1]);
-        float2 k_pair = _f2_4;
-        r_q[i0] = q_pair.x;
-        r_q[i1] = q_pair.y;
-        r_k[i0] = k_pair.x;
-        r_k[i1] = k_pair.y;
-        q_sq_pair = fma_f32x2_rn_ftz(q_pair, q_pair, q_sq_pair);
-        k_sq_pair = fma_f32x2_rn_ftz(k_pair, k_pair, k_sq_pair);
-        qk_pair = fma_f32x2_rn_ftz(q_pair, k_pair, qk_pair);
+        if (lane_1 < 16) {
+            float2 _f2_2 = make_float2(sMixed[qk_smem_start + i0], sMixed[qk_smem_start + i1]);
+            float2 q_pair = _f2_2;
+            float2 _f2_3 = make_float2(sMixed[192 + qk_smem_start + i0], sMixed[192 + qk_smem_start + i1]);
+            float2 k_pair = _f2_3;
+            r_q[i0] = q_pair.x;
+            r_q[i1] = q_pair.y;
+            r_k[i0] = k_pair.x;
+            r_k[i1] = k_pair.y;
+            q_sq_pair = fma_f32x2_rn_ftz(q_pair, q_pair, q_sq_pair);
+            k_sq_pair = fma_f32x2_rn_ftz(k_pair, k_pair, k_sq_pair);
+        }
     }
     float q_sq = q_sq_pair.x + q_sq_pair.y;
     float k_sq = k_sq_pair.x + k_sq_pair.y;
-    float qk_dot = qk_pair.x + qk_pair.y;
     float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 8);
     q_sq += _shfl_xor_0;
     float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 8);
     k_sq += _shfl_xor_1;
-    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, qk_dot, 8);
-    qk_dot += _shfl_xor_2;
-    float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 4);
-    q_sq += _shfl_xor_3;
-    float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 4);
-    k_sq += _shfl_xor_4;
-    float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, qk_dot, 4);
-    qk_dot += _shfl_xor_5;
-    float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 2);
+    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 4);
+    q_sq += _shfl_xor_2;
+    float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 4);
+    k_sq += _shfl_xor_3;
+    float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 2);
+    q_sq += _shfl_xor_4;
+    float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 2);
+    k_sq += _shfl_xor_5;
+    float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 1);
     q_sq += _shfl_xor_6;
-    float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 2);
+    float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 1);
     k_sq += _shfl_xor_7;
-    float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, qk_dot, 2);
-    qk_dot += _shfl_xor_8;
-    float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, q_sq, 1);
-    q_sq += _shfl_xor_9;
-    float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, k_sq, 1);
-    k_sq += _shfl_xor_10;
-    float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, qk_dot, 1);
-    qk_dot += _shfl_xor_11;
     float q_scale = 0.0f;
     float k_scale = 0.0f;
-    float normalized_qk = 0.0f;
-    float _rsqrt_0 = rsqrtf(q_sq + 1e-06f);
-    q_scale = _rsqrt_0 * 0.08838834764831845f;
-    float _rsqrt_1 = rsqrtf(k_sq + 1e-06f);
-    k_scale = _rsqrt_1;
-    normalized_qk = qk_dot * q_scale * k_scale;
+    if (lane_1 < 16) {
+        float _rsqrt_0 = rsqrtf(q_sq + 1e-06f);
+        q_scale = _rsqrt_0 * 0.08838834764831845f;
+        float _rsqrt_1 = rsqrtf(k_sq + 1e-06f);
+        k_scale = _rsqrt_1;
+    }
+    float _shfl_0;
+    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(q_scale), "r"(lane_group));
+    q_scale = _shfl_0;
+    float _shfl_1;
+    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(k_scale), "r"(lane_group));
+    k_scale = _shfl_1;
+    #pragma unroll
+    for (int i_1 = 0; i_1 < 8; i_1++) {
+        float _shfl_2;
+        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(r_q[i_1]), "r"(lane_group));
+        r_q[i_1] = _shfl_2;
+        float _shfl_3;
+        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_3) : "f"(r_k[i_1]), "r"(lane_group));
+        r_k[i_1] = _shfl_3;
+    }
     float beta = sBeta[0];
     #pragma unroll
     for (int i_pair_1 = 0; i_pair_1 < 4; i_pair_1++) {
@@ -856,11 +1140,11 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
     }
     #pragma unroll
     for (int value_tile = 0; value_tile < 1; value_tile++) {
-        int tile_base = value_tile * 128;
-        int state_tile_base = state_group_base + tile_base * 128;
+        int tile_base = value_tile * 64 + cluster_tile_base;
+        int state_tile_base = state_group_base + value_tile * 64 * 128;
         if (value_tile > 0) {
             #pragma unroll
-            for (int local_row_1 = 0; local_row_1 < 4; local_row_1++) {
+            for (int local_row_1 = 0; local_row_1 < 2; local_row_1++) {
                 {
                     unsigned _ldv8_4_0;
                     unsigned _ldv8_4_1;
@@ -871,7 +1155,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _ldv8_4_6;
                     unsigned _ldv8_4_7;
                     asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(state_src + (state_tile_base + local_row_1 * 128))) : "memory");
+                        : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(state + (state_tile_base + local_row_1 * 128))) : "memory");
                     state_regs[local_row_1 * 8 + 0] = __uint_as_float(_ldv8_4_0);
                     state_regs[local_row_1 * 8 + 1] = __uint_as_float(_ldv8_4_1);
                     state_regs[local_row_1 * 8 + 2] = __uint_as_float(_ldv8_4_2);
@@ -884,225 +1168,96 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
             }
         }
         #pragma unroll
-        for (int row_group = 0; row_group < 4 / ((1) ? 4 : 2); row_group++) {
-            int local_row_a = row_group * ((1) ? 4 : 2);
+        for (int row_group = 0; row_group < 2 / ((0) ? 4 : 2); row_group++) {
+            int local_row_a = row_group * ((0) ? 4 : 2);
             int local_row_b = local_row_a + 1;
-            int local_row_c = local_row_a + 2;
-            int local_row_d = local_row_a + 3;
+            float2 _f2_4 = make_float2(0.0f, 0.0f);
+            float2 state_key_pair_a = _f2_4;
             float2 _f2_5 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_a = _f2_5;
-            float2 _f2_6 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_b = _f2_6;
-            float2 _f2_7 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_c = _f2_7;
-            float2 _f2_8 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_d = _f2_8;
+            float2 state_key_pair_b = _f2_5;
             #pragma unroll
             for (int i_pair_2 = 0; i_pair_2 < 4; i_pair_2++) {
                 int i0_2 = i_pair_2 * 2;
                 int i1_2 = i0_2 + 1;
                 int reg_offset_a = local_row_a * 8 + i0_2;
                 int reg_offset_b = local_row_b * 8 + i0_2;
-                int reg_offset_c = local_row_c * 8 + i0_2;
-                int reg_offset_d = local_row_d * 8 + i0_2;
-                float2 _f2_9 = make_float2(r_decay[i0_2], r_decay[i1_2]);
-                float2 decay_pair = _f2_9;
-                float2 _f2_10 = make_float2(r_k[i0_2], r_k[i1_2]);
-                float2 key_pair = _f2_10;
-                float2 _f2_11 = make_float2(state_regs[reg_offset_a], state_regs[reg_offset_a + 1]);
+                float2 _f2_6 = make_float2(r_decay[i0_2], r_decay[i1_2]);
+                float2 decay_pair = _f2_6;
+                float2 _f2_7 = make_float2(r_k[i0_2], r_k[i1_2]);
+                float2 key_pair = _f2_7;
+                float2 _f2_8 = make_float2(state_regs[reg_offset_a], state_regs[reg_offset_a + 1]);
                 float2 _mul_f32x2_0;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_11), "l"(*(const unsigned long long*)&decay_pair));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_8), "l"(*(const unsigned long long*)&decay_pair));
                 float2 state_pair_a = _mul_f32x2_0;
-                float2 _f2_12 = make_float2(state_regs[reg_offset_b], state_regs[reg_offset_b + 1]);
+                float2 _f2_9 = make_float2(state_regs[reg_offset_b], state_regs[reg_offset_b + 1]);
                 float2 _mul_f32x2_1;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&_f2_12), "l"(*(const unsigned long long*)&decay_pair));
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&_f2_9), "l"(*(const unsigned long long*)&decay_pair));
                 float2 state_pair_b = _mul_f32x2_1;
-                float2 _f2_13 = make_float2(state_regs[reg_offset_c], state_regs[reg_offset_c + 1]);
-                float2 _mul_f32x2_2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_2) : "l"(*(const unsigned long long*)&_f2_13), "l"(*(const unsigned long long*)&decay_pair));
-                float2 state_pair_c = _mul_f32x2_2;
-                float2 _f2_14 = make_float2(state_regs[reg_offset_d], state_regs[reg_offset_d + 1]);
-                float2 _mul_f32x2_3;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_3) : "l"(*(const unsigned long long*)&_f2_14), "l"(*(const unsigned long long*)&decay_pair));
-                float2 state_pair_d = _mul_f32x2_3;
                 state_regs[reg_offset_a] = state_pair_a.x;
                 state_regs[reg_offset_a + 1] = state_pair_a.y;
                 state_regs[reg_offset_b] = state_pair_b.x;
                 state_regs[reg_offset_b + 1] = state_pair_b.y;
-                state_regs[reg_offset_c] = state_pair_c.x;
-                state_regs[reg_offset_c + 1] = state_pair_c.y;
-                state_regs[reg_offset_d] = state_pair_d.x;
-                state_regs[reg_offset_d + 1] = state_pair_d.y;
                 state_key_pair_a = fma_f32x2_rn_ftz(state_pair_a, key_pair, state_key_pair_a);
                 state_key_pair_b = fma_f32x2_rn_ftz(state_pair_b, key_pair, state_key_pair_b);
-                state_key_pair_c = fma_f32x2_rn_ftz(state_pair_c, key_pair, state_key_pair_c);
-                state_key_pair_d = fma_f32x2_rn_ftz(state_pair_d, key_pair, state_key_pair_d);
             }
             float state_key_dot_a = state_key_pair_a.x + state_key_pair_a.y;
             float state_key_dot_b = state_key_pair_b.x + state_key_pair_b.y;
-            float state_key_dot_c = state_key_pair_c.x + state_key_pair_c.y;
-            float state_key_dot_d = state_key_pair_d.x + state_key_pair_d.y;
-            float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 8);
+            float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 8);
+            state_key_dot_a += _shfl_xor_8;
+            float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 8);
+            state_key_dot_b += _shfl_xor_9;
+            float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 4);
+            state_key_dot_a += _shfl_xor_10;
+            float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 4);
+            state_key_dot_b += _shfl_xor_11;
+            float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 2);
             state_key_dot_a += _shfl_xor_12;
-            float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 8);
+            float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 2);
             state_key_dot_b += _shfl_xor_13;
-            float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_c, 8);
-            state_key_dot_c += _shfl_xor_14;
-            float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_d, 8);
-            state_key_dot_d += _shfl_xor_15;
-            float _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 4);
-            state_key_dot_a += _shfl_xor_16;
-            float _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 4);
-            state_key_dot_b += _shfl_xor_17;
-            float _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_c, 4);
-            state_key_dot_c += _shfl_xor_18;
-            float _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_d, 4);
-            state_key_dot_d += _shfl_xor_19;
-            float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 2);
-            state_key_dot_a += _shfl_xor_20;
-            float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 2);
-            state_key_dot_b += _shfl_xor_21;
-            float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_c, 2);
-            state_key_dot_c += _shfl_xor_22;
-            float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_d, 2);
-            state_key_dot_d += _shfl_xor_23;
-            float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 1);
-            state_key_dot_a += _shfl_xor_24;
-            float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 1);
-            state_key_dot_b += _shfl_xor_25;
-            float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_c, 1);
-            state_key_dot_c += _shfl_xor_26;
-            float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_d, 1);
-            state_key_dot_d += _shfl_xor_27;
+            float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_a, 1);
+            state_key_dot_a += _shfl_xor_14;
+            float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, state_key_dot_b, 1);
+            state_key_dot_b += _shfl_xor_15;
             state_key_dot_a *= k_scale;
             state_key_dot_b *= k_scale;
-            state_key_dot_c *= k_scale;
-            state_key_dot_d *= k_scale;
             int value_row_a = tile_base + state_owner_row_base + local_row_a;
             int value_row_b = tile_base + state_owner_row_base + local_row_b;
-            int value_row_c = tile_base + state_owner_row_base + local_row_c;
-            int value_row_d = tile_base + state_owner_row_base + local_row_d;
             int value_smem_row_a = value_row_a;
             int value_smem_row_b = value_row_b;
-            int value_smem_row_c = value_row_c;
-            int value_smem_row_d = value_row_d;
             float value_a = sMixed[384 + value_smem_row_a];
             float value_b = sMixed[384 + value_smem_row_b];
-            float value_c = sMixed[384 + value_smem_row_c];
-            float value_d = sMixed[384 + value_smem_row_d];
             float delta_a = (value_a - state_key_dot_a) * beta;
             float delta_b = (value_b - state_key_dot_b) * beta;
-            float delta_c = (value_c - state_key_dot_c) * beta;
-            float delta_d = (value_d - state_key_dot_d) * beta;
             float delta_key_scale_a = delta_a * k_scale;
             float delta_key_scale_b = delta_b * k_scale;
-            float delta_key_scale_c = delta_c * k_scale;
-            float delta_key_scale_d = delta_d * k_scale;
-            float2 _f2_15 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_a = _f2_15;
-            float2 _f2_16 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_b = _f2_16;
-            float2 _f2_17 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_c = _f2_17;
-            float2 _f2_18 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_d = _f2_18;
+            float recurrence_value_a = 0.0f;
+            float recurrence_value_b = 0.0f;
+            float2 _f2_10 = make_float2(0.0f, 0.0f);
+            float2 state_query_pair_a = _f2_10;
+            float2 _f2_11 = make_float2(0.0f, 0.0f);
+            float2 state_query_pair_b = _f2_11;
             #pragma unroll
             for (int i_pair_3 = 0; i_pair_3 < 4; i_pair_3++) {
                 int i0_3 = i_pair_3 * 2;
                 int i1_3 = i0_3 + 1;
                 int reg_offset_a_1 = local_row_a * 8 + i0_3;
                 int reg_offset_b_1 = local_row_b * 8 + i0_3;
-                int reg_offset_c_1 = local_row_c * 8 + i0_3;
-                int reg_offset_d_1 = local_row_d * 8 + i0_3;
-                float2 _f2_19 = make_float2(r_q[i0_3], r_q[i1_3]);
-                float2 query_pair = _f2_19;
-                float2 _f2_20 = make_float2(state_regs[reg_offset_a_1], state_regs[reg_offset_a_1 + 1]);
-                state_query_pair_a = fma_f32x2_rn_ftz(_f2_20, query_pair, state_query_pair_a);
-                float2 _f2_21 = make_float2(state_regs[reg_offset_b_1], state_regs[reg_offset_b_1 + 1]);
-                state_query_pair_b = fma_f32x2_rn_ftz(_f2_21, query_pair, state_query_pair_b);
-                float2 _f2_22 = make_float2(state_regs[reg_offset_c_1], state_regs[reg_offset_c_1 + 1]);
-                state_query_pair_c = fma_f32x2_rn_ftz(_f2_22, query_pair, state_query_pair_c);
-                float2 _f2_23 = make_float2(state_regs[reg_offset_d_1], state_regs[reg_offset_d_1 + 1]);
-                state_query_pair_d = fma_f32x2_rn_ftz(_f2_23, query_pair, state_query_pair_d);
-            }
-            float state_query_dot_a = state_query_pair_a.x + state_query_pair_a.y;
-            float state_query_dot_b = state_query_pair_b.x + state_query_pair_b.y;
-            float state_query_dot_c = state_query_pair_c.x + state_query_pair_c.y;
-            float state_query_dot_d = state_query_pair_d.x + state_query_pair_d.y;
-            float _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_a, 8);
-            state_query_dot_a += _shfl_xor_28;
-            float _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_b, 8);
-            state_query_dot_b += _shfl_xor_29;
-            float _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_c, 8);
-            state_query_dot_c += _shfl_xor_30;
-            float _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_d, 8);
-            state_query_dot_d += _shfl_xor_31;
-            float _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_a, 4);
-            state_query_dot_a += _shfl_xor_32;
-            float _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_b, 4);
-            state_query_dot_b += _shfl_xor_33;
-            float _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_c, 4);
-            state_query_dot_c += _shfl_xor_34;
-            float _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_d, 4);
-            state_query_dot_d += _shfl_xor_35;
-            float _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_a, 2);
-            state_query_dot_a += _shfl_xor_36;
-            float _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_b, 2);
-            state_query_dot_b += _shfl_xor_37;
-            float _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_c, 2);
-            state_query_dot_c += _shfl_xor_38;
-            float _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_d, 2);
-            state_query_dot_d += _shfl_xor_39;
-            float _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_a, 1);
-            state_query_dot_a += _shfl_xor_40;
-            float _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_b, 1);
-            state_query_dot_b += _shfl_xor_41;
-            float _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_c, 1);
-            state_query_dot_c += _shfl_xor_42;
-            float _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, state_query_dot_d, 1);
-            state_query_dot_d += _shfl_xor_43;
-            state_query_dot_a *= q_scale;
-            state_query_dot_b *= q_scale;
-            state_query_dot_c *= q_scale;
-            state_query_dot_d *= q_scale;
-            float recurrence_value_a = 0.0f;
-            float recurrence_value_b = 0.0f;
-            float recurrence_value_c = 0.0f;
-            float recurrence_value_d = 0.0f;
-            recurrence_value_a = state_query_dot_a + delta_a * normalized_qk;
-            recurrence_value_b = state_query_dot_b + delta_b * normalized_qk;
-            recurrence_value_c = state_query_dot_c + delta_c * normalized_qk;
-            recurrence_value_d = state_query_dot_d + delta_d * normalized_qk;
-            #pragma unroll
-            for (int i_pair_4 = 0; i_pair_4 < 4; i_pair_4++) {
-                int i0_4 = i_pair_4 * 2;
-                int i1_4 = i0_4 + 1;
-                int reg_offset_a_2 = local_row_a * 8 + i0_4;
-                int reg_offset_b_2 = local_row_b * 8 + i0_4;
-                int reg_offset_c_2 = local_row_c * 8 + i0_4;
-                int reg_offset_d_2 = local_row_d * 8 + i0_4;
-                float2 _f2_24 = make_float2(r_k[i0_4], r_k[i1_4]);
-                float2 key_pair_1 = _f2_24;
-                float2 _f2_25 = make_float2(delta_key_scale_a, delta_key_scale_a);
-                float2 _f2_26 = make_float2(state_regs[reg_offset_a_2], state_regs[reg_offset_a_2 + 1]);
-                float2 updated_pair_a = fma_f32x2_rn_ftz(_f2_25, key_pair_1, _f2_26);
-                float2 _f2_27 = make_float2(delta_key_scale_b, delta_key_scale_b);
-                float2 _f2_28 = make_float2(state_regs[reg_offset_b_2], state_regs[reg_offset_b_2 + 1]);
-                float2 updated_pair_b = fma_f32x2_rn_ftz(_f2_27, key_pair_1, _f2_28);
-                float2 _f2_29 = make_float2(delta_key_scale_c, delta_key_scale_c);
-                float2 _f2_30 = make_float2(state_regs[reg_offset_c_2], state_regs[reg_offset_c_2 + 1]);
-                float2 updated_pair_c = fma_f32x2_rn_ftz(_f2_29, key_pair_1, _f2_30);
-                float2 _f2_31 = make_float2(delta_key_scale_d, delta_key_scale_d);
-                float2 _f2_32 = make_float2(state_regs[reg_offset_d_2], state_regs[reg_offset_d_2 + 1]);
-                float2 updated_pair_d = fma_f32x2_rn_ftz(_f2_31, key_pair_1, _f2_32);
-                state_regs[reg_offset_a_2] = updated_pair_a.x;
-                state_regs[reg_offset_a_2 + 1] = updated_pair_a.y;
-                state_regs[reg_offset_b_2] = updated_pair_b.x;
-                state_regs[reg_offset_b_2 + 1] = updated_pair_b.y;
-                state_regs[reg_offset_c_2] = updated_pair_c.x;
-                state_regs[reg_offset_c_2 + 1] = updated_pair_c.y;
-                state_regs[reg_offset_d_2] = updated_pair_d.x;
-                state_regs[reg_offset_d_2 + 1] = updated_pair_d.y;
+                float2 _f2_12 = make_float2(r_k[i0_3], r_k[i1_3]);
+                float2 key_pair_1 = _f2_12;
+                float2 _f2_13 = make_float2(delta_key_scale_a, delta_key_scale_a);
+                float2 _f2_14 = make_float2(state_regs[reg_offset_a_1], state_regs[reg_offset_a_1 + 1]);
+                float2 updated_pair_a = fma_f32x2_rn_ftz(_f2_13, key_pair_1, _f2_14);
+                float2 _f2_15 = make_float2(delta_key_scale_b, delta_key_scale_b);
+                float2 _f2_16 = make_float2(state_regs[reg_offset_b_1], state_regs[reg_offset_b_1 + 1]);
+                float2 updated_pair_b = fma_f32x2_rn_ftz(_f2_15, key_pair_1, _f2_16);
+                state_regs[reg_offset_a_1] = updated_pair_a.x;
+                state_regs[reg_offset_a_1 + 1] = updated_pair_a.y;
+                state_regs[reg_offset_b_1] = updated_pair_b.x;
+                state_regs[reg_offset_b_1 + 1] = updated_pair_b.y;
+                float2 _f2_17 = make_float2(r_q[i0_3], r_q[i1_3]);
+                float2 query_pair = _f2_17;
+                state_query_pair_a = fma_f32x2_rn_ftz(updated_pair_a, query_pair, state_query_pair_a);
+                state_query_pair_b = fma_f32x2_rn_ftz(updated_pair_b, query_pair, state_query_pair_b);
             }
             if (is_live != 0) {
                 {
@@ -1116,7 +1271,7 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _stv8_5_7 = __float_as_uint(state_regs[local_row_a * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_a * 128))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + local_row_a * 128))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
                 }
                 {
                     unsigned _stv8_6_0 = __float_as_uint(state_regs[local_row_b * 8 + 0]);
@@ -1129,89 +1284,118 @@ kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat1
                     unsigned _stv8_6_7 = __float_as_uint(state_regs[local_row_b * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_b * 128))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
-                }
-                {
-                    unsigned _stv8_7_0 = __float_as_uint(state_regs[local_row_c * 8 + 0]);
-                    unsigned _stv8_7_1 = __float_as_uint(state_regs[local_row_c * 8 + 1]);
-                    unsigned _stv8_7_2 = __float_as_uint(state_regs[local_row_c * 8 + 2]);
-                    unsigned _stv8_7_3 = __float_as_uint(state_regs[local_row_c * 8 + 3]);
-                    unsigned _stv8_7_4 = __float_as_uint(state_regs[local_row_c * 8 + 4]);
-                    unsigned _stv8_7_5 = __float_as_uint(state_regs[local_row_c * 8 + 5]);
-                    unsigned _stv8_7_6 = __float_as_uint(state_regs[local_row_c * 8 + 6]);
-                    unsigned _stv8_7_7 = __float_as_uint(state_regs[local_row_c * 8 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_c * 128))), "r"(_stv8_7_0), "r"(_stv8_7_1), "r"(_stv8_7_2), "r"(_stv8_7_3), "r"(_stv8_7_4), "r"(_stv8_7_5), "r"(_stv8_7_6), "r"(_stv8_7_7) : "memory");
-                }
-                {
-                    unsigned _stv8_8_0 = __float_as_uint(state_regs[local_row_d * 8 + 0]);
-                    unsigned _stv8_8_1 = __float_as_uint(state_regs[local_row_d * 8 + 1]);
-                    unsigned _stv8_8_2 = __float_as_uint(state_regs[local_row_d * 8 + 2]);
-                    unsigned _stv8_8_3 = __float_as_uint(state_regs[local_row_d * 8 + 3]);
-                    unsigned _stv8_8_4 = __float_as_uint(state_regs[local_row_d * 8 + 4]);
-                    unsigned _stv8_8_5 = __float_as_uint(state_regs[local_row_d * 8 + 5]);
-                    unsigned _stv8_8_6 = __float_as_uint(state_regs[local_row_d * 8 + 6]);
-                    unsigned _stv8_8_7 = __float_as_uint(state_regs[local_row_d * 8 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state_src + (state_tile_base + local_row_d * 128))), "r"(_stv8_8_0), "r"(_stv8_8_1), "r"(_stv8_8_2), "r"(_stv8_8_3), "r"(_stv8_8_4), "r"(_stv8_8_5), "r"(_stv8_8_6), "r"(_stv8_8_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + local_row_b * 128))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
                 }
             }
+            recurrence_value_a = state_query_pair_a.x + state_query_pair_a.y;
+            recurrence_value_b = state_query_pair_b.x + state_query_pair_b.y;
+            float _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_a, 8);
+            recurrence_value_a += _shfl_xor_16;
+            float _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_b, 8);
+            recurrence_value_b += _shfl_xor_17;
+            float _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_a, 4);
+            recurrence_value_a += _shfl_xor_18;
+            float _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_b, 4);
+            recurrence_value_b += _shfl_xor_19;
+            float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_a, 2);
+            recurrence_value_a += _shfl_xor_20;
+            float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_b, 2);
+            recurrence_value_b += _shfl_xor_21;
+            float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_a, 1);
+            recurrence_value_a += _shfl_xor_22;
+            float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, recurrence_value_b, 1);
+            recurrence_value_b += _shfl_xor_23;
+            recurrence_value_a *= q_scale;
+            recurrence_value_b *= q_scale;
             if (lane_group == 0) {
                 sRecurrence[value_row_a] = recurrence_value_a;
                 sRecurrence[value_row_b] = recurrence_value_b;
-                sRecurrence[value_row_c] = recurrence_value_c;
-                sRecurrence[value_row_d] = recurrence_value_d;
             }
         }
     }
     __syncthreads();
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    int conv_writer_producer = tid_0 - 96;
+    if (tid_0 / 96 == cluster_rank + 1) {
+        int spread_qkv_idx = conv_writer_producer / 64;
+        int spread_channel = (conv_writer_producer - spread_qkv_idx * 64) * 2;
+        int spread_channel_base = spread_qkv_idx * hidden + head * 128 + spread_channel;
+        int spread_store_base = slot * conv_slot_stride + spread_channel_base;
+        if (is_live != 0) {
+            conv_state[spread_store_base] = sConvNew[conv_writer_producer * 6];
+            conv_state[spread_store_base + 1] = sConvNew[conv_writer_producer * 6 + 1];
+            conv_state[spread_store_base + qkv_size] = sConvNew[conv_writer_producer * 6 + 2];
+            conv_state[spread_store_base + qkv_size + 1] = sConvNew[conv_writer_producer * 6 + 3];
+            conv_state[spread_store_base + 2 * qkv_size] = sConvNew[conv_writer_producer * 6 + 4];
+            conv_state[spread_store_base + 2 * qkv_size + 1] = sConvNew[conv_writer_producer * 6 + 5];
+        }
+    }
     if (warp == 0) {
-        float output_values[4];
-        __nv_bfloat162 recurrence_pair0 = reinterpret_cast<const __nv_bfloat162*>(sRecurrence)[lane_1 * 2];
-        __nv_bfloat162 recurrence_pair1 = reinterpret_cast<const __nv_bfloat162*>(sRecurrence)[lane_1 * 2 + 1];
-        output_values[0] = (float)recurrence_pair0.x;
-        output_values[1] = (float)recurrence_pair0.y;
-        output_values[2] = (float)recurrence_pair1.x;
-        output_values[3] = (float)recurrence_pair1.y;
-        float sum_squares = 0.0f;
-        #pragma unroll
-        for (int channel_idx = 0; channel_idx < 4; channel_idx++) {
-            float value = output_values[channel_idx];
-            sum_squares += value * value;
+        float tile_partial = 0.0f;
+        if (lane_1 < 16) {
+            __nv_bfloat162 partial_pair0 = reinterpret_cast<const __nv_bfloat162*>(sRecurrence)[cluster_tile_base / 2 + lane_1 * 2];
+            __nv_bfloat162 partial_pair1 = reinterpret_cast<const __nv_bfloat162*>(sRecurrence)[cluster_tile_base / 2 + lane_1 * 2 + 1];
+            float partial_v0 = (float)partial_pair0.x;
+            float partial_v1 = (float)partial_pair0.y;
+            float partial_v2 = (float)partial_pair1.x;
+            float partial_v3 = (float)partial_pair1.y;
+            tile_partial = partial_v0 * partial_v0 + partial_v1 * partial_v1 + partial_v2 * partial_v2 + partial_v3 * partial_v3;
         }
-        float _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, sum_squares, 16);
-        sum_squares += _shfl_xor_44;
-        float _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, sum_squares, 8);
-        sum_squares += _shfl_xor_45;
-        float _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, sum_squares, 4);
-        sum_squares += _shfl_xor_46;
-        float _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, sum_squares, 2);
-        sum_squares += _shfl_xor_47;
-        float _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, sum_squares, 1);
-        sum_squares += _shfl_xor_48;
-        float _rsqrt_2 = rsqrtf(sum_squares * 0.0078125f + norm_eps);
-        float inverse_rms = _rsqrt_2;
-        int output_base = (row * H + head) * 128 + lane_1 * 4;
-        float output_scales[4];
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&output_scales[0])), "=r"(*reinterpret_cast<uint32_t*>(&output_scales[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&output_scales[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&output_scales[(0) + 3]))
-            : "r"(sOutputScale_addr + (unsigned int)(lane_1 * 16)));
-        #pragma unroll
-        for (int channel_idx_1 = 0; channel_idx_1 < 4; channel_idx_1++) {
-            if (is_live != 0) {
-                output_values[channel_idx_1] = output_values[channel_idx_1] * inverse_rms * output_scales[channel_idx_1];
-            } else {
-                output_values[channel_idx_1] = 0.0f;
+        float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, tile_partial, 8);
+        tile_partial += _shfl_xor_24;
+        float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, tile_partial, 4);
+        tile_partial += _shfl_xor_25;
+        float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, tile_partial, 2);
+        tile_partial += _shfl_xor_26;
+        float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, tile_partial, 1);
+        tile_partial += _shfl_xor_27;
+        if (lane_1 == 0) {
+            mbarrier_arrive_expect_tx(cluster_rms_partial_addr, 4);
+            uint32_t _mapa_0;
+            asm volatile(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mapa_0) : "r"(sClusterRms_addr + 4), "r"(1 - cluster_rank));
+            uint32_t _mapa_1;
+            asm volatile(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mapa_1) : "r"(cluster_rms_partial_addr), "r"(1 - cluster_rank));
+            asm volatile(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                :: "r"(_mapa_0), "f"(tile_partial), "r"(_mapa_1) : "memory");
+        }
+        mbarrier_wait(cluster_rms_partial_addr, 0);
+        float pair_sum_squares = tile_partial + sClusterRms[1];
+        float _rsqrt_2 = rsqrtf(pair_sum_squares * 0.0078125f + norm_eps);
+        float pair_inverse_rms = _rsqrt_2;
+        if (lane_1 < 16) {
+            int tile_column = cluster_tile_base + lane_1 * 4;
+            float pair_output_values[4];
+            __nv_bfloat162 output_pair0 = reinterpret_cast<const __nv_bfloat162*>(sRecurrence)[cluster_tile_base / 2 + lane_1 * 2];
+            __nv_bfloat162 output_pair1 = reinterpret_cast<const __nv_bfloat162*>(sRecurrence)[cluster_tile_base / 2 + lane_1 * 2 + 1];
+            pair_output_values[0] = (float)output_pair0.x;
+            pair_output_values[1] = (float)output_pair0.y;
+            pair_output_values[2] = (float)output_pair1.x;
+            pair_output_values[3] = (float)output_pair1.y;
+            float pair_output_scales[4];
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&pair_output_scales[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_output_scales[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pair_output_scales[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pair_output_scales[(0) + 3]))
+                : "r"(sOutputScale_addr + (unsigned int)(tile_column * 4)));
+            #pragma unroll
+            for (int channel_idx = 0; channel_idx < 4; channel_idx++) {
+                if (is_live != 0) {
+                    pair_output_values[channel_idx] = pair_output_values[channel_idx] * pair_inverse_rms * pair_output_scales[channel_idx];
+                } else {
+                    pair_output_values[channel_idx] = 0.0f;
+                }
             }
-        }
-        {
-            uint2 _pk2;
-            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-            _pk[0] = __floats2bfloat162_rn(output_values[0 + 0], output_values[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(output_values[0 + 2], output_values[0 + 3]);
-            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(output))[output_base]) = _pk2;
+            int pair_output_base = (row * H + head) * 128 + tile_column;
+            {
+                uint2 _pk2;
+                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                _pk[0] = __floats2bfloat162_rn(pair_output_values[0 + 0], pair_output_values[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(pair_output_values[0 + 2], pair_output_values[0 + 3]);
+                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(output))[pair_output_base]) = _pk2;
+            }
         }
     }
 }
