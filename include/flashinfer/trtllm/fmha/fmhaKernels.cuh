@@ -365,6 +365,22 @@ class TllmGenFmhaKernel {
     return std::make_pair(mKernelMetaMap.find(hashId) != mKernelMetaMap.end(), info);
   }
 
+  // Planning-only query for dense MLA. This is the first kernel selected by run(), whose
+  // head divisibility check precedes every reselection trigger. Passing this check does not
+  // certify later launch conditions. Read registry metadata without loading a cubin.
+  int getMlaInitialHeadDivisor(RunnerParams const& params) const {
+    FLASHINFER_CHECK(isGenerationKernel(params.mKernelType) && isMlaGenKernel(params) &&
+                         !isSparseMla(params.mSparseMlaType),
+                     "The MLA head-divisibility query requires dense MLA generation.");
+    SelectKernelParams selectKernelParams{params};
+    selectKernel(params, selectKernelParams);
+    auto const [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
+    auto const found = mKernelMetaMap.find(hashId);
+    FLASHINFER_CHECK(found != mKernelMetaMap.end(), "Trtllm-gen kernels not found: " + info);
+    auto const& kernelMeta = mKernelMeta[found->second];
+    return kernelMeta.mGroupsHeadsQ ? std::min(params.mNumHeadsQPerKv, kernelMeta.mStepQ) : 1;
+  }
+
   // start here
   void run(RunnerParams const& params) const {
     SelectKernelParams selectKernelParams{params};
@@ -463,9 +479,10 @@ class TllmGenFmhaKernel {
                                             params.enable_pdl, params.stream);
 
     if (params.lsePtr != nullptr) {
-      FLASHINFER_CUDA_CHECK(flashinfer::ComputeLSEFromMD(
-          params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ, params.mNumHeadsQ,
-          params.lseStrideTokens, params.lseStrideHeads, params.enable_pdl, params.stream));
+      FLASHINFER_CUDA_CHECK(
+          flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ,
+                                       params.mNumHeadsQ, params.lseStrideTokens, params.lseScale,
+                                       params.lseStrideHeads, params.enable_pdl, params.stream));
     }
   }
 

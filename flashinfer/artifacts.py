@@ -14,15 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import logging
 import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Generator
-import requests  # type: ignore[import-untyped]
 import shutil
+import time
+from typing import Generator
+
+import requests  # type: ignore[import-untyped]
 
 # Create logger for artifacts module to avoid circular import with jit.core
 logger = logging.getLogger("flashinfer.artifacts")
@@ -37,9 +39,6 @@ from .jit.cubin_loader import (
     download_file,
     verify_cubin,
 )
-
-
-from contextlib import contextmanager
 
 
 @contextmanager
@@ -141,7 +140,7 @@ class ArtifactPath:
     # publish carries the Blackwell (sm100f/sm103a) and Rubin (sm107a) cubins.
     TRTLLM_GEN_FMHA: str = "2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "1d145b82ac60add55ea213863523f12d63005651/batched_gemm-09795a1-31ee4e5/"
+        "4e73ccb74f333ecfebeac52abf3ebe1fa2dd34b3/batched_gemm-b738138-6923fec/"
     )
     TRTLLM_GEN_GEMM: str = (
         "7b1fc253cd6237950e76310873f4acf4d97a3904/gemm-b738138-25754e6/"
@@ -169,7 +168,7 @@ class CheckSumHash:
         "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
     )
     TRTLLM_GEN_BMM: str = (
-        "e071273ce357ee3e8d40ce905dac03d2a6078f6c5869ca3b7d1f1d146643f009"
+        "8190fcb70b7661bf11cc5247b98d7fc55153386f969175c196a9e29d5801c7a1"
     )
     DEEPGEMM: str = "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
     TRTLLM_GEN_GEMM: str = (
@@ -357,6 +356,29 @@ def download_artifacts() -> None:
         local_path = FLASHINFER_CUBIN_DIR / name
         if not verify_cubin(str(local_path), checksum):
             raise RuntimeError("Failed to download cubins: checksum mismatch")
+
+    # A restore-key fallback may seed this download with a cache produced for an
+    # older artifact manifest. Remove anything that is not in the current,
+    # checksum-verified file list so stale kernels cannot leak into the wheel.
+    expected_files = {name for name, _ in cubin_files}
+    stale_files = []
+    for local_path in FLASHINFER_CUBIN_DIR.rglob("*"):
+        if local_path.is_file():
+            relative_path = local_path.relative_to(FLASHINFER_CUBIN_DIR).as_posix()
+            if relative_path not in expected_files:
+                local_path.unlink()
+                stale_files.append(relative_path)
+
+    for local_path in sorted(
+        (path for path in FLASHINFER_CUBIN_DIR.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        with suppress(OSError):
+            local_path.rmdir()
+
+    if stale_files:
+        logger.info("Removed %d stale cached artifacts", len(stale_files))
 
 
 def get_artifacts_status() -> tuple[tuple[str, bool], ...]:

@@ -28,6 +28,8 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
 cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
+# Native Rubin MegaMoE uses APIs absent from the general CUDA-extra floor.
+sm107 = ["nvidia-cutlass-dsl[cu13]>=4.8.0.dev0", "nvshmem4py-cu13>=0.3.1", "torch>=2.8"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl-extensions) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
@@ -70,8 +72,14 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
+"flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+# Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
+# importlib.resources.
+"flashinfer.msa_ops" = ["*.json"]
 # Workload registry of the experimental fused GDN decode backends, loaded at
 # runtime via importlib.resources.
 "flashinfer.gdn_kernels.experimental" = ["*.json"]
@@ -80,6 +88,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
+"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.
 "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
@@ -120,6 +130,7 @@ follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
 exclude = [
+  "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/.*/sources/",
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
@@ -130,7 +141,8 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
   "flashinfer/prims_ts/",
-  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
@@ -148,6 +160,9 @@ exclude = [
   # Self-sampling GVR V2: verbatim TRT-LLM drops (see the ruff exclude note).
   "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
+  # Same class: a CuTe DSL kernel body, kept byte-faithful to the artifact its
+  # kernel-level numbers were measured on.
+  "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
   "build/",
 ]
 
@@ -164,10 +179,12 @@ exclude = [
 [tool.ruff]
 # Ruff infers the target from project.requires-python.
 extend-exclude = [
+  "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/*/sources/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
-  "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
   "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",

@@ -4920,7 +4920,8 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
     name_prefix="cute_dsl_fused_moe_bf16",
     description=(
         "SM90 (Hopper) CuTe-DSL unquantized (bf16/fp16) fused MoE: moe_sort "
-        "routing maps + gather-fused grouped GEMM1 with SiLU-gating epilogue "
+        "routing maps + gather-fused grouped GEMM1 with the activation in its "
+        "epilogue (SwiGLU/OAI/SiTU, GeGLU-tanh, or non-gated ReLU^2) "
         "+ grouped GEMM2 with fused finalize. Pre-routed "
         "(token_selected_experts + token_final_scales)."
     ),
@@ -4928,7 +4929,10 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
         "num_tokens": Var(description="Total tokens across the batch."),
         "hidden_size": Const(abbrev="h"),
         "gemm1_out_size": Var(
-            description="FC1 output rows: 2 * intermediate_size (gated SwiGLU)."
+            description=(
+                "FC1 output rows: 2 * intermediate_size for gated activations, "
+                "intermediate_size for Relu2."
+            )
         ),
         "intermediate_size": Var(description="MoE intermediate size per rank."),
         "num_local_experts": Const(abbrev="e"),
@@ -4952,9 +4956,10 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "hidden_size"],
             description=(
-                "FC1 weights, up/gate interleaved at 32 columns (reference "
-                "repack: interleave_up_gate_sm90; frameworks keep their own "
-                "copy, the SM100 convention)."
+                "FC1 weights. Gated activations: up/gate interleaved at 32 "
+                "columns (reference repack: interleave_up_gate_sm90; frameworks "
+                "keep their own copy, the SM100 convention). Relu2: a plain "
+                "[E, I, hidden] projection."
             ),
         ),
         "w2_weight": Tensor(
@@ -4968,6 +4973,35 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
         ),
         "local_expert_offset": Scalar(
             "int32", optional=True, description="Global id of the first local expert."
+        ),
+        "activation_type": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "GEMM1 activation type: ActivationType.Swiglu for gated "
+                "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
+                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
+                "non-gated ReLU^2. Determines gemm1_out_size."
+            ),
+        ),
+        "swiglu_alpha": Scalar(
+            "float32", optional=True, description="SwiGLU sigmoid multiplier."
+        ),
+        "swiglu_beta": Scalar(
+            "float32", optional=True, description="SwiGLU up-projection bias."
+        ),
+        "swiglu_limit": Scalar(
+            "float32", optional=True, description="SwiGLU clamp limit."
+        ),
+        "situ_beta": Scalar(
+            "float32",
+            optional=True,
+            description="SiTU gate tanh-clamp beta; enables SiTU when set.",
+        ),
+        "situ_linear_beta": Scalar(
+            "float32",
+            optional=True,
+            description="Optional SiTU up-branch tanh-clamp beta.",
         ),
     },
     outputs={

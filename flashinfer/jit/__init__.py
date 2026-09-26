@@ -96,6 +96,9 @@ from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .cake_megamoe_topk_reduce import (
     gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
 )
+from .cake_sampling import gen_cake_sampling_module as gen_cake_sampling_module
+from .cake_sampling import get_cake_sampling_uri as get_cake_sampling_uri
+from .cake_sampling import load_cake_sampling_module as load_cake_sampling_module
 from .cake_megamoe_topk_reduce import (
     get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
 )

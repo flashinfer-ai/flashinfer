@@ -109,12 +109,34 @@ from .dcp_alltoall import (
 )
 from .dcp_alltoall import decode_cp_a2a_init_workspace as decode_cp_a2a_init_workspace
 from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspace_size
+from .dcp_lse_reduce import decode_cp_a2a_lse_reduce as decode_cp_a2a_lse_reduce
+from .dcp_lse_reduce import (
+    decode_cp_a2a_lse_reduce_create_workspace as decode_cp_a2a_lse_reduce_create_workspace,
+)
+from .dcp_lse_reduce import (
+    decode_cp_a2a_lse_reduce_workspace_size as decode_cp_a2a_lse_reduce_workspace_size,
+)
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
 from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (
     prepare_all_gather_matmul as prepare_all_gather_matmul,
+)
+from .cake_fused_norm_combine import (
+    CakeFusedNormCombineWorkspace as CakeFusedNormCombineWorkspace,
+)
+from .cake_fused_norm_combine import (
+    cake_fused_norm_combine as cake_fused_norm_combine,
+)
+from .cake_fused_norm_combine import (
+    cake_fused_norm_combine_create_workspace as cake_fused_norm_combine_create_workspace,
+)
+from .cake_fused_norm_combine import (
+    cake_fused_norm_combine_destroy_workspace as cake_fused_norm_combine_destroy_workspace,
+)
+from .cake_fused_norm_combine import (
+    cake_fused_norm_combine_workspace_bytes as cake_fused_norm_combine_workspace_bytes,
 )
 
 

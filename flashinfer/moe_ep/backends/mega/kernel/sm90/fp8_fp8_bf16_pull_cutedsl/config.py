@@ -71,7 +71,7 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
+    enable_in_kernel_fc2_reduce: bool = False
     # Legacy alias: True maps to token_back_mode="reuse_dispatch_warps".
     token_back_by_dispatch: bool = False
     # Explicit token-back placement; overrides token_back_by_dispatch when set.
@@ -115,6 +115,12 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # pool with 128-row expert segments) -- read it back from the workspace's
     # ``fc1_c`` after compute().  Default off (compiled out).
     generate_c: bool = False
+    # Tail-split pair tasks for the odd tail cluster block of an expert (both
+    # CTAs of a 2-CTA token cluster compute the single valid token tile
+    # against adjacent weight tiles).  None follows the heuristic table's
+    # per-bucket choice; True/False forces it.  Legal only with swap-AB cga
+    # (1, 2, 1) or non-swap cga (2, 1, 1).  Output-invariant.
+    tail_split_pairs: bool | None = None
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0
     fc2_activation_dequant_scale: float = 1.0

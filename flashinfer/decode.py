@@ -39,6 +39,8 @@ from .mla import (
 )
 from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
+from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
+from .cudnn.decode import CudnnDecodeGraph, prepare_cudnn_batch_decode
 from .jit import (
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -158,7 +160,6 @@ _PRIMS_TS_LAZY_EXPORTS = (
             "get_prims_ts_batch_decode_workspace_size",
             "make_q_token_kv_block_sparse_qo_indptr",
             "prepare_prims_ts_batch_decode_with_kv_cache",
-            "prims_ts_batch_decode_with_kv_cache",
             "suggest_q_token_kv_block_sparse_group_size",
             "validate_q_token_kv_block_sparse_group_size",
         }
@@ -233,6 +234,154 @@ def sm110_gqa_decode(
         out=out,
         q_scale=q_scale,
     )
+
+
+@flashinfer_experimental_api(feature="Prepared SM110 GQA decode")
+def prepare_sm110_gqa_decode(
+    inputs: dict[str, Any], num_splits: Optional[int] = None
+) -> dict[str, Any]:
+    r"""Prepare repeated FP16 GQA decode launches on an exact SM110 GPU.
+
+    Parameters
+    ----------
+    inputs : dict[str, Any]
+        Contiguous CUDA tensors ``Q`` [B,32,128], ``KV`` [B,2,8,capacity,128],
+        caller-owned ``O`` [B,32,128] (all FP16), and int32
+        ``sequence_lengths`` [B]. All tensors must share one CUDA device and
+        ``O`` must not alias any input storage. Optional ``q_scale`` defaults
+        to 1.0 and must be finite and positive.
+    num_splits : Optional[int]
+        ``None`` selects the prepared shape specialization. Above capacity 64,
+        ``1`` selects the original long kernel. B=1 with capacity 1024 or 4096
+        also supports its fixed split count of ``10``. Above capacity 64,
+        other split choices are rejected. Capacities up to 64 always use the
+        original short kernel; accepted explicit counts are 1, 2, 4, 8, 10, 16.
+
+    Returns
+    -------
+    dict[str, Any]
+        Opaque prepared state owning tensor references and any workspace.
+        Pass it to :func:`launch_sm110_gqa_decode_prepared` without modifying it.
+
+    Notes
+    -----
+    This opt-in interface separates allocation and JIT compilation from
+    sustained decode. Default specializations cover B=4/capacity=256 and
+    B=1/capacity=1024 or 4096; other shapes use the original kernels.
+    Every sequence length must remain in ``[1, capacity]`` at every launch.
+    GPU length values may change between launches; preparation does not read
+    them back to the host. The caller is responsible for this precondition.
+    Prepare and warm up before CUDA Graph capture. Retain the prepared state
+    until all asynchronous work completes and captured Graphs are retired.
+    """
+    from .experimental.sm110_gqa_decode import prepare_for_launch
+
+    return prepare_for_launch(inputs, num_splits=num_splits)
+
+
+@flashinfer_experimental_api(feature="Balanced paged GQA decode")
+def prepare_balanced_batch_decode_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    sm_scale: Optional[float] = None,
+    q_len_per_req: int = 1,
+    out: Optional[torch.Tensor] = None,
+    kv_layout: str = "HND",
+    backend: str = "cake",
+):
+    r"""Prepare on-device load-balanced BF16 paged GQA decode (SM100/SM103).
+
+    The experimental Cake backend serves ragged paged decode batches with one
+    persistent launch whose work plan is derived on the GPU from ``seq_lens``:
+    long requests are split across CTAs and short ones packed, with no host
+    planning, no request permutation and no per-length CUDA Graph variants
+    (the kernel-owned scheduler requested in flashinfer-ai/flashinfer#4832).
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        BF16 ``[batch * q_len_per_req, num_q_heads, 128]``; request ``b`` owns
+        rows ``[b * q_len_per_req, (b + 1) * q_len_per_req)`` and query head
+        ``h`` attends to KV head ``h // 8`` (exactly eight query heads per KV
+        head).
+    kv_cache : Tuple[torch.Tensor, torch.Tensor]
+        ``(k_cache, v_cache)``, each BF16 ``[num_pages, num_kv_heads, 16, 128]``
+        (``HND`` pages of 16 tokens).
+    block_tables : torch.Tensor
+        int32 ``[batch, max_pages]`` page ids per request.  A width that is a
+        multiple of eight pages is read in place; other widths are copied
+        into a padded table inside ``workspace_buffer`` at preparation.
+    seq_lens : torch.Tensor
+        int32 ``[batch]`` KV lengths including the ``q_len_per_req`` new
+        tokens.  Read on device at every launch.
+    workspace_buffer : torch.Tensor
+        Caller-owned CUDA bytes of at least
+        :func:`flashinfer.experimental.balanced_gqa_decode.cake_backend.balanced_gqa_decode_workspace_size`;
+        the split partials and the kernel's self-resetting counters live here,
+        so the region must not be shared with other work between launches.
+    sm_scale : Optional[float]
+        Softmax scale; defaults to ``1 / sqrt(128)``.
+    q_len_per_req : int
+        Query tokens per request (speculative / MTP verify).  Row ``j`` of a
+        request attends causally to its first ``seq_len - (q_len_per_req - 1 - j)``
+        KV positions.
+    out : Optional[torch.Tensor]
+        Optional caller-owned BF16 ``[batch * q_len_per_req, num_q_heads, 128]``.
+    kv_layout : str
+        Only ``"HND"`` is supported.
+    backend : str
+        Only ``"cake"`` is supported.
+
+    Returns
+    -------
+    BalancedGQADecodeRunner
+        Calling it launches the decode on the current stream with no CUDA
+        allocation or host synchronization and returns ``out``.  CUDA Graph
+        capture belongs to the caller; a captured runner replays correctly
+        for any lengths later written into ``seq_lens``.  See
+        ``flashinfer/experimental/balanced_gqa_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("balanced GQA decode currently supports backend='cake'")
+    from .experimental.balanced_gqa_decode.cake_backend import (
+        prepare_balanced_batch_decode_with_kv_cache as prepare,
+    )
+
+    return prepare(
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        sm_scale=sm_scale,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        kv_layout=kv_layout,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="Prepared SM110 GQA decode launch")
+def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
+    r"""Launch prepared decode on the current PyTorch stream and return its O.
+
+    ``prepared`` is the unmodified result of :func:`prepare_sm110_gqa_decode`.
+    Its tensors and workspace must remain alive through asynchronous launches
+    and CUDA Graph replays. GPU sequence lengths may change within the valid
+    range, while shapes, storage, and query scale remain fixed.
+
+    Concurrent invocations require independent prepared objects and output/
+    workspace storage. A prepared object can be reused on ordered streams,
+    including event-ordered stream handoffs. No allocations or host reads of
+    sequence lengths occur in this launch path.
+    """
+    from .experimental.sm110_gqa_decode import launch_prepared
+
+    return launch_prepared(prepared)
 
 
 @functools.cache
@@ -941,8 +1090,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             no RoPE/ALiBi/soft-cap).
             The ``cudnn`` backend runs cuDNN's paged SDPA decode graph
             (:func:`flashinfer.decode.cudnn_batch_decode_with_kv_cache`). It supports
-            fp16/bf16 q/kv/o of one dtype, GQA, ``return_lse`` and CUDA graphs, but not
-            ``q_len_per_req > 1``, RoPE, soft-cap, sliding window, sinks, fp8 or NVFP4 KV.
+            fp16/bf16 q/kv/o of one dtype, GQA, ``return_lse``, CUDA graphs,
+            multi-token decode (``q_len_per_req > 1``, bottom-right causal), a left
+            sliding window (``window_left``) and attention ``sinks``, but not RoPE,
+            soft-cap, fp8 or NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when
+            the cuDNN stack's SDPA engines accept it (cudnn-frontend 1.30+ with the
+            FROST engines enabled); the backend engine raises a not-supported error
+            at the first run.
             Pass a fixed ``block_tables`` to :meth:`plan` when capturing CUDA graphs so
             the captured block-table buffer is stable across re-plans.
 
@@ -1005,6 +1159,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         self._trtllm_gen_multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
         self._cudnn_block_tables: Optional[torch.Tensor] = None
+        # cudnn backend: the graph prepared at the first run() after plan() (validated
+        # once, per-step run() rebinds only the tensors that change) and the planned
+        # per-batch KV-length view it binds.
+        self._cudnn_prepared: Optional[CudnnDecodeGraph] = None
+        self._cudnn_kv_lens_view: Optional[torch.Tensor] = None
+        self._cudnn_q_lens_view: Optional[torch.Tensor] = None
+        self._cudnn_q_lens_shape: Optional[tuple[int, int]] = None
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -1082,6 +1243,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
+        self._cudnn_prepared = None
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
@@ -1239,7 +1401,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
         if q_len_per_req > 1:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1560,10 +1722,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
-            if not self.use_tensor_cores:
+            if not self.use_tensor_cores and self._backend != "cudnn":
                 raise ValueError(
                     "q_len_per_req > 1 requires tensor-core decode "
-                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl backend)."
+                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl/cudnn backend)."
                 )
             qo_indptr_host = qo_indptr_host * q_len_per_req
         if self.is_cuda_graph_enabled:
@@ -1647,7 +1809,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
         if q_len_per_req > 1 and is_causal:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1759,7 +1921,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"cute-dsl decode backend does not support "
                     f"pos_encoding_mode={pos_encoding_mode!r}"
                 )
-            self._max_kv_len = int(max(kv_lens_arr_host).item())
+            self._max_kv_len = int(kv_lens_arr_host.max().item())
             kv_splits = None
             if fixed_split_size > 0:
                 fixed_split_len = fixed_split_size * page_size
@@ -1797,7 +1959,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
             # Allocated once per plan and reused across run() launches. The
             # trtllm-gen kernel self-resets the counters at the end of each
             # launch, so no per-launch re-zeroing is needed.
@@ -1851,7 +2013,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             self._plan_info = self._cached_module.plan()  # None
         elif self.use_tensor_cores:
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
@@ -1986,16 +2148,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "cudnn decode backend does not apply position encoding "
                 f"(pos_encoding_mode must be 'NONE'); got {pos_encoding_mode!r}."
             )
-        if window_left >= 0:
-            raise NotImplementedError(
-                "cudnn decode backend does not support sliding window "
-                f"(window_left={window_left})."
-            )
-        if q_len_per_req > 1:
-            raise NotImplementedError(
-                "cudnn decode backend supports q_len_per_req == 1 only "
-                f"(got {q_len_per_req})."
-            )
         if q_data_type not in (torch.float16, torch.bfloat16) or not (
             q_data_type == kv_data_type == o_data_type
         ):
@@ -2005,6 +2157,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
 
         self._page_size = page_size
+        if self._cudnn_q_lens_shape != (batch_size, q_len_per_req):
+            # CUDA-graph mode freezes both dimensions before reaching here.
+            # Keep this allocation on the wrapper even if a prepared graph is
+            # replaced (e.g. a later run requests LSE).
+            self._cudnn_q_lens_view = torch.full(
+                (batch_size, 1, 1, 1),
+                q_len_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._cudnn_q_lens_shape = (batch_size, q_len_per_req)
         if batch_size > self._kv_lens_buffer.shape[0]:
             self._kv_lens_buffer = torch.empty(
                 (batch_size,), dtype=torch.int32, device=self.device
@@ -2033,6 +2196,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"max kv_len={max_kv_len}, page_size={page_size})."
                 )
             self._max_kv_len = self._block_tables.shape[1] * page_size
+            self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
+                batch_size, 1, 1, 1
+            )
             return
 
         # cuDNN bakes max_seq_len_kv and the block-table width into the built graph,
@@ -2069,6 +2235,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         table.copy_(host_table, non_blocking=non_blocking)
         self._block_tables = table
         self._max_kv_len = max_kv_len
+        self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
+            batch_size, 1, 1, 1
+        )
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -2324,14 +2493,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
             q_len_per_req = q.size(0) // actual_batch_size
 
-        if not self.use_tensor_cores and q_len_per_req > 1:
+        if not self.use_tensor_cores and self._backend != "cudnn" and q_len_per_req > 1:
             raise ValueError(
                 f"q implies q_len_per_req={q_len_per_req}, but the "
                 "non-tensor-core decode kernel only supports q_len_per_req=1."
             )
         planned_q_len = getattr(self, "_q_len_per_req", 1) or 1
         if (
-            self.use_tensor_cores
+            (self.use_tensor_cores or self._backend == "cudnn")
             and self._backend not in ("trtllm-gen", "cute-dsl")
             and q_len_per_req != planned_q_len
         ):
@@ -2511,10 +2680,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         if self._backend == "cudnn":
-            if sinks is not None:
-                raise NotImplementedError(
-                    "cudnn decode backend does not support attention sinks."
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support NVFP4 KV cache."
@@ -2522,11 +2687,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if skip_softmax_threshold_scale_factor is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support skip-softmax."
-                )
-            if q.shape[0] != actual_batch_size:
-                raise NotImplementedError(
-                    "cudnn decode backend requires q_len_per_req == 1 "
-                    f"(got q.shape[0]={q.shape[0]}, batch_size={actual_batch_size})."
                 )
             if v_cache.dtype != self._cached_kv_data_type:
                 raise ValueError(
@@ -2538,23 +2698,75 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._kv_layout == "NHD":
                 k_cache = k_cache.transpose(-3, -2)
                 v_cache = v_cache.transpose(-3, -2)
+            if q.stride(-1) != 1:
+                q = q.contiguous()
             # Staged at plan() time (device buffers, no host sync): safe to capture.
-            cudnn_batch_decode_with_kv_cache(
-                q,
-                k_cache,
-                v_cache,
-                sm_scale,
-                self._float_workspace_buffer,
-                max_sequence_kv=self._max_kv_len,
-                actual_seq_lens_kv=self._kv_lens_buffer[:actual_batch_size].view(
+            # The graph is prepared once per signature (validation, graph-cache
+            # lookup, variant pack); a step rebinds q / caches / out / lse and runs.
+            # q has batch * q_len_per_req consecutive rows per request; the graph
+            # applies the bottom-right causal diagonal for q_len > 1, the left
+            # window bound and the per-head sink logits.
+            kv_lens = self._cudnn_kv_lens_view
+            if kv_lens is None or kv_lens.shape[0] != actual_batch_size:
+                kv_lens = self._kv_lens_buffer[:actual_batch_size].view(
                     actual_batch_size, 1, 1, 1
-                ),
+                )
+            signature = dict(
+                max_sequence_kv=self._max_kv_len,
+                actual_seq_lens_kv=kv_lens,
                 block_tables=self._block_tables,
-                is_cuda_graph_compatible=self.is_cuda_graph_enabled,
-                out=out,
                 return_lse=return_lse,
-                lse=lse,
+                q_len_per_req=q_len_per_req,
+                window_left=window_left,
             )
+            if not _CUDNN_GRAPH_AVAILABLE:
+                # No cuDNN graph API installed: the public entry point's cubin fallback.
+                cudnn_batch_decode_with_kv_cache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    self._float_workspace_buffer,
+                    is_cuda_graph_compatible=self.is_cuda_graph_enabled,
+                    out=out,
+                    lse=lse,
+                    sinks=sinks,
+                    **signature,
+                )
+            else:
+                prepared = self._cudnn_prepared
+                if prepared is None or not prepared.matches(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    out=out,
+                    lse=lse,
+                    sinks=sinks,
+                    **signature,
+                ):
+                    prepared = self._cudnn_prepared = prepare_cudnn_batch_decode(
+                        q,
+                        k_cache,
+                        v_cache,
+                        sm_scale,
+                        out=out,
+                        lse=lse,
+                        sinks=sinks,
+                        actual_seq_lens_q=self._cudnn_q_lens_view,
+                        **signature,
+                    )
+                prepared.run(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    lse,
+                    self._float_workspace_buffer,
+                    actual_seq_lens_kv=kv_lens,
+                    block_tables=self._block_tables,
+                    sinks=sinks,
+                )
         elif self.use_tensor_cores:
             run_args = [self._float_workspace_buffer]
             if self._backend == "trtllm-gen":
@@ -2945,6 +3157,7 @@ class TrtllmGenDecodeModule:
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
@@ -3939,11 +4152,17 @@ def trtllm_batch_decode_with_kv_cache(
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
-            lse_stride_tokens,
-            lse_stride_heads,
-            enable_block_sparse_attention,
-            None,  # sparse_mla_top_k_lens
         ]
+        if backend != "cake":
+            run_args.append(1.0)  # lse_scale
+        run_args.extend(
+            [
+                lse_stride_tokens,
+                lse_stride_heads,
+                enable_block_sparse_attention,
+                None,  # sparse_mla_top_k_lens
+            ]
+        )
         if backend != "cake":
             run_args.extend(
                 (

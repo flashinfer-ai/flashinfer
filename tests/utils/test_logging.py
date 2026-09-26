@@ -25,6 +25,83 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize(
+    "modules",
+    [
+        (),
+        ("flashinfer",),
+        (
+            "flashinfer.decode",
+            "flashinfer.api_logging",
+            "flashinfer.mla._batch_mla._auto_policy",
+        ),
+    ],
+)
+@pytest.mark.parametrize("category", [UserWarning, DeprecationWarning])
+def test_warn_from_external_caller_skips_internal_frames(modules, category):
+    import functools
+    import inspect
+    import warnings
+
+    from flashinfer.api_logging import _warn_from_external_caller
+
+    call = functools.partial(
+        _warn_from_external_caller, "caller-attributed warning", category
+    )
+    for module in modules:
+        namespace = {"__name__": module, "callback": call}
+        exec(
+            compile("def invoke():\n    callback()\n", f"<{module}>", "exec"), namespace
+        )
+        call = namespace["invoke"]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            expected_line = inspect.currentframe().f_lineno + 1
+            call()
+    assert len(caught) == 2, "The helper must leave deduplication to its callers"
+    for warning in caught:
+        assert str(warning.message) == "caller-attributed warning"
+        assert warning.category is category
+        assert warning.filename == __file__
+        assert warning.lineno == expected_line
+
+
+def test_warn_from_external_caller_preserves_similarly_named_external_module():
+    import functools
+    import warnings
+
+    from flashinfer.api_logging import _warn_from_external_caller
+
+    namespace = {
+        "__name__": "flashinfer_extensions.user",
+        "callback": functools.partial(
+            _warn_from_external_caller, "external caller", UserWarning
+        ),
+    }
+    exec(
+        compile("def invoke():\n    callback()\n", "<external caller>", "exec"),
+        namespace,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        namespace["invoke"]()
+    assert len(caught) == 1
+    assert caught[0].filename == "<external caller>"
+    assert caught[0].lineno == 2
+
+
+def test_warn_from_external_caller_respects_warning_errors():
+    import warnings
+
+    from flashinfer.api_logging import _warn_from_external_caller
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        with pytest.raises(UserWarning, match="warning promoted to error"):
+            _warn_from_external_caller("warning promoted to error", UserWarning)
+
+
 # Test enum classes
 class TestEnum(Enum):
     """Test enum with integer values."""

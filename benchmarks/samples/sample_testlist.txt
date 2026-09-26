@@ -60,17 +60,29 @@
 --routine unified_moe --backends cutlass cutile --quant-variant nvfp4 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_w4a4"
 --routine unified_moe --backends cutile --quant-variant nvfp4_w4a16 --num_tokens 8 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_nvfp4_w4a16"
 --routine unified_moe --backends cutile --quant-variant mxfp4 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_mxfp4_w4a4"
+--routine unified_moe --backends cutlass cutile --quant-variant fp8 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_fp8"
+--routine unified_moe --backends cutile --quant-variant fp8_w8a16 --num_tokens 8 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_fp8_w8a16"
+--routine unified_moe --backends cutile --quant-variant mxfp8 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_mxfp8"
+--routine unified_moe --backends cutlass cutile --quant-variant mxfp4_w4a8 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_mxfp4_w4a8"
 
 # NVIDIA Nemotron-3.5-Lightning-30B-A3B: ReLU2, H=2688, I=1856, E=128, top-k=6
 --routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_bf16"
 --routine unified_moe --backends cutlass cutile --quant-variant nvfp4 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_w4a4"
 --routine unified_moe --backends cutile --quant-variant mxfp4_w4a16 --num_tokens 8 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_mxfp4_w4a16"
+--routine unified_moe --backends cutile --quant-variant mxfp8_w8a16 --num_tokens 8 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_mxfp8_w8a16"
 
 # CuteDSL NVFP4 MoE (Blackwell SM10.0/SM10.3 only; SwiGLU only)
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "cute_dsl_moe_large"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 256 --hidden_size 1024 --intermediate_size 512 --num_experts 256 --top_k 2 -vv --generate_repro_command --case_tag "cute_dsl_moe_small"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --autotune -vv --generate_repro_command --case_tag "cute_dsl_moe_autotune"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --local_expert_offset 0 --local_num_experts 32 -vv --generate_repro_command --case_tag "cute_dsl_moe_ep8"
+
+# CuteDSL BF16/FP16 MoE (Hopper SM9.0 only; --activation-type Swiglu/GegluTanh/Relu2; pre-routed top-k ids and scales; per-rank shapes for TP, --local_num_experts/--local_expert_offset for EP)
+--routine cute_dsl_bf16_moe --num_tokens 1 --hidden_size 2048 --intermediate_size 768 --num_experts 128 --top_k 8 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_30b_decode"
+--routine cute_dsl_bf16_moe --num_tokens 4096 --hidden_size 2048 --intermediate_size 768 --num_experts 128 --top_k 8 --input_dtype bfloat16 --autotune -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_30b_prefill_autotune"
+--routine cute_dsl_bf16_moe --num_tokens 256 --hidden_size 4096 --intermediate_size 384 --num_experts 128 --top_k 8 --input_dtype float16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_235b_tp4_fp16"
+--routine cute_dsl_bf16_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 512 --num_experts 512 --top_k 10 --local_num_experts 64 --local_expert_offset 64 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_next_ep8"
+--routine cute_dsl_bf16_moe --num_tokens 256 --hidden_size 4096 --intermediate_size 14336 --num_experts 8 --top_k 2 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_mixtral_8x7b"
 
 # b12x NVFP4 MoE (Blackwell SM12.0/SM12.1 only; SwiGLU or ReLU2, bf16 input)
 --routine b12x_fused_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 -vv --generate_repro_command --case_tag "b12x_moe_swiglu"

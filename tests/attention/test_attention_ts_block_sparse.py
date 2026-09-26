@@ -1087,6 +1087,9 @@ def test_contiguous_one_shot_forwards_route_mode_and_capacity(
     calls: list[tuple[str, dict[str, object]]] = []
     sentinel = object()
     monkeypatch.setattr(
+        block_sparse_module, "_validate_runtime_device", lambda _device: None
+    )
+    monkeypatch.setattr(
         block_sparse_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
@@ -1366,6 +1369,9 @@ def test_block_sparse_plan_rejects_cuda_graph_capture_before_allocation(
 ) -> None:
     device = torch.device("cuda:0")
     plan_stream = object()
+    monkeypatch.setattr(
+        block_sparse_module, "_validate_runtime_device", lambda _device: None
+    )
     monkeypatch.setattr(
         block_sparse_module,
         "_resolve_cuda_device",
@@ -1837,7 +1843,7 @@ def test_decode_schedule_revalidates_mutable_paged_staging_config(
             tile_size_kv=128,
             page_offsets_num_warps=2,
         )
-        message = "exactly one producer warp"
+        message = "page-offset staging requires one producer warp"
     else:
         cfg = block_sparse_config._make_block_sparse_config(
             block_sparse_config._BlockSparseCompileKey(
@@ -2757,6 +2763,7 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
     )
 
     state = SimpleNamespace(
+        share_pattern_across_kv_heads=False,
         device=torch.device("cpu"),
         batch_size=1,
         seq_len_q=8,
@@ -3800,6 +3807,7 @@ def test_paged_inspection_launches_share_one_summary(
     result = inspect_paged(
         *metadata,
         static=SimpleNamespace(
+            share_pattern_across_kv_heads=False,
             batch_size=1,
             num_kv_heads=1,
             seq_len_q=64,
