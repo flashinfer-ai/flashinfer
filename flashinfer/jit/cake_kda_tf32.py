@@ -12434,6 +12434,17 @@ def prepare_descriptors(prepared):
                 owner._projection_module.prepare(
                     grid=owner._projection_grid, **owner._projection_args
                 )
+            if getattr(owner, "_apply_route", False):
+                # Kernel round 2: pair-map producer, prefix chain and fused apply.
+                owner._pairmap_module.prepare(
+                    grid=owner._pairmap_grid, **owner._pairmap_bindings()
+                )
+                owner._prefix_module.prepare(
+                    grid=owner._prefix_grid, **owner._prefix_bindings()
+                )
+                owner._apply_module.prepare(
+                    grid=owner._apply_grid, **owner._apply_bindings()
+                )
         else:
             if owner.prepare_module is not None:
                 owner.prepare_module.prepare(
