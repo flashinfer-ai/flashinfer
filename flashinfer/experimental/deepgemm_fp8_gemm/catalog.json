@@ -3,7 +3,7 @@
   "arches": {
     "sm_100a": {
       "programs": {
-        "deepgemm_fp8_gemm_1d1d_sm100a_0813fc81ca8776c1f7bf_kernel": {
+        "deepgemm_fp8_gemm_1d1d_sm100a_47634a3658f45388c0db_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -62,20 +62,20 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "4d8a225e93192fdf4207056df9b1c1567962833a7044a8a136962ae7e88de4dc",
+          "closure_sha256": "9e9b4de2a243fed39a20d173748cd62ed0a212b18ec99255dc0de17257303276",
           "compile_flags": [
             "--register-usage-level=10"
           ],
           "ffi_entry": "run",
-          "module_ident": "deepgemm_fp8_gemm_1d1d_sm100a_0813fc81ca8776c1f7bf_sm_100a",
-          "name": "deepgemm_fp8_gemm_1d1d_sm100a_0813fc81ca8776c1f7bf",
+          "module_ident": "deepgemm_fp8_gemm_1d1d_sm100a_47634a3658f45388c0db_sm_100a",
+          "name": "deepgemm_fp8_gemm_1d1d_sm100a_47634a3658f45388c0db",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_0813fc81ca8776c1f7bf_kernel.ptx",
-            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_0813fc81ca8776c1f7bf_binding.cu"
+            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_47634a3658f45388c0db_kernel.ptx",
+            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_47634a3658f45388c0db_binding.cu"
           ]
         },
-        "deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e_kernel": {
+        "deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -134,17 +134,17 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "01efcce9725654c83c360684071aa5713eb9561c1f2f9e5cb964ebe788073d8f",
+          "closure_sha256": "58734f1c9a1438d267346e65031258bb8ec8eb3382a8b870b8888856af233bcc",
           "compile_flags": [
             "--register-usage-level=10"
           ],
           "ffi_entry": "run",
-          "module_ident": "deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e_sm_100a",
-          "name": "deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e",
+          "module_ident": "deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f_sm_100a",
+          "name": "deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e_kernel.ptx",
-            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e_binding.cu"
+            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f_kernel.ptx",
+            "csrc/experimental/deepgemm_fp8_gemm/generated/sm_100a/deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f_binding.cu"
           ]
         }
       },
@@ -165,7 +165,7 @@
             "grid_n": 32,
             "num_sms": 148
           },
-          "program": "deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e_kernel"
+          "program": "deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f_kernel"
         },
         "wgrad": {
           "config": {
@@ -183,7 +183,7 @@
             "grid_n": 32,
             "num_sms": 148
           },
-          "program": "deepgemm_fp8_gemm_1d1d_sm100a_0813fc81ca8776c1f7bf_kernel"
+          "program": "deepgemm_fp8_gemm_1d1d_sm100a_47634a3658f45388c0db_kernel"
         }
       }
     },

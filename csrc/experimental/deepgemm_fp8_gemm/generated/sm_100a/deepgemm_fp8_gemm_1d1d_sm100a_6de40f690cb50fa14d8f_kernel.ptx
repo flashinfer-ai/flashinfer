@@ -7,7 +7,7 @@
 
 .extern .shared .align 128 .b8 smem_raw[];
 
-.visible .entry kernel_deepgemm_fp8_gemm_1d1d_sm100a_c3bb67e65e06f65ac31e(
+.visible .entry kernel_deepgemm_fp8_gemm_1d1d_sm100a_6de40f690cb50fa14d8f(
     .param .align 128 .b8 A[128],
     .param .align 128 .b8 B[128],
     .param .align 128 .b8 SFA[128],
@@ -417,7 +417,7 @@ $L_select_end_30:
     or.b32 %r6, %r6, %r7;
     shl.b32 %r8, %r4, 4;
     or.b32 %r6, %r6, %r8;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r1], %rd0, %rd1, %r6, [%r2], [%r3], %p26;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r1], %rd0, %rd1, %r6, [%r2], [%r3], %p26;
     add.u64 %ud15, %rd0, 2;
     mov.b64 %rd2, %ud15;
     add.u64 %ud16, %rd1, 2;
@@ -428,7 +428,7 @@ $L_select_end_30:
     or.b32 %r9, %r9, %r10;
     shl.b32 %r11, %r4, 4;
     or.b32 %r9, %r9, %r11;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r1], %rd2, %rd3, %r9, [%r2], [%r3], %p27;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r1], %rd2, %rd3, %r9, [%r2], [%r3], %p27;
     add.u64 %ud17, %rd0, 4;
     mov.b64 %rd4, %ud17;
     add.u64 %ud18, %rd1, 4;
@@ -439,7 +439,7 @@ $L_select_end_30:
     or.b32 %r12, %r12, %r13;
     shl.b32 %r14, %r4, 4;
     or.b32 %r12, %r12, %r14;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r1], %rd4, %rd5, %r12, [%r2], [%r3], %p28;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r1], %rd4, %rd5, %r12, [%r2], [%r3], %p28;
     add.u64 %ud19, %rd0, 6;
     mov.b64 %rd6, %ud19;
     add.u64 %ud20, %rd1, 6;
@@ -450,7 +450,7 @@ $L_select_end_30:
     or.b32 %r15, %r15, %r16;
     shl.b32 %r17, %r4, 4;
     or.b32 %r15, %r15, %r17;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r1], %rd6, %rd7, %r15, [%r2], [%r3], %p29;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r1], %rd6, %rd7, %r15, [%r2], [%r3], %p29;
 $L_elect_end_31:
     bar.warp.sync 0xffffffff;
     mul.lo.u32 %u164, %u126, 8;
@@ -536,7 +536,7 @@ $L_select_end_38:
     or.b32 %r24, %r24, %r25;
     shl.b32 %r26, %r22, 4;
     or.b32 %r24, %r24, %r26;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r19], %rd8, %rd9, %r24, [%r20], [%r21], %p37;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r19], %rd8, %rd9, %r24, [%r20], [%r21], %p37;
     add.u64 %ud23, %rd8, 2;
     mov.b64 %rd10, %ud23;
     add.u64 %ud24, %rd9, 2;
@@ -547,7 +547,7 @@ $L_select_end_38:
     or.b32 %r27, %r27, %r28;
     shl.b32 %r29, %r22, 4;
     or.b32 %r27, %r27, %r29;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r19], %rd10, %rd11, %r27, [%r20], [%r21], %p38;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r19], %rd10, %rd11, %r27, [%r20], [%r21], %p38;
     add.u64 %ud25, %rd8, 4;
     mov.b64 %rd12, %ud25;
     add.u64 %ud26, %rd9, 4;
@@ -558,7 +558,7 @@ $L_select_end_38:
     or.b32 %r30, %r30, %r31;
     shl.b32 %r32, %r22, 4;
     or.b32 %r30, %r30, %r32;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r19], %rd12, %rd13, %r30, [%r20], [%r21], %p39;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r19], %rd12, %rd13, %r30, [%r20], [%r21], %p39;
     add.u64 %ud27, %rd8, 6;
     mov.b64 %rd14, %ud27;
     add.u64 %ud28, %rd9, 6;
@@ -569,7 +569,7 @@ $L_select_end_38:
     or.b32 %r33, %r33, %r34;
     shl.b32 %r35, %r22, 4;
     or.b32 %r33, %r33, %r35;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r19], %rd14, %rd15, %r33, [%r20], [%r21], %p40;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r19], %rd14, %rd15, %r33, [%r20], [%r21], %p40;
 $L_elect_end_39:
     bar.warp.sync 0xffffffff;
     mul.lo.u32 %u189, %u126, 8;
@@ -655,7 +655,7 @@ $L_select_end_46:
     or.b32 %r42, %r42, %r43;
     shl.b32 %r44, %r40, 4;
     or.b32 %r42, %r42, %r44;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r37], %rd16, %rd17, %r42, [%r38], [%r39], %p48;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r37], %rd16, %rd17, %r42, [%r38], [%r39], %p48;
     add.u64 %ud31, %rd16, 2;
     mov.b64 %rd18, %ud31;
     add.u64 %ud32, %rd17, 2;
@@ -666,7 +666,7 @@ $L_select_end_46:
     or.b32 %r45, %r45, %r46;
     shl.b32 %r47, %r40, 4;
     or.b32 %r45, %r45, %r47;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r37], %rd18, %rd19, %r45, [%r38], [%r39], %p49;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r37], %rd18, %rd19, %r45, [%r38], [%r39], %p49;
     add.u64 %ud33, %rd16, 4;
     mov.b64 %rd20, %ud33;
     add.u64 %ud34, %rd17, 4;
@@ -677,7 +677,7 @@ $L_select_end_46:
     or.b32 %r48, %r48, %r49;
     shl.b32 %r50, %r40, 4;
     or.b32 %r48, %r48, %r50;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r37], %rd20, %rd21, %r48, [%r38], [%r39], %p50;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r37], %rd20, %rd21, %r48, [%r38], [%r39], %p50;
     add.u64 %ud35, %rd16, 6;
     mov.b64 %rd22, %ud35;
     add.u64 %ud36, %rd17, 6;
@@ -688,7 +688,7 @@ $L_select_end_46:
     or.b32 %r51, %r51, %r52;
     shl.b32 %r53, %r40, 4;
     or.b32 %r51, %r51, %r53;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r37], %rd22, %rd23, %r51, [%r38], [%r39], %p51;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r37], %rd22, %rd23, %r51, [%r38], [%r39], %p51;
 $L_elect_end_47:
     bar.warp.sync 0xffffffff;
     mul.lo.u32 %u214, %u126, 8;
@@ -774,7 +774,7 @@ $L_select_end_54:
     or.b32 %r60, %r60, %r61;
     shl.b32 %r62, %r58, 4;
     or.b32 %r60, %r60, %r62;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r55], %rd24, %rd25, %r60, [%r56], [%r57], %p59;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r55], %rd24, %rd25, %r60, [%r56], [%r57], %p59;
     add.u64 %ud39, %rd24, 2;
     mov.b64 %rd26, %ud39;
     add.u64 %ud40, %rd25, 2;
@@ -785,7 +785,7 @@ $L_select_end_54:
     or.b32 %r63, %r63, %r64;
     shl.b32 %r65, %r58, 4;
     or.b32 %r63, %r63, %r65;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r55], %rd26, %rd27, %r63, [%r56], [%r57], %p60;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r55], %rd26, %rd27, %r63, [%r56], [%r57], %p60;
     add.u64 %ud41, %rd24, 4;
     mov.b64 %rd28, %ud41;
     add.u64 %ud42, %rd25, 4;
@@ -796,7 +796,7 @@ $L_select_end_54:
     or.b32 %r66, %r66, %r67;
     shl.b32 %r68, %r58, 4;
     or.b32 %r66, %r66, %r68;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r55], %rd28, %rd29, %r66, [%r56], [%r57], %p61;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r55], %rd28, %rd29, %r66, [%r56], [%r57], %p61;
     add.u64 %ud43, %rd24, 6;
     mov.b64 %rd30, %ud43;
     add.u64 %ud44, %rd25, 6;
@@ -807,7 +807,7 @@ $L_select_end_54:
     or.b32 %r69, %r69, %r70;
     shl.b32 %r71, %r58, 4;
     or.b32 %r69, %r69, %r71;
-    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%r55], %rd30, %rd31, %r69, [%r56], [%r57], %p62;
+    tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%r55], %rd30, %rd31, %r69, [%r56], [%r57], %p62;
 $L_elect_end_55:
     bar.warp.sync 0xffffffff;
     mul.lo.u32 %u239, %u126, 8;
