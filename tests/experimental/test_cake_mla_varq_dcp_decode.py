@@ -476,6 +476,29 @@ def _assert_close_to_reference(out, lse, ref_out, ref_lse, dtype):
     )
 
 
+def _assert_replay_close(out, lse, other_out, other_lse):
+    """Two launches on identical inputs agree within the documented replay spread.
+
+    When a request's local KV range is split into units on different clusters
+    the kernel merges the partials in unit-completion order from BF16-staged
+    partials (README, "Numerics and reproducibility"): consecutive launches can
+    differ by a few BF16 ulps of ``out`` and about 3e-3 of ``lse``; unsplit
+    rows are bitwise reproducible.  The -inf positions of ``lse`` (rows with
+    no keys) and the zero rows of ``out`` are always exact.
+    """
+    assert not torch.isnan(out.float()).any()
+    neg_inf = torch.isneginf(other_lse.float())
+    assert torch.equal(torch.isneginf(lse.float()), neg_inf)
+    torch.testing.assert_close(out.float(), other_out.float(), atol=1e-3, rtol=2.0**-7)
+    finite = ~neg_inf
+    torch.testing.assert_close(
+        lse.float()[finite], other_lse.float()[finite], atol=4e-3, rtol=0
+    )
+    assert torch.equal(
+        out.float()[neg_inf], torch.zeros_like(out.float()[neg_inf])
+    )
+
+
 def _launch_rank(
     query,
     cum_seq_lens_q,
@@ -794,8 +817,9 @@ def test_world1_var_q_matches_disabled_dcp():
         cp_rank=0,
         enable_dcp=False,
     )
-    torch.testing.assert_close(dcp_out, base_out, atol=0, rtol=0)
-    torch.testing.assert_close(dcp_lse, base_lse, atol=0, rtol=0)
+    # Both launches split the 1024-token request across clusters; they agree
+    # within the documented merge-order spread, not bitwise.
+    _assert_replay_close(dcp_out, dcp_lse, base_out, base_lse)
     ref_out, ref_lse = _reference_variable_q(
         query, cum_q, global_kv, global_lens.tolist(), cp_world=1, cp_rank=0
     )
@@ -857,7 +881,9 @@ def test_prepared_runner_replays_without_allocation():
         after = torch.cuda.memory_stats()
         assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
         assert after["allocation.all.freed"] == before["allocation.all.freed"]
-        assert torch.equal(out, first[0]) and torch.equal(lse, first[1])
+        # The 4101-token request splits into units; replays agree within the
+        # documented merge-order spread (bitwise only for unsplit rows).
+        _assert_replay_close(out, lse, first[0], first[1])
 
 
 def test_rejects_unsupported_compute_capability():
