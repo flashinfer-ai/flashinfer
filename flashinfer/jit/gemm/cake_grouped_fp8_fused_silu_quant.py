@@ -19,9 +19,145 @@ from typing import Any
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
 
-MODULES: dict[str, dict[str, Any]] = {}
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0": {
+        "arch": "sm_100a",
+        "route": "gemm_then_silu_mul_group_quant_fp8",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0_sm_100a",
+        "sources": [
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "buffer",
+                "y",
+            ],
+            [
+                "buffer",
+                "out_q",
+            ],
+            [
+                "buffer",
+                "out_s",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "H",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "tma_workspace_bytes": 0,
+        "closure_sha256": "5515138571101fd184ae4873481201cad419b970d11eff2cf857781f3de04f1c",
+    },
+    "cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2": {
+        "arch": "sm_100a",
+        "route": "fused_cg2_ab7_pairsched_kg4",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2_sm_100a",
+        "sources": [
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "tma_buffer",
+                "A",
+            ],
+            [
+                "tma_buffer",
+                "B",
+            ],
+            [
+                "buffer",
+                "out_q",
+            ],
+            [
+                "buffer",
+                "out_s",
+            ],
+            [
+                "buffer",
+                "a_scale",
+            ],
+            [
+                "buffer",
+                "b_scale",
+            ],
+            [
+                "buffer",
+                "m_indices",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "N",
+            ],
+            [
+                "parameter",
+                "K",
+            ],
+            [
+                "parameter",
+                "G",
+            ],
+            [
+                "workspace",
+                "tma_descriptor_workspace",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "tma_workspace_bytes": 256,
+        "closure_sha256": "5edfabacedc2aaf4df2b95aac264bbbb630de181dfebecc379808261db9cd73a",
+    },
+}
 
-ROUTE_GEOMETRY: dict[str, dict[str, int]] = {}
+ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
+    "fused_cg2_ab7_pairsched_kg4": {
+        "tile_m": 256,
+        "tile_n": 256,
+        "cluster_ctas": 2,
+    },
+    "gemm_then_silu_mul_group_quant_fp8": {
+        "tile_m": 1,
+        "tile_n": 256,
+        "cluster_ctas": 1,
+    },
+}
 
 ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags}
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a"}
