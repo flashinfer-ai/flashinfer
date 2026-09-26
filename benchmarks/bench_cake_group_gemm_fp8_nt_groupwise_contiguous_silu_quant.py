@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark the generated SM100a fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quant against the FlashInfer chain.
+"""Benchmark the generated SM100a grouped FP8 gate_up GEMM + SwiGLU + FP8 quant programs against the FlashInfer chain.
 
 Chain = CuTe-DSL ``group_gemm_fp8_nt_groupwise_contiguous`` + ``silu_and_mul`` +
 ``per_token_group_quant_8bit`` (sum of the three kernels' CUPTI times, cold L2).
@@ -35,6 +35,10 @@ SHAPES = [
         4096,
     ),
     ("wide_ep32_gate_up_all_odd", [384] * 8 + [128] * 8, 2048, 4096),
+    # small-M route (grouped GEMM + generated SwiGLU/group-quant kernel): aligned and partial-tail routings
+    ("one_pair", [256], 512, 1024),
+    ("odd_blocks_with_empty", [384, 128, 0, 640], 512, 512),
+    ("leading_internal_empty_partial_tail", [0, 256, 0, 0, 128, 100], 256, 1024),
 ]
 
 
@@ -113,6 +117,8 @@ def main():
             K=k,
             groups=len(group_counts),
             route=prepared.route,
+            gemm_backend=prepared.gemm_backend,
+            prepared_kernels=prepared.num_kernels,
             grid=list(prepared.grid),
             fused_ms=fused_ms,
             chain_ms=chain_ms,
@@ -125,7 +131,7 @@ def main():
         )
         rows.append(row)
         print(
-            f"{label:36s} fused {fused_ms * 1e3:8.2f} us | chain {chain_ms * 1e3:8.2f} us "
+            f"{label:36s} {prepared.route}[{prepared.gemm_backend or '-'}] {fused_ms * 1e3:8.2f} us | chain {chain_ms * 1e3:8.2f} us "
             f"(gemm {gemm_ms * 1e3:.2f} + act {act_ms * 1e3:.2f} + quant {quant_ms * 1e3:.2f}) "
             f"| {row['speedup']:.3f}x | scales exact {scale_exact} | fp8 equal {q_exact_frac:.4f}"
         )

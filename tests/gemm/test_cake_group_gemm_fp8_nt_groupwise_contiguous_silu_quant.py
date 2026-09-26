@@ -11,9 +11,14 @@ from flashinfer.gemm import (
     prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant,
 )
 from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
+    ACT_ROUTE,
     FUSED_ROUTE,
+    GEMM_BACKEND_CAKE,
+    GEMM_BACKEND_CUTE,
+    SMALL_M_MAX,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
     launch_plan,
+    small_m_gemm_backend,
 )
 from flashinfer.quantization import per_token_group_quant_8bit
 
@@ -226,7 +231,18 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
-    assert prepared.route == FUSED_ROUTE
+    m = sum(group_counts)
+    if m < SMALL_M_MAX:
+        assert prepared.route == ACT_ROUTE
+        assert prepared.num_kernels == 2
+        assert prepared.gemm_backend == small_m_gemm_backend(m, n2, k)
+        assert prepared.gemm_backend == (
+            GEMM_BACKEND_CAKE if (m % 128 and k >= 1024) else GEMM_BACKEND_CUTE
+        )
+    else:
+        assert prepared.route == FUSED_ROUTE
+        assert prepared.num_kernels == 1
+        assert prepared.gemm_backend is None
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
     g, u, act = _reference_activation(
@@ -268,9 +284,16 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
     _assert_matches(out_q, out_s, chain_q, chain_s)
 
 
-def test_launch_plan_matches_prepared():
+@pytest.mark.parametrize(
+    "group_counts,n2,k,expected_route",
+    [
+        pytest.param([256] * 16, 2048, 4096, FUSED_ROUTE, id="fused_wide"),
+        pytest.param([256] * 8, 256, 512, FUSED_ROUTE, id="fused_at_threshold"),
+        pytest.param([256] * 4 + [128, 100], 512, 1024, ACT_ROUTE, id="small_m"),
+    ],
+)
+def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     device = torch.device("cuda")
-    group_counts, n2, k = [256] * 16, 2048, 4096
     a, b, a_scale, b_scale, m_indices = _make_inputs(
         group_counts, n2, k, seed=664, device=device
     )
@@ -278,15 +301,30 @@ def test_launch_plan_matches_prepared():
         a, b, a_scale, b_scale, m_indices
     )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    route, grid = launch_plan(sum(group_counts), n2, sm_count=sm_count)
+    m = sum(group_counts)
+    route, grid = launch_plan(m, n2, sm_count=sm_count)
+    assert route == expected_route
     assert (prepared.route, prepared.grid) == (route, grid)
-    assert grid[0] % 2 == 0 and grid[0] <= 128
+    if route == FUSED_ROUTE:
+        assert grid[0] % 2 == 0 and grid[0] <= 128
+    else:
+        items = m * (n2 // 2 // GROUP_SIZE)
+        assert 1 <= grid[0] <= max(1, -(-items // 4))
+        assert grid[0] <= 16 * sm_count
 
 
-def test_cuda_graph_replay_after_first_launch():
+@pytest.mark.parametrize(
+    "group_counts,n2,k",
+    [
+        pytest.param([128, 128, 100], 256, 1024, id="small_m_partial_tail"),
+        pytest.param([256, 256], 256, 512, id="small_m_aligned"),
+        pytest.param([256] * 8, 256, 512, id="fused"),
+    ],
+)
+def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     device = torch.device("cuda")
     a, b, a_scale, b_scale, m_indices = _make_inputs(
-        [128, 128, 100], 256, 1024, seed=665, device=device
+        group_counts, n2, k, seed=665, device=device
     )
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices
