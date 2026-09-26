@@ -586,7 +586,7 @@ template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALG
           BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, typename Predicate>
 __device__ __forceinline__ void DeviceSamplingFromProb(
     uint32_t i, uint32_t d, Predicate pred, float u, vec_t<float, VEC_SIZE> prob_vec,
-    float& aggregate,
+    float& aggregate, int& last_valid_index,
     SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
   const uint32_t tx = threadIdx.x;
   float prob_greater_than_threshold[VEC_SIZE];
@@ -641,24 +641,24 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     __syncthreads();
   }
 
-  // update the last valid index
-  int valid_index[VEC_SIZE];
+  // Keep fallback candidates local until the scan ends without selecting a token.
 #pragma unroll
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
     if (valid[j]) {
-      valid_index[j] = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
-    } else {
-      valid_index[j] = -1;
+      last_valid_index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
     }
   }
-  int max_valid_index =
-      BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
-          .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1 && max_valid_index < (int)d) {
-    temp_storage->last_valid_id = max_valid_index;
+  aggregate += aggregate_local;
+  if (temp_storage->sampled_id == d &&
+      (aggregate > u || i + 1 == ceil_div(d, BLOCK_THREADS * VEC_SIZE))) {
+    int max_valid_index =
+        BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
+            .Reduce(last_valid_index, MaxReduceOp{});
+    if (tx == 0) {
+      temp_storage->last_valid_id = max_valid_index;
+    }
   }
   __syncthreads();
-  aggregate += aggregate_local;
 }
 
 template <typename DType, typename IdType>
@@ -811,6 +811,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromPro
           smem_sampling);
   temp_storage.sampled_id = d;
   temp_storage.last_valid_id = -1;
+  int last_valid_index = -1;
   __syncthreads();
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -826,7 +827,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromPro
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
-        i, d, [](float x) { return x > 0; }, u, probs_vec, aggregate, &temp_storage);
+        i, d, [](float x) { return x > 0; }, u, probs_vec, aggregate, last_valid_index,
+        &temp_storage);
     if (float(aggregate) > u) {
       break;
     }
@@ -887,6 +889,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
     round += 1;
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
+    int last_valid_index = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -899,7 +902,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
-          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, last_valid_index,
+          &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1017,6 +1021,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFro
   do {
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
+    int last_valid_index = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1029,7 +1034,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFro
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
-          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, last_valid_index,
+          &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1170,6 +1176,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
   int sampled_id;
   temp_storage.sampled_id = d;
   temp_storage.last_valid_id = -1;
+  int last_valid_index = -1;
   __syncthreads();
   float u = curand_uniform(&state) * q;
 #pragma unroll 2
@@ -1181,7 +1188,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
-        i, d, [&](float x) { return x >= pivot; }, u, probs_vec, aggregate, &temp_storage);
+        i, d, [&](float x) { return x >= pivot; }, u, probs_vec, aggregate, last_valid_index,
+        &temp_storage);
     if (aggregate > u) {
       break;
     }
@@ -1239,6 +1247,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
   do {
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
+    int last_valid_index = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1251,7 +1260,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC>(
-          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, last_valid_index,
+          &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1964,6 +1974,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   float u = curand_uniform(&curand_state) * sum_relu_q_minus_p;
 
   float aggregate_relu_q_minus_p(0);
+  int last_valid_index = -1;
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(0);
@@ -1987,7 +1998,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
         i, d, [&](float x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p,
-        &temp_storage);
+        last_valid_index, &temp_storage);
     if (aggregate_relu_q_minus_p > u) {
       break;
     }
