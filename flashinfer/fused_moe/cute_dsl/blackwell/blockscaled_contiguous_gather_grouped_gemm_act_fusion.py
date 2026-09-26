@@ -801,6 +801,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.epi_tile,
             self.num_c_stage,
         )
+        if self.zero_fill:
+            # Zero-fill staging: the bulk copies stream a zeroed prefix of the
+            # C staging smem (whole 2 KB multiples, at most 32 KB per copy).
+            sc_bytes = (
+                cute.cosize(self.c_smem_layout_staged.outer) * self.c_dtype.width // 8
+            )
+            zb = min(sc_bytes, 32768)
+            zb -= zb % 2048
+            if zb < 2048 or self.zero_fill_chunk_bytes % zb != 0:
+                raise ValueError(
+                    f"zero_fill: C staging smem of {sc_bytes} B cannot tile a "
+                    f"{self.zero_fill_chunk_bytes} B chunk"
+                )
+            self.zero_fill_bulk_bytes = zb
 
         # Overlap and double buffer accumulator when num_acc_stage == 1 for cta_tile_n = 256 case
         self.overlapping_accum = self.num_acc_stage == 1
@@ -3496,20 +3510,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 else:
                     do_fill = (my_tiles > 0) | (other_tiles == 0)
                 if do_fill:
-                    sc_bytes = (
-                        cute.cosize(self.c_smem_layout_staged.outer)
-                        * self.c_dtype.width
-                        // 8
-                    )
-                    zb = min(sc_bytes, 32768)
-                    zb = zb - zb % 2048
-                    if cutlass.const_expr(
-                        zb < 2048 or self.zero_fill_chunk_bytes % zb != 0
-                    ):
-                        raise ValueError(
-                            f"zero_fill: C staging smem of {sc_bytes} B cannot "
-                            f"tile a {self.zero_fill_chunk_bytes} B chunk"
-                        )
+                    zb = self.zero_fill_bulk_bytes
                     copies_per_chunk = self.zero_fill_chunk_bytes // zb
                     sZ = storage.sC.get_tensor(
                         cute.make_layout((zb // 4,)), dtype=cutlass.Uint32
