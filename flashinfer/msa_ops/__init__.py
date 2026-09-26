@@ -30,7 +30,10 @@ SUPPORTS_PACKED_KV = True
 
 
 def supports_packed_kv(device: torch.device | str) -> bool:
-    """Return whether MSA accepts packed paged K/V views on ``device``."""
+    """Return generic packed-KV support; SM100/SM103 has narrower decode routes.
+
+    See :func:`msa_sparse_decode_attention` for packed FP8/NVFP4 requirements.
+    """
 
     normalized_device = torch.device(device)
     return normalized_device.type == "cuda" and get_compute_capability(

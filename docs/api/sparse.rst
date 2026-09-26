@@ -55,17 +55,22 @@ allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
 ``msa_prefill_nvfp4_specialized_stats()`` and
 ``msa_decode_nvfp4_specialized_stats()`` report the exact accepted set. Other
 NVFP4 forms -- flat or ragged K/V, or separately allocated scale tensors --
-remain SM120/SM121-only, and outside those routes the 10.0/10.3 backend
-requires separate contiguous K and V tensors and does not make implicit
-copies. The decode ``out=`` parameter is implemented by that 10.0/10.3 route
-alone; every other route raises ``NotImplementedError`` when it is passed.
+remain SM120/SM121-only. SM100/SM103 additionally supports packed FP8 HND
+decode with BF16 Q, device float32 scalar K/V scales and an explicit
+``MSASparseAttentionWorkspace``. It accepts independent, unsorted, strided
+TopK16 rows for Q1–8, head layouts 64/4 or 16/1, batches up to 256 and
+contexts up to 262144. K/V remain views into the original cache; only
+metadata is prepared before the existing TRT-LLM block-sparse attention call.
+Other 10.0/10.3 paths require separate contiguous K/V and make no implicit copies.
+The decode ``out=`` parameter is supported by the packed FP8 and NVFP4 routes;
+other routes raise ``NotImplementedError`` when it is passed.
 The compute capability 10.0/10.3 backend uses TopK16 as its generic contract
 and additionally retains four shape-exact routes: paged BF16 decode at
 B64/Q8/KV65536/TopK32, 512-thread paged BF16 decode at
 B2/Q1/KV257/TopK4, flat
 BF16-query/FP8-KV prefill at B3/Q1024/KV8192/TopK8, and paged BF16 prefill at
 B3/Q4096/KV8192/TopK4. Neighboring non-TopK16 shapes fail closed instead of
-entering a generic kernel. The decode path uses direct persistent M16
+entering a generic kernel. The non-packed-FP8 decode path uses direct persistent M16
 ownership for both Q1 and multi-token decode; it does not route BF16 decode
 through prefill or split-K.
 Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
@@ -90,6 +95,18 @@ way. ``msa_prefill_nvfp4_specialized_stats()`` reports the bound as
 Call :func:`flashinfer.msa_ops.supports_packed_kv` with the active device when
 integrating a cache manager across these architectures; the legacy aggregate
 ``SUPPORTS_PACKED_KV`` flag describes the SM120/SM121 backend.
+For the specialized SM100/SM103 FP8 decode contract above, split the cache
+without copying and reuse the existing workspace::
+
+    workspace = flashinfer.msa_ops.MSASparseAttentionWorkspace(q.device)
+    out = torch.empty_like(q)
+    # Warm and capture on the same stream; one workspace per captured call.
+    flashinfer.msa_ops.msa_sparse_decode_attention(
+        q, packed_kv[..., :128], packed_kv[..., 128:], topk_idx,
+        page_table=block_table, seqused_k=seq_lens, seqlen_q=4,
+        k_scale=k_scale, v_scale=v_scale, workspace=workspace, out=out,
+    )
+
 Per-token tensor ``num_valid_pages`` for
 :func:`flashinfer.msa_ops.msa_topk_select` is likewise SM120/SM121-only;
 compute capability 10.0/10.3 requires a scalar value or ``None`` and rejects

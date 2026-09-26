@@ -95,6 +95,7 @@ msa_proxy_score_fp4_h4_kv1.json
 msa_proxy_score_h4_kv1_d128.json
 msa_sparse_attention_h64_kv4_d128_topk16.json
 msa_sparse_decode_attention_h64_kv4_d128_topk16.json
+msa_sparse_decode_packed_fp8_k0v0_h64_kv4_d128_p128_topk16.json
 msa_topk_select_h4_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
@@ -2746,6 +2747,33 @@ with contextlib.suppress(Exception):
             seqlen_q=1,
             causal=True,
         )
+
+# ── MSA packed FP8 speculative decode (SM100/SM103) ──
+with contextlib.suppress(Exception):
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_decode_attention,
+    )
+
+    _q = torch.randn(8, 64, 128, dtype=torch.bfloat16, device=device)
+    _kv = torch.randn(32, 4, 128, 256, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    msa_sparse_decode_attention(
+        _q,
+        _kv[..., :128],
+        _kv[..., 128:],
+        torch.arange(16, dtype=torch.int32, device=device)
+        .expand(4, 8, 16)
+        .contiguous(),
+        page_table=torch.arange(32, dtype=torch.int32, device=device).reshape(2, 16),
+        seqused_k=torch.full((2,), 2048, dtype=torch.int32, device=device),
+        seqlen_q=4,
+        k_scale=torch.tensor(0.7, device=device),
+        v_scale=torch.tensor(1.3, device=device),
+        out=torch.empty_like(_q),
+        workspace=MSASparseAttentionWorkspace(device),
+    )
 
 # ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103/SM107) ──
 # FP8 (per-token fp32 KV scale) and FP4 (MXFP4 block-scaled). Traces dump before
