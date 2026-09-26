@@ -125,12 +125,22 @@ def _validate_contract(options, *, size_query=False):
         raise ValueError("Cake SiTU requires unbiased BF16 input and SiTU parameters")
 
 
+_FORCED_TILE_N16_TOKENS = (32, 64, 128, 256)
+
+
 def _cake_situ_workspace_size(options):
     # No device query, module load, CUDA allocation or initialization.
     _validate_contract(options, size_query=True)
     max_tokens = options["max_num_tokens"]
-    ordinary = _workspace_layout(max_tokens)[1]
-    return max(ordinary, _workspace_layout(64)[1]) if max_tokens >= 64 else ordinary
+    # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
+    # that force tile-N16 (32 and 64) need more scratch rows than the tile-N8
+    # counts that follow them, so a maximum-size buffer must cover every forced
+    # count at or below ``max_num_tokens`` as well as ``max_num_tokens`` itself.
+    return max(
+        _workspace_layout(num_tokens)[1]
+        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS)
+        if num_tokens <= max_tokens
+    )
 
 
 def _tensor(tensor, name, *, shape, dtype, device):

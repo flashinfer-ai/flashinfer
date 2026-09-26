@@ -66,6 +66,20 @@ def test_cake_situ_rejects_unsupported_dispatch(options, message):
         _workspace_size(**options)
 
 
+def test_cake_situ_workspace_size_holds_every_smaller_shape():
+    # The per-shape layout is not monotonic in the token count (32 and 64 force
+    # tile-N16 and need more scratch than the tile-N8 counts after them), but
+    # the public size query must still honor the documented contract that a
+    # maximum-size buffer holds every smaller prepared shape.
+    sizes = [_workspace_size(max_num_tokens=n) for n in range(1, 16385)]
+    running_max = 0
+    for size in sizes:
+        running_max = max(running_max, size)
+        assert size == running_max
+    assert _workspace_size(max_num_tokens=40) >= _workspace_size(max_num_tokens=32)
+    assert _workspace_size(max_num_tokens=100) >= _workspace_size(max_num_tokens=64)
+
+
 @pytest.fixture(scope="module")
 def cake_situ_device():
     if not torch.cuda.is_available():
@@ -115,6 +129,25 @@ def cake_situ_weights(cake_situ_device):
 def cake_situ_workspace(cake_situ_device):
     # A single maximum-size allocation is reused across all four token sizes.
     return torch.empty(_workspace_size(), dtype=torch.uint8, device=cake_situ_device)
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens, num_tokens", [(40, 32), (100, 64)], ids=["n40_holds_32", "n100_holds_64"],
+)
+def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
+    max_num_tokens, num_tokens, cake_situ_device,
+):
+    # Allocating for a token count strictly between two forced tile-N16 counts
+    # must still allow preparing the smaller forced count in the same buffer.
+    workspace = torch.empty(
+        _workspace_size(max_num_tokens=max_num_tokens),
+        dtype=torch.uint8, device=cake_situ_device,
+    )
+    for tokens in (num_tokens, max_num_tokens):
+        assert cutlass_fused_moe_prepare_workspace(
+            workspace, tokens, backend="cake",
+            weight_layout="trtllm_shuffled_nvfp4_group16",
+        ) is workspace
 
 
 def _trtllm_reference(x, ids, route_weights, prepared):
