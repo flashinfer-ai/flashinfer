@@ -35,6 +35,8 @@ class _GeneratedBatchMLAModule(Protocol):
 
     def run(self, *args: object) -> object: ...
 
+    def run_with_kv_len(self, *args: object) -> object: ...
+
 
 @functools.lru_cache(maxsize=128)
 def get_batch_mla_module(
@@ -678,6 +680,7 @@ class _BatchMLAGeneratedFaMechanics:
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        kv_len: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # ---------------------------------------------------------------------------
         # Validate inputs and scale arguments
@@ -759,7 +762,13 @@ class _BatchMLAGeneratedFaMechanics:
         # ---------------------------------------------------------------------------
         mask_mode = MaskMode.CAUSAL.value if self._causal else MaskMode.NON_CAUSAL.value
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
-        self._cached_module.run(
+        run = self._cached_module.run
+        device_length_args: tuple[object, ...] = ()
+        if kv_len is not None:
+            run = self._cached_module.run_with_kv_len
+            device_length_args = (self._qo_indptr_buf, kv_len)
+        run(
+            *device_length_args,
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
@@ -975,7 +984,17 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         bmm2_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if kv_len is not None:
-            raise ValueError("kv_len is only supported with cutlass backend.")
+            if self._backend != "fa3" or self._causal:
+                raise ValueError("kv_len requires a non-causal fa3 plan for FA MLA.")
+            check_shape_dtype_device(
+                kv_len,
+                self._kv_len_arr_buf.shape,
+                torch.int32,
+                self.device,
+                "kv_len",
+            )
+            if not kv_len.is_contiguous():
+                raise ValueError("kv_len must be contiguous.")
         if page_table is not None:
             raise ValueError("page_table is only supported with cutlass backend.")
         if o_scale is not None:
@@ -1006,4 +1025,5 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             ckv_scale=ckv_scale,
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
+            kv_len=kv_len,
         )

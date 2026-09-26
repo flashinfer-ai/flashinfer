@@ -26,7 +26,8 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void BatchMLAPagedAttentionSM90Run(
+static void BatchMLAPagedAttentionSM90RunImpl(
+    Optional<TensorView> maybe_qo_indptr, Optional<TensorView> maybe_kv_len,
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
     TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
@@ -68,6 +69,12 @@ void BatchMLAPagedAttentionSM90Run(
         params.ckv = static_cast<DTypeKV*>(ckv_cache.data_ptr());
         params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
 
+        if (maybe_kv_len.has_value()) {
+          TVM_FFI_ICHECK(mask_mode == MaskMode::kNone);
+          params.batch_q_indptr = static_cast<IdType*>(maybe_qo_indptr.value().data_ptr());
+          params.device_kv_len = static_cast<IdType*>(maybe_kv_len.value().data_ptr());
+          params.batch_size = maybe_kv_len.value().size(0);
+        }
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
         params.partial_indptr =
@@ -130,4 +137,32 @@ void BatchMLAPagedAttentionSM90Run(
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "Failed to run MLA, error: " << cudaGetErrorString(status);
       });
+}
+
+void BatchMLAPagedAttentionSM90Run(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
+    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
+    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
+    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+  BatchMLAPagedAttentionSM90RunImpl(std::nullopt, std::nullopt, float_workspace_buffer,
+                                    int_workspace_buffer, plan_info_vec, q_nope, q_pe, ckv_cache,
+                                    kpe_cache, kv_indices, o, maybe_lse, mask_mode_code, num_heads,
+                                    page_size, sm_scale, return_lse_base_on_e, ckv_scale, kpe_scale,
+                                    maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
+}
+
+void BatchMLAPagedAttentionSM90RunWithKVLen(
+    TensorView qo_indptr, TensorView kv_len, TensorView float_workspace_buffer,
+    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec, TensorView q_nope,
+    TensorView q_pe, TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
+    TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code, int64_t num_heads,
+    int64_t page_size, double sm_scale, bool return_lse_base_on_e, double ckv_scale,
+    double kpe_scale, Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+  BatchMLAPagedAttentionSM90RunImpl(qo_indptr, kv_len, float_workspace_buffer, int_workspace_buffer,
+                                    plan_info_vec, q_nope, q_pe, ckv_cache, kpe_cache, kv_indices,
+                                    o, maybe_lse, mask_mode_code, num_heads, page_size, sm_scale,
+                                    return_lse_base_on_e, ckv_scale, kpe_scale,
+                                    maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
 }

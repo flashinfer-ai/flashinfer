@@ -223,7 +223,7 @@ def get_batch_mla_uri(
         f"head_dim_ckv_{head_dim_ckv}_"
         f"head_dim_kpe_{head_dim_kpe}_"
         f"profiler_{use_profiler}_planabi2"
-    ) + ("_sm90" if backend == "fa3" else "")
+    ) + ("_sm90_device_kv_len" if backend == "fa3" else "")
 
 
 def gen_batch_mla_module(
