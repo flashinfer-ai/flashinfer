@@ -25,6 +25,10 @@ import pytest
 
 pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
+from .test_nvfp4_cutedsl_kernel_vs_reference import (  # noqa: E402, F401 -- shared pytest fixture
+    w4a16_single_rank_runtime,
+)
+
 
 def _require_blackwell():
     import torch
@@ -38,7 +42,13 @@ def _require_blackwell():
         pytest.skip(f"cutedsl mega kernels need sm_100/sm_103; got sm_{cap[0]}{cap[1]}")
 
 
-def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int = 1024):
+def _single_rank_layer(
+    backend_name: str,
+    hidden: int = 2048,
+    intermediate: int = 1024,
+    knobs=None,
+    quantize_input: bool = True,
+):
     """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging."""
     import torch
 
@@ -50,6 +60,7 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         MoEWeightPack,
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     num_experts = 4
@@ -74,14 +85,17 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         generator=g,
     )
 
-    if backend_name == "nvfp4":
-        mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
-        )
-    else:
-        mk = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
-        )
+    config_type = {
+        "nvfp4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "mxfp8": Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }[backend_name]
+    options = (
+        {"knobs": {} if knobs is None else knobs} if backend_name == "w4a16" else {}
+    )
+    mk = config_type(
+        intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0, **options
+    )
 
     layer = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -93,12 +107,18 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         weights=MoEWeightPack(w13=w13, w2=w2),
         backend=MegaConfig(
             megakernel=mk,
-            quantize_input=True,
+            quantize_input=quantize_input,
             preprocess_weights=True,
         ),
     )
     return layer, dict(
-        hidden=hidden, num_experts=num_experts, topk=topk, max_tokens=max_tokens
+        hidden=hidden,
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        id_dtype={"nvfp4": torch.int64, "mxfp8": torch.int64, "w4a16": torch.int32}[
+            backend_name
+        ],
     )
 
 
@@ -127,13 +147,21 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
     )
     return MoEEpTensors(
         hidden_states=hidden_states,
-        topk_ids=topk_ids.to(torch.int64),
+        topk_ids=topk_ids.to(problem["id_dtype"]),
         topk_weights=topk_weights.to(torch.float32),
     )
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "backend_name,quantize_input,input_layout",
+    [("nvfp4", True, "contiguous"), ("mxfp8", True, "contiguous")]
+    + [
+        ("w4a16", True, layout)
+        for layout in ("contiguous", "transposed", "offset", "strided")
+    ]
+    + [("w4a16", False, "contiguous")],
+)
 @pytest.mark.parametrize(
     "hidden,intermediate",
     [
@@ -145,23 +173,70 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
     ],
 )
 def test_mega_layer_graph_capture_replay_matches_eager(
-    monkeypatch, backend_name, hidden, intermediate
+    monkeypatch,
+    request,
+    backend_name,
+    quantize_input,
+    input_layout,
+    hidden,
+    intermediate,
 ):
     import torch
+    from flashinfer.moe_ep import MoEEpTensors
 
     _require_blackwell()
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    layer, problem = _single_rank_layer(backend_name, hidden, intermediate)
+    if backend_name == "w4a16":
+        request.getfixturevalue("w4a16_single_rank_runtime")
+    layer, problem = _single_rank_layer(
+        backend_name,
+        hidden,
+        intermediate,
+        knobs="auto" if backend_name == "w4a16" else None,
+        quantize_input=quantize_input,
+    )
+    graph = None
     try:
         t = _random_batch(problem, seed=3)
+        if input_layout in ("transposed", "offset"):
+            t.topk_ids = t.topk_ids.to(torch.int64)
 
-        # 1) Warmup contract: all lazy host-side work happens here, eagerly.
-        layer.warmup()
+        def view(source):
+            if input_layout == "contiguous":
+                return source
+            if input_layout == "transposed":
+                return source.t().contiguous().t()
+            if input_layout == "offset":
+                storage = torch.empty(
+                    source.numel() + 1, dtype=source.dtype, device=source.device
+                )
+                return storage[1:].view_as(source).copy_(source)
+            if input_layout == "strided":
+                storage = torch.empty(
+                    (source.shape[0], 2 * source.shape[1]),
+                    dtype=source.dtype,
+                    device=source.device,
+                )
+                return storage[:, ::2].copy_(source)
+            raise AssertionError(input_layout)
 
-        # Eager reference on the real batch (also proves warmup's dummy batch
-        # left the layer in a working steady state).
-        y_eager = layer.forward(t).clone()
+        t = MoEEpTensors(
+            *(view(x) for x in (t.hidden_states, t.topk_ids, t.topk_weights))
+        )
+        control = MoEEpTensors(
+            *(
+                x.clone(memory_format=torch.contiguous_format)
+                for x in (t.hidden_states, t.topk_ids, t.topk_weights)
+            )
+        )
+
+        # 1) Warmup includes the real collective autotune sweep for knobs="auto".
+        # Later eager/capture/replay calls use the selected callable normally.
+        layer.warmup(t if not quantize_input else None)
+
+        # Eager reference on the real batch after warmup.
+        y_eager = layer.forward(control).clone()
         torch.cuda.synchronize()
 
         # 2) Capture one forward. The graph's input buffers are t's tensors
@@ -193,11 +268,14 @@ def test_mega_layer_graph_capture_replay_matches_eager(
         torch.cuda.synchronize()
         assert torch.equal(y_replay, y_eager2)
     finally:
+        if graph is not None:
+            graph.reset()
         layer.destroy()
 
 
 @pytest.mark.arch_blackwell
-def test_mega_layer_capture_without_warmup_raises(monkeypatch):
+@pytest.mark.parametrize("backend_name", ["nvfp4", "w4a16"])
+def test_mega_layer_capture_without_warmup_raises(monkeypatch, request, backend_name):
     """Lazy workspace alloc inside capture must fail loudly, not corrupt."""
     import torch
 
@@ -206,7 +284,9 @@ def test_mega_layer_capture_without_warmup_raises(monkeypatch):
     from flashinfer.moe_ep import MoEEpConfigError
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    layer, problem = _single_rank_layer("nvfp4")
+    if backend_name == "w4a16":
+        request.getfixturevalue("w4a16_single_rank_runtime")
+    layer, problem = _single_rank_layer(backend_name)
     try:
         t = _random_batch(problem, seed=5)
         graph = torch.cuda.CUDAGraph()
@@ -271,7 +351,10 @@ def test_mega_layer_forward_output_view_public_api(monkeypatch):
 
 
 @pytest.mark.arch_blackwell
-def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
+@pytest.mark.parametrize("backend_name", ["nvfp4", "w4a16"])
+def test_mega_layer_multi_size_graphs_and_eager_interleave(
+    monkeypatch, request, backend_name
+):
     """Engine pattern: one graph per batch size + eager calls, interleaved.
 
     Regression test for the tail-mask memo bug: a small-size graph replayed
@@ -284,22 +367,25 @@ def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
     _require_blackwell()
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    layer, problem = _single_rank_layer("nvfp4")
+    if backend_name == "w4a16":
+        request.getfixturevalue("w4a16_single_rank_runtime")
+    layer, problem = _single_rank_layer(backend_name)
+    output_view = {"nvfp4": True, "w4a16": False}[backend_name]
     try:
         layer.warmup()
         t64 = _random_batch(problem, seed=51, num_tokens=64)
         t32 = _random_batch(problem, seed=52, num_tokens=32)
 
-        y64_ref = layer.forward(t64, return_workspace_view=True).clone()
-        y32_ref = layer.forward(t32, return_workspace_view=True).clone()
+        y64_ref = layer.forward(t64, return_workspace_view=output_view).clone()
+        y32_ref = layer.forward(t32, return_workspace_view=output_view).clone()
         torch.cuda.synchronize()
 
         g64 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g64):
-            y64_g = layer.forward(t64, return_workspace_view=True)
+            y64_g = layer.forward(t64, return_workspace_view=output_view)
         g32 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g32):
-            y32_g = layer.forward(t32, return_workspace_view=True)
+            y32_g = layer.forward(t32, return_workspace_view=output_view)
 
         # Small replay AFTER large replay: the 64-row staging must not leak
         # into the 32-row step.
@@ -319,14 +405,19 @@ def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
         torch.cuda.synchronize()
         assert torch.equal(y32_eager, y32_ref), "eager after replay diverged"
 
-        # Zero-copy view sizing must reflect the ACTUAL staged count even on
-        # capture-touched buffers (regression: memo poisoning made the view
-        # capacity-sized during engine capture warmup).
-        kernel, ws, transformed = layer._kernel, layer._workspace, layer._transformed
-        kernel.stage_inputs(t32, ws, quantize_input=True)
-        view = kernel.compute(ws, transformed, output=None)
-        torch.cuda.synchronize()
-        assert view.shape[0] == t32.hidden_states.shape[0]
-        assert torch.equal(view, y32_ref)
+        if backend_name == "nvfp4":
+            # Zero-copy view sizing must reflect the ACTUAL staged count even on
+            # capture-touched buffers (regression: memo poisoning made the view
+            # capacity-sized during engine capture warmup).
+            kernel, ws, transformed = (
+                layer._kernel,
+                layer._workspace,
+                layer._transformed,
+            )
+            kernel.stage_inputs(t32, ws, quantize_input=True)
+            view = kernel.compute(ws, transformed, output=None)
+            torch.cuda.synchronize()
+            assert view.shape[0] == t32.hidden_states.shape[0]
+            assert torch.equal(view, y32_ref)
     finally:
         layer.destroy()
