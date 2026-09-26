@@ -57,6 +57,10 @@ MAX_SEQ = 136
 MAX_SELECTED = 64
 TILE_FIXED_COST = 0.3
 LOAD_COST = 1.0
+# Ragged plans list-schedule costlier tiles first over all heads (LPT) when
+# every head's K and V fit this many bytes of L2; larger working sets keep the
+# head-major order so the CTAs running concurrently share one head's blocks.
+TILE_ORDER_L2_BUDGET = 24 << 20
 PAIRING_WINDOW = 16
 LOG2E = 1.4426950408889634
 _FP32_MAX = 3.4028234663852886e38
@@ -457,11 +461,17 @@ def plan_vsa_sm90(
             for qb, partner in pairs:
                 _emit_tile(hh, qb, partner, mode, rows, infos, seqs, owns, lens)
         costs = [_tile_cost(owns[t]) for t in range(len(infos))]
-        order = (
-            sorted(range(len(infos)), key=lambda i: (infos[i][0], -costs[i]))
-            if ragged
-            else list(range(len(infos)))
-        )
+        if not ragged:
+            order = list(range(len(infos)))
+        elif h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET:
+            g_est = max(1, min(len(infos), sms))
+            lu = LOAD_COST * g_est / sms
+            order = sorted(
+                range(len(infos)),
+                key=lambda i: (-max(costs[i], lens[i] * lu), infos[i][0], infos[i][1]),
+            )
+        else:
+            order = sorted(range(len(infos)), key=lambda i: (infos[i][0], -costs[i]))
         return tuple([x[i] for i in order] for x in (infos, seqs, owns, lens, costs))
 
     if mode is None:
