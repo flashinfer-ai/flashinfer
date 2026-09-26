@@ -790,6 +790,89 @@ def test_dense_dual_tile_routing_follows_rows_per_expert():
     )
 
 
+@pytest.mark.parametrize("dense_dual_tile", [False, True])
+def test_dense_gemm1_zero_fill_matches_memset(monkeypatch, dense_dual_tile):
+    """With MXFP4_DENSE_FILL_IN_GEMM1 the gather GEMM1's epilogue warps zero the
+    finalize output (dynamic chunks, counters reset by the last warp) and the
+    memset launch disappears; the output matches the memset plan on repeated
+    runs and graph replays (a stale counter or a missed chunk would leave the
+    previous run's values in the reduce-add target), on the dual-tile chain
+    (the unchosen variant leaves the fill to the chosen one) and when no route
+    is local (both variants have zero tiles: the output must still be zero)."""
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    case = make_case(
+        tokens=584,
+        hidden=256,
+        intermediate=256,
+        num_experts=16,
+        local_num_experts=8,
+        local_expert_offset=0,
+        top_k=2,
+    )
+    _set_routing(case, hot=False)
+    weights = prepare_cute_weights(case)
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "0")
+    plain_plan, plain_output = _plan_dense(
+        _make_dual_tile_wrapper(case, dense_dual_tile), case, weights
+    )
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "1")
+    fill_plan, fill_output = _plan_dense(
+        _make_dual_tile_wrapper(case, dense_dual_tile), case, weights
+    )
+    assert fill_plan._memset is None and fill_plan._aux_stream is None
+    assert plain_plan._memset is not None
+    counters = fill_plan._kwargs["zero_fill_counters"]
+    for _ in range(3):
+        fill_plan.run()
+        plain_plan.run()
+    torch.cuda.synchronize()
+    assert counters.tolist() == [0, 0]
+    _assert_dual_tile_matches_single(
+        case, fill_output, plain_output, reference_moe(case)
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        fill_plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for hot in (True, False, True):
+        _set_routing(case, hot=hot)
+        graph.replay()
+        graph.replay()
+        plain_plan.run()
+        torch.cuda.synchronize()
+        assert counters.tolist() == [0, 0]
+        _assert_dual_tile_matches_single(
+            case, fill_output, plain_output, reference_moe(case)
+        )
+    # Nothing local: every route goes to experts 8..15, both tile variants see
+    # zero tiles and the output (previous values) must come back as zeros.
+    tokens = case.topk_ids.shape[0]
+    t = torch.arange(tokens, device=case.topk_ids.device, dtype=torch.int32)
+    case.topk_ids.copy_(torch.stack([8 + t % 8, 8 + (t + 3) % 8], dim=1))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert counters.tolist() == [0, 0]
+    assert not fill_output.any()
+
+
+def test_dense_fill_in_gemm1_policy(monkeypatch):
+    """``ep`` (expert-parallel ranks only) / ``1`` / ``0`` vocabulary of the
+    in-GEMM1 zero-fill, mirroring DENSE_ASYNC_MEMSET."""
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "ep")
+    assert mxfp4._dense_fill_in_gemm1(896, 112)
+    assert not mxfp4._dense_fill_in_gemm1(896, 896)
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "1")
+    assert mxfp4._dense_fill_in_gemm1(896, 896)
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "0")
+    assert not mxfp4._dense_fill_in_gemm1(896, 112)
+
+
 @pytest.mark.parametrize("rows_per_expert", [73, 293])
 def test_dense_dual_tile_keeps_128_where_256_pads(rows_per_expert):
     """73- and 293-row experts pad 2x / 1.33x under the 256 tile: the routing
