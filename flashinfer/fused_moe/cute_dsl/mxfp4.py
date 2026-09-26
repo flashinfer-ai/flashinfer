@@ -348,9 +348,17 @@ def _dense_async_memset(num_experts: int, num_local_experts: int) -> bool:
 # DENSE_ASYNC_MEMSET: "ep" = expert-parallel ranks only, "1" = every layout,
 # "0" = off (the memset path above).
 DENSE_FILL_IN_GEMM1 = os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1", "0")
+# Below this token count the zero-fill (5.6 us at T = 2048) hides beside GEMM1
+# on the auxiliary stream anyway; the in-GEMM1 fill only pays where the memset
+# gates a GEMM launch.
+DENSE_FILL_IN_GEMM1_MIN_TOKENS = int(
+    os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1_MIN_TOKENS", "8192")
+)
 
 
-def _dense_fill_in_gemm1(num_experts: int, num_local_experts: int) -> bool:
+def _dense_fill_in_gemm1(num_experts: int, num_local_experts: int, num_tokens: int) -> bool:
+    if num_tokens < DENSE_FILL_IN_GEMM1_MIN_TOKENS:
+        return False
     if DENSE_FILL_IN_GEMM1 == "1":
         return True
     if DENSE_FILL_IN_GEMM1 == "ep":
@@ -2340,7 +2348,7 @@ class CuteDslMxfp4MoEWrapper:
                     torch.zeros(2, dtype=torch.int32, device=output.device)
                     if not dense_two_stage
                     and _dense_fill_in_gemm1(
-                        self.num_experts, self.num_local_experts
+                        self.num_experts, self.num_local_experts, num_tokens
                     )
                     else None
                 ),

@@ -817,6 +817,7 @@ def test_dense_gemm1_zero_fill_matches_memset(monkeypatch, dense_dual_tile):
     plain_plan, plain_output = _plan_dense(
         _make_dual_tile_wrapper(case, dense_dual_tile), case, weights
     )
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1_MIN_TOKENS", 0)
     monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "1")
     fill_plan, fill_output = _plan_dense(
         _make_dual_tile_wrapper(case, dense_dual_tile), case, weights
@@ -864,13 +865,16 @@ def test_dense_fill_in_gemm1_policy(monkeypatch):
     in-GEMM1 zero-fill, mirroring DENSE_ASYNC_MEMSET."""
     from flashinfer.fused_moe.cute_dsl import mxfp4
 
+    monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1_MIN_TOKENS", 8192)
     monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "ep")
-    assert mxfp4._dense_fill_in_gemm1(896, 112)
-    assert not mxfp4._dense_fill_in_gemm1(896, 896)
+    assert mxfp4._dense_fill_in_gemm1(896, 112, 8192)
+    assert not mxfp4._dense_fill_in_gemm1(896, 112, 4096)
+    assert not mxfp4._dense_fill_in_gemm1(896, 896, 8192)
     monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "1")
-    assert mxfp4._dense_fill_in_gemm1(896, 896)
+    assert mxfp4._dense_fill_in_gemm1(896, 896, 32768)
+    assert not mxfp4._dense_fill_in_gemm1(896, 896, 2048)
     monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "0")
-    assert not mxfp4._dense_fill_in_gemm1(896, 112)
+    assert not mxfp4._dense_fill_in_gemm1(896, 112, 32768)
 
 
 @pytest.mark.parametrize("rows_per_expert", [73, 293])

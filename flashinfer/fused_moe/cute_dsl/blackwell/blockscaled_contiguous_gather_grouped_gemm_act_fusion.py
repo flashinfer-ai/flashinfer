@@ -2733,67 +2733,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            if cutlass.const_expr(self.zero_fill):
-                #
-                # Zero-fill of the finalize GEMM2's token output (the fused
-                # finalize reduce-adds into it), done by the epilogue warps
-                # before their first tile: they are idle until the MMA warp
-                # fills the first accumulator, and the CTAs without tiles
-                # (most of them on a sparse routing) fill while the others
-                # compute, so no separate kernel takes the SMs. Warps claim
-                # 32 KB chunks from a global counter, the next claim issued
-                # before the current chunk's stores (per-SM store throughput
-                # is capped at ~64 GB/s on B300, a claim costs a ~1 us
-                # round trip). The (claim, done) counters live in a caller
-                # buffer zeroed once; the last warp of the launch resets
-                # both, and every later launch touches them only after its
-                # griddepcontrol.wait. A launch whose tile variant the
-                # routing did not choose leaves the fill to the chosen one
-                # unless neither has tiles (nothing routed to this rank).
-                #
-                my_tiles = num_non_exiting_tiles[0]
-                other_tiles = zero_fill_other_tiles[0]
-                if (my_tiles > 0) | (other_tiles == 0):
-                    lane = cute.arch.lane_idx()
-                    grid_x, _, _ = cute.arch.grid_dim()
-                    claim_addr = zero_fill_counters.iterator.toint()
-                    done_addr = (zero_fill_counters.iterator + 1).toint()
-                    num_vec = cute.size(zero_fill_words) // 4
-                    chunk_vec = 32 * self.zero_fill_iters
-                    num_chunks = cute.ceil_div(num_vec, chunk_vec)
-                    zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
-                    for i in cutlass.range_constexpr(4):
-                        zeros[i] = cutlass.Uint32(0)
-                    claimed = cutlass.Int32(0)
-                    if lane == 0:
-                        claimed = atomic_add_global_i32(claim_addr, cutlass.Int32(1))
-                    claimed = cute.arch.shuffle_sync(claimed, 0)
-                    while claimed < num_chunks:
-                        next_claim = cutlass.Int32(0)
-                        if lane == 0:
-                            next_claim = atomic_add_global_i32(
-                                claim_addr, cutlass.Int32(1)
-                            )
-                        base_vec = claimed * chunk_vec + lane
-                        for it in cutlass.range_constexpr(self.zero_fill_iters):
-                            vec = base_vec + it * 32
-                            if vec < num_vec:
-                                g_out = cute.make_tensor(
-                                    zero_fill_words.iterator
-                                    + cute.assume(vec * 4, divby=4),
-                                    layout=cute.make_layout((4,)),
-                                )
-                                cute.autovec_copy(zeros, g_out)
-                        claimed = cute.arch.shuffle_sync(next_claim, 0)
-                    threadfence()
-                    if lane == 0:
-                        total_warps = grid_x * len(self.epilog_warp_id)
-                        finished = atomic_add_global_i32(done_addr, cutlass.Int32(1))
-                        if finished == total_warps - 1:
-                            zero_fill_counters[0] = cutlass.Int32(0)
-                            zero_fill_counters[1] = cutlass.Int32(0)
-                            threadfence()
-
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
@@ -3525,6 +3464,66 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+            if cutlass.const_expr(self.zero_fill):
+                #
+                # Zero-fill of the finalize GEMM2's token output (the fused
+                # finalize reduce-adds into it), done by the epilogue warps
+                # once their tiles are stored: the CTAs without tiles (most
+                # of them on a sparse routing) reach this point at once and
+                # fill while the others compute, the busy CTAs' share hides
+                # in the tail imbalance, and no separate kernel takes the SMs. Warps claim
+                # 32 KB chunks from a global counter, the next claim issued
+                # before the current chunk's stores (per-SM store throughput
+                # is capped at ~64 GB/s on B300, a claim costs a ~1 us
+                # round trip). The (claim, done) counters live in a caller
+                # buffer zeroed once; the last warp of the launch resets
+                # both, and every later launch touches them only after its
+                # griddepcontrol.wait. A launch whose tile variant the
+                # routing did not choose leaves the fill to the chosen one
+                # unless neither has tiles (nothing routed to this rank).
+                #
+                my_tiles = num_non_exiting_tiles[0]
+                other_tiles = zero_fill_other_tiles[0]
+                if (my_tiles > 0) | (other_tiles == 0):
+                    lane = cute.arch.lane_idx()
+                    grid_x, _, _ = cute.arch.grid_dim()
+                    claim_addr = zero_fill_counters.iterator.toint()
+                    done_addr = (zero_fill_counters.iterator + 1).toint()
+                    num_vec = cute.size(zero_fill_words) // 4
+                    chunk_vec = 32 * self.zero_fill_iters
+                    num_chunks = cute.ceil_div(num_vec, chunk_vec)
+                    zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                    for i in cutlass.range_constexpr(4):
+                        zeros[i] = cutlass.Uint32(0)
+                    claimed = cutlass.Int32(0)
+                    if lane == 0:
+                        claimed = atomic_add_global_i32(claim_addr, cutlass.Int32(1))
+                    claimed = cute.arch.shuffle_sync(claimed, 0)
+                    while claimed < num_chunks:
+                        next_claim = cutlass.Int32(0)
+                        if lane == 0:
+                            next_claim = atomic_add_global_i32(
+                                claim_addr, cutlass.Int32(1)
+                            )
+                        base_vec = claimed * chunk_vec + lane
+                        for it in cutlass.range_constexpr(self.zero_fill_iters):
+                            vec = base_vec + it * 32
+                            if vec < num_vec:
+                                g_out = cute.make_tensor(
+                                    zero_fill_words.iterator
+                                    + cute.assume(vec * 4, divby=4),
+                                    layout=cute.make_layout((4,)),
+                                )
+                                cute.autovec_copy(zeros, g_out)
+                        claimed = cute.arch.shuffle_sync(next_claim, 0)
+                    threadfence()
+                    if lane == 0:
+                        total_warps = grid_x * len(self.epilog_warp_id)
+                        finished = atomic_add_global_i32(done_addr, cutlass.Int32(1))
+                        if finished == total_warps - 1:
+                            zero_fill_counters[0] = cutlass.Int32(0)
+                            zero_fill_counters[1] = cutlass.Int32(0)
+                            threadfence()
 
         if cutlass.const_expr(not self.pdl_trigger_early):
             griddepcontrol_launch_dependents()
