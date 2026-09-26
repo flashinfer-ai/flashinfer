@@ -763,7 +763,7 @@ class _BatchMLAGeneratedFaMechanics:
         mask_mode = MaskMode.CAUSAL.value if self._causal else MaskMode.NON_CAUSAL.value
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
         run = self._cached_module.run
-        device_length_args = ()
+        device_length_args: tuple[object, ...] = ()
         if kv_len is not None:
             run = self._cached_module.run_with_kv_len
             device_length_args = (self._qo_indptr_buf, kv_len)
