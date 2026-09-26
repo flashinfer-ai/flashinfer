@@ -1069,17 +1069,24 @@ class MoEMicroKernel:
                     expert_id = weight_expert_ids[local_expert_id].to(Int32)
                 else:
                     expert_id = topk_ids[local_expert_id].to(Int32)
+                # The dense single-token layout keeps a slot for an unrouted
+                # (negative) pair: quantize it against expert 0 so its row is
+                # well defined; the FC2 epilogue zeroes its routing weight.
+                if expert_id < Int32(0):
+                    expert_id = Int32(0)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
-                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
-                    row = atomic_add_global_i32(
-                        get_ptr_as_int64(row_counts, local_expert_id),
-                        Int32(1),
-                    )
-                    map_idx = local_expert_id * max_rows + row
-                    st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
-                    st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                    # Compact id -1 marks an unrouted pair (see triton_compact).
+                    if local_expert_id >= Int32(0):
+                        expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                        row = atomic_add_global_i32(
+                            get_ptr_as_int64(row_counts, local_expert_id),
+                            Int32(1),
+                        )
+                        map_idx = local_expert_id * max_rows + row
+                        st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
+                        st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
                     _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
                     _st_shared_i32(ctrl_base_addr + Int32(4), row)
                     _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
@@ -1091,6 +1098,9 @@ class MoEMicroKernel:
             # Distribute quantization across all CTA threads. Each FP4 block
             # covers one scale-vector and can be packed independently.
             should_quantize = Int32(1)
+            if cutlass.const_expr(not self.single_token):
+                if local_expert_id < Int32(0):
+                    should_quantize = Int32(0)
             packed_local_expert_id = local_expert_id
             packed_row = row
             quant_expert_id = expert_id
@@ -1104,6 +1114,8 @@ class MoEMicroKernel:
                         quant_expert_id = topk_ids[Int32(0)].to(Int32)
                     else:
                         quant_expert_id = weight_expert_ids[Int32(0)]
+                    if quant_expert_id < Int32(0):
+                        quant_expert_id = Int32(0)
                     packed_local_expert_id = Int32(0)
                     packed_row = Int32(0)
                 else:
@@ -1454,12 +1466,17 @@ class MoEMicroKernel:
             while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
+                route_masked = Int32(0)
                 if cutlass.const_expr(self.single_token):
                     if cutlass.const_expr(not self.is_gated):
                         weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     else:
                         weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = Int32(1)
+                    # Unrouted pair: compute expert 0 with a zero routing weight.
+                    if weight_expert_idx < Int32(0):
+                        route_masked = Int32(1)
+                        weight_expert_idx = Int32(0)
                 else:
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = row_counts[local_expert_idx]
@@ -1592,6 +1609,8 @@ class MoEMicroKernel:
                 if cutlass.const_expr(self.single_token):
                     unique_tok = local_expert_idx // num_topk
                     unique_wv = topk_weights[local_expert_idx].to(cutlass.Float32)
+                    if route_masked > Int32(0):
+                        unique_wv = cutlass.Float32(0.0)
 
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
                 MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
@@ -2309,6 +2328,8 @@ class MoEMicroKernel:
                         weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     else:
                         weight_expert_idx = weight_expert_ids[local_expert_idx]
+                    if weight_expert_idx < Int32(0):
+                        weight_expert_idx = Int32(0)
                 else:
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                 input_local_expert_idx = (
