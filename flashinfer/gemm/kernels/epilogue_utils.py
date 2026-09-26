@@ -627,7 +627,7 @@ def epilogue_with_alpha(
     )
 
     simt_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyStgOp(),
+        cute.nvgpu.CopyR2GOp(),
         gemm_kernel.c_dtype,
         num_bits_per_copy=num_bits_per_copy,
         l1c_evict_priority=CacheEvictionPriority.NO_ALLOCATE,
