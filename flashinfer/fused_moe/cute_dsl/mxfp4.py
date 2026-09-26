@@ -356,7 +356,9 @@ DENSE_FILL_IN_GEMM1_MIN_TOKENS = int(
 )
 
 
-def _dense_fill_in_gemm1(num_experts: int, num_local_experts: int, num_tokens: int) -> bool:
+def _dense_fill_in_gemm1(
+    num_experts: int, num_local_experts: int, num_tokens: int
+) -> bool:
     if num_tokens < DENSE_FILL_IN_GEMM1_MIN_TOKENS:
         return False
     if DENSE_FILL_IN_GEMM1 == "1":

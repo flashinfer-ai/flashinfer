@@ -3496,7 +3496,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             zf_c = cute.arch.shuffle_sync(zf_c, 0)
                             if zf_c < zf_num_units:
                                 zf_base = zf_c * zf_unit_vec + zf_lane
-                                for it in cutlass.range(0, zf_unit_vec // 32, 1, unroll=8):
+                                for it in cutlass.range(
+                                    0, zf_unit_vec // 32, 1, unroll=8
+                                ):
                                     zf_vec = zf_base + it * 32
                                     if zf_vec < zf_num_vec:
                                         zf_out = cute.make_tensor(
@@ -4458,9 +4460,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else None
         )
         zero_fill_other_tiles = (
-            cute.make_tensor(
-                zero_fill_other_tiles_ptr, layout=cute.make_layout((1,))
-            )
+            cute.make_tensor(zero_fill_other_tiles_ptr, layout=cute.make_layout((1,)))
             if cutlass.const_expr(zero_fill_other_tiles_ptr is not None)
             else None
         )
