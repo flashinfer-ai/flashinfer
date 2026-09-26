@@ -149,7 +149,7 @@ free of the split-unit epilogue keeps the softmax block loop of unsplit units
 at the schedule of the single-program kernel (a split path in the epilogue
 costs 1-2 % on every long row). The split program itself runs at a per-unit
 cost relative to the dense program that depends on `(pv_mode, arch)`
-(`SPLIT_PROGRAM_COST`: sm_103a fp8pv 1.35x, calibrated on the short partial-wave units; sm_100a fp4pv 1.03x, parity
+(`SPLIT_PROGRAM_COST`: sm_103a fp8pv 1.01x after the fp8 softmax body's free-buffer wait moved behind its exp2/pack block; sm_100a fp4pv 1.03x, parity
 otherwise); the planner scales a split plan's makespan by it, so a row splits
 only when the wave-quantization gain exceeds the program cost. The quantizer writes a
 **head-major, per-segment 128-token-padded packed layout**: segment `s`
