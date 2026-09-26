@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
@@ -1682,15 +1682,28 @@ class VariableBlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-            If set to ``auto``, the function will automatically choose the backend based on the
-            device architecture and kernel availability.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or the explicit
+            ``cake`` (generated Cake kernels; Hopper SM90 only: BF16 HND, head_dim 128,
+            equal Q/KV head counts, noncausal 64-token blocks, 1..64 selected KV blocks
+            per query block; small selections (at most 6 blocks per query block and a
+            grid that fits one wave) route to a one-CTA-per-query-block kernel with the
+            plan passed in the kernel parameter bank, everything else to the persistent
+            kernel). Defaults to ``auto``. Automatic selection never selects
+            ``cake``.  If set to ``auto``, the function will automatically choose the
+            backend based on the device architecture and kernel availability.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._workspace_size = (
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
+        self._cake_vsa_sm90_plan: Optional[Any] = None
+        if backend == "cake":
+            # The Cake SM90 route consumes the caller's block mask directly and
+            # never invokes the generic sparse planner: skip its per-wrapper
+            # 8 MiB device/host workspaces.
+            self._backend = backend
+            return
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
@@ -1823,6 +1836,32 @@ class VariableBlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = q_data_type
+
+        if self._backend == "cake":
+            from .cake_vsa_sm90 import create_plan
+
+            if self._cake_vsa_sm90_plan is not None:
+                self._cake_vsa_sm90_plan.check_replan()
+            self._cake_vsa_sm90_plan = None
+            self._cake_vsa_sm90_plan = create_plan(
+                self.device,
+                block_mask_map,
+                block_row_sz,
+                block_col_sz,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                logits_soft_cap=logits_soft_cap,
+                sm_scale=sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                non_blocking=non_blocking,
+            )
+            self._sm_scale = self._cake_vsa_sm90_plan.sm_scale
+            return
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -2062,7 +2101,18 @@ class VariableBlockSparseAttentionWrapper:
 
             * The attention output, shape: ``[M, num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
+
+            For ``backend="cake"`` the output follows the same DPS ABI (``out`` is
+            ``[H*M, 1, head_dim]``) and the return value is the HND view ``[H, M, head_dim]``;
+            ``out`` must be contiguous and must not overlap ``q``/``k``/``v``.
         """
+        if self._backend == "cake":
+            if self._cake_vsa_sm90_plan is None:
+                raise RuntimeError("Call plan() successfully before run()")
+            return self._cake_vsa_sm90_plan.run(
+                q, k, v, out=out, lse=lse, return_lse=return_lse, enable_pdl=enable_pdl
+            )
+
         # NOTE(Zihao): defer import of einops
         import einops
 
