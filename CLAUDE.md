@@ -688,6 +688,16 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE` | `1` | `flashinfer/cudnn/prefill.py` (ragged token-indptr path) | `0` makes the cuDNN ragged prefill graph declare the exact `(batch, max_seq_len)` per call instead of building one override-enabled graph per length class (declared max_len 128 or 65536+, batch 4096+) and passing the real shapes at execute time via cuDNN's shape override. Override exists because cuDNN finalizes one execution plan per declared shape (55-70 ms, ~1 s with a kernel compile) and serving changes the shape every step; needs cuDNN 9.22+ and cudnn-frontend 1.29+, otherwise the exact declaration is used. Disable only to bisect a suspected override regression. |
 | `FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE` | `0` | `flashinfer/gemm/gemm_base.py` (read once at import) | `1` downgrades the refusal to build a cuDNN execution plan during CUDA graph capture from a `CudnnPlanBuildInCaptureError` to a warning. Set it only if you have verified your cuDNN version tolerates plan build under capture; the supported alternative is to run each shape once eagerly outside the capture region, which populates the per-shape plan cache the captured call then reuses. |
 
+##### Ulysses PCIe / RDMA Transport (experimental)
+
+Read when `UlyssesCommunicator` uses the PCIe backend -- named explicitly, or selected by `backend="auto"` where NVLink is unavailable and `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is set. Every rank must set these identically (rank-ordered lists take one comma-separated value per rank).
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_ULYSSES_PCIE_NICS` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Override automatic PCI-distance NIC routing for the RDMA routes: mlx5 device names, one per rank in rank order. |
+| `FLASHINFER_ULYSSES_PCIE_GID_INDICES` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Pick one GID table index per rank when a chosen NIC has several usable IPv4 RoCE v2 entries. |
+| `FLASHINFER_ULYSSES_PCIE_ROUTE` | `auto` | `flashinfer/comm/ulysses_topology.py` | `p2p` forces the all-P2P route; `rdma` forces all-RDMA (per-rank mlx5 to every peer) at world size 2/4/8; `hybrid` forces the eight-rank 4+4 NUMA hybrid; forced RDMA routes fall back to all-P2P with a `RuntimeWarning` when their requirements are unmet; `auto` prefers the all-RDMA route at world sizes 4 and 8. |
+
 ##### Experimental KDA Output-Only Decode Tuning
 
 Low-level overrides for the output-only / RecoverSSM-verify KDA decode

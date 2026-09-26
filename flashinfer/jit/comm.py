@@ -293,6 +293,24 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
+def gen_ulysses_pcie_module() -> JitSpec:
+    """Build the optional single-node PCIe/mlx5 Ulysses transport.
+
+    Reached for ``backend="pcie"`` -- named explicitly, or chosen by ``auto``
+    behind the experimental opt-in -- and deliberately absent from
+    ``flashinfer/aot.py``, so nothing else ever needs rdma-core.
+
+    ``csrc/ulysses_pcie_transport.cuh`` is intentionally not in ``sources``
+    (a ``.cuh`` there would become its own translation unit); ninja's depfile
+    tracks it for rebuilds.
+    """
+    return gen_jit_spec(
+        "ulysses_pcie",
+        [jit_env.FLASHINFER_CSRC_DIR / "ulysses_pcie.cu"],
+        extra_ldflags=["-libverbs", "-lmlx5", "-lcuda"],
+    )
+
+
 MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
 
 _MOE_ALLTOALL_GENERATED_SOURCE = {
