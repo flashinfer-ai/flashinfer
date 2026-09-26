@@ -132,3 +132,18 @@ See `tests/experimental/test_cake_mla_varq_dcp_decode.py` for the torch
 reference (the upstream DCP test semantics), the validated shape set and the
 cross-rank merge check, and `benchmarks/bench_cake_mla_varq_dcp_decode.py`
 for the comparison against `cute_dsl_mla_decode` on the 24 performance rows.
+
+## Numerics and reproducibility
+
+Outputs are BF16 `out` and FP32 `lse` accumulated in FP32 from FP32 softmax
+(FP8 inputs are scaled in FP32); the validated tolerances against the FP32
+reference are 1e-2 (BF16) and 0.1 / 0.2 on `out` / `lse` (FP8), the same as
+the upstream CuTe-DSL tests. When a request's local KV range is split into
+units that run on different clusters, the kernel merges the partial results
+in the order in which the units complete, from BF16-staged partials, so two
+launches on identical inputs can differ by a few BF16 ulps of `out` (about
+5e-4 absolute) and about 3e-3 of `lse`; rows whose items never split are
+bitwise reproducible. Kernel time at this scale (10-170 us) also depends on
+the kernel that ran immediately before it -- for this kernel and for the
+CuTe-DSL baseline alike -- so the published comparisons measure each kernel
+back-to-back with a cold L2 before every sample.
