@@ -418,8 +418,7 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Run per-runner autotune, then measure each winner-tactic and
-        pick cross-backend winner."""
+        """Tune each runner, then select by packing + forward GPU latency."""
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
@@ -446,16 +445,15 @@ class MoELayer:
                 break
             from ..testing.utils import bench_gpu_time
 
-            # Measure runner at its winning tactic.  Use CUDA-graph timing so
-            # the cross-backend comparison reflects production (graph-captured)
-            # latency rather than per-call launch/Python overhead — at low token
-            # counts (~tens of us kernels) a no-graph 10-iter median is dominated
-            # by that overhead and picks the wrong backend.  Requires a warmed-up
-            # layer (the autotune pass above), not a cold capture.
+            def run_candidate(r=runner, t=tactic):
+                packed_inputs = r.pack_inputs(act_pack, weight_pack)
+                return r.forward(
+                    packed_inputs, tactic=t, **r.launch_kwargs_for(packed_inputs)
+                )
+
+            # Measure packing + forward GPU time after warmup.
             times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
-                    i, tactic=t, **kw
-                ),
+                run_candidate,
                 dry_run_iters=5,
                 repeat_iters=30,
                 use_cuda_graph=True,
