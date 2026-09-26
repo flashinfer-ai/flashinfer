@@ -8,6 +8,7 @@ from flashinfer.parallel_attention import split_varlen_input
 def test_split_varlen_input_handles_sequences_shorter_than_world_size(
     tensor_layout,
 ):
+    """Keep trailing ranks empty and pad both supported tensor layouts."""
     values = torch.arange(7, dtype=torch.float32)
     tensor = (
         values.reshape(1, 7, 1) if tensor_layout == "HND" else values.reshape(7, 1, 1)
@@ -34,6 +35,7 @@ def test_split_varlen_input_handles_sequences_shorter_than_world_size(
 
 
 def test_split_varlen_input_preserves_even_split_behavior():
+    """Retain the existing partition for evenly divisible sequences."""
     tensor = torch.arange(12, dtype=torch.float32).reshape(1, 12, 1)
 
     chunks = [
