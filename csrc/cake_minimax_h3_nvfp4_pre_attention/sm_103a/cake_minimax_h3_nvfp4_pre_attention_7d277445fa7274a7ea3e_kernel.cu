@@ -624,7 +624,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_minimax_h3_nvfp4_pre_attention_a6d128025625bf09a7d9(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ x_norm_weight, __nv_bfloat16* __restrict__ adaln_scale, __nv_bfloat16* __restrict__ adaln_shift, int* __restrict__ adaln_index, float* __restrict__ x_global_scale, uint8_t* __restrict__ activation_q, uint8_t* __restrict__ activation_sf, __nv_bfloat16* __restrict__ debug_adaln_bf16, int write_debug, float eps, int M)
+kernel_cake_minimax_h3_nvfp4_pre_attention_7d277445fa7274a7ea3e(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ x_norm_weight, __nv_bfloat16* __restrict__ adaln_scale, __nv_bfloat16* __restrict__ adaln_shift, int* __restrict__ adaln_index, float* __restrict__ x_global_scale, uint8_t* __restrict__ activation_q, uint8_t* __restrict__ activation_sf, __nv_bfloat16* __restrict__ debug_adaln_bf16, int write_debug, float eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

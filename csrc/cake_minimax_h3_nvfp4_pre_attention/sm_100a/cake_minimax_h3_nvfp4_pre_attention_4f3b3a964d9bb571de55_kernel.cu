@@ -144,6 +144,19 @@ __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count
 }
 
 
+__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
     uint32_t token;
     asm volatile(
@@ -564,7 +577,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+kernel_cake_minimax_h3_nvfp4_pre_attention_4f3b3a964d9bb571de55(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1031,12 +1044,12 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap co
                     unsigned int normalized[64];
                     #pragma unroll
                     for (int b_1 = 0; b_1 < 8; b_1++) {
-                        unsigned int weight_words[8];
+                        unsigned int loaded_w[8];
                         #pragma unroll
                         for (int h = 0; h < 2; h++) {
                             {
                                 const uint4* _vptr_0 = reinterpret_cast<const uint4*>(((kind == 0) ? q_norm_weight : k_norm_weight) + b_1 * 16 + h * 8);
-                                uint4* _vdst_0 = reinterpret_cast<uint4*>(&weight_words[4 * h]);
+                                uint4* _vdst_0 = reinterpret_cast<uint4*>(&loaded_w[4 * h]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
                                     _vdst_0[_blk] = _vptr_0[_blk];
@@ -1048,7 +1061,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap co
                             float2 _f2_1 = make_float2(__uint_as_float(words[b_1 * 8 + j_3] << 16), __uint_as_float(words[b_1 * 8 + j_3] & 4294901760));
                             float2 _mul_f32x2_0;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_1), "l"(*(const unsigned long long*)&_f2_0));
-                            float2 _f2_2 = make_float2(__uint_as_float(weight_words[j_3] << 16), __uint_as_float(weight_words[j_3] & 4294901760));
+                            float2 _f2_2 = make_float2(__uint_as_float(loaded_w[j_3] << 16), __uint_as_float(loaded_w[j_3] & 4294901760));
                             float2 _mul_f32x2_1;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&_mul_f32x2_0), "l"(*(const unsigned long long*)&_f2_2));
                             __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(_mul_f32x2_1.x, _mul_f32x2_1.y));
@@ -1059,13 +1072,13 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap co
                     int rope_token = _min_0;
                     #pragma unroll
                     for (int b_2 = 0; b_2 < 3; b_2++) {
-                        unsigned int cos_words[8];
-                        unsigned int sin_words[8];
+                        unsigned int loaded_cos[8];
+                        unsigned int loaded_sin[8];
                         #pragma unroll
                         for (int h_1 = 0; h_1 < 2; h_1++) {
                             {
                                 const uint4* _vptr_1 = reinterpret_cast<const uint4*>(rope_cos_sin + rope_token * 96 + b_2 * 16 + h_1 * 8);
-                                uint4* _vdst_1 = reinterpret_cast<uint4*>(&cos_words[4 * h_1]);
+                                uint4* _vdst_1 = reinterpret_cast<uint4*>(&loaded_cos[4 * h_1]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
                                     _vdst_1[_blk] = _vptr_1[_blk];
@@ -1073,7 +1086,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap co
                             }
                             {
                                 const uint4* _vptr_2 = reinterpret_cast<const uint4*>(rope_cos_sin + rope_token * 96 + 48 + b_2 * 16 + h_1 * 8);
-                                uint4* _vdst_2 = reinterpret_cast<uint4*>(&sin_words[4 * h_1]);
+                                uint4* _vdst_2 = reinterpret_cast<uint4*>(&loaded_sin[4 * h_1]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
                                     _vdst_2[_blk] = _vptr_2[_blk];
@@ -1084,9 +1097,9 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap co
                         for (int j_4 = 0; j_4 < 8; j_4++) {
                             unsigned int n_lo_word = normalized[b_2 * 8 + j_4];
                             unsigned int n_hi_word = normalized[(b_2 + 3) * 8 + j_4];
-                            float2 _f2_3 = make_float2(__uint_as_float(cos_words[j_4] << 16), __uint_as_float(cos_words[j_4] & 4294901760));
-                            float2 _f2_4 = make_float2(__uint_as_float(sin_words[j_4] << 16 ^ 2147483648), __uint_as_float(sin_words[j_4] & 4294901760 ^ 2147483648));
-                            float2 _f2_5 = make_float2(__uint_as_float(sin_words[j_4] << 16), __uint_as_float(sin_words[j_4] & 4294901760));
+                            float2 _f2_3 = make_float2(__uint_as_float(loaded_cos[j_4] << 16), __uint_as_float(loaded_cos[j_4] & 4294901760));
+                            float2 _f2_4 = make_float2(__uint_as_float(loaded_sin[j_4] << 16 ^ 2147483648), __uint_as_float(loaded_sin[j_4] & 4294901760 ^ 2147483648));
+                            float2 _f2_5 = make_float2(__uint_as_float(loaded_sin[j_4] << 16), __uint_as_float(loaded_sin[j_4] & 4294901760));
                             float2 _f2_6 = make_float2(__uint_as_float(n_hi_word << 16), __uint_as_float(n_hi_word & 4294901760));
                             float2 _mul_f32x2_2;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_2) : "l"(*(const unsigned long long*)&_f2_6), "l"(*(const unsigned long long*)&_f2_4));
@@ -1403,11 +1416,9 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_cda5a9989addcabdb8fe(CakeTensorMap co
                 }
                 this_bid_1 = _clc_ctaid_2 + (unsigned int)cta_rank;
             }
-            {
-                if (epi_warp == 0) {
-                    if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group 0;");
-                    }
+            if (epi_warp == 0) {
+                if (elect_sync()) {
+                    asm volatile("cp.async.bulk.wait_group 0;");
                 }
             }
         }
