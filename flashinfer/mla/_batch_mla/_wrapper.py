@@ -6,7 +6,6 @@ you may not use this file except in compliance with the License.
 """
 
 import functools
-import inspect
 import math
 import warnings
 from dataclasses import replace
@@ -14,9 +13,13 @@ from typing import Any, ClassVar, Literal, Optional, Protocol, Tuple, Union, ove
 
 import torch
 
-from ...api_logging import flashinfer_api
+from ...api_logging import (
+    _warn_from_external_caller,
+    flashinfer_api,
+    warn_experimental_backend_once,
+)
 from ...trace.templates.attention import mla_paged_decode_trace
-from ...utils import determine_mla_backend, get_compute_capability
+from ...utils import get_compute_capability
 from ._backends._capabilities import (
     _BackendPlanUnsupportedError,
     MLAPlanCapabilities,
@@ -30,7 +33,6 @@ from ._backends.cute_dsl_monolithic_backend import (
     _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
 from ._backends.cutile_backend import (
-    _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES,
     _BatchMLAPagedAttentionCutileBackend,
 )
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
@@ -45,6 +47,7 @@ from ._contracts import (
     _structural_mla_input_facts,
 )
 from ._planning import _MLAPlanArguments
+from ._auto_policy import _BatchMLAPagedAttentionAutoBackend
 
 
 class _PlannedBackend(Protocol):
@@ -115,9 +118,6 @@ class _BatchMLAPagedAttentionCuteDslBackend:
             try:
                 if reason := plan_capability_rejection_reason(plan_args, capabilities):
                     raise _BackendPlanUnsupportedError(reason)
-                preflight = getattr(backend_type, "preflight_plan_from_wrapper", None)
-                if preflight is not None:
-                    preflight(plan_args)
                 return backend_type.plan_from_wrapper(plan_args)
             except _BackendPlanUnsupportedError as exc:
                 typed_rejections.append(f"{capabilities.backend_name}: {exc}")
@@ -135,7 +135,8 @@ _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "xqa": _BatchMLAPagedAttentionXqaBackend,
     "cute-dsl-monolithic": _BatchMLAPagedAttentionCuteDslMonolithicBackend,
     "cute-dsl-modular": _BatchMLAPagedAttentionCuteDslModularBackend,
-    "cute-dsl": _BatchMLAPagedAttentionCuteDslBackend,
+    "auto": _BatchMLAPagedAttentionAutoBackend,  # dispatch wrapper, see _auto_policy.py
+    "cute-dsl": _BatchMLAPagedAttentionCuteDslBackend,  # dispatch wrapper
 }
 
 
@@ -144,21 +145,6 @@ _MIRRORED_BACKEND_ATTRS = (
     "_int_workspace_buffer",
     "_pin_memory_int_workspace_buffer",
 )
-
-
-def _warn_from_external_caller(message: str, category: type[Warning]) -> None:
-    """Warn at the first caller outside the local and API-logging wrappers."""
-
-    frame = inspect.currentframe()
-    stacklevel = 1
-    internal_modules = {__name__, flashinfer_api.__module__}
-    try:
-        while frame is not None and frame.f_globals.get("__name__") in internal_modules:
-            stacklevel += 1
-            frame = frame.f_back
-    finally:
-        del frame
-    warnings.warn(message, category, stacklevel=stacklevel)
 
 
 def _warn_on_positional_mla_arguments(method: Any) -> Any:
@@ -193,37 +179,7 @@ class BatchMLAPagedAttentionWrapper:
     computation and Matrix Absorption background.
     """
 
-    _blackwell_auto_fallback_warned: bool = False
     _legacy_plan_warned: bool = False
-
-    @classmethod
-    def _maybe_warn_blackwell_auto_fallback(
-        cls, device: torch.device, selected_backend: str
-    ) -> None:
-        if cls._blackwell_auto_fallback_warned:
-            return
-        major, minor = _get_compute_capability(device)
-        if major < 10:
-            return
-        cls._blackwell_auto_fallback_warned = True
-        if (major, minor) in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
-            in_wrapper_alternative = (
-                "backend='cutile' is the native in-wrapper cuda.tile alternative."
-            )
-        else:
-            in_wrapper_alternative = (
-                "backend='cutlass' is the closest in-wrapper alternative but may be "
-                "slower than this fallback for decode shapes."
-            )
-        warnings.warn(
-            f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
-            f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
-            f"and gives poor MLA decode performance. For decode, use "
-            f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
-            f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
-            UserWarning,
-            stacklevel=3,
-        )
 
     @classmethod
     def _warn_legacy_plan_once(cls) -> None:
@@ -319,15 +275,15 @@ class BatchMLAPagedAttentionWrapper:
             Caller-reserved ``int32`` buffer of shape ``[batch_size]`` for CSR
             KV lengths. Used only with CUDA graphs.
         backend : {"auto", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"}
-            Requested concrete backend. ``"auto"`` selects the architecture
-            default exposed by :func:`flashinfer.utils.determine_mla_backend`.
-            Explicit CUTLASS callers should plan with canonical dense metadata;
-            its historical planless ``run`` path remains deprecated.
-            Explicit cuTile callers should plan packed or split FP16/BF16
-            DeepSeek MLA decode inputs with canonical dense or CSR metadata.
-            cuTile is not selected automatically.
-            TRTLLM-GEN, XQA, and CuTe DSL selectors are also explicit-only and
-            acquire their executable state when :meth:`plan` is called.
+            Requested policy or concrete backend. ``"auto"`` is resolved in
+            :meth:`plan`: SM100 orders supported backends using request facts;
+            other architectures use :func:`flashinfer.utils.determine_mla_backend`.
+            Explicit requests remain strict; ``"cute-dsl"`` is a family alias.
+            Compilation and selection finish before normal execution or capture.
+            Canonical dense or CSR metadata is accepted; independent split query
+            or KV storage requires a backend with native split-input support.
+            Existing non-FA graph plans allow one plan per wrapper. Use a new
+            wrapper when preparing a different backend for a new capture.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -336,14 +292,11 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
-        self._requested_backend = backend
-        if backend == "auto":
-            self._backend = determine_mla_backend(self.device)
-            self._maybe_warn_blackwell_auto_fallback(self.device, self._backend)
-        elif backend in _BACKEND_TYPES:
+        if backend in _BACKEND_TYPES:
+            self._backend_type = _BACKEND_TYPES[backend]
             self._backend = backend
         else:
-            accepted = ("auto", *sorted(_BACKEND_TYPES))
+            accepted = sorted(_BACKEND_TYPES)
             raise ValueError(
                 "backend must be one of "
                 + ", ".join(repr(name) for name in accepted)
@@ -528,7 +481,15 @@ class BatchMLAPagedAttentionWrapper:
             Deprecated flat dense page-table metadata fields.
         max_q_len : Optional[int]
             Maximum dense query length; inferred from query metadata when
-            omitted.
+            omitted. For CuTe DSL monolithic plans created with nonuniform
+            query lengths, this also sets the per-request CUDA graph launch
+            capacity. Those plans may update query offsets in place while
+            preserving batch size, total tokens, tensor addresses/shapes, and
+            positive request lengths within this capacity. Initially uniform
+            plans keep query lengths fixed. Other selected backends retain
+            their own graph contracts; automatic selection does not guarantee
+            support for query redistribution. Direct graph replay does not
+            validate updated offsets in Python.
         num_heads : Optional[int]
             Number of query heads.
         head_dim_ckv, head_dim_kpe : Optional[int]
@@ -656,7 +617,14 @@ class BatchMLAPagedAttentionWrapper:
         if kv_cache_layout is None:
             kv_cache_layout = "split" if legacy_flat else "packed"
         output_dtype = q_data_type if output_dtype is None else output_dtype
-        if kv_data_type == torch.float8_e4m3fn and scale_mode == "default":
+        if (
+            kv_data_type == torch.float8_e4m3fn
+            and scale_mode == "default"
+            and not (
+                q_data_type == torch.float8_e4m3fn
+                and _get_compute_capability(self.device) == (10, 0)
+            )
+        ):
             # Existing FP8 callers always supply CKV/KPE scales at run time.
             scale_mode = "kv-per-tensor"
 
@@ -719,60 +687,39 @@ class BatchMLAPagedAttentionWrapper:
             _kv_indices_buf=self._kv_indices_buf,
             _kv_len_arr_buf=self._kv_len_arr_buf,
             _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
+            _previous_backend_name=previous_backend_name,
         )
 
         # ---------------------------------------------------------------------------
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
-        graph_workspace_snapshot = None
-        if graph_plan_int_workspace_buffer is not None:
-            prior_plan_workspace_bytes = int(
-                getattr(previous_backend, "_staged_int_workspace_bytes", 0)
+        planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+        capabilities = planned_backend._plan_capabilities
+        if capabilities.is_experimental:
+            warn_experimental_backend_once(
+                "BatchMLAPagedAttentionWrapper",
+                capabilities.backend_name,
+                automatic=self._backend_type is _BatchMLAPagedAttentionAutoBackend,
             )
-            if not (
-                0
-                <= prior_plan_workspace_bytes
-                <= graph_plan_int_workspace_buffer.numel()
-            ):
-                raise RuntimeError(
-                    "previous CUDA graph plan has an invalid device int workspace "
-                    "usage size."
-                )
-            graph_workspace_snapshot = graph_plan_int_workspace_buffer[
-                :prior_plan_workspace_bytes
-            ].clone()
-
-        try:
-            backend_type = _BACKEND_TYPES[self._backend]
-            planned_backend = backend_type.plan_from_wrapper(plan_args)
-            planned_backend_capabilities = planned_backend._plan_capabilities
-            planned_query_layout: Literal["packed", "split"] = (
-                "packed"
-                if planned_backend_capabilities.requires_packed_query
-                else "split"
-            )
-            planned_kv_cache_layout: Literal["packed", "split"] = (
-                "packed"
-                if planned_backend_capabilities.requires_packed_kv_cache
-                else "split"
-            )
-            planned_backend_name = planned_backend._backend
-        except Exception:
-            if graph_workspace_snapshot is not None:
-                graph_plan_int_workspace_buffer[
-                    : graph_workspace_snapshot.numel()
-                ].copy_(graph_workspace_snapshot)
-            raise
 
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
         # ---------------------------------------------------------------------------
+        self._backend = planned_backend._backend
         self._planned_backend = planned_backend
-        self._planned_backend_name = planned_backend_name
-        self._planned_backend_capabilities = planned_backend_capabilities
+        self._planned_backend_name = planned_backend._backend
+        self._planned_backend_capabilities = planned_backend._plan_capabilities
         self._input_contract = input_contract
-        self._planned_query_layout = planned_query_layout
-        self._planned_kv_cache_layout = planned_kv_cache_layout
+        self._planned_query_layout = (
+            "packed"
+            if planned_backend._plan_capabilities.requires_packed_query
+            else "split"
+        )
+        self._planned_kv_cache_layout = (
+            "packed"
+            if planned_backend._plan_capabilities.requires_packed_kv_cache
+            else "split"
+        )
         self._publish_backend_mirrors(planned_backend)
         self._legacy_flat_csr_plan = legacy_flat_csr
         self._qo_indptr_buf = getattr(

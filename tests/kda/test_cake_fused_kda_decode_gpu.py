@@ -169,6 +169,69 @@ _VARIANT_CASES = (
     ("direct_bf16", 24, 7, torch.bfloat16, "page", "positive"),
     ("wide512_vector4_positive_f32", 12, 24, torch.float32, "page", "positive"),
 )
+# H=8 (Kimi-K3 TP12) routes: (variant, rows, state dtype, layout, slot class,
+# slot pool).  Rows sit on every Cake band boundary; the persistent BF16
+# stream family (rows >= 64) is exercised with scattered slots over large
+# pools, including one pool that needs 64-bit slot offsets (~4.6 GiB state).
+_H8_STREAM_POOL = 4096
+_H8_WIDE_OFFSET_POOL = 16384
+_H8_ROUTE_CASES = (
+    ("repeated_safe_f32", 5, torch.float32, "page", "repeated", None),
+    ("repeated_safe_bf16", 70, torch.bfloat16, "padded", "repeated", None),
+    ("cluster2_wide_positive_f32", 1, torch.float32, "page", "positive", None),
+    ("cluster2_wide_positive_f32", 9, torch.float32, "padded", "positive", None),
+    ("wide512_regcap128_positive_f32", 16, torch.float32, "page", "positive", None),
+    ("wide512_regcap128_positive_f32", 18, torch.float32, "padded", "positive", None),
+    (
+        "cluster2_wide_positive_f32_wide_slot_offsets",
+        8,
+        torch.float32,
+        "page",
+        "random_positive",
+        _H8_WIDE_OFFSET_POOL,
+    ),
+    ("wide512_positive_f32", 19, torch.float32, "page", "positive", None),
+    ("wide512_positive_f32", 24, torch.float32, "page", "positive", None),
+    ("wide512_positive_f32", 37, torch.float32, "padded", "positive", None),
+    ("wide512_positive_f32", 56, torch.float32, "page", "positive", None),
+    ("wide512_positive_f32", 76, torch.float32, "page", "positive", None),
+    ("high_work_positive_f32", 38, torch.float32, "page", "positive", None),
+    ("high_work_positive_f32", 55, torch.float32, "padded", "positive", None),
+    ("high_work_positive_f32", 77, torch.float32, "page", "positive", None),
+    ("high_work_positive_f32", 148, torch.float32, "page", "positive", None),
+    ("high_work_positive_f32", 256, torch.float32, "page", "random_positive", 1024),
+    ("wide512_f32", 18, torch.float32, "page", "null", None),
+    ("direct_f32", 19, torch.float32, "page", "null", None),
+    ("direct_f32", 37, torch.float32, "padded", "null", None),
+    ("compact_async_f32", 38, torch.float32, "page", "null", None),
+    ("compact_async_f32", 55, torch.float32, "page", "null", None),
+    ("direct_f32", 56, torch.float32, "page", "null", None),
+    ("direct_f32", 147, torch.float32, "page", "null", None),
+    ("high_work_f32", 148, torch.float32, "page", "null", None),
+    ("wide512_bf16", 1, torch.bfloat16, "page", "positive", None),
+    ("wide512_bf16", 18, torch.bfloat16, "page", "positive", None),
+    ("wide512_bf16", 18, torch.bfloat16, "padded", "null", None),
+    ("compact_async_bf16", 19, torch.bfloat16, "page", "positive", None),
+    ("compact_async_bf16", 63, torch.bfloat16, "padded", "positive", None),
+    ("compact_async_bf16", 63, torch.bfloat16, "page", "null", None),
+    ("direct_bf16", 64, torch.bfloat16, "page", "null", None),
+    ("direct_bf16", 147, torch.bfloat16, "page", "null", None),
+    ("high_work_bf16", 148, torch.bfloat16, "page", "null", None),
+    ("stream_bf16", 64, torch.bfloat16, "page", "positive", None),
+    ("stream_bf16", 64, torch.bfloat16, "page", "random_positive", _H8_STREAM_POOL),
+    ("stream_bf16", 65, torch.bfloat16, "padded", "random_positive", _H8_STREAM_POOL),
+    ("stream_bf16", 147, torch.bfloat16, "page", "positive", None),
+    ("stream_bf16", 148, torch.bfloat16, "page", "random_positive", _H8_STREAM_POOL),
+    ("stream_bf16", 1024, torch.bfloat16, "page", "random_positive", _H8_STREAM_POOL),
+    (
+        "stream_bf16_wide_slot_offsets",
+        64,
+        torch.bfloat16,
+        "page",
+        "random_positive",
+        _H8_WIDE_OFFSET_POOL,
+    ),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -202,10 +265,14 @@ def _make_inputs(
     slot_class="positive",
     rank4_output_gate=False,
     seed=42,
+    num_slots=None,
 ):
     device = torch.device("cuda")
     hidden_size = num_heads * _HEAD_DIM
-    num_slots = max(num_rows + 1, 4)
+    explicit_slots = num_slots is not None
+    if num_slots is None:
+        num_slots = max(num_rows + 1, 4)
+    assert num_rows < num_slots
     generator = torch.Generator(device=device).manual_seed(seed)
 
     def randn(shape, dtype=torch.float32):
@@ -230,27 +297,24 @@ def _make_inputs(
         dtype=torch.bfloat16,
         device=device,
     )
-    conv_state.copy_(0.1 * randn((num_slots, 3 * hidden_size, 3), torch.bfloat16))
     state = torch.empty_strided(
         (num_slots, num_heads, _HEAD_DIM, _HEAD_DIM),
         (state_slot_stride, _HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1),
         dtype=state_dtype,
         device=device,
     )
-    state.copy_(0.01 * randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), state_dtype))
-    beta_storage = randn((1, num_rows, num_heads + beta_padding), torch.bfloat16)
-    output_gate_storage = randn(
-        (num_rows, hidden_size + output_gate_padding), torch.bfloat16
-    )
-    output_gate = output_gate_storage.as_strided(
-        (num_rows, num_heads, _HEAD_DIM),
-        (hidden_size + output_gate_padding, _HEAD_DIM, 1),
-    )
-    if rank4_output_gate:
-        output_gate = output_gate.unsqueeze(0)
 
     if slot_class == "positive":
         state_indices = torch.arange(num_rows, 0, -1, dtype=torch.int32, device=device)
+    elif slot_class == "random_positive":
+        # Unique positive slots scattered over the whole pool; the last slot is
+        # always live so 64-bit offset variants address the far end of it.
+        state_indices = (
+            torch.randperm(num_slots - 1, device=device, generator=generator)[:num_rows]
+            + 1
+        ).to(torch.int32)
+        if not bool((state_indices == num_slots - 1).any()):
+            state_indices[0] = num_slots - 1
     elif slot_class == "null":
         state_indices = torch.arange(num_rows, 0, -1, dtype=torch.int32, device=device)
         state_indices[: min(2, num_rows)] = torch.tensor(
@@ -264,6 +328,34 @@ def _make_inputs(
         )
     else:
         raise ValueError(f"unknown slot class: {slot_class}")
+
+    if explicit_slots:
+        # Large pools: randomise only the live slots and keep the rest zero so
+        # multi-gigabyte pools do not need equally large random temporaries.
+        conv_state.zero_()
+        state.zero_()
+        live_slots = state_indices[state_indices > 0].long()
+        conv_state[live_slots] = 0.1 * randn(
+            (live_slots.numel(), 3 * hidden_size, 3), torch.bfloat16
+        )
+        state[live_slots] = 0.01 * randn(
+            (live_slots.numel(), num_heads, _HEAD_DIM, _HEAD_DIM), state_dtype
+        )
+    else:
+        conv_state.copy_(0.1 * randn((num_slots, 3 * hidden_size, 3), torch.bfloat16))
+        state.copy_(
+            0.01 * randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), state_dtype)
+        )
+    beta_storage = randn((1, num_rows, num_heads + beta_padding), torch.bfloat16)
+    output_gate_storage = randn(
+        (num_rows, hidden_size + output_gate_padding), torch.bfloat16
+    )
+    output_gate = output_gate_storage.as_strided(
+        (num_rows, num_heads, _HEAD_DIM),
+        (hidden_size + output_gate_padding, _HEAD_DIM, 1),
+    )
+    if rank4_output_gate:
+        output_gate = output_gate.unsqueeze(0)
 
     return {
         "x": x_storage[:, : 3 * hidden_size],
@@ -280,6 +372,7 @@ def _make_inputs(
         "backend": "cake",
         "state_indices_mode": {
             "positive": "positive_unique",
+            "random_positive": "positive_unique",
             "null": "unique_or_null",
             "repeated": "repeated_positive",
         }[slot_class],
@@ -527,6 +620,74 @@ def test_cake_fused_kda_decode_all_registered_factories(
 
 
 @pytest.mark.parametrize(
+    (
+        "variant_name",
+        "num_rows",
+        "state_dtype",
+        "layout",
+        "slot_class",
+        "num_slots",
+    ),
+    [
+        pytest.param(
+            *case,
+            id=f"{case[0]}-n{case[1]}-{str(case[2]).removeprefix('torch.')}-"
+            f"{case[3]}-{case[4]}" + (f"-slots{case[5]}" if case[5] else ""),
+        )
+        for case in _H8_ROUTE_CASES
+    ],
+)
+def test_cake_fused_kda_decode_h8_routes(
+    monkeypatch,
+    variant_name,
+    num_rows,
+    state_dtype,
+    layout,
+    slot_class,
+    num_slots,
+):
+    inputs = _make_inputs(
+        8,
+        num_rows,
+        state_dtype=state_dtype,
+        layout=layout,
+        slot_class=slot_class,
+        num_slots=num_slots,
+    )
+    _run_and_check_cake(monkeypatch, inputs, expected_variant=variant_name)
+
+
+@pytest.mark.parametrize(
+    ("num_rows", "lower_bound", "norm_eps", "layout", "rank4_output_gate"),
+    (
+        (64, None, 0.0, "page", False),
+        (100, None, 3e-4, "padded", True),
+        (129, -2.75, 3e-4, "padded", True),
+    ),
+)
+def test_cake_fused_kda_decode_h8_stream_runtime_configuration_domain(
+    monkeypatch, num_rows, lower_bound, norm_eps, layout, rank4_output_gate
+):
+    inputs = _make_inputs(
+        8,
+        num_rows,
+        state_dtype=torch.bfloat16,
+        layout=layout,
+        slot_class="random_positive",
+        rank4_output_gate=rank4_output_gate,
+        num_slots=_H8_STREAM_POOL,
+    )
+    _run_and_check_cake(
+        monkeypatch,
+        inputs,
+        expected_variant="stream_bf16",
+        lower_bound=lower_bound,
+        norm_eps=norm_eps,
+        preallocate_output=True,
+    )
+
+
+@pytest.mark.parametrize(
     ("num_heads", "num_rows"),
     [
         pytest.param(num_heads, num_rows, id=f"h{num_heads}-n{num_rows}")
@@ -605,8 +766,23 @@ def test_cake_fused_kda_decode_cross_surface_boundaries(
     )
 
 
-def test_cake_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
-    inputs = _make_inputs(12, 25, state_dtype=torch.float32)
+@pytest.mark.parametrize(
+    ("num_heads", "num_rows", "state_dtype", "slot_class", "expected_variant"),
+    (
+        (12, 25, torch.float32, "positive", "compact_async_positive_f32"),
+        (8, 128, torch.bfloat16, "random_positive", "stream_bf16"),
+    ),
+)
+def test_cake_fused_kda_decode_cuda_graph_replay_correctness(
+    monkeypatch, num_heads, num_rows, state_dtype, slot_class, expected_variant
+):
+    inputs = _make_inputs(
+        num_heads,
+        num_rows,
+        state_dtype=state_dtype,
+        slot_class=slot_class,
+        num_slots=_H8_STREAM_POOL if slot_class == "random_positive" else None,
+    )
     reference_conv_state = _clone_strided(inputs["conv_state"])
     reference_state = _clone_strided(inputs["state"])
 
@@ -625,7 +801,7 @@ def test_cake_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
         "state": _clone_strided(inputs["state"]),
         "lower_bound": None,
         "output": torch.empty(
-            (1, 25, 12, _HEAD_DIM),
+            (1, num_rows, num_heads, _HEAD_DIM),
             dtype=torch.bfloat16,
             device="cuda",
         ),
@@ -635,7 +811,9 @@ def test_cake_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
 
     actual_conv_state = _clone_strided(inputs["conv_state"])
     actual_state = _clone_strided(inputs["state"])
-    output = torch.empty((1, 25, 12, _HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty(
+        (1, num_rows, num_heads, _HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+    )
     graph_kwargs = {
         **inputs,
         "conv_state": actual_conv_state,
@@ -647,10 +825,7 @@ def test_cake_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
     with torch.cuda.graph(graph):
         captured_output = fused_kda_decode(**graph_kwargs)
     assert captured_output is output
-    assert routed_variants == [
-        "compact_async_positive_f32",
-        "compact_async_positive_f32",
-    ]
+    assert routed_variants == [expected_variant, expected_variant]
 
     for _ in range(2):
         expected = _reference(
@@ -668,8 +843,18 @@ def test_cake_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
         torch.testing.assert_close(actual_state, reference_state, rtol=1e-2, atol=1e-2)
 
 
-def test_cake_fused_kda_decode_preserves_write_guards(monkeypatch):
-    inputs = _make_inputs(12, 25, layout="padded")
+@pytest.mark.parametrize(
+    ("num_heads", "num_rows", "state_dtype", "expected_variant"),
+    (
+        (12, 25, torch.float32, "compact_async_positive_f32"),
+        (8, 40, torch.float32, "high_work_positive_f32"),
+        (8, 64, torch.bfloat16, "stream_bf16"),
+    ),
+)
+def test_cake_fused_kda_decode_preserves_write_guards(
+    monkeypatch, num_heads, num_rows, state_dtype, expected_variant
+):
+    inputs = _make_inputs(num_heads, num_rows, state_dtype=state_dtype, layout="padded")
     reference_conv_state = _clone_strided(inputs["conv_state"])
     reference_state = _clone_strided(inputs["state"])
     expected = _reference(inputs, reference_conv_state, reference_state)
@@ -699,7 +884,7 @@ def test_cake_fused_kda_decode_preserves_write_guards(monkeypatch):
     }
     actual = fused_kda_decode(**kwargs)
     assert actual is output
-    assert routed_variants == ["compact_async_positive_f32"]
+    assert routed_variants == [expected_variant]
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
     torch.testing.assert_close(actual_state, reference_state, rtol=1e-2, atol=1e-2)

@@ -722,8 +722,20 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     moe::dev::activation::run(activationData, stream);
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
+  } else if (mUsePerTokenScalingGemm2 && mGemm2.mDtypeAct == btg::Dtype::E4m3) {
+    FLASHINFER_CHECK(
+        mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
+        "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
+    invokePerTokenQuantization<__nv_bfloat16, __nv_fp8_e4m3>(
+        reinterpret_cast<__nv_fp8_e4m3*>(workspace.activation_output),
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output),
+        workspace.total_max_padded_tokens, args.intermediate_size, nullptr,
+        workspace.activation_output_scale, nullptr, tensorrt_llm::common::QuantMode::fp8RowWise(),
+        stream);
+
+    gemm2_input = workspace.activation_output;
+    gemm2_input_scale = workspace.activation_output_scale;
   } else if (mUsePerTokenScalingGemm2) {
-    // TODO(siyuan): currently only support per-token nvfp4 quantization
     FLASHINFER_CHECK(
         mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
         "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");

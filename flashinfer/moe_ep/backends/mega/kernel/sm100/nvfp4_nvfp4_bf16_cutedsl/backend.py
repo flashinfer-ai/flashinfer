@@ -146,11 +146,17 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
-        """Whether this exact workspace can use the frozen SM100a reducer."""
+        """Whether this exact workspace can use the frozen Cake reducer.
+
+        The reducer is published for the datacenter-Blackwell targets that
+        also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
+        """
+        from flashinfer.jit.cake_megamoe_topk_reduce import supported_capabilities
 
         k = self._kernel_config
         return (
-            torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 0)
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+            in supported_capabilities()
             and fleet_params.max_tokens_per_rank in (256, 4096)
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
@@ -403,7 +409,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
 
             reducer_state = (
-                get_cake_megamoe_topk_reduce_module(),
+                get_cake_megamoe_topk_reduce_module(partials.device),
                 partials,
                 workspace_root,
                 key[3],
