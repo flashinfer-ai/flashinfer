@@ -2539,6 +2539,25 @@ def _compute_mla_decode_buckets(
     return get_hybrid_num_tokens_buckets(max(1, cap))
 
 
+def _cake_trtllm_mla_blackwell_supports(
+    query: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sparse_mla_top_k: int,
+) -> bool:
+    """Whether the generated TRT-LLM-style Blackwell MLA programs cover this dimension tuple."""
+    from .cake_trtllm_mla_blackwell import supports_dimension_tuple
+
+    return supports_dimension_tuple(
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        int(query.shape[-2]),
+        int(sparse_mla_top_k),
+    )
+
+
 def _validate_mla_dcp_args(
     *,
     query: torch.Tensor,
@@ -3687,7 +3706,12 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
 
-    if backend == "cake":
+    if backend == "cake" and _cake_trtllm_mla_blackwell_supports(
+        query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, sparse_mla_top_k
+    ):
+        # Two Cake MLA families answer to backend="cake": the TRT-LLM-style Blackwell decode
+        # programs for their generated dimension tuples, and the Kimi-K3 FP8 paged-cache route
+        # (below) for everything else in its contract.
         from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
         return trtllm_mla_blackwell_decode(
@@ -3723,6 +3747,67 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             backend = "sparse"
         elif cc[0] != 10:
             backend = "xqa"
+
+    if backend == "cake":
+        # Cake-generated Kimi-K3 MLA over the FP8 paged latent cache (SM100 / SM103): dense
+        # decode, packed variable-Q / MTP and incremental prefill; BF16 output, caller-owned
+        # ``out``, current stream, CUDA-Graph replayable.  Unsupported here: sparse top-k,
+        # sinks, LSE output, DCP, skip-softmax, FP16 softmax, PDL, NVFP4 / uint8 caches.
+        unsupported = []
+        if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
+            unsupported.append("sparse_mla_top_k")
+        if sinks is not None:
+            unsupported.append("sinks")
+        if return_lse or lse is not None:
+            unsupported.append("return_lse / lse")
+        if enable_dcp:
+            unsupported.append("enable_dcp")
+        if skip_softmax_threshold_scale_factor is not None:
+            unsupported.append("skip_softmax_threshold_scale_factor")
+        if use_fp16_softmax:
+            unsupported.append("use_fp16_softmax")
+        if enable_pdl:
+            unsupported.append("enable_pdl")
+        if multi_ctas_kv_counter_buffer is not None:
+            unsupported.append("multi_ctas_kv_counter_buffer")
+        if unsupported:
+            raise ValueError(
+                "backend='cake' does not support " + ", ".join(unsupported)
+            )
+        if seq_lens is None:
+            raise ValueError("backend='cake' requires seq_lens")
+        if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "backend='cake' requires float8_e4m3fn query and kv_cache, got "
+                f"{query.dtype} and {kv_cache.dtype}"
+            )
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            raise ValueError(
+                "backend='cake' supports kv_lora_rank=512 and qk_rope_head_dim=64 only"
+            )
+        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+            raise ValueError("backend='cake' takes host float bmm1_scale / bmm2_scale")
+        if out is None:
+            out = torch.empty(
+                (*query.shape[:-1], kv_lora_rank),
+                dtype=torch.bfloat16,
+                device=query.device,
+            )
+        from .cake_kimi_k3_mla import run_cake_kimi_k3_mla_fp8_paged_attention
+
+        return run_cake_kimi_k3_mla_fp8_paged_attention(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            out,
+            workspace_buffer,
+            bmm1_scale=float(bmm1_scale),
+            bmm2_scale=float(bmm2_scale),
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            max_seq_len=int(max_seq_len),
+        )
 
     # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
     # active top-k length; the SM120 sparse backend bounds each row by its
