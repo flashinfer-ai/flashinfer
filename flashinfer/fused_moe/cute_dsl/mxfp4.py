@@ -354,6 +354,11 @@ DENSE_FILL_IN_GEMM1 = os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1", "1")
 DENSE_FILL_IN_GEMM1_MIN_TOKENS = int(
     os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1_MIN_TOKENS", "8192")
 )
+# Dense form, T > 16, PDL on: one CuTe conversion launch (route ids and FP32
+# weights from the packed routing) replaces the two torch unpack kernels
+# (5.8 us at T = 8192 on B300, launch-bound); the output clear stays in the
+# gather GEMM1 or on the auxiliary stream. ``0`` keeps the torch kernels.
+ROUTE_PREPROCESS_PDL = os.environ.get("MXFP4_ROUTE_PREPROCESS_PDL", "1") == "1"
 
 
 def _dense_fill_in_gemm1(
@@ -710,6 +715,9 @@ class Mxfp4MoEPlan:
         self._route_ids = route_ids
         self._route_weights = route_weights
         self._route_preprocess = None
+        # True when the bound preprocess also clears the output (run() then
+        # skips the memset).
+        self._route_preprocess_clears = False
         self._aux_stream = None
         self._main_event = None
         self._memset_event = None
@@ -779,21 +787,30 @@ class Mxfp4MoEPlan:
                     "_enable_decode_specialization", False
                 ),
             )
+            self._route_preprocess_clears = True
             # Preprocessing warmup clears output. Finish the complete MoE so
             # plan retains its existing valid-output postcondition.
             self.run()
-        elif not self._kwargs["enable_pdl"]:
-            # T > 16: one conversion + output-clear launch replaces the torch
-            # unpack kernels and the separate memset (run() skips the memset
-            # whenever a route preprocess is bound).
+        elif not self._kwargs["enable_pdl"] or ROUTE_PREPROCESS_PDL:
+            # T > 16: one conversion launch replaces the two torch unpack
+            # kernels. Without PDL it also clears the output (run() then skips
+            # the memset); under PDL the clear stays where the round-15/17
+            # measurements put it, in the gather GEMM1 (zero_fill_counters)
+            # or on the auxiliary stream beside it, and the launch converts
+            # only (grid sized by routes).
+            clears = (
+                self._kwargs.get("zero_fill_counters") is None
+                and not self._kwargs["enable_pdl"]
+            )
             self._route_preprocess = _plan_route_preprocess(
                 self._topk_ids,
                 self._topk_weights,
                 route_ids=self._route_ids,
                 route_weights=self._route_weights,
                 output=self.output,
-                clear_output=self._kwargs.get("zero_fill_counters") is None,
+                clear_output=clears,
             )
+            self._route_preprocess_clears = clears
             self.run()
 
     def run(self) -> torch.Tensor:
@@ -815,7 +832,7 @@ class Mxfp4MoEPlan:
             ):
                 self._sort(*self._sort_args, stream_ptr)
             async_memset = (
-                self._route_preprocess is None and self._aux_stream is not None
+                not self._route_preprocess_clears and self._aux_stream is not None
             )
             if async_memset:
                 # Fork: the zero-fill waits for everything enqueued so far
@@ -832,7 +849,7 @@ class Mxfp4MoEPlan:
             if async_memset:
                 # Join: GEMM2 reduce-adds into the zeroed output.
                 torch.cuda.current_stream().wait_event(self._memset_event)
-            elif self._route_preprocess is None and self._memset is not None:
+            elif not self._route_preprocess_clears and self._memset is not None:
                 self._memset(*self._memset_args, stream_ptr)
             self._finalize(*self._finalize_args, stream=stream)
             if self._finalize_alt is not None:
