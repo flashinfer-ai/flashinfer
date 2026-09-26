@@ -250,6 +250,7 @@ __device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
     return r;
 }
 
+
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
 __device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
@@ -623,7 +624,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_minimax_h3_nvfp4_pre_attention_9edde0d17b6d62645e38(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ x_norm_weight, __nv_bfloat16* __restrict__ adaln_scale, __nv_bfloat16* __restrict__ adaln_shift, int* __restrict__ adaln_index, float* __restrict__ x_global_scale, uint8_t* __restrict__ activation_q, uint8_t* __restrict__ activation_sf, __nv_bfloat16* __restrict__ debug_adaln_bf16, int write_debug, float eps, int M)
+kernel_cake_minimax_h3_nvfp4_pre_attention_a6d128025625bf09a7d9(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ x_norm_weight, __nv_bfloat16* __restrict__ adaln_scale, __nv_bfloat16* __restrict__ adaln_shift, int* __restrict__ adaln_index, float* __restrict__ x_global_scale, uint8_t* __restrict__ activation_q, uint8_t* __restrict__ activation_sf, __nv_bfloat16* __restrict__ debug_adaln_bf16, int write_debug, float eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -631,8 +632,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_9edde0d17b6d62645e38(__nv_bfloat16* _
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
