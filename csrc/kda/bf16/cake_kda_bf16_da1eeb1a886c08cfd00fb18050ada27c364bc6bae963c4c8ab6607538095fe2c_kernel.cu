@@ -821,7 +821,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 extern "C" {
 
 __global__ __launch_bounds__(128, 3) void
-kernel_cake_kda_bf16_99c45fc0c64a48627d579b73940402297d6fcfd23ed00bd1f9cf84f9c2fe1bc9(float* __restrict__ split_state, __nv_bfloat16* __restrict__ map_state_bf16, float* __restrict__ carry, float* __restrict__ final_state, int write_final_state, int num_heads, int* __restrict__ part_cu_seqlens)
+kernel_cake_kda_bf16_da1eeb1a886c08cfd00fb18050ada27c364bc6bae963c4c8ab6607538095fe2c(float* __restrict__ split_state, __nv_bfloat16* __restrict__ map_state_bf16, float* __restrict__ carry, __nv_bfloat16* __restrict__ carry_hi, __nv_bfloat16* __restrict__ carry_lo, float* __restrict__ final_state, int write_final_state, int num_heads, int* __restrict__ part_cu_seqlens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -829,7 +829,8 @@ kernel_cake_kda_bf16_99c45fc0c64a48627d579b73940402297d6fcfd23ed00bd1f9cf84f9c2f
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define map_full0_addr (mbar_base + 0)
@@ -870,6 +871,8 @@ kernel_cake_kda_bf16_99c45fc0c64a48627d579b73940402297d6fcfd23ed00bd1f9cf84f9c2f
     int row_band = bid % 32;
     int row = row_band * 4 + warp;
     int col = lane * 4;
+    float hi_reg[4];
+    float lo_reg[4];
     if (part_begin > 0) {
         float zero[4];
         zero[0] = 0.0f;
@@ -880,6 +883,38 @@ kernel_cake_kda_bf16_99c45fc0c64a48627d579b73940402297d6fcfd23ed00bd1f9cf84f9c2f
             {
                 float4 _v4 = make_float4(zero[0 + 0], zero[0 + 1], zero[0 + 2], zero[0 + 3]);
                 *reinterpret_cast<float4*>(carry + ((part_begin - 1) * num_heads + task) * 16384 + row * 128 + col) = _v4;
+            }
+            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(zero[0]);
+            float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+            hi_reg[0] = _cvt_f32_0;
+            lo_reg[0] = zero[0] - hi_reg[0];
+            __nv_bfloat16 _cvt_bf16_1 = __float2bfloat16(zero[1]);
+            float _cvt_f32_1 = __bfloat162float(_cvt_bf16_1);
+            hi_reg[1] = _cvt_f32_1;
+            lo_reg[1] = zero[1] - hi_reg[1];
+            __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(zero[2]);
+            float _cvt_f32_2 = __bfloat162float(_cvt_bf16_2);
+            hi_reg[2] = _cvt_f32_2;
+            lo_reg[2] = zero[2] - hi_reg[2];
+            __nv_bfloat16 _cvt_bf16_3 = __float2bfloat16(zero[3]);
+            float _cvt_f32_3 = __bfloat162float(_cvt_bf16_3);
+            hi_reg[3] = _cvt_f32_3;
+            lo_reg[3] = zero[3] - hi_reg[3];
+            {
+                __nv_bfloat162 _pk = __floats2bfloat162_rn(hi_reg[0 + 0], hi_reg[0 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_hi))[((part_begin - 1) * num_heads + task) * 16384 + row * 128 + col]) = _pk;
+            }
+            {
+                __nv_bfloat162 _pk = __floats2bfloat162_rn(lo_reg[0 + 0], lo_reg[0 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_lo))[((part_begin - 1) * num_heads + task) * 16384 + row * 128 + col]) = _pk;
+            }
+            {
+                __nv_bfloat162 _pk = __floats2bfloat162_rn(hi_reg[2 + 0], hi_reg[2 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_hi))[((part_begin - 1) * num_heads + task) * 16384 + row * 128 + col + 2]) = _pk;
+            }
+            {
+                __nv_bfloat162 _pk = __floats2bfloat162_rn(lo_reg[2 + 0], lo_reg[2 + 1]);
+                *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_lo))[((part_begin - 1) * num_heads + task) * 16384 + row * 128 + col + 2]) = _pk;
             }
         }
     }
@@ -923,6 +958,38 @@ kernel_cake_kda_bf16_99c45fc0c64a48627d579b73940402297d6fcfd23ed00bd1f9cf84f9c2f
                 {
                     float4 _v4 = make_float4(carry_reg[0 + 0], carry_reg[0 + 1], carry_reg[0 + 2], carry_reg[0 + 3]);
                     *reinterpret_cast<float4*>(carry + ((part - 1) * num_heads + task) * 16384 + row * 128 + col) = _v4;
+                }
+                __nv_bfloat16 _cvt_bf16_4 = __float2bfloat16(carry_reg[0]);
+                float _cvt_f32_4 = __bfloat162float(_cvt_bf16_4);
+                hi_reg[0] = _cvt_f32_4;
+                lo_reg[0] = carry_reg[0] - hi_reg[0];
+                __nv_bfloat16 _cvt_bf16_5 = __float2bfloat16(carry_reg[1]);
+                float _cvt_f32_5 = __bfloat162float(_cvt_bf16_5);
+                hi_reg[1] = _cvt_f32_5;
+                lo_reg[1] = carry_reg[1] - hi_reg[1];
+                __nv_bfloat16 _cvt_bf16_6 = __float2bfloat16(carry_reg[2]);
+                float _cvt_f32_6 = __bfloat162float(_cvt_bf16_6);
+                hi_reg[2] = _cvt_f32_6;
+                lo_reg[2] = carry_reg[2] - hi_reg[2];
+                __nv_bfloat16 _cvt_bf16_7 = __float2bfloat16(carry_reg[3]);
+                float _cvt_f32_7 = __bfloat162float(_cvt_bf16_7);
+                hi_reg[3] = _cvt_f32_7;
+                lo_reg[3] = carry_reg[3] - hi_reg[3];
+                {
+                    __nv_bfloat162 _pk = __floats2bfloat162_rn(hi_reg[0 + 0], hi_reg[0 + 1]);
+                    *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_hi))[((part - 1) * num_heads + task) * 16384 + row * 128 + col]) = _pk;
+                }
+                {
+                    __nv_bfloat162 _pk = __floats2bfloat162_rn(lo_reg[0 + 0], lo_reg[0 + 1]);
+                    *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_lo))[((part - 1) * num_heads + task) * 16384 + row * 128 + col]) = _pk;
+                }
+                {
+                    __nv_bfloat162 _pk = __floats2bfloat162_rn(hi_reg[2 + 0], hi_reg[2 + 1]);
+                    *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_hi))[((part - 1) * num_heads + task) * 16384 + row * 128 + col + 2]) = _pk;
+                }
+                {
+                    __nv_bfloat162 _pk = __floats2bfloat162_rn(lo_reg[2 + 0], lo_reg[2 + 1]);
+                    *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(carry_lo))[((part - 1) * num_heads + task) * 16384 + row * 128 + col + 2]) = _pk;
                 }
             }
             float accum[4];

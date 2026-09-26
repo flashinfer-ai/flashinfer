@@ -821,7 +821,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 extern "C" {
 
 __global__ __launch_bounds__(128, 3) void
-kernel_cake_kda_bf16_2d657c38da52dd2e2d1390b97be85df7eb4f1f2eaa769e687e006a2cc4d2f8e5(float* __restrict__ split_state, __nv_bfloat16* __restrict__ map_state_bf16, float* __restrict__ carry, float* __restrict__ final_state, int write_final_state, int num_heads, int* __restrict__ part_cu_seqlens)
+kernel_cake_kda_bf16_071df2fa023b7afee720481cc582e55dc1840d5909fc6c988fd242be44dd8412(float* __restrict__ split_state, __nv_bfloat16* __restrict__ map_state_bf16, float* __restrict__ carry, __nv_bfloat16* __restrict__ carry_hi, __nv_bfloat16* __restrict__ carry_lo, float* __restrict__ final_state, int write_final_state, int num_heads, int* __restrict__ part_cu_seqlens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -829,8 +829,7 @@ kernel_cake_kda_bf16_2d657c38da52dd2e2d1390b97be85df7eb4f1f2eaa769e687e006a2cc4d
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define map_full0_addr (mbar_base + 0)
@@ -871,6 +870,8 @@ kernel_cake_kda_bf16_2d657c38da52dd2e2d1390b97be85df7eb4f1f2eaa769e687e006a2cc4d
     int row_band = bid % 32;
     int row = row_band * 4 + warp;
     int col = lane * 4;
+    float hi_reg[4];
+    float lo_reg[4];
     if (part_begin > 0) {
         float zero[4];
         zero[0] = 0.0f;
