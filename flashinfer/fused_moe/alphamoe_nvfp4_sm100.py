@@ -1232,7 +1232,9 @@ def _check_prepared_w1_interleaved(w1, w1_scale, scales):
         return
     e, n, packed_k = w1.shape
     panels = e * (n // 128) * (packed_k // 128)
-    _require_cuda_tensor("w1_scale_prepared_interleaved", scales, dtype=torch.uint8, ndim=3)
+    _require_cuda_tensor(
+        "w1_scale_prepared_interleaved", scales, dtype=torch.uint8, ndim=3
+    )
     if (
         scales.device != w1_scale.device
         or tuple(scales.shape) != (panels, 16, 128)
@@ -1243,7 +1245,7 @@ def _check_prepared_w1_interleaved(w1, w1_scale, scales):
         )
 
 
-_S5_MERGE_COUNTERS = {}
+_S5_MERGE_COUNTERS: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _s5_merge_counters(count, device):
@@ -1252,7 +1254,11 @@ def _s5_merge_counters(count, device):
     The kernels reset every counter they consume, so one zero-initialised buffer per
     (device, stream) is reused across calls without any per-call fill launch.
     """
-    key = (device.index if device.index is not None else torch.cuda.current_device(), torch.cuda.current_stream(device).cuda_stream, int(count))
+    key = (
+        device.index if device.index is not None else torch.cuda.current_device(),
+        torch.cuda.current_stream(device).cuda_stream,
+        int(count),
+    )
     buffer = _S5_MERGE_COUNTERS.get(key)
     if buffer is None:
         buffer = torch.zeros((int(count),), dtype=torch.uint32, device=device)
@@ -1483,16 +1489,19 @@ def _alphamoe_try_complete_routed(
             (capacity * blocks, 8192), dtype=torch.float32, device=hidden_states.device
         )
         e_, n_, packed_k_ = gemm1_weights.shape
-        if (
-            w1_scale_prepared is not None
-            and tuple(w1_scale_prepared.shape) == (e_ * (n_ // 128) * (packed_k_ // 128), 16, 128)
+        if w1_scale_prepared is not None and tuple(w1_scale_prepared.shape) == (
+            e_ * (n_ // 128) * (packed_k_ // 128),
+            16,
+            128,
         ):
             # S5 one-token path: act/sf workspaces + zeroed self-resetting merge counters
             act_workspace = torch.empty(
                 (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
             )
             sf_workspace = torch.empty(
-                (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+                (capacity * blocks, 1024),
+                dtype=torch.uint8,
+                device=hidden_states.device,
             )
             merge_counters = _s5_merge_counters(capacity * blocks, hidden_states.device)
     elif route_id == 8:
@@ -1884,8 +1893,14 @@ def alphamoe_nvfp4_routed_moe_deferred(
             w2_data_prepared=w2_data_prepared,
         )
         return AlphaMoeNvfp4DeferredOutput(
-            route_id, None, None, topk_weights, output2_scale_scalar,
-            routed_scaling_factor, top_k, out,
+            route_id,
+            None,
+            None,
+            topk_weights,
+            output2_scale_scalar,
+            routed_scaling_factor,
+            top_k,
+            out,
         )
     m, k = out.shape
     e, n, _ = gemm1_weights.shape
@@ -1904,16 +1919,19 @@ def alphamoe_nvfp4_routed_moe_deferred(
             (capacity * blocks, 8192), dtype=torch.float32, device=hidden_states.device
         )
         e_, n_, packed_k_ = gemm1_weights.shape
-        if (
-            w1_scale_prepared is not None
-            and tuple(w1_scale_prepared.shape) == (e_ * (n_ // 128) * (packed_k_ // 128), 16, 128)
+        if w1_scale_prepared is not None and tuple(w1_scale_prepared.shape) == (
+            e_ * (n_ // 128) * (packed_k_ // 128),
+            16,
+            128,
         ):
             # S5 one-token path: act/sf workspaces + zeroed self-resetting merge counters
             act_workspace = torch.empty(
                 (capacity * blocks, 512), dtype=torch.uint8, device=hidden_states.device
             )
             sf_workspace = torch.empty(
-                (capacity * blocks, 1024), dtype=torch.uint8, device=hidden_states.device
+                (capacity * blocks, 1024),
+                dtype=torch.uint8,
+                device=hidden_states.device,
             )
             merge_counters = _s5_merge_counters(capacity * blocks, hidden_states.device)
     elif route_id == 8:
@@ -2014,8 +2032,14 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w2_data_prepared,
     )
     return AlphaMoeNvfp4DeferredOutput(
-        route_id, route_accumulator, route_experts, topk_weights,
-        output2_scale_scalar, routed_scaling_factor, top_k, None,
+        route_id,
+        route_accumulator,
+        route_experts,
+        topk_weights,
+        output2_scale_scalar,
+        routed_scaling_factor,
+        top_k,
+        None,
     )
 
 
