@@ -31,6 +31,12 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .cake_grouped_fp8_gemm import (
+    PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
+)
+from .cake_grouped_fp8_gemm import (
+    prepare_group_gemm_fp8_nt_groupwise_contiguous as prepare_group_gemm_fp8_nt_groupwise_contiguous,
+)
 
 from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
@@ -146,6 +152,8 @@ __all__ = (
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise_contiguous",
+        "prepare_group_gemm_fp8_nt_groupwise_contiguous",
+        "PreparedGroupGemmFp8NtGroupwiseContiguous",
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
