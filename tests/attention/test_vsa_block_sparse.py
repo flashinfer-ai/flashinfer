@@ -828,6 +828,137 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
 
 @_requires_sm100_or_sm103
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 65),  # 1 full block + 1-token partial tail
+        (64, 127),  # 1 full block + 63-token partial tail
+        (128, 193),  # 2 full Q-blocks, 3 full KV blocks + 1-token partial tail
+    ],
+)
+def test_vsa_blk64_partial_kv_tail(seqlen_q, seqlen_k, workspace):
+    """blk64 kernel must produce finite, correct output when seqlen_k % 64 != 0.
+
+    Previously the packed rank-6 TMA view rounded the KV block count up to
+    ceil_div(seqlen_k, 64) full 64-token blocks.  TMA read beyond the actual
+    buffer for the last partial block, producing NaN/Inf outputs.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    num_heads = 4
+    dtype = torch.bfloat16
+
+    q = torch.randn(seqlen_q, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(seqlen_k, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(seqlen_k, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    mb = (seqlen_q + R64 - 1) // R64
+    nb = (seqlen_k + C64 - 1) // C64
+
+    # Dense pattern: every Q-block attends to all KV blocks (including partial tail).
+    indptr = torch.arange(mb + 1, dtype=torch.int32, device=device) * nb
+    indices = torch.cat(
+        [torch.arange(nb, dtype=torch.int32, device=device) for _ in range(mb)]
+    )
+
+    # Dense PyTorch reference: plain scaled-dot-product attention.
+    scale = HEAD_DIM_BLK64**-0.5
+    qf = q.float().permute(1, 0, 2)  # [H, Sq, D]
+    kf = k.float().permute(1, 0, 2)  # [H, Sk, D]
+    vf = v.float().permute(1, 0, 2)  # [H, Sk, D]
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    probs = torch.softmax(scores, dim=-1)
+    o_ref = torch.matmul(probs, vf).permute(1, 0, 2).to(dtype)  # [Sq, H, D]
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        seqlen_q,
+        seqlen_k,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    assert torch.isfinite(o).all(), (
+        f"blk64 output contains non-finite values for seqlen_k={seqlen_k} (% 64 != 0)"
+    )
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,kv_splits",
+    [
+        (128, 65, 2),  # partial tail (1 token), explicit split=2
+        (128, 193, 2),  # partial tail (1 token), 3 full + 1 partial block, split=2
+        (128, 193, 4),  # same, split=4
+    ],
+)
+def test_vsa_blk64_partial_kv_tail_kv_splits(seqlen_q, seqlen_k, kv_splits, workspace):
+    """blk64 split-KV path must produce correct output when seqlen_k % 64 != 0.
+
+    kv_splits > 1 activates a separate combine kernel after the main forward
+    pass.  The block_sizes partial-tail masking must be in effect inside each
+    split's forward pass so that out-of-bounds KV positions don't contaminate
+    the per-split softmax statistics fed into the combine step.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    num_heads = 4
+    dtype = torch.bfloat16
+
+    q = torch.randn(seqlen_q, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(seqlen_k, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(seqlen_k, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    mb = (seqlen_q + R64 - 1) // R64
+    nb = (seqlen_k + C64 - 1) // C64
+
+    # Dense pattern: every Q-block attends to all KV blocks including partial tail.
+    indptr = torch.arange(mb + 1, dtype=torch.int32, device=device) * nb
+    indices = torch.cat(
+        [torch.arange(nb, dtype=torch.int32, device=device) for _ in range(mb)]
+    )
+
+    # Dense SDPA reference over all seqlen_k tokens.
+    scale = HEAD_DIM_BLK64**-0.5
+    qf = q.float().permute(1, 0, 2)  # [H, Sq, D]
+    kf = k.float().permute(1, 0, 2)  # [H, Sk, D]
+    vf = v.float().permute(1, 0, 2)  # [H, Sk, D]
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    probs = torch.softmax(scores, dim=-1)
+    o_ref = torch.matmul(probs, vf).permute(1, 0, 2).to(dtype)  # [Sq, H, D]
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        seqlen_q,
+        seqlen_k,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=dtype,
+        kv_splits=kv_splits,
+    )
+    o = wrapper.run(q, k, v)
+
+    assert torch.isfinite(o).all(), (
+        f"blk64 kv_splits={kv_splits} output contains non-finite values "
+        f"for seqlen_k={seqlen_k} (% 64 != 0)"
+    )
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize("kv_splits", [1, 2, 4, "auto"])
 def test_vsa_blk64_kv_splits(kv_splits, workspace):
     """blk64 output must match the dense reference across kv_splits values."""
