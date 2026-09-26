@@ -121,6 +121,14 @@ MAIN_KWARGS = (
     "static_only",
     "dbg",
     "partial_slots",
+    "fd_tiles_max",
+    "fd_num_heads",
+    "fd_cp_world",
+    "fd_num_items",
+    "fd_unit_min",
+    "fd_static_tiles",
+    "fd_unit_den",
+    "fd_clusters",
     "grid",
 )
 MERGE_KWARGS = (
@@ -137,6 +145,20 @@ MERGE_KWARGS = (
     "max_records",
     "grid",
 )
+
+
+def _fast_divmod(divisor: int) -> tvm_ffi.Shape:
+    """Three-field carrier of a generated ``LoomFastDivmod`` parameter: the
+    divisor with its CUTLASS FastDivmod multiplier and shift (host-derived so
+    the kernel's single-warp prologue passes divide with one umulhi + shift)."""
+    divisor = int(divisor)
+    if not 1 <= divisor <= 0x7FFF_FFFF:
+        raise ValueError(f"fast divmod divisor must be in [1, 2147483647], got {divisor}")
+    if divisor == 1:
+        return tvm_ffi.Shape((1, 0, 0))
+    p = 31 + (divisor - 1).bit_length()
+    multiplier = (((1 << p) + divisor - 1) // divisor) & 0xFFFF_FFFF
+    return tvm_ffi.Shape((divisor, multiplier, p - 32))
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -851,6 +873,14 @@ def prepare_cake_mla_varq_dcp_decode(
         static_only=int(plan["static_only"]),
         dbg=dbg,
         partial_slots=partial_slots,
+        fd_tiles_max=_fast_divmod(plan["tiles_max"]),
+        fd_num_heads=_fast_divmod(num_heads),
+        fd_cp_world=_fast_divmod(cp_world),
+        fd_num_items=_fast_divmod(items),
+        fd_unit_min=_fast_divmod(plan["unit_min"]),
+        fd_static_tiles=_fast_divmod(plan["static_tiles"]),
+        fd_unit_den=_fast_divmod(plan["unit_den"]),
+        fd_clusters=_fast_divmod(plan["grid_clusters"]),
         grid=(int(plan["grid_clusters"]) * CLUSTER_SIZE, 1, 1),
     )
     assert tuple(main_kwargs) == MAIN_KWARGS
