@@ -53,7 +53,16 @@ WEIGHT_SEED = 621
 SITU_BETA = 4.0
 SITU_LINEAR_BETA = 25.0
 # Representative subset of the 60 validated rows: both stages x TP {1, 8} x these token counts.
-SMOKE_TOKENS = (1, 8, 16, 128, 256, 4096)
+SMOKE_TOKENS = (
+    1,
+    8,
+    16,
+    128,
+    256,
+    4096,
+    8192,
+    16384,
+)  # decode + prefill routes, incl. the power-capped GEMM rows
 
 
 # ---------------------------------------------------------------------------
