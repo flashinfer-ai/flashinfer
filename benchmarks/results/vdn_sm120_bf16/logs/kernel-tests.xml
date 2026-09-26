@@ -1,0 +1,269 @@
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="241" time="3.549" timestamp="2026-09-27T05:33:24.115613+08:00">
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-frame-none]" time="1.228" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-frame-rows]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-frame-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-frame-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-chunk-none]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-chunk-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-chunk-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[0-3-4-chunk-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-frame-none]" time="0.006" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-frame-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-frame-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-frame-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-chunk-none]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-chunk-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-chunk-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[1-0-0-chunk-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-frame-none]" time="0.009" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-frame-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-frame-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-frame-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-chunk-none]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-chunk-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-chunk-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[2-2-3-chunk-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-frame-none]" time="0.009" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-frame-rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-frame-columns]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-frame-both]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-chunk-none]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-chunk-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-chunk-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[7-3-0-chunk-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-frame-none]" time="0.005" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-frame-rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-frame-columns]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-frame-both]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-chunk-none]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-chunk-rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-chunk-columns]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-4-chunk-both]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-frame-none]" time="0.005" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-frame-rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-frame-columns]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-frame-both]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-chunk-none]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-chunk-rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-chunk-columns]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_window_mask[13-0-0-chunk-both]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-128]" time="0.006" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-386]" time="0.004" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-514]" time="0.004" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-last_dim]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-misaligned]" time="0.004" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-broadcast]" time="0.004" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.01-transposed]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-128]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-386]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-514]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-last_dim]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-misaligned]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-broadcast]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.3-transposed]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-128]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-386]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-514]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-last_dim]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-misaligned]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-broadcast]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_strides_and_reuse[0.125-transposed]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_out[separate]" time="0.005" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_out[query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_out[key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_out[value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_out[misaligned]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_replan" time="0.014" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_failed_device_replan_invalidates_plan" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_outside_clip_windows[none]" time="0.005" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_outside_clip_windows[rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_outside_clip_windows[columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_outside_clip_windows[both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_cpu_validation[None]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_cpu_validation[bad_workspace1]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_cpu_validation[bad_workspace2]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_validation[small]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_validation[dtype]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_validation[rank]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_validation[stride]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_validation[alignment]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_wrong_architecture" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides0]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides1]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides2]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides3]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides4]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides5]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides6]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides7]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides8]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides9]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides10]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides11]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides12]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides13]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides14]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides15]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides16]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides17]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides18]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides19]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides20]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides21]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides22]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides23]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides24]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides25]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_validation[overrides26]" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_plan_rejects_empty_rows_and_index_overflow" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_before_plan" time="0.000" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[dtype-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[dtype-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[dtype-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[dtype-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[shape-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[shape-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[shape-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[shape-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[device-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[device-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[device-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[device-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[grad-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[grad-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[grad-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[grad-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[workspace-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[workspace-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[workspace-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_run_validation[workspace-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp16-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp16-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp16-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp16-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e4m3-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e4m3-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e4m3-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e4m3-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e5m2-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e5m2-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e5m2-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[fp8_e5m2-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d64-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d64-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d64-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d64-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d256-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d256-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d256-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[d256-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[one_head-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[one_head-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[one_head-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[one_head-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[four_heads-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[four_heads-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[four_heads-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[four_heads-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank2-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank2-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank2-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank2-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank4-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank4-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank4-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[rank4-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[non_tensor-query]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[non_tensor-key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[non_tensor-value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_unsupported_input_contracts[non_tensor-out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_out_must_be_contiguous" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_execution_contract" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-127-1]" time="0.015" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-128-7]" time="0.009" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-129-56]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-255-7]" time="0.012" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-256-56]" time="0.011" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-257-1]" time="0.012" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-1023-56]" time="0.099" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-1024-1]" time="0.094" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[dense-1025-7]" time="0.097" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-127-1]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-128-7]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-129-56]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-255-7]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-256-56]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-257-1]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-1023-56]" time="0.092" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-1024-1]" time="0.088" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[self-1025-7]" time="0.088" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-127-1]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-128-7]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-129-56]" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-255-7]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-256-56]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-257-1]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-1023-56]" time="0.092" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-1024-1]" time="0.094" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_tile_boundaries[irregular-1025-7]" time="0.092" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_nonconsecutive_equal_windows[none]" time="0.012" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_nonconsecutive_equal_windows[rows]" time="0.006" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_nonconsecutive_equal_windows[columns]" time="0.006" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_nonconsecutive_equal_windows[both]" time="0.007" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[uniform-none]" time="0.021" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[uniform-rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[uniform-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[uniform-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[constant_value-none]" time="0.004" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[constant_value-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[constant_value-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[constant_value-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[peaked-none]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[peaked-rows]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[peaked-columns]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_analytic_inputs[peaked-both]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_masked_value_sentinel[none]" time="0.012" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_masked_value_sentinel[rows]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_masked_value_sentinel[columns]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_masked_value_sentinel[both]" time="0.002" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_long_sequence_sampled_fp32[386-37-56]" time="0.097">
+      <properties>
+        <property name="sampled_query_rows" value="[0, 3622, 3623, 4132, 4133, 4642, 12803, 13312, 21473, 21982, 21983, 22492]" />
+        <property name="relative_l2_error" value="0.0022900751791894436" />
+        <property name="max_abs_error" value="0.0002332925796508789" />
+      </properties>
+    </testcase>
+    <testcase classname="tests.attention.test_vdn_window" name="test_long_sequence_sampled_fp32[386-107-7]" time="0.084">
+      <properties>
+        <property name="sampled_query_rows" value="[0, 3622, 3623, 4132, 4133, 4642, 30653, 31162, 57173, 57682, 57683, 58192]" />
+        <property name="relative_l2_error" value="0.0023089817259460688" />
+        <property name="max_abs_error" value="0.0003295689821243286" />
+      </properties>
+    </testcase>
+    <testcase classname="tests.attention.test_vdn_window" name="test_long_sequence_sampled_fp32[514-37-56]" time="0.090">
+      <properties>
+        <property name="sampled_query_rows" value="[0, 3622, 3623, 4132, 4133, 4642, 12803, 13312, 21473, 21982, 21983, 22492]" />
+        <property name="relative_l2_error" value="0.0023222975432872772" />
+        <property name="max_abs_error" value="0.00025435537099838257" />
+      </properties>
+    </testcase>
+    <testcase classname="tests.attention.test_vdn_window" name="test_long_sequence_sampled_fp32[514-107-7]" time="0.084">
+      <properties>
+        <property name="sampled_query_rows" value="[0, 3622, 3623, 4132, 4133, 4642, 30653, 31162, 57173, 57682, 57683, 58192]" />
+        <property name="relative_l2_error" value="0.0023148232139647007" />
+        <property name="max_abs_error" value="0.00019487738609313965" />
+      </properties>
+    </testcase>
+    <testcase classname="tests.attention.test_vdn_window" name="test_nondefault_stream" time="0.008" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_real_cuda_graph_rejection[plan]" time="0.019" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_real_cuda_graph_rejection[run]" time="0.004" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_mismatched_cuda_device[query]" time="0.097" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_mismatched_cuda_device[key]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_mismatched_cuda_device[value]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_mismatched_cuda_device[out]" time="0.001" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_noncurrent_cuda_device_guard" time="0.003" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_workspace_and_plan_are_released" time="0.364" />
+    <testcase classname="tests.attention.test_vdn_window" name="test_copy_kernels_large_index" time="0.047" />
+  </testsuite>
+</testsuites>

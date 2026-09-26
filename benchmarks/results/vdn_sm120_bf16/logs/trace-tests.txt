@@ -1,0 +1,17 @@
+....                                                                     [100%]
+=============================== warnings summary ===============================
+tests/conftest.py:30
+tests/conftest.py:30
+  tests/conftest.py:30: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+
+flashinfer/cute_dsl/availability.py:136
+  flashinfer/cute_dsl/availability.py:136: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+flashinfer/cute_dsl/attention/roles/mla_compute.py:30
+  flashinfer/cute_dsl/attention/roles/mla_compute.py:30: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+4 passed, 798 deselected, 4 warnings in 0.21s

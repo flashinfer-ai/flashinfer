@@ -123,6 +123,7 @@ trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
+vdn_window_attention_h7_d128.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -2793,3 +2794,31 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+
+def example_vdn_window(device):
+    """SM120 BF16 window softmax; plan geometry is external to the trace schema."""
+    from flashinfer.vdn import VDNWindowAttentionWrapper
+
+    frames, spatial, prefix, suffix, heads = 7, 8, 13, 6, 7
+    size = prefix + frames * spatial + suffix
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = VDNWindowAttentionWrapper(workspace)
+    wrapper.plan(
+        size,
+        heads,
+        prefix,
+        frames,
+        spatial,
+        [(f - 1, f + 1) for f in range(frames)],
+        anchor_frames="both",
+    )
+    q, k, v = [
+        torch.randn(size, heads, 128, dtype=torch.bfloat16, device=device)
+        for _ in range(3)
+    ]
+    return wrapper.run(q, k, v)
+
+
+if torch.cuda.get_device_capability(device) == (12, 0):
+    example_vdn_window(device)

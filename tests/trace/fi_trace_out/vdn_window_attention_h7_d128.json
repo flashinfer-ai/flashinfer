@@ -1,0 +1,65 @@
+{
+  "name": "vdn_window_attention_h7_d128",
+  "description": "BF16 VDN window/global/anchor softmax on SM120. This tensor signature does not encode the host-side window bounds, anchor mode or scale; replay must use the original VDNWindowAttentionWrapper.plan() arguments. It covers only the softmax branch, not VDN's linear recurrence.",
+  "op_type": "vdn_window_attention",
+  "tags": [
+    "fi_api:flashinfer.vdn.VDNWindowAttentionWrapper.run",
+    "sparse:window",
+    "precision:bf16",
+    "arch:sm120"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 7
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "constraints": [
+    "head_dim == 128"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "key": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "value": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "param": "out"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

@@ -102,6 +102,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.sparse",
     "flashinfer.topk",
     "flashinfer.topk_varlen.topk_varlen",
+    "flashinfer.vdn",
     "flashinfer.xqa",
 )
 
