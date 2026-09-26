@@ -444,7 +444,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         pdl_trigger_early: bool = False,
         zero_fill: bool = False,
         zero_fill_secondary: bool = False,
-        zero_fill_mainloop: bool = True,
         zero_fill_chunk_bytes: int = 65536,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
@@ -518,10 +517,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # only when the primary has no tiles.
         self.zero_fill = bool(zero_fill)
         self.zero_fill_secondary = bool(zero_fill_secondary)
-        # Mainloop phase on sparse launches (at most one tile per CTA): the
-        # epilogue warps stream bulk copies of the zeroed C staging smem
-        # while the MMA warp builds their only accumulator.
-        self.zero_fill_mainloop = bool(zero_fill_mainloop)
         self.zero_fill_chunk_bytes = int(zero_fill_chunk_bytes)
         self.use_a_per_token_scale = use_a_per_token_scale
         self.topk = topk
@@ -2798,38 +2793,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 for i in cutlass.range_constexpr(4):
                     zf_zeros[i] = cutlass.Uint32(0)
                 zf_tile = cutlass.Int32(0)
-                # Mainloop phase (sparse launches): when the launch holds at
-                # most one CTA tile per CTA, every CTA's staging smem is idle
-                # until its single epilogue, so the epilogue warps zero it
-                # now and stream bulk copies of it into the output while the
-                # MMA warp builds the accumulator (the tile chain is bound by
-                # its operand ring, not by the SM's store path). Launches
-                # with more tiles than CTAs (dense routings) skip the phase.
-                zf_sparse = cutlass.Boolean(False)
-                zf_sZ = storage.sC.get_tensor(
-                    cute.make_layout((self.zero_fill_bulk_bytes // 4,)),
-                    dtype=cutlass.Uint32,
-                )
-                if cutlass.const_expr(self.zero_fill_mainloop):
-                    zf_gx, zf_gy, zf_gz = cute.arch.grid_dim()
-                    zf_num_ctas = zf_gx * zf_gy * zf_gz
-                    zf_cta_tiles = (
-                        zf_my_tiles
-                        * tile_sched_params.problem_shape_ntile_mnl[1]
-                        * cute.size(tiled_mma.thr_id.shape)
-                    )
-                    zf_sparse = zf_do_fill & (zf_cta_tiles <= zf_num_ctas)
-                    if zf_sparse:
-                        for i in cutlass.range_constexpr(
-                            self.zero_fill_bulk_bytes // 16 // 128
-                        ):
-                            zf_s_out = cute.make_tensor(
-                                zf_sZ.iterator + (epi_tidx + i * 128) * 4,
-                                layout=cute.make_layout((4,)),
-                            )
-                            cute.autovec_copy(zf_zeros, zf_s_out)
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        self.epilog_sync_barrier.arrive_and_wait()
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 mma_tile_coord_mnl = (
@@ -2904,62 +2867,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         )
                     ]
 
-                if cutlass.const_expr(self.zero_fill and self.zero_fill_mainloop):
-                    # Mainloop phase of the zero-fill (sparse launches, first
-                    # tile only): until the accumulator is ready, lane 0 of
-                    # each epilogue warp claims zero_fill_chunk_bytes and
-                    # streams the zeroed staging smem out with cp.async.bulk,
-                    # at most two chunks in flight per warp. Every read of the
-                    # staging smem completes before the epilogue writes it.
-                    if zf_sparse & (zf_tile == 0):
-                        zf_ml_src = zf_sZ.iterator.toint()
-                        zf_ml_dst = zero_fill_words.iterator.toint()
-                        zf_ml_bytes = cutlass.Int64(zf_num_vec) * 16
-                        zf_ml_per = cutlass.Int32(
-                            self.zero_fill_chunk_bytes // self.zero_fill_bulk_bytes
-                        )
-                        zf_ml_go = cutlass.Boolean(True)
-                        zf_ml_ready = acc_pipeline.consumer_try_wait(acc_consumer_state)
-                        if zf_ml_ready:
-                            zf_ml_go = cutlass.Boolean(False)
-                        while zf_ml_go:
-                            zf_ml_c = cutlass.Int32(0)
-                            if zf_lane == 0:
-                                zf_ml_c = atomic_add_global_i32(zf_claim_addr, zf_ml_per)
-                            zf_ml_c = cute.arch.shuffle_sync(zf_ml_c, 0)
-                            if zf_ml_c < zf_num_units:
-                                if zf_lane == 0:
-                                    for j in cutlass.range_constexpr(
-                                        self.zero_fill_chunk_bytes
-                                        // self.zero_fill_bulk_bytes
-                                    ):
-                                        zf_ml_u = zf_ml_c + j
-                                        if zf_ml_u < zf_num_units:
-                                            zf_ml_off = (
-                                                cutlass.Int64(zf_ml_u)
-                                                * self.zero_fill_bulk_bytes
-                                            )
-                                            zf_ml_sz = cutlass.Int32(
-                                                cutlass.min(
-                                                    zf_ml_bytes - zf_ml_off,
-                                                    cutlass.Int64(self.zero_fill_bulk_bytes),
-                                                )
-                                            )
-                                            blk_copy_raw(
-                                                zf_ml_dst + zf_ml_off, zf_ml_src, zf_ml_sz
-                                            )
-                                    cute.arch.cp_async_bulk_commit_group()
-                                    cute.arch.cp_async_bulk_wait_group(1, read=True)
-                                zf_ml_ready = acc_pipeline.consumer_try_wait(
-                                    acc_consumer_state
-                                )
-                                if zf_ml_ready:
-                                    zf_ml_go = cutlass.Boolean(False)
-                            else:
-                                zf_ml_go = cutlass.Boolean(False)
-                        if zf_lane == 0:
-                            cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        self.epilog_sync_barrier.arrive_and_wait()
                 #
                 # Wait for accumulator buffer full
                 #
