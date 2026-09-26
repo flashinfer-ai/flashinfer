@@ -262,9 +262,11 @@ def plan_varq_dcp_decode(
         static_tiles = max(
             unit_min, _ceil_div(items * max_local_tiles, 2 * grid_clusters)
         )
-        if max_local_tiles <= NO_SPLIT_MAX_TILES or items >= grid_clusters:
+        if max_local_tiles <= NO_SPLIT_MAX_TILES or 2 * items >= 3 * grid_clusters:
+            # short items, or at least 1.5 items per cluster: whole items
             static_tiles = max_local_tiles
-        elif tiles_max > 1 and max_local_tiles >= 2 * LONG_ITEM_TILES:
+        elif max_local_tiles >= 2 * LONG_ITEM_TILES:
+            # 64-tile items: half the item as the static unit
             static_tiles = max(static_tiles, max_local_tiles // 2)
     static_tiles = int(static_tiles)
     if static_tiles <= 0:
