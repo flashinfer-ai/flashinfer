@@ -302,7 +302,10 @@ class _DecodeInputs:
 
 def _decode_q_view(q: torch.Tensor, batch_size: int, q_len_per_req: int):
     if q_len_per_req == 1:
-        return q
+        # FE can describe a dense buffer using the graph's BHSD declaration,
+        # but retains a strided buffer's own geometry. Give packed Q the same
+        # axis order as its descriptor; unsqueeze is a view, not a copy.
+        return q if q.is_contiguous() else q.unsqueeze(2)
     return q.view(batch_size, q_len_per_req, q.shape[1], q.shape[2]).transpose(1, 2)
 
 
