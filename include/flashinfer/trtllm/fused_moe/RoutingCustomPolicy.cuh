@@ -199,13 +199,26 @@ struct SigmoidPreprocess {
   }
 };
 
-/// SigmoidBias: applies sigmoid(score) + bias[expertIdx] for topK selection.
-/// Used by DeepSeek-style routing where expert selection is based on biased sigmoid scores.
-struct SigmoidBiasPreprocess {
+/// Score transforms for the bias-selection policies below: raw logit -> per-expert
+/// routing score, computed in float.
+struct SigmoidScore {
+  __forceinline__ __device__ static float apply(float x) { return sigmoid_accurate(x); }
+};
+
+struct SqrtSoftplusScore {
+  __forceinline__ __device__ static float apply(float x) { return sqrt_softplus_accurate(x); }
+};
+
+/// BiasPreprocess<ScoreFn>: applies ScoreFn(score) + bias[expertIdx] for topK selection.
+/// Used by DeepSeek-style routing where expert selection is based on biased scores while the
+/// final weights use the un-biased ScoreFn(score) (see ScaledSumNormalizePostprocessT).
+/// A null bias pointer selects on the plain ScoreFn(score).
+template <typename ScoreFn>
+struct BiasPreprocess {
   /// Opts into the block-per-token kernel (provides applyToSmem below).
   static constexpr bool kSupportsBlockPerToken = true;
 
-  /// BaseType: sigmoid is computed in float for numerical stability.
+  /// BaseType: scores are computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
 
@@ -221,6 +234,13 @@ struct SigmoidBiasPreprocess {
     }
   };
 
+  template <typename ParamsT>
+  __forceinline__ __device__ static float loadBias(ParamsT const& params, int32_t expertIdx) {
+    return params.ptrRoutingBias != nullptr
+               ? loadScalar(params.ptrRoutingBias, expertIdx, params.dtypeBias)
+               : 0.f;
+  }
+
   template <typename DataType, int VecSize, typename ParamsT>
   __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& /*warp*/,
                                                DataType (&score)[VecSize],
@@ -228,16 +248,15 @@ struct SigmoidBiasPreprocess {
                                                ParamsT const& params) {
 #pragma unroll
     for (int i = 0; i < VecSize; i++) {
-      float s = sigmoid_accurate(static_cast<float>(score[i]));
-      float bias = idx[i] < numExperts ? loadScalar(params.ptrRoutingBias, idx[i], params.dtypeBias)
-                                       : float{-INFINITY};
+      float s = ScoreFn::apply(static_cast<float>(score[i]));
+      float bias = idx[i] < numExperts ? loadBias(params, idx[i]) : float{-INFINITY};
       score[i] = static_cast<DataType>(s + bias);
     }
   }
 
-  /// Block-per-token interface: compute (sigmoid, sigmoid+bias) per expert.
-  /// `smemAux[e] = sigmoid(score[e])`         — read by ScaledSumNormalizePostprocess
-  /// `smemBiased[e] = sigmoid(score[e]) + bias[e]` — used as the topK selection key
+  /// Block-per-token interface: compute (score, score + bias) per expert.
+  /// `smemAux[e] = ScoreFn(score[e])`           — read by ScaledSumNormalizePostprocessT
+  /// `smemBiased[e] = ScoreFn(score[e]) + bias[e]` — used as the topK selection key
   /// The two arrays must be distinct (cannot alias).
   template <typename SmemT, typename InputT, typename ParamsT>
   __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
@@ -245,13 +264,19 @@ struct SigmoidBiasPreprocess {
                                                      SmemT* smemBiased, SmemT* smemAux,
                                                      ParamsT const& params) {
     for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
-      float s = sigmoid_accurate(static_cast<float>(ptrScores[e]));
-      float bias = loadScalar(params.ptrRoutingBias, e, params.dtypeBias);
+      float s = ScoreFn::apply(static_cast<float>(ptrScores[e]));
+      float bias = loadBias(params, e);
       smemAux[e] = static_cast<SmemT>(s);
       smemBiased[e] = static_cast<SmemT>(s + bias);
     }
   }
 };
+
+/// SigmoidBias: sigmoid(score) + bias (DeepSeek-V3 nGroup<=1, MiniMax2, Kimi-K2, Nemotron).
+using SigmoidBiasPreprocess = BiasPreprocess<SigmoidScore>;
+/// SqrtSoftplusBias: sqrt(softplus(score)) + bias (DeepSeek-V4 family,
+/// scoring_func="sqrtsoftplus").
+using SqrtSoftplusBiasPreprocess = BiasPreprocess<SqrtSoftplusScore>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Postprocess policies: applied to the top-K scores AFTER topK selection.
@@ -425,23 +450,26 @@ struct SigmoidPostprocess {
   }
 };
 
-/// ScaledSumNormalize: normalizes un-biased sigmoid scores by sum and applies
-/// routeScale. SigmoidBias selection uses sigmoid(raw) + bias as the top-K key,
-/// but final weights must use sigmoid(raw). Warp-per-token routing recomputes
-/// selected sigmoid(raw) from raw logits to avoid cancellation when a tiny
-/// sigmoid is rounded away by a large bias; block-per-token routing reads the
-/// same un-biased sigmoid from smemAux.
-/// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
-/// The DeepSeek and MiniMax2 runners use epsilon=1e-20 to prevent division by zero.
-struct ScaledSumNormalizePostprocess {
+/// ScaledSumNormalizePostprocessT<ScoreFn>: normalizes the un-biased scores by their sum and
+/// applies routeScale. BiasPreprocess<ScoreFn> selection uses ScoreFn(raw) + bias as the top-K
+/// key, but final weights must use ScoreFn(raw). Warp-per-token routing recomputes ScoreFn(raw)
+/// from the raw logits to avoid cancellation when a tiny score is rounded away by a large bias;
+/// block-per-token routing reads the same un-biased score from smemAux.
+/// Used by DeepSeek-style routing: final_weight = ScoreFn(raw) * routeScale / (sum + epsilon).
+/// The DeepSeek, MiniMax2 and SqrtSoftplus runners use epsilon=1e-20 to prevent division by zero.
+/// With normTopkProb == false the sum-normalization is skipped (final_weight = ScoreFn(raw) *
+/// routeScale): DeepSeek-V4 honors norm_topk_prob. Data::mNormTopkProb defaults to true and the
+/// DeepSeekV3 / MiniMax2 runners never clear it, so those methods keep normalizing.
+template <typename ScoreFn>
+struct ScaledSumNormalizePostprocessT {
   /// Opts into the block-per-token kernel (provides applyWithAux below).
   static constexpr bool kSupportsBlockPerToken = true;
   static constexpr bool kSupportsLaneOwnedTopK = true;
   static constexpr bool kNeedsRawScores = true;
 
-  /// Needs per-expert aux data (un-biased sigmoid) in the block-per-token
-  /// kernel — paired with SigmoidBiasPreprocess, which writes the un-biased
-  /// sigmoid to smemAux[e].  The kernel allocates a distinct smemAux array
+  /// Needs per-expert aux data (un-biased score) in the block-per-token
+  /// kernel — paired with BiasPreprocess<ScoreFn>, which writes the un-biased
+  /// score to smemAux[e].  The kernel allocates a distinct smemAux array
   /// instead of aliasing it to smemBiased.
   static constexpr bool kNeedsAux = true;
 
@@ -449,32 +477,40 @@ struct ScaledSumNormalizePostprocess {
   struct Params {
     float routeScale = 1.0f;
     float sumEpsilon = 0.0f;
+    bool normTopkProb = true;
 
     void set(routingCustom::Data const& data) {
       routeScale = data.mRouteScale;
       sumEpsilon = data.mSumEpsilon;
+      normTopkProb = data.mNormTopkProb;
     }
   };
 
-  /// Warp-per-token variant with access to the original raw scores. SigmoidBias
-  /// selection uses sigmoid(raw) + bias as the topK key, but final weights must
-  /// be normalized from the un-biased sigmoid(raw). Recomputing sigmoid(raw)
-  /// avoids lossy recovery when a tiny sigmoid is rounded away by a large bias.
+  template <typename ParamsT>
+  __forceinline__ __device__ static float finalWeight(float score, float sum,
+                                                      ParamsT const& params) {
+    float const denom = params.normTopkProb ? (sum + params.sumEpsilon) : 1.f;
+    return score * params.routeScale / denom;
+  }
+
+  /// Warp-per-token variant with access to the original raw scores. Selection
+  /// uses ScoreFn(raw) + bias as the topK key, but final weights must be
+  /// normalized from the un-biased ScoreFn(raw). Recomputing ScoreFn(raw)
+  /// avoids lossy recovery when a tiny score is rounded away by a large bias.
   template <typename DataType, typename InputType, int K, typename ParamsT>
   __forceinline__ __device__ static void applyWithScores(
       cg::thread_block_tile<WarpSize> const& warp, DataType (&warpTopKScore)[K],
       int32_t const (&warpTopKExpertIdx)[K], int32_t laneIdx, int32_t topK,
       InputType const* ptrScores, ParamsT const& params) {
-    float sigmoidScore = 0.f;
+    float score = 0.f;
     if (laneIdx < topK) {
       int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
-      sigmoidScore = sigmoid_accurate(static_cast<float>(ptrScores[expertIdx]));
+      score = ScoreFn::apply(static_cast<float>(ptrScores[expertIdx]));
     }
 
-    float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    float sum = cg::reduce(warp, score, cg::plus<float>());
     if (laneIdx < topK) {
-      warpTopKScore[laneIdx] =
-          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+      warpTopKScore[laneIdx] = static_cast<DataType>(finalWeight(score, sum, params));
     }
   }
 
@@ -485,33 +521,30 @@ struct ScaledSumNormalizePostprocess {
       cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
       int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, InputType const* ptrScores,
       ParamsT const& params) {
-    float const sigmoidScore =
-        laneIdx < topK ? sigmoid_accurate(static_cast<float>(ptrScores[laneTopKExpertIdx])) : 0.f;
-    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    float const score =
+        laneIdx < topK ? ScoreFn::apply(static_cast<float>(ptrScores[laneTopKExpertIdx])) : 0.f;
+    float const sum = cg::reduce(warp, score, cg::plus<float>());
     if (laneIdx < topK) {
-      laneTopKScore =
-          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+      laneTopKScore = static_cast<DataType>(finalWeight(score, sum, params));
     }
   }
 
-  /// Lane-owned block-per-token variant. Reads the un-biased sigmoid from
+  /// Lane-owned block-per-token variant. Reads the un-biased score from
   /// smemAux just like applyWithAux, but consumes scalar TopK state.
   template <typename DataType, typename SmemT, typename ParamsT>
   __forceinline__ __device__ static void applyForLaneWithAux(
       cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
       int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, SmemT const* smemAux,
       ParamsT const& params) {
-    float const sigmoidScore =
-        laneIdx < topK ? static_cast<float>(smemAux[laneTopKExpertIdx]) : 0.f;
-    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    float const score = laneIdx < topK ? static_cast<float>(smemAux[laneTopKExpertIdx]) : 0.f;
+    float const sum = cg::reduce(warp, score, cg::plus<float>());
     if (laneIdx < topK) {
-      laneTopKScore =
-          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+      laneTopKScore = static_cast<DataType>(finalWeight(score, sum, params));
     }
   }
 
-  /// Block-per-token variant: read un-biased sigmoid directly from smemAux
-  /// (written by SigmoidBiasPreprocess::applyToSmem) instead of reloading bias
+  /// Block-per-token variant: read the un-biased score directly from smemAux
+  /// (written by BiasPreprocess<ScoreFn>::applyToSmem) instead of reloading bias
   /// and subtracting.  Saves one global memory read + one FMA per top-K lane.
   template <typename DataType, int K, typename SmemT, typename ParamsT>
   __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
@@ -519,15 +552,18 @@ struct ScaledSumNormalizePostprocess {
                                                       int32_t const (&warpTopKExpertIdx)[K],
                                                       int32_t laneIdx, int32_t topK,
                                                       SmemT const* smemAux, ParamsT const& params) {
-    float sigmoidScore =
-        laneIdx < topK ? static_cast<float>(smemAux[warpTopKExpertIdx[laneIdx]]) : 0.f;
-    float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    float score = laneIdx < topK ? static_cast<float>(smemAux[warpTopKExpertIdx[laneIdx]]) : 0.f;
+    float sum = cg::reduce(warp, score, cg::plus<float>());
     if (laneIdx < topK) {
-      warpTopKScore[laneIdx] =
-          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+      warpTopKScore[laneIdx] = static_cast<DataType>(finalWeight(score, sum, params));
     }
   }
 };
+
+/// ScaledSumNormalize over sigmoid scores (DeepSeek-V3 nGroup<=1, MiniMax2).
+using ScaledSumNormalizePostprocess = ScaledSumNormalizePostprocessT<SigmoidScore>;
+/// ScaledSumNormalize over sqrt-softplus scores (DeepSeek-V4 family).
+using SqrtSoftplusScaledSumNormalizePostprocess = ScaledSumNormalizePostprocessT<SqrtSoftplusScore>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ExpertSelectPolicy: encapsulates the entire expert selection logic.
@@ -879,6 +915,18 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess> {
                          >;
 };
 
+/// SqrtSoftplusBias + ScaledSumNormalize<SqrtSoftplus> (DeepSeek-V4 family: 256 or 384 experts,
+/// topK=6, ungrouped noaux_tc).
+template <>
+struct PolicyTraits<SqrtSoftplusBiasPreprocess, SqrtSoftplusScaledSumNormalizePostprocess> {
+  using Pairs = TierList<Tier<128, 8>,   // Small expert counts (unit tests)
+                         Tier<256, 8>,   // DeepSeek-V4-Flash (256 experts, topK=6)
+                         Tier<384, 8>,   // DeepSeek-V4.1-Flash / V4-Pro (384 experts, topK=6)
+                         Tier<512, 8>,   // Headroom for larger DSV4-style expert counts
+                         Tier<1024, 32>  // Fallback (expert count / topK may grow)
+                         >;
+};
+
 /// None + Sigmoid (TopKSigmoid: TopK -> Sigmoid).
 /// Mirrors the tiers of Sigmoid + SumNormalize, the policy pair it is the
 /// selection-order counterpart of.
@@ -1042,7 +1090,10 @@ struct DefaultRoutingLaunchConfig {
 // string for diagnostics.
 template <typename Fn>
 inline void dispatchRoutingPolicy(Data const& data, Fn&& fn) {
-  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
+  if (data.mPreprocessType == RoutingPreprocessType::SqrtSoftplusBias)
+    fn(SqrtSoftplusBiasPreprocess{}, SqrtSoftplusScaledSumNormalizePostprocess{},
+       "SqrtSoftplusBiasPreprocess+ScaledSumNormalizePostprocess");
+  else if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
     fn(SigmoidBiasPreprocess{}, ScaledSumNormalizePostprocess{},
        "SigmoidBiasPreprocess+ScaledSumNormalizePostprocess");
   else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid)

@@ -4043,7 +4043,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                    RoutingMethodType::SigmoidRenorm ||
                static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Sigmoid ||
                static_cast<RoutingMethodType>(routing_method_type) ==
-                   RoutingMethodType::TopKSigmoid) {
+                   RoutingMethodType::TopKSigmoid ||
+               static_cast<RoutingMethodType>(routing_method_type) ==
+                   RoutingMethodType::SqrtSoftplus) {
       TVM_FFI_ICHECK(args->top_k <= 32 && args->top_k > 0)
           << "Current routing kernel (no groups) only supports top_k<=32 && top_k>0.";
     } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {

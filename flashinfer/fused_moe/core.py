@@ -4763,6 +4763,9 @@ def trtllm_bf16_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
@@ -4976,6 +4979,9 @@ def trtllm_bf16_routed_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
@@ -5192,6 +5198,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6032,6 +6041,9 @@ def trtllm_fp8_block_scale_routed_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``False``).
     weight_layout : int
@@ -6308,6 +6320,9 @@ def trtllm_fp4_block_scale_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6588,6 +6603,9 @@ def trtllm_fp4_block_scale_routed_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6821,6 +6839,9 @@ def trtllm_mxint4_block_scale_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -6993,6 +7014,9 @@ def trtllm_mxint4_block_scale_routed_moe(
         - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
         - ``9`` ``TopKSigmoid`` — TopK → Sigmoid (no renormalization).
         - ``10`` ``Unspecified`` — reserved.
+        - ``11`` ``SqrtSoftplus`` — sqrt(softplus) + Bias → TopK →
+          ScaledSumNormalize of the un-biased scores (DeepSeek-V4 family;
+          honors ``norm_topk_prob`` and ``routed_scaling_factor``).
     do_finalize : bool
         Whether to run the finalize stage (default ``True``).
     enable_pdl : Optional[bool]

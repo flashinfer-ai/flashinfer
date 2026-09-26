@@ -126,6 +126,13 @@ __forceinline__ __device__ float loadScalar(void const* ptr, int idx,
 
 static __device__ inline float sigmoid_accurate(float x) { return 0.5f * tanhf(0.5f * x) + 0.5f; }
 
+/// sqrt(softplus(x)) evaluated as sqrt(max(x, 0) + log1p(exp(-|x|))): the naive
+/// log(1 + exp(x)) overflows for x > ~88 and rounds to 0 for x < ~-17. Same
+/// formulation as act_sqrt_softplus in flashinfer/fused_moe/hash_topk.cuh.
+static __device__ inline float sqrt_softplus_accurate(float x) {
+  return sqrtf(fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))));
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
