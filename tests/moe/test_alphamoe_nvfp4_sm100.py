@@ -558,7 +558,13 @@ def test_alphamoe_nvfp4_rejects_invalid_host_contracts():
 # Deferred finalize (complete routes): identical arithmetic, BF16 caller seed.
 # ---------------------------------------------------------------------------
 
-_COMPLETE_E, _COMPLETE_N, _COMPLETE_K, _COMPLETE_TOP_K, _COMPLETE_BLOCK_M = 256, 1024, 6144, 8, 8
+_COMPLETE_E, _COMPLETE_N, _COMPLETE_K, _COMPLETE_TOP_K, _COMPLETE_BLOCK_M = (
+    256,
+    1024,
+    6144,
+    8,
+    8,
+)
 
 
 def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
@@ -568,10 +574,14 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
     device = torch.device("cuda")
 
     def u8(*shape):
-        return torch.randint(0, 256, shape, dtype=torch.uint8, device=device, generator=generator)
+        return torch.randint(
+            0, 256, shape, dtype=torch.uint8, device=device, generator=generator
+        )
 
     def e4m3(*shape):
-        return (torch.rand(shape, device=device, generator=generator) * 0.75 + 0.25).to(torch.float8_e4m3fn)
+        return (torch.rand(shape, device=device, generator=generator) * 0.75 + 0.25).to(
+            torch.float8_e4m3fn
+        )
 
     x = u8(m, _COMPLETE_K // 2)
     x_scale = e4m3(m, _COMPLETE_K // 16)
@@ -579,32 +589,61 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
     w1_scale = e4m3(_COMPLETE_E, _COMPLETE_N, _COMPLETE_K // 16)
     w2 = u8(_COMPLETE_E, _COMPLETE_K, _COMPLETE_N // 4)
     w2_scale = e4m3(_COMPLETE_E, _COMPLETE_K, _COMPLETE_N // 32)
-    scalar = lambda: (torch.rand((_COMPLETE_E,), device=device, generator=generator) * 0.5 + 0.5)
+    scalar = lambda: (
+        torch.rand((_COMPLETE_E,), device=device, generator=generator) * 0.5 + 0.5
+    )
     logits = torch.rand((m, _COMPLETE_E), device=device, generator=generator)
     topk_weights, topk_ids = torch.topk(logits, _COMPLETE_TOP_K, dim=-1)
-    topk_weights = (topk_weights / topk_weights.sum(dim=-1, keepdim=True)).float().contiguous()
+    topk_weights = (
+        (topk_weights / topk_weights.sum(dim=-1, keepdim=True)).float().contiguous()
+    )
     topk_ids = topk_ids.to(torch.int32).contiguous()
     pairs = m * _COMPLETE_TOP_K
-    raw_capacity = pairs * _COMPLETE_BLOCK_M if pairs < _COMPLETE_E + 1 else pairs + (_COMPLETE_E + 1) * (_COMPLETE_BLOCK_M - 1)
+    raw_capacity = (
+        pairs * _COMPLETE_BLOCK_M
+        if pairs < _COMPLETE_E + 1
+        else pairs + (_COMPLETE_E + 1) * (_COMPLETE_BLOCK_M - 1)
+    )
     expert_capacity = (raw_capacity + _COMPLETE_BLOCK_M - 1) // _COMPLETE_BLOCK_M
     case = dict(
-        hidden_states=x, hidden_states_scale=x_scale, gemm1_weights=w1, gemm1_weights_scale=w1_scale,
-        gemm2_weights=w2, gemm2_weights_scale=w2_scale, output1_scale_gate_scalar=scalar(),
-        output1_scale_scalar=scalar(), output2_scale_scalar=scalar(), topk_weights=topk_weights, topk_ids=topk_ids,
-        top_k=_COMPLETE_TOP_K, block_m=_COMPLETE_BLOCK_M, routed_scaling_factor=1.0,
-        w1_scale_prepared=api.prepare_nvfp4_w1_scales(w1_scale), w2_scale_prepared=api.prepare_nvfp4_w2_scales(w2_scale),
+        hidden_states=x,
+        hidden_states_scale=x_scale,
+        gemm1_weights=w1,
+        gemm1_weights_scale=w1_scale,
+        gemm2_weights=w2,
+        gemm2_weights_scale=w2_scale,
+        output1_scale_gate_scalar=scalar(),
+        output1_scale_scalar=scalar(),
+        output2_scale_scalar=scalar(),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        top_k=_COMPLETE_TOP_K,
+        block_m=_COMPLETE_BLOCK_M,
+        routed_scaling_factor=1.0,
+        w1_scale_prepared=api.prepare_nvfp4_w1_scales(w1_scale),
+        w2_scale_prepared=api.prepare_nvfp4_w2_scales(w2_scale),
         w1_data_prepared=api.prepare_nvfp4_w1_data(w1) if prepared_data else None,
         w2_data_prepared=api.prepare_nvfp4_w2_data(w2) if prepared_data else None,
-        w1_scale_prepared_interleaved=api.prepare_nvfp4_w1_scales_interleaved(w1_scale) if prepared_data else None,
+        w1_scale_prepared_interleaved=api.prepare_nvfp4_w1_scales_interleaved(w1_scale)
+        if prepared_data
+        else None,
     )
-    seed_out = torch.randn((m, _COMPLETE_K), device=device, generator=generator).to(torch.bfloat16)
+    seed_out = torch.randn((m, _COMPLETE_K), device=device, generator=generator).to(
+        torch.bfloat16
+    )
 
     def workspaces():
         return dict(
-            sorted_token_ids=torch.empty((expert_capacity * _COMPLETE_BLOCK_M,), dtype=torch.int32, device=device),
-            expert_ids=torch.empty((expert_capacity,), dtype=torch.int32, device=device),
+            sorted_token_ids=torch.empty(
+                (expert_capacity * _COMPLETE_BLOCK_M,), dtype=torch.int32, device=device
+            ),
+            expert_ids=torch.empty(
+                (expert_capacity,), dtype=torch.int32, device=device
+            ),
             num_tokens_post_padded=torch.empty((1,), dtype=torch.int32, device=device),
-            cumsum_buffer=torch.empty((_COMPLETE_E + 2,), dtype=torch.int32, device=device),
+            cumsum_buffer=torch.empty(
+                (_COMPLETE_E + 2,), dtype=torch.int32, device=device
+            ),
         )
 
     return case, seed_out, workspaces
@@ -612,34 +651,71 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
 
 @pytest.mark.parametrize(
     "m,prepared_data,expected_route",
-    [(1, False, 1), (4, False, 8), (8, False, 2), (8, True, 9), (16, False, 7), (16, True, 9), (128, False, 3)],
-    ids=["m1_route1", "m4_route8", "m8_route2", "m8_route9", "m16_route7", "m16_route9", "m128_route3_not_deferrable"],
+    [
+        (1, False, 1),
+        (4, False, 8),
+        (8, False, 2),
+        (8, True, 9),
+        (16, False, 7),
+        (16, True, 9),
+        (128, False, 3),
+    ],
+    ids=[
+        "m1_route1",
+        "m4_route8",
+        "m8_route2",
+        "m8_route9",
+        "m16_route7",
+        "m16_route9",
+        "m128_route3_not_deferrable",
+    ],
 )
-def test_alphamoe_nvfp4_deferred_finalize_matches_routed(m, prepared_data, expected_route):
+def test_alphamoe_nvfp4_deferred_finalize_matches_routed(
+    m, prepared_data, expected_route
+):
     _skip_if_not_supported()
     from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as api
 
-    case, seed_out, workspaces = _complete_route_case(m, 4020 + m, prepared_data=prepared_data)
+    case, seed_out, workspaces = _complete_route_case(
+        m, 4020 + m, prepared_data=prepared_data
+    )
     route_id = api._alphamoe_complete_route_id(
-        case["hidden_states"], case["hidden_states_scale"], case["gemm1_weights"], case["gemm1_weights_scale"],
-        case["gemm2_weights_scale"], case["topk_ids"], seed_out, case["top_k"], case["block_m"],
-        case["w1_scale_prepared"], case["w1_data_prepared"],
-        w1_scale_prepared_interleaved=case.get("w1_scale_prepared_interleaved"), w2_scale_prepared=case["w2_scale_prepared"],
+        case["hidden_states"],
+        case["hidden_states_scale"],
+        case["gemm1_weights"],
+        case["gemm1_weights_scale"],
+        case["gemm2_weights_scale"],
+        case["topk_ids"],
+        seed_out,
+        case["top_k"],
+        case["block_m"],
+        case["w1_scale_prepared"],
+        case["w1_data_prepared"],
+        w1_scale_prepared_interleaved=case.get("w1_scale_prepared_interleaved"),
+        w2_scale_prepared=case["w2_scale_prepared"],
         w2_data_prepared=case["w2_data_prepared"],
     )
     assert route_id == expected_route, route_id
 
     if expected_route in (1, 2, 7, 8, 9):
         # Deferrable routes: the BF16-seed finalize equals the seeded routed entry bitwise.
-        reference = api.alphamoe_nvfp4_routed_moe(out=seed_out.clone(), **workspaces(), **case)
+        reference = api.alphamoe_nvfp4_routed_moe(
+            out=seed_out.clone(), **workspaces(), **case
+        )
     else:
         # Other routes keep the zero-seeded routed result and add it to the seed afterwards
         # (the same arithmetic the separate model-side add performs today).
         reference = seed_out.clone()
-        reference.add_(api.alphamoe_nvfp4_routed_moe(out=torch.zeros_like(seed_out), **workspaces(), **case))
+        reference.add_(
+            api.alphamoe_nvfp4_routed_moe(
+                out=torch.zeros_like(seed_out), **workspaces(), **case
+            )
+        )
     torch.cuda.synchronize()
 
-    work = torch.full((m, _COMPLETE_K), float("nan"), dtype=torch.bfloat16, device="cuda")
+    work = torch.full(
+        (m, _COMPLETE_K), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
     deferred = api.alphamoe_nvfp4_routed_moe_deferred(out=work, **workspaces(), **case)
     assert deferred.route_id == expected_route
     assert deferred.deferred == (expected_route in (1, 2, 7, 8, 9))
@@ -647,15 +723,21 @@ def test_alphamoe_nvfp4_deferred_finalize_matches_routed(m, prepared_data, expec
     returned = api.alphamoe_nvfp4_finalize_deferred(deferred, in_place)
     torch.cuda.synchronize()
     assert returned.data_ptr() == in_place.data_ptr()
-    assert torch.equal(in_place, reference), "in-place deferred finalize differs from the routed entry"
+    assert torch.equal(in_place, reference), (
+        "in-place deferred finalize differs from the routed entry"
+    )
     if deferred.deferred:
-        assert torch.isnan(work.float()).all(), "deferred routes must not touch the output workspace"
+        assert torch.isnan(work.float()).all(), (
+            "deferred routes must not touch the output workspace"
+        )
 
     deferred = api.alphamoe_nvfp4_routed_moe_deferred(out=work, **workspaces(), **case)
     separate = torch.empty_like(seed_out)
     api.alphamoe_nvfp4_finalize_deferred(deferred, seed_out, separate)
     torch.cuda.synchronize()
-    assert torch.equal(separate, reference), "separate-output deferred finalize differs from the routed entry"
+    assert torch.equal(separate, reference), (
+        "separate-output deferred finalize differs from the routed entry"
+    )
 
     with pytest.raises(ValueError):
         api.alphamoe_nvfp4_finalize_deferred(deferred, seed_out.float())
@@ -671,7 +753,9 @@ def test_prepare_nvfp4_w2_data_is_a_panel_permutation():
         for ob in range(k // 128):
             for j in range(blocks):
                 panel = prepared[(e * (k // 128) + ob) * blocks + j]
-                assert torch.equal(panel, w2[e, ob * 128:(ob + 1) * 128, j * 64:(j + 1) * 64])
+                assert torch.equal(
+                    panel, w2[e, ob * 128 : (ob + 1) * 128, j * 64 : (j + 1) * 64]
+                )
     with pytest.raises(ValueError):
         prepare_nvfp4_w2_data(w2[:, :100].contiguous())
     with pytest.raises(TypeError):
