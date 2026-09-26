@@ -48,6 +48,7 @@ enum class Geometry : uint8_t {
   kH2048I512E512K10,
   kH2048I1536E60K4,
   kH6144I1536E192K4,
+  kH4096I2048E256K6,
   kH2560I768E384K4,
   kH2048I768E128K8,
   kH4096I1536E128K8,
@@ -75,6 +76,9 @@ enum class RoutePacker : uint8_t {
   kE64Scan1,
   kE64Scan2,
   kGeneral,
+  kExpertOrder,
+  kSortedShort,
+  kCountRank,
   // The packed route tables are derived inside the persistent FC1 prologue;
   // the graph has no route_pack launch and FC1/FC2 re-arm their own workfeeds.
   kFusedFc1,
@@ -85,6 +89,8 @@ enum class Fc1Schedule : uint8_t {
   kPersistent,
   kPersistentDeviceWorkfeed,
   kPersistentPaddedScaleDeviceWorkfeed,
+  kPersistentExpertOrder,
+  kPersistentMetadataPublication,
   kPersistentEarlySfbDeviceWorkfeed,
 };
 
@@ -93,6 +99,8 @@ enum class Fc2Schedule : uint8_t {
   kRouteParallelK512DeviceWorkfeed,
   kRouteParallelK768K96,
   kRouteParallelK768K96PaddedScale,
+  kRouteParallelK512,
+  kImmutableWeightPrefill,
   kRouteParallelK512Stage5DeviceWorkfeed,
   kRouteParallelK512MmaU2DeviceWorkfeed,
 };
@@ -127,7 +135,8 @@ constexpr bool IsGeometry(const Shape& shape, int32_t hidden_size, int32_t inter
 
 constexpr Activation ActivationForGeometry(Geometry geometry) {
   if (geometry == Geometry::kH6144I1536E192K4) return Activation::kSiLU;
-  if (geometry == Geometry::kH6144I3072E128K4) return Activation::kSwiGLUParameterized;
+  if (geometry == Geometry::kH6144I3072E128K4 ||
+      geometry == Geometry::kH4096I2048E256K6) return Activation::kSwiGLUParameterized;
   if (geometry == Geometry::kH3584I3072E896K16) return Activation::kSiTU;
   return Activation::kSwiGLU;
 }
@@ -428,6 +437,35 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
 constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   if (shape.num_tokens < 1 || shape.num_tokens > kMaximumTokens) {
     return UnsupportedSchedule();
+  }
+
+  if (IsGeometry(shape, 4096, 2048, 256, 6)) {
+    // Fixed top-k6 finalizers do not use the generic unroll/workfeed fields.
+    if (shape.num_tokens <= 8) {
+      const bool ordered = shape.num_tokens >= 7;
+      return {true,
+              Geometry::kH4096I2048E256K6,
+              RouteLayout::kDirect,
+              ordered ? RoutePacker::kExpertOrder : RoutePacker::kNone,
+              ordered ? Fc1Schedule::kPersistentExpertOrder : Fc1Schedule::kPersistent,
+              Fc2Schedule::kRouteParallelK512,
+              128,
+              0,
+              0};
+    }
+    const RoutePacker planner = shape.num_tokens <= 10 ? RoutePacker::kSortedShort
+                                : (shape.num_tokens == 11 || shape.num_tokens == 23)
+                                    ? RoutePacker::kCountRank
+                                    : RoutePacker::kGeneral;
+    return {true,
+            Geometry::kH4096I2048E256K6,
+            RouteLayout::kGpuPacked,
+            planner,
+            Fc1Schedule::kPersistentMetadataPublication,
+            Fc2Schedule::kImmutableWeightPrefill,
+            128,
+            0,
+            0};
   }
 
   if (IsGeometry(shape, 6144, 3072, 128, 4) &&
@@ -957,6 +995,8 @@ struct KernelLaunch {
   bool spread_cluster;
   KernelSubmit submit;
   const void* arguments;
+  // Negative means no launch-local preference.
+  int preferred_shared_memory_carveout = -1;
 };
 
 using LaunchVisitor = void (*)(const KernelLaunch&, void*);

@@ -627,7 +627,9 @@ class CakeWarpDecodeConfig:
         Register the returned dictionary with
         ``MoEWeightPack.prepare_for("cake", view)``. Default SwiGLU and SiTU
         may register that dictionary for ``"trtllm_fp4_routed"`` as well.
-        Parameterized SwiGLU consumes logical beta/clamp here; the official
+        SwiGLU(limit=10.0) on H4096/I2048/E256 keeps raw-accumulator beta/clamp
+        and shares the same prepared dictionary with the official runner. Other
+        parameterized SwiGLU consumes logical beta/clamp here; the official
         runner requires each divided by ``output1_scale_gate_scalar``. For
         non-unit gate scales, prepare a separate official dictionary with those
         derived FP32 per-expert buffers, keeping alpha and physical tensors
@@ -646,6 +648,7 @@ class CakeWarpDecodeConfig:
             (SwiGLU(), (2048, 1536, 60)),
             (SwiGLU(), (2560, 768, 384)),
             (SiLU(), (6144, 1536, 192)),
+            (SwiGLU(limit=10.0), (4096, 2048, 256)),
             (SwiGLU(), (2048, 768, 128)),
             (SwiGLU(), (4096, 1536, 128)),
             (SwiGLU(), (2048, 512, 256)),
@@ -667,7 +670,8 @@ class CakeWarpDecodeConfig:
                 "and SiLU() with "
                 "(6144, 1536, 192), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
                 "with (6144, 3072, 128), or SiTU(gate_scale=4.0, linear_scale=25.0) "
-                "with (3584, 3072, 896); got "
+                "with (3584, 3072, 896), or SwiGLU(limit=10.0) with "
+                "(4096, 2048, 256) on SM100; got "
                 f"activation={activation!r}, geometry={geometry}."
             )
         return TrtllmFp4Config.prepare_weights(

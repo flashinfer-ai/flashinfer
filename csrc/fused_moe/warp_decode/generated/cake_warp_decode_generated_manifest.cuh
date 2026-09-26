@@ -36,6 +36,10 @@
 #error "FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR must be 0 or 3"
 #endif
 
+#if FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR == 0 && FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+#include "dsv4_clamped_e256/dsv4_clamped_e256_manifest.cuh"
+#endif
+
 #if FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR == 0
 extern "C" {
 __global__ __launch_bounds__(256) void
@@ -4366,6 +4370,10 @@ inline void VisitKernel_31(const KernelArgs_31& args, dim3 grid,
 
 inline int64_t WorkspaceSize(const warp_decode::Shape& shape,
                              const warp_decode::Schedule& schedule) {
+#if FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+  if (schedule.geometry == warp_decode::Geometry::kH4096I2048E256K6)
+    return dsv4_clamped_e256::WorkspaceSize(shape, schedule);
+#endif
   const auto selected = warp_decode::SelectSchedule(shape);
   if (!selected.supported || !detail::SameSchedule(selected, schedule)) return -1;
   detail::WorkspaceView view{};
@@ -4376,6 +4384,10 @@ inline int64_t WorkspaceSize(const warp_decode::Shape& shape,
 inline warp_decode::ManifestStatus PrepareWorkspace(const warp_decode::Invocation& inv,
                                                      const warp_decode::Schedule& schedule,
                                                      cudaStream_t stream) {
+#if FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+  if (schedule.geometry == warp_decode::Geometry::kH4096I2048E256K6)
+    return dsv4_clamped_e256::PrepareWorkspace(inv, schedule, stream);
+#endif
   const int64_t required = WorkspaceSize(inv.shape, schedule);
   if (required < 0 || inv.workspace == nullptr || inv.workspace_bytes < static_cast<size_t>(required) ||
       reinterpret_cast<uintptr_t>(inv.workspace) % kWorkspaceAlignment != 0)
@@ -4443,6 +4455,10 @@ inline warp_decode::ManifestStatus PrepareWorkspace(const warp_decode::Invocatio
 
 inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
                                                       bool allow_initialization) {
+#if FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+  const auto clamped_status = dsv4_clamped_e256::EnsureDeviceReady(device_id, allow_initialization);
+  if (!clamped_status.Ok()) return clamped_status;
+#endif
   if (device_id < 0 || device_id >= 64) return detail::Invalid("EnsureDeviceReady device");
   int current = -1;
   cudaError_t error = cudaGetDevice(&current);
@@ -4512,6 +4528,12 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
 inline void ForEachLaunch(const warp_decode::Invocation& inv,
                           const warp_decode::Schedule& schedule,
                           warp_decode::LaunchVisitor visitor, void* context) {
+#if FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+  if (schedule.geometry == warp_decode::Geometry::kH4096I2048E256K6) {
+    dsv4_clamped_e256::ForEachLaunch(inv, schedule, visitor, context);
+    return;
+  }
+#endif
   const auto selected = warp_decode::SelectSchedule(inv.shape);
   if (!visitor || !selected.supported || !detail::SameSchedule(selected, schedule) ||
       inv.workspace == nullptr) return;
