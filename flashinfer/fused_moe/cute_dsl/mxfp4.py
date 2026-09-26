@@ -337,6 +337,8 @@ def _dense_async_memset(num_experts: int, num_local_experts: int) -> bool:
     if DENSE_ASYNC_MEMSET == "ep":
         return num_local_experts < num_experts
     return False
+
+
 B300_SITU_DENSE_DUAL_TACTIC = _T256_N256_C1
 # Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
 # applies the route weights (no bulk reduce-add into the output).

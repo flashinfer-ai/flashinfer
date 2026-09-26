@@ -1563,9 +1563,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 e1_prev = e1_prev * (1 - is_lane0) + e0_last * is_lane0
                 not_lane0 = lane > 0
                 same = (not_lane0 & (e0 == e0_prev)) | (e1 == e1_prev)
-                transitions = cutlass.Int32(not_lane0 & (e0 != e0_prev)) + cutlass.Int32(
-                    e1 != e1_prev
-                )
+                transitions = cutlass.Int32(
+                    not_lane0 & (e0 != e0_prev)
+                ) + cutlass.Int32(e1 != e1_prev)
                 giant_any = cute.arch.vote_any_sync(same)
                 distinct = cute.arch.warp_redux_sync(transitions, "add") + 1
                 # A launch without valid tiles (the unchosen alternate tile)
@@ -1689,9 +1689,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mn_limit = tile_idx_to_mn_limit[sched_group]
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = sched_coord_m
-                        sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
-                            1
-                        ]
+                        sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[1]
                         sInfo[(2, tile_info_producer_state.index)] = expert_idx
                         sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                             work_tile.is_valid_tile
