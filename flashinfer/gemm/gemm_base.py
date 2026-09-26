@@ -2998,7 +2998,8 @@ def _cutedsl_low_latency_blockscaled_tgv_requirement(
         raise ValueError("Input tensors must have the same logical K dimension")
 
     is_nvfp4 = a_descale.dtype == torch.float8_e4m3fn
-    k_alignment = 64 if is_nvfp4 else 128
+    # Mixed FP4/FP8 operands unpack FP4 through TMA, which needs K % 128
+    k_alignment = 128 if a.dtype != b.dtype else 32
     if m > 8 or logical_k % k_alignment:
         raise ValueError(
             f"Block-scaled TGV requires M <= 8 and K divisible by {k_alignment}"
@@ -3090,8 +3091,9 @@ def tgv_gemm_sm100(
         - Dense inputs must have the same dtype and do not use scale factors.
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major).
         - Block-scaled inputs require ``M <= 8`` and flattened 128x4 scale-factor layouts.
-        - NVFP4 requires two FP4 operands, FP8 E4M3 scales, and ``K`` divisible by 64.
-        - MX scaling accepts FP4 or FP8 operands, including mixed operands, with FP8 E8M0 scales and ``K`` divisible by 128.
+        - Block-scaled inputs require ``K`` divisible by 32, or by 128 for mixed FP4/FP8 operands.
+        - NVFP4 requires two FP4 operands and FP8 E4M3 scales.
+        - MX scaling accepts FP4 or FP8 operands, including mixed operands, with FP8 E8M0 scales.
         - FP4 packs two values per byte, so its physical K dimension is ``K // 2``.
         - For block-scaled inputs, ``bias`` and the output must be BF16 or FP16 and share the same dtype.
     """
@@ -3165,7 +3167,9 @@ def tgv_gemm_sm100(
             bias,
         ]
         runners = [runner]
-        tuning_config = TuningConfig()
+        tuning_config = TuningConfig(
+            use_cold_l2_cache=True, use_cuda_graph=True, profiling_repeat=100
+        )
         dtype_str = f"{a.dtype}_{b.dtype}_{a_descale.dtype}"
     else:
         runners = [
@@ -5719,9 +5723,9 @@ def _cutedsl_low_latency_blockscaled_gemm_fp8_requirement(
         raise ValueError(
             "cutedsl_low_latency mm_fp8 requires contiguous (M, K) and (N, K) inputs"
         )
-    if a.shape[0] > 8 or a.shape[1] % 128:
+    if a.shape[0] > 8 or a.shape[1] % 32:
         raise ValueError(
-            "cutedsl_low_latency mm_fp8 requires M <= 8 and K divisible by 128"
+            "cutedsl_low_latency mm_fp8 requires M <= 8 and K divisible by 32"
         )
     if a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2) or b.dtype not in (
         torch.float8_e4m3fn,
@@ -5777,7 +5781,7 @@ def mm_fp8(
     backend: Literal["trtllm_low_latency", "cutedsl_low_latency"]
         Backend to use for computation. Default is "trtllm_low_latency".
         - "trtllm_low_latency": optimized for small M dimension.
-        - "cutedsl_low_latency": requires SM100/SM103, m <= 8, and k divisible by 128.
+        - "cutedsl_low_latency": requires SM100/SM103, m <= 8, and k divisible by 32.
 
     Returns
     -------
@@ -5851,7 +5855,9 @@ def mm_fp8(
         trtllm_low_latency_gemm(a, b, alpha, out)
     elif backend == "cutedsl_low_latency":
         k = a.shape[1]
-        scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
+        scale_sizes = [
+            ((rows + 127) // 128) * ((k + 127) // 128) * 512 for rows in (n, m)
+        ]
         workspace = _get_cache_buf(
             "mm_fp8_low_latency_workspace",
             DEFAULT_WORKSPACE_SIZE + sum(scale_sizes),
@@ -5878,7 +5884,12 @@ def mm_fp8(
             None,
         ]
         runner, tactic = AutoTuner.get().choose_one(
-            "mm_fp8_cutedsl_low_latency", [runner], TuningConfig(), inputs
+            "mm_fp8_cutedsl_low_latency",
+            [runner],
+            TuningConfig(
+                use_cold_l2_cache=True, use_cuda_graph=True, profiling_repeat=100
+            ),
+            inputs,
         )
         runner(inputs=inputs, tactic=tactic)
     else:
@@ -6205,11 +6216,11 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
             "cutedsl_low_latency mm_mxfp8 requires a contiguous (M, K) "
             "tensor and a column-major (K, N) tensor"
         )
-    if a.shape[0] > 8 or a.shape[1] % 128 != 0:
+    if a.shape[0] > 8 or a.shape[1] % 32 != 0:
         if backend != "cutedsl_low_latency":
             return False
         raise ValueError(
-            "cutedsl_low_latency mm_mxfp8 requires M <= 8 and K divisible by 128"
+            "cutedsl_low_latency mm_mxfp8 requires M <= 8 and K divisible by 32"
         )
     return True
 
@@ -7421,12 +7432,11 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
             "tensor and a column-major (K, N) tensor"
         )
     real_k = a.shape[1] * 2
-    k_alignment = 64 if use_nvfp4 else 128
-    if a.shape[0] > 8 or real_k % k_alignment != 0:
+    if a.shape[0] > 8 or real_k % 32 != 0:
         if backend != "cutedsl_low_latency":
             return False
         raise ValueError(
-            f"cutedsl_low_latency FP4 GEMM requires M <= 8 and K divisible by {k_alignment}"
+            "cutedsl_low_latency FP4 GEMM requires M <= 8 and K divisible by 32"
         )
     return True
 
@@ -7579,9 +7589,10 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
         """TunableRunner for CuTe DSL low-latency block-scaled dense GEMM.
 
         Tactics are tuples:
-            (cta_k, num_ab_stage, num_sfb_tmem_stage, split_k)
+            (cta_tile_shape_mnk, num_ab_stage, num_sfb_tmem_stage, split_k)
         where:
-            - cta_k: number of threads per CTA
+            - cta_tile_shape_mnk: (M, N, K) tile one CTA loads and stores; M may
+              be below the 128-row MMA
             - num_ab_stage: number of stages in the AB stage
             - num_sfb_tmem_stage: number of stages in the SFB stage
             - split_k: whether to split the K dimension
@@ -7601,7 +7612,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> list[tuple[int, int, int, int]]:
+        ) -> list[tuple[tuple[int, int, int], int, int, int]]:
             return valid_tactics(*prepare_inputs(inputs))
 
         def forward(
@@ -7643,7 +7654,8 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 raise ValueError(f"Invalid low-latency GEMM tactic: {tactic}")
 
             m, n, _, batch_size = problem_mnkl
-            cta_k, num_ab_stage, num_sfb_tmem_stage, split_k = tactic
+            cta_tile_shape_mnk, num_ab_stage, num_sfb_tmem_stage, split_k = tactic
+            cta_k = cta_tile_shape_mnk[2]
             is_kernel_output = (
                 batch_size == 1
                 and out.dtype == out_dtype
@@ -7737,7 +7749,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 dummy_mnkl = tuple(cutlass.Int32(x) for x in (128, 8, cta_k, 1))
                 gemm = LowLatencyBlockscaledGemmKernel(
                     acc_dtype=cutlass.Float32,
-                    mma_tiler_mnk=(128, 8, cta_k),
+                    cta_tile_shape_mnk=cta_tile_shape_mnk,
                     num_ab_stage=num_ab_stage,
                     num_sfb_tmem_stage=num_sfb_tmem_stage,
                     sf_vec_size=sf_vec_size,
@@ -8675,8 +8687,7 @@ def mm_fp4(
         ``"cute-dsl"`` backends are never auto-selected because they require
         different weight preparation. The ``"cutedsl_low_latency"`` backend is the last
         heuristic candidate for eligible SM100/SM103 problems and requires
-        ``M <= 8``, 128x4 scale factors, and K divisible by 64 for NVFP4 or 128
-        for MXFP4.
+        ``M <= 8``, 128x4 scale factors, and K divisible by 32.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.

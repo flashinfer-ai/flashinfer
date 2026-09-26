@@ -58,6 +58,13 @@ _EDGE_KERNEL_SHAPES = [
     (129, 3, 384, 2),
 ]
 
+_K_TAIL_SHAPES = [
+    (200, 8, 2880, 1),
+    (129, 3, 2912, 2),
+    (130, 5, 32, 1),
+    (130, 5, 96, 2),
+]
+
 
 def _require_supported_gpu():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
@@ -224,7 +231,7 @@ def test_low_latency_blockscaled_gemm_can_implement(
             sf_dtype,
             sf_vec_size,
             c_dtype,
-            mma_tiler_mnk=(128, 8, cta_k),
+            cta_tile_shape_mnk=(128, 8, cta_k),
             num_ab_stage=ab_stages,
             num_sfb_tmem_stage=1,
             split_k=split_k,
@@ -270,7 +277,7 @@ def test_low_latency_blockscaled_gemm_all_tactics_correctness(fmt):
             sf_dtype,
             sf_vec_size,
             cutlass.BFloat16,
-            mma_tiler_mnk=(128, 8, tactic[0]),
+            cta_tile_shape_mnk=tactic[0],
             num_ab_stage=tactic[1],
             num_sfb_tmem_stage=tactic[2],
             split_k=tactic[3],
@@ -327,3 +334,39 @@ def test_low_latency_blockscaled_gemm_all_tactics_correctness(fmt):
     ]
     for shape in model_shapes[:1] + model_shapes[-1:] + edge_shapes[:1]:
         _run_all_tactics_and_check(runner, shape, fmt, workspace, alpha)
+
+
+@pytest.mark.parametrize("mnkl", _K_TAIL_SHAPES)
+@pytest.mark.parametrize("fmt", _SUPPORTED_FORMATS)
+def test_low_latency_blockscaled_gemm_partial_k_tile(fmt, mnkl):
+    """A K that CTA-K does not divide runs with a zero-filled last K tile."""
+    _require_supported_gpu()
+    a_dtype, b_dtype, sf_dtype, sf_vec_size = fmt
+    runner = _make_runner()
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    alpha = torch.tensor(0.125, dtype=torch.float32, device="cuda")
+    a, b, sfa, sfb, out, sfa_simple, sfb_simple = make_blockscaled_tensors(
+        mnkl, a_dtype, b_dtype, sf_dtype, sf_vec_size, cutlass.BFloat16
+    )
+    bias = torch.linspace(-0.5, 0.5, mnkl[0], dtype=torch.bfloat16, device="cuda")
+    inputs = [a, b, sfa, sfb, out, workspace, mnkl, alpha, bias]
+    reference = _reference_output(
+        a, b, sfa_simple, sfb_simple, sf_vec_size, mnkl, alpha, bias
+    )
+
+    tactics = runner.get_valid_tactics(inputs, None)
+    if a_dtype.width != b_dtype.width:
+        # Mixed-width TMA unpacking needs K % 128, which these shapes violate
+        assert tactics == []
+        return
+
+    # One partial-tile tactic per (CTA-M, split-K or not)
+    picked = {}
+    for tactic in tactics:
+        if mnkl[2] % tactic[0][2]:
+            picked.setdefault((tactic[0][0], tactic[3] > 1), tactic)
+    assert picked, f"expected partial-K-tile tactics for {mnkl} and {fmt}"
+    for tactic in picked.values():
+        out.zero_()
+        runner.forward(inputs, tactic=tactic)
+        torch.testing.assert_close(out.cpu(), reference, atol=1e-1, rtol=1e-3)
