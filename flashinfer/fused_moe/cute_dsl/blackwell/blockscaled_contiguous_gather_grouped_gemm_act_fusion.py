@@ -2783,9 +2783,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     zf_do_fill = (zf_my_tiles > 0) | (zf_other_tiles == 0)
                 zf_lane = cute.arch.lane_idx()
                 zf_claim_addr = zero_fill_counters.iterator.toint()
-                zf_chunk_vec = self.zero_fill_chunk_bytes // 16
+                # Claims count units of zero_fill_bulk_bytes (one bulk copy);
+                # the in-loop phase takes one unit per tile, the tail phase
+                # zero_fill_chunk_bytes / unit units per claim.
+                zf_unit_vec = self.zero_fill_bulk_bytes // 16
                 zf_num_vec = cute.size(zero_fill_words) // 4
-                zf_num_chunks = cute.ceil_div(zf_num_vec, zf_chunk_vec)
+                zf_num_units = cute.ceil_div(zf_num_vec, zf_unit_vec)
                 zf_zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
                 for i in cutlass.range_constexpr(4):
                     zf_zeros[i] = cutlass.Uint32(0)
@@ -3479,8 +3482,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 if cutlass.const_expr(self.zero_fill):
                     # In-loop phase of the zero-fill: while the MMA warp
                     # builds the next accumulator, one epilogue warp per tile
-                    # (round robin) claims a chunk and stores it with plain
-                    # 16 B stores, so a dense routing's fill is spread over
+                    # (round robin) claims one unit and stores it with plain
+                    # 16 B stores (a 16 KB unit is ~0.25 us at the per-SM
+                    # store cap), so a dense routing's fill is spread over
                     # the tile loop instead of being exposed at the end.
                     if zf_do_fill:
                         if (zf_tile % len(self.epilog_warp_id)) == warp_idx:
@@ -3490,9 +3494,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     zf_claim_addr, cutlass.Int32(1)
                                 )
                             zf_c = cute.arch.shuffle_sync(zf_c, 0)
-                            if zf_c < zf_num_chunks:
-                                zf_base = zf_c * zf_chunk_vec + zf_lane
-                                for it in cutlass.range(0, zf_chunk_vec // 32, 1, unroll=8):
+                            if zf_c < zf_num_units:
+                                zf_base = zf_c * zf_unit_vec + zf_lane
+                                for it in cutlass.range(0, zf_unit_vec // 32, 1, unroll=8):
                                     zf_vec = zf_base + it * 32
                                     if zf_vec < zf_num_vec:
                                         zf_out = cute.make_tensor(
@@ -3570,24 +3574,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     src_addr = sZ.iterator.toint()
                     dst_base = zero_fill_words.iterator.toint()
                     num_bytes = cutlass.Int64(zf_num_vec) * 16
-                    num_chunks = zf_num_chunks
+                    num_units = zf_num_units
+                    per_claim = cutlass.Int32(copies_per_chunk)
                     claimed = cutlass.Int32(0)
                     if lane == 0:
-                        claimed = atomic_add_global_i32(claim_addr, cutlass.Int32(1))
+                        claimed = atomic_add_global_i32(claim_addr, per_claim)
                     claimed = cute.arch.shuffle_sync(claimed, 0)
-                    while claimed < num_chunks:
+                    while claimed < num_units:
                         next_claim = cutlass.Int32(0)
                         if lane == 0:
-                            next_claim = atomic_add_global_i32(
-                                claim_addr, cutlass.Int32(1)
-                            )
-                            off = cutlass.Int64(claimed) * self.zero_fill_chunk_bytes
+                            next_claim = atomic_add_global_i32(claim_addr, per_claim)
                             for j in cutlass.range_constexpr(copies_per_chunk):
-                                rem = num_bytes - off
-                                if rem > 0:
-                                    sz = cutlass.Int32(cutlass.min(rem, cutlass.Int64(zb)))
+                                unit = claimed + j
+                                if unit < num_units:
+                                    off = cutlass.Int64(unit) * zb
+                                    sz = cutlass.Int32(
+                                        cutlass.min(num_bytes - off, cutlass.Int64(zb))
+                                    )
                                     blk_copy_raw(dst_base + off, src_addr, sz)
-                                off = off + zb
                             cute.arch.cp_async_bulk_commit_group()
                         claimed = cute.arch.shuffle_sync(next_claim, 0)
                     if lane == 0:

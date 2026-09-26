@@ -347,7 +347,7 @@ def _dense_async_memset(num_experts: int, num_local_experts: int) -> bool:
 # the CTAs without tiles fill while the others compute. Same vocabulary as
 # DENSE_ASYNC_MEMSET: "ep" = expert-parallel ranks only, "1" = every layout,
 # "0" = off (the memset path above).
-DENSE_FILL_IN_GEMM1 = os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1", "0")
+DENSE_FILL_IN_GEMM1 = os.environ.get("MXFP4_DENSE_FILL_IN_GEMM1", "1")
 # Below this token count the zero-fill (5.6 us at T = 2048) hides beside GEMM1
 # on the auxiliary stream anyway; the in-GEMM1 fill only pays where the memset
 # gates a GEMM launch.
