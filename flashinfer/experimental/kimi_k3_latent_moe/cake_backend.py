@@ -73,7 +73,7 @@ DECODE_MAX_T = 128
 ROW_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 
 # ---------------------------------------------------------------------------
-# Decode planner (port of loom/examples/weave/kimi_k3_latent_moe_decode.py)
+# Decode planner (port of the Cake decode kernel module ``kimi_k3_latent_moe_decode``)
 # ---------------------------------------------------------------------------
 
 BLOCK_ROWS = 128
