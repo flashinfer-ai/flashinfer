@@ -175,7 +175,12 @@ class W4A16Epilogue:
             work_tile_info = sched_consumer.consume_work()
             iket.range_pop()
 
+            iket.range_push(
+                "epilogue_wait_store_warps",
+                (prev_work_tile_info.phase << 16) | prev_work_tile_info.expert_idx,
+            )
             wait_only_named_barrier.arrive_and_wait()
+            iket.range_pop()
 
             # Publish completion for the work tile snapshotted above.
             if cur_was_linear1:
@@ -346,11 +351,11 @@ class W4A16Fc2Epilogue(EpilogueContext):
             tmem_acc_tensor,
             (32, self._EpilogueTokenTileSize),
         )[None, None, self.tidx // 32, None]
-        iket.range_push("epilogue_wait_fc2_mma_result")
+        iket.range_push("epilogue_acquire_fc2_mma_result")
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
         iket.range_pop()
         iket.range_push(
-            "epilogue_store_fc2_token_output",
+            "epilogue_convert_store_fc2",
             (work_tile_info.phase << 16) | work_tile_info.expert_idx,
         )
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
@@ -517,7 +522,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_pop()
         iket.range_push(
-            "epilogue_store_fc1_intermediate",
+            "epilogue_compute_store_fc1",
             (work_tile_info.phase << 16) | work_tile_info.expert_idx,
         )
         # Keep prior subtiles in the established loop and specialize only the

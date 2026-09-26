@@ -903,7 +903,7 @@ class Sm100W4A16MegaMoEKernel:
         # Work-range payload: FC phase in the high 16 bits, local expert below.
         # IKET emits one record per active warp; normal compilation strips it.
         iket.range_push(
-            "weight_issue_nvfp4_and_scale_tma", (work.phase << 16) | work.expert_idx
+            "weight_load_nvfp4_scales_tile", (work.phase << 16) | work.expert_idx
         )
         real_a, _ = ext.get_gmem_tensor("a", tensor, work)
         real_s, _ = ext.get_gmem_tensor("sfa", sf_tensor, work)
@@ -940,7 +940,10 @@ class Sm100W4A16MegaMoEKernel:
         )
         state.reset_count()
         for _ in cutlass.range(k_count, unroll=1):
+            iket.range_push("weight_wait_raw_smem_slot_free", state.count)
             pipe.producer_acquire(state)
+            iket.range_pop()
+            iket.range_push("weight_issue_nvfp4_and_scale_tma", state.count)
             cute.copy(
                 atom,
                 src_a[(None, state.count)],
@@ -957,6 +960,7 @@ class Sm100W4A16MegaMoEKernel:
                 mcast_mask=mask,
             )
             pipe.producer_commit(state)
+            iket.range_pop()
             state.advance()
         iket.range_pop()
         return state
@@ -977,7 +981,7 @@ class Sm100W4A16MegaMoEKernel:
         k_count,
     ):
         iket.range_push(
-            "activation_issue_bf16_tma", (work.phase << 16) | work.expert_idx
+            "activation_load_bf16_tile", (work.phase << 16) | work.expert_idx
         )
         real_b, _ = ext.get_gmem_tensor("b", tensor, work)
         # Match the existing swapped Mega dynamic-N split in both FC phases.
@@ -1010,7 +1014,10 @@ class Sm100W4A16MegaMoEKernel:
         )
         state.reset_count()
         for _ in cutlass.range(k_count, unroll=1):
+            iket.range_push("activation_wait_smem_slot_free", state.count)
             pipe.producer_acquire(state)
+            iket.range_pop()
+            iket.range_push("activation_issue_bf16_tma", state.count)
             cute.copy(
                 atom,
                 src[(None, state.count)],
@@ -1020,6 +1027,7 @@ class Sm100W4A16MegaMoEKernel:
                 cache_policy=cutlass.Int64(0x14F0000000000000),
             )
             pipe.producer_commit(state)
+            iket.range_pop()
             state.advance()
         iket.range_pop()
         return state
@@ -1317,7 +1325,7 @@ class Sm100W4A16MegaMoEKernel:
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
                     iket.range_push(
-                        "activation_wait_fc1_tokens_ready",
+                        "activation_check_fc1_tokens",
                         (work.phase << 16) | work.expert_idx,
                     )
                     self.token_comm.fc1_tma_b_predispatch_spin(token_comm_args, work)
@@ -1336,11 +1344,11 @@ class Sm100W4A16MegaMoEKernel:
                         self._fc1_k_tiles,
                     )
                 else:
-                    iket.range_push(
-                        "activation_wait_fc1_intermediate",
-                        (work.phase << 16) | work.expert_idx,
-                    )
                     if not work.peek_ready:
+                        iket.range_push(
+                            "activation_wait_fc1_intermediate",
+                            (work.phase << 16) | work.expert_idx,
+                        )
                         spin_wait(
                             fc1_done.iterator
                             + work.cumulative_token_block_count
@@ -1348,7 +1356,7 @@ class Sm100W4A16MegaMoEKernel:
                             lambda v: v >= fc2_threshold,
                             fail_sleep_cycles=500,
                         )
-                    iket.range_pop()
+                        iket.range_pop()
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1619,13 +1627,15 @@ class Sm100W4A16MegaMoEKernel:
         iket.range_push("cta_wait_all_roles_finished")
         tail_barrier.arrive_and_wait()
         iket.range_pop()
-        iket.range_push("cta_drain_peer_token_returns")
+        if warp >= 8 and warp < 12:
+            iket.range_push("dispatch_wait_all_peer_returns")
         self.token_comm.kernel_tail_drain(
             token_comm_args,
             warp_idx=warp,
             lane_idx=cute.arch.lane_idx(),
         )
-        iket.range_pop()
+        if warp >= 8 and warp < 12:
+            iket.range_pop()
         if cutlass.const_expr(
             not self.in_kernel_fc2_reduce and reduced_output is not None
         ):
@@ -1648,11 +1658,11 @@ class Sm100W4A16MegaMoEKernel:
             tail_barrier.arrive_and_wait()
             iket.range_pop()
             if warp < 8 or warp >= 12:
-                iket.range_push("combine_reduce_topk_bf16")
                 combine = cute.recast_tensor(
                     token_comm_args.combine_output, cutlass.BFloat16
                 )
                 while worker_idx < num_workers:
+                    iket.range_push("combine_reduce_topk_bf16")
                     self.topk_reduce._reduce_bf16_worker(
                         combine,
                         None
@@ -1663,6 +1673,7 @@ class Sm100W4A16MegaMoEKernel:
                         hidden_tile_idx,
                         score_reg,
                     )
+                    iket.range_pop()
                     worker_idx += worker_stride
                     if worker_idx < num_workers:
                         token_idx, hidden_tile_idx = (
@@ -1674,7 +1685,6 @@ class Sm100W4A16MegaMoEKernel:
                                 worker_idx,
                             )
                         )
-                iket.range_pop()
             else:
                 self.token_comm.kernel_tail_cleanup(
                     token_comm_args,
