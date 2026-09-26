@@ -3959,8 +3959,16 @@ class FlashKDABlackwellBF16FusedLaunch:
                 zero_workspace=empty_u32,
                 zero_words=0,
                 num_sequences=num_seqs,
+                # The rank-three panel descriptor is typed like the rows the
+                # module carries (FP32 carrier -> FP32 rows).
                 state_checkpoints_tma=state_checkpoints
-                if state_checkpoints is not None and not fp32_checkpoints
+                if state_checkpoints is not None
+                else torch.empty(
+                    (1, 1, HEAD_DIM, HEAD_DIM),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                if fp32_carrier
                 else empty_checkpoint_tma,
             )
         if use_small_bh_owner_helper:
