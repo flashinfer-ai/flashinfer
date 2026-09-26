@@ -3558,6 +3558,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 if zf_do_fill:
                     zb = self.zero_fill_bulk_bytes
                     copies_per_chunk = self.zero_fill_chunk_bytes // zb
+                    # producer_tail only covers the bulk groups of the thread
+                    # that issued the C stores (warp 0); the other epilogue
+                    # warps must not zero the staging smem before that
+                    # thread has seen its last TMA store finish reading it.
+                    self.epilog_sync_barrier.arrive_and_wait()
                     sZ = storage.sC.get_tensor(
                         cute.make_layout((zb // 4,)), dtype=cutlass.Uint32
                     )
