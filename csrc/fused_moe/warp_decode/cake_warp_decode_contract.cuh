@@ -422,6 +422,8 @@ struct KernelLaunch {
   bool spread_cluster;
   KernelSubmit submit;
   const void* arguments;
+  // Negative means no launch-local preference.
+  int preferred_shared_memory_carveout = -1;
 };
 
 using LaunchVisitor = void (*)(const KernelLaunch&, void*);

@@ -591,7 +591,7 @@
       ],
       "tma_abi": "grid_constant",
       "tma_workspace_bytes": 0,
-      "preferred_shared_memory_carveout": null,
+      "preferred_shared_memory_carveout": 100,
       "dynamic_shared_memory_policy": {
         "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
         "normal_limit_device_attribute_id": 97,
@@ -2437,7 +2437,7 @@
     {
       "id": "device_09",
       "file": "device_09.cu",
-      "kernel_symbol": "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100",
+      "kernel_symbol": "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100",
       "parameters": [
         {
           "name": "A",
@@ -2874,7 +2874,7 @@
       ],
       "tma_abi": "grid_constant",
       "tma_workspace_bytes": 0,
-      "preferred_shared_memory_carveout": null,
+      "preferred_shared_memory_carveout": 100,
       "dynamic_shared_memory_policy": {
         "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
         "normal_limit_device_attribute_id": 97,

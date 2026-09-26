@@ -464,15 +464,6 @@ __device__ __forceinline__ void tma_4d_gmem2smem_cta2(
 }
 
 
-__device__ __forceinline__ void tma_store_4d(
-    const void *tmap, int x, int y, int z, int w, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2, %3, %4}], [%5];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
-}
-
-
 __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
     asm volatile(
         "{\n\t"
@@ -487,7 +478,7 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 extern "C" {
 
 __global__ __launch_bounds__(416, 2) __cluster_dims__(2,1,1) void
-kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles)
+kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -699,8 +690,6 @@ kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100(const __grid_constant__ 
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3]))
                         : "r"(taddr + (unsigned int)(cta_rank * 128 << 16) + 1048576 + acc_stage * 16));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                    asm volatile("cp.async.bulk.wait_group.read 0;");
-                    asm volatile("barrier.sync 7, 128;" ::: "memory");
                     int token = wide_token;
                     wide_values[0] = _tmem_load_0[0] * output_scale;
                     wide_values[1] = _tmem_load_0[2] * output_scale;
@@ -712,10 +701,8 @@ kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100(const __grid_constant__ 
                         wide_packed[_lp] = *(uint32_t*)&_bf2;
                     }
                     wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32;
-                    if (wide_feature < 64) {
-                        epi_staging_u64[(token * 64 + wide_feature) / 4] = wide_word;
-                    } else {
-                        epi_staging_u64[(512 + token * 64 + wide_feature - 64) / 4] = wide_word;
+                    if ((unsigned int)mn_limit > n_tile * 8 + (unsigned int)token) {
+                        *(reinterpret_cast<unsigned long long*>(C + ((n_tile * 8 + (unsigned int)token) * (unsigned int)M + m_tile * 128 + (unsigned int)wide_feature)) + (0)) = wide_word;
                     }
                     int token_0 = wide_token + 1;
                     wide_values[0] = _tmem_load_0[1] * output_scale;
@@ -728,21 +715,9 @@ kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100(const __grid_constant__ 
                         wide_packed[_lp] = *(uint32_t*)&_bf2;
                     }
                     wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32;
-                    if (wide_feature < 64) {
-                        epi_staging_u64[(token_0 * 64 + wide_feature) / 4] = wide_word;
-                    } else {
-                        epi_staging_u64[(512 + token_0 * 64 + wide_feature - 64) / 4] = wide_word;
+                    if ((unsigned int)mn_limit > n_tile * 8 + (unsigned int)token_0) {
+                        *(reinterpret_cast<unsigned long long*>(C + ((n_tile * 8 + (unsigned int)token_0) * (unsigned int)M + m_tile * 128 + (unsigned int)wide_feature)) + (0)) = wide_word;
                     }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    asm volatile("barrier.sync 7, 128;" ::: "memory");
-                    if (warp == 0) {
-                        if (elect_sync()) {
-                            int padding_rows = (8 - mn_limit % 8) % 8;
-                            tma_store_4d((&C_tma), m_tile * 128, padding_rows, 1073741824, n_tile * 8 - (unsigned int)padding_rows + 1073741824, epi_staging_addr);
-                            tma_store_4d((&C_tma), m_tile * 128 + 64, padding_rows, 1073741824, n_tile * 8 - (unsigned int)padding_rows + 1073741824, epi_staging_addr + 1024);
-                        }
-                    }
-                    asm volatile("cp.async.bulk.commit_group;");
                     asm volatile("barrier.sync 7, 128;" ::: "memory");
                     if (elect_sync()) {
                         asm volatile(
@@ -768,7 +743,6 @@ kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100(const __grid_constant__ 
                 }
                 cluster_work = next_linear;
             }
-            asm volatile("cp.async.bulk.wait_group.read 0;");
         }
     }
     // ---- Role: copy_sfb ----

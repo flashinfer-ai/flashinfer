@@ -455,7 +455,7 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
   TVM_FFI_ICHECK(launch.programmatic_dependent_launch)
       << launch.name << " does not declare the required programmatic dependent launch contract";
 
-  std::array<cudaLaunchAttribute, 5> attributes{};
+  std::array<cudaLaunchAttribute, 6> attributes{};
   uint32_t attribute_count = 0;
 
   attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -480,6 +480,14 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
   } else {
     TVM_FFI_ICHECK(!launch.spread_cluster)
         << launch.name << " requests spread scheduling without a cluster";
+  }
+  if (launch.preferred_shared_memory_carveout >= 0) {
+    TVM_FFI_ICHECK(launch.preferred_shared_memory_carveout <= 100)
+        << launch.name << " has an invalid shared-memory carveout preference";
+    attributes[attribute_count].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+    attributes[attribute_count].val.sharedMemCarveout =
+        static_cast<unsigned int>(launch.preferred_shared_memory_carveout);
+    ++attribute_count;
   }
   if (launch.cooperative) {
     attributes[attribute_count].id = cudaLaunchAttributeCooperative;

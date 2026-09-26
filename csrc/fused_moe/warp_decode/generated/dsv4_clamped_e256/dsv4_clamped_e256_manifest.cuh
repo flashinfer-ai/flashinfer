@@ -173,7 +173,7 @@ inline ManifestStatus EnsureDeviceReady(int32_t device, bool allow_initializatio
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe), cudaFuncAttributeMaxDynamicSharedMemorySize, 159872);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
-  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100), cudaFuncAttributeMaxDynamicSharedMemorySize, 85120);
+  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100), cudaFuncAttributeMaxDynamicSharedMemorySize, 85120);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   state.ready = true;
   return ManifestStatus::Success();
@@ -396,7 +396,7 @@ struct Args_device_09 {
 };
 inline cudaError_t Submit_device_09(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_09*>(opaque);
-  return SubmitExtendedKernel(config, kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100,
+  return SubmitExtendedKernel(config, kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100,
       args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.total_tiles);
 }
 
@@ -573,17 +573,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 6, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0};
+      &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 6, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_1};
+      &Submit_device_07, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 1, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_2};
+      &Submit_device_04, &args_2, -1};
     visitor(launch_2, context);
     return;
   }
@@ -733,17 +733,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 12, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0};
+      &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 12, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_1};
+      &Submit_device_07, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 2, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_2};
+      &Submit_device_04, &args_2, -1};
     visitor(launch_2, context);
     return;
   }
@@ -893,17 +893,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 18, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0};
+      &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 18, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_1};
+      &Submit_device_07, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 3, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_2};
+      &Submit_device_04, &args_2, -1};
     visitor(launch_2, context);
     return;
   }
@@ -1053,17 +1053,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0};
+      &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_1};
+      &Submit_device_07, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 4, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_2};
+      &Submit_device_04, &args_2, -1};
     visitor(launch_2, context);
     return;
   }
@@ -1213,17 +1213,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0};
+      &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_1};
+      &Submit_device_07, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 5, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_2};
+      &Submit_device_04, &args_2, -1};
     visitor(launch_2, context);
     return;
   }
@@ -1373,17 +1373,17 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0};
+      &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_1};
+      &Submit_device_07, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 6, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_2};
+      &Submit_device_04, &args_2, -1};
     visitor(launch_2, context);
     return;
   }
@@ -1538,22 +1538,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_t7_direct_route_order", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
       128u, true, false, false, false,
-      &Submit_device_08, &args_0};
+      &Submit_device_08, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_02, &args_1};
+      &Submit_device_02, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_2};
+      &Submit_device_07, &args_2, -1};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 7, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_3};
+      &Submit_device_04, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -1708,22 +1708,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_t7_direct_route_order", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
       128u, true, false, false, false,
-      &Submit_device_08, &args_0};
+      &Submit_device_08, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_02, &args_1};
+      &Submit_device_02, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       159872u, true, false, false, false,
-      &Submit_device_07, &args_2};
+      &Submit_device_07, &args_2, -1};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 8, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_04, &args_3};
+      &Submit_device_04, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -1878,22 +1878,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_sorted_short_route_pack", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
       128u, true, false, false, false,
-      &Submit_device_10, &args_0};
+      &Submit_device_10, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 54, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 54, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 54, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 9, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -2048,22 +2048,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_sorted_short_route_pack", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
       128u, true, false, false, false,
-      &Submit_device_10, &args_0};
+      &Submit_device_10, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 60, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 60, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 60, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 10, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -2218,22 +2218,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_05, &args_0};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 66, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 66, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 66, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 11, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -2388,22 +2388,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 72, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 72, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 72, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 12, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -2558,22 +2558,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 78, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 78, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 78, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 13, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -2728,22 +2728,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 84, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 84, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 84, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 14, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -2898,22 +2898,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 90, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 90, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 90, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 15, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -3068,22 +3068,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 96, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 96, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 96, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 16, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -3238,22 +3238,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 102, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 102, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 102, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 17, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -3408,22 +3408,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 108, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 108, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 108, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 18, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -3578,22 +3578,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 114, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 114, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 114, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 19, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -3748,22 +3748,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 120, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 120, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 120, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 20, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -3918,22 +3918,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 126, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 126, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 126, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 21, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -4088,22 +4088,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 132, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 132, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 132, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 22, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -4258,22 +4258,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_05, &args_0};
+      &Submit_device_05, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 138, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 138, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 138, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 23, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -4428,22 +4428,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 144, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 144, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 144, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 24, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -4598,22 +4598,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 150, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 150, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 150, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 25, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -4768,22 +4768,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 156, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 156, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 156, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 26, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -4938,22 +4938,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 162, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 162, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 162, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 27, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -5108,22 +5108,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 168, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 168, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 168, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 28, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -5278,22 +5278,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 174, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 174, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 174, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 29, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -5448,22 +5448,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 180, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 180, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 180, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 30, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -5618,22 +5618,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 186, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 186, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 186, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 31, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
@@ -5788,22 +5788,22 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     KernelLaunch launch_0{
       "kernel_dsv4_e256_route_pack", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false, false,
-      &Submit_device_00, &args_0};
+      &Submit_device_00, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100", dim3(64, 192, 1), dim3(384, 1, 1), dim3(2, 1, 1),
       64128u, true, false, false, true,
-      &Submit_device_01, &args_1};
+      &Submit_device_01, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_dsv4_flash_moe_5184_fc2_weight_pdl_overlap_sm100", dim3(32, 192, 1), dim3(416, 1, 1), dim3(2, 1, 1),
+      "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100", dim3(32, 192, 1), dim3(416, 1, 1), dim3(2, 1, 1),
       85120u, true, false, false, true,
-      &Submit_device_09, &args_2};
+      &Submit_device_09, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100", dim3(16, 32, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false, false,
-      &Submit_device_03, &args_3};
+      &Submit_device_03, &args_3, -1};
     visitor(launch_3, context);
     return;
   }
