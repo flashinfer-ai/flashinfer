@@ -80,22 +80,21 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
     monkeypatch.setattr(aot, "_gen_blackwell_bf16_bmm_aot_specs", lambda caps: [])
     monkeypatch.setattr(aot, "get_cuda_version", lambda: Version("13.0"))
 
-    config = aot.get_default_config()
     specs = aot.gen_all_modules(
-        config["f16_dtype"],
-        config["f8_dtype"],
-        config["fa2_head_dim"],
-        config["fa3_head_dim"],
-        config["use_sliding_window"],
-        config["use_logits_soft_cap"],
+        [],
+        [],
+        [],
+        [],
+        [False],  # XQA iterates over the sliding-window options.
+        [],
         sm_capabilities,
-        config["add_comm"],
-        config["add_gemma"],
-        config["add_oai_oss"],
-        config["add_moe"],
-        config["add_act"],
-        config["add_misc"],
-        config["add_xqa"],
+        True,
+        False,
+        False,
+        True,
+        False,
+        True,
+        True,
     )
     return {spec.name for spec in specs}
 
