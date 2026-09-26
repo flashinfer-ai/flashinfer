@@ -32,8 +32,8 @@ persistent kernel:
 - Batches whose requests all span at most four selected pages (`page_table`
   with at most four columns, e.g. the 257-token tail of a decode step) run the
   short-item program when the architecture registers it
-  (`cake_jit.select_short_module`): one four-CTA cluster of register-MMA CTAs
-  per work item, one CTA per selected page, the FP32 partials merged through
+  (`cake_jit.select_short_module`): one eight-CTA cluster of register-MMA CTAs
+  per work item, two CTAs per selected page, the FP32 partials merged through
   distributed shared memory. It needs no workspace; the runner reports
   `route == "short"`. Longer requests take the persistent program above.
 - Preparation binds the tensors and decides the program and the split factor;

@@ -28,7 +28,7 @@ across 2, 4 or 8 CTAs whose FP32 partials are merged by the last CTA to finish
 prepared runner launches with no allocation and can be captured into a CUDA
 Graph.  When the architecture also registers the short-item program, batches
 whose requests span at most ``max_pages`` (four) selected pages run it
-instead: one four-CTA cluster of register-MMA CTAs per work item, one CTA per
+instead: one eight-CTA cluster of register-MMA CTAs per work item, two CTAs per
 selected page, the partials merged through distributed shared memory, no
 workspace.  See ``README.md`` in this package.
 """
@@ -545,7 +545,7 @@ def prepare_msa_nvfp4_sparse_decode(
     returned runner launches with none.  When the device registers the
     short-item program and every request spans at most its page budget
     (``short_route_applies``), the runner binds that program (``route ==
-    "short"``, one four-CTA cluster per work item, no workspace).  Otherwise
+    "short"``, one eight-CTA cluster per work item, no workspace).  Otherwise
     the split factor is decided from the batch geometry and the device's
     resident-CTA capacity; when it is greater than one the FP32 partials and
     completion counters are carved out of ``workspace_buffer`` and the

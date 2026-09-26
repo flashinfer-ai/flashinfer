@@ -28,7 +28,7 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # split factor) carry the persistent decode kernel with its translation units,
 # compile flags, FFI entry and argument plan, plus the resident-CTA count per SM
 # the host uses to size the persistent grid; the optional ``short`` record of an
-# architecture carries the four-CTA-cluster register-MMA program that serves
+# architecture carries the eight-CTA-cluster register-MMA program that serves
 # work items of at most ``max_pages`` selected pages (``cluster`` CTAs per item,
 # at most ``max_clusters`` clusters per launch).  Populated verbatim by the
 # generated-program export; do not edit by hand.
@@ -37,13 +37,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "arch": "sm_100a",
         "route": "short",
         "max_pages": 4,
-        "cluster": 4,
-        "max_clusters": 32,
+        "cluster": 8,
+        "max_clusters": 16,
         "main": {
-            "module": "cake_msa_nvfp4_decode_e8756444575e4dd50978",
+            "module": "cake_msa_nvfp4_decode_df7f2762d61ee806c8b2",
             "sources": [
-                "cake_msa_nvfp4_decode/sm_100a/cake_msa_nvfp4_decode_e8756444575e4dd50978_kernel.cu",
-                "cake_msa_nvfp4_decode/sm_100a/cake_msa_nvfp4_decode_e8756444575e4dd50978_binding.cu",
+                "cake_msa_nvfp4_decode/sm_100a/cake_msa_nvfp4_decode_df7f2762d61ee806c8b2_kernel.cu",
+                "cake_msa_nvfp4_decode/sm_100a/cake_msa_nvfp4_decode_df7f2762d61ee806c8b2_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
@@ -79,10 +79,10 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "acdbe147fb783f345705cf7fa9ace7294f962b291e890ff01e588953a48f9509",
+            "closure_sha256": "2e1cc988d1e55fa7dd4ae9fe0e6f696d4d19fe8155ad0206dc1535a09ca54c39",
             "tma_workspace_bytes": 0,
         },
-        "closure_sha256": "acdbe147fb783f345705cf7fa9ace7294f962b291e890ff01e588953a48f9509",
+        "closure_sha256": "2e1cc988d1e55fa7dd4ae9fe0e6f696d4d19fe8155ad0206dc1535a09ca54c39",
     },
     "cake_msa_nvfp4_decode_sm_100a_split1": {
         "arch": "sm_100a",
@@ -272,13 +272,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "arch": "sm_103a",
         "route": "short",
         "max_pages": 4,
-        "cluster": 4,
-        "max_clusters": 32,
+        "cluster": 8,
+        "max_clusters": 16,
         "main": {
-            "module": "cake_msa_nvfp4_decode_ea637f6d9fac2e60b40a",
+            "module": "cake_msa_nvfp4_decode_2de357fbc4b45f0c3621",
             "sources": [
-                "cake_msa_nvfp4_decode/sm_103a/cake_msa_nvfp4_decode_ea637f6d9fac2e60b40a_kernel.cu",
-                "cake_msa_nvfp4_decode/sm_103a/cake_msa_nvfp4_decode_ea637f6d9fac2e60b40a_binding.cu",
+                "cake_msa_nvfp4_decode/sm_103a/cake_msa_nvfp4_decode_2de357fbc4b45f0c3621_kernel.cu",
+                "cake_msa_nvfp4_decode/sm_103a/cake_msa_nvfp4_decode_2de357fbc4b45f0c3621_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
@@ -314,10 +314,10 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "525ecd117bda21f862c7cb981ccfdde5ba4dd1d9de30550bb4f1bb53113939c3",
+            "closure_sha256": "2b335b952460bdf46ae729296e15a6bf1d44103ec617215cbebe514afd857765",
             "tma_workspace_bytes": 0,
         },
-        "closure_sha256": "525ecd117bda21f862c7cb981ccfdde5ba4dd1d9de30550bb4f1bb53113939c3",
+        "closure_sha256": "2b335b952460bdf46ae729296e15a6bf1d44103ec617215cbebe514afd857765",
     },
     "cake_msa_nvfp4_decode_sm_103a_split1": {
         "arch": "sm_103a",

@@ -423,7 +423,7 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
     arch = arch_for(device)
     if short_route_applies(arch, inputs["max_pages"]):
         # Requests of at most the short program's page budget take the
-        # four-CTA-cluster program: one cluster per work item, no split.
+        # eight-CTA-cluster program: one cluster per work item, no split.
         assert runner.route == "short"
         assert runner.splits == 1
         record = short_program_record(arch)
@@ -533,7 +533,7 @@ def _require_short_program():
 
 
 def test_short_items_take_the_cluster_program():
-    """Requests within the short program's page budget run one four-CTA cluster
+    """Requests within the short program's page budget run one eight-CTA cluster
     per work item from the same pages, with no workspace and no allocation."""
     _require_short_program()
     inputs, runner, _ = _run_and_check([257, 300, 1, 512], 4, seed=17)

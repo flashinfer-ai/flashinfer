@@ -54,28 +54,28 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SMEM_MAX_OFF 1024
-#define SMEM_SMEM_MAX_STAGE_BYTES 512
-#define SMEM_SMEM_MAX_STRIDE 512
-#define SMEM_SMEM_SUM_OFF 1536
-#define SMEM_SMEM_SUM_STAGE_BYTES 512
-#define SMEM_SMEM_SUM_STRIDE 512
-#define SMEM_SMEM_Q_OFF 2048
+#define SMEM_SMEM_MAX_STAGE_BYTES 256
+#define SMEM_SMEM_MAX_STRIDE 256
+#define SMEM_SMEM_SUM_OFF 1280
+#define SMEM_SMEM_SUM_STAGE_BYTES 256
+#define SMEM_SMEM_SUM_STRIDE 256
+#define SMEM_SMEM_Q_OFF 1536
 #define SMEM_SMEM_Q_STAGE_BYTES 4352
 #define SMEM_SMEM_Q_STRIDE 4352
-#define SMEM_SMEM_STAT_OFF 6400
-#define SMEM_SMEM_STAT_STAGE_BYTES 96
-#define SMEM_SMEM_STAT_STRIDE 96
+#define SMEM_SMEM_STAT_OFF 5888
+#define SMEM_SMEM_STAT_STAGE_BYTES 112
+#define SMEM_SMEM_STAT_STRIDE 112
 #define SMEM_SMEM_ZONE_OFF 6528
-#define SMEM_SMEM_ZONE_STAGE_BYTES 6144
-#define SMEM_SMEM_ZONE_STRIDE 6144
-#define SMEM_SMEM_TILES_OFF 12672
-#define SMEM_SMEM_TILES_STAGE_BYTES 69632
-#define SMEM_SMEM_TILES_STRIDE 69632
-#define SMEM_SMEM_OPART_OFF 12672
-#define SMEM_SMEM_OPART_STAGE_BYTES 69632
-#define SMEM_SMEM_OPART_STRIDE 69632
-#define SMEM_TOTAL 82304
-#define THREADS 256
+#define SMEM_SMEM_ZONE_STAGE_BYTES 7168
+#define SMEM_SMEM_ZONE_STRIDE 7168
+#define SMEM_SMEM_TILES_OFF 13696
+#define SMEM_SMEM_TILES_STAGE_BYTES 34816
+#define SMEM_SMEM_TILES_STRIDE 34816
+#define SMEM_SMEM_OPART_OFF 13696
+#define SMEM_SMEM_OPART_STAGE_BYTES 34816
+#define SMEM_SMEM_OPART_STRIDE 34816
+#define SMEM_TOTAL 48512
+#define THREADS 128
 
 #include <math_constants.h>
 
@@ -334,8 +334,8 @@ __device__ __forceinline__ void fence_async_shared() {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) __cluster_dims__(4,1,1) void
-kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q, uint8_t* __restrict__ K, uint8_t* __restrict__ K_scale, uint8_t* __restrict__ V, uint8_t* __restrict__ V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages, int k_page_stride, int k_head_stride, int ks_page_stride, int ks_head_stride, int v_page_stride, int v_head_stride, int vs_page_stride, int vs_head_stride)
+__global__ __launch_bounds__(128, 1) __cluster_dims__(8,1,1) void
+kernel_cake_msa_nvfp4_decode_2de357fbc4b45f0c3621(__nv_bfloat16* __restrict__ Q, uint8_t* __restrict__ K, uint8_t* __restrict__ K_scale, uint8_t* __restrict__ V, uint8_t* __restrict__ V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages, int k_page_stride, int k_head_stride, int ks_page_stride, int ks_head_stride, int v_page_stride, int v_head_stride, int vs_page_stride, int vs_head_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -343,16 +343,15 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define part_ready_addr (mbar_base + 0)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 4;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 4;
+    const unsigned int clusters_x = gridDim.x / 8;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
     const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
     int cta_rank;
@@ -361,18 +360,18 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
     // Kernel setup ops
     float* smem_max = reinterpret_cast<float*>(smem_raw + 1024);
     const int smem_max_addr = smem + 1024;
-    float* smem_sum = reinterpret_cast<float*>(smem_raw + 1536);
-    const int smem_sum_addr = smem + 1536;
-    unsigned int* smem_q = reinterpret_cast<unsigned int*>(smem_raw + 2048);
-    const int smem_q_addr = smem + 2048;
-    float* smem_stat = reinterpret_cast<float*>(smem_raw + 6400);
-    const int smem_stat_addr = smem + 6400;
+    float* smem_sum = reinterpret_cast<float*>(smem_raw + 1280);
+    const int smem_sum_addr = smem + 1280;
+    unsigned int* smem_q = reinterpret_cast<unsigned int*>(smem_raw + 1536);
+    const int smem_q_addr = smem + 1536;
+    float* smem_stat = reinterpret_cast<float*>(smem_raw + 5888);
+    const int smem_stat_addr = smem + 5888;
     float* smem_zone = reinterpret_cast<float*>(smem_raw + 6528);
     const int smem_zone_addr = smem + 6528;
-    unsigned int* smem_tiles = reinterpret_cast<unsigned int*>(smem_raw + 12672);
-    const int smem_tiles_addr = smem + 12672;
-    float* smem_opart = reinterpret_cast<float*>(smem_raw + 12672);
-    const int smem_opart_addr = smem + 12672;
+    unsigned int* smem_tiles = reinterpret_cast<unsigned int*>(smem_raw + 13696);
+    const int smem_tiles_addr = smem + 13696;
+    float* smem_opart = reinterpret_cast<float*>(smem_raw + 13696);
+    const int smem_opart_addr = smem + 13696;
 
     // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
     // Mbarriers at smem_raw[0..8)
@@ -396,17 +395,18 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
     int lane_1 = lane;
     int tid_2 = tid;
     int rank = cta_rank;
-    unsigned int cluster_x = blockIdx.x / 4;
-    unsigned int num_clusters_x = gridDim.x / 4;
-    int tok0 = warp_0 * 16;
+    int pslot = rank / 2;
+    unsigned int cluster_x = blockIdx.x / 8;
+    unsigned int num_clusters_x = gridDim.x / 8;
+    int tok0 = rank % 2 * 64 + warp_0 * 16;
     int slice_addr = smem_tiles_addr + (unsigned int)(warp_0 * 8704);
     int wbase = warp_0 * 2176;
     int r0 = lane_1 / 4;
     int quad = lane_1 % 4;
-    int h_e = tid_2 / 16;
-    int g_e = tid_2 % 16;
-    int owner = h_e / 4;
-    int hl = h_e % 4;
+    int h_e = tid_2 / 8;
+    int g_e = tid_2 % 8;
+    int owner = h_e / 2;
+    int hl = h_e % 2;
     int slot = ((rank > owner) ? rank - 1 : rank);
     int q_addr = smem_q_addr;
     float s_acc[8];
@@ -418,8 +418,8 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
     int sw_k[2];
     unsigned int raw_v[8];
     int sw_v[4];
-    float eacc[8];
-    float ov[8];
+    float eacc[16];
+    float ov[16];
     int item_par = 0;
     #pragma unroll 1
     for (unsigned int work_idx = cluster_x; work_idx < total_items; work_idx += num_clusters_x) {
@@ -483,7 +483,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_0 = __shfl_sync(0xFFFFFFFF, valid_l, 0);
         vs = _shfl_0;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 0;
             }
             seen = seen + 1;
@@ -491,7 +491,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_1 = __shfl_sync(0xFFFFFFFF, valid_l, 1);
         vs = _shfl_1;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 1;
             }
             seen = seen + 1;
@@ -499,7 +499,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_2 = __shfl_sync(0xFFFFFFFF, valid_l, 2);
         vs = _shfl_2;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 2;
             }
             seen = seen + 1;
@@ -507,7 +507,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_3 = __shfl_sync(0xFFFFFFFF, valid_l, 3);
         vs = _shfl_3;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 3;
             }
             seen = seen + 1;
@@ -515,7 +515,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_4 = __shfl_sync(0xFFFFFFFF, valid_l, 4);
         vs = _shfl_4;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 4;
             }
             seen = seen + 1;
@@ -523,7 +523,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_5 = __shfl_sync(0xFFFFFFFF, valid_l, 5);
         vs = _shfl_5;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 5;
             }
             seen = seen + 1;
@@ -531,7 +531,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_6 = __shfl_sync(0xFFFFFFFF, valid_l, 6);
         vs = _shfl_6;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 6;
             }
             seen = seen + 1;
@@ -539,7 +539,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_7 = __shfl_sync(0xFFFFFFFF, valid_l, 7);
         vs = _shfl_7;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 7;
             }
             seen = seen + 1;
@@ -547,7 +547,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_8 = __shfl_sync(0xFFFFFFFF, valid_l, 8);
         vs = _shfl_8;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 8;
             }
             seen = seen + 1;
@@ -555,7 +555,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_9 = __shfl_sync(0xFFFFFFFF, valid_l, 9);
         vs = _shfl_9;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 9;
             }
             seen = seen + 1;
@@ -563,7 +563,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_10 = __shfl_sync(0xFFFFFFFF, valid_l, 10);
         vs = _shfl_10;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 10;
             }
             seen = seen + 1;
@@ -571,7 +571,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_11 = __shfl_sync(0xFFFFFFFF, valid_l, 11);
         vs = _shfl_11;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 11;
             }
             seen = seen + 1;
@@ -579,7 +579,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_12 = __shfl_sync(0xFFFFFFFF, valid_l, 12);
         vs = _shfl_12;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 12;
             }
             seen = seen + 1;
@@ -587,7 +587,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_13 = __shfl_sync(0xFFFFFFFF, valid_l, 13);
         vs = _shfl_13;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 13;
             }
             seen = seen + 1;
@@ -595,7 +595,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_14 = __shfl_sync(0xFFFFFFFF, valid_l, 14);
         vs = _shfl_14;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 14;
             }
             seen = seen + 1;
@@ -603,7 +603,7 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         int _shfl_15 = __shfl_sync(0xFFFFFFFF, valid_l, 15);
         vs = _shfl_15;
         if (vs > 0) {
-            if (seen == rank) {
+            if (seen == pslot) {
                 pick = 15;
             }
             seen = seen + 1;
@@ -695,6 +695,19 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         }
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
             "r"(q_addr + tid_2 / 16 * 272 + tid_2 % 16 * 16), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[0])), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[(0) + 3])));
+        int qrow_0 = ((group_size > (tid_2 + 128) / 16) ? (tid_2 + 128) / 16 : group_size - 1);
+        int _vec_load_1[4];
+        {
+            const int4* _ivptr_7 = reinterpret_cast<const int4*>(Q + (q_row0 + qrow_0) * 128 + (tid_2 + 128) % 16 * 8);
+            int4 _ivld_7;
+            _ivld_7 = *_ivptr_7;
+            _vec_load_1[0 + 0] = _ivld_7.x;
+            _vec_load_1[0 + 1] = _ivld_7.y;
+            _vec_load_1[0 + 2] = _ivld_7.z;
+            _vec_load_1[0 + 3] = _ivld_7.w;
+        }
+        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
+            "r"(q_addr + (tid_2 + 128) / 16 * 272 + (tid_2 + 128) % 16 * 16), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_1[0])), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_1[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_1[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&_vec_load_1[(0) + 3])));
         __syncthreads();
         s_acc[0] = 0.0f;
         s_acc[1] = 0.0f;
@@ -2871,13 +2884,13 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
             smem_sum[warp_0 * 16 + r0 + 8] = l1;
         }
         if (tid_2 == 0) {
-            mbarrier_arrive_expect_tx(part_ready_addr, 6240);
+            mbarrier_arrive_expect_tx(part_ready_addr, 7280);
         }
         __syncthreads();
         float hm = 0.0f;
         float hs = 0.0f;
-        float wm[8];
-        float ws[8];
+        float wm[4];
+        float ws[4];
         float ehm = -CAKE_INF;
         wm[0] = smem_max[h_e];
         ws[0] = smem_sum[h_e];
@@ -2895,25 +2908,9 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         ws[3] = smem_sum[48 + h_e];
         float _fmax_15 = fmaxf(ehm, wm[3]);
         ehm = _fmax_15;
-        wm[4] = smem_max[64 + h_e];
-        ws[4] = smem_sum[64 + h_e];
-        float _fmax_16 = fmaxf(ehm, wm[4]);
-        ehm = _fmax_16;
-        wm[5] = smem_max[80 + h_e];
-        ws[5] = smem_sum[80 + h_e];
-        float _fmax_17 = fmaxf(ehm, wm[5]);
-        ehm = _fmax_17;
-        wm[6] = smem_max[96 + h_e];
-        ws[6] = smem_sum[96 + h_e];
-        float _fmax_18 = fmaxf(ehm, wm[6]);
-        ehm = _fmax_18;
-        wm[7] = smem_max[112 + h_e];
-        ws[7] = smem_sum[112 + h_e];
-        float _fmax_19 = fmaxf(ehm, wm[7]);
-        ehm = _fmax_19;
         float ehs = 0.0f;
         float wgt = 0.0f;
-        unsigned int ew[8];
+        unsigned int ew[16];
         float eb = 0.0f;
         eacc[0] = 0.0f;
         eacc[1] = 0.0f;
@@ -2923,16 +2920,30 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         eacc[5] = 0.0f;
         eacc[6] = 0.0f;
         eacc[7] = 0.0f;
+        eacc[8] = 0.0f;
+        eacc[9] = 0.0f;
+        eacc[10] = 0.0f;
+        eacc[11] = 0.0f;
+        eacc[12] = 0.0f;
+        eacc[13] = 0.0f;
+        eacc[14] = 0.0f;
+        eacc[15] = 0.0f;
         float _exp2_8 = approx_exp2((wm[0] - ehm) * softmax_scale_log2);
         wgt = ((wm[0] > -CAKE_INF) ? _exp2_8 : 0.0f);
         float _fma_8 = __fmaf_rn(wgt, ws[0], ehs);
         ehs = _fma_8;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4)));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 16));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 16));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[8])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 32));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[12])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 48));
         eb = reinterpret_cast<float*>(&ew[0])[0];
         float _fma_9 = __fmaf_rn(wgt, eb, eacc[0]);
         eacc[0] = _fma_9;
@@ -2957,251 +2968,229 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
         eb = reinterpret_cast<float*>(&ew[7])[0];
         float _fma_16 = __fmaf_rn(wgt, eb, eacc[7]);
         eacc[7] = _fma_16;
+        eb = reinterpret_cast<float*>(&ew[8])[0];
+        float _fma_17 = __fmaf_rn(wgt, eb, eacc[8]);
+        eacc[8] = _fma_17;
+        eb = reinterpret_cast<float*>(&ew[9])[0];
+        float _fma_18 = __fmaf_rn(wgt, eb, eacc[9]);
+        eacc[9] = _fma_18;
+        eb = reinterpret_cast<float*>(&ew[10])[0];
+        float _fma_19 = __fmaf_rn(wgt, eb, eacc[10]);
+        eacc[10] = _fma_19;
+        eb = reinterpret_cast<float*>(&ew[11])[0];
+        float _fma_20 = __fmaf_rn(wgt, eb, eacc[11]);
+        eacc[11] = _fma_20;
+        eb = reinterpret_cast<float*>(&ew[12])[0];
+        float _fma_21 = __fmaf_rn(wgt, eb, eacc[12]);
+        eacc[12] = _fma_21;
+        eb = reinterpret_cast<float*>(&ew[13])[0];
+        float _fma_22 = __fmaf_rn(wgt, eb, eacc[13]);
+        eacc[13] = _fma_22;
+        eb = reinterpret_cast<float*>(&ew[14])[0];
+        float _fma_23 = __fmaf_rn(wgt, eb, eacc[14]);
+        eacc[14] = _fma_23;
+        eb = reinterpret_cast<float*>(&ew[15])[0];
+        float _fma_24 = __fmaf_rn(wgt, eb, eacc[15]);
+        eacc[15] = _fma_24;
         float _exp2_9 = approx_exp2((wm[1] - ehm) * softmax_scale_log2);
         wgt = ((wm[1] > -CAKE_INF) ? _exp2_9 : 0.0f);
-        float _fma_17 = __fmaf_rn(wgt, ws[1], ehs);
-        ehs = _fma_17;
+        float _fma_25 = __fmaf_rn(wgt, ws[1], ehs);
+        ehs = _fma_25;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 8704));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 8704));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 8704 + 16));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 8704 + 16));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[8])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 8704 + 32));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[12])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 8704 + 48));
         eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_18 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_18;
+        float _fma_26 = __fmaf_rn(wgt, eb, eacc[0]);
+        eacc[0] = _fma_26;
         eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_19 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_19;
+        float _fma_27 = __fmaf_rn(wgt, eb, eacc[1]);
+        eacc[1] = _fma_27;
         eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_20 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_20;
+        float _fma_28 = __fmaf_rn(wgt, eb, eacc[2]);
+        eacc[2] = _fma_28;
         eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_21 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_21;
+        float _fma_29 = __fmaf_rn(wgt, eb, eacc[3]);
+        eacc[3] = _fma_29;
         eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_22 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_22;
+        float _fma_30 = __fmaf_rn(wgt, eb, eacc[4]);
+        eacc[4] = _fma_30;
         eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_23 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_23;
+        float _fma_31 = __fmaf_rn(wgt, eb, eacc[5]);
+        eacc[5] = _fma_31;
         eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_24 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_24;
+        float _fma_32 = __fmaf_rn(wgt, eb, eacc[6]);
+        eacc[6] = _fma_32;
         eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_25 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_25;
+        float _fma_33 = __fmaf_rn(wgt, eb, eacc[7]);
+        eacc[7] = _fma_33;
+        eb = reinterpret_cast<float*>(&ew[8])[0];
+        float _fma_34 = __fmaf_rn(wgt, eb, eacc[8]);
+        eacc[8] = _fma_34;
+        eb = reinterpret_cast<float*>(&ew[9])[0];
+        float _fma_35 = __fmaf_rn(wgt, eb, eacc[9]);
+        eacc[9] = _fma_35;
+        eb = reinterpret_cast<float*>(&ew[10])[0];
+        float _fma_36 = __fmaf_rn(wgt, eb, eacc[10]);
+        eacc[10] = _fma_36;
+        eb = reinterpret_cast<float*>(&ew[11])[0];
+        float _fma_37 = __fmaf_rn(wgt, eb, eacc[11]);
+        eacc[11] = _fma_37;
+        eb = reinterpret_cast<float*>(&ew[12])[0];
+        float _fma_38 = __fmaf_rn(wgt, eb, eacc[12]);
+        eacc[12] = _fma_38;
+        eb = reinterpret_cast<float*>(&ew[13])[0];
+        float _fma_39 = __fmaf_rn(wgt, eb, eacc[13]);
+        eacc[13] = _fma_39;
+        eb = reinterpret_cast<float*>(&ew[14])[0];
+        float _fma_40 = __fmaf_rn(wgt, eb, eacc[14]);
+        eacc[14] = _fma_40;
+        eb = reinterpret_cast<float*>(&ew[15])[0];
+        float _fma_41 = __fmaf_rn(wgt, eb, eacc[15]);
+        eacc[15] = _fma_41;
         float _exp2_10 = approx_exp2((wm[2] - ehm) * softmax_scale_log2);
         wgt = ((wm[2] > -CAKE_INF) ? _exp2_10 : 0.0f);
-        float _fma_26 = __fmaf_rn(wgt, ws[2], ehs);
-        ehs = _fma_26;
+        float _fma_42 = __fmaf_rn(wgt, ws[2], ehs);
+        ehs = _fma_42;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 17408));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 17408));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 17408 + 16));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 17408 + 16));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[8])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 17408 + 32));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[12])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 17408 + 48));
         eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_27 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_27;
+        float _fma_43 = __fmaf_rn(wgt, eb, eacc[0]);
+        eacc[0] = _fma_43;
         eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_28 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_28;
+        float _fma_44 = __fmaf_rn(wgt, eb, eacc[1]);
+        eacc[1] = _fma_44;
         eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_29 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_29;
+        float _fma_45 = __fmaf_rn(wgt, eb, eacc[2]);
+        eacc[2] = _fma_45;
         eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_30 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_30;
+        float _fma_46 = __fmaf_rn(wgt, eb, eacc[3]);
+        eacc[3] = _fma_46;
         eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_31 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_31;
+        float _fma_47 = __fmaf_rn(wgt, eb, eacc[4]);
+        eacc[4] = _fma_47;
         eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_32 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_32;
+        float _fma_48 = __fmaf_rn(wgt, eb, eacc[5]);
+        eacc[5] = _fma_48;
         eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_33 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_33;
+        float _fma_49 = __fmaf_rn(wgt, eb, eacc[6]);
+        eacc[6] = _fma_49;
         eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_34 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_34;
+        float _fma_50 = __fmaf_rn(wgt, eb, eacc[7]);
+        eacc[7] = _fma_50;
+        eb = reinterpret_cast<float*>(&ew[8])[0];
+        float _fma_51 = __fmaf_rn(wgt, eb, eacc[8]);
+        eacc[8] = _fma_51;
+        eb = reinterpret_cast<float*>(&ew[9])[0];
+        float _fma_52 = __fmaf_rn(wgt, eb, eacc[9]);
+        eacc[9] = _fma_52;
+        eb = reinterpret_cast<float*>(&ew[10])[0];
+        float _fma_53 = __fmaf_rn(wgt, eb, eacc[10]);
+        eacc[10] = _fma_53;
+        eb = reinterpret_cast<float*>(&ew[11])[0];
+        float _fma_54 = __fmaf_rn(wgt, eb, eacc[11]);
+        eacc[11] = _fma_54;
+        eb = reinterpret_cast<float*>(&ew[12])[0];
+        float _fma_55 = __fmaf_rn(wgt, eb, eacc[12]);
+        eacc[12] = _fma_55;
+        eb = reinterpret_cast<float*>(&ew[13])[0];
+        float _fma_56 = __fmaf_rn(wgt, eb, eacc[13]);
+        eacc[13] = _fma_56;
+        eb = reinterpret_cast<float*>(&ew[14])[0];
+        float _fma_57 = __fmaf_rn(wgt, eb, eacc[14]);
+        eacc[14] = _fma_57;
+        eb = reinterpret_cast<float*>(&ew[15])[0];
+        float _fma_58 = __fmaf_rn(wgt, eb, eacc[15]);
+        eacc[15] = _fma_58;
         float _exp2_11 = approx_exp2((wm[3] - ehm) * softmax_scale_log2);
         wgt = ((wm[3] > -CAKE_INF) ? _exp2_11 : 0.0f);
-        float _fma_35 = __fmaf_rn(wgt, ws[3], ehs);
-        ehs = _fma_35;
+        float _fma_59 = __fmaf_rn(wgt, ws[3], ehs);
+        ehs = _fma_59;
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 26112));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 26112));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 26112 + 16));
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 26112 + 16));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[8])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(8) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 26112 + 32));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&ew[12])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(12) + 3]))
+            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 16) * 4) + 26112 + 48));
         eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_36 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_36;
+        float _fma_60 = __fmaf_rn(wgt, eb, eacc[0]);
+        eacc[0] = _fma_60;
         eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_37 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_37;
+        float _fma_61 = __fmaf_rn(wgt, eb, eacc[1]);
+        eacc[1] = _fma_61;
         eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_38 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_38;
+        float _fma_62 = __fmaf_rn(wgt, eb, eacc[2]);
+        eacc[2] = _fma_62;
         eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_39 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_39;
+        float _fma_63 = __fmaf_rn(wgt, eb, eacc[3]);
+        eacc[3] = _fma_63;
         eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_40 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_40;
+        float _fma_64 = __fmaf_rn(wgt, eb, eacc[4]);
+        eacc[4] = _fma_64;
         eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_41 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_41;
+        float _fma_65 = __fmaf_rn(wgt, eb, eacc[5]);
+        eacc[5] = _fma_65;
         eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_42 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_42;
+        float _fma_66 = __fmaf_rn(wgt, eb, eacc[6]);
+        eacc[6] = _fma_66;
         eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_43 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_43;
-        float _exp2_12 = approx_exp2((wm[4] - ehm) * softmax_scale_log2);
-        wgt = ((wm[4] > -CAKE_INF) ? _exp2_12 : 0.0f);
-        float _fma_44 = __fmaf_rn(wgt, ws[4], ehs);
-        ehs = _fma_44;
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 34816));
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 34816 + 16));
-        eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_45 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_45;
-        eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_46 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_46;
-        eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_47 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_47;
-        eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_48 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_48;
-        eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_49 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_49;
-        eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_50 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_50;
-        eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_51 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_51;
-        eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_52 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_52;
-        float _exp2_13 = approx_exp2((wm[5] - ehm) * softmax_scale_log2);
-        wgt = ((wm[5] > -CAKE_INF) ? _exp2_13 : 0.0f);
-        float _fma_53 = __fmaf_rn(wgt, ws[5], ehs);
-        ehs = _fma_53;
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 43520));
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 43520 + 16));
-        eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_54 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_54;
-        eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_55 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_55;
-        eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_56 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_56;
-        eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_57 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_57;
-        eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_58 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_58;
-        eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_59 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_59;
-        eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_60 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_60;
-        eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_61 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_61;
-        float _exp2_14 = approx_exp2((wm[6] - ehm) * softmax_scale_log2);
-        wgt = ((wm[6] > -CAKE_INF) ? _exp2_14 : 0.0f);
-        float _fma_62 = __fmaf_rn(wgt, ws[6], ehs);
-        ehs = _fma_62;
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 52224));
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 52224 + 16));
-        eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_63 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_63;
-        eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_64 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_64;
-        eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_65 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_65;
-        eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_66 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_66;
-        eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_67 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_67;
-        eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_68 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_68;
-        eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_69 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_69;
-        eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_70 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_70;
-        float _exp2_15 = approx_exp2((wm[7] - ehm) * softmax_scale_log2);
-        wgt = ((wm[7] > -CAKE_INF) ? _exp2_15 : 0.0f);
-        float _fma_71 = __fmaf_rn(wgt, ws[7], ehs);
-        ehs = _fma_71;
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[0])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(0) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 60928));
-        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(*reinterpret_cast<uint32_t*>(&ew[4])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&ew[(4) + 3]))
-            : "r"(smem_tiles_addr + (unsigned int)((h_e * 136 + g_e * 8) * 4) + 60928 + 16));
-        eb = reinterpret_cast<float*>(&ew[0])[0];
-        float _fma_72 = __fmaf_rn(wgt, eb, eacc[0]);
-        eacc[0] = _fma_72;
-        eb = reinterpret_cast<float*>(&ew[1])[0];
-        float _fma_73 = __fmaf_rn(wgt, eb, eacc[1]);
-        eacc[1] = _fma_73;
-        eb = reinterpret_cast<float*>(&ew[2])[0];
-        float _fma_74 = __fmaf_rn(wgt, eb, eacc[2]);
-        eacc[2] = _fma_74;
-        eb = reinterpret_cast<float*>(&ew[3])[0];
-        float _fma_75 = __fmaf_rn(wgt, eb, eacc[3]);
-        eacc[3] = _fma_75;
-        eb = reinterpret_cast<float*>(&ew[4])[0];
-        float _fma_76 = __fmaf_rn(wgt, eb, eacc[4]);
-        eacc[4] = _fma_76;
-        eb = reinterpret_cast<float*>(&ew[5])[0];
-        float _fma_77 = __fmaf_rn(wgt, eb, eacc[5]);
-        eacc[5] = _fma_77;
-        eb = reinterpret_cast<float*>(&ew[6])[0];
-        float _fma_78 = __fmaf_rn(wgt, eb, eacc[6]);
-        eacc[6] = _fma_78;
-        eb = reinterpret_cast<float*>(&ew[7])[0];
-        float _fma_79 = __fmaf_rn(wgt, eb, eacc[7]);
-        eacc[7] = _fma_79;
+        float _fma_67 = __fmaf_rn(wgt, eb, eacc[7]);
+        eacc[7] = _fma_67;
+        eb = reinterpret_cast<float*>(&ew[8])[0];
+        float _fma_68 = __fmaf_rn(wgt, eb, eacc[8]);
+        eacc[8] = _fma_68;
+        eb = reinterpret_cast<float*>(&ew[9])[0];
+        float _fma_69 = __fmaf_rn(wgt, eb, eacc[9]);
+        eacc[9] = _fma_69;
+        eb = reinterpret_cast<float*>(&ew[10])[0];
+        float _fma_70 = __fmaf_rn(wgt, eb, eacc[10]);
+        eacc[10] = _fma_70;
+        eb = reinterpret_cast<float*>(&ew[11])[0];
+        float _fma_71 = __fmaf_rn(wgt, eb, eacc[11]);
+        eacc[11] = _fma_71;
+        eb = reinterpret_cast<float*>(&ew[12])[0];
+        float _fma_72 = __fmaf_rn(wgt, eb, eacc[12]);
+        eacc[12] = _fma_72;
+        eb = reinterpret_cast<float*>(&ew[13])[0];
+        float _fma_73 = __fmaf_rn(wgt, eb, eacc[13]);
+        eacc[13] = _fma_73;
+        eb = reinterpret_cast<float*>(&ew[14])[0];
+        float _fma_74 = __fmaf_rn(wgt, eb, eacc[14]);
+        eacc[14] = _fma_74;
+        eb = reinterpret_cast<float*>(&ew[15])[0];
+        float _fma_75 = __fmaf_rn(wgt, eb, eacc[15]);
+        eacc[15] = _fma_75;
         hm = ehm;
         hs = ehs;
         if (owner != rank) {
             uint32_t _mapa_0;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_0) : "r"(smem_zone_addr + (unsigned int)((slot * 4 + hl) * 512) + (unsigned int)(g_e * 32)), "r"(owner));
+                : "=r"(_mapa_0) : "r"(smem_zone_addr + (unsigned int)((slot * 2 + hl) * 512) + (unsigned int)(g_e * 64)), "r"(owner));
             uint32_t _mapa_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
@@ -3212,11 +3201,17 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
                 :: "r"(_mapa_0 + 16), "r"(__float_as_uint(eacc[4])), "r"(__float_as_uint(eacc[5])), "r"(__float_as_uint(eacc[6])), "r"(__float_as_uint(eacc[7])), "r"(_mapa_1) : "memory");
+            asm volatile(
+                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                :: "r"(_mapa_0 + 32), "r"(__float_as_uint(eacc[8])), "r"(__float_as_uint(eacc[9])), "r"(__float_as_uint(eacc[10])), "r"(__float_as_uint(eacc[11])), "r"(_mapa_1) : "memory");
+            asm volatile(
+                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                :: "r"(_mapa_0 + 48), "r"(__float_as_uint(eacc[12])), "r"(__float_as_uint(eacc[13])), "r"(__float_as_uint(eacc[14])), "r"(__float_as_uint(eacc[15])), "r"(_mapa_1) : "memory");
             if (g_e == 0) {
                 uint32_t _mapa_2;
                 asm volatile(
                     "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(_mapa_2) : "r"(smem_stat_addr + (unsigned int)((slot * 4 + hl) * 8)), "r"(owner));
+                    : "=r"(_mapa_2) : "r"(smem_stat_addr + (unsigned int)((slot * 2 + hl) * 8)), "r"(owner));
                 asm volatile(
                     "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
                     :: "r"(_mapa_2), "f"(hm), "r"(_mapa_1) : "memory");
@@ -3228,23 +3223,39 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
             mbarrier_wait_cluster_hint(part_ready_addr, item_par, 10000000);
             float tm = 0.0f;
             float ts = 0.0f;
-            float pm[3];
-            float ps[3];
+            float pm[7];
+            float ps[7];
             float tm_0 = hm;
             pm[0] = smem_stat[hl * 2];
             ps[0] = smem_stat[hl * 2 + 1];
-            float _fmax_20 = fmaxf(tm_0, pm[0]);
+            float _fmax_16 = fmaxf(tm_0, pm[0]);
+            tm_0 = _fmax_16;
+            pm[1] = smem_stat[(2 + hl) * 2];
+            ps[1] = smem_stat[(2 + hl) * 2 + 1];
+            float _fmax_17 = fmaxf(tm_0, pm[1]);
+            tm_0 = _fmax_17;
+            pm[2] = smem_stat[(4 + hl) * 2];
+            ps[2] = smem_stat[(4 + hl) * 2 + 1];
+            float _fmax_18 = fmaxf(tm_0, pm[2]);
+            tm_0 = _fmax_18;
+            pm[3] = smem_stat[(6 + hl) * 2];
+            ps[3] = smem_stat[(6 + hl) * 2 + 1];
+            float _fmax_19 = fmaxf(tm_0, pm[3]);
+            tm_0 = _fmax_19;
+            pm[4] = smem_stat[(8 + hl) * 2];
+            ps[4] = smem_stat[(8 + hl) * 2 + 1];
+            float _fmax_20 = fmaxf(tm_0, pm[4]);
             tm_0 = _fmax_20;
-            pm[1] = smem_stat[(4 + hl) * 2];
-            ps[1] = smem_stat[(4 + hl) * 2 + 1];
-            float _fmax_21 = fmaxf(tm_0, pm[1]);
+            pm[5] = smem_stat[(10 + hl) * 2];
+            ps[5] = smem_stat[(10 + hl) * 2 + 1];
+            float _fmax_21 = fmaxf(tm_0, pm[5]);
             tm_0 = _fmax_21;
-            pm[2] = smem_stat[(8 + hl) * 2];
-            ps[2] = smem_stat[(8 + hl) * 2 + 1];
-            float _fmax_22 = fmaxf(tm_0, pm[2]);
+            pm[6] = smem_stat[(12 + hl) * 2];
+            ps[6] = smem_stat[(12 + hl) * 2 + 1];
+            float _fmax_22 = fmaxf(tm_0, pm[6]);
             tm_0 = _fmax_22;
-            float _exp2_16 = approx_exp2((hm - tm_0) * softmax_scale_log2);
-            float w0 = ((hm > -CAKE_INF) ? _exp2_16 : 0.0f);
+            float _exp2_12 = approx_exp2((hm - tm_0) * softmax_scale_log2);
+            float w0 = ((hm > -CAKE_INF) ? _exp2_12 : 0.0f);
             float ts_1 = w0 * hs;
             ov[0] = w0 * eacc[0];
             ov[1] = w0 * eacc[1];
@@ -3254,111 +3265,465 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
             ov[5] = w0 * eacc[5];
             ov[6] = w0 * eacc[6];
             ov[7] = w0 * eacc[7];
+            ov[8] = w0 * eacc[8];
+            ov[9] = w0 * eacc[9];
+            ov[10] = w0 * eacc[10];
+            ov[11] = w0 * eacc[11];
+            ov[12] = w0 * eacc[12];
+            ov[13] = w0 * eacc[13];
+            ov[14] = w0 * eacc[14];
+            ov[15] = w0 * eacc[15];
             float wp = 0.0f;
-            unsigned int zw[8];
+            unsigned int zw[16];
             float zb = 0.0f;
-            float _exp2_17 = approx_exp2((pm[0] - tm_0) * softmax_scale_log2);
-            wp = ((pm[0] > -CAKE_INF) ? _exp2_17 : 0.0f);
-            float _fma_80 = __fmaf_rn(wp, ps[0], ts_1);
-            ts_1 = _fma_80;
+            float _exp2_13 = approx_exp2((pm[0] - tm_0) * softmax_scale_log2);
+            wp = ((pm[0] > -CAKE_INF) ? _exp2_13 : 0.0f);
+            float _fma_76 = __fmaf_rn(wp, ps[0], ts_1);
+            ts_1 = _fma_76;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
-                : "r"(smem_zone_addr + (unsigned int)(hl * 512) + (unsigned int)(g_e * 32)));
+                : "r"(smem_zone_addr + (unsigned int)(hl * 512) + (unsigned int)(g_e * 64)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
-                : "r"(smem_zone_addr + (unsigned int)(hl * 512) + (unsigned int)(g_e * 32) + 16));
+                : "r"(smem_zone_addr + (unsigned int)(hl * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)(hl * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)(hl * 512) + (unsigned int)(g_e * 64) + 48));
             zb = reinterpret_cast<float*>(&zw[0])[0];
-            float _fma_81 = __fmaf_rn(wp, zb, ov[0]);
-            ov[0] = _fma_81;
+            float _fma_77 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_77;
             zb = reinterpret_cast<float*>(&zw[1])[0];
-            float _fma_82 = __fmaf_rn(wp, zb, ov[1]);
-            ov[1] = _fma_82;
+            float _fma_78 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_78;
             zb = reinterpret_cast<float*>(&zw[2])[0];
-            float _fma_83 = __fmaf_rn(wp, zb, ov[2]);
-            ov[2] = _fma_83;
+            float _fma_79 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_79;
             zb = reinterpret_cast<float*>(&zw[3])[0];
-            float _fma_84 = __fmaf_rn(wp, zb, ov[3]);
-            ov[3] = _fma_84;
+            float _fma_80 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_80;
             zb = reinterpret_cast<float*>(&zw[4])[0];
-            float _fma_85 = __fmaf_rn(wp, zb, ov[4]);
-            ov[4] = _fma_85;
+            float _fma_81 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_81;
             zb = reinterpret_cast<float*>(&zw[5])[0];
-            float _fma_86 = __fmaf_rn(wp, zb, ov[5]);
-            ov[5] = _fma_86;
+            float _fma_82 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_82;
             zb = reinterpret_cast<float*>(&zw[6])[0];
-            float _fma_87 = __fmaf_rn(wp, zb, ov[6]);
-            ov[6] = _fma_87;
+            float _fma_83 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_83;
             zb = reinterpret_cast<float*>(&zw[7])[0];
-            float _fma_88 = __fmaf_rn(wp, zb, ov[7]);
-            ov[7] = _fma_88;
-            float _exp2_18 = approx_exp2((pm[1] - tm_0) * softmax_scale_log2);
-            wp = ((pm[1] > -CAKE_INF) ? _exp2_18 : 0.0f);
-            float _fma_89 = __fmaf_rn(wp, ps[1], ts_1);
-            ts_1 = _fma_89;
+            float _fma_84 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_84;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_85 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_85;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_86 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_86;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_87 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_87;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_88 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_88;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_89 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_89;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_90 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_90;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_91 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_91;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_92 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_92;
+            float _exp2_14 = approx_exp2((pm[1] - tm_0) * softmax_scale_log2);
+            wp = ((pm[1] > -CAKE_INF) ? _exp2_14 : 0.0f);
+            float _fma_93 = __fmaf_rn(wp, ps[1], ts_1);
+            ts_1 = _fma_93;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
-                : "r"(smem_zone_addr + (unsigned int)((4 + hl) * 512) + (unsigned int)(g_e * 32)));
+                : "r"(smem_zone_addr + (unsigned int)((2 + hl) * 512) + (unsigned int)(g_e * 64)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
-                : "r"(smem_zone_addr + (unsigned int)((4 + hl) * 512) + (unsigned int)(g_e * 32) + 16));
+                : "r"(smem_zone_addr + (unsigned int)((2 + hl) * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((2 + hl) * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((2 + hl) * 512) + (unsigned int)(g_e * 64) + 48));
             zb = reinterpret_cast<float*>(&zw[0])[0];
-            float _fma_90 = __fmaf_rn(wp, zb, ov[0]);
-            ov[0] = _fma_90;
+            float _fma_94 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_94;
             zb = reinterpret_cast<float*>(&zw[1])[0];
-            float _fma_91 = __fmaf_rn(wp, zb, ov[1]);
-            ov[1] = _fma_91;
+            float _fma_95 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_95;
             zb = reinterpret_cast<float*>(&zw[2])[0];
-            float _fma_92 = __fmaf_rn(wp, zb, ov[2]);
-            ov[2] = _fma_92;
+            float _fma_96 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_96;
             zb = reinterpret_cast<float*>(&zw[3])[0];
-            float _fma_93 = __fmaf_rn(wp, zb, ov[3]);
-            ov[3] = _fma_93;
+            float _fma_97 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_97;
             zb = reinterpret_cast<float*>(&zw[4])[0];
-            float _fma_94 = __fmaf_rn(wp, zb, ov[4]);
-            ov[4] = _fma_94;
+            float _fma_98 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_98;
             zb = reinterpret_cast<float*>(&zw[5])[0];
-            float _fma_95 = __fmaf_rn(wp, zb, ov[5]);
-            ov[5] = _fma_95;
+            float _fma_99 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_99;
             zb = reinterpret_cast<float*>(&zw[6])[0];
-            float _fma_96 = __fmaf_rn(wp, zb, ov[6]);
-            ov[6] = _fma_96;
+            float _fma_100 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_100;
             zb = reinterpret_cast<float*>(&zw[7])[0];
-            float _fma_97 = __fmaf_rn(wp, zb, ov[7]);
-            ov[7] = _fma_97;
-            float _exp2_19 = approx_exp2((pm[2] - tm_0) * softmax_scale_log2);
-            wp = ((pm[2] > -CAKE_INF) ? _exp2_19 : 0.0f);
-            float _fma_98 = __fmaf_rn(wp, ps[2], ts_1);
-            ts_1 = _fma_98;
+            float _fma_101 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_101;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_102 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_102;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_103 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_103;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_104 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_104;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_105 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_105;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_106 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_106;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_107 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_107;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_108 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_108;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_109 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_109;
+            float _exp2_15 = approx_exp2((pm[2] - tm_0) * softmax_scale_log2);
+            wp = ((pm[2] > -CAKE_INF) ? _exp2_15 : 0.0f);
+            float _fma_110 = __fmaf_rn(wp, ps[2], ts_1);
+            ts_1 = _fma_110;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
-                : "r"(smem_zone_addr + (unsigned int)((8 + hl) * 512) + (unsigned int)(g_e * 32)));
+                : "r"(smem_zone_addr + (unsigned int)((4 + hl) * 512) + (unsigned int)(g_e * 64)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
-                : "r"(smem_zone_addr + (unsigned int)((8 + hl) * 512) + (unsigned int)(g_e * 32) + 16));
+                : "r"(smem_zone_addr + (unsigned int)((4 + hl) * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((4 + hl) * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((4 + hl) * 512) + (unsigned int)(g_e * 64) + 48));
             zb = reinterpret_cast<float*>(&zw[0])[0];
-            float _fma_99 = __fmaf_rn(wp, zb, ov[0]);
-            ov[0] = _fma_99;
+            float _fma_111 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_111;
             zb = reinterpret_cast<float*>(&zw[1])[0];
-            float _fma_100 = __fmaf_rn(wp, zb, ov[1]);
-            ov[1] = _fma_100;
+            float _fma_112 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_112;
             zb = reinterpret_cast<float*>(&zw[2])[0];
-            float _fma_101 = __fmaf_rn(wp, zb, ov[2]);
-            ov[2] = _fma_101;
+            float _fma_113 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_113;
             zb = reinterpret_cast<float*>(&zw[3])[0];
-            float _fma_102 = __fmaf_rn(wp, zb, ov[3]);
-            ov[3] = _fma_102;
+            float _fma_114 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_114;
             zb = reinterpret_cast<float*>(&zw[4])[0];
-            float _fma_103 = __fmaf_rn(wp, zb, ov[4]);
-            ov[4] = _fma_103;
+            float _fma_115 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_115;
             zb = reinterpret_cast<float*>(&zw[5])[0];
-            float _fma_104 = __fmaf_rn(wp, zb, ov[5]);
-            ov[5] = _fma_104;
+            float _fma_116 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_116;
             zb = reinterpret_cast<float*>(&zw[6])[0];
-            float _fma_105 = __fmaf_rn(wp, zb, ov[6]);
-            ov[6] = _fma_105;
+            float _fma_117 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_117;
             zb = reinterpret_cast<float*>(&zw[7])[0];
-            float _fma_106 = __fmaf_rn(wp, zb, ov[7]);
-            ov[7] = _fma_106;
+            float _fma_118 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_118;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_119 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_119;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_120 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_120;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_121 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_121;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_122 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_122;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_123 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_123;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_124 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_124;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_125 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_125;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_126 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_126;
+            float _exp2_16 = approx_exp2((pm[3] - tm_0) * softmax_scale_log2);
+            wp = ((pm[3] > -CAKE_INF) ? _exp2_16 : 0.0f);
+            float _fma_127 = __fmaf_rn(wp, ps[3], ts_1);
+            ts_1 = _fma_127;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((6 + hl) * 512) + (unsigned int)(g_e * 64)));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((6 + hl) * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((6 + hl) * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((6 + hl) * 512) + (unsigned int)(g_e * 64) + 48));
+            zb = reinterpret_cast<float*>(&zw[0])[0];
+            float _fma_128 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_128;
+            zb = reinterpret_cast<float*>(&zw[1])[0];
+            float _fma_129 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_129;
+            zb = reinterpret_cast<float*>(&zw[2])[0];
+            float _fma_130 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_130;
+            zb = reinterpret_cast<float*>(&zw[3])[0];
+            float _fma_131 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_131;
+            zb = reinterpret_cast<float*>(&zw[4])[0];
+            float _fma_132 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_132;
+            zb = reinterpret_cast<float*>(&zw[5])[0];
+            float _fma_133 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_133;
+            zb = reinterpret_cast<float*>(&zw[6])[0];
+            float _fma_134 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_134;
+            zb = reinterpret_cast<float*>(&zw[7])[0];
+            float _fma_135 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_135;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_136 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_136;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_137 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_137;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_138 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_138;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_139 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_139;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_140 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_140;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_141 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_141;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_142 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_142;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_143 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_143;
+            float _exp2_17 = approx_exp2((pm[4] - tm_0) * softmax_scale_log2);
+            wp = ((pm[4] > -CAKE_INF) ? _exp2_17 : 0.0f);
+            float _fma_144 = __fmaf_rn(wp, ps[4], ts_1);
+            ts_1 = _fma_144;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((8 + hl) * 512) + (unsigned int)(g_e * 64)));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((8 + hl) * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((8 + hl) * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((8 + hl) * 512) + (unsigned int)(g_e * 64) + 48));
+            zb = reinterpret_cast<float*>(&zw[0])[0];
+            float _fma_145 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_145;
+            zb = reinterpret_cast<float*>(&zw[1])[0];
+            float _fma_146 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_146;
+            zb = reinterpret_cast<float*>(&zw[2])[0];
+            float _fma_147 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_147;
+            zb = reinterpret_cast<float*>(&zw[3])[0];
+            float _fma_148 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_148;
+            zb = reinterpret_cast<float*>(&zw[4])[0];
+            float _fma_149 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_149;
+            zb = reinterpret_cast<float*>(&zw[5])[0];
+            float _fma_150 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_150;
+            zb = reinterpret_cast<float*>(&zw[6])[0];
+            float _fma_151 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_151;
+            zb = reinterpret_cast<float*>(&zw[7])[0];
+            float _fma_152 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_152;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_153 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_153;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_154 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_154;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_155 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_155;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_156 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_156;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_157 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_157;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_158 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_158;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_159 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_159;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_160 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_160;
+            float _exp2_18 = approx_exp2((pm[5] - tm_0) * softmax_scale_log2);
+            wp = ((pm[5] > -CAKE_INF) ? _exp2_18 : 0.0f);
+            float _fma_161 = __fmaf_rn(wp, ps[5], ts_1);
+            ts_1 = _fma_161;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((10 + hl) * 512) + (unsigned int)(g_e * 64)));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((10 + hl) * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((10 + hl) * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((10 + hl) * 512) + (unsigned int)(g_e * 64) + 48));
+            zb = reinterpret_cast<float*>(&zw[0])[0];
+            float _fma_162 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_162;
+            zb = reinterpret_cast<float*>(&zw[1])[0];
+            float _fma_163 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_163;
+            zb = reinterpret_cast<float*>(&zw[2])[0];
+            float _fma_164 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_164;
+            zb = reinterpret_cast<float*>(&zw[3])[0];
+            float _fma_165 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_165;
+            zb = reinterpret_cast<float*>(&zw[4])[0];
+            float _fma_166 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_166;
+            zb = reinterpret_cast<float*>(&zw[5])[0];
+            float _fma_167 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_167;
+            zb = reinterpret_cast<float*>(&zw[6])[0];
+            float _fma_168 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_168;
+            zb = reinterpret_cast<float*>(&zw[7])[0];
+            float _fma_169 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_169;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_170 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_170;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_171 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_171;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_172 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_172;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_173 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_173;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_174 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_174;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_175 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_175;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_176 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_176;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_177 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_177;
+            float _exp2_19 = approx_exp2((pm[6] - tm_0) * softmax_scale_log2);
+            wp = ((pm[6] > -CAKE_INF) ? _exp2_19 : 0.0f);
+            float _fma_178 = __fmaf_rn(wp, ps[6], ts_1);
+            ts_1 = _fma_178;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[0])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(0) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((12 + hl) * 512) + (unsigned int)(g_e * 64)));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[4])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(4) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((12 + hl) * 512) + (unsigned int)(g_e * 64) + 16));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[8])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(8) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((12 + hl) * 512) + (unsigned int)(g_e * 64) + 32));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&zw[12])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&zw[(12) + 3]))
+                : "r"(smem_zone_addr + (unsigned int)((12 + hl) * 512) + (unsigned int)(g_e * 64) + 48));
+            zb = reinterpret_cast<float*>(&zw[0])[0];
+            float _fma_179 = __fmaf_rn(wp, zb, ov[0]);
+            ov[0] = _fma_179;
+            zb = reinterpret_cast<float*>(&zw[1])[0];
+            float _fma_180 = __fmaf_rn(wp, zb, ov[1]);
+            ov[1] = _fma_180;
+            zb = reinterpret_cast<float*>(&zw[2])[0];
+            float _fma_181 = __fmaf_rn(wp, zb, ov[2]);
+            ov[2] = _fma_181;
+            zb = reinterpret_cast<float*>(&zw[3])[0];
+            float _fma_182 = __fmaf_rn(wp, zb, ov[3]);
+            ov[3] = _fma_182;
+            zb = reinterpret_cast<float*>(&zw[4])[0];
+            float _fma_183 = __fmaf_rn(wp, zb, ov[4]);
+            ov[4] = _fma_183;
+            zb = reinterpret_cast<float*>(&zw[5])[0];
+            float _fma_184 = __fmaf_rn(wp, zb, ov[5]);
+            ov[5] = _fma_184;
+            zb = reinterpret_cast<float*>(&zw[6])[0];
+            float _fma_185 = __fmaf_rn(wp, zb, ov[6]);
+            ov[6] = _fma_185;
+            zb = reinterpret_cast<float*>(&zw[7])[0];
+            float _fma_186 = __fmaf_rn(wp, zb, ov[7]);
+            ov[7] = _fma_186;
+            zb = reinterpret_cast<float*>(&zw[8])[0];
+            float _fma_187 = __fmaf_rn(wp, zb, ov[8]);
+            ov[8] = _fma_187;
+            zb = reinterpret_cast<float*>(&zw[9])[0];
+            float _fma_188 = __fmaf_rn(wp, zb, ov[9]);
+            ov[9] = _fma_188;
+            zb = reinterpret_cast<float*>(&zw[10])[0];
+            float _fma_189 = __fmaf_rn(wp, zb, ov[10]);
+            ov[10] = _fma_189;
+            zb = reinterpret_cast<float*>(&zw[11])[0];
+            float _fma_190 = __fmaf_rn(wp, zb, ov[11]);
+            ov[11] = _fma_190;
+            zb = reinterpret_cast<float*>(&zw[12])[0];
+            float _fma_191 = __fmaf_rn(wp, zb, ov[12]);
+            ov[12] = _fma_191;
+            zb = reinterpret_cast<float*>(&zw[13])[0];
+            float _fma_192 = __fmaf_rn(wp, zb, ov[13]);
+            ov[13] = _fma_192;
+            zb = reinterpret_cast<float*>(&zw[14])[0];
+            float _fma_193 = __fmaf_rn(wp, zb, ov[14]);
+            ov[14] = _fma_193;
+            zb = reinterpret_cast<float*>(&zw[15])[0];
+            float _fma_194 = __fmaf_rn(wp, zb, ov[15]);
+            ov[15] = _fma_194;
             float _rcp_0 = approx_rcp(ts_1);
             float tinv = ((ts_1 > 0.0f) ? output_scale * _rcp_0 : 0.0f);
             ov[0] = ov[0] * tinv;
@@ -3369,17 +3734,30 @@ kernel_cake_msa_nvfp4_decode_e8756444575e4dd50978(__nv_bfloat16* __restrict__ Q,
             ov[5] = ov[5] * tinv;
             ov[6] = ov[6] * tinv;
             ov[7] = ov[7] * tinv;
+            ov[8] = ov[8] * tinv;
+            ov[9] = ov[9] * tinv;
+            ov[10] = ov[10] * tinv;
+            ov[11] = ov[11] * tinv;
+            ov[12] = ov[12] * tinv;
+            ov[13] = ov[13] * tinv;
+            ov[14] = ov[14] * tinv;
+            ov[15] = ov[15] * tinv;
             tm = tm_0;
             ts = ts_1;
             if (h_e < group_size) {
-                int o_off = (q_row0 + h_e) * 128 + g_e * 8;
+                int o_off = (q_row0 + h_e) * 128 + g_e * 16;
                 {
-                    __nv_bfloat162 _pk[4];
+                    __nv_bfloat162 _pk[8];
                     _pk[0] = __floats2bfloat162_rn(ov[0 + 0], ov[0 + 1]);
                     _pk[1] = __floats2bfloat162_rn(ov[0 + 2], ov[0 + 3]);
                     _pk[2] = __floats2bfloat162_rn(ov[0 + 4], ov[0 + 5]);
                     _pk[3] = __floats2bfloat162_rn(ov[0 + 6], ov[0 + 7]);
+                    _pk[4] = __floats2bfloat162_rn(ov[0 + 8], ov[0 + 9]);
+                    _pk[5] = __floats2bfloat162_rn(ov[0 + 10], ov[0 + 11]);
+                    _pk[6] = __floats2bfloat162_rn(ov[0 + 12], ov[0 + 13]);
+                    _pk[7] = __floats2bfloat162_rn(ov[0 + 14], ov[0 + 15]);
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + o_off))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + o_off))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
                 }
                 if (g_e == 0) {
                     float lse = -CAKE_INF;
