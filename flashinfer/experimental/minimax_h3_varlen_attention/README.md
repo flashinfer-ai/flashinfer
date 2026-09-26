@@ -33,7 +33,10 @@ positive count works). `softmax_scale` defaults to `1 / sqrt(128)`.
 
 ```python
 import torch
-from flashinfer.prefill import minimax_h3_varlen_attention, minimax_h3_varlen_nvfp4_attention
+from flashinfer.prefill import (
+    minimax_h3_varlen_attention,
+    minimax_h3_varlen_nvfp4_attention,
+)
 
 cu = [0, 133, 300, 900]
 T, H = cu[-1], 7
@@ -41,9 +44,13 @@ q = torch.randn(T, H, 128, dtype=torch.bfloat16, device="cuda")
 k, v = torch.randn_like(q), torch.randn_like(q)
 cu_seqlens = torch.tensor(cu, dtype=torch.int32, device="cuda")
 
-out = minimax_h3_varlen_attention(q, k, v, cu_seqlens)                     # BF16
-out8 = minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp8")  # NVFP4 QK, FP8 PV
-out4 = minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp4")  # NVFP4 QK, NVFP4 PV
+out = minimax_h3_varlen_attention(q, k, v, cu_seqlens)  # BF16
+out8 = minimax_h3_varlen_nvfp4_attention(
+    q, k, v, cu_seqlens, pv_mode="fp8"
+)  # NVFP4 QK, FP8 PV
+out4 = minimax_h3_varlen_nvfp4_attention(
+    q, k, v, cu_seqlens, pv_mode="fp4"
+)  # NVFP4 QK, NVFP4 PV
 ```
 
 Both one-shot APIs read `cu_seqlens` back to the host (one synchronization)
@@ -58,11 +65,13 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
 )
 
 runner = prepare_minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out)
-runner()            # launches on the current stream, returns out (no allocation)
-nv = prepare_minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp8", out=out8)
-nv.quantize()       # quantization only (fp8: the amax kernel + one fused launch)
-nv.attention()      # attention launch only
-nv()                # complete pipeline (what the one-shot API times)
+runner()  # launches on the current stream, returns out (no allocation)
+nv = prepare_minimax_h3_varlen_nvfp4_attention(
+    q, k, v, cu_seqlens, pv_mode="fp8", out=out8
+)
+nv.quantize()  # quantization only (fp8: the amax kernel + one fused launch)
+nv.attention()  # attention launch only
+nv()  # complete pipeline (what the one-shot API times)
 ```
 
 A runner is bound to one `cu_seqlens`, one shape set and one set of tensor

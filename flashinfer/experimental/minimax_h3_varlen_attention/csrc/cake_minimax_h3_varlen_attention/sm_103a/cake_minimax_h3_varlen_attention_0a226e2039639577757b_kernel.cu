@@ -51,6 +51,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define SMEM_AMAX_SMEM_OFF 0
+#define SMEM_AMAX_SMEM_STAGE_BYTES 32
+#define SMEM_AMAX_SMEM_STRIDE 32
+#define SMEM_TOTAL 128
 #define THREADS 256
 
 #include <math_constants.h>
@@ -614,15 +618,22 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_b40e2945061cd567f966(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp8, float* __restrict__ v_amax, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
+kernel_cake_minimax_h3_varlen_attention_0a226e2039639577757b(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp8, float* __restrict__ v_amax, float* __restrict__ v_amax_partial, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    // Kernel setup ops
+    float* amax_smem = reinterpret_cast<float*>(smem_raw + 0);
+    const int amax_smem_addr = smem + 0;
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -633,10 +644,6 @@ kernel_cake_minimax_h3_varlen_attention_b40e2945061cd567f966(__nv_bfloat16* __re
     int pblock = tile - head * PB;
     int first_token = block_token[pblock] + sub * 32;
     int valid_rows = block_valid[pblock] - sub * 32;
-    float amax = v_amax[0];
-    float _max_0 = max_noftz(amax, 1e-12f);
-    float _rcp_0 = approx_rcp(_max_0);
-    float v_inverse_scale = _rcp_0 * 448.0f;
     float q_values[16];
     float k_values[16];
     float v_values[16];
@@ -846,6 +853,37 @@ kernel_cake_minimax_h3_varlen_attention_b40e2945061cd567f966(__nv_bfloat16* __re
             }
         }
     }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    float amax_lo = v_amax_partial[tid];
+    float amax_hi = v_amax_partial[tid + 256];
+    float _max_0 = max_noftz(amax_lo, amax_hi);
+    float amax_local = _max_0;
+    float _warp_reduce_0 = amax_local;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+    amax_local = _warp_reduce_0;
+    float _cross_warp_reduce_0;
+    if (lane == 0) { amax_smem[warp] = amax_local; }
+    __syncthreads();
+    if (warp == 0) {
+        float _br = (lane < 8) ? amax_smem[lane] : -CUDART_INF_F;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _br = fmaxf(_br, __shfl_xor_sync(0xFFFFFFFF, _br, offset));
+        if (lane == 0) { amax_smem[0] = _br; }
+    }
+    __syncthreads();
+    _cross_warp_reduce_0 = amax_smem[0];
+    float amax = _cross_warp_reduce_0;
+    float _max_1 = max_noftz(amax, 1e-12f);
+    float _rcp_0 = approx_rcp(_max_1);
+    float v_inverse_scale = _rcp_0 * 448.0f;
+    if (bid_0 == 0) {
+        if (tid == 0) {
+            *(reinterpret_cast<float*>(v_amax) + (0)) = amax;
+        }
+    }
     #pragma unroll
     for (int iteration_1 = 0; iteration_1 < 1; iteration_1++) {
         int vector_1 = tid + iteration_1 * 256;
@@ -864,10 +902,10 @@ kernel_cake_minimax_h3_varlen_attention_b40e2945061cd567f966(__nv_bfloat16* __re
             q_values_min = fminf(q_values_min, (q_values + iteration_1 * 16)[_lr]);
         }
         float value_min = q_values_min;
-        float _max_1 = max_noftz(value_max, -value_min);
-        float amax_0 = _max_1;
-        float _max_2 = max_noftz(amax_0 * 0.16666666666666666f, 0.001953125f);
-        float raw_scale = _max_2;
+        float _max_2 = max_noftz(value_max, -value_min);
+        float amax_0 = _max_2;
+        float _max_3 = max_noftz(amax_0 * 0.16666666666666666f, 0.001953125f);
+        float raw_scale = _max_3;
         float _fp8_rt_0;
         uint16_t _e4m3x2_3;
         uint32_t _f16x2_3;
@@ -898,10 +936,10 @@ kernel_cake_minimax_h3_varlen_attention_b40e2945061cd567f966(__nv_bfloat16* __re
             k_values_min = fminf(k_values_min, (k_values + iteration_1 * 16)[_lr]);
         }
         float value_min_2 = k_values_min;
-        float _max_3 = max_noftz(value_max_1, -value_min_2);
-        float amax_3 = _max_3;
-        float _max_4 = max_noftz(amax_3 * 0.16666666666666666f, 0.001953125f);
-        float raw_scale_4 = _max_4;
+        float _max_4 = max_noftz(value_max_1, -value_min_2);
+        float amax_3 = _max_4;
+        float _max_5 = max_noftz(amax_3 * 0.16666666666666666f, 0.001953125f);
+        float raw_scale_4 = _max_5;
         float _fp8_rt_1;
         uint16_t _e4m3x2_4;
         uint32_t _f16x2_4;
