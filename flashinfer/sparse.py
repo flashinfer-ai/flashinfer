@@ -1683,9 +1683,12 @@ class VariableBlockSparseAttentionWrapper:
             buffer should be the same as the device of the input tensors.
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3`` or the explicit
-            ``cake`` (generated Cake kernel; Hopper SM90 only: BF16 HND, head_dim 128,
+            ``cake`` (generated Cake kernels; Hopper SM90 only: BF16 HND, head_dim 128,
             equal Q/KV head counts, noncausal 64-token blocks, 1..64 selected KV blocks
-            per query block). Defaults to ``auto``. Automatic selection never selects
+            per query block; small selections (at most 6 blocks per query block and a
+            grid that fits one wave) route to a one-CTA-per-query-block kernel with the
+            plan passed in the kernel parameter bank, everything else to the persistent
+            kernel). Defaults to ``auto``. Automatic selection never selects
             ``cake``.  If set to ``auto``, the function will automatically choose the
             backend based on the device architecture and kernel availability.
         """

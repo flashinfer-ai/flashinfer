@@ -571,6 +571,8 @@ class CakeVsaSm90Plan:
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         if torch.cuda.get_device_capability(self.device) != (9, 0):
             raise ValueError("cake (SM90) VSA requires Hopper compute capability 9.0")
         if causal:
