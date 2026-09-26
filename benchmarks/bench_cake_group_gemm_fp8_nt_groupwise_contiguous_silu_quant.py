@@ -3,7 +3,10 @@
 """Benchmark the generated SM100a grouped FP8 gate_up GEMM + SwiGLU + FP8 quant programs against the FlashInfer chain.
 
 Chain = CuTe-DSL ``group_gemm_fp8_nt_groupwise_contiguous`` + ``silu_and_mul`` +
-``per_token_group_quant_8bit`` (sum of the three kernels' CUPTI times, cold L2).
+``per_token_group_quant_8bit``.  Both arms are timed the same way: captured once into a CUDA graph and
+replayed with a cold L2 (CUPTI span of the graph's kernels), so host launch gaps of the eager calls do not
+enter either side.  The eager span of the prepared launch and the eager per-kernel times of the chain are
+reported as diagnostics.
 
 Usage: python benchmarks/bench_cake_group_gemm_fp8_nt_groupwise_contiguous_silu_quant.py [--json out.json]
 """
@@ -67,9 +70,14 @@ def make_inputs(group_counts, n2, k, device):
     return a, b, a_scale.contiguous(), b_scale.contiguous(), m_indices.contiguous()
 
 
-def _median_ms(fn):
+def _median_ms(fn, *, graph):
+    """Median cold-L2 CUPTI time of ``fn``; ``graph=True`` replays one CUDA graph capture of ``fn``."""
     return float(
-        torch.tensor(bench_gpu_time(fn, cold_l2_cache=True, enable_cupti=True)).median()
+        torch.tensor(
+            bench_gpu_time(
+                fn, cold_l2_cache=True, enable_cupti=True, use_cuda_graph=graph
+            )
+        ).median()
     )
 
 
@@ -97,19 +105,32 @@ def main():
         q_exact_frac = float(
             (fused_q.view(torch.uint8) == chain_q.view(torch.uint8)).float().mean()
         )
-        fused_ms = _median_ms(prepared.launch)
+
+        def chain():
+            group_gemm_fp8_nt_groupwise_contiguous(
+                a, b, a_scale, b_scale, m_indices, out=y
+            )
+            silu_and_mul(y, out=act)
+            per_token_group_quant_8bit(act, GROUP_SIZE, EPS, torch.float8_e4m3fn)
+
+        fused_ms = _median_ms(prepared.launch, graph=True)
+        chain_ms = _median_ms(chain, graph=True)
+        # diagnostics: eager span of the prepared launch (includes host launch gaps between its kernels) and
+        # eager per-kernel times of the chain
+        fused_eager_ms = _median_ms(prepared.launch, graph=False)
         gemm_ms = _median_ms(
             lambda: group_gemm_fp8_nt_groupwise_contiguous(
                 a, b, a_scale, b_scale, m_indices, out=y
-            )
+            ),
+            graph=False,
         )
-        act_ms = _median_ms(lambda: silu_and_mul(y, out=act))
+        act_ms = _median_ms(lambda: silu_and_mul(y, out=act), graph=False)
         quant_ms = _median_ms(
             lambda: per_token_group_quant_8bit(
                 act, GROUP_SIZE, EPS, torch.float8_e4m3fn
-            )
+            ),
+            graph=False,
         )
-        chain_ms = gemm_ms + act_ms + quant_ms
         row = dict(
             label=label,
             M=m,
@@ -121,7 +142,9 @@ def main():
             prepared_kernels=prepared.num_kernels,
             grid=list(prepared.grid),
             fused_ms=fused_ms,
+            fused_eager_ms=fused_eager_ms,
             chain_ms=chain_ms,
+            chain_eager_kernel_sum_ms=gemm_ms + act_ms + quant_ms,
             chain_gemm_ms=gemm_ms,
             chain_silu_and_mul_ms=act_ms,
             chain_quant_ms=quant_ms,
@@ -131,8 +154,9 @@ def main():
         )
         rows.append(row)
         print(
-            f"{label:36s} {prepared.route}[{prepared.gemm_backend or '-'}] {fused_ms * 1e3:8.2f} us | chain {chain_ms * 1e3:8.2f} us "
-            f"(gemm {gemm_ms * 1e3:.2f} + act {act_ms * 1e3:.2f} + quant {quant_ms * 1e3:.2f}) "
+            f"{label:36s} {prepared.route}[{prepared.gemm_backend or '-'}] graph {fused_ms * 1e3:8.2f} us "
+            f"(eager {fused_eager_ms * 1e3:.2f}) | chain graph {chain_ms * 1e3:8.2f} us "
+            f"(eager kernels gemm {gemm_ms * 1e3:.2f} + act {act_ms * 1e3:.2f} + quant {quant_ms * 1e3:.2f}) "
             f"| {row['speedup']:.3f}x | scales exact {scale_exact} | fp8 equal {q_exact_frac:.4f}"
         )
     if args.json:
