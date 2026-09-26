@@ -22,14 +22,21 @@ KV blocks, 1..64 selected KV blocks per query block (ragged counts allowed),
 custom finite softmax scales (including 0 and negative), no LSE / PDL /
 positional encoding / logits soft cap.
 
-The plan is built on the host (:func:`plan_vsa_sm90`) and uploaded once: a per-CTA
-list of *tiles* for a persistent kernel (``grid = min(tiles, SMs)``).  A tile is
-either one 64-row query block whose KV list alternates between the two consumer
+Two kernels serve the contract.  Small problems (at most 6 selected KV blocks
+per query block, a grid that fits one wave, a plan that fits the kernel
+parameter budget; :func:`small_route`) run the *small-selection* kernel: one
+128-thread CTA per query block whose plan (``[count, blk...]`` int16 halfwords,
+:func:`plan_small`) travels in the launch parameters, so no metadata upload
+and no dependent global load precede the K/V loads.  Everything else runs the
+persistent kernel: the plan (:func:`plan_vsa_sm90`) is uploaded once as a
+per-CTA list of *tiles* (``grid = min(tiles, SMs)``).  A tile is either one
+64-row query block whose KV list alternates between the two consumer
 warpgroups (``split``) or two query blocks of one head that share the KV ring
-(``pair``); the mode with the smaller modelled makespan wins.  The layout of the
-int32 plan rows mirrors the Cake kernel (``loom/examples/weave/vsa_sm90_bf16.py``)
-and is validated by the kernel's own tests; :func:`plan_vsa_sm90` is a
-dependency-free port of the Cake planner and must stay byte-identical to it.
+(``pair``); the mode with the smaller modelled makespan wins.  The plan layouts
+mirror the Cake kernels (``loom/examples/weave/vsa_sm90_bf16.py`` and
+``vsa_sm90_small.py``) and are validated by the kernels' own tests; both
+planners are dependency-free ports of the Cake planners and must stay
+byte-identical to them.
 """
 
 from __future__ import annotations
@@ -63,6 +70,90 @@ MAX_OWN = MAX_SEQ // 2
 OWN_WORDS = MAX_OWN // 2
 META_OWN_OFF = META_SEQ_OFF + META_SEQ_WORDS
 META_WORDS = META_OWN_OFF + NUM_CONSUMER_WGS * OWN_WORDS  # 144
+
+# Small-selection route (port of loom/examples/weave/vsa_sm90_small.py).
+SMALL_KMAX_VARIANTS = (1, 3, 4, 6)
+SMALL_OCCUPANCY = {
+    1: 4,
+    3: 2,
+    4: 1,
+    6: 1,
+}  # CTAs per SM on H100 (49/113/145/209 KB SMEM)
+PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
+
+
+def small_kmax_for(capacity: int) -> int:
+    """Smallest compiled small-kernel variant that holds ``capacity`` blocks per tile."""
+    for kmax in SMALL_KMAX_VARIANTS:
+        if capacity <= kmax:
+            return kmax
+    raise ValueError(
+        f"small kernel supports at most {SMALL_KMAX_VARIANTS[-1]} KV blocks per query block, got {capacity}"
+    )
+
+
+def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[int]:
+    """KMAX of the small kernel when the problem should take the small route, else ``None``.
+
+    Rule: every query block selects at most ``SMALL_KMAX_VARIANTS[-1]`` KV blocks,
+    the whole grid fits one wave of the chosen variant (``tiles <= occupancy *
+    SMs``) and the plan fits the by-value parameter (``tiles * (kmax + 1) <=
+    PLAN_HALFWORDS``); everything larger goes to the persistent pair/split kernel.
+    """
+    mask = block_mask.to("cpu", torch.bool)
+    h, mb, _nb = mask.shape
+    capacity = int(mask.sum(dim=-1).max())
+    if capacity > SMALL_KMAX_VARIANTS[-1]:
+        return None
+    kmax = small_kmax_for(capacity)
+    if h * mb > SMALL_OCCUPANCY[kmax] * sms or h * mb * (kmax + 1) > PLAN_HALFWORDS:
+        return None
+    return kmax
+
+
+def plan_small(block_mask: torch.Tensor, *, kmax: Optional[int] = None) -> dict:
+    """Per-tile plan rows ``[count, blk0, ...]`` as int16 halfwords (``kmax + 1`` per tile).
+
+    Returns the CPU int16 ``plan`` of exactly ``PLAN_HALFWORDS`` elements (the
+    by-value kernel parameter, ``-1`` padded), or raises when the problem does
+    not fit.  Byte-identical to the Cake planner (``vsa_sm90_small.plan_small``).
+    """
+    mask = block_mask.to("cpu", torch.bool)
+    if mask.ndim != 3:
+        raise ValueError("block_mask must be (H, MB, NB)")
+    h, mb, nb = mask.shape
+    if nb > 32767:
+        raise ValueError("KV block ids must fit int16")
+    counts = mask.sum(dim=-1, dtype=torch.int32)
+    if bool((counts == 0).any()):
+        raise ValueError("every query block must select at least one KV block")
+    capacity = int(counts.max())
+    kmax = small_kmax_for(capacity) if kmax is None else int(kmax)
+    if kmax not in SMALL_KMAX_VARIANTS or kmax < capacity:
+        raise ValueError(f"kmax={kmax} cannot hold {capacity} blocks per tile")
+    tiles = h * mb
+    stride = kmax + 1
+    if tiles * stride > PLAN_HALFWORDS:
+        raise ValueError(
+            f"{tiles} tiles x {stride} halfwords exceed the {PLAN_HALFWORDS}-halfword plan parameter"
+        )
+    order = torch.argsort(~mask, dim=-1, stable=True)[..., :capacity]
+    valid = torch.arange(capacity) < counts.unsqueeze(-1)
+    ids = torch.where(valid, order, -1).to(torch.int16)
+    rows = torch.full((tiles, stride), -1, dtype=torch.int16)
+    rows[:, 0] = counts.reshape(-1).to(torch.int16)
+    rows[:, 1 : 1 + capacity] = ids.reshape(tiles, capacity)
+    plan = torch.full((PLAN_HALFWORDS,), -1, dtype=torch.int16)
+    plan[: tiles * stride] = rows.reshape(-1)
+    return {
+        "plan": plan,
+        "H": h,
+        "MB": mb,
+        "NB": nb,
+        "capacity": capacity,
+        "kmax": kmax,
+        "num_tiles": tiles,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +565,9 @@ class CakeVsaSm90Plan:
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: Optional[torch.dtype] = None,
         non_blocking: bool = True,
+        route: Optional[str] = None,
     ):
+        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"persistent"`` force one kernel."""
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
@@ -506,7 +599,30 @@ class CakeVsaSm90Plan:
         self.sm_scale = scale
         self.scale_log2 = scale * LOG2E
         props = torch.cuda.get_device_properties(self.device)
-        plan = plan_vsa_sm90(block_mask_map, sms=int(props.multi_processor_count))
+        sms = int(props.multi_processor_count)
+        if route not in (None, "small", "persistent"):
+            raise ValueError(
+                f"unknown route {route!r}; expected None, 'small' or 'persistent'"
+            )
+        small_kmax = small_route(block_mask_map, sms=sms) if route is None else None
+        if route == "small":
+            small_kmax = small_kmax_for(int(block_mask_map.to("cpu").sum(dim=-1).max()))
+        self.captured = False
+        self.small_kmax: Optional[int] = small_kmax
+        if small_kmax is not None:
+            plan = plan_small(block_mask_map, kmax=small_kmax)
+            self.mode = "small"
+            self.num_tiles = plan["num_tiles"]
+            self.num_ctas = plan["num_tiles"]
+            self.tile_stride = 0
+            self.num_heads = plan["H"]
+            self.qo_len = plan["MB"] * BLOCK
+            self.kv_len = plan["NB"] * BLOCK
+            # The plan is a launch parameter (CPU int16): nothing is uploaded,
+            # so there is no stream dependency and a captured graph replays it.
+            self.plan_param = plan["plan"].contiguous()
+            return
+        plan = plan_vsa_sm90(block_mask_map, sms=sms)
         self.mode = plan["mode"]
         self.num_ctas = plan["num_ctas"]
         self.num_tiles = plan["num_tiles"]
@@ -514,7 +630,6 @@ class CakeVsaSm90Plan:
         self.num_heads = plan["H"]
         self.qo_len = plan["MB"] * BLOCK
         self.kv_len = plan["NB"] * BLOCK
-        self.captured = False
         with torch.cuda.device(self.device):
             host_meta = plan["meta"]
             if non_blocking:
@@ -598,35 +713,52 @@ class CakeVsaSm90Plan:
 
         from .jit.cake_vsa_sm90 import load_cake_vsa_sm90_module
 
-        module, _record = load_cake_vsa_sm90_module()
+        stage = "attention" if self.small_kmax is None else f"small_k{self.small_kmax}"
+        module, _record = load_cake_vsa_sm90_module(stage)
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device)
             if torch.cuda.is_current_stream_capturing():
                 self.captured = True
-            # The plan may have been built on another stream: an event wait
-            # enqueues the dependency without a CPU synchronization.
-            stream.wait_event(self.ready)
+            if self.small_kmax is None:
+                # The plan may have been built on another stream: an event wait
+                # enqueues the dependency without a CPU synchronization.
+                stream.wait_event(self.ready)
             aligned_q = self._aligned(q)
             aligned_k = self._aligned(k)
             aligned_v = self._aligned(v)
             target = result if result.data_ptr() % 16 == 0 else torch.empty_like(result)
             with tvm_ffi.use_torch_stream():
-                module.run(
-                    aligned_q,
-                    aligned_k,
-                    aligned_v,
-                    target,
-                    self.meta,
-                    int(self.tile_stride),
-                    int(self.qo_len),
-                    int(self.kv_len),
-                    float(self.scale_log2),
-                    self.dbg,
-                    self.tl,
-                    int(self.num_ctas),
-                    1,
-                    1,
-                )
+                if self.small_kmax is not None:
+                    module.run(
+                        aligned_q,
+                        aligned_k,
+                        aligned_v,
+                        target,
+                        self.plan_param,
+                        int(self.qo_len),
+                        int(self.kv_len),
+                        float(self.scale_log2),
+                        int(self.num_tiles),
+                        1,
+                        1,
+                    )
+                else:
+                    module.run(
+                        aligned_q,
+                        aligned_k,
+                        aligned_v,
+                        target,
+                        self.meta,
+                        int(self.tile_stride),
+                        int(self.qo_len),
+                        int(self.kv_len),
+                        float(self.scale_log2),
+                        self.dbg,
+                        self.tl,
+                        int(self.num_ctas),
+                        1,
+                        1,
+                    )
             if target is not result:
                 result.copy_(target)
         return result
@@ -643,4 +775,10 @@ def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
         return CakeVsaSm90Plan(device, *args, **kwargs)
 
 
-__all__ = ["CakeVsaSm90Plan", "create_plan", "plan_vsa_sm90"]
+__all__ = [
+    "CakeVsaSm90Plan",
+    "create_plan",
+    "plan_small",
+    "plan_vsa_sm90",
+    "small_route",
+]

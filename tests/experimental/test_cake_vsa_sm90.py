@@ -23,6 +23,9 @@ import pytest
 import torch
 
 from flashinfer.cake_vsa_sm90 import (
+    PLAN_HALFWORDS,
+    SMALL_OCCUPANCY,
+    CakeVsaSm90Plan,
     MAX_OWN,
     META_NOWN,
     META_NSEQ,
@@ -32,7 +35,9 @@ from flashinfer.cake_vsa_sm90 import (
     META_WORDS,
     OWN_WORDS,
     _schedule_feasible,
+    plan_small,
     plan_vsa_sm90,
+    small_route,
 )
 
 
@@ -60,6 +65,48 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
 # ---------------------------------------------------------------------------
 # Host planner (CPU only)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "h,mb,nb,capacity,expected",
+    [
+        (1, 1, 1, 1, 1),  # one tile, one block
+        (4, 4, 4, 1, 1),  # 16 tiles
+        (8, 4, 4, 3, 3),
+        (8, 16, 16, 4, 4),  # 128 tiles at 1 CTA/SM
+        (8, 17, 16, 4, None),  # 136 tiles > 132 SMs at 1 CTA/SM
+        (8, 64, 64, 1, 1),  # 512 tiles at 4 CTAs/SM
+        (8, 32, 32, 8, None),  # 8 blocks > KMAX 6
+        (2, 128, 32, 6, None),  # 256 x 7 halfwords > PLAN_HALFWORDS
+    ],
+)
+def test_small_route_rule(h, mb, nb, capacity, expected):
+    mask = _random_mask(h, mb, nb, capacity, ragged=False)
+    assert small_route(mask, sms=132) == expected
+    if expected is not None:
+        assert h * mb <= SMALL_OCCUPANCY[expected] * 132
+        assert h * mb * (expected + 1) <= PLAN_HALFWORDS
+
+
+def test_plan_small_layout_and_padding():
+    mask = _random_mask(3, 5, 9, 4, seed=3, ragged=True)
+    plan = plan_small(mask)
+    assert plan["kmax"] == 4 and plan["num_tiles"] == 15
+    rows = plan["plan"]
+    assert rows.dtype == torch.int16 and rows.numel() == PLAN_HALFWORDS
+    stride = plan["kmax"] + 1
+    for tile in range(15):
+        head, qb = divmod(tile, 5)
+        row = rows[tile * stride : (tile + 1) * stride].tolist()
+        selected = mask[head, qb].nonzero().flatten().tolist()
+        assert row[0] == len(selected)
+        assert row[1 : 1 + len(selected)] == selected
+        assert all(v == -1 for v in row[1 + len(selected) :])
+    assert bool((rows[15 * stride :] == -1).all())
+    with pytest.raises(ValueError, match="cannot hold"):
+        plan_small(mask, kmax=3)
+    with pytest.raises(ValueError, match="exceed"):
+        plan_small(_random_mask(2, 128, 32, 6, ragged=False))
 
 
 def _decode_tiles(plan):
@@ -206,6 +253,40 @@ def _reference(q, k, v, mask, scale):
     return torch.einsum("hmn,hnd->hmd", torch.softmax(scores, dim=-1), v.float()).to(
         q.dtype
     )
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "h,mb,nb,capacity,scale",
+    [
+        (1, 1, 1, 1, None),
+        (4, 4, 4, 1, 0.5),
+        (8, 4, 4, 3, None),
+        (8, 16, 16, 4, -0.125),
+        (2, 8, 32, 6, 0.0),
+    ],
+)
+def test_small_and_persistent_routes_agree(h, mb, nb, capacity, scale):
+    """Both kernels implement the same contract: force each route on a small problem."""
+    mask = _random_mask(h, mb, nb, capacity, seed=11, ragged=True, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(h, mb, nb)
+    outputs = {}
+    for route in ("small", "persistent"):
+        plan = CakeVsaSm90Plan(
+            "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route=route
+        )
+        assert plan.mode == ("small" if route == "small" else plan.mode)
+        outputs[route] = plan.run(q, k, v).float()
+    assert plan.mode in ("pair", "split")
+    reference = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale).float()
+    for route, out in outputs.items():
+        torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
+        assert float((out - reference).abs().max()) <= 0.03, route
+    # Auto routing picks the small kernel for every one of these problems.
+    auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
+    assert auto.mode == "small"
 
 
 @requires_hopper

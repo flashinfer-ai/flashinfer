@@ -36,7 +36,9 @@ from .core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags
 _GENERATED_ROOT = "csrc/cake_vsa_sm90"
 _MANIFEST_NAME = "cake_vsa_sm90_manifest.json"
 _ARCH = "sm_90a"
-_STAGE = "attention"
+# Persistent pair/split route plus the small-selection route (one CTA per query
+# block, plan in the kernel-parameter constant bank) in four KMAX variants.
+STAGES = ("attention", "small_k1", "small_k3", "small_k4", "small_k6")
 
 
 def _get_csrc_dir() -> Path:
@@ -75,16 +77,20 @@ def _manifest() -> dict[str, Any]:
     return value
 
 
-def _record() -> dict[str, Any]:
+def _record(stage: str = "attention") -> dict[str, Any]:
+    if stage not in STAGES:
+        raise ValueError(
+            f"unknown Cake SM90 VSA stage {stage!r}; expected one of {STAGES}"
+        )
     matches = [
         item
         for item in _manifest()["modules"]
         if item.get("arch") == _ARCH
-        and dict(item.get("route", {})).get("stage") == _STAGE
+        and dict(item.get("route", {})).get("stage") == stage
     ]
     if len(matches) != 1:
         raise RuntimeError(
-            f"expected one generated Cake SM90 VSA module for ({_ARCH}, {_STAGE}), got {len(matches)}"
+            f"expected one generated Cake SM90 VSA module for ({_ARCH}, {stage}), got {len(matches)}"
         )
     return matches[0]
 
@@ -111,14 +117,14 @@ def _source_path(relative_path: str) -> Path:
     return path
 
 
-def cake_vsa_sm90_launch() -> dict[str, Any]:
-    """Launch record of the generated module (block, dynamic SMEM, PDL/cooperative flags)."""
-    return dict(_record()["launch"])
+def cake_vsa_sm90_launch(stage: str = "attention") -> dict[str, Any]:
+    """Launch record of one generated module (block, dynamic SMEM, PDL/cooperative flags)."""
+    return dict(_record(stage)["launch"])
 
 
 @functools.cache
-def gen_cake_vsa_sm90_module() -> JitSpec:
-    record = _record()
+def gen_cake_vsa_sm90_module(stage: str = "attention") -> JitSpec:
+    record = _record(stage)
     units = record["translation_units"]
     spec = gen_jit_spec(
         name=f"{record['name']}_{_ARCH}",
@@ -132,25 +138,29 @@ def gen_cake_vsa_sm90_module() -> JitSpec:
 
 
 @functools.cache
-def load_cake_vsa_sm90_module():
-    """Build and load the ``sm_90a`` module; return ``(module, manifest record)``."""
-    spec = gen_cake_vsa_sm90_module()
+def load_cake_vsa_sm90_module(stage: str = "attention"):
+    """Build and load one ``sm_90a`` module; return ``(module, manifest record)``."""
+    spec = gen_cake_vsa_sm90_module(stage)
     module = spec.build_and_load()
-    return module, _record()
+    return module, _record(stage)
 
 
 def build_all_cake_vsa_sm90_modules() -> dict[str, str]:
-    spec = gen_cake_vsa_sm90_module()
-    module = spec.build_and_load()
-    record = _record()
-    if not hasattr(module, str(record["ffi_entry"])):
-        raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
-    return {
-        f"{record['name']}_{_ARCH}": str(spec.get_library_path().resolve(strict=True))
-    }
+    built = {}
+    for stage in STAGES:
+        spec = gen_cake_vsa_sm90_module(stage)
+        module = spec.build_and_load()
+        record = _record(stage)
+        if not hasattr(module, str(record["ffi_entry"])):
+            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
+        built[f"{record['name']}_{_ARCH}"] = str(
+            spec.get_library_path().resolve(strict=True)
+        )
+    return built
 
 
 __all__ = [
+    "STAGES",
     "build_all_cake_vsa_sm90_modules",
     "cake_vsa_sm90_launch",
     "gen_cake_vsa_sm90_module",
