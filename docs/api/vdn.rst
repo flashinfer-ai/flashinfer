@@ -60,24 +60,6 @@ The full suite includes sampled FP32 references at 22,493 and 58,193 tokens
 and a copy-kernel regression beyond the signed int32 element-offset boundary.
 The latter requires 18 GiB of free device memory; multi-device checks require
 two visible CUDA devices.
-The benchmark uses the OpenVDN SM120 decomposition:
-dense PyTorch SDPA for global/anchor query rows plus PyTorch varlen attention
-for gathered windows (PyTorch with ``torch.nn.attention.varlen`` required).
-
-.. code-block:: bash
-
-    python benchmarks/bench_vdn_window.py --frames 107 --heads 7 --output /tmp/vdn-107f.json
-    python benchmarks/bench_vdn_window.py --frames 37 --heads 56 --output /tmp/vdn-56h.json
-    python benchmarks/bench_vdn_window.py --frames 37 --heads 7 \
-        --projection-width 386 --strided-qk --output /tmp/vdn-strided.json
-
-Timing includes input copies, gathers, attention, output scatter and
-allocation. Both methods are warmed before randomly interleaved samples;
-cold planning is reported separately. Window-operator speedups do not
-establish full VDN or video-generation speedups.
-Use ``--cold-l2`` to flush at least 256 MiB outside each timed region.
-Measured cold/warm results, all samples, validation coverage and reproduction
-commands are in ``benchmarks/results/vdn_sm120_bf16/README.md``.
 
 .. currentmodule:: flashinfer.vdn
 
