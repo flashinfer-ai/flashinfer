@@ -143,7 +143,6 @@ __global__ void routingMainKernel(KernelParams params) {
   // note that for invalid scores, we use negative infinity,
   // needed for GLM-style routing where bias can be negative
   static constexpr float invalidScoreFloat = float{-INFINITY};
-  const OutputT invalidScore = OutputT{invalidScoreFloat};
 
   // load bias already; each warp represents one expert group
   auto threadExpert = threadIdx.x;
@@ -157,9 +156,8 @@ __global__ void routingMainKernel(KernelParams params) {
   }
   auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
   auto biasVal = (expertSelected && params.mPtrRoutingBias != nullptr)
-                     ? static_cast<OutputT>(
-                           loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias))
-                     : (expertSelected ? OutputT{0} : invalidScore);
+                     ? loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias)
+                     : (expertSelected ? 0.0F : invalidScoreFloat);
 
   // initialize the mPtrExpertCounts
   // Include the fused shared experts so the histogram/offset slots for the
@@ -188,7 +186,8 @@ __global__ void routingMainKernel(KernelParams params) {
     // get the sigmoid score
     // note that for invalid values, we simply use a negative value:
     // sigmoid scores are always strictly positive
-    auto scoreSigmoid = sigmoid_accurate(score);
+    // The tanh form loses small positive probabilities for negative logits.
+    auto scoreSigmoid = 1.0f / (1.0f + expf(-score));
     // write the sigmoid score to shared for later use
     if (expertSelected) {
       smemScoreSigmoid[threadExpert] = scoreSigmoid;
