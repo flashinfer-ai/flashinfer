@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -36,6 +38,31 @@ def gumbel_distribution(beta):
 def set_random_seed(seed=42):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def required_num_trials(
+    expected_probs,
+    cosine_threshold=0.99,
+    compare_two_samples=True,
+    safety_factor=1.25,
+    min_trials=10_000,
+):
+    """Compute the required trials from a probability distribution's effective support."""
+    probs = expected_probs.float()
+    probs = probs / probs.sum()
+
+    sum_p2 = probs.square().sum().item()
+    effective_support = 1.0 / sum_p2
+
+    if compare_two_samples:
+        multiplier = cosine_threshold / (1.0 - cosine_threshold)
+    else:
+        multiplier = cosine_threshold**2 / (1.0 - cosine_threshold**2)
+
+    return max(
+        min_trials,
+        math.ceil(safety_factor * multiplier * effective_support),
+    )
 
 
 def get_generators():
@@ -85,12 +112,12 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
     def test_probs_sample_freq(self, vocab_size, distribution, zero_ratio):
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
         logits[:, zero_indices] = -float("inf")
         probs = torch.softmax(logits, dim=-1)
+        num_trials = required_num_trials(probs)
 
         pipe_compiled = LogitsPipe(
             [Sample()], compile=True, input_type=TensorType.PROBS
@@ -147,10 +174,10 @@ class TestLogitsPipeCompilation:
     )
     def test_logits_sample_freq(self, vocab_size, distribution):
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         probs = torch.softmax(logits, dim=-1)
+        num_trials = required_num_trials(probs)
 
         pipe_compiled = LogitsPipe(
             [Sample()], compile=True, input_type=TensorType.LOGITS
@@ -206,7 +233,6 @@ class TestLogitsPipeCompilation:
             pytest.skip("k should be less than vocab_size")
 
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         probs = torch.softmax(logits, dim=-1)
@@ -216,6 +242,7 @@ class TestLogitsPipeCompilation:
         mask = (probs >= pivot.unsqueeze(-1)).int()
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [TopK(), Sample()], compile=True, input_type=TensorType.PROBS
@@ -276,7 +303,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
     def test_probs_top_p_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
         eps = 1e-4
 
         logits = distribution((1, vocab_size), "cuda:0")
@@ -288,6 +314,7 @@ class TestLogitsPipeCompilation:
         mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [TopP(), Sample()],
@@ -348,7 +375,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
     def test_probs_min_p_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         probs = torch.softmax(logits, dim=-1)
@@ -361,6 +387,7 @@ class TestLogitsPipeCompilation:
         mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [MinP(), Sample()],
@@ -422,7 +449,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.1, 0.5])
     def test_probs_top_k_top_p_joint_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
         eps = 1e-4
 
         if p == 0.1:
@@ -447,6 +473,7 @@ class TestLogitsPipeCompilation:
         mask = torch.minimum(mask_top_k, mask_top_p)
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [
@@ -507,7 +534,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.1, 0.5])
     def test_logits_top_k_top_p_joint_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
         eps = 1e-4
 
         if p == 0.1:
@@ -532,6 +558,7 @@ class TestLogitsPipeCompilation:
         mask = torch.minimum(mask_top_k, mask_top_p)
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [
