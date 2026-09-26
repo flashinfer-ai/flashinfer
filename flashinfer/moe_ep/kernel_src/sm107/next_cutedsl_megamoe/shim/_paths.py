@@ -31,6 +31,12 @@ def bootstrap_paths() -> None:
     for name in _SENTINEL_MODULES:
         mod = sys.modules.get(name)
         mod_file = getattr(mod, "__file__", None) if mod is not None else None
+        if mod is not None and mod_file is None:
+            raise RuntimeError(
+                f"kernel module {name!r} is already imported without a file; "
+                "it may shadow the next_cutedsl_megamoe drop's top-level package. "
+                "Use a separate process for whatever owns that module."
+            )
         if mod_file is not None and not os.path.abspath(mod_file).startswith(
             src_dir + os.sep
         ):
