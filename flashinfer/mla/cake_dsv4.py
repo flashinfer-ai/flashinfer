@@ -844,6 +844,23 @@ def _route(
             return "fp8_h64_source_exact"
         if max_q_len >= 257:
             return "fp8_lowhead_prefill"
+        if (
+            num_heads in (8, 16)
+            and batch_size == 3
+            and max_q_len == 5
+            and ragged
+            and (
+                (is_topk128x and sparse_topk == 260)
+                or (is_topk4x and sparse_topk == (192 if num_heads == 8 else 256))
+            )
+        ):
+            # CAKE-624 W18: FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
+            # on these rows (heads on the MMA N side, kind::f8f6f4, P e4m3
+            # x448); same shape lock as the BF16 source-exact route.  Paired
+            # vs trtllm-gen: rows 55/58/67/70 GB300 1.27-1.30x / B200
+            # 1.24-1.25x, width-260 rows 56/59/68/71 GB300 1.38-1.49x /
+            # B200 1.33-1.43x (one-partition producer 0.99-1.27x).
+            return "fp8_h8_h16_source_exact"
         if num_heads == 64 and _fp8_h64_uses_persistent_body(
             sparse_topk, num_query_tokens
         ):
@@ -1264,6 +1281,12 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         return
 
     if route == "bf16_h8_h16_source_exact":
+        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        return
+
+    if route == "fp8_h8_h16_source_exact":
+        # Same launch shape as the BF16 source-exact body (one CTA per
+        # (query-within-sequence, value quarter, batch)); FP8 Q/KV pools.
         L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
         return
 
