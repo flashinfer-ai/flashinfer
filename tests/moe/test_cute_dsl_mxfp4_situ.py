@@ -860,6 +860,94 @@ def test_dense_gemm1_zero_fill_matches_memset(monkeypatch, dense_dual_tile):
     assert not fill_output.any()
 
 
+def _make_dual_tile_wrapper_pdl(case, dense_dual_tile):
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
+
+    return CuteDslMxfp4MoEWrapper(
+        case.num_experts,
+        case.topk_ids.shape[1],
+        case.hidden_size,
+        case.intermediate_size,
+        num_local_experts=case.local_num_experts,
+        local_expert_offset=case.local_expert_offset,
+        swapab_max_tokens=0,
+        dense_dual_tile=dense_dual_tile,
+        enable_pdl=True,
+    )
+
+
+@pytest.mark.parametrize("fill_in_gemm1", [False, True])
+def test_dense_route_preprocess_pdl_matches_torch(
+    monkeypatch, dense_dual_tile, fill_in_gemm1
+):
+    """Under PDL the dense form (T > 16) converts the routing with the CuTe
+    launch (MXFP4_ROUTE_PREPROCESS_PDL) instead of the torch unpack kernels;
+    the launch converts only, so the output clear stays where it was (the
+    memset beside GEMM1, or the gather GEMM1's own fill): route ids / weights
+    and the output match the torch conversion on repeated runs and graph
+    replays with changing routings."""
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    case = make_case(
+        tokens=584,
+        hidden=256,
+        intermediate=256,
+        num_experts=16,
+        local_num_experts=8,
+        local_expert_offset=0,
+        top_k=2,
+    )
+    _set_routing(case, hot=False)
+    weights = prepare_cute_weights(case)
+    if fill_in_gemm1:
+        monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1_MIN_TOKENS", 0)
+        monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "1")
+    else:
+        monkeypatch.setattr(mxfp4, "DENSE_FILL_IN_GEMM1", "0")
+    monkeypatch.setattr(mxfp4, "ROUTE_PREPROCESS_PDL", False)
+    torch_plan, torch_output = _plan_dense(
+        _make_dual_tile_wrapper_pdl(case, dense_dual_tile), case, weights
+    )
+    monkeypatch.setattr(mxfp4, "ROUTE_PREPROCESS_PDL", True)
+    cute_plan, cute_output = _plan_dense(
+        _make_dual_tile_wrapper_pdl(case, dense_dual_tile), case, weights
+    )
+    assert torch_plan._route_preprocess is None
+    assert cute_plan._route_preprocess is not None
+    assert not cute_plan._route_preprocess.sorts_tokens
+    assert not cute_plan._route_preprocess_clears
+    # The clear is not the conversion launch's job under PDL.
+    assert (cute_plan._memset is None) == fill_in_gemm1
+    assert (torch_plan._memset is None) == fill_in_gemm1
+    for hot in (False, True, False):
+        _set_routing(case, hot=hot)
+        for _ in range(2):
+            torch_plan.run()
+            cute_plan.run()
+        torch.cuda.synchronize()
+        assert torch.equal(cute_plan._route_ids, torch_plan._route_ids)
+        assert torch.equal(cute_plan._route_weights, torch_plan._route_weights)
+        _assert_dual_tile_matches_single(
+            case, cute_output, torch_output, reference_moe(case)
+        )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        cute_plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for hot in (True, False):
+        _set_routing(case, hot=hot)
+        graph.replay()
+        torch_plan.run()
+        torch.cuda.synchronize()
+        assert torch.equal(cute_plan._route_ids, torch_plan._route_ids)
+        _assert_dual_tile_matches_single(
+            case, cute_output, torch_output, reference_moe(case)
+        )
+
+
 def test_dense_fill_in_gemm1_policy(monkeypatch):
     """``ep`` (expert-parallel ranks only) / ``1`` / ``0`` vocabulary of the
     in-GEMM1 zero-fill, mirroring DENSE_ASYNC_MEMSET."""
