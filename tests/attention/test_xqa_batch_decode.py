@@ -386,8 +386,8 @@ def generate_spec_dec_mask(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+    get_compute_capability(torch.device(device="cuda"))[0] not in [8, 9, 10, 12],
+    reason="XQA is only supported on SM8x, SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size,head_dim",
@@ -590,8 +590,8 @@ def test_xqa_batch_decode(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+    get_compute_capability(torch.device(device="cuda"))[0] not in [8, 9, 10, 12],
+    reason="XQA is only supported on SM8x, SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
@@ -696,8 +696,8 @@ def generate_ragged_spec_dec_mask(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+    get_compute_capability(torch.device(device="cuda"))[0] not in [8, 9, 10, 12],
+    reason="XQA is only supported on SM8x, SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "q_lens_pattern,page_size,num_kv_heads,head_grp_size",
@@ -896,6 +896,10 @@ def test_xqa_batch_decode_ragged_q(
 # (no interleave dim), so the SF page stride differs from the data-cache page
 # stride by the factor-2 stacking. This exercises the dedicated sf_stride_*
 # plumbing and regresses if the kernel falls back to the data-cache strides.
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] == 8,
+    reason="NVFP4 KV cache requires SM12x; not supported on SM8x GPUs",
+)
 @pytest.mark.parametrize("sf_layout", ["stacked", "separate"])
 @pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
 def test_xqa_batch_decode_nvfp4_kv(
@@ -1077,8 +1081,8 @@ def test_xqa_batch_decode_nvfp4_kv(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+    get_compute_capability(torch.device(device="cuda"))[0] not in [8, 9, 10, 12],
+    reason="XQA is only supported on SM8x, SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
