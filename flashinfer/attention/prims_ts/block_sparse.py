@@ -68,7 +68,7 @@ from ._block_sparse.runtime import (
     validate_block_sparse_run as _validate_block_sparse_run,
     validate_paged_kv_storage as _validate_paged_kv_storage,
 )
-from .decode import PagedKVCache, _resolve_cuda_device
+from .decode import PagedKVCache, _resolve_cuda_device, _validate_runtime_device
 
 
 class _BlockSparseWrapperBase:
@@ -226,6 +226,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
         device, device_index = _resolve_cuda_device(device)
+        _validate_runtime_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             if torch.cuda.is_current_stream_capturing():
@@ -486,6 +487,7 @@ def block_sparse_attention(
     if use_proxy_routes and static.mask_type != "dense":
         raise ValueError("block-sparse proxy routes require mask_type='dense'")
     device, _ = _resolve_cuda_device(q.device)
+    _validate_runtime_device(device)
     _validate_block_sparse_metadata(
         sparse_format=sparse_format,
         block_indptr=block_indptr,
@@ -617,6 +619,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         )
         assert static.page_size is not None
         device, device_index = _resolve_cuda_device(device)
+        _validate_runtime_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             if torch.cuda.is_current_stream_capturing():
@@ -840,6 +843,7 @@ def block_sparse_attention_with_paged_kv_cache(
 
     batch_size, seq_len_q, num_qo_heads, head_dim = map(int, q.shape)
     metadata_device, _ = _resolve_cuda_device(q.device)
+    _validate_runtime_device(metadata_device)
     paged = _validate_paged_kv_storage(
         _PagedKVStorage(
             paged_kv_cache=paged_kv_cache,

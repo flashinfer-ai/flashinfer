@@ -18,11 +18,12 @@ entry point for every phase. The public ``recurrent_kda`` classifies the call
 and serves decode and speculative decode through the same shared decode
 dispatcher that :ref:`apikda_decode` uses, while dispatching eligible ordinary
 multi-token prefill to the optimized backend described in
-:ref:`apikda_prefill`. Which
-prefill backend that is depends on the device: SM100a and SM103a use the frozen
-FlashKDA-compatible kernels, SM120a uses a CuTe-DSL backend of its own. The two
-architecture sets are disjoint, so the public signature and every call outside
-the eligible prefill subset are unaffected either way.
+:ref:`apikda_prefill`. The automatic prefill selection depends on the device
+and workload: eligible SM100a and SM103a calls with small logical
+batch-times-head count use the bundled small-BH CuTe-DSL kernel; other calls
+follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
+backend of its own. These prefill routes leave decode and speculative-decode
+dispatch unchanged.
 
 .. currentmodule:: flashinfer.kda
 
@@ -51,6 +52,16 @@ Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
 The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
+
+``fused_kda_decode`` combines width-four causal convolution, one KDA update,
+and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
+pipeline to packed ragged speculative decode, retaining one recurrent
+checkpoint per token and an extended rolling convolution window. Its optional
+``t1_state_indices`` argument is a T=1-only fast path containing caller-resolved
+per-row cache slots. T>1 always uses the ``state_indices[N, T]``,
+``query_start_loc``, and ``num_accepted_tokens`` metadata with the multitoken
+kernel; passing ``t1_state_indices`` for T>1 is rejected. No T>1 kernel
+behavior or performance is changed by this optimization.
 
 Pass ``backend="cake"`` to select the exported Cake backend. On SM100-family
 SM100a (B200/GB200) and SM103a (B300/GB300) devices, its D128 ``T=1..6``
@@ -167,6 +178,7 @@ small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
     :toctree: ../generated
 
     fused_kda_decode
+    packed_fused_kda_decode
     packed_kda_decode
     recurrent_kda
 
