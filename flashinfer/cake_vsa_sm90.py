@@ -92,7 +92,7 @@ SMALL_OCCUPANCY = {
 PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
 PLAN_META = 2  # halfwords per item before the block ids: [meta, qtile]
 MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign clear)
-SMALL_ITEM_FLOATS = BLOCK * HEAD_DIM  # FP32 partial accumulator per split item
+SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # BF16 partial accumulator per split item
 SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
 # Split-KV cost model (relative units): one KV block through the single
 # warpgroup chain vs. one extra slice merged by the last CTA (fitted on H100,
@@ -739,8 +739,8 @@ class CakeVsaSm90Plan:
             if self.small_split:
                 with torch.cuda.device(self.device):
                     self.partial_o = torch.empty(
-                        (self.num_items * SMALL_ITEM_FLOATS,),
-                        dtype=torch.float32,
+                        (self.num_items * SMALL_ITEM_ELEMS,),
+                        dtype=torch.bfloat16,
                         device=self.device,
                     )
                     self.partial_stats = torch.empty(
