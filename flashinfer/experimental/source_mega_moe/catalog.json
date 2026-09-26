@@ -461,7 +461,7 @@
             "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_29fdf4b933419f44d74c_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm100a_4cba9ed690b5c4825366_kernel": {
+        "deepgemm_source_mega_moe_sm100a_477ff413a440bcd12a9c_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -683,14 +683,14 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "a9dcf2087d3fcb17b4b5cb0877e734c24776d72efe470cf4b125e1bd6379da44",
+          "closure_sha256": "86a5f24abe0c83a8e19c6573d5e942679862ad564a3b36d9a5be2c6134a2a763",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_4cba9ed690b5c4825366_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_4cba9ed690b5c4825366_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_477ff413a440bcd12a9c_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_477ff413a440bcd12a9c_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm100a_696428176544eb30fe9d_kernel": {
+        "deepgemm_source_mega_moe_sm100a_5a39fa97a1959c87b6e9_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -912,11 +912,240 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "38cf3ddb407c8d8a584227b84946881e22915229c675da03870e283ff997b0c4",
+          "closure_sha256": "d22617e316d31f41da77764872cd7291bf3ad5f8835714dca6c850199c0bd26f",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_696428176544eb30fe9d_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_696428176544eb30fe9d_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_5a39fa97a1959c87b6e9_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_5a39fa97a1959c87b6e9_binding.cu"
+          ]
+        },
+        "deepgemm_source_mega_moe_sm100a_7bb71541fe1471d45be1_kernel": {
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "A1"
+            ],
+            [
+              "tma_buffer",
+              "A2"
+            ],
+            [
+              "tma_buffer",
+              "SA1"
+            ],
+            [
+              "tma_buffer",
+              "SA2"
+            ],
+            [
+              "tma_buffer",
+              "B1"
+            ],
+            [
+              "tma_buffer",
+              "B2"
+            ],
+            [
+              "tma_buffer",
+              "SB1"
+            ],
+            [
+              "tma_buffer",
+              "SB2"
+            ],
+            [
+              "tma_buffer",
+              "SFA1"
+            ],
+            [
+              "tma_buffer",
+              "SFA2"
+            ],
+            [
+              "tma_buffer",
+              "SSFA1"
+            ],
+            [
+              "tma_buffer",
+              "SSFA2"
+            ],
+            [
+              "tma_buffer",
+              "SFB1"
+            ],
+            [
+              "tma_buffer",
+              "SFB2"
+            ],
+            [
+              "tma_buffer",
+              "SSFB1"
+            ],
+            [
+              "tma_buffer",
+              "SSFB2"
+            ],
+            [
+              "tma_buffer",
+              "L1Output"
+            ],
+            [
+              "tma_buffer",
+              "SharedL1Output"
+            ],
+            [
+              "buffer",
+              "X"
+            ],
+            [
+              "buffer",
+              "XSF"
+            ],
+            [
+              "buffer",
+              "TopK"
+            ],
+            [
+              "buffer",
+              "Weights"
+            ],
+            [
+              "buffer",
+              "L1Acts"
+            ],
+            [
+              "buffer",
+              "L1SF"
+            ],
+            [
+              "buffer",
+              "L1Weights"
+            ],
+            [
+              "buffer",
+              "L2SF"
+            ],
+            [
+              "buffer",
+              "SharedL2SF"
+            ],
+            [
+              "buffer",
+              "SourceIndices"
+            ],
+            [
+              "buffer",
+              "TokenMetadata"
+            ],
+            [
+              "buffer",
+              "GridCounters"
+            ],
+            [
+              "buffer",
+              "NvlCounter"
+            ],
+            [
+              "buffer",
+              "NvlSignals"
+            ],
+            [
+              "buffer",
+              "PeerGrid"
+            ],
+            [
+              "buffer",
+              "ReadyGrid"
+            ],
+            [
+              "buffer",
+              "SendCounts"
+            ],
+            [
+              "buffer",
+              "RecvCounts"
+            ],
+            [
+              "buffer",
+              "RecvSum"
+            ],
+            [
+              "buffer",
+              "L1Full"
+            ],
+            [
+              "buffer",
+              "L1Empty"
+            ],
+            [
+              "buffer",
+              "L2Mask"
+            ],
+            [
+              "buffer",
+              "L2Empty"
+            ],
+            [
+              "buffer",
+              "SharedFull"
+            ],
+            [
+              "buffer",
+              "L1Counter"
+            ],
+            [
+              "buffer",
+              "L2Counter"
+            ],
+            [
+              "buffer",
+              "SharedL1Counter"
+            ],
+            [
+              "buffer",
+              "SharedL2Counter"
+            ],
+            [
+              "buffer",
+              "Combine"
+            ],
+            [
+              "buffer",
+              "CombineBytes"
+            ],
+            [
+              "buffer",
+              "Y"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [],
+          "closure_sha256": "1b02a883e50cdd9dd06ec264ebadd580cca100099adef84430199e95c4646792",
+          "tma_workspace_bytes": 2304,
+          "sources": [
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_7bb71541fe1471d45be1_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_7bb71541fe1471d45be1_binding.cu"
           ]
         },
         "deepgemm_source_mega_moe_sm100a_7ceeb18346c7dd7695d3_kernel": {
@@ -1377,7 +1606,7 @@
             "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_8875e3640e31fbf45510_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm100a_a0848c72bc4f7b9e8881_kernel": {
+        "deepgemm_source_mega_moe_sm100a_a10523c6370e20a0a260_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -1599,11 +1828,11 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "0d6aec16b26348908e929126c929763fb4a4b67046c30661930d38830a02dfc1",
+          "closure_sha256": "bec155f242aa017f53e530f2d0f46d5bccb3c59dfc0891a448f4f1dd686b0fb4",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_a0848c72bc4f7b9e8881_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_a0848c72bc4f7b9e8881_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_a10523c6370e20a0a260_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_a10523c6370e20a0a260_binding.cu"
           ]
         },
         "deepgemm_source_mega_moe_sm100a_a5d76d21d3a8eecc0086_kernel": {
@@ -1835,7 +2064,7 @@
             "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_a5d76d21d3a8eecc0086_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm100a_ddd198249ca7fdac6490_kernel": {
+        "deepgemm_source_mega_moe_sm100a_bfbdf6f8c3c61de6edf7_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -2057,246 +2286,17 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "9388133187ec25af9814a7c3a21d9739265e273248c28c046ba0239b06ed451a",
+          "closure_sha256": "d665c8ec46b557663220e65c586663c360e4cb68ebd771aa600dc231c08022a9",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_ddd198249ca7fdac6490_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_ddd198249ca7fdac6490_binding.cu"
-          ]
-        },
-        "deepgemm_source_mega_moe_sm100a_fc6ab78605d9e24bf3ca_kernel": {
-          "ffi_entry": "run",
-          "ffi_prepare_entry": "run_prepare",
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "A1"
-            ],
-            [
-              "tma_buffer",
-              "A2"
-            ],
-            [
-              "tma_buffer",
-              "SA1"
-            ],
-            [
-              "tma_buffer",
-              "SA2"
-            ],
-            [
-              "tma_buffer",
-              "B1"
-            ],
-            [
-              "tma_buffer",
-              "B2"
-            ],
-            [
-              "tma_buffer",
-              "SB1"
-            ],
-            [
-              "tma_buffer",
-              "SB2"
-            ],
-            [
-              "tma_buffer",
-              "SFA1"
-            ],
-            [
-              "tma_buffer",
-              "SFA2"
-            ],
-            [
-              "tma_buffer",
-              "SSFA1"
-            ],
-            [
-              "tma_buffer",
-              "SSFA2"
-            ],
-            [
-              "tma_buffer",
-              "SFB1"
-            ],
-            [
-              "tma_buffer",
-              "SFB2"
-            ],
-            [
-              "tma_buffer",
-              "SSFB1"
-            ],
-            [
-              "tma_buffer",
-              "SSFB2"
-            ],
-            [
-              "tma_buffer",
-              "L1Output"
-            ],
-            [
-              "tma_buffer",
-              "SharedL1Output"
-            ],
-            [
-              "buffer",
-              "X"
-            ],
-            [
-              "buffer",
-              "XSF"
-            ],
-            [
-              "buffer",
-              "TopK"
-            ],
-            [
-              "buffer",
-              "Weights"
-            ],
-            [
-              "buffer",
-              "L1Acts"
-            ],
-            [
-              "buffer",
-              "L1SF"
-            ],
-            [
-              "buffer",
-              "L1Weights"
-            ],
-            [
-              "buffer",
-              "L2SF"
-            ],
-            [
-              "buffer",
-              "SharedL2SF"
-            ],
-            [
-              "buffer",
-              "SourceIndices"
-            ],
-            [
-              "buffer",
-              "TokenMetadata"
-            ],
-            [
-              "buffer",
-              "GridCounters"
-            ],
-            [
-              "buffer",
-              "NvlCounter"
-            ],
-            [
-              "buffer",
-              "NvlSignals"
-            ],
-            [
-              "buffer",
-              "PeerGrid"
-            ],
-            [
-              "buffer",
-              "ReadyGrid"
-            ],
-            [
-              "buffer",
-              "SendCounts"
-            ],
-            [
-              "buffer",
-              "RecvCounts"
-            ],
-            [
-              "buffer",
-              "RecvSum"
-            ],
-            [
-              "buffer",
-              "L1Full"
-            ],
-            [
-              "buffer",
-              "L1Empty"
-            ],
-            [
-              "buffer",
-              "L2Mask"
-            ],
-            [
-              "buffer",
-              "L2Empty"
-            ],
-            [
-              "buffer",
-              "SharedFull"
-            ],
-            [
-              "buffer",
-              "L1Counter"
-            ],
-            [
-              "buffer",
-              "L2Counter"
-            ],
-            [
-              "buffer",
-              "SharedL1Counter"
-            ],
-            [
-              "buffer",
-              "SharedL2Counter"
-            ],
-            [
-              "buffer",
-              "Combine"
-            ],
-            [
-              "buffer",
-              "CombineBytes"
-            ],
-            [
-              "buffer",
-              "Y"
-            ],
-            [
-              "parameter",
-              "num_tokens"
-            ],
-            [
-              "workspace",
-              "tma_descriptor_workspace"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [],
-          "closure_sha256": "7c5be02e7713cde79bd3111de1f76a806f7a3021c658e4c83de006a7784910f3",
-          "tma_workspace_bytes": 2304,
-          "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_fc6ab78605d9e24bf3ca_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_fc6ab78605d9e24bf3ca_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_bfbdf6f8c3c61de6edf7_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_100a/deepgemm_source_mega_moe_sm100a_bfbdf6f8c3c61de6edf7_binding.cu"
           ]
         }
       },
       "routes": {
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":148,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
-          "program": "deepgemm_source_mega_moe_sm100a_a0848c72bc4f7b9e8881_kernel",
+          "program": "deepgemm_source_mega_moe_sm100a_7bb71541fe1471d45be1_kernel",
           "num_sms": 148,
           "layout": {
             "config": {
@@ -2592,7 +2592,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":148,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
-          "program": "deepgemm_source_mega_moe_sm100a_fc6ab78605d9e24bf3ca_kernel",
+          "program": "deepgemm_source_mega_moe_sm100a_a10523c6370e20a0a260_kernel",
           "num_sms": 148,
           "layout": {
             "config": {
@@ -4072,7 +4072,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":148,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}": {
-          "program": "deepgemm_source_mega_moe_sm100a_696428176544eb30fe9d_kernel",
+          "program": "deepgemm_source_mega_moe_sm100a_bfbdf6f8c3c61de6edf7_kernel",
           "num_sms": 148,
           "layout": {
             "config": {
@@ -4368,7 +4368,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":256,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":17,\"routed_weight_dtype\":\"fp4\",\"top_k\":2}": {
-          "program": "deepgemm_source_mega_moe_sm100a_ddd198249ca7fdac6490_kernel",
+          "program": "deepgemm_source_mega_moe_sm100a_477ff413a440bcd12a9c_kernel",
           "num_sms": 2,
           "layout": {
             "config": {
@@ -4664,7 +4664,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":256,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":17,\"routed_weight_dtype\":\"fp8\",\"top_k\":2}": {
-          "program": "deepgemm_source_mega_moe_sm100a_4cba9ed690b5c4825366_kernel",
+          "program": "deepgemm_source_mega_moe_sm100a_5a39fa97a1959c87b6e9_kernel",
           "num_sms": 2,
           "layout": {
             "config": {
@@ -5488,7 +5488,7 @@
             "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_006a008999705260749c_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm103a_09dd6089f9a754e1e20e_kernel": {
+        "deepgemm_source_mega_moe_sm103a_13c7cf4a726370e2944b_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -5710,11 +5710,240 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "3b073eb2ac50140d98f3f6176394237d3905abff5f7186ed710596c957d2cb0a",
+          "closure_sha256": "14a15da09429314c48c0914d8fdb9c3de508c5a678f82c7fe5bf38475f7bb8d6",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_09dd6089f9a754e1e20e_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_09dd6089f9a754e1e20e_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_13c7cf4a726370e2944b_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_13c7cf4a726370e2944b_binding.cu"
+          ]
+        },
+        "deepgemm_source_mega_moe_sm103a_198680b8ae642da7c828_kernel": {
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "A1"
+            ],
+            [
+              "tma_buffer",
+              "A2"
+            ],
+            [
+              "tma_buffer",
+              "SA1"
+            ],
+            [
+              "tma_buffer",
+              "SA2"
+            ],
+            [
+              "tma_buffer",
+              "B1"
+            ],
+            [
+              "tma_buffer",
+              "B2"
+            ],
+            [
+              "tma_buffer",
+              "SB1"
+            ],
+            [
+              "tma_buffer",
+              "SB2"
+            ],
+            [
+              "tma_buffer",
+              "SFA1"
+            ],
+            [
+              "tma_buffer",
+              "SFA2"
+            ],
+            [
+              "tma_buffer",
+              "SSFA1"
+            ],
+            [
+              "tma_buffer",
+              "SSFA2"
+            ],
+            [
+              "tma_buffer",
+              "SFB1"
+            ],
+            [
+              "tma_buffer",
+              "SFB2"
+            ],
+            [
+              "tma_buffer",
+              "SSFB1"
+            ],
+            [
+              "tma_buffer",
+              "SSFB2"
+            ],
+            [
+              "tma_buffer",
+              "L1Output"
+            ],
+            [
+              "tma_buffer",
+              "SharedL1Output"
+            ],
+            [
+              "buffer",
+              "X"
+            ],
+            [
+              "buffer",
+              "XSF"
+            ],
+            [
+              "buffer",
+              "TopK"
+            ],
+            [
+              "buffer",
+              "Weights"
+            ],
+            [
+              "buffer",
+              "L1Acts"
+            ],
+            [
+              "buffer",
+              "L1SF"
+            ],
+            [
+              "buffer",
+              "L1Weights"
+            ],
+            [
+              "buffer",
+              "L2SF"
+            ],
+            [
+              "buffer",
+              "SharedL2SF"
+            ],
+            [
+              "buffer",
+              "SourceIndices"
+            ],
+            [
+              "buffer",
+              "TokenMetadata"
+            ],
+            [
+              "buffer",
+              "GridCounters"
+            ],
+            [
+              "buffer",
+              "NvlCounter"
+            ],
+            [
+              "buffer",
+              "NvlSignals"
+            ],
+            [
+              "buffer",
+              "PeerGrid"
+            ],
+            [
+              "buffer",
+              "ReadyGrid"
+            ],
+            [
+              "buffer",
+              "SendCounts"
+            ],
+            [
+              "buffer",
+              "RecvCounts"
+            ],
+            [
+              "buffer",
+              "RecvSum"
+            ],
+            [
+              "buffer",
+              "L1Full"
+            ],
+            [
+              "buffer",
+              "L1Empty"
+            ],
+            [
+              "buffer",
+              "L2Mask"
+            ],
+            [
+              "buffer",
+              "L2Empty"
+            ],
+            [
+              "buffer",
+              "SharedFull"
+            ],
+            [
+              "buffer",
+              "L1Counter"
+            ],
+            [
+              "buffer",
+              "L2Counter"
+            ],
+            [
+              "buffer",
+              "SharedL1Counter"
+            ],
+            [
+              "buffer",
+              "SharedL2Counter"
+            ],
+            [
+              "buffer",
+              "Combine"
+            ],
+            [
+              "buffer",
+              "CombineBytes"
+            ],
+            [
+              "buffer",
+              "Y"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [],
+          "closure_sha256": "4a9914db65612bc1eefff88542096d8741644c4593c61d4ebdafada0184981b7",
+          "tma_workspace_bytes": 2304,
+          "sources": [
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_198680b8ae642da7c828_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_198680b8ae642da7c828_binding.cu"
           ]
         },
         "deepgemm_source_mega_moe_sm103a_61e9d9c4d2c2268bbd95_kernel": {
@@ -5946,7 +6175,7 @@
             "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_61e9d9c4d2c2268bbd95_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm103a_6610db990af7382a1e4f_kernel": {
+        "deepgemm_source_mega_moe_sm103a_65e322dc09a8bccce8a4_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -6168,469 +6397,11 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "aa8640c92a4d1224775bb750dbc9249aecc353556ec1ceb8512df1d7ac8c2ef6",
+          "closure_sha256": "7d76f58a646e531bcde65f610d53af9e67f489133defbdf6e66baab8882ea8b5",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_6610db990af7382a1e4f_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_6610db990af7382a1e4f_binding.cu"
-          ]
-        },
-        "deepgemm_source_mega_moe_sm103a_704ec582a4f1c3a5df79_kernel": {
-          "ffi_entry": "run",
-          "ffi_prepare_entry": "run_prepare",
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "A1"
-            ],
-            [
-              "tma_buffer",
-              "A2"
-            ],
-            [
-              "tma_buffer",
-              "SA1"
-            ],
-            [
-              "tma_buffer",
-              "SA2"
-            ],
-            [
-              "tma_buffer",
-              "B1"
-            ],
-            [
-              "tma_buffer",
-              "B2"
-            ],
-            [
-              "tma_buffer",
-              "SB1"
-            ],
-            [
-              "tma_buffer",
-              "SB2"
-            ],
-            [
-              "tma_buffer",
-              "SFA1"
-            ],
-            [
-              "tma_buffer",
-              "SFA2"
-            ],
-            [
-              "tma_buffer",
-              "SSFA1"
-            ],
-            [
-              "tma_buffer",
-              "SSFA2"
-            ],
-            [
-              "tma_buffer",
-              "SFB1"
-            ],
-            [
-              "tma_buffer",
-              "SFB2"
-            ],
-            [
-              "tma_buffer",
-              "SSFB1"
-            ],
-            [
-              "tma_buffer",
-              "SSFB2"
-            ],
-            [
-              "tma_buffer",
-              "L1Output"
-            ],
-            [
-              "tma_buffer",
-              "SharedL1Output"
-            ],
-            [
-              "buffer",
-              "X"
-            ],
-            [
-              "buffer",
-              "XSF"
-            ],
-            [
-              "buffer",
-              "TopK"
-            ],
-            [
-              "buffer",
-              "Weights"
-            ],
-            [
-              "buffer",
-              "L1Acts"
-            ],
-            [
-              "buffer",
-              "L1SF"
-            ],
-            [
-              "buffer",
-              "L1Weights"
-            ],
-            [
-              "buffer",
-              "L2SF"
-            ],
-            [
-              "buffer",
-              "SharedL2SF"
-            ],
-            [
-              "buffer",
-              "SourceIndices"
-            ],
-            [
-              "buffer",
-              "TokenMetadata"
-            ],
-            [
-              "buffer",
-              "GridCounters"
-            ],
-            [
-              "buffer",
-              "NvlCounter"
-            ],
-            [
-              "buffer",
-              "NvlSignals"
-            ],
-            [
-              "buffer",
-              "PeerGrid"
-            ],
-            [
-              "buffer",
-              "ReadyGrid"
-            ],
-            [
-              "buffer",
-              "SendCounts"
-            ],
-            [
-              "buffer",
-              "RecvCounts"
-            ],
-            [
-              "buffer",
-              "RecvSum"
-            ],
-            [
-              "buffer",
-              "L1Full"
-            ],
-            [
-              "buffer",
-              "L1Empty"
-            ],
-            [
-              "buffer",
-              "L2Mask"
-            ],
-            [
-              "buffer",
-              "L2Empty"
-            ],
-            [
-              "buffer",
-              "SharedFull"
-            ],
-            [
-              "buffer",
-              "L1Counter"
-            ],
-            [
-              "buffer",
-              "L2Counter"
-            ],
-            [
-              "buffer",
-              "SharedL1Counter"
-            ],
-            [
-              "buffer",
-              "SharedL2Counter"
-            ],
-            [
-              "buffer",
-              "Combine"
-            ],
-            [
-              "buffer",
-              "CombineBytes"
-            ],
-            [
-              "buffer",
-              "Y"
-            ],
-            [
-              "parameter",
-              "num_tokens"
-            ],
-            [
-              "workspace",
-              "tma_descriptor_workspace"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [],
-          "closure_sha256": "16b3cdbe24c051468f183ee974356dbb6b96493c3adf8609c046e6885dfadaee",
-          "tma_workspace_bytes": 2304,
-          "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_704ec582a4f1c3a5df79_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_704ec582a4f1c3a5df79_binding.cu"
-          ]
-        },
-        "deepgemm_source_mega_moe_sm103a_72655d9684f2bd14eefa_kernel": {
-          "ffi_entry": "run",
-          "ffi_prepare_entry": "run_prepare",
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "A1"
-            ],
-            [
-              "tma_buffer",
-              "A2"
-            ],
-            [
-              "tma_buffer",
-              "SA1"
-            ],
-            [
-              "tma_buffer",
-              "SA2"
-            ],
-            [
-              "tma_buffer",
-              "B1"
-            ],
-            [
-              "tma_buffer",
-              "B2"
-            ],
-            [
-              "tma_buffer",
-              "SB1"
-            ],
-            [
-              "tma_buffer",
-              "SB2"
-            ],
-            [
-              "tma_buffer",
-              "SFA1"
-            ],
-            [
-              "tma_buffer",
-              "SFA2"
-            ],
-            [
-              "tma_buffer",
-              "SSFA1"
-            ],
-            [
-              "tma_buffer",
-              "SSFA2"
-            ],
-            [
-              "tma_buffer",
-              "SFB1"
-            ],
-            [
-              "tma_buffer",
-              "SFB2"
-            ],
-            [
-              "tma_buffer",
-              "SSFB1"
-            ],
-            [
-              "tma_buffer",
-              "SSFB2"
-            ],
-            [
-              "tma_buffer",
-              "L1Output"
-            ],
-            [
-              "tma_buffer",
-              "SharedL1Output"
-            ],
-            [
-              "buffer",
-              "X"
-            ],
-            [
-              "buffer",
-              "XSF"
-            ],
-            [
-              "buffer",
-              "TopK"
-            ],
-            [
-              "buffer",
-              "Weights"
-            ],
-            [
-              "buffer",
-              "L1Acts"
-            ],
-            [
-              "buffer",
-              "L1SF"
-            ],
-            [
-              "buffer",
-              "L1Weights"
-            ],
-            [
-              "buffer",
-              "L2SF"
-            ],
-            [
-              "buffer",
-              "SharedL2SF"
-            ],
-            [
-              "buffer",
-              "SourceIndices"
-            ],
-            [
-              "buffer",
-              "TokenMetadata"
-            ],
-            [
-              "buffer",
-              "GridCounters"
-            ],
-            [
-              "buffer",
-              "NvlCounter"
-            ],
-            [
-              "buffer",
-              "NvlSignals"
-            ],
-            [
-              "buffer",
-              "PeerGrid"
-            ],
-            [
-              "buffer",
-              "ReadyGrid"
-            ],
-            [
-              "buffer",
-              "SendCounts"
-            ],
-            [
-              "buffer",
-              "RecvCounts"
-            ],
-            [
-              "buffer",
-              "RecvSum"
-            ],
-            [
-              "buffer",
-              "L1Full"
-            ],
-            [
-              "buffer",
-              "L1Empty"
-            ],
-            [
-              "buffer",
-              "L2Mask"
-            ],
-            [
-              "buffer",
-              "L2Empty"
-            ],
-            [
-              "buffer",
-              "SharedFull"
-            ],
-            [
-              "buffer",
-              "L1Counter"
-            ],
-            [
-              "buffer",
-              "L2Counter"
-            ],
-            [
-              "buffer",
-              "SharedL1Counter"
-            ],
-            [
-              "buffer",
-              "SharedL2Counter"
-            ],
-            [
-              "buffer",
-              "Combine"
-            ],
-            [
-              "buffer",
-              "CombineBytes"
-            ],
-            [
-              "buffer",
-              "Y"
-            ],
-            [
-              "parameter",
-              "num_tokens"
-            ],
-            [
-              "workspace",
-              "tma_descriptor_workspace"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "compile_flags": [],
-          "closure_sha256": "52bd529657ddc57d97412140763411a35cbf7eee788c9f422de86d52ab1efaff",
-          "tma_workspace_bytes": 2304,
-          "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_72655d9684f2bd14eefa_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_72655d9684f2bd14eefa_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_65e322dc09a8bccce8a4_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_65e322dc09a8bccce8a4_binding.cu"
           ]
         },
         "deepgemm_source_mega_moe_sm103a_7a97744368e543dbed50_kernel": {
@@ -6862,6 +6633,235 @@
             "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_7a97744368e543dbed50_binding.cu"
           ]
         },
+        "deepgemm_source_mega_moe_sm103a_b0d4e3ac8a937e5d1e46_kernel": {
+          "ffi_entry": "run",
+          "ffi_prepare_entry": "run_prepare",
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "A1"
+            ],
+            [
+              "tma_buffer",
+              "A2"
+            ],
+            [
+              "tma_buffer",
+              "SA1"
+            ],
+            [
+              "tma_buffer",
+              "SA2"
+            ],
+            [
+              "tma_buffer",
+              "B1"
+            ],
+            [
+              "tma_buffer",
+              "B2"
+            ],
+            [
+              "tma_buffer",
+              "SB1"
+            ],
+            [
+              "tma_buffer",
+              "SB2"
+            ],
+            [
+              "tma_buffer",
+              "SFA1"
+            ],
+            [
+              "tma_buffer",
+              "SFA2"
+            ],
+            [
+              "tma_buffer",
+              "SSFA1"
+            ],
+            [
+              "tma_buffer",
+              "SSFA2"
+            ],
+            [
+              "tma_buffer",
+              "SFB1"
+            ],
+            [
+              "tma_buffer",
+              "SFB2"
+            ],
+            [
+              "tma_buffer",
+              "SSFB1"
+            ],
+            [
+              "tma_buffer",
+              "SSFB2"
+            ],
+            [
+              "tma_buffer",
+              "L1Output"
+            ],
+            [
+              "tma_buffer",
+              "SharedL1Output"
+            ],
+            [
+              "buffer",
+              "X"
+            ],
+            [
+              "buffer",
+              "XSF"
+            ],
+            [
+              "buffer",
+              "TopK"
+            ],
+            [
+              "buffer",
+              "Weights"
+            ],
+            [
+              "buffer",
+              "L1Acts"
+            ],
+            [
+              "buffer",
+              "L1SF"
+            ],
+            [
+              "buffer",
+              "L1Weights"
+            ],
+            [
+              "buffer",
+              "L2SF"
+            ],
+            [
+              "buffer",
+              "SharedL2SF"
+            ],
+            [
+              "buffer",
+              "SourceIndices"
+            ],
+            [
+              "buffer",
+              "TokenMetadata"
+            ],
+            [
+              "buffer",
+              "GridCounters"
+            ],
+            [
+              "buffer",
+              "NvlCounter"
+            ],
+            [
+              "buffer",
+              "NvlSignals"
+            ],
+            [
+              "buffer",
+              "PeerGrid"
+            ],
+            [
+              "buffer",
+              "ReadyGrid"
+            ],
+            [
+              "buffer",
+              "SendCounts"
+            ],
+            [
+              "buffer",
+              "RecvCounts"
+            ],
+            [
+              "buffer",
+              "RecvSum"
+            ],
+            [
+              "buffer",
+              "L1Full"
+            ],
+            [
+              "buffer",
+              "L1Empty"
+            ],
+            [
+              "buffer",
+              "L2Mask"
+            ],
+            [
+              "buffer",
+              "L2Empty"
+            ],
+            [
+              "buffer",
+              "SharedFull"
+            ],
+            [
+              "buffer",
+              "L1Counter"
+            ],
+            [
+              "buffer",
+              "L2Counter"
+            ],
+            [
+              "buffer",
+              "SharedL1Counter"
+            ],
+            [
+              "buffer",
+              "SharedL2Counter"
+            ],
+            [
+              "buffer",
+              "Combine"
+            ],
+            [
+              "buffer",
+              "CombineBytes"
+            ],
+            [
+              "buffer",
+              "Y"
+            ],
+            [
+              "parameter",
+              "num_tokens"
+            ],
+            [
+              "workspace",
+              "tma_descriptor_workspace"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "compile_flags": [],
+          "closure_sha256": "323501a1bb7ca36f6a3ced278cb0f881b82b22bf3f71773a0928f3fe0aa4b8df",
+          "tma_workspace_bytes": 2304,
+          "sources": [
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_b0d4e3ac8a937e5d1e46_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_b0d4e3ac8a937e5d1e46_binding.cu"
+          ]
+        },
         "deepgemm_source_mega_moe_sm103a_d4c050622cdad1f01c9e_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
@@ -7091,7 +7091,7 @@
             "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_d4c050622cdad1f01c9e_binding.cu"
           ]
         },
-        "deepgemm_source_mega_moe_sm103a_e7d87b15af9975a131f6_kernel": {
+        "deepgemm_source_mega_moe_sm103a_e946ab242d9c3e46f271_kernel": {
           "ffi_entry": "run",
           "ffi_prepare_entry": "run_prepare",
           "arg_plan": [
@@ -7313,11 +7313,11 @@
             ]
           ],
           "compile_flags": [],
-          "closure_sha256": "44a15f2c9e0dc5e420ebf49d99c82b8987a6deab5d90b63f5ade851070832204",
+          "closure_sha256": "a06fd690cce8dad0d62dad705930b0bbe94344f769c4b315e03508263a677883",
           "tma_workspace_bytes": 2304,
           "sources": [
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_e7d87b15af9975a131f6_kernel.cu",
-            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_e7d87b15af9975a131f6_binding.cu"
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_e946ab242d9c3e46f271_kernel.cu",
+            "csrc/experimental/source_mega_moe/generated/sm_103a/deepgemm_source_mega_moe_sm103a_e946ab242d9c3e46f271_binding.cu"
           ]
         },
         "deepgemm_source_mega_moe_sm103a_f8012cab817e1079e6cc_kernel": {
@@ -7552,7 +7552,7 @@
       },
       "routes": {
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
-          "program": "deepgemm_source_mega_moe_sm103a_72655d9684f2bd14eefa_kernel",
+          "program": "deepgemm_source_mega_moe_sm103a_198680b8ae642da7c828_kernel",
           "num_sms": 152,
           "layout": {
             "config": {
@@ -7848,7 +7848,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
-          "program": "deepgemm_source_mega_moe_sm103a_09dd6089f9a754e1e20e_kernel",
+          "program": "deepgemm_source_mega_moe_sm103a_b0d4e3ac8a937e5d1e46_kernel",
           "num_sms": 152,
           "layout": {
             "config": {
@@ -9328,7 +9328,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}": {
-          "program": "deepgemm_source_mega_moe_sm103a_704ec582a4f1c3a5df79_kernel",
+          "program": "deepgemm_source_mega_moe_sm103a_13c7cf4a726370e2944b_kernel",
           "num_sms": 152,
           "layout": {
             "config": {
@@ -9624,7 +9624,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":256,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":17,\"routed_weight_dtype\":\"fp4\",\"top_k\":2}": {
-          "program": "deepgemm_source_mega_moe_sm103a_6610db990af7382a1e4f_kernel",
+          "program": "deepgemm_source_mega_moe_sm103a_65e322dc09a8bccce8a4_kernel",
           "num_sms": 2,
           "layout": {
             "config": {
@@ -9920,7 +9920,7 @@
           }
         },
         "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":256,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":17,\"routed_weight_dtype\":\"fp8\",\"top_k\":2}": {
-          "program": "deepgemm_source_mega_moe_sm103a_e7d87b15af9975a131f6_kernel",
+          "program": "deepgemm_source_mega_moe_sm103a_e946ab242d9c3e46f271_kernel",
           "num_sms": 2,
           "layout": {
             "config": {
