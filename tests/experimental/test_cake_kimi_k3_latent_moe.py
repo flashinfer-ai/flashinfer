@@ -70,13 +70,21 @@ def test_decode_plan_rules():
     assert decode_front_plan(9, i_local_for_tp(8))["n_pad"] == 16
     assert decode_front_plan(128, i_local_for_tp(1))["n_pad"] == 128
     for plan in (tp1, tp8):
-        assert plan["kdepth"] == 1 and 1 <= plan["stages"] <= cb.MAX_STAGES and not plan["fused"]
+        assert (
+            plan["kdepth"] == 1
+            and 1 <= plan["stages"] <= cb.MAX_STAGES
+            and not plan["fused"]
+        )
     # Tail: 56 output tiles -> 112 cluster-pair CTAs; the fused norm is always on.
     for tp in SUPPORTED_TP:
         for tokens in (1, 8, 16, 128):
             plan = decode_tail_plan(tokens, i_local_for_tp(tp), tp)
             assert (plan["tiles"], plan["grid"], plan["cluster"]) == (56, 112, 2)
-            assert plan["fused"] and plan["k1"] == LATENT // tp // 64 and plan["k2"] == SHARED_INTERMEDIATE // tp // 64
+            assert (
+                plan["fused"]
+                and plan["k1"] == LATENT // tp // 64
+                and plan["k2"] == SHARED_INTERMEDIATE // tp // 64
+            )
             if plan["rows_smem"]:
                 assert plan["smem_b1"]
     # The resident B operand with staged rows serves the smallest TP8 tails; T16 falls back to the global-y protocol.
@@ -104,24 +112,33 @@ def test_decode_symbol_encodes_the_plan():
 def test_split_plan_rules():
     # No remainder wave, short K loops (TP8: 19 iterations) or a small-reuse region keep whole tiles.
     whole = split_plan(148, 152, SM_COUNT, 1)
-    assert whole == dict(num_items=148, full_items=148, sk_ipc=152, sk_max_seg=1, sk_total=0, sk_tiles=0)
+    assert whole == dict(
+        num_items=148, full_items=148, sk_ipc=152, sk_max_seg=1, sk_total=0, sk_tiles=0
+    )
     assert split_plan(56, 19, SM_COUNT, 1)["sk_tiles"] == 0
     assert split_plan(60, 152, SM_COUNT, 4)["sk_tiles"] == 0
     # TP1 T=2048 (224 pair tiles on 74 resident clusters): 2 x 74 whole + one stream-K wave (module docstring).
     sk = split_plan(224, 152, SM_COUNT, 8)
     assert sk["full_items"] == 148 and sk["sk_tiles"] == 76 and sk["sk_ipc"] == 157
-    assert sk["num_items"] == 148 + -(-76 * 152 // 157) and 1 < sk["sk_max_seg"] <= cb.MAX_SEG
+    assert (
+        sk["num_items"] == 148 + -(-76 * 152 // 157)
+        and 1 < sk["sk_max_seg"] <= cb.MAX_SEG
+    )
 
 
 def test_prefill_tail_plan_and_trigger():
     plan = prefill_tail_plan(256, 8)
-    assert plan["m_tiles"] == 2 and plan["cluster_tiles"] == 28 and plan["norm_grid"] == 64
+    assert (
+        plan["m_tiles"] == 2 and plan["cluster_tiles"] == 28 and plan["norm_grid"] == 64
+    )
     assert plan["num_k"] == (LATENT // 8 + SHARED_INTERMEDIATE // 8) // 64 == 19
     assert plan["sk_tiles"] == 0 and plan["gemm_grid"] == 56 and plan["early_trigger"]
     # TP1 T=256: 112 GEMM CTAs next to 64 norm CTAs do not fit 148 SMs -> late trigger.
     tp1 = prefill_tail_plan(256, 1)
     assert tp1["gemm_grid"] == (tp1["num_items"]) * 2 and not tp1["early_trigger"]
-    assert cb.norm_early_trigger(300, 64, SM_COUNT) and not cb.norm_early_trigger(112, 64, SM_COUNT)
+    assert cb.norm_early_trigger(300, 64, SM_COUNT) and not cb.norm_early_trigger(
+        112, 64, SM_COUNT
+    )
     assert cb.front_grid(cb.m_tiles_for(256), i_local_for_tp(1)) == 1 * 66 * 2
     assert cb.front_grid(cb.m_tiles_for(300), i_local_for_tp(8)) == 2 * 24 * 2
 
@@ -129,7 +146,12 @@ def test_prefill_tail_plan_and_trigger():
 def test_route_keys_cover_the_row_set():
     keys = required_kernel_keys()
     assert len(keys) == len(set(keys))
-    assert {k.split(":")[0] for k in keys} == {"decode", "front", "tail_norm", "tail_gemm"}
+    assert {k.split(":")[0] for k in keys} == {
+        "decode",
+        "front",
+        "tail_norm",
+        "tail_gemm",
+    }
     assert "front:i6144" in keys and "front:i768" in keys
     assert "tail_gemm:tp1" in keys and "tail_gemm:tp8" in keys
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
@@ -157,11 +179,21 @@ def make_weights(device, seed=WEIGHT_SEED):
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def lin(n, k):
-        return (torch.randn(n, k, generator=gen, dtype=torch.float32) * (k**-0.5)).to(torch.bfloat16).to(device)
+        return (
+            (torch.randn(n, k, generator=gen, dtype=torch.float32) * (k**-0.5))
+            .to(torch.bfloat16)
+            .to(device)
+        )
 
     gate_weight = lin(NUM_EXPERTS, HIDDEN)
-    torch.randn(NUM_EXPERTS, generator=gen, dtype=torch.float32)  # gate bias (router only; keeps the seed stream)
-    norm_weight = (1.0 + 0.1 * torch.randn(LATENT, generator=gen, dtype=torch.float32)).to(torch.bfloat16).to(device)
+    torch.randn(
+        NUM_EXPERTS, generator=gen, dtype=torch.float32
+    )  # gate bias (router only; keeps the seed stream)
+    norm_weight = (
+        (1.0 + 0.1 * torch.randn(LATENT, generator=gen, dtype=torch.float32))
+        .to(torch.bfloat16)
+        .to(device)
+    )
     return dict(
         gate_weight=gate_weight,
         norm_weight=norm_weight,
@@ -201,7 +233,10 @@ def rmsnorm(x, weight, eps=RMS_EPS):
 
 def front_reference(x, w):
     gate_up = torch.cat(
-        [torch.nn.functional.linear(x, w["shared_gate_weight"]), torch.nn.functional.linear(x, w["shared_up_weight"])],
+        [
+            torch.nn.functional.linear(x, w["shared_gate_weight"]),
+            torch.nn.functional.linear(x, w["shared_up_weight"]),
+        ],
         dim=-1,
     )
     return dict(
@@ -219,7 +254,9 @@ def tail_reference(routed, shared_act, w, tp, rank):
     k_up = LATENT // tp
     cols = slice(rank * k_up, (rank + 1) * k_up)
     up = torch.nn.functional.linear(y[:, cols].float(), w["up_weight"][:, cols].float())
-    shared = torch.nn.functional.linear(shared_act.float(), w["shared_down_weight"].float())
+    shared = torch.nn.functional.linear(
+        shared_act.float(), w["shared_down_weight"].float()
+    )
     return dict(y=y, out=(up + shared).to(torch.bfloat16))
 
 
@@ -237,7 +274,9 @@ def _require_program(stage, tp, tokens):
     if int(torch.cuda.get_device_properties(0).multi_processor_count) != SM_COUNT:
         pytest.skip(f"the plan rules were frozen for {SM_COUNT} SMs")
     if not cb.generated_program_available(device, stage, tp, tokens):
-        pytest.skip(f"the generated {stage} program for {arch} (tp {tp}, T {tokens}) is not registered")
+        pytest.skip(
+            f"the generated {stage} program for {arch} (tp {tp}, T {tokens}) is not registered"
+        )
     return device
 
 
@@ -269,7 +308,9 @@ def _assert_close(name, actual, expected, atol, rtol):
     err = (actual.float() - expected.float()).abs()
     tol = atol + rtol * expected.float().abs()
     bad = int((err > tol).sum())
-    assert bad == 0, f"{name}: {bad} elements outside atol={atol} rtol={rtol} (max abs err {float(err.max()):.4g})"
+    assert bad == 0, (
+        f"{name}: {bad} elements outside atol={atol} rtol={rtol} (max abs err {float(err.max()):.4g})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,13 +325,31 @@ def test_front_matches_reference(tp, tokens):
     w = shard(_weights(device), tp, 0)
     i_local = SHARED_INTERMEDIATE // tp
     gen = torch.Generator(device="cpu").manual_seed(621 + tokens)
-    x = torch.randn(tokens, HIDDEN, generator=gen, dtype=torch.float32).to(torch.bfloat16).to(device)
-    shared_gate_up = torch.cat([w["shared_gate_weight"], w["shared_up_weight"]], dim=0).contiguous()
-    logits = torch.full((tokens, NUM_EXPERTS), float("nan"), dtype=torch.float32, device=device)
-    latent = torch.full((tokens, LATENT), float("nan"), dtype=torch.bfloat16, device=device)
-    shared_act = torch.full((tokens, i_local), float("nan"), dtype=torch.bfloat16, device=device)
+    x = (
+        torch.randn(tokens, HIDDEN, generator=gen, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+    shared_gate_up = torch.cat(
+        [w["shared_gate_weight"], w["shared_up_weight"]], dim=0
+    ).contiguous()
+    logits = torch.full(
+        (tokens, NUM_EXPERTS), float("nan"), dtype=torch.float32, device=device
+    )
+    latent = torch.full(
+        (tokens, LATENT), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    shared_act = torch.full(
+        (tokens, i_local), float("nan"), dtype=torch.bfloat16, device=device
+    )
     runner = prepare_kimi_k3_latent_moe_front(
-        x, w["gate_weight"], w["down_weight"], shared_gate_up, logits, latent, shared_act
+        x,
+        w["gate_weight"],
+        w["down_weight"],
+        shared_gate_up,
+        logits,
+        latent,
+        shared_act,
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
     assert runner.kernel_keys == route_kernel_keys("front", tp, tokens)
@@ -304,19 +363,36 @@ def test_front_matches_reference(tp, tokens):
     # Idempotent re-launch and bit-identical CUDA-graph replay (the deployment form).
     runner()
     torch.cuda.synchronize()
-    assert all(torch.equal(a, b) for a, b in zip(first, (logits, latent, shared_act)))
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(first, (logits, latent, shared_act), strict=True)
+    )
     graph = _graph_replay(runner)
     for t in (logits, latent, shared_act):
         t.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
-    assert all(torch.equal(a, b) for a, b in zip(first, (logits, latent, shared_act)))
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(first, (logits, latent, shared_act), strict=True)
+    )
     # The one-shot entry point writes the same values.
     for t in (logits, latent, shared_act):
         t.fill_(float("nan"))
-    kimi_k3_latent_moe_front(x, w["gate_weight"], w["down_weight"], shared_gate_up, logits, latent, shared_act)
+    kimi_k3_latent_moe_front(
+        x,
+        w["gate_weight"],
+        w["down_weight"],
+        shared_gate_up,
+        logits,
+        latent,
+        shared_act,
+    )
     torch.cuda.synchronize()
-    assert all(torch.equal(a, b) for a, b in zip(first, (logits, latent, shared_act)))
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(first, (logits, latent, shared_act), strict=True)
+    )
 
 
 @pytest.mark.parametrize("tokens", SMOKE_TOKENS)
@@ -327,13 +403,32 @@ def test_tail_matches_reference(tp, tokens):
     w = shard(_weights(device), tp, rank)
     i_local = SHARED_INTERMEDIATE // tp
     gen = torch.Generator(device="cpu").manual_seed(628 + tokens)
-    routed = (torch.randn(1, tokens, LATENT, generator=gen) * 0.7).to(torch.bfloat16).to(device).contiguous()
-    shared_act = (torch.randn(tokens, i_local, generator=gen) * 0.6).to(torch.bfloat16).to(device).contiguous()
-    out = torch.full((tokens, HIDDEN), float("nan"), dtype=torch.bfloat16, device=device)
+    routed = (
+        (torch.randn(1, tokens, LATENT, generator=gen) * 0.7)
+        .to(torch.bfloat16)
+        .to(device)
+        .contiguous()
+    )
+    shared_act = (
+        (torch.randn(tokens, i_local, generator=gen) * 0.6)
+        .to(torch.bfloat16)
+        .to(device)
+        .contiguous()
+    )
+    out = torch.full(
+        (tokens, HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
+    )
     y = torch.full((tokens, LATENT), float("nan"), dtype=torch.bfloat16, device=device)
     runner = prepare_kimi_k3_latent_moe_tail(
-        routed, w["norm_weight"], w["up_weight"], shared_act, w["shared_down_weight"], out,
-        tp=tp, rank=rank, y_workspace=y,
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
     assert runner.kernel_keys == route_kernel_keys("tail", tp, tokens)
@@ -344,7 +439,9 @@ def test_tail_matches_reference(tp, tokens):
     # The normalised latent reproduces the reference rounding exactly (FP32 statistics, BF16 round,
     # BF16 weight product); the GEMM output is within the BF16 contract tolerance.
     _assert_close("y", y, expected["y"], ATOL, RTOL)
-    assert torch.equal(y, expected["y"]), f"y differs from the reference in {int((y != expected['y']).sum())} elements"
+    assert torch.equal(y, expected["y"]), (
+        f"y differs from the reference in {int((y != expected['y']).sum())} elements"
+    )
     _assert_close("out", out, expected["out"], ATOL, RTOL)
     first = (y.clone(), out.clone())
     runner()
@@ -359,8 +456,15 @@ def test_tail_matches_reference(tp, tokens):
     y.fill_(float("nan"))
     out.fill_(float("nan"))
     kimi_k3_latent_moe_tail(
-        routed, w["norm_weight"], w["up_weight"], shared_act, w["shared_down_weight"], out,
-        tp=tp, rank=rank, y_workspace=y,
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
     )
     torch.cuda.synchronize()
     assert torch.equal(first[0], y) and torch.equal(first[1], out)
@@ -373,13 +477,30 @@ def test_tail_rank_slice_tp8():
     w = shard(_weights(device), tp, rank)
     i_local = SHARED_INTERMEDIATE // tp
     gen = torch.Generator(device="cpu").manual_seed(777)
-    routed = (torch.randn(1, tokens, LATENT, generator=gen) * 0.7).to(torch.bfloat16).to(device).contiguous()
-    shared_act = (torch.randn(tokens, i_local, generator=gen) * 0.6).to(torch.bfloat16).to(device).contiguous()
+    routed = (
+        (torch.randn(1, tokens, LATENT, generator=gen) * 0.7)
+        .to(torch.bfloat16)
+        .to(device)
+        .contiguous()
+    )
+    shared_act = (
+        (torch.randn(tokens, i_local, generator=gen) * 0.6)
+        .to(torch.bfloat16)
+        .to(device)
+        .contiguous()
+    )
     out = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device=device)
     y = torch.empty((tokens, LATENT), dtype=torch.bfloat16, device=device)
     kimi_k3_latent_moe_tail(
-        routed, w["norm_weight"], w["up_weight"], shared_act, w["shared_down_weight"], out,
-        tp=tp, rank=rank, y_workspace=y,
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
     )
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)
@@ -388,7 +509,9 @@ def test_tail_rank_slice_tp8():
 
 
 def test_rejects_invalid_operands():
-    device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    device = (
+        torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    )
     x = torch.zeros(4, HIDDEN, dtype=torch.bfloat16, device=device)
     gate = torch.zeros(NUM_EXPERTS, HIDDEN, dtype=torch.bfloat16, device=device)
     down = torch.zeros(LATENT, HIDDEN, dtype=torch.bfloat16, device=device)
@@ -397,11 +520,23 @@ def test_rejects_invalid_operands():
     latent = torch.zeros(4, LATENT, dtype=torch.bfloat16, device=device)
     act = torch.zeros(4, 768, dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_front(x.float(), gate, down, sgu, logits, latent, act)
+        prepare_kimi_k3_latent_moe_front(
+            x.float(), gate, down, sgu, logits, latent, act
+        )
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_front(x, gate, down, torch.zeros(2 * 512, HIDDEN, dtype=torch.bfloat16, device=device), logits, latent, act)
+        prepare_kimi_k3_latent_moe_front(
+            x,
+            gate,
+            down,
+            torch.zeros(2 * 512, HIDDEN, dtype=torch.bfloat16, device=device),
+            logits,
+            latent,
+            act,
+        )
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_front(x, gate, down, sgu, logits.to(torch.bfloat16), latent, act)
+        prepare_kimi_k3_latent_moe_front(
+            x, gate, down, sgu, logits.to(torch.bfloat16), latent, act
+        )
     routed = torch.zeros(1, 4, LATENT, dtype=torch.bfloat16, device=device)
     nw = torch.zeros(LATENT, dtype=torch.bfloat16, device=device)
     up = torch.zeros(HIDDEN, LATENT, dtype=torch.bfloat16, device=device)
@@ -409,12 +544,22 @@ def test_rejects_invalid_operands():
     out = torch.zeros(4, HIDDEN, dtype=torch.bfloat16, device=device)
     y = torch.zeros(4, LATENT, dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_tail(routed, nw, up, act, sd, out, tp=4, rank=0, y_workspace=y)
+        prepare_kimi_k3_latent_moe_tail(
+            routed, nw, up, act, sd, out, tp=4, rank=0, y_workspace=y
+        )
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_tail(routed, nw, up, act, sd, out, tp=8, rank=8, y_workspace=y)
+        prepare_kimi_k3_latent_moe_tail(
+            routed, nw, up, act, sd, out, tp=8, rank=8, y_workspace=y
+        )
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_tail(routed[0], nw, up, act, sd, out, tp=8, rank=0, y_workspace=y)
+        prepare_kimi_k3_latent_moe_tail(
+            routed[0], nw, up, act, sd, out, tp=8, rank=0, y_workspace=y
+        )
     with pytest.raises(ValueError):
-        prepare_kimi_k3_latent_moe_tail(routed, nw, up, act, sd, out, tp=8, rank=0, y_workspace=y[:, :LATENT // 2])
+        prepare_kimi_k3_latent_moe_tail(
+            routed, nw, up, act, sd, out, tp=8, rank=0, y_workspace=y[:, : LATENT // 2]
+        )
     with pytest.raises(ValueError):
-        kimi_k3_latent_moe_front(x, gate, down, sgu, logits, latent, act, backend="cutlass")
+        kimi_k3_latent_moe_front(
+            x, gate, down, sgu, logits, latent, act, backend="cutlass"
+        )

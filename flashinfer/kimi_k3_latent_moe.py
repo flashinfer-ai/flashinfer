@@ -31,7 +31,9 @@ _FEATURE = "Kimi-K3 LatentMoE front/tail"
 
 def _backend(backend: str):
     if backend != "cake":
-        raise ValueError("the Kimi-K3 LatentMoE projections currently support backend='cake'")
+        raise ValueError(
+            "the Kimi-K3 LatentMoE projections currently support backend='cake'"
+        )
     from .experimental.kimi_k3_latent_moe import cake_backend
 
     return cake_backend
@@ -168,7 +170,15 @@ def prepare_kimi_k3_latent_moe_tail(
         CUDA Graph capture of the runner is supported; prepare outside capture.
     """
     return _backend(backend).prepare_kimi_k3_latent_moe_tail(
-        routed, norm_weight, up_weight, shared_act, shared_down_weight, out, tp=tp, rank=rank, y_workspace=y_workspace
+        routed,
+        norm_weight,
+        up_weight,
+        shared_act,
+        shared_down_weight,
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y_workspace,
     )
 
 
@@ -192,7 +202,15 @@ def kimi_k3_latent_moe_tail(
     launch; returns ``out``.
     """
     _backend(backend).prepare_kimi_k3_latent_moe_tail(
-        routed, norm_weight, up_weight, shared_act, shared_down_weight, out, tp=tp, rank=rank, y_workspace=y_workspace
+        routed,
+        norm_weight,
+        up_weight,
+        shared_act,
+        shared_down_weight,
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y_workspace,
     )()
     return out
 
