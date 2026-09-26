@@ -52,6 +52,7 @@ Example (Wrapper API with CUDA Graph):
 
 from typing import Any, Dict, Optional, Tuple, Union
 
+import os
 import warnings
 import weakref
 
@@ -105,6 +106,13 @@ from .tuner import (
 
 _cuda_graph_resources: Dict[str, Any] = {}
 
+
+
+# Zero-fill of the finalize output inside the gather GEMM1 (round 17): on
+# launches with at most one tile per CTA the epilogue warps also fill during
+# the mainloop (round 18); ``MXFP4_DENSE_FILL_MAINLOOP=0`` keeps the tail-only
+# form for A/B measurement.
+_DENSE_FILL_MAINLOOP = os.environ.get("MXFP4_DENSE_FILL_MAINLOOP", "1") == "1"
 
 def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
     if output_dtype == torch.float16:
@@ -499,6 +507,7 @@ def _moe_core_impl(
             gated=gated,
             zero_fill_output=moe_output if gemm1_zero_fill else None,
             zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
+            zero_fill_mainloop=_DENSE_FILL_MAINLOOP,
             zero_fill_other_tiles=(
                 (alt_num_tiles if dual_tile_size else base_num_tiles)
                 if gemm1_zero_fill
@@ -553,6 +562,7 @@ def _moe_core_impl(
             gated=gated,
             zero_fill_output=moe_output if gemm1_zero_fill else None,
             zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
+            zero_fill_mainloop=_DENSE_FILL_MAINLOOP,
             zero_fill_other_tiles=base_num_tiles if gemm1_zero_fill else None,
             zero_fill_secondary=True,
             _prepared_launches=alt_launches,
