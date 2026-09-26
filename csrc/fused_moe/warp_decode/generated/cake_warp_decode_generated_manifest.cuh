@@ -113,7 +113,7 @@ inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
 inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 219776u;
-inline constexpr char kGeneratedSourceSha256[] = "5b65a6b3577b69d9b12c49fbf849b5f93ae24aad994a289a7ffbf0fd8d2390c2";
+inline constexpr char kGeneratedSourceSha256[] = "021a8eb574f0b9e37da690f09d34c0f8cd9b549b61d5d861b9809d2a88543d40";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {
@@ -4931,19 +4931,19 @@ kernel_cake_warp_decode_f9fa9b6f9f326f89c9c6(__nv_bfloat16* __restrict__ route_o
 __global__ __launch_bounds__(128, 1) void
 kernel_cake_warp_decode_f972b14f1dbd02512dc3(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_7fc2fef14e509a2ea34d(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_7173b39130de7a59f9c6(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_a51e242f56d657482bdb(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_7e715939a26489a27fcb(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_1bb8b252204839e84d03(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_65d8dc9a2b51bca5f578(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_edd9c9d19ffc1ff08290(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_36ef13a3551d497679cd(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_7dffa57b5590226f0397(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_b84333fbc5c6282202d1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_27f245c50c816f8ee062(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_64b75a49bc729f82a995(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_6f62d76b37a192bc2026(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
+kernel_cake_warp_decode_9805c54bf6db2ee12595(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas);
 }
 
 namespace flashinfer::warp_decode::generated {
@@ -4955,7 +4955,7 @@ inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
 inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 219776u;
-inline constexpr char kGeneratedSourceSha256[] = "5b65a6b3577b69d9b12c49fbf849b5f93ae24aad994a289a7ffbf0fd8d2390c2";
+inline constexpr char kGeneratedSourceSha256[] = "021a8eb574f0b9e37da690f09d34c0f8cd9b549b61d5d861b9809d2a88543d40";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {
@@ -4998,13 +4998,13 @@ inline constexpr KernelSpec kKernelSpecs[] = {
   {"kernel_cake_warp_decode_269d5aebbb5aa995796a", "finalize_direct_t128_k16", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
   {"kernel_cake_warp_decode_f9fa9b6f9f326f89c9c6", "finalize_packed_t128_k8", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
   {"kernel_cake_warp_decode_f972b14f1dbd02512dc3", "finalize_packed_t128_k10", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_7fc2fef14e509a2ea34d", "fc1_swiglu_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a51e242f56d657482bdb", "fc1_swiglu_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_1bb8b252204839e84d03", "fc1_swiglu_early_sfb_a_tma_merged_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_edd9c9d19ffc1ff08290", "fc2_sm103_k512_stage5_valid_k64_prefetch_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_7dffa57b5590226f0397", "fc2_sm103_refined_k256_workfeed_prefetch_fused_pack", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_27f245c50c816f8ee062", "fc2_sm103_k512_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_6f62d76b37a192bc2026", "fc2_sm103_k512_valid_k64_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_7173b39130de7a59f9c6", "fc1_swiglu_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_7e715939a26489a27fcb", "fc1_swiglu_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_65d8dc9a2b51bca5f578", "fc1_swiglu_early_sfb_a_tma_merged_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 219776u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_36ef13a3551d497679cd", "fc2_sm103_k512_stage5_valid_k64_prefetch_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_b84333fbc5c6282202d1", "fc2_sm103_refined_k256_workfeed_prefetch_fused_pack", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_64b75a49bc729f82a995", "fc2_sm103_k512_mma_u2_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_9805c54bf6db2ee12595", "fc2_sm103_k512_valid_k64_fused_pack_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
 };
 static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 34);
 
@@ -8950,7 +8950,7 @@ struct KernelArgs_27 {
 };
 inline cudaError_t SubmitKernel_27(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_27*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_7fc2fef14e509a2ea34d,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_7173b39130de7a59f9c6,
       args.A,
       args.B,
       args.SFA,
@@ -9068,7 +9068,7 @@ struct KernelArgs_28 {
 };
 inline cudaError_t SubmitKernel_28(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_28*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_a51e242f56d657482bdb,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_7e715939a26489a27fcb,
       args.A,
       args.B,
       args.SFA,
@@ -9186,7 +9186,7 @@ struct KernelArgs_29 {
 };
 inline cudaError_t SubmitKernel_29(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_29*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_1bb8b252204839e84d03,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_65d8dc9a2b51bca5f578,
       args.A,
       args.B,
       args.SFA,
@@ -9293,7 +9293,7 @@ struct KernelArgs_30 {
 };
 inline cudaError_t SubmitKernel_30(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_30*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_edd9c9d19ffc1ff08290,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_36ef13a3551d497679cd,
       args.A,
       args.B,
       args.SFA,
@@ -9378,7 +9378,7 @@ struct KernelArgs_31 {
 };
 inline cudaError_t SubmitKernel_31(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_31*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_7dffa57b5590226f0397,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_b84333fbc5c6282202d1,
       args.A,
       args.B,
       args.SFA,
@@ -9463,7 +9463,7 @@ struct KernelArgs_32 {
 };
 inline cudaError_t SubmitKernel_32(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_32*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_27f245c50c816f8ee062,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_64b75a49bc729f82a995,
       args.A,
       args.B,
       args.SFA,
@@ -9548,7 +9548,7 @@ struct KernelArgs_33 {
 };
 inline cudaError_t SubmitKernel_33(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_33*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_6f62d76b37a192bc2026,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_9805c54bf6db2ee12595,
       args.A,
       args.B,
       args.SFA,
@@ -9736,13 +9736,13 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
       reinterpret_cast<const void*>(kernel_cake_warp_decode_269d5aebbb5aa995796a),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_f9fa9b6f9f326f89c9c6),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_f972b14f1dbd02512dc3),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_7fc2fef14e509a2ea34d),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_a51e242f56d657482bdb),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_1bb8b252204839e84d03),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_edd9c9d19ffc1ff08290),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_7dffa57b5590226f0397),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_27f245c50c816f8ee062),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_6f62d76b37a192bc2026)
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_7173b39130de7a59f9c6),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_7e715939a26489a27fcb),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_65d8dc9a2b51bca5f578),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_36ef13a3551d497679cd),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_b84333fbc5c6282202d1),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_64b75a49bc729f82a995),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_9805c54bf6db2ee12595)
   };
   for (int kernel = 0; kernel < 34; ++kernel) {
     const size_t requested = kKernelSpecs[kernel].dynamic_smem_bytes;

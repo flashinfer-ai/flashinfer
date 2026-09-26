@@ -468,7 +468,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_7fc2fef14e509a2ea34d(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas)
+kernel_cake_warp_decode_7e715939a26489a27fcb(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ route_experts, int* __restrict__ route_slots, float* __restrict__ pack_ready, int* __restrict__ done_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int initial_work, int launch_ctas)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1443,8 +1443,16 @@ kernel_cake_warp_decode_7fc2fef14e509a2ea34d(const __grid_constant__ CUtensorMap
                 for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                     mbarrier_wait(k_done_addr + (stage_3) * 8, _phase_k_done_2);
                     if (elect_sync()) {
-                        tma_4d_gmem2smem(smem_a_addr + stage_3 * 32768, (&A), 0, m_tile_4 * 128, iter_k_2 * 2, expert_1, a_full_addr + (stage_3) * 8);
-                        tma_4d_gmem2smem(smem_a_addr + stage_3 * 32768 + 16384, (&A), 0, m_tile_4 * 128, iter_k_2 * 2 + 1, expert_1, a_full_addr + (stage_3) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                            :: "r"(smem_a_addr + stage_3 * 32768), "l"((&A)), "r"(0), "r"(m_tile_4 * 128), "r"(iter_k_2 * 2), "r"(expert_1),
+                               "r"(a_full_addr + (stage_3) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                        asm volatile(
+                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                            :: "r"(smem_a_addr + stage_3 * 32768 + 16384), "l"((&A)), "r"(0), "r"(m_tile_4 * 128), "r"(iter_k_2 * 2 + 1), "r"(expert_1),
+                               "r"(a_full_addr + (stage_3) * 8), "l"(0x12F0000000000000ULL) : "memory");
                         mbarrier_arrive_expect_tx(a_full_addr + (stage_3) * 8, 32768);
                     }
                     stage_3 += 1;
@@ -1491,7 +1499,11 @@ kernel_cake_warp_decode_7fc2fef14e509a2ea34d(const __grid_constant__ CUtensorMap
                     mbarrier_wait(sfa_free_addr + (stage_4) * 8, _phase_sfa_free);
                     int sf_tile = ((unsigned int)(expert_2 * grid_m) + m_tile_5) * (unsigned int)K_tiles + (unsigned int)iter_k_3;
                     if (elect_sync()) {
-                        tma_4d_gmem2smem(smem_sfa_addr + stage_4 * 4096, (&SFA), 0, 0, iter_k_3 * 8, (unsigned int)(expert_2 * grid_m) + m_tile_5, sfa_full_addr + (stage_4) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                            :: "r"(smem_sfa_addr + stage_4 * 4096), "l"((&SFA)), "r"(0), "r"(0), "r"(iter_k_3 * 8), "r"((unsigned int)(expert_2 * grid_m) + m_tile_5),
+                               "r"(sfa_full_addr + (stage_4) * 8), "l"(0x12F0000000000000ULL) : "memory");
                         mbarrier_arrive_expect_tx(sfa_full_addr + (stage_4) * 8, 4096);
                     }
                     stage_4 += 1;
@@ -1599,7 +1611,7 @@ kernel_cake_warp_decode_7fc2fef14e509a2ea34d(const __grid_constant__ CUtensorMap
                 unsigned int tile_work_id_1 = m_tile_7 * (unsigned int)grid_n + n_tile_7;
                 bool tile_profile_1 = _tile_iter_7 < 2;
                 mbarrier_wait(mma_free_addr + (acc_stage_1) * 8, _phase_mma_free);
-                #pragma unroll 1
+                #pragma unroll 2
                 for (int iter_k_4 = 0; iter_k_4 < K_tiles; iter_k_4++) {
                     unsigned int stage_record = _tile_iter_7 * (unsigned int)K_tiles + (unsigned int)iter_k_4;
                     unsigned int stage_work_id = tile_work_id_1 * (unsigned int)K_tiles + (unsigned int)iter_k_4;
