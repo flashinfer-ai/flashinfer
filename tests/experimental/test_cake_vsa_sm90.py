@@ -199,6 +199,47 @@ def test_plan_rejects_unsupported_masks():
         plan_vsa_sm90(torch.ones((1, 1, 2), dtype=torch.int32), sms=132)
 
 
+def _cta_tiles(plan):
+    """Per-CTA lists of (head, positions) read back from the plan rows."""
+    meta, stride = plan["meta"], plan["tile_stride"]
+    out = []
+    for c in range(plan["num_ctas"]):
+        n = int(meta[c * stride, META_NTILES])
+        out.append(
+            [
+                (int(meta[c * stride + i, 0]), int(meta[c * stride + i, META_NSEQ]))
+                for i in range(n)
+            ]
+        )
+    return out
+
+
+def test_plan_ragged_tile_order_balances_when_kv_fits_l2():
+    # 7 heads x 64 query blocks over 64 KV blocks: K+V = 14.7 MB, under the
+    # L2 budget, and more tiles than SMs.  The global LPT order hands every
+    # CTA one of the largest tiles first; no later tile is longer than any
+    # CTA's first one.
+    mask = _random_mask(7, 64, 64, 16, ragged=True)
+    plan = plan_vsa_sm90(mask, mode="split", sms=132)
+    ctas = _cta_tiles(plan)
+    assert plan["num_ctas"] == 132 and sum(map(len, ctas)) == 7 * 64
+    first = min(t[0][1] for t in ctas)
+    later = max((p for t in ctas for _, p in t[1:]), default=0)
+    assert first >= later
+    loads = [sum(p for _, p in t) for t in ctas]
+    assert max(loads) <= sum(loads) / len(loads) + max(p for t in ctas for _, p in t)
+
+
+def test_plan_ragged_tile_order_stays_head_major_above_l2_budget():
+    # 8 heads x 512 KV blocks: K+V = 268 MB, above the budget, so each CTA's
+    # tiles arrive in head order (the concurrently running CTAs share a head).
+    mask = _random_mask(8, 64, 512, 16, ragged=True)
+    plan = plan_vsa_sm90(mask, mode="split", sms=132)
+    for tiles in _cta_tiles(plan):
+        heads = [h for h, _ in tiles]
+        assert heads == sorted(heads)
+
+
 def test_plan_mode_selection_prefers_split_below_full_occupancy():
     mask = _random_mask(8, 16, 16, 12, ragged=False)
     assert plan_vsa_sm90(mask, sms=132)["mode"] == "split"
