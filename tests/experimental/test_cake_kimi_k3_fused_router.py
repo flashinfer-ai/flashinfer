@@ -19,7 +19,7 @@ import torch
 
 from flashinfer.experimental.kimi_k3_fused_router import cake_backend
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
-    ARM_G_CTAS_PER_SM,
+    ARM_GW_CTAS_PER_SM,
     ARM_L_MIN_GRID,
     ARM_LC_TOKENS,
     ARM_Q4S_CLUSTER,
@@ -251,7 +251,7 @@ def test_route_tables_cover_the_routed_shapes():
             "LC",
             "M",
             "Q4S",
-            "G",
+            "GW",
         }
     assert SHAPE_ROUTES["sm_100a"] == SHAPE_ROUTES["sm_103a"]
     assert route_arm("sm_100a", 512, 8) == "Q4S"
@@ -266,7 +266,7 @@ def test_route_tables_cover_the_routed_shapes():
         assert route_arm(arch, 256, 16) == "M"
         assert route_arm(arch, 2048, 8) == "Q4S"
         assert route_arm(arch, 1024, 16) == "Q4S"
-        assert route_arm(arch, 8192, 16) == "G"
+        assert route_arm(arch, 8192, 16) == "GW"
     with pytest.raises(NotImplementedError, match="exactly num_tokens"):
         route_arm("sm_100a", 3, 8)
     with pytest.raises(NotImplementedError):
@@ -295,10 +295,10 @@ def test_launch_grid_rules(compute_capability, sm_count):
     assert launch_grid("L", 512, **kw) == min(512, cap)
     assert launch_grid("M", 256, **kw) == 256
     assert launch_grid("M", 2048, **kw) == cap
-    # Arm G: CTAs-per-SM launch bound of the architecture.
-    g_ctas = ARM_G_CTAS_PER_SM[compute_capability] * sm_count
-    assert launch_grid("G", 4096, **kw) == min(4096, g_ctas)
-    assert launch_grid("G", 8192, **kw) == g_ctas
+    # Arm GW: CTAs-per-SM launch bound of the architecture (four on both).
+    gw_ctas = ARM_GW_CTAS_PER_SM[compute_capability] * sm_count
+    assert launch_grid("GW", 4096, **kw) == min(4096, gw_ctas)
+    assert launch_grid("GW", 8192, **kw) == gw_ctas
     # Arm Q4S: four CTAs per SM regardless of the architecture cap, bounded by
     # whole co-resident clusters, then rounded down to clusters.
     q4s_ctas = ARM_Q4S_CTAS_PER_SM * sm_count
@@ -328,7 +328,7 @@ def test_launch_grid_rules(compute_capability, sm_count):
     with pytest.raises(RuntimeError, match="exactly num_tokens"):
         launch_grid("LC", 16, **kw)
     with pytest.raises(RuntimeError, match="launch bound"):
-        launch_grid("G", 4096, compute_capability=(9, 0), sm_count=132)
+        launch_grid("GW", 4096, compute_capability=(9, 0), sm_count=132)
     with pytest.raises(ValueError):
         launch_grid("A", 1, **kw)
     with pytest.raises(ValueError):

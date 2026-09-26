@@ -23,7 +23,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
 # excluded from all hooks so formatting/lint churn doesn't block syncs or alter
 # the source-distributed kernel payload.
 # The shim/ layers next to them are ours and stay checked.
-# The Cake concat-MLA, MoE finalize, MXFP8 MegaMoE, selective-state, MoE all-reduce, Mamba,
+# The Cake TRT-LLM MLA Blackwell generated sources, concat-MLA, MoE finalize, MXFP8 MegaMoE, selective-state, MoE all-reduce, Mamba,
 # warp-decode, and KDA CUDA/host trees, including generated-dispatch sources,
 # are byte-faithful exports. Their SHA-256 digests are checked by JIT manifests
 # and must not be rewritten.
@@ -33,7 +33,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
 # benefit and obscure its history.
 # GDN CP generated CUDA and its source registry are also receipt-bound exports.
 # Preserve their bytes; the handwritten GDN adapters and tests stay checked.
-exclude: ^(?:flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100\.py|csrc/(?:cake_dsv4/|cake_sampling/generated/|cake_minimax_h3_mxfp8_pre_attention/|cake_minimax_h3_nvfp4_pre_attention/|cake_minimax_h3_qkv_quantize_pack/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_moe_finalize_allreduce_fusion/|cake_nvfp4_svdquant_gemm/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|cake_trtllm_moe_allreduce_fusion/|cake_fused_norm_combine/|fused_moe/warp_decode/generated/|kda/cake_flashkda_blackwell_evolution_.*\.cu)|flashinfer/(?:experimental/(?:cake_mxfp8_megamoe_ep16|sm110_gqa_decode|nvfp4_attention|nvfp4_mla_decode|balanced_gqa_decode|minimax_h3_varlen_attention|kimi_k3_fused_router)/csrc/|moe_ep/kernel_src/(?:sm100/cutedsl_megamoe|sm107/next_cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/)|csrc/gdn/gdn_cp/sm_103a/|csrc/generated/dcp_alltoall/|flashinfer/jit/cake_gdn_cp_generated\.py$)
+exclude: ^(?:flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100\.py|csrc/(?:cake_trtllm_mla_blackwell/generated/|cake_dsv4/|cake_sampling/generated/|cake_minimax_h3_mxfp8_pre_attention/|cake_minimax_h3_nvfp4_pre_attention/|cake_minimax_h3_qkv_quantize_pack/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_moe_finalize_allreduce_fusion/|cake_nvfp4_svdquant_gemm/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|cake_trtllm_moe_allreduce_fusion/|cake_trtllm_moe_allreduce_union/|cake_fused_norm_combine/|fused_moe/warp_decode/generated/|kda/cake_flashkda_blackwell_evolution_.*\.cu)|flashinfer/(?:experimental/(?:cake_mxfp8_megamoe_ep16|sm110_gqa_decode|nvfp4_attention|nvfp4_mla_decode|balanced_gqa_decode|minimax_h3_varlen_attention|kimi_k3_fused_router)/csrc/|moe_ep/kernel_src/(?:sm100/cutedsl_megamoe|sm107/next_cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/)|csrc/gdn/gdn_cp/sm_103a/|csrc/generated/dcp_alltoall/|flashinfer/jit/cake_gdn_cp_generated\.py$)
 
 repos:
   # Standard hooks
@@ -41,8 +41,8 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
-        # Required generated CuTe sources; retain lint and formatting checks.
-        exclude: ^flashinfer/experimental/cake_mxfp8_megamoe_ep16/kernels/fused_(?:cta0|all_ctas)\.py$
+        # Required generated CuTe sources and Frost catalogs; retain other checks.
+        exclude: ^flashinfer/experimental/(?:cake_mxfp8_megamoe_ep16/kernels/fused_(?:cta0|all_ctas)\.py|cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/[^/]+/cudnn_frost_selected_kernels\.json)$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
@@ -50,6 +50,8 @@ repos:
       - id: mixed-line-ending
       - id: requirements-txt-fixer
       - id: trailing-whitespace
+        # Frozen template bytes are authenticated by the artifact manifests.
+        exclude: ^flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/[^/]+/sources/[^/]+\.py$
 
   # Changes tabs to spaces
   - repo: https://github.com/Lucas-C/pre-commit-hooks
@@ -68,7 +70,7 @@ repos:
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break their static source-registry identities.
         exclude: |
-          (?x)^(3rdparty/.*|csrc/cake_bf16_bmm/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/cake_sage_block_sparse_attention/(?:sm_100a|sm_103a)/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*)$
+          (?x)^(3rdparty/.*|csrc/cake_bf16_bmm/.*|csrc/fused_moe/warp_decode/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/cake_sage_block_sparse_attention/(?:sm_100a|sm_103a)/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
@@ -76,7 +78,8 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py)|flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:kernel_moe|moe)_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)\.py)
+          # Geometry names in generated Frost templates are injected before JIT.
+          exclude: ^(flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/[^/]+/sources/|flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py)|flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:kernel_moe|moe)_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)\.py)
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

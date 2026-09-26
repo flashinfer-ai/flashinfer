@@ -33,7 +33,10 @@ positive count works). `softmax_scale` defaults to `1 / sqrt(128)`.
 
 ```python
 import torch
-from flashinfer.prefill import minimax_h3_varlen_attention, minimax_h3_varlen_nvfp4_attention
+from flashinfer.prefill import (
+    minimax_h3_varlen_attention,
+    minimax_h3_varlen_nvfp4_attention,
+)
 
 cu = [0, 133, 300, 900]
 T, H = cu[-1], 7
@@ -41,9 +44,13 @@ q = torch.randn(T, H, 128, dtype=torch.bfloat16, device="cuda")
 k, v = torch.randn_like(q), torch.randn_like(q)
 cu_seqlens = torch.tensor(cu, dtype=torch.int32, device="cuda")
 
-out = minimax_h3_varlen_attention(q, k, v, cu_seqlens)                     # BF16
-out8 = minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp8")  # NVFP4 QK, FP8 PV
-out4 = minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp4")  # NVFP4 QK, NVFP4 PV
+out = minimax_h3_varlen_attention(q, k, v, cu_seqlens)  # BF16
+out8 = minimax_h3_varlen_nvfp4_attention(
+    q, k, v, cu_seqlens, pv_mode="fp8"
+)  # NVFP4 QK, FP8 PV
+out4 = minimax_h3_varlen_nvfp4_attention(
+    q, k, v, cu_seqlens, pv_mode="fp4"
+)  # NVFP4 QK, NVFP4 PV
 ```
 
 Both one-shot APIs read `cu_seqlens` back to the host (one synchronization)
@@ -58,11 +65,13 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
 )
 
 runner = prepare_minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out)
-runner()            # launches on the current stream, returns out (no allocation)
-nv = prepare_minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode="fp8", out=out8)
-nv.quantize()       # quantizer stage only (fp8: amax reduction + one fused launch)
-nv.attention()      # attention launch only
-nv()                # complete pipeline (what the one-shot API times)
+runner()  # launches on the current stream, returns out (no allocation)
+nv = prepare_minimax_h3_varlen_nvfp4_attention(
+    q, k, v, cu_seqlens, pv_mode="fp8", out=out8
+)
+nv.quantize()  # quantization only (fp8: the amax kernel + one fused launch)
+nv.attention()  # attention launch only
+nv()  # complete pipeline (what the one-shot API times)
 ```
 
 A runner is bound to one `cu_seqlens`, one shape set and one set of tensor
@@ -84,8 +93,15 @@ unit with one table lookup. The host builds, from `cu_seqlens` (empty segments
 dropped) and `num_heads`:
 
 * `seg_begin[s]`, `seg_len[s]` (int32, `num_segments` entries),
-* `unit_table` (int32, `2 * total_tiles` entries): per slot the segment index
-  and `head << 16 | cluster_in_segment`.
+* `unit_table` (int32, `4 * total_tiles` entries): per slot the segment index,
+  `head << 16 | cluster_in_segment`, `kv_block_begin << 16 | kv_blocks` (the
+  unit's K/V block range inside the segment) and its partial slot (`-1` for an
+  unsplit unit, which writes the BF16 output directly),
+* `combine_table` (int32, `4 * num_combine_units` entries): per K/V-split
+  unit the segment index, `head << 16 | cluster_in_segment`, its first partial
+  slot and the number of splits, plus the plan's partial workspace
+  `partial_O` (FP16, `num_partial_slots * 512 * 128`) and `partial_ML` (FP32,
+  `num_partial_slots * 512 * 2`).
 
 Units are enumerated segment-major (heads slow, clusters fast, so a cluster's
 Q tiles reuse the segment's K/V from L2) and placed into slots
@@ -93,6 +109,24 @@ longest-processing-time first over the per-unit cost `ceil(seg_len / 128) + 2`
 K/V blocks (`assign_unit_slots`): the partial tail round receives the cheapest
 units and, within every full round, the clusters that also own a tail unit
 receive that round's cheapest units; equal costs keep the enumeration order.
+
+**K/V splits for the partial wave.** When the unit count leaves a partial
+wave on the persistent grid (`total_units mod num_clusters != 0`, fewer than
+four waves), the planner (`choose_kv_splits`) simulates the slot assignment
+for splitting the `total_units mod num_clusters` most expensive units (and,
+as the fallback, every unit) `k = 2..8` ways into near-equal K/V block ranges
+and keeps the candidate with the lowest makespan plus combine cost when it
+beats the unsplit plan by more than 3 %. A split unit's ranges are separate
+units of the table; each runs the full online softmax over its range and
+writes its rows normalized by its own softmax sum as FP16 into its partial
+slot together with the FP32 `(scaled log2 row max, row sum)`. The `combine`
+stage (one warp per output row, `128` CTAs of 128 threads per split unit)
+then merges the slots with the exact FlashAttention formula
+`O = sum_i 2^(m_i - m) l_i O_i / sum_i 2^(m_i - m) l_i` into the BF16 output.
+It is launched after the attention kernel on the same stream and skipped when
+the plan has no split units. Plans with at least as many units as clusters
+per wave are unchanged (unsplit units are bitwise identical to the previous
+kernel).
 The plan is a host-side function of `(cu_seqlens, num_heads, num_SMs)` and
 reproduces the Cake production plan table for table (`num_heads < 2^15`,
 fewer than `2^16` clusters per segment). K/V TMA loads that run past a segment
@@ -106,7 +140,18 @@ inside its segment.
 Quantization is part of the pipeline: one fused quantizer launch (`quantize`;
 `minimax_h3_varlen_nvfp4_quantize_qkv` for `pv_mode="fp4"`,
 `minimax_h3_varlen_nvfp4_quantize_qk_fp8v` for `pv_mode="fp8"`), then one
-attention launch (`attention`). The quantizer writes a
+attention launch. The attention launch uses one of two generated programs,
+chosen at preparation from the plan: the dense `attention` program (no
+K/V-split code at all) for plans without split units, `attention_split` for
+plans with them (`runner.attention_stage`, `route_metadata["attention_variant"]`).
+Both are the same kernel specialised at build time; keeping the dense program
+free of the split-unit epilogue keeps the softmax block loop of unsplit units
+at the schedule of the single-program kernel (a split path in the epilogue
+costs 1-2 % on every long row). The split program itself runs at a per-unit
+cost relative to the dense program that depends on `(pv_mode, arch)`
+(`SPLIT_PROGRAM_COST`: sm_103a fp8pv 1.35x, calibrated on the short partial-wave units; sm_100a fp4pv 1.03x, parity
+otherwise); the planner scales a split plan's makespan by it, so a row splits
+only when the wave-quantization gain exceeds the program cost. The quantizer writes a
 **head-major, per-segment 128-token-padded packed layout**: segment `s`
 (non-empty segments only) owns `ceil(len / 128)` packed 128-token blocks
 starting at packed block `seg_tile_base[s]`, `PB = sum(ceil(len / 128))`, and
@@ -123,34 +168,45 @@ kernel is unchanged. Host tables (int32):
   K and V of the 32-token slice `b % 4` of packed block `(b // 4) % PB` for
   head `(b // 4) // PB`.
 * attention scheduler (built once per `(cu_seqlens, heads)`,
-  `build_tile_tables`), `total_tiles = heads * sum(ceil(len / 512))` entries:
-  `cl_head[t]`, `cl_seg_begin[t]`, `cl_seg_len[t]`, `cl_kv_base[t] =
-  seg_tile_base[s]`, `cl_q_block[t]` (first Q block of the cluster tile inside
-  its segment, a multiple of four). Tiles are ordered segment-major with the
-  longest segments first (ties keep segment order), then head, then the
-  segment's cluster tiles, so the statically round-robined persistent grid
-  (`grid = 2 * min(num_SMs / 2, total_tiles)` CTAs, cluster `i` runs tiles
-  `i, i + G, ...`) ends on the cheapest tiles while consecutive tiles stream
-  one head's K/V. CTA rank `r` of a cluster owns blocks `cl_q_block + 2r` and
-  `cl_q_block + 2r + 1`.
+  `build_tile_tables`), one entry per scheduled unit (`heads * sum(ceil(len /
+  512))` cluster tiles plus the extra K/V-split ranges): `cl_head[t]`,
+  `cl_seg_begin[t]`, `cl_seg_len[t]`, `cl_kv_base[t] = seg_tile_base[s]`,
+  `cl_q_block[t]` (first Q block of the cluster tile inside its segment, a
+  multiple of four), `cl_kv_begin[t]` / `cl_kv_blocks[t]` (the unit's K/V
+  block range inside the segment) and `cl_ws_slot[t]` (partial slot, `-1` for
+  an unsplit unit). Units are enumerated segment-major with the longest
+  segments first (ties keep segment order), then head, then the segment's
+  cluster tiles (consecutive units stream one head's K/V), split by the same
+  `choose_kv_splits` planner as the BF16 family, and placed into the
+  statically strided persistent grid (`grid = 2 * min(num_SMs / 2,
+  total_tiles)` CTAs, cluster `i` runs units `i, i + G, ...`)
+  longest-processing-time first (`assign_unit_slots`). CTA rank `r` of a
+  cluster owns blocks `cl_q_block + 2r` and `cl_q_block + 2r + 1`. The tables
+  also carry the `combine_table`, `seg_begin` / `seg_len` and the FP16 / FP32
+  partial workspace of the `combine` stage, which runs after the attention
+  launch (ordinary serial launch) when the plan has split units.
 
 The attention launch is a **programmatic dependent launch**: the quantizer
 signals `griddepcontrol.launch_dependents` at its end, the attention prologue
 runs its barrier/TMEM setup and then waits with `griddepcontrol.wait` before
 reading the packed operands. The launch attribute
-(`cudaLaunchAttributeProgrammaticStreamSerialization`) is baked into the
-generated attention host binding by the export, so the runner only enqueues
-the two launches in order on the current stream; the `fp8` `amax(V)`
-reduction runs before the quantizer launch.
+(`cudaLaunchAttributeProgrammaticStreamSerialization`) is baked into both
+generated attention host bindings by the export, so the runner only enqueues
+the launches in order on the current stream (quantizer, the bound attention
+program and, for plans with K/V-split units, the `combine` stage). The `fp8`
+route starts with the `amax` stage, a fixed grid of 512 CTAs that each write
+one partial `max|V|`; its quantizer binding carries the same launch
+attribute, so the quantizer's Q/K/V loads overlap the partial-max tail and
+only the fold of the partials waits.
 
 Packed operands (`q_fp4`, `k_fp4`, `q_scale`, `k_scale`, plus `v_fp4_t`,
 `v_scale_lo`, `v_scale_hi` for `fp4` or `v_fp8`, `v_amax` for `fp8`) cost
 about 180 bytes per (token, head) and are allocated at preparation
 (`nvfp4_workspace_shapes(heads, PB, pv_mode)`); a caller-owned set may be
-passed through `workspace=`. For `pv_mode="fp8"` the per-tensor
-`amax(V)` is one device reduction into `v_amax` before the fused quantizer
-launch; the scalar never visits the host, so the pipeline is CUDA-Graph
-capturable.
+passed through `workspace=`. For `pv_mode="fp8"` the per-tensor `amax(V)`
+is computed on the device (`amax` partials in `v_amax_partial`, folded into
+`v_amax` by the quantizer); the scalar never visits the host, so the pipeline
+is CUDA-Graph capturable.
 
 ## Supported hardware and limitations
 

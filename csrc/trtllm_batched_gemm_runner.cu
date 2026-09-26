@@ -181,10 +181,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
           std::strstr(config.mFunctionName, "E2m1xFp32") != nullptr) {
         continue;
       }
-      if (mOptions.usePerChannelScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
-      }
+      bool const usesPerChannelScaling =
+          options.mTransposeMmaOutput ? options.mUsePerTokenSfA : options.mUsePerTokenSfB;
+      if (usesPerChannelScaling != mOptions.usePerChannelScaling) continue;
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;

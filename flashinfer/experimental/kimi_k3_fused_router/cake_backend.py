@@ -24,8 +24,9 @@ kernels: one dispatch arm per exact ``(num_tokens, block_m)`` shape of the
 routed set, selected by a per-architecture table.  Most arms launch as a
 cooperative persistent grid bounded by the device's SM count (arm Q4S
 additionally uses 4-CTA clusters at four CTAs per SM and is bounded by the
-driver's co-resident cluster capacity; arm G uses a per-architecture
-CTAs-per-SM bound); arm LC
+driver's co-resident cluster capacity; arm GW, the warp-per-row two-join
+kernel for the largest batches, uses a per-architecture CTAs-per-SM bound);
+arm LC
 launches one non-cooperative cluster of ``num_tokens`` CTAs for the smallest
 batches.  Nothing is planned on the host and nothing is allocated
 at launch, so a prepared runner is CUDA Graph safe.  See ``README.md`` in
@@ -65,8 +66,9 @@ ARM_L_MAX_TOKENS = 512
 ARM_L_MIN_GRID = 128
 # Arm LC: one kernel per row count, launched as a single cluster of num_tokens CTAs.
 ARM_LC_TOKENS = (2, 4, 8)
-# Arm G: persistent grid of CTAs-per-SM x SM count (launch bounds of the kernel).
-ARM_G_CTAS_PER_SM = {(10, 0): 4, (10, 3): 6}
+# Arm GW: persistent grid of CTAs-per-SM x SM count (launch bounds of the kernel,
+# __launch_bounds__(224, 4) on both architectures).
+ARM_GW_CTAS_PER_SM = {(10, 0): 4, (10, 3): 4}
 ARM_M_MAX_TOKENS = 2048
 # Arm Q4S: 4-CTA clusters, kernel compiled with __launch_bounds__(224, 4); grid =
 # min(num_tokens, 4 x SM count, co-resident cluster capacity) in whole clusters.
@@ -118,10 +120,10 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1024, 16): "Q4S",
     (2048, 8): "Q4S",
     (2048, 16): "Q4S",
-    (4096, 8): "G",
-    (4096, 16): "G",
-    (8192, 8): "G",
-    (8192, 16): "G",
+    (4096, 8): "GW",
+    (4096, 16): "GW",
+    (8192, 8): "GW",
+    (8192, 16): "GW",
 }
 _SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = dict(_SM100_SHAPE_ROUTE)
 SHAPE_ROUTES = {"sm_100a": _SM100_SHAPE_ROUTE, "sm_103a": _SM103_SHAPE_ROUTE}
@@ -263,12 +265,12 @@ def launch_grid(
                 f"{cluster_cap} clustered CTAs"
             )
         return grid_x
-    if arm == "G":
+    if arm == "GW":
         try:
-            ctas_per_sm = ARM_G_CTAS_PER_SM[compute_capability]
+            ctas_per_sm = ARM_GW_CTAS_PER_SM[compute_capability]
         except KeyError:
             raise RuntimeError(
-                f"arm G has no launch bound for compute capability {compute_capability}"
+                f"arm GW has no launch bound for compute capability {compute_capability}"
             ) from None
         return max(1, min(grid_rows, ctas_per_sm * int(sm_count)))
     raise ValueError(f"unknown dispatch arm {arm!r}")
