@@ -368,7 +368,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 4) void
-kernel_cake_vsa_sm90_0ef5b67f3dc93b066ede(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2, __nv_bfloat16* __restrict__ Wo, float* __restrict__ Ws, unsigned int* __restrict__ Wc)
+kernel_cake_vsa_sm90_a79dcd21193e97439853(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2, __nv_bfloat16* __restrict__ Wo, float* __restrict__ Ws, unsigned int* __restrict__ Wc)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -856,387 +856,379 @@ kernel_cake_vsa_sm90_0ef5b67f3dc93b066ede(const __grid_constant__ CUtensorMap Q,
             float merged_max1 = row_max1;
             #pragma unroll 1
             for (int j = 0; j < nsplit; j++) {
-                if (j != my_split) {
-                    int other_stats = (first_item + j) * 128;
-                    float _max_38 = max_noftz(merged_max0, Ws[other_stats + m0_local * 2]);
-                    merged_max0 = _max_38;
-                    float _max_39 = max_noftz(merged_max1, Ws[other_stats + m1_local * 2]);
-                    merged_max1 = _max_39;
-                }
+                int other_stats = (first_item + j) * 128;
+                float _max_38 = max_noftz(merged_max0, Ws[other_stats + m0_local * 2]);
+                merged_max0 = _max_38;
+                float _max_39 = max_noftz(merged_max1, Ws[other_stats + m1_local * 2]);
+                merged_max1 = _max_39;
             }
-            float _exp2_34 = approx_exp2(row_max0 - merged_max0);
-            float weight0 = _exp2_34;
-            float _exp2_35 = approx_exp2(row_max1 - merged_max1);
-            float weight1 = _exp2_35;
-            d_o[0] = d_o[0] * weight0;
-            d_o[1] = d_o[1] * weight0;
-            d_o[4] = d_o[4] * weight0;
-            d_o[5] = d_o[5] * weight0;
-            d_o[8] = d_o[8] * weight0;
-            d_o[9] = d_o[9] * weight0;
-            d_o[12] = d_o[12] * weight0;
-            d_o[13] = d_o[13] * weight0;
-            d_o[16] = d_o[16] * weight0;
-            d_o[17] = d_o[17] * weight0;
-            d_o[20] = d_o[20] * weight0;
-            d_o[21] = d_o[21] * weight0;
-            d_o[24] = d_o[24] * weight0;
-            d_o[25] = d_o[25] * weight0;
-            d_o[28] = d_o[28] * weight0;
-            d_o[29] = d_o[29] * weight0;
-            d_o[32] = d_o[32] * weight0;
-            d_o[33] = d_o[33] * weight0;
-            d_o[36] = d_o[36] * weight0;
-            d_o[37] = d_o[37] * weight0;
-            d_o[40] = d_o[40] * weight0;
-            d_o[41] = d_o[41] * weight0;
-            d_o[44] = d_o[44] * weight0;
-            d_o[45] = d_o[45] * weight0;
-            d_o[48] = d_o[48] * weight0;
-            d_o[49] = d_o[49] * weight0;
-            d_o[52] = d_o[52] * weight0;
-            d_o[53] = d_o[53] * weight0;
-            d_o[56] = d_o[56] * weight0;
-            d_o[57] = d_o[57] * weight0;
-            d_o[60] = d_o[60] * weight0;
-            d_o[61] = d_o[61] * weight0;
-            d_o[2] = d_o[2] * weight1;
-            d_o[3] = d_o[3] * weight1;
-            d_o[6] = d_o[6] * weight1;
-            d_o[7] = d_o[7] * weight1;
-            d_o[10] = d_o[10] * weight1;
-            d_o[11] = d_o[11] * weight1;
-            d_o[14] = d_o[14] * weight1;
-            d_o[15] = d_o[15] * weight1;
-            d_o[18] = d_o[18] * weight1;
-            d_o[19] = d_o[19] * weight1;
-            d_o[22] = d_o[22] * weight1;
-            d_o[23] = d_o[23] * weight1;
-            d_o[26] = d_o[26] * weight1;
-            d_o[27] = d_o[27] * weight1;
-            d_o[30] = d_o[30] * weight1;
-            d_o[31] = d_o[31] * weight1;
-            d_o[34] = d_o[34] * weight1;
-            d_o[35] = d_o[35] * weight1;
-            d_o[38] = d_o[38] * weight1;
-            d_o[39] = d_o[39] * weight1;
-            d_o[42] = d_o[42] * weight1;
-            d_o[43] = d_o[43] * weight1;
-            d_o[46] = d_o[46] * weight1;
-            d_o[47] = d_o[47] * weight1;
-            d_o[50] = d_o[50] * weight1;
-            d_o[51] = d_o[51] * weight1;
-            d_o[54] = d_o[54] * weight1;
-            d_o[55] = d_o[55] * weight1;
-            d_o[58] = d_o[58] * weight1;
-            d_o[59] = d_o[59] * weight1;
-            d_o[62] = d_o[62] * weight1;
-            d_o[63] = d_o[63] * weight1;
-            row_sum0 = row_sum0 * weight0;
-            row_sum1 = row_sum1 * weight1;
+            d_o[0] = 0.0f;
+            d_o[1] = 0.0f;
+            d_o[2] = 0.0f;
+            d_o[3] = 0.0f;
+            d_o[4] = 0.0f;
+            d_o[5] = 0.0f;
+            d_o[6] = 0.0f;
+            d_o[7] = 0.0f;
+            d_o[8] = 0.0f;
+            d_o[9] = 0.0f;
+            d_o[10] = 0.0f;
+            d_o[11] = 0.0f;
+            d_o[12] = 0.0f;
+            d_o[13] = 0.0f;
+            d_o[14] = 0.0f;
+            d_o[15] = 0.0f;
+            d_o[16] = 0.0f;
+            d_o[17] = 0.0f;
+            d_o[18] = 0.0f;
+            d_o[19] = 0.0f;
+            d_o[20] = 0.0f;
+            d_o[21] = 0.0f;
+            d_o[22] = 0.0f;
+            d_o[23] = 0.0f;
+            d_o[24] = 0.0f;
+            d_o[25] = 0.0f;
+            d_o[26] = 0.0f;
+            d_o[27] = 0.0f;
+            d_o[28] = 0.0f;
+            d_o[29] = 0.0f;
+            d_o[30] = 0.0f;
+            d_o[31] = 0.0f;
+            d_o[32] = 0.0f;
+            d_o[33] = 0.0f;
+            d_o[34] = 0.0f;
+            d_o[35] = 0.0f;
+            d_o[36] = 0.0f;
+            d_o[37] = 0.0f;
+            d_o[38] = 0.0f;
+            d_o[39] = 0.0f;
+            d_o[40] = 0.0f;
+            d_o[41] = 0.0f;
+            d_o[42] = 0.0f;
+            d_o[43] = 0.0f;
+            d_o[44] = 0.0f;
+            d_o[45] = 0.0f;
+            d_o[46] = 0.0f;
+            d_o[47] = 0.0f;
+            d_o[48] = 0.0f;
+            d_o[49] = 0.0f;
+            d_o[50] = 0.0f;
+            d_o[51] = 0.0f;
+            d_o[52] = 0.0f;
+            d_o[53] = 0.0f;
+            d_o[54] = 0.0f;
+            d_o[55] = 0.0f;
+            d_o[56] = 0.0f;
+            d_o[57] = 0.0f;
+            d_o[58] = 0.0f;
+            d_o[59] = 0.0f;
+            d_o[60] = 0.0f;
+            d_o[61] = 0.0f;
+            d_o[62] = 0.0f;
+            d_o[63] = 0.0f;
+            row_sum0 = 0.0f;
+            row_sum1 = 0.0f;
             #pragma unroll 1
             for (int j_1 = 0; j_1 < nsplit; j_1++) {
-                if (j_1 != my_split) {
-                    int other_item = first_item + j_1;
-                    int other_stats_1 = other_item * 128;
-                    float _exp2_36 = approx_exp2(Ws[other_stats_1 + m0_local * 2] - merged_max0);
-                    float other_w0 = _exp2_36;
-                    float _exp2_37 = approx_exp2(Ws[other_stats_1 + m1_local * 2] - merged_max1);
-                    float other_w1 = _exp2_37;
-                    float _fma_0 = __fmaf_rn(Ws[other_stats_1 + m0_local * 2 + 1], other_w0, row_sum0);
-                    row_sum0 = _fma_0;
-                    float _fma_1 = __fmaf_rn(Ws[other_stats_1 + m1_local * 2 + 1], other_w1, row_sum1);
-                    row_sum1 = _fma_1;
-                    int other_base = other_item * 8192 + tid * 8;
-                    float _vec_load_0[8];
-                    {
-                        const uint4* _vptr_5 = reinterpret_cast<const uint4*>(Wo + other_base + 0);
-                        uint4 _vld_5[1];
+                int other_item = first_item + j_1;
+                int other_stats_1 = other_item * 128;
+                float _exp2_34 = approx_exp2(Ws[other_stats_1 + m0_local * 2] - merged_max0);
+                float other_w0 = _exp2_34;
+                float _exp2_35 = approx_exp2(Ws[other_stats_1 + m1_local * 2] - merged_max1);
+                float other_w1 = _exp2_35;
+                float _fma_0 = __fmaf_rn(Ws[other_stats_1 + m0_local * 2 + 1], other_w0, row_sum0);
+                row_sum0 = _fma_0;
+                float _fma_1 = __fmaf_rn(Ws[other_stats_1 + m1_local * 2 + 1], other_w1, row_sum1);
+                row_sum1 = _fma_1;
+                int other_base = other_item * 8192 + tid * 8;
+                float _vec_load_0[8];
+                {
+                    const uint4* _vptr_5 = reinterpret_cast<const uint4*>(Wo + other_base + 0);
+                    uint4 _vld_5[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_5[_blk] = _vptr_5[_blk];
+                        uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
                         #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_5[_blk] = _vptr_5[_blk];
-                            uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_5[_pair]));
-                            }
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_5[_pair]));
                         }
                     }
-                    float _fma_2 = __fmaf_rn(_vec_load_0[0], ((0) ? other_w1 : other_w0), d_o[0]);
-                    d_o[0] = _fma_2;
-                    float _fma_3 = __fmaf_rn(_vec_load_0[1], ((0) ? other_w1 : other_w0), d_o[1]);
-                    d_o[1] = _fma_3;
-                    float _fma_4 = __fmaf_rn(_vec_load_0[2], ((1) ? other_w1 : other_w0), d_o[2]);
-                    d_o[2] = _fma_4;
-                    float _fma_5 = __fmaf_rn(_vec_load_0[3], ((1) ? other_w1 : other_w0), d_o[3]);
-                    d_o[3] = _fma_5;
-                    float _fma_6 = __fmaf_rn(_vec_load_0[4], ((0) ? other_w1 : other_w0), d_o[4]);
-                    d_o[4] = _fma_6;
-                    float _fma_7 = __fmaf_rn(_vec_load_0[5], ((0) ? other_w1 : other_w0), d_o[5]);
-                    d_o[5] = _fma_7;
-                    float _fma_8 = __fmaf_rn(_vec_load_0[6], ((1) ? other_w1 : other_w0), d_o[6]);
-                    d_o[6] = _fma_8;
-                    float _fma_9 = __fmaf_rn(_vec_load_0[7], ((1) ? other_w1 : other_w0), d_o[7]);
-                    d_o[7] = _fma_9;
-                    float _vec_load_1[8];
-                    {
-                        const uint4* _vptr_6 = reinterpret_cast<const uint4*>(Wo + (other_base + 1024) + 0);
-                        uint4 _vld_6[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_6[_blk] = _vptr_6[_blk];
-                            uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_6[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_10 = __fmaf_rn(_vec_load_1[0], ((0) ? other_w1 : other_w0), d_o[8]);
-                    d_o[8] = _fma_10;
-                    float _fma_11 = __fmaf_rn(_vec_load_1[1], ((0) ? other_w1 : other_w0), d_o[9]);
-                    d_o[9] = _fma_11;
-                    float _fma_12 = __fmaf_rn(_vec_load_1[2], ((1) ? other_w1 : other_w0), d_o[10]);
-                    d_o[10] = _fma_12;
-                    float _fma_13 = __fmaf_rn(_vec_load_1[3], ((1) ? other_w1 : other_w0), d_o[11]);
-                    d_o[11] = _fma_13;
-                    float _fma_14 = __fmaf_rn(_vec_load_1[4], ((0) ? other_w1 : other_w0), d_o[12]);
-                    d_o[12] = _fma_14;
-                    float _fma_15 = __fmaf_rn(_vec_load_1[5], ((0) ? other_w1 : other_w0), d_o[13]);
-                    d_o[13] = _fma_15;
-                    float _fma_16 = __fmaf_rn(_vec_load_1[6], ((1) ? other_w1 : other_w0), d_o[14]);
-                    d_o[14] = _fma_16;
-                    float _fma_17 = __fmaf_rn(_vec_load_1[7], ((1) ? other_w1 : other_w0), d_o[15]);
-                    d_o[15] = _fma_17;
-                    float _vec_load_2[8];
-                    {
-                        const uint4* _vptr_7 = reinterpret_cast<const uint4*>(Wo + (other_base + 2048) + 0);
-                        uint4 _vld_7[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_7[_blk] = _vptr_7[_blk];
-                            uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_7[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_18 = __fmaf_rn(_vec_load_2[0], ((0) ? other_w1 : other_w0), d_o[16]);
-                    d_o[16] = _fma_18;
-                    float _fma_19 = __fmaf_rn(_vec_load_2[1], ((0) ? other_w1 : other_w0), d_o[17]);
-                    d_o[17] = _fma_19;
-                    float _fma_20 = __fmaf_rn(_vec_load_2[2], ((1) ? other_w1 : other_w0), d_o[18]);
-                    d_o[18] = _fma_20;
-                    float _fma_21 = __fmaf_rn(_vec_load_2[3], ((1) ? other_w1 : other_w0), d_o[19]);
-                    d_o[19] = _fma_21;
-                    float _fma_22 = __fmaf_rn(_vec_load_2[4], ((0) ? other_w1 : other_w0), d_o[20]);
-                    d_o[20] = _fma_22;
-                    float _fma_23 = __fmaf_rn(_vec_load_2[5], ((0) ? other_w1 : other_w0), d_o[21]);
-                    d_o[21] = _fma_23;
-                    float _fma_24 = __fmaf_rn(_vec_load_2[6], ((1) ? other_w1 : other_w0), d_o[22]);
-                    d_o[22] = _fma_24;
-                    float _fma_25 = __fmaf_rn(_vec_load_2[7], ((1) ? other_w1 : other_w0), d_o[23]);
-                    d_o[23] = _fma_25;
-                    float _vec_load_3[8];
-                    {
-                        const uint4* _vptr_8 = reinterpret_cast<const uint4*>(Wo + (other_base + 3072) + 0);
-                        uint4 _vld_8[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_8[_blk] = _vptr_8[_blk];
-                            uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_8[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_26 = __fmaf_rn(_vec_load_3[0], ((0) ? other_w1 : other_w0), d_o[24]);
-                    d_o[24] = _fma_26;
-                    float _fma_27 = __fmaf_rn(_vec_load_3[1], ((0) ? other_w1 : other_w0), d_o[25]);
-                    d_o[25] = _fma_27;
-                    float _fma_28 = __fmaf_rn(_vec_load_3[2], ((1) ? other_w1 : other_w0), d_o[26]);
-                    d_o[26] = _fma_28;
-                    float _fma_29 = __fmaf_rn(_vec_load_3[3], ((1) ? other_w1 : other_w0), d_o[27]);
-                    d_o[27] = _fma_29;
-                    float _fma_30 = __fmaf_rn(_vec_load_3[4], ((0) ? other_w1 : other_w0), d_o[28]);
-                    d_o[28] = _fma_30;
-                    float _fma_31 = __fmaf_rn(_vec_load_3[5], ((0) ? other_w1 : other_w0), d_o[29]);
-                    d_o[29] = _fma_31;
-                    float _fma_32 = __fmaf_rn(_vec_load_3[6], ((1) ? other_w1 : other_w0), d_o[30]);
-                    d_o[30] = _fma_32;
-                    float _fma_33 = __fmaf_rn(_vec_load_3[7], ((1) ? other_w1 : other_w0), d_o[31]);
-                    d_o[31] = _fma_33;
-                    float _vec_load_4[8];
-                    {
-                        const uint4* _vptr_9 = reinterpret_cast<const uint4*>(Wo + (other_base + 4096) + 0);
-                        uint4 _vld_9[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_9[_blk] = _vptr_9[_blk];
-                            uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_9[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_34 = __fmaf_rn(_vec_load_4[0], ((0) ? other_w1 : other_w0), d_o[32]);
-                    d_o[32] = _fma_34;
-                    float _fma_35 = __fmaf_rn(_vec_load_4[1], ((0) ? other_w1 : other_w0), d_o[33]);
-                    d_o[33] = _fma_35;
-                    float _fma_36 = __fmaf_rn(_vec_load_4[2], ((1) ? other_w1 : other_w0), d_o[34]);
-                    d_o[34] = _fma_36;
-                    float _fma_37 = __fmaf_rn(_vec_load_4[3], ((1) ? other_w1 : other_w0), d_o[35]);
-                    d_o[35] = _fma_37;
-                    float _fma_38 = __fmaf_rn(_vec_load_4[4], ((0) ? other_w1 : other_w0), d_o[36]);
-                    d_o[36] = _fma_38;
-                    float _fma_39 = __fmaf_rn(_vec_load_4[5], ((0) ? other_w1 : other_w0), d_o[37]);
-                    d_o[37] = _fma_39;
-                    float _fma_40 = __fmaf_rn(_vec_load_4[6], ((1) ? other_w1 : other_w0), d_o[38]);
-                    d_o[38] = _fma_40;
-                    float _fma_41 = __fmaf_rn(_vec_load_4[7], ((1) ? other_w1 : other_w0), d_o[39]);
-                    d_o[39] = _fma_41;
-                    float _vec_load_5[8];
-                    {
-                        const uint4* _vptr_10 = reinterpret_cast<const uint4*>(Wo + (other_base + 5120) + 0);
-                        uint4 _vld_10[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_10[_blk] = _vptr_10[_blk];
-                            uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_5[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_5[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_10[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_42 = __fmaf_rn(_vec_load_5[0], ((0) ? other_w1 : other_w0), d_o[40]);
-                    d_o[40] = _fma_42;
-                    float _fma_43 = __fmaf_rn(_vec_load_5[1], ((0) ? other_w1 : other_w0), d_o[41]);
-                    d_o[41] = _fma_43;
-                    float _fma_44 = __fmaf_rn(_vec_load_5[2], ((1) ? other_w1 : other_w0), d_o[42]);
-                    d_o[42] = _fma_44;
-                    float _fma_45 = __fmaf_rn(_vec_load_5[3], ((1) ? other_w1 : other_w0), d_o[43]);
-                    d_o[43] = _fma_45;
-                    float _fma_46 = __fmaf_rn(_vec_load_5[4], ((0) ? other_w1 : other_w0), d_o[44]);
-                    d_o[44] = _fma_46;
-                    float _fma_47 = __fmaf_rn(_vec_load_5[5], ((0) ? other_w1 : other_w0), d_o[45]);
-                    d_o[45] = _fma_47;
-                    float _fma_48 = __fmaf_rn(_vec_load_5[6], ((1) ? other_w1 : other_w0), d_o[46]);
-                    d_o[46] = _fma_48;
-                    float _fma_49 = __fmaf_rn(_vec_load_5[7], ((1) ? other_w1 : other_w0), d_o[47]);
-                    d_o[47] = _fma_49;
-                    float _vec_load_6[8];
-                    {
-                        const uint4* _vptr_11 = reinterpret_cast<const uint4*>(Wo + (other_base + 6144) + 0);
-                        uint4 _vld_11[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_11[_blk] = _vptr_11[_blk];
-                            uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_6[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_6[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_11[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_50 = __fmaf_rn(_vec_load_6[0], ((0) ? other_w1 : other_w0), d_o[48]);
-                    d_o[48] = _fma_50;
-                    float _fma_51 = __fmaf_rn(_vec_load_6[1], ((0) ? other_w1 : other_w0), d_o[49]);
-                    d_o[49] = _fma_51;
-                    float _fma_52 = __fmaf_rn(_vec_load_6[2], ((1) ? other_w1 : other_w0), d_o[50]);
-                    d_o[50] = _fma_52;
-                    float _fma_53 = __fmaf_rn(_vec_load_6[3], ((1) ? other_w1 : other_w0), d_o[51]);
-                    d_o[51] = _fma_53;
-                    float _fma_54 = __fmaf_rn(_vec_load_6[4], ((0) ? other_w1 : other_w0), d_o[52]);
-                    d_o[52] = _fma_54;
-                    float _fma_55 = __fmaf_rn(_vec_load_6[5], ((0) ? other_w1 : other_w0), d_o[53]);
-                    d_o[53] = _fma_55;
-                    float _fma_56 = __fmaf_rn(_vec_load_6[6], ((1) ? other_w1 : other_w0), d_o[54]);
-                    d_o[54] = _fma_56;
-                    float _fma_57 = __fmaf_rn(_vec_load_6[7], ((1) ? other_w1 : other_w0), d_o[55]);
-                    d_o[55] = _fma_57;
-                    float _vec_load_7[8];
-                    {
-                        const uint4* _vptr_12 = reinterpret_cast<const uint4*>(Wo + (other_base + 7168) + 0);
-                        uint4 _vld_12[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_12[_blk] = _vptr_12[_blk];
-                            uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12[_blk]);
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&_vec_load_7[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_7[0 + _blk * 8 + _pair * 2])[1])
-                                    : "r"(_vpairs_12[_pair]));
-                            }
-                        }
-                    }
-                    float _fma_58 = __fmaf_rn(_vec_load_7[0], ((0) ? other_w1 : other_w0), d_o[56]);
-                    d_o[56] = _fma_58;
-                    float _fma_59 = __fmaf_rn(_vec_load_7[1], ((0) ? other_w1 : other_w0), d_o[57]);
-                    d_o[57] = _fma_59;
-                    float _fma_60 = __fmaf_rn(_vec_load_7[2], ((1) ? other_w1 : other_w0), d_o[58]);
-                    d_o[58] = _fma_60;
-                    float _fma_61 = __fmaf_rn(_vec_load_7[3], ((1) ? other_w1 : other_w0), d_o[59]);
-                    d_o[59] = _fma_61;
-                    float _fma_62 = __fmaf_rn(_vec_load_7[4], ((0) ? other_w1 : other_w0), d_o[60]);
-                    d_o[60] = _fma_62;
-                    float _fma_63 = __fmaf_rn(_vec_load_7[5], ((0) ? other_w1 : other_w0), d_o[61]);
-                    d_o[61] = _fma_63;
-                    float _fma_64 = __fmaf_rn(_vec_load_7[6], ((1) ? other_w1 : other_w0), d_o[62]);
-                    d_o[62] = _fma_64;
-                    float _fma_65 = __fmaf_rn(_vec_load_7[7], ((1) ? other_w1 : other_w0), d_o[63]);
-                    d_o[63] = _fma_65;
                 }
+                float _fma_2 = __fmaf_rn(_vec_load_0[0], ((0) ? other_w1 : other_w0), d_o[0]);
+                d_o[0] = _fma_2;
+                float _fma_3 = __fmaf_rn(_vec_load_0[1], ((0) ? other_w1 : other_w0), d_o[1]);
+                d_o[1] = _fma_3;
+                float _fma_4 = __fmaf_rn(_vec_load_0[2], ((1) ? other_w1 : other_w0), d_o[2]);
+                d_o[2] = _fma_4;
+                float _fma_5 = __fmaf_rn(_vec_load_0[3], ((1) ? other_w1 : other_w0), d_o[3]);
+                d_o[3] = _fma_5;
+                float _fma_6 = __fmaf_rn(_vec_load_0[4], ((0) ? other_w1 : other_w0), d_o[4]);
+                d_o[4] = _fma_6;
+                float _fma_7 = __fmaf_rn(_vec_load_0[5], ((0) ? other_w1 : other_w0), d_o[5]);
+                d_o[5] = _fma_7;
+                float _fma_8 = __fmaf_rn(_vec_load_0[6], ((1) ? other_w1 : other_w0), d_o[6]);
+                d_o[6] = _fma_8;
+                float _fma_9 = __fmaf_rn(_vec_load_0[7], ((1) ? other_w1 : other_w0), d_o[7]);
+                d_o[7] = _fma_9;
+                float _vec_load_1[8];
+                {
+                    const uint4* _vptr_6 = reinterpret_cast<const uint4*>(Wo + (other_base + 1024) + 0);
+                    uint4 _vld_6[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_6[_blk] = _vptr_6[_blk];
+                        uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_6[_pair]));
+                        }
+                    }
+                }
+                float _fma_10 = __fmaf_rn(_vec_load_1[0], ((0) ? other_w1 : other_w0), d_o[8]);
+                d_o[8] = _fma_10;
+                float _fma_11 = __fmaf_rn(_vec_load_1[1], ((0) ? other_w1 : other_w0), d_o[9]);
+                d_o[9] = _fma_11;
+                float _fma_12 = __fmaf_rn(_vec_load_1[2], ((1) ? other_w1 : other_w0), d_o[10]);
+                d_o[10] = _fma_12;
+                float _fma_13 = __fmaf_rn(_vec_load_1[3], ((1) ? other_w1 : other_w0), d_o[11]);
+                d_o[11] = _fma_13;
+                float _fma_14 = __fmaf_rn(_vec_load_1[4], ((0) ? other_w1 : other_w0), d_o[12]);
+                d_o[12] = _fma_14;
+                float _fma_15 = __fmaf_rn(_vec_load_1[5], ((0) ? other_w1 : other_w0), d_o[13]);
+                d_o[13] = _fma_15;
+                float _fma_16 = __fmaf_rn(_vec_load_1[6], ((1) ? other_w1 : other_w0), d_o[14]);
+                d_o[14] = _fma_16;
+                float _fma_17 = __fmaf_rn(_vec_load_1[7], ((1) ? other_w1 : other_w0), d_o[15]);
+                d_o[15] = _fma_17;
+                float _vec_load_2[8];
+                {
+                    const uint4* _vptr_7 = reinterpret_cast<const uint4*>(Wo + (other_base + 2048) + 0);
+                    uint4 _vld_7[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_7[_blk] = _vptr_7[_blk];
+                        uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_7[_pair]));
+                        }
+                    }
+                }
+                float _fma_18 = __fmaf_rn(_vec_load_2[0], ((0) ? other_w1 : other_w0), d_o[16]);
+                d_o[16] = _fma_18;
+                float _fma_19 = __fmaf_rn(_vec_load_2[1], ((0) ? other_w1 : other_w0), d_o[17]);
+                d_o[17] = _fma_19;
+                float _fma_20 = __fmaf_rn(_vec_load_2[2], ((1) ? other_w1 : other_w0), d_o[18]);
+                d_o[18] = _fma_20;
+                float _fma_21 = __fmaf_rn(_vec_load_2[3], ((1) ? other_w1 : other_w0), d_o[19]);
+                d_o[19] = _fma_21;
+                float _fma_22 = __fmaf_rn(_vec_load_2[4], ((0) ? other_w1 : other_w0), d_o[20]);
+                d_o[20] = _fma_22;
+                float _fma_23 = __fmaf_rn(_vec_load_2[5], ((0) ? other_w1 : other_w0), d_o[21]);
+                d_o[21] = _fma_23;
+                float _fma_24 = __fmaf_rn(_vec_load_2[6], ((1) ? other_w1 : other_w0), d_o[22]);
+                d_o[22] = _fma_24;
+                float _fma_25 = __fmaf_rn(_vec_load_2[7], ((1) ? other_w1 : other_w0), d_o[23]);
+                d_o[23] = _fma_25;
+                float _vec_load_3[8];
+                {
+                    const uint4* _vptr_8 = reinterpret_cast<const uint4*>(Wo + (other_base + 3072) + 0);
+                    uint4 _vld_8[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_8[_blk] = _vptr_8[_blk];
+                        uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_8[_pair]));
+                        }
+                    }
+                }
+                float _fma_26 = __fmaf_rn(_vec_load_3[0], ((0) ? other_w1 : other_w0), d_o[24]);
+                d_o[24] = _fma_26;
+                float _fma_27 = __fmaf_rn(_vec_load_3[1], ((0) ? other_w1 : other_w0), d_o[25]);
+                d_o[25] = _fma_27;
+                float _fma_28 = __fmaf_rn(_vec_load_3[2], ((1) ? other_w1 : other_w0), d_o[26]);
+                d_o[26] = _fma_28;
+                float _fma_29 = __fmaf_rn(_vec_load_3[3], ((1) ? other_w1 : other_w0), d_o[27]);
+                d_o[27] = _fma_29;
+                float _fma_30 = __fmaf_rn(_vec_load_3[4], ((0) ? other_w1 : other_w0), d_o[28]);
+                d_o[28] = _fma_30;
+                float _fma_31 = __fmaf_rn(_vec_load_3[5], ((0) ? other_w1 : other_w0), d_o[29]);
+                d_o[29] = _fma_31;
+                float _fma_32 = __fmaf_rn(_vec_load_3[6], ((1) ? other_w1 : other_w0), d_o[30]);
+                d_o[30] = _fma_32;
+                float _fma_33 = __fmaf_rn(_vec_load_3[7], ((1) ? other_w1 : other_w0), d_o[31]);
+                d_o[31] = _fma_33;
+                float _vec_load_4[8];
+                {
+                    const uint4* _vptr_9 = reinterpret_cast<const uint4*>(Wo + (other_base + 4096) + 0);
+                    uint4 _vld_9[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_9[_blk] = _vptr_9[_blk];
+                        uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_9[_pair]));
+                        }
+                    }
+                }
+                float _fma_34 = __fmaf_rn(_vec_load_4[0], ((0) ? other_w1 : other_w0), d_o[32]);
+                d_o[32] = _fma_34;
+                float _fma_35 = __fmaf_rn(_vec_load_4[1], ((0) ? other_w1 : other_w0), d_o[33]);
+                d_o[33] = _fma_35;
+                float _fma_36 = __fmaf_rn(_vec_load_4[2], ((1) ? other_w1 : other_w0), d_o[34]);
+                d_o[34] = _fma_36;
+                float _fma_37 = __fmaf_rn(_vec_load_4[3], ((1) ? other_w1 : other_w0), d_o[35]);
+                d_o[35] = _fma_37;
+                float _fma_38 = __fmaf_rn(_vec_load_4[4], ((0) ? other_w1 : other_w0), d_o[36]);
+                d_o[36] = _fma_38;
+                float _fma_39 = __fmaf_rn(_vec_load_4[5], ((0) ? other_w1 : other_w0), d_o[37]);
+                d_o[37] = _fma_39;
+                float _fma_40 = __fmaf_rn(_vec_load_4[6], ((1) ? other_w1 : other_w0), d_o[38]);
+                d_o[38] = _fma_40;
+                float _fma_41 = __fmaf_rn(_vec_load_4[7], ((1) ? other_w1 : other_w0), d_o[39]);
+                d_o[39] = _fma_41;
+                float _vec_load_5[8];
+                {
+                    const uint4* _vptr_10 = reinterpret_cast<const uint4*>(Wo + (other_base + 5120) + 0);
+                    uint4 _vld_10[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_10[_blk] = _vptr_10[_blk];
+                        uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_5[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_5[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_10[_pair]));
+                        }
+                    }
+                }
+                float _fma_42 = __fmaf_rn(_vec_load_5[0], ((0) ? other_w1 : other_w0), d_o[40]);
+                d_o[40] = _fma_42;
+                float _fma_43 = __fmaf_rn(_vec_load_5[1], ((0) ? other_w1 : other_w0), d_o[41]);
+                d_o[41] = _fma_43;
+                float _fma_44 = __fmaf_rn(_vec_load_5[2], ((1) ? other_w1 : other_w0), d_o[42]);
+                d_o[42] = _fma_44;
+                float _fma_45 = __fmaf_rn(_vec_load_5[3], ((1) ? other_w1 : other_w0), d_o[43]);
+                d_o[43] = _fma_45;
+                float _fma_46 = __fmaf_rn(_vec_load_5[4], ((0) ? other_w1 : other_w0), d_o[44]);
+                d_o[44] = _fma_46;
+                float _fma_47 = __fmaf_rn(_vec_load_5[5], ((0) ? other_w1 : other_w0), d_o[45]);
+                d_o[45] = _fma_47;
+                float _fma_48 = __fmaf_rn(_vec_load_5[6], ((1) ? other_w1 : other_w0), d_o[46]);
+                d_o[46] = _fma_48;
+                float _fma_49 = __fmaf_rn(_vec_load_5[7], ((1) ? other_w1 : other_w0), d_o[47]);
+                d_o[47] = _fma_49;
+                float _vec_load_6[8];
+                {
+                    const uint4* _vptr_11 = reinterpret_cast<const uint4*>(Wo + (other_base + 6144) + 0);
+                    uint4 _vld_11[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_11[_blk] = _vptr_11[_blk];
+                        uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_6[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_6[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_11[_pair]));
+                        }
+                    }
+                }
+                float _fma_50 = __fmaf_rn(_vec_load_6[0], ((0) ? other_w1 : other_w0), d_o[48]);
+                d_o[48] = _fma_50;
+                float _fma_51 = __fmaf_rn(_vec_load_6[1], ((0) ? other_w1 : other_w0), d_o[49]);
+                d_o[49] = _fma_51;
+                float _fma_52 = __fmaf_rn(_vec_load_6[2], ((1) ? other_w1 : other_w0), d_o[50]);
+                d_o[50] = _fma_52;
+                float _fma_53 = __fmaf_rn(_vec_load_6[3], ((1) ? other_w1 : other_w0), d_o[51]);
+                d_o[51] = _fma_53;
+                float _fma_54 = __fmaf_rn(_vec_load_6[4], ((0) ? other_w1 : other_w0), d_o[52]);
+                d_o[52] = _fma_54;
+                float _fma_55 = __fmaf_rn(_vec_load_6[5], ((0) ? other_w1 : other_w0), d_o[53]);
+                d_o[53] = _fma_55;
+                float _fma_56 = __fmaf_rn(_vec_load_6[6], ((1) ? other_w1 : other_w0), d_o[54]);
+                d_o[54] = _fma_56;
+                float _fma_57 = __fmaf_rn(_vec_load_6[7], ((1) ? other_w1 : other_w0), d_o[55]);
+                d_o[55] = _fma_57;
+                float _vec_load_7[8];
+                {
+                    const uint4* _vptr_12 = reinterpret_cast<const uint4*>(Wo + (other_base + 7168) + 0);
+                    uint4 _vld_12[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_12[_blk] = _vptr_12[_blk];
+                        uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_7[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_7[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_12[_pair]));
+                        }
+                    }
+                }
+                float _fma_58 = __fmaf_rn(_vec_load_7[0], ((0) ? other_w1 : other_w0), d_o[56]);
+                d_o[56] = _fma_58;
+                float _fma_59 = __fmaf_rn(_vec_load_7[1], ((0) ? other_w1 : other_w0), d_o[57]);
+                d_o[57] = _fma_59;
+                float _fma_60 = __fmaf_rn(_vec_load_7[2], ((1) ? other_w1 : other_w0), d_o[58]);
+                d_o[58] = _fma_60;
+                float _fma_61 = __fmaf_rn(_vec_load_7[3], ((1) ? other_w1 : other_w0), d_o[59]);
+                d_o[59] = _fma_61;
+                float _fma_62 = __fmaf_rn(_vec_load_7[4], ((0) ? other_w1 : other_w0), d_o[60]);
+                d_o[60] = _fma_62;
+                float _fma_63 = __fmaf_rn(_vec_load_7[5], ((0) ? other_w1 : other_w0), d_o[61]);
+                d_o[61] = _fma_63;
+                float _fma_64 = __fmaf_rn(_vec_load_7[6], ((1) ? other_w1 : other_w0), d_o[62]);
+                d_o[62] = _fma_64;
+                float _fma_65 = __fmaf_rn(_vec_load_7[7], ((1) ? other_w1 : other_w0), d_o[63]);
+                d_o[63] = _fma_65;
             }
             if (tid == 0) {
                 *(reinterpret_cast<unsigned int*>(Wc + tile) + (0)) = 0;

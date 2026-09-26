@@ -451,11 +451,14 @@ def test_split_route_against_persistent(h, mb, nb, capacity, scale, ragged):
     ):
         torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
         assert float((out - reference).abs().max()) <= 0.03, name
+    # The automatic route follows ``small_route`` (unsplit variant first, then
+    # split-KV when the grid cannot fill the persistent kernel).
     auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
+    rule = small_route(
+        mask, sms=torch.cuda.get_device_properties(0).multi_processor_count
+    )
     expected_mode = (
-        "smallsplit"
-        if 2 * h * mb <= torch.cuda.get_device_properties(0).multi_processor_count
-        else auto.mode
+        "persistent" if rule is None else ("smallsplit" if rule[1] else "small")
     )
     assert auto.mode == expected_mode
 
