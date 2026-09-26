@@ -37,8 +37,8 @@ def warmup_jit():
             [torch.float16],  # kv_dtypes
             [128],  # head_dims
             [0],  # pos_encoding_modes
-            [False],  # use_sliding_windows
-            [False],  # use_fp16_qk_reductions
+            [False, True],  # use_sliding_windows
+            [False],  # use_logits_soft_caps
         )
         + gen_prefill_attention_modules(
             [torch.float16],  # q_dtypes
@@ -47,7 +47,7 @@ def warmup_jit():
             ],  # kv_dtypes
             [128],  # head_dims
             [0],  # pos_encoding_modes
-            [False],  # use_sliding_windows
+            [False, True],  # use_sliding_windows
             [False],  # use_logits_soft_cap
             [False],  # use_fp16_qk_reductions
         )
@@ -65,7 +65,21 @@ def warmup_jit():
                 0,  # pos_encoding_mode_d
                 False,  # use_sliding_window_d
                 False,  # use_logits_soft_cap_d
-            )
+            ),
+            gen_pod_module(
+                torch.float16,  # dtype_q
+                torch.float16,  # dtype_kv
+                torch.float16,  # dtype_o
+                128,  # head_dim
+                0,  # pos_encoding_mode_p
+                False,  # use_sliding_window_p
+                False,  # use_logits_soft_cap_p
+                False,  # use_fp16_qk_reduction
+                torch.int32,  # dtype_idx
+                0,  # pos_encoding_mode_d
+                True,  # use_sliding_window_d
+                False,  # use_logits_soft_cap_d
+            ),
         ],
         verbose=False,
     )
@@ -221,6 +235,116 @@ def test_pod_with_paged_kv_cache(
     torch.testing.assert_close(
         o_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch"
     )
+
+
+def test_pod_with_paged_kv_cache_decode_plan_settings():
+    r"""Decode-side settings come from plan() (issue #3509).
+
+    Plans with a non-default ``window_left`` and ``sm_scale`` and checks the
+    decode output against ``BatchDecodeWithPagedKVCacheWrapper`` planned with
+    the same values.
+    """
+    head_dim = 128
+    num_qo_heads = 8
+    num_kv_heads = 8
+    page_size_d = 16
+    batch_size_d = 4
+    kv_len_d = 128  # > window_left, so the window actually clips history
+    window_left = 32
+    sm_scale = 0.5 / (head_dim**0.5)  # non-default: default is head_dim**-0.5
+    pos_encoding_mode = "NONE"
+    q_dtype = torch.float16
+    kv_dtype = torch.float16
+
+    # The prefill side is not under test; keep it minimal.
+    qo_len_p = kv_len_p = 32
+    q_p = torch.randn(
+        qo_len_p, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    k_p = torch.randn(
+        kv_len_p, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_p = torch.randn(
+        kv_len_p, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+
+    q_d = torch.randn(
+        batch_size_d, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    num_pages_per_seq = (kv_len_d + page_size_d - 1) // page_size_d
+    total_num_pages = num_pages_per_seq * batch_size_d
+    kv_shape = [total_num_pages, 2, page_size_d, num_kv_heads, head_dim]
+    kv_data = torch.randn(*kv_shape, device="cuda:0", dtype=torch.float32).to(kv_dtype)
+    kv_indptr_d = (
+        torch.arange(0, batch_size_d + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices_d = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size_d,),
+        (kv_len_d - 1) % page_size_d + 1,
+        device="cuda:0",
+        dtype=torch.int32,
+    )
+
+    # Reference: BatchDecodeWithPagedKVCacheWrapper planned with the same
+    # non-default window_left / sm_scale.
+    decode_workspace_buffer = torch.empty(
+        32 * 1024 * 1024, device="cuda:0", dtype=torch.int8
+    )
+    decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        decode_workspace_buffer, "NHD"
+    )
+    decode_wrapper.plan(
+        kv_indptr_d,
+        kv_indices_d,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size_d,
+        pos_encoding_mode=pos_encoding_mode,
+        window_left=window_left,
+        sm_scale=sm_scale,
+        data_type=kv_dtype,
+        q_data_type=q_dtype,
+    )
+    o_ref_d = decode_wrapper.run(q_d, kv_data)
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, device="cuda:0", dtype=torch.int8)
+    pod_wrapper = flashinfer.PODWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+    pod_wrapper.plan(
+        kv_indptr_d,
+        kv_indices_d,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size_d,
+        pos_encoding_mode=pos_encoding_mode,
+        window_left=window_left,
+        sm_scale=sm_scale,
+        data_type=kv_dtype,
+        q_data_type=q_dtype,
+    )
+    _, o_d = pod_wrapper.run(q_p, k_p, v_p, q_d, kv_data)
+    torch.testing.assert_close(
+        o_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch"
+    )
+
+    # The deprecated run-time settings warn and must equal the planned values.
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        _, o_d_again = pod_wrapper.run(
+            q_p, k_p, v_p, q_d, kv_data, window_left_d=window_left, sm_scale_d=sm_scale
+        )
+    torch.testing.assert_close(o_d_again, o_d, rtol=1e-3, atol=1e-3)
+    with (
+        pytest.raises(ValueError, match="differs from the value planned"),
+        pytest.warns(DeprecationWarning),
+    ):
+        pod_wrapper.run(q_p, k_p, v_p, q_d, kv_data, window_left_d=-1)
+    with pytest.raises(NotImplementedError, match="non-causal"):
+        pod_wrapper.run(q_p, k_p, v_p, q_d, kv_data, causal_d=True)
 
 
 if __name__ == "__main__":
