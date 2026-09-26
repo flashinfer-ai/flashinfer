@@ -95,10 +95,10 @@ MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign cle
 SMALL_ITEM_FLOATS = BLOCK * HEAD_DIM  # FP32 partial accumulator per split item
 SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
 # Split-KV cost model (relative units): one KV block through the single
-# warpgroup chain vs. one extra slice merged by the last CTA.  Same constants
-# as the Cake planner (``vsa_sm90_small``).
+# warpgroup chain vs. one extra slice merged by the last CTA (fitted on H100,
+# CAKE-671).  Same constants as the Cake planner (``vsa_sm90_small``).
 SPLIT_BLOCK_COST = 1.0
-SPLIT_MERGE_COST = 0.4
+SPLIT_MERGE_COST = 0.8
 
 
 def small_kmax_for(capacity: int) -> int:
@@ -135,9 +135,7 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
     return best[1]
 
 
-def small_route(
-    block_mask: torch.Tensor, *, sms: int
-) -> Optional[tuple[int, bool]]:
+def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[tuple[int, bool]]:
     """``(kmax, split)`` when the problem should take a small-kernel route, else ``None``.
 
     Unsplit rule: every query block selects at most ``SMALL_KMAX_VARIANTS[-1]``

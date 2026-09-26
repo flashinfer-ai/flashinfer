@@ -78,13 +78,31 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
         (4, 4, 4, 1, (1, False)),  # 16 tiles
         (8, 4, 4, 3, (3, False)),
         (8, 16, 16, 4, (4, False)),  # 128 tiles at 1 CTA/SM
-        (8, 17, 16, 4, None),  # 136 tiles > 132 SMs at 1 CTA/SM, too many for the split rule
+        (
+            8,
+            17,
+            16,
+            4,
+            None,
+        ),  # 136 tiles > 132 SMs at 1 CTA/SM, too many for the split rule
         (8, 64, 64, 1, (1, False)),  # 512 tiles at 4 CTAs/SM
         (8, 32, 32, 8, None),  # 8 blocks > KMAX 6, 256 tiles fill the persistent kernel
         (2, 128, 32, 6, None),  # 256 x 8 halfwords > PLAN_HALFWORDS
-        (1, 16, 16, 16, "split"),  # one head, 16 x 16 blocks: 32 warpgroups < 132 SMs -> split-KV
+        (
+            1,
+            16,
+            16,
+            16,
+            "split",
+        ),  # one head, 16 x 16 blocks: 32 warpgroups < 132 SMs -> split-KV
         (2, 8, 64, 32, "split"),  # 16 tiles x 32 blocks: 6 slices of KMAX 6 = 96 items
-        (2, 8, 64, 64, None),  # 16 tiles x 64 blocks: no one-wave variant fits the plan budget
+        (
+            2,
+            8,
+            64,
+            64,
+            None,
+        ),  # 16 tiles x 64 blocks: no one-wave variant fits the plan budget
     ],
 )
 def test_small_route_rule(h, mb, nb, capacity, expected):
@@ -427,11 +445,18 @@ def test_split_route_against_persistent(h, mb, nb, capacity, scale, ragged):
         "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="persistent"
     )
     reference = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale).float()
-    for name, out in (("smallsplit", first), ("persistent", persistent.run(q, k, v).float())):
+    for name, out in (
+        ("smallsplit", first),
+        ("persistent", persistent.run(q, k, v).float()),
+    ):
         torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
         assert float((out - reference).abs().max()) <= 0.03, name
     auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
-    expected_mode = "smallsplit" if 2 * h * mb <= torch.cuda.get_device_properties(0).multi_processor_count else auto.mode
+    expected_mode = (
+        "smallsplit"
+        if 2 * h * mb <= torch.cuda.get_device_properties(0).multi_processor_count
+        else auto.mode
+    )
     assert auto.mode == expected_mode
 
 
