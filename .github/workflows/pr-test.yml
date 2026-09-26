@@ -228,6 +228,13 @@ jobs:
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
                 for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
+                  # Runtime entries land before their multi-arch image is
+                  # published. The release-ci-docker workflow adds the tag in
+                  # its generated follow-up PR; only then can AOT consume it.
+                  if ! grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
+                    echo "::notice title=AOT image not published::Skipping ${cuda}; ci/docker-tags.yml has no published image yet" >&2
+                    continue
+                  fi
                   jq -nc --arg arch "$arch" --arg cuda "$cuda" '{
                     name: "AOT Build Import (\($arch), \($cuda))",
                     kind: "aot",

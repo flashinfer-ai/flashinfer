@@ -9,6 +9,28 @@ SCCACHE_VERSION="0.17.0"
 SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
 SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
 
+# Compare CUDA major/minor versions supplied as either 13.4 or compact 134.
+cuda_version_at_least() {
+  local version=$1
+  local minimum_major=$2
+  local minimum_minor=$3
+  local major
+  local minor
+
+  if [[ "${version}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+  elif [[ "${version}" =~ ^([0-9]{2})([0-9]+)$ ]]; then
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+  else
+    return 1
+  fi
+
+  (( 10#${major} > minimum_major ||
+     (10#${major} == minimum_major && 10#${minor} >= minimum_minor) ))
+}
+
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
 # memory to avoid OOMs on multi-arch builds.
@@ -116,7 +138,14 @@ setup_jit_cache_python_build() {
   local pytorch_index=$3
   local pytorch_index_url="https://download.pytorch.org/whl/${pytorch_index}"
 
-  "${python_bin}" -m pip install --upgrade build
+  # pip 26.2.1 fixed ProtocolError from truncated downloads bypassing its
+  # resume logic. Provider builds download CUDA wheels hundreds of MB in size,
+  # so use that fix and allow more connection/resume attempts by default.
+  export PIP_RETRIES="${PIP_RETRIES:-10}"
+  export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-10}"
+  export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
+  env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+    "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
 
   if "${python_bin}" - "${expected_cuda_version}" <<'PY'
 import sys
@@ -314,9 +343,9 @@ install_patched_sccache() {
   fi
 }
 
-# Install the official release by default. CUDA 13.4 uses the first upstream
-# revision containing the CUDA 13.3+ dry-run parser fix while that fix remains
-# unreleased: https://github.com/mozilla/sccache/pull/2722
+# Install the official release by default. CUDA 13.4 and newer use the first
+# upstream revision containing the CUDA 13.3+ dry-run parser fix while that fix
+# remains unreleased: https://github.com/mozilla/sccache/pull/2722
 install_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
@@ -330,20 +359,17 @@ install_sccache() {
       ;;
   esac
 
-  case "${CUDA_VERSION:-}" in
-    13.4|134)
-      install_patched_sccache \
-        "${SCCACHE_CUDA_134_REVISION}" \
-        "${SCCACHE_CUDA_134_SOURCE_SHA256}"
-      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-source"
-      export FLASHINFER_SCCACHE_REVISION="${SCCACHE_CUDA_134_REVISION}"
-      ;;
-    *)
-      install_released_sccache "${sccache_version}" "${sccache_arch}"
-      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
-      export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
-      ;;
-  esac
+  if cuda_version_at_least "${CUDA_VERSION:-}" 13 4; then
+    install_patched_sccache \
+      "${SCCACHE_CUDA_134_REVISION}" \
+      "${SCCACHE_CUDA_134_SOURCE_SHA256}"
+    export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-source"
+    export FLASHINFER_SCCACHE_REVISION="${SCCACHE_CUDA_134_REVISION}"
+  else
+    install_released_sccache "${sccache_version}" "${sccache_arch}"
+    export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
+    export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
+  fi
 }
 
 # Install sccache (if missing), configure environment, and start the server.

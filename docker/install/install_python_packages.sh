@@ -47,7 +47,7 @@ if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
   mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
 fi
 CUDA_TILE_COMPILE_DEPENDENCIES=()
-if [[ "${CUDA_MAJOR}" == "13" ]]; then
+if [[ "${CUDA_MAJOR}" == "13" ]] && (( 10#${CUDA_MINOR} < 4 )); then
   mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES < <(
     PYTHONPATH=/install python3 -c \
       'from build_utils import get_cuda_tile_compile_dependency_requirements; print(*get_cuda_tile_compile_dependency_requirements(), sep="\n")'
@@ -73,7 +73,12 @@ export PIP_CONSTRAINT="$TORCH_CONSTRAINT"
 
 # Resolve the remaining direct dependencies once. Match cuda-python to the
 # image's CUDA major/minor; this also satisfies the matching nvshmem4py range.
-CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"
+# CUDA 13.4 started at patch release 13.4.1, so there is no 13.4 distribution.
+if [[ "${CUDA_TAG}" == "cu134" ]]; then
+  CUDA_PYTHON="cuda-python==13.4.1"
+else
+  CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"
+fi
 if [[ "${CUDA_TAG}" == cu13* ]]; then
   NVSHMEM4PY="nvshmem4py-cu13"
   CUDNN_PACKAGE="nvidia-cudnn-cu13"
@@ -94,7 +99,7 @@ pip3 install \
   "${NVSHMEM4PY}" \
   "${CI_IMAGE_DEPENDENCIES[@]}"
 
-if [[ "${CUDA_MAJOR}" == "13" ]]; then
+if (( ${#CUDA_TILE_COMPILE_DEPENDENCIES[@]} > 0 )); then
   pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"
 fi
 
