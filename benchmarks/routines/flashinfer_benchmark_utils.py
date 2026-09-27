@@ -251,6 +251,7 @@ benchmark_apis = {
         "mm_bf16",
         "bmm_bf16",
         "tinygemm_bf16",
+        "fp8_blockscale_gemm_sm90",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -626,6 +627,19 @@ routine_cc_to_supported_backends = {
         "11.0": ["cutlass", "cudnn"],
         "12.0": ["cutlass", "cudnn"],
         "12.1": ["cutlass", "cudnn"],
+    },
+    "fp8_blockscale_gemm_sm90": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["deepgemm"],
+        "10.0": [],
+        "10.3": [],
+        "10.7": [],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
     },
     "tinygemm_bf16": {
         "7.5": [],

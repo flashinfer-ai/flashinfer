@@ -1332,6 +1332,36 @@ void gemm_dispatch_old(void* mat_a, void* mat_b, void* mat_d, float* scales_a, f
 #undef DISPATCH_BLOCK_SIZE_M
 }
 
+__global__ void cluster_occupancy_probe_kernel() {}
+
+// Number of `cluster_size`-CTA clusters that can be resident at one CTA per SM. Clusters must fit
+// in a GPC, so this is below num_sms / cluster_size when GPC sizes are not multiples of it.
+inline int get_max_active_clusters_one_cta_per_sm(int cluster_size) {
+  static std::array<std::array<int, 9>, 64> cache{};
+  int device = 0;
+  TLLM_CUDA_CHECK(cudaGetDevice(&device));
+  int& cached = cache.at(device).at(cluster_size);
+  if (cached == 0) {
+    int max_smem = 0;
+    TLLM_CUDA_CHECK(
+        cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(cluster_occupancy_probe_kernel,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem));
+    cudaLaunchConfig_t config = {};
+    config.gridDim = cluster_size;
+    config.blockDim = 128;
+    config.dynamicSmemBytes = max_smem;
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {static_cast<unsigned>(cluster_size), 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+    TLLM_CUDA_CHECK(cudaOccupancyMaxActiveClusters(
+        &cached, reinterpret_cast<void const*>(cluster_occupancy_probe_kernel), &config));
+  }
+  return cached;
+}
+
 void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
                    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n,
                    uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs) {
@@ -1359,18 +1389,21 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
                        static_cast<int*>(nullptr), stream, num_device_sms,
                        static_cast<uint32_t>(best_smem_size));
   } else {
-    auto [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size] =
-        deep_gemm::jit::get_best_gemm_config(shape_n, shape_m, shape_k, num_problems,
-                                             num_device_sms, false, true);
+    auto const config = deep_gemm::jit::get_best_gemm_config(
+        shape_n, shape_m, shape_k, num_problems, num_device_sms, false, true);
+    auto const [best_block_m, best_block_n, best_num_stages, best_num_tma_multicast,
+                best_smem_size] = config;
+    auto const [num_split_k, num_stages, smem_size] = deep_gemm::jit::get_swapab_split_k_config(
+        shape_n, shape_m, shape_k, config, num_device_sms, get_max_active_clusters_one_cta_per_sm);
     auto runtime = deep_gemm::jit::getGlobalCompiler().build(
-        shape_n, shape_k, best_block_m, best_block_n, block_k, num_problems, best_num_stages,
-        best_num_tma_multicast, deep_gemm::GemmType::Normal, true);
+        shape_n, shape_k, best_block_m, best_block_n, block_k, num_problems, num_stages,
+        best_num_tma_multicast, deep_gemm::GemmType::Normal, true, num_split_k);
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
     deep_gemm::runGemmSwapAB(kernel, mat_b, ld_b, mat_a, ld_a, mat_d, ld_d, scales_b, scales_a,
                              shape_n, shape_m, shape_k, best_block_m, best_block_n, block_k,
                              num_problems, best_num_tma_multicast, deep_gemm::GemmType::Normal,
-                             static_cast<int*>(nullptr), stream, num_device_sms,
-                             static_cast<uint32_t>(best_smem_size));
+                             static_cast<int*>(nullptr), static_cast<uint32_t>(num_split_k), stream,
+                             num_device_sms, static_cast<uint32_t>(smem_size));
   }
 }
 

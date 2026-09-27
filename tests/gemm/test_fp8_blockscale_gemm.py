@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 import flashinfer
 from flashinfer.gemm import fp8_blockscale_gemm_sm90
-from flashinfer.testing.utils import per_token_cast_to_fp8
+from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 from flashinfer.utils import (
     get_compute_capability,
     has_flashinfer_jit_cache,
@@ -387,6 +387,71 @@ def test_fp8_blockscale_gemm_output_buffer():
         reference.flatten().float(), output.flatten().float(), dim=0
     )
     assert cos_sim > 0.99
+
+
+@pytest.mark.parametrize("m", [1, 7, 16, 31])
+@pytest.mark.parametrize(
+    "n, k",
+    [
+        # Split factors chosen on GH200 (132 SMs) in parentheses
+        (2112, 7168),  # 17 weight blocks (2 or 4, depending on M)
+        (512, 7168),  # 4 weight blocks (8)
+        (1152, 4096),  # 9 weight blocks (4 or 8)
+        (3072, 1536),  # 24 weight blocks (3)
+        (4096, 512),  # K too short to split
+        (7168, 2048),  # 56 weight blocks, no split
+    ],
+)
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_fp8_blockscale_gemm_small_m_split_k(m, n, k, input_dtype):
+    """Small-M (swap-AB) shapes, including the ones that split K across a thread block cluster.
+
+    Weight blocks get different magnitudes so that a partial sum combined with the wrong K range
+    or the wrong scales changes the result. Also checks that repeated calls are bitwise identical.
+    """
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
+
+    device = "cuda"
+    torch.manual_seed(0)
+    block_mag = torch.rand((n + 127) // 128, k // 128, device=device) * 4 + 0.25
+    weight_bf16 = (
+        torch.randn(n, k, device=device)
+        * block_mag.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    ).bfloat16()
+    weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
+    input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+
+    weight_dequant = weight_fp8.float() * weight_scale.repeat_interleave(128, 0)[
+        :n
+    ].repeat_interleave(128, 1)
+    if input_dtype == torch.float8_e4m3fn:
+        input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
+        input_scale_mn = torch.zeros(
+            k // 128, (m + 3) // 4 * 4, device=device, dtype=torch.float32
+        )
+        input_scale_mn[:, :m] = input_scale.T
+        # (M, K/128) view of the MN-major, M-padded scale buffer the kernel reads
+        args = (input_fp8, weight_fp8, input_scale_mn[:, :m].T, weight_scale)
+        input_dequant = (
+            input_fp8.float().view(m, k // 128, 128) * input_scale.view(m, k // 128, 1)
+        ).view(m, k)
+        tol = 1e-2
+    else:
+        args = (input_bf16, weight_fp8, None, weight_scale)
+        # The input is quantized to FP8 inside the op
+        input_dequant = input_bf16.float()
+        tol = 6e-2
+    reference = input_dequant @ weight_dequant.T
+
+    out = torch.full((m, n), float("nan"), device=device, dtype=torch.bfloat16)
+    fp8_blockscale_gemm_sm90(*args, out=out)
+    rel_err = (out.float() - reference).norm() / reference.norm()
+    assert torch.isfinite(out).all()
+    assert rel_err < tol, f"relative error {rel_err:.3e} exceeds {tol}"
+
+    out_again = fp8_blockscale_gemm_sm90(*args)
+    assert torch.equal(out, out_again)
 
 
 if __name__ == "__main__":
