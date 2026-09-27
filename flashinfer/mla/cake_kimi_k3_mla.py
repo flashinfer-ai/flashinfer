@@ -379,7 +379,9 @@ class KimiK3MlaFp8PagedAttention:
             self.tile_rows = self.rt
         # The merge covers the packed rows (uniform plan) or the rows of the split items only (tail plan).
         self.reduce_rows = (
-            self.rows_max if self.n_full_items == 0 else self.tail_items * self.tile_rows
+            self.rows_max
+            if self.n_full_items == 0
+            else self.tail_items * self.tile_rows
         )
         if self.num_split <= REDUCE_WARP_MAX_SPLITS:
             self.reduce_warps = reduce_warps_per_row(self.reduce_rows)
