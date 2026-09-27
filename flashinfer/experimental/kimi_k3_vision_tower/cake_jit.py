@@ -28,7 +28,11 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #
 # ``MODULES`` holds one record per physical generated module (a kernel plus
 # its host binding): translation units, compile flags, FFI entry, argument
-# plan and closure identity.  ``KERNELS`` maps ``"<arch>"`` to the logical
+# plan, closure identity and the TMA descriptor contract (``tma_abi``;
+# for the pointer-ABI attention module the caller-owned workspace size
+# ``tma_workspace_bytes`` and its ``tma_prepare_entry``, the exported
+# ``run_prepare_tma`` the host calls once per plan before the first launch).
+# ``KERNELS`` maps ``"<arch>"`` to the logical
 # kernel key -> module assignment the host launcher resolves at preparation:
 #
 # * ``gemm:<variant>:<tile>``   the fused tcgen05 BF16 GEMM family

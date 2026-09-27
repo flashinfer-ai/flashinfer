@@ -69,13 +69,28 @@ Host work is split exactly like the Cake production launcher:
   ``rope_cs`` table (:func:`pack_rope_table`: one ``(cos, sin)`` word per pair,
   read by the ``*_cs`` QKV tiles), the merge table, the attention segment plan
   (unit layout + LPT unit table), the GEMM tile configurations for the token
-  counts and every workspace.  The positional
+  counts and every workspace, including the attention kernel's TMA descriptor
+  workspace (``attn_tma_desc``, see below).  The positional
   rows depend on the weights and are derived by
   :func:`prepare_kimi_k3_vision_tower` (or passed in by a serving runtime that
   caches them per grid).
 * :func:`prepare_kimi_k3_vision_tower` -- binds every launch of the sequence
-  to the generated argument plans.  The returned runner's ``launch()`` performs
-  no allocation and no host synchronization and is CUDA-graph capturable.
+  to the generated argument plans and prepares the attention descriptor
+  workspace (below).  The returned runner's ``launch()`` performs no
+  allocation and no host synchronization and is CUDA-graph capturable.
+
+TMA descriptor ABI: the GEMM family and the RMSNorm apply pass take their
+tensor maps as ``__grid_constant__`` kernel parameters, exactly as in Cake
+production.  The attention kernel is exported in its production *pointer*
+ABI: its four ``CUtensorMap``s (Q, K, V, O -- all plan workspaces) live in
+device memory owned by the plan (``workspace["attn_tma_desc"]``, 128 B per
+map) and the kernel receives their addresses.  The generated attention
+binding exports two entries: ``run_prepare_tma`` (same arguments as ``run``;
+validates, encodes the descriptors and copies them into the workspace once,
+synchronously, outside CUDA-graph capture) and ``run`` (launch-only).
+:func:`prepare_kimi_k3_vision_tower` calls ``run_prepare_tma`` once per plan
+(the descriptors depend only on plan-owned buffers); ``launch()`` and graph
+replays never touch the workspace again.
 
 The host plan reproduces the Cake planner table for table (segment plan,
 unit table, merge table, tile selection, launch grids); the generated-program
@@ -228,6 +243,7 @@ ATTENTION_KWARGS = (
     "total_tiles",
     "num_heads",
     "softmax_scale_log2",
+    "tma_descriptor_workspace",
     "grid",
 )
 MERGE_KWARGS = ("x", "norm_weight", "merge_table", "m_out", "eps", "grid")
@@ -977,17 +993,31 @@ class VisionTowerPlan:
         torch.Tensor
     )  # pack_rope_table(cos, sin): u32 [T, 64] f16x2 (cos, sin) words
     workspace: dict[str, torch.Tensor] = field(repr=False)
+    # (module, workspace address) pairs whose TMA descriptor workspace has been
+    # prepared (``run_prepare_tma``); the descriptors depend on plan-owned
+    # buffers only, so one preparation per plan serves every runner.
+    prepared_tma: dict[tuple[str, int], bool] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     @property
     def tiles_per_cta(self) -> int:
         return self.attention.tiles_per_cta
 
 
+def attention_tma_workspace_bytes(arch: str, tiles_per_cta: int) -> int:
+    """Bytes of the caller-owned TMA descriptor workspace of the registered attention module (0 = by-value ABI / unregistered)."""
+    key = attention_kernel_key(tiles_per_cta)
+    if not route_available(arch, (key,)):
+        return 0
+    return int(MODULES[kernel_module_name(arch, key)].get("tma_workspace_bytes", 0))
+
+
 def vision_workspace_shapes(
-    total_tokens: int, merged: int
+    total_tokens: int, merged: int, attention_tma_bytes: int = 0
 ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     bf16 = torch.bfloat16
-    return {
+    shapes = {
         "x": ((total_tokens, HIDDEN), bf16),
         # RMSNorm handoff written by the residual epilogues and read by the next
         # norm GEMM: xw = bf16(x * w_norm_next) and the FP32 [T, 16] row sums of
@@ -1012,6 +1042,12 @@ def vision_workspace_shapes(
         "pixel_dummy": ((2, PATCH_DIM), bf16),
         "probe_dummy": ((PROBE_WORDS,), torch.uint64),
     }
+    if attention_tma_bytes:
+        # Pointer-ABI attention: the plan owns the device bytes of the kernel's
+        # CUtensorMaps (prepared once by ``run_prepare_tma``; 128-byte aligned
+        # by the caching allocator's 512-byte granularity, verified by the binding).
+        shapes["attn_tma_desc"] = ((int(attention_tma_bytes),), torch.uint8)
+    return shapes
 
 
 def pack_rope_table(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -1069,9 +1105,17 @@ def build_kimi_k3_vision_plan(
             raise ValueError(
                 f"{name} must be a contiguous fp32 [{total}, {ROPE_PAIRS}] tensor on {device}"
             )
+    attention = build_attention_plan(cu, device, HEADS, grid_clusters=grid_clusters)
+    tma_bytes = (
+        attention_tma_workspace_bytes(arch, attention.tiles_per_cta)
+        if device.type == "cuda"
+        else 0
+    )
     workspace = {
         name: torch.zeros(shape, dtype=dtype, device=device)
-        for name, (shape, dtype) in vision_workspace_shapes(total, merged).items()
+        for name, (shape, dtype) in vision_workspace_shapes(
+            total, merged, attention_tma_bytes=tma_bytes
+        ).items()
     }
     return VisionTowerPlan(
         grid_thws=grids,
@@ -1082,7 +1126,7 @@ def build_kimi_k3_vision_plan(
         device=device,
         arch=arch,
         sm_count=sm_count,
-        attention=build_attention_plan(cu, device, HEADS, grid_clusters=grid_clusters),
+        attention=attention,
         merge_table=build_merge_table(grids, device),
         gemm_configs=gemm_configs_for(total, merged),
         cos=cos,
@@ -1097,8 +1141,15 @@ def build_kimi_k3_vision_plan(
 # ---------------------------------------------------------------------------
 
 
-def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entry."""
+def _bind(
+    module_name: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple, Optional[Callable[..., Any]]]:
+    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entries.
+
+    Returns the launch entry, its positional arguments and the module's TMA
+    preparation entry (``tma_prepare_entry``; ``None`` for by-value descriptor
+    modules), which takes the same positional arguments.
+    """
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
@@ -1113,7 +1164,9 @@ def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any],
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
     module = load_cake_kimi_k3_vision_tower_module(module_name)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    prepare_entry = record.get("tma_prepare_entry")
+    prepare = getattr(module, prepare_entry) if prepare_entry else None
+    return getattr(module, record["ffi_entry"]), tuple(arguments), prepare
 
 
 @dataclass(frozen=True)
@@ -1124,9 +1177,23 @@ class _Launch:
     kwargs: dict[str, Any] = field(repr=False)
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
+    # ``run_prepare_tma`` of a pointer-ABI module (same arguments); None otherwise.
+    prepare: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
     def __call__(self) -> None:
         self.entry(*self.arguments)
+
+    def prepare_tma(self, plan: "VisionTowerPlan") -> bool:
+        """Prepare this launch's descriptor workspace once per plan; True if a copy was made."""
+        if self.prepare is None:
+            return False
+        key = (self.module, int(self.kwargs["tma_descriptor_workspace"].data_ptr()))
+        if key in plan.prepared_tma:
+            return False
+        with tvm_ffi.use_torch_stream():
+            self.prepare(*self.arguments)
+        plan.prepared_tma[key] = True
+        return True
 
 
 @dataclass(frozen=True)
@@ -1136,7 +1203,8 @@ class KimiK3VisionTowerRunner:
     ``launch()`` runs every kernel of the tower on the current torch stream into
     the caller-owned ``out`` with no CUDA allocation and no host
     synchronization and returns ``out``; it is CUDA-graph capturable (capture
-    belongs to the caller).  Prepare a new runner when ``grid_thws``, the layer
+    belongs to the caller; the attention descriptor workspace was prepared by
+    :func:`prepare_kimi_k3_vision_tower`).  Prepare a new runner when ``grid_thws``, the layer
     count or a tensor binding (``pixel_values``, ``out``, weights) changes;
     values may change freely.  ``stages`` exposes one launch per stage (layer
     stages use layer 0) for per-operator tests and timing.
@@ -1272,8 +1340,8 @@ def _gemm_launch(
     )
     assert tuple(kwargs) == GEMM_KWARGS
     module = kernel_module_name(plan.arch, gemm_kernel_key(variant, cfg.name))
-    entry, arguments = _bind(module, kwargs)
-    return _Launch(stage, layer, module, kwargs, entry, arguments)
+    entry, arguments, prepare = _bind(module, kwargs)
+    return _Launch(stage, layer, module, kwargs, entry, arguments, prepare)
 
 
 def _attention_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
@@ -1292,12 +1360,14 @@ def _attention_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
         total_tiles=int(attn.total_tiles),
         num_heads=int(attn.num_heads),
         softmax_scale_log2=float(SOFTMAX_SCALE) / math.log(2.0),
+        # Pointer-ABI descriptor workspace (plan-owned; ignored by a by-value module).
+        tma_descriptor_workspace=ws.get("attn_tma_desc", ws["u32_dummy"]),
         grid=(2 * int(attn.num_clusters), 1, 1),
     )
     assert tuple(kwargs) == ATTENTION_KWARGS
     module = kernel_module_name(plan.arch, attention_kernel_key(attn.tiles_per_cta))
-    entry, arguments = _bind(module, kwargs)
-    return _Launch("layer_attention", layer, module, kwargs, entry, arguments)
+    entry, arguments, prepare = _bind(module, kwargs)
+    return _Launch("layer_attention", layer, module, kwargs, entry, arguments, prepare)
 
 
 def _merge_launch(plan: VisionTowerPlan, weights: PreparedWeights) -> _Launch:
@@ -1312,8 +1382,8 @@ def _merge_launch(plan: VisionTowerPlan, weights: PreparedWeights) -> _Launch:
     )
     assert tuple(kwargs) == MERGE_KWARGS
     module = kernel_module_name(plan.arch, MERGE_KERNEL_KEY)
-    entry, arguments = _bind(module, kwargs)
-    return _Launch("final_norm_merge", -1, module, kwargs, entry, arguments)
+    entry, arguments, prepare = _bind(module, kwargs)
+    return _Launch("final_norm_merge", -1, module, kwargs, entry, arguments, prepare)
 
 
 def _rmsnorm_apply_launch(
@@ -1330,8 +1400,10 @@ def _rmsnorm_apply_launch(
     )
     assert tuple(kwargs) == RMSNORM_APPLY_KWARGS
     module = kernel_module_name(plan.arch, RMSNORM_APPLY_KERNEL_KEY)
-    entry, arguments = _bind(module, kwargs)
-    return _Launch("merger_rmsnorm_apply", -1, module, kwargs, entry, arguments)
+    entry, arguments, prepare = _bind(module, kwargs)
+    return _Launch(
+        "merger_rmsnorm_apply", -1, module, kwargs, entry, arguments, prepare
+    )
 
 
 def _launch_sequence(
@@ -1545,6 +1617,11 @@ def prepare_kimi_k3_vision_tower(
         pos_rows = pos_emb_rows(prepared.pos_emb, prepared.time_weight, grids)
     _check_2d(pos_rows, (plan.total_tokens, HIDDEN), "pos_rows")
     launches = _launch_sequence(plan, prepared, pixel_values, pos_rows, out)
+    # Pointer-ABI modules (the attention kernel): encode the CUtensorMaps and
+    # copy them into the plan-owned workspace once, synchronously, before any
+    # launch or graph capture.  Idempotent per (module, workspace).
+    for item in launches:
+        item.prepare_tma(plan)
     return KimiK3VisionTowerRunner(
         plan, prepared, pixel_values, pos_rows, out, launches
     )
