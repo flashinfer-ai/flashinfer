@@ -10,7 +10,7 @@ wrapper API on the new backend name.
 import pytest
 import torch
 
-from flashinfer.cake_vsa_sm90 import CakeVsaSm90Plan, small_route
+from flashinfer.cake_vsa_sm90 import CakeVsaSm90Plan, cluster_capacity, small_route
 from flashinfer.experimental.cake_vsa_sm90_cute import STAGES, is_available, load_stage
 
 requires_hopper = pytest.mark.skipif(
@@ -226,7 +226,9 @@ def test_wrapper_backend_cake_cute_auto_route_matches_cake():
     assert (plan_a.engine, plan_c.engine) == ("cuda", "cute")
     assert _stage_of(plan_a) == _stage_of(plan_c)
     rule = small_route(
-        mask, sms=torch.cuda.get_device_properties(0).multi_processor_count
+        mask,
+        sms=torch.cuda.get_device_properties(0).multi_processor_count,
+        cluster_capacity=cluster_capacity(torch.cuda.current_device()),
     )
     assert (plan_c.small_kmax is None) == (rule is None)
     q, k, v = _inputs(h, mb, nb)

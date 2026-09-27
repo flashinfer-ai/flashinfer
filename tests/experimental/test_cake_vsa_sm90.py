@@ -25,7 +25,7 @@ import torch
 from flashinfer.cake_vsa_sm90 import (
     MAX_NSPLIT,
     PLAN_HALFWORDS,
-    CLUSTER_GPC_SMS,
+    REFERENCE_CLUSTER_CAPACITY_H100_SXM,
     CLUSTER_VARIANTS,
     PLAN_META_SPLIT,
     PLAN_META_UNSPLIT,
@@ -33,6 +33,7 @@ from flashinfer.cake_vsa_sm90 import (
     SMALL_OCCUPANCY,
     CakeVsaSm90Plan,
     cluster_cost,
+    cluster_capacity,
     cluster_variant_for,
     split_cost,
     MAX_OWN,
@@ -49,6 +50,9 @@ from flashinfer.cake_vsa_sm90 import (
     small_route,
     split_kmax,
 )
+
+
+CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM  # measured co-resident cluster capacity of the 132-SM H100 SXM
 
 
 def _random_mask(h, mb, nb, capacity, seed=0, ragged=True, device="cpu"):
@@ -119,7 +123,7 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
 )
 def test_small_route_rule(h, mb, nb, capacity, expected):
     mask = _random_mask(h, mb, nb, capacity, ragged=False)
-    route = small_route(mask, sms=132)
+    route = small_route(mask, sms=132, cluster_capacity=CAP)
     counts = [capacity] * (h * mb)
     if expected == "split":
         assert route is not None and route[1] is True and route[2] == 0
@@ -133,8 +137,8 @@ def test_small_route_rule(h, mb, nb, capacity, expected):
         assert route is not None and route[1] is False and route[2] > 0
         kmax, csize = route[0], route[2]
         assert (kmax, csize) in CLUSTER_VARIANTS and kmax * csize >= capacity
-        assert h * mb <= (132 // CLUSTER_GPC_SMS) * (CLUSTER_GPC_SMS // csize)
-        assert (kmax, csize) == cluster_variant_for(counts, sms=132)
+        assert h * mb <= CAP[csize]  # one wave of clusters on the 132-SM H100 SXM
+        assert (kmax, csize) == cluster_variant_for(counts, sms=132, cluster_capacity=CAP)
         assert cluster_cost(counts, kmax, csize) < split_cost(
             counts, split_kmax(counts, sms=132)
         )
@@ -153,17 +157,45 @@ def test_sliced_routes_take_the_cheaper_modelled_variant():
     for t in range(64):
         ragged.reshape(64, 16)[t, : 1 + t % 8] = True
     counts = ragged.sum(-1).reshape(-1).tolist()
-    kmax, split, cluster = small_route(ragged, sms=132)
+    kmax, split, cluster = small_route(ragged, sms=132, cluster_capacity=CAP)
     assert (kmax, split, cluster) == (4, False, 2)
     assert split_kmax(counts, sms=132) in (
         3,
         4,
         6,
     )  # a split variant fits; it is just costlier
-    assert cluster_variant_for(counts, sms=132) == (4, 2)
+    assert cluster_variant_for(counts, sms=132, cluster_capacity=CAP) == (4, 2)
     uniform = torch.zeros((1, 16, 16), dtype=torch.bool)
     uniform[..., :16] = True
-    assert small_route(uniform, sms=132) == (4, False, 4)
+    assert small_route(uniform, sms=132, cluster_capacity=CAP) == (4, False, 4)
+
+
+def test_cluster_one_wave_uses_the_device_capacity():
+    """The 132-SM H100 holds 30 four-CTA clusters (not 8 GPCs x 4 = 32): 31-32 tiles of capacity 7-8
+    take the two-CTA (4, 2) variant instead of a second wave of (2, 4); capacity 13-16 has no
+    one-wave cluster there and falls back to the split route; the capacity table is mandatory."""
+    assert cluster_variant_for([8] * 30, sms=132, cluster_capacity=CAP) == (2, 4)
+    assert cluster_variant_for([8] * 31, sms=132, cluster_capacity=CAP) == (4, 2)
+    assert cluster_variant_for([8] * 32, sms=132, cluster_capacity=CAP) == (4, 2)
+    assert cluster_variant_for([16] * 31, sms=132, cluster_capacity=CAP) is None
+    mask = torch.zeros((8, 4, 64), dtype=torch.bool)
+    mask[..., :16] = True  # 32 tiles x 16 blocks
+    kmax, split, cluster = small_route(mask, sms=132, cluster_capacity=CAP)
+    assert split is True and cluster == 0 and kmax == split_kmax([16] * 32, sms=132)
+    with pytest.raises(ValueError, match="cluster_capacity_unresolved"):
+        cluster_variant_for([8] * 16, sms=132)
+    with pytest.raises(ValueError, match="cluster_capacity_missing"):
+        cluster_variant_for([8] * 16, sms=132, cluster_capacity={2: 66})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_cluster_capacity_resolves_from_the_driver():
+    cap = cluster_capacity(torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    assert set(cap) == {2, 3, 4, 6}
+    for csize, clusters in cap.items():
+        assert 1 <= clusters <= sms // csize
+    assert cap[4] <= cap[2] // 2 + 1
 
 
 def test_plan_small_cluster_rows_pad_every_query_block():
@@ -543,7 +575,9 @@ def test_split_route_against_persistent(h, mb, nb, capacity, scale, ragged):
     # split-KV when the grid cannot fill the persistent kernel).
     auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
     rule = small_route(
-        mask, sms=torch.cuda.get_device_properties(0).multi_processor_count
+        mask,
+        sms=torch.cuda.get_device_properties(0).multi_processor_count,
+        cluster_capacity=cluster_capacity(torch.cuda.current_device()),
     )
     expected_mode = _mode_of(rule)
     assert auto.mode == expected_mode
@@ -603,7 +637,9 @@ def test_cluster_route_against_persistent(h, mb, nb, capacity, scale, ragged):
         assert float((out - reference).abs().max()) <= 0.03, name
     auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
     rule = small_route(
-        mask, sms=torch.cuda.get_device_properties(0).multi_processor_count
+        mask,
+        sms=torch.cuda.get_device_properties(0).multi_processor_count,
+        cluster_capacity=cluster_capacity(torch.cuda.current_device()),
     )
     assert auto.mode == _mode_of(rule)
 

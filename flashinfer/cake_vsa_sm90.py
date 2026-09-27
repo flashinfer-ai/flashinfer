@@ -53,9 +53,10 @@ byte-identical to them.
 
 from __future__ import annotations
 
+import functools
 import heapq
 import math
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -131,7 +132,13 @@ CLUSTER_VARIANTS = (
     (4, 4),
     (6, 2),
 )  # (6, 3): receive buffers exceed the 227 KB SMEM
-CLUSTER_GPC_SMS = 16
+# One-wave cluster placement uses the device's co-resident cluster capacity
+# ``{csize: clusters}`` resolved from ``cuOccupancyMaxActiveClusters`` at one
+# CTA per SM (:func:`cluster_capacity`).  A per-GPC model (8 GPCs x 16 SMs)
+# over-counted four-CTA clusters on the 132-SM H100 (32 vs 30) and sent
+# 31-32-tile problems into a second cluster wave.  The reference table below
+# is that device's measured capacity, for tests only — planning resolves it.
+REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {2: 66, 3: 39, 4: 30, 6: 17, 8: 15}
 CLUSTER_MERGE_COST = 0.3
 CLUSTER_PAD_COST = 0.15
 
@@ -207,16 +214,25 @@ def cluster_cost(counts: list[int], kmax: int, csize: int) -> float:
 
 
 def cluster_variant_for(
-    counts: list[int], *, sms: Optional[int] = None
+    counts: list[int],
+    *,
+    sms: Optional[int] = None,
+    cluster_capacity: Optional[Mapping[int, int]] = None,
 ) -> Optional[tuple[int, int]]:
     """``(kmax, csize)`` of the cheapest cluster variant for ``counts``, or ``None``.
 
     Candidates hold the largest selection (``kmax * csize >= capacity``), fit
-    the plan parameter and, when ``sms`` is given, run as one wave of clusters
-    at one CTA per SM (``sms // CLUSTER_GPC_SMS`` GPCs each place
-    ``CLUSTER_GPC_SMS // csize`` clusters).  Ranked by :func:`cluster_cost`.
-    Mirrors ``vsa_sm90_small.cluster_variant_for``.
+    the plan parameter and, when ``sms`` is given, run as one wave of clusters:
+    ``tiles <= cluster_capacity[csize]``, the device's co-resident cluster
+    count at one CTA per SM (:func:`cluster_capacity`).  Ranked by
+    :func:`cluster_cost`.  Mirrors ``vsa_sm90_small.cluster_variant_for``.
     """
+    if sms is not None and cluster_capacity is None:
+        raise ValueError(
+            "[cluster_capacity_unresolved] cluster_variant_for(sms=...) needs "
+            "cluster_capacity={csize: co-resident clusters} resolved from the device "
+            "(cluster_capacity(device))"
+        )
     capacity = max(counts)
     tiles = len(counts)
     best = None
@@ -226,18 +242,98 @@ def cluster_variant_for(
             or tiles * csize * (kmax + PLAN_META_SPLIT) > PLAN_HALFWORDS
         ):
             continue
-        if sms is not None and tiles > (sms // CLUSTER_GPC_SMS) * (
-            CLUSTER_GPC_SMS // csize
-        ):
-            continue
+        if sms is not None:
+            assert cluster_capacity is not None
+            if csize not in cluster_capacity:
+                raise ValueError(
+                    f"[cluster_capacity_missing] no co-resident cluster count for cluster size {csize}"
+                )
+            if tiles > int(cluster_capacity[csize]):
+                continue
         cost = cluster_cost(counts, kmax, csize)
         if best is None or cost < best[0]:
             best = (cost, kmax, csize)
     return None if best is None else (best[1], best[2])
 
 
+_PROBE_KERNEL = "cake_vsa_sm90_cluster_capacity_probe"
+_PROBE_SOURCE = f'extern "C" __global__ void {_PROBE_KERNEL}() {{}}\n'
+CLUSTER_SIZES: tuple[int, ...] = tuple(sorted({csize for _kmax, csize in CLUSTER_VARIANTS}))
+
+
+@functools.lru_cache(maxsize=None)
+def cluster_capacity(device_index: int) -> dict[int, int]:
+    """``{cluster size: max co-resident clusters}`` of ``device_index`` at one CTA per SM.
+
+    ``cuOccupancyMaxActiveClusters`` on an empty probe kernel launched with the
+    device's maximum opt-in dynamic shared memory (one CTA per SM).  The answer
+    follows the part's GPC topology after floorsweeping, not ``SMs // csize``:
+    a 132-SM H100 SXM holds 66 two-CTA clusters but 30 four-CTA clusters.
+    """
+    from .cuda_utils import checkCudaErrors, driver, nvrtc
+
+    with torch.cuda.device(device_index):
+        torch.empty(1, device="cuda")  # primary context
+        major, minor = torch.cuda.get_device_capability(device_index)
+        prog = checkCudaErrors(
+            nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], [])
+        )
+        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        checkCudaErrors(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        size = checkCudaErrors(nvrtc.nvrtcGetCUBINSize(prog))
+        cubin = b" " * size
+        checkCudaErrors(nvrtc.nvrtcGetCUBIN(prog, cubin))
+        checkCudaErrors(nvrtc.nvrtcDestroyProgram(prog))
+        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(device_index))
+        try:
+            checkCudaErrors(driver.cuCtxSetCurrent(ctx))
+            module = checkCudaErrors(driver.cuModuleLoadData(cubin))
+            try:
+                func = checkCudaErrors(
+                    driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode())
+                )
+                smem = checkCudaErrors(
+                    driver.cuDeviceGetAttribute(
+                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        device_index,
+                    )
+                )
+                checkCudaErrors(
+                    driver.cuFuncSetAttribute(
+                        func,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem,
+                    )
+                )
+                result = {}
+                for csize in CLUSTER_SIZES:
+                    attr = driver.CUlaunchAttribute()
+                    attr.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                    attr.value.clusterDim.x = csize
+                    attr.value.clusterDim.y = 1
+                    attr.value.clusterDim.z = 1
+                    config = driver.CUlaunchConfig()
+                    config.gridDimX = csize
+                    config.gridDimY = 1
+                    config.gridDimZ = 1
+                    config.blockDimX = 128
+                    config.blockDimY = 1
+                    config.blockDimZ = 1
+                    config.sharedMemBytes = smem
+                    config.attrs = [attr]
+                    config.numAttrs = 1
+                    result[int(csize)] = int(
+                        checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config))
+                    )
+            finally:
+                checkCudaErrors(driver.cuModuleUnload(module))
+        finally:
+            checkCudaErrors(driver.cuDevicePrimaryCtxRelease(device_index))
+    return result
+
+
 def small_route(
-    block_mask: torch.Tensor, *, sms: int
+    block_mask: torch.Tensor, *, sms: int, cluster_capacity: Mapping[int, int]
 ) -> Optional[tuple[int, bool, int]]:
     """``(kmax, split, cluster)`` when the problem should take a small-kernel route, else ``None``.
 
@@ -247,7 +343,8 @@ def small_route(
     (tried when the unsplit rule fails): the grid is too small for the
     persistent kernel's two consumer warpgroups per CTA (``2 * tiles <= SMs``);
     the split-KV variant of :func:`split_kmax` and the cluster variant of
-    :func:`cluster_variant_for` are compared by their modelled costs and the
+    :func:`cluster_variant_for` (one wave of clusters by the device's
+    :func:`cluster_capacity`) are compared by their modelled costs and the
     cheaper one wins.  Everything larger goes to the persistent pair/split
     kernel.  Mirrors ``vsa_sm90_small.small_route``.
     """
@@ -268,7 +365,7 @@ def small_route(
             split: Optional[int] = split_kmax(counts, sms=sms)
         except ValueError:
             split = None
-        cluster = cluster_variant_for(counts, sms=sms)
+        cluster = cluster_variant_for(counts, sms=sms, cluster_capacity=cluster_capacity)
         if cluster is not None and (
             split is None or cluster_cost(counts, *cluster) < split_cost(counts, split)
         ):
@@ -881,7 +978,9 @@ class CakeVsaSm90Plan:
             )
         small: Optional[tuple[int, bool, int]] = None
         if route is None:
-            small = small_route(block_mask_map, sms=sms)
+            small = small_route(
+                block_mask_map, sms=sms, cluster_capacity=cluster_capacity(self.device.index)
+            )
         elif route == "small":
             small = (
                 small_kmax_for(int(block_mask_map.to("cpu").sum(dim=-1).max())),
@@ -1187,6 +1286,7 @@ def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
 
 __all__ = [
     "CakeVsaSm90Plan",
+    "cluster_capacity",
     "cluster_variant_for",
     "create_plan",
     "plan_small",
