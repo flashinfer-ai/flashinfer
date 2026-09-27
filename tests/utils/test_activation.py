@@ -85,5 +85,47 @@ def test_fused_gelu_mul(dim, batch_size, seq_len, enable_pdl):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+_ACT_REFS = {
+    "silu": torch.nn.functional.silu,
+    "gelu": lambda x: torch.nn.functional.gelu(x, approximate="none"),
+    "gelu_tanh": lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
+}
+
+
+@pytest.mark.parametrize("act", ["silu", "gelu", "gelu_tanh"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dim", [855, 1710, 3420, 4096, 14336, 28672])
+def test_act_and_mul_small_batch_split(act, dtype, dim):
+    # Small batches split each row across several CTAs; a row's output must not
+    # depend on how many rows are launched together. Large batches use one CTA per row.
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    x = torch.randn(8 * num_sms, 2 * dim, device="cuda", dtype=dtype)
+    fn = getattr(flashinfer.activation, f"{act}_and_mul")
+    y = fn(x)
+    y_ref = (_ACT_REFS[act](x[:, :dim].float()) * x[:, dim:].float()).to(dtype)
+    tol = 1e-2 if dtype == torch.bfloat16 else 2e-3
+    torch.testing.assert_close(y, y_ref, rtol=tol, atol=tol)
+    sizes = [1, 3, num_sms - 1, num_sms, num_sms + 1, 2 * num_sms - 1, 2 * num_sms]
+    for num_tokens in sizes:
+        torch.testing.assert_close(fn(x[:num_tokens]), y[:num_tokens], rtol=0, atol=0)
+
+
+def test_act_and_mul_cuda_graph():
+    # Two split launches back to back, the second reading the first one's output, so
+    # a multi-CTA-per-row kernel waits on another one (PDL) inside the graph.
+    x = torch.randn(4, 2 * 14336, device="cuda", dtype=torch.bfloat16)
+    y1 = torch.full((4, 14336), float("nan"), device="cuda", dtype=torch.bfloat16)
+    y2 = torch.full((4, 7168), float("nan"), device="cuda", dtype=torch.bfloat16)
+    y1_ref = flashinfer.activation.silu_and_mul(x)
+    y2_ref = flashinfer.activation.gelu_and_mul(y1_ref)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flashinfer.activation.silu_and_mul(x, out=y1)
+        flashinfer.activation.gelu_and_mul(y1, out=y2)
+    graph.replay()
+    torch.testing.assert_close(y1, y1_ref, rtol=0, atol=0)
+    torch.testing.assert_close(y2, y2_ref, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     test_fused_silu_mul(128, 1, 1, True)

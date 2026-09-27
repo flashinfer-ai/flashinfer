@@ -25,6 +25,7 @@ from .utils import write_if_different
 activation_templ = r"""
 #include <flashinfer/activation.cuh>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <type_traits>
 #include "tvm_ffi_utils.h"
 
@@ -40,6 +41,9 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   dim3 grid(num_tokens);
 
   cudaSetDevice(out.device().device_id);
+  int num_sms_attr = 0;
+  cudaDeviceGetAttribute(&num_sms_attr, cudaDevAttrMultiProcessorCount, out.device().device_id);
+  const uint32_t num_sms = num_sms_attr;
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
     cudaLaunchConfig_t config;
@@ -65,10 +69,37 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
       // higher DRAM throughput at d=8192 on B200; the exact gain depends on the
       // compiler's register allocation for this kernel).
       config.blockDim = std::min(d / vec_size, 256U);
-      auto kernel =
-          flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}, vec_size>;
+      const uint32_t block_size = config.blockDim.x;
+      const uint32_t num_vecs = d / vec_size;
+      // With fewer rows than 2 blocks per SM, one block per row leaves most SMs idle. Split
+      // each row across enough blocks for about 2 per SM, or more (up to 4 per SM) until each
+      // thread has at most 2 vectors, which it then loads together. Never split finer than
+      // one vector per thread. Larger batches keep the one-block-per-row kernel: in a GH200
+      // sweep the unrolled launch was not reliably faster there (up to 7% slower for bf16
+      // gelu_tanh at 512 rows).
+      uint32_t split = 1;
+      bool unroll = false;
+      if (num_vecs > 0 && num_tokens > 0 && num_tokens < 2 * num_sms) {
+        const uint32_t rows = static_cast<uint32_t>(num_tokens);
+        const uint32_t spread = 2 * num_sms / rows;
+        const uint32_t fit = std::min(ceil_div(num_vecs, 2 * block_size), 4 * num_sms / rows);
+        split = std::min(std::max(spread, fit), ceil_div(num_vecs, block_size));
+        unroll = ceil_div(num_vecs, block_size * split) >= 2;
+      }
+      if (split == 1 && !unroll) {
+        auto kernel =
+            flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}, vec_size>;
+        cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                           static_cast<c_type*>(input.data_ptr()), d);
+        return;
+      }
+      config.gridDim = static_cast<uint32_t>(num_tokens * split);
+      auto kernel = unroll ? flashinfer::activation::act_and_mul_split_kernel<
+                                 c_type, {{ act_func_name }}, vec_size, 2>
+                           : flashinfer::activation::act_and_mul_split_kernel<
+                                 c_type, {{ act_func_name }}, vec_size, 1>;
       cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                         static_cast<c_type*>(input.data_ptr()), d);
+                         static_cast<c_type*>(input.data_ptr()), d, split);
     };
 
     // Use the widest vector that divides d. The y half of a row starts d
