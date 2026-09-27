@@ -35,16 +35,21 @@ REDUCE_DIM_CHUNKS = 4  # CTA reducer: 128 latent dims per CTA
 ROW_TILES = (16, 32, 48, 64, 96)
 # Two-CTA wide route (Cake ``kimi_k3_mla_wide``): 128 packed rows per cluster of two CTAs, K tokens
 # split across the pair.  Taken for requests with more than WIDE_MIN_ROWS packed rows whose longest
-# KV is at least WIDE_MIN_KV tokens (the lazy-E4M3 probability reference of that schedule is out of
-# the contract tolerance on shorter KV prefill, which stays on the row tiles).
+# KV is at least WIDE_MIN_KV tokens: the lazy-E4M3 probability reference of that schedule meets the
+# uniform-profile tolerance (atol 0.01 / rtol 0.02 against an FP32 reference) from a longest KV of
+# 8192 tokens on (needs atol 0.0082 at 8192, 0.0084 at 16384, 0.0121 at 4096); shorter-KV prefill
+# stays on the row tiles.
 WIDE_MIN_ROWS = 64
-WIDE_MIN_KV = 16384
+WIDE_MIN_KV = 8192
 WIDE_TILE_Q = 128  # packed rows per two-CTA cluster
 WIDE_CLUSTER = 2  # CTAs per cluster: one SM pair per work item
 WIDE_MIN_TILES_PER_SPLIT = 2
 # Per-wave fixed cost (prologue + drain of a work item) in 128-token tile periods; mirrors Cake
-# ``WIDE_WAVE_COST_TILES`` (calibrated on B200: one wave of 305 tiles beat three waves of 99).
-WIDE_WAVE_COST_TILES = 8
+# ``WIDE_WAVE_COST_TILES``.  Calibrated on B200 (148 SMs: one wave of 305 tiles beat three waves of
+# 99) and on GB300 (152 SMs: one wave of 9 splits over 298 tiles beat two full waves of 19 splits by
+# 3 % on the 8-request H96 decode row; forced-split sweeps fit the per-wave term at 20-25 tiles); 16
+# is the smallest value that reproduces every measured optimum on 148 / 152 / 160 SMs.
+WIDE_WAVE_COST_TILES = 16
 
 
 def _target_arch(device: torch.device) -> str:
