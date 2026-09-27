@@ -347,7 +347,11 @@ def test_plan_covers_every_query_block_once_and_is_deadlock_free(
     mask = _random_mask(h, mb, nb, capacity, ragged=ragged)
     plan = plan_vsa_sm90(mask, sms=132)
     assert plan["meta"].shape[1] == META_WORDS
-    assert plan["num_ctas"] == min(plan["num_tiles"], 132)
+    # the grid is the full machine or a uniform grid keeping >= 90 % of it busy
+    assert 0.9 * min(plan["num_tiles"], 132) <= plan["num_ctas"] <= min(plan["num_tiles"], 132)
+    per_cta = [len(t) for t in _cta_tiles(plan)]
+    if plan["num_ctas"] < min(plan["num_tiles"], 132):
+        assert max(per_cta) - min(per_cta) == 0
     seen = set()
     for head, qb0, qb1, mode, positions, owns in _decode_tiles(plan):
         blocks = {qb0} if mode else {qb0, qb1}

@@ -629,28 +629,64 @@ def _tile_cost(owns_t) -> float:
     return max(len(o) for o in owns_t) + TILE_FIXED_COST
 
 
-def _assign_tiles(
-    costs: list[float], lens: list[int], sms: int
-) -> tuple[list[list[int]], float]:
-    """List-schedule the tiles onto ``min(T, sms)`` persistent CTAs.
+GRID_MIN_FRACTION = 0.9  # a smaller, uniform persistent grid only while >= 90 % of the SMs stay busy
 
-    A CTA's key is the larger of its consumer time (sum of tile costs) and its
-    load time (positions loaded x ``LOAD_COST`` x occupancy ``g / sms``).
-    """
-    n = len(costs)
-    g = max(1, min(n, sms))
-    load_unit = LOAD_COST * g / sms
+
+def _list_schedule(
+    costs: list[float], lens: list[int], g: int
+) -> tuple[list[list[int]], float]:
     cons = [0.0] * g
     load = [0.0] * g
     heap = [(0.0, c) for c in range(g)]
     lists: list[list[int]] = [[] for _ in range(g)]
-    for t in range(n):
+    for t in range(len(costs)):
         _, c = heapq.heappop(heap)
         lists[c].append(t)
         cons[c] += costs[t]
-        load[c] += lens[t] * load_unit
+        load[c] += lens[t] * LOAD_COST
         heapq.heappush(heap, (max(cons[c], load[c]), c))
     return lists, max(key for key, _ in heap)
+
+
+def _grid_candidates(n_tiles: int, sms: int) -> list[int]:
+    """Persistent grid sizes worth trying: the full machine and the largest
+    grids that spread ``n_tiles`` uniformly (``ceil(n / k)`` CTAs for k tiles
+    each) while keeping at least ``GRID_MIN_FRACTION`` of the SMs busy.
+    Mirrors ``vsa_sm90_bf16._grid_candidates``."""
+    g_max = max(1, min(n_tiles, sms))
+    cands = {g_max}
+    for k in range(1, n_tiles + 1):  # k tiles per CTA
+        g = -(-n_tiles // k)
+        if g < GRID_MIN_FRACTION * g_max:
+            break
+        if g <= g_max:
+            cands.add(g)
+        if g == 1:
+            break
+    return sorted(cands, reverse=True)
+
+
+def _assign_tiles(
+    costs: list[float], lens: list[int], sms: int
+) -> tuple[list[list[int]], float]:
+    """List-schedule the tiles onto ``g`` persistent CTAs.
+
+    A CTA's key is the larger of its consumer time (sum of tile costs) and its
+    load time (positions loaded x ``LOAD_COST``; the chip's memory bandwidth
+    bounds a streaming iteration, so the term does not scale with the grid).
+    The grid is chosen among :func:`_grid_candidates` by makespan; a tie goes
+    to the grid with the most uniform tile counts (128 x 2 rather than
+    124 x 2 + 8 x 1 for 256 tiles), then to the larger grid.  Mirrors
+    ``vsa_sm90_bf16._assign_tiles``.
+    """
+    best = None
+    for g in _grid_candidates(len(costs), sms):
+        lists, makespan = _list_schedule(costs, lens, g)
+        spread = max(len(lst) for lst in lists) - min(len(lst) for lst in lists)
+        key = (round(makespan, 9), spread, -g)
+        if best is None or key < best[0]:
+            best = (key, lists, makespan)
+    return best[1], best[2]
 
 
 def _pairs_for_head(
@@ -801,11 +837,13 @@ def plan_vsa_sm90(
         if not ragged:
             order = list(range(len(infos)))
         elif h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET:
-            g_est = max(1, min(len(infos), sms))
-            lu = LOAD_COST * g_est / sms
             order = sorted(
                 range(len(infos)),
-                key=lambda i: (-max(costs[i], lens[i] * lu), infos[i][0], infos[i][1]),
+                key=lambda i: (
+                    -max(costs[i], lens[i] * LOAD_COST),
+                    infos[i][0],
+                    infos[i][1],
+                ),
             )
         else:
             order = sorted(range(len(infos)), key=lambda i: (infos[i][0], -costs[i]))
