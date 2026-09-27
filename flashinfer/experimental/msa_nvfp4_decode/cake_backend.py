@@ -63,7 +63,7 @@ STATS_PER_SLOT = PAGE_SIZE  # partial max/sum entries per (item, split) slot
 PARTIAL_O_PER_SLOT = STATS_PER_SLOT * HEAD_DIM
 WORKSPACE_ALIGN = 256
 TMA_ALIGN = 16
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 LN2 = math.log(2.0)
 
 # Semantic argument names of the single stage, in the order the generated
@@ -166,7 +166,7 @@ def persistent_cta_capacity(device: torch.device) -> int:
     """Number of CTAs the persistent grid may hold on ``device``."""
     arch = arch_for(device)
     if arch is None:
-        raise ValueError("NVFP4 MSA decode requires compute capability 10.0 or 10.3")
+        raise ValueError("NVFP4 MSA decode requires compute capability 10.0, 10.3 or 10.7")
     sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     return sms * ctas_per_sm(arch)
 
@@ -579,7 +579,7 @@ def prepare_msa_nvfp4_sparse_decode(
     if arch is None:
         capability = torch.cuda.get_device_capability(device)
         raise ValueError(
-            "NVFP4 MSA decode requires compute capability 10.0 or 10.3 "
+            "NVFP4 MSA decode requires compute capability 10.0, 10.3 or 10.7 "
             f"(got {capability[0]}.{capability[1]})"
         )
     total_q = batch * int(seqlen_q)
