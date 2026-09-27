@@ -36,6 +36,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import Int32
@@ -450,6 +451,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         zero_fill_chunk_bytes: int = 65536,
         cluster_split_k: bool = False,
         cluster_split_max_tiles: int = 0,
+        a_tma_gather: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -530,6 +532,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
+        # Row operand through the TMA unit (``tile::gather4`` over the
+        # unpermuted activations, one instruction per four permuted rows)
+        # instead of the LDGSTS gather warps, which then only place SFA.
+        # Single-CTA tile without B multicast: the A bytes join the B/SFB
+        # stage barrier's transaction count.
+        self.a_tma_gather = bool(a_tma_gather)
+        if self.a_tma_gather and (
+            self.use_2cta_instrs or tuple(cluster_shape_mn) != (1, 1)
+        ):
+            raise ValueError(
+                "a_tma_gather needs the single-CTA tile and cluster shape (1, 1)"
+            )
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.raster_along_m = raster_along_m
@@ -900,6 +914,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         zero_fill_words: Optional[cute.Tensor] = None,
         zero_fill_counters: Optional[cute.Tensor] = None,
         zero_fill_other_tiles: Optional[cute.Tensor] = None,
+        permuted_idx_to_token_idx: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -1098,6 +1113,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (b_copy_size + sfb_copy_size) * atom_thr_size
 
+        # Row operand through TMA gather4 (see ``a_tma_gather``): indexed by
+        # permuted row through ``permuted_idx_to_token_idx`` (padding rows
+        # carry an out-of-range token index and are zero-filled by TMA).
+        tma_atom_a = None
+        tma_tensor_a = None
+        coord_a = None
+        if cutlass.const_expr(self.a_tma_gather):
+            if cutlass.const_expr(permuted_idx_to_token_idx is None):
+                raise ValueError("a_tma_gather needs permuted_idx_to_token_idx")
+            a_smem_layout = cute.slice_(
+                self.a_smem_layout_staged, (None, None, None, 0)
+            )
+            tma_atom_a, tma_tensor_a, coord_a = self._make_gather4_tma_atom_a(
+                a, a_smem_layout, tiled_mma, permuted_idx_to_token_idx
+            )
+            self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
+
         # Setup TMA store for C
         tma_atom_c = None
         tma_tensor_c = None
@@ -1271,6 +1303,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tiled_mma,
             tiled_mma_sfb,
             a,
+            tma_atom_a,
+            tma_tensor_a,
+            coord_a,
             tma_atom_b,
             tma_tensor_b,
             sfa,
@@ -1364,6 +1399,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
         mA_mkl: cute.Tensor,
+        tma_atom_a: Optional[cute.CopyAtom],
+        mA_tma: Optional[cute.Tensor],
+        mIdxA: Optional[cute.Tensor],
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
         mSFA_mkl: cute.Tensor,
@@ -1408,6 +1446,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         if warp_idx == self.tma_b_warp_id:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfb)
+            if cutlass.const_expr(self.a_tma_gather):
+                cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
@@ -1656,6 +1696,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cute.group_modes(sB, 0, 3),
             cute.group_modes(tCgB, 0, 3),
         )
+
+        # TMA gather4 row operand: (row tile, K tile) of the permuted-row
+        # index tensor drives the four gather coordinates per instruction.
+        tAsA_tma = None
+        tAgA_tma = None
+        tAgI_tma = None
+        if cutlass.const_expr(self.a_tma_gather):
+            a_tiler = (self.mma_tiler[0], self.mma_tiler[2])
+            gA_tma = cute.zipped_divide(mA_tma, a_tiler)
+            gI_tma = cute.zipped_divide(mIdxA, a_tiler)
+            tAsA_tma, tAgA_tma, tAgI_tma = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 3),
+                [gA_tma, gI_tma],
+            )
 
         # TMA load SFB partition_S/D
         sfb_cta_layout = cute.make_layout(
@@ -2082,45 +2139,50 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         )
                     ]
 
-                    for i in range(8):
-                        #
-                        # Load A matrix: 8x LDGSTS.128 per thread with swizzle_128B
-                        # Each LDGSTS.128 loads a_elements_per_ldgsts values.
-                        # Global memory address is computed using token offset for gather operation
-                        # Predicate mask guards against invalid token IDs (padding tokens marked as -1)
-                        #
-                        A_gmem_slice_offset = A_gmem_thread_offset + cute.assume(
-                            a_token_offset_tensor[i] * tAgA_ktile.layout[0].stride,
-                            divby=self.a_elements_per_ldgsts,
-                        )
-                        A_gmem_slice_offset = cute.assume(
-                            A_gmem_slice_offset,
-                            divby=self.a_elements_per_ldgsts,
-                        )
-                        tAgA_slice_ptr = tAgA_ktile.iterator + A_gmem_slice_offset
-                        tAgA_slice = cute.make_tensor(
-                            tAgA_slice_ptr,
-                            layout=cute.make_layout((self.a_elements_per_ldgsts,)),
-                        )
+                    # With the TMA row operand these warps only place SFA.
+                    if cutlass.const_expr(not self.a_tma_gather):
+                        for i in range(8):
+                            #
+                            # Load A matrix: 8x LDGSTS.128 per thread with swizzle_128B
+                            # Each LDGSTS.128 loads a_elements_per_ldgsts values.
+                            # Global memory address is computed using token offset for gather operation
+                            # Predicate mask guards against invalid token IDs (padding tokens marked as -1)
+                            #
+                            A_gmem_slice_offset = A_gmem_thread_offset + cute.assume(
+                                a_token_offset_tensor[i] * tAgA_ktile.layout[0].stride,
+                                divby=self.a_elements_per_ldgsts,
+                            )
+                            A_gmem_slice_offset = cute.assume(
+                                A_gmem_slice_offset,
+                                divby=self.a_elements_per_ldgsts,
+                            )
+                            tAgA_slice_ptr = tAgA_ktile.iterator + A_gmem_slice_offset
+                            tAgA_slice = cute.make_tensor(
+                                tAgA_slice_ptr,
+                                layout=cute.make_layout((self.a_elements_per_ldgsts,)),
+                            )
 
-                        tAsA_slice = cute.make_tensor(
-                            tAsA_ktile[(None, i, None)].iterator,
-                            layout=cute.make_layout((self.a_elements_per_ldgsts,)),
-                        )
-                        a_predicate_slice = cute.make_rmem_tensor(
-                            cute.make_layout((1,)), cutlass.Boolean
-                        )
-                        # Row validity does not guard a partial final K tile.
-                        a_predicate_slice[0] = a_predicate_tensor[i] & (
-                            (a_producer_state.count + cs_k_base)
-                            * self.cta_tile_shape_mnk[2]
-                            + A_gmem_thread_offset
-                            < cute.size(mA_mkl, mode=[1])
-                        )
+                            tAsA_slice = cute.make_tensor(
+                                tAsA_ktile[(None, i, None)].iterator,
+                                layout=cute.make_layout((self.a_elements_per_ldgsts,)),
+                            )
+                            a_predicate_slice = cute.make_rmem_tensor(
+                                cute.make_layout((1,)), cutlass.Boolean
+                            )
+                            # Row validity does not guard a partial final K tile.
+                            a_predicate_slice[0] = a_predicate_tensor[i] & (
+                                (a_producer_state.count + cs_k_base)
+                                * self.cta_tile_shape_mnk[2]
+                                + A_gmem_thread_offset
+                                < cute.size(mA_mkl, mode=[1])
+                            )
 
-                        cute.copy_atom_call(
-                            a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
-                        )
+                            cute.copy_atom_call(
+                                a_atom_copy,
+                                tAgA_slice,
+                                tAsA_slice,
+                                pred=a_predicate_slice,
+                            )
 
                     for i in range(self.sfa_copies_per_thread):
                         #
@@ -2391,6 +2453,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             tBsSFB_pipe,
                             tma_bar_ptr=tma_bar,
                             mcast_mask=sfb_full_mcast_mask,
+                        )
+
+                    # TMA gather4 load of the row operand (same stage barrier)
+                    if cutlass.const_expr(self.a_tma_gather):
+                        a_crd = (
+                            None,
+                            (tile_info[0], b_producer_state.count + cs_k_base),
+                        )
+                        cute.copy(
+                            tma_atom_a,
+                            [tAgA_tma[a_crd], tAgI_tma[a_crd]],
+                            tAsA_tma[(None, b_producer_state.index)],
+                            tma_bar_ptr=tma_bar,
                         )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
@@ -5412,6 +5487,49 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 cute.arch.cluster_arrive_relaxed()
                 cute.arch.cluster_wait()
 
+    def _make_gather4_tma_atom_a(
+        self,
+        a: cute.Tensor,
+        a_smem_layout: cute.ComposedLayout,
+        tiled_mma: cute.TiledMma,
+        row_index: cute.Tensor,
+    ):
+        """``tile::gather4`` TMA atom for the gathered row operand A.
+
+        The data tensor is the unpermuted ``(tokens, K)`` activation matrix;
+        the per-permuted-row token index drives the four gather coordinates of
+        every instruction, so the returned TMA tensor is indexed by permuted
+        row (``(R, K)``) like the index tensor. Mirrors the A projection of
+        ``make_tiled_tma_atom_A`` (the smem layout is the MMA operand layout).
+        """
+        a_2d = cute.make_tensor(
+            a.iterator,
+            cute.make_ordered_layout((a.shape[0], a.shape[1]), order=(1, 0)),
+        )
+        coord = cute.make_tensor(
+            row_index.iterator,
+            cute.make_layout((row_index.shape[0], a.shape[1]), stride=(1, 0)),
+        )
+        op = cpasync.CopyBulkTensor2DGather4G2SOp(cta_group=self.cta_group)
+        ident = cute.make_identity_layout(a_2d.shape)
+        g_tile = cute.composition(ident, (self.mma_tiler[0], self.mma_tiler[2]))
+        cta_v_map = tiled_mma._thrfrg_A(g_tile)
+        cta_v_map = cute.get(cta_v_map, mode=[1])
+        cta_v_map = cute.dice(cta_v_map, (1, (1,) * cute.rank(g_tile)))
+        smem_ir = (
+            a_smem_layout.value if hasattr(a_smem_layout, "value") else a_smem_layout
+        )
+        res = _cute_nvgpu_ir.atom_make_non_exec_2d_gather4_tma_load(
+            a_2d.value,
+            coord.layout,
+            smem_ir,
+            cta_v_map,
+            op._to_ir(),
+            num_multicast=1,
+        )
+        atom = cute.CopyAtom(op, cpasync.CopyBulkTensorTileG2SNonExecTrait(res[0]))
+        return atom, res[1], coord
+
     def epilog_tmem_copy_and_partition(
         self,
         tidx: cutlass.Int32,
@@ -6184,6 +6302,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         zero_fill_num_words: cutlass.Int32 = 0,
         zero_fill_counters_ptr: Optional[cute.Pointer] = None,
         zero_fill_other_tiles_ptr: Optional[cute.Pointer] = None,
+        permuted_idx_to_token_idx_ptr: Optional[cute.Pointer] = None,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
@@ -6295,6 +6414,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else None
         )
 
+        # gather4 row coordinates of the TMA row operand (see a_tma_gather)
+        permuted_idx_to_token_idx = (
+            cute.make_tensor(
+                permuted_idx_to_token_idx_ptr, layout=cute.make_layout((m,))
+            )
+            if cutlass.const_expr(permuted_idx_to_token_idx_ptr is not None)
+            else None
+        )
+
         return self(
             a,
             b,
@@ -6318,6 +6446,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             zero_fill_words=zero_fill_words,
             zero_fill_counters=zero_fill_counters,
             zero_fill_other_tiles=zero_fill_other_tiles,
+            permuted_idx_to_token_idx=permuted_idx_to_token_idx,
         )
 
 

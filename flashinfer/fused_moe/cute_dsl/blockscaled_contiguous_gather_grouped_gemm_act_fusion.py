@@ -283,6 +283,8 @@ def _get_compiled_gather_kernel(
     zero_fill_other_tiles_ptr=None,
     zero_fill_secondary: bool = False,
     cluster_split_k: bool = False,
+    a_tma_gather: bool = False,
+    token_idx_ptr=None,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -344,12 +346,17 @@ def _get_compiled_gather_kernel(
         zero_fill_words_ptr is not None,
         zero_fill_secondary,
         cluster_split_k,
+        a_tma_gather,
     )
 
     if cache_key not in _gather_kernel_cache:
         if is_rubin and cluster_split_k:
             raise NotImplementedError(
                 "cluster_split_k is not supported by the Rubin (SM107) kernel"
+            )
+        if is_rubin and a_tma_gather:
+            raise NotImplementedError(
+                "a_tma_gather is not supported by the Rubin (SM107) kernel"
             )
         if is_rubin:
             # The Rubin (SM107) kernel currently only implements the gated
@@ -417,6 +424,7 @@ def _get_compiled_gather_kernel(
                 cluster_split_max_tiles=(
                     get_max_active_clusters(2) if cluster_split_k else 0
                 ),
+                a_tma_gather=a_tma_gather,
             )
         wrapper_fn = gemm.wrapper
 
@@ -466,6 +474,7 @@ def _get_compiled_gather_kernel(
                     "zero_fill_num_words": zero_fill_num_words,
                     "zero_fill_counters_ptr": zero_fill_counters_ptr,
                     "zero_fill_other_tiles_ptr": zero_fill_other_tiles_ptr,
+                    "permuted_idx_to_token_idx_ptr": token_idx_ptr,
                 }
                 if not is_rubin
                 else {}
@@ -523,6 +532,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     zero_fill_other_tiles: Optional[torch.Tensor] = None,
     zero_fill_secondary: bool = False,
     cluster_split_k: bool = False,
+    # Load the gathered rows of A with TMA gather4 (Blackwell, single-CTA
+    # tile); needs one int32 token index per permuted row (padding rows
+    # out of range).
+    a_tma_gather: bool = False,
+    permuted_idx_to_token_idx: Optional[torch.Tensor] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
@@ -915,6 +929,28 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     num_tiles_ptr = make_ptr(
         cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem
     )
+    token_idx_ptr = None
+    if a_tma_gather:
+        if is_rubin:
+            raise NotImplementedError(
+                "a_tma_gather is not supported by the Rubin (SM107) kernel"
+            )
+        if (
+            permuted_idx_to_token_idx is None
+            or permuted_idx_to_token_idx.dtype != torch.int32
+            or permuted_idx_to_token_idx.device != a.device
+            or not permuted_idx_to_token_idx.is_contiguous()
+            or permuted_idx_to_token_idx.shape[0] < permuted_m
+        ):
+            raise ValueError(
+                "a_tma_gather needs permuted_idx_to_token_idx: contiguous int32 "
+                f"on the input device with at least {permuted_m} entries"
+            )
+        token_idx_ptr = make_ptr(
+            cutlass.Int32,
+            permuted_idx_to_token_idx.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
     row_group_ptr = None
     if tile_idx_to_row_group is not None:
         if is_rubin:
@@ -1051,6 +1087,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         zero_fill_other_tiles_ptr=zero_fill_other_tiles_ptr,
         zero_fill_secondary=zero_fill_secondary,
         cluster_split_k=cluster_split_k,
+        a_tma_gather=a_tma_gather,
+        token_idx_ptr=token_idx_ptr,
     )
 
     # Execute kernel with runtime parameters.
@@ -1092,6 +1130,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             "zero_fill_num_words": zero_fill_num_words,
             "zero_fill_counters_ptr": zero_fill_counters_ptr,
             "zero_fill_other_tiles_ptr": zero_fill_other_tiles_ptr,
+            "permuted_idx_to_token_idx_ptr": token_idx_ptr,
         }
         if not is_rubin
         else {}

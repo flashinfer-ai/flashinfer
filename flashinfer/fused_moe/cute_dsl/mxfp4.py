@@ -411,6 +411,9 @@ DENSE_GEMM2_SWIZZLE = int(os.environ.get("MXFP4_GEMM2_SWIZZLE", "4"))
 # the current one (the shard's K=384 tiles are epilogue-bound). Measured in
 # phase 4; 1 keeps the phase-3 kernel.
 DENSE_GEMM2_C_STAGES = int(os.environ.get("MXFP4_GEMM2_C_STAGES", "1"))
+# Dense GEMM1 row operand through TMA ``tile::gather4`` instead of the LDGSTS
+# gather warps (single-CTA 128-row tile; the 2-CTA tile keeps LDGSTS).
+DENSE_GEMM1_A_TMA = os.environ.get("MXFP4_GEMM1_A_TMA", "0") == "1"
 DENSE_GEMM2_RASTER_M_MAX_SHARD = int(
     os.environ.get("MXFP4_GEMM2_RASTER_M_MAX_SHARD", "512")
 )
@@ -755,6 +758,8 @@ class Mxfp4MoEPlan:
             self._prepare_routing()
             _moe_core_impl(**self._kwargs, _prepared_launches=launches)
         self._sort, self._sort_args = launches["sort"]
+        # gather4 row coordinates of the TMA row operand (DENSE_GEMM1_A_TMA)
+        self._token_index = launches.get("swap_token_index")
         self._gather, self._gather_args, self._gather_kwargs = launches["gather"]
         # Dual-tile routing: the alternate-tile GEMMs run after the base ones;
         # the one the routing did not choose exits on a zero tile count.
@@ -845,6 +850,9 @@ class Mxfp4MoEPlan:
                 or not self._route_preprocess.sorts_tokens
             ):
                 self._sort(*self._sort_args, stream_ptr)
+            if self._token_index is not None:
+                token_index, token_index_args = self._token_index
+                token_index(*token_index_args, stream=stream)
             async_memset = (
                 not self._route_preprocess_clears and self._aux_stream is not None
             )
@@ -2057,6 +2065,12 @@ class CuteDslMxfp4MoEWrapper:
                 4,
             ),
             ("out_permuted_idx_to_expanded_idx", (rows,), torch.int32, 4),
+            *(
+                # gather4 row coordinates of the TMA row operand of GEMM1
+                [("permuted_idx_to_token_idx", (rows,), torch.int32, 4)]
+                if DENSE_GEMM1_A_TMA
+                else []
+            ),
             ("out_total_num_padded_tokens", (1,), torch.int32, 4),
             ("out_num_non_exiting_tiles", (1,), torch.int32, 4),
             ("gemm1_out", (rows, self.intermediate_shard), torch.float8_e4m3fn, 1),
@@ -2398,6 +2412,8 @@ class CuteDslMxfp4MoEWrapper:
                 gemm2_raster_along_m=gemm2_raster[0],
                 gemm2_swizzle_size=gemm2_raster[1],
                 gemm2_c_stages=DENSE_GEMM2_C_STAGES,
+                gemm1_a_tma=DENSE_GEMM1_A_TMA,
+                permuted_idx_to_token_idx=buffers.get("permuted_idx_to_token_idx"),
                 dual_alt_pdl=DENSE_DUAL_ALT_PDL,
                 moe_sort_buffers={
                     name: value

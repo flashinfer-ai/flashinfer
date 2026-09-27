@@ -231,6 +231,11 @@ def _moe_core_impl(
     # Output staging buffers of the Blackwell finalize GEMM2 (1, or 2 to
     # overlap the next tile's staging with the bulk reduce-add drain).
     gemm2_c_stages: int = 1,
+    # Dense GEMM1 row operand through TMA gather4 (Blackwell single-CTA tile,
+    # cluster (1, 1)); needs ``permuted_idx_to_token_idx`` (one int32 per
+    # permuted row, filled here after the sort).
+    gemm1_a_tma: bool = False,
+    permuted_idx_to_token_idx: Optional[torch.Tensor] = None,
     # Launch the alternate-tile GEMMs as programmatic dependents of the base
     # ones (PDL): their launch overlaps the base kernel's tail, so the variant
     # the routing did not choose costs about a launch gap instead of ~3 us.
@@ -431,6 +436,24 @@ def _moe_core_impl(
         _prepared_launches=_prepared_launches,
         **moe_sort_kwargs,
     )
+    gemm1_a_tma_base = (
+        bool(gemm1_a_tma)
+        and not is_rubin
+        and gemm1_mma_tiler_mn[0] == 128
+        and tuple(gemm1_cluster_shape_mn) == (1, 1)
+    )
+    if gemm1_a_tma_base:
+        if permuted_idx_to_token_idx is None:
+            raise ValueError("gemm1_a_tma needs permuted_idx_to_token_idx")
+        from .swapab_moe import fill_permuted_token_index
+
+        fill_permuted_token_index(
+            permuted_idx_to_expanded_idx,
+            permuted_idx_to_token_idx,
+            num_tokens,
+            top_k,
+            _prepared_launches=_prepared_launches,
+        )
 
     # Record event for async memset synchronization
     if use_async_memset and use_fused_finalize:
@@ -510,6 +533,10 @@ def _moe_core_impl(
                 (alt_num_tiles if dual_tile_size else base_num_tiles)
                 if gemm1_zero_fill
                 else None
+            ),
+            a_tma_gather=gemm1_a_tma_base,
+            permuted_idx_to_token_idx=(
+                permuted_idx_to_token_idx if gemm1_a_tma_base else None
             ),
             _prepared_launches=_prepared_launches,
         )
