@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Behavioural coverage for the NVFP4 paged-KV MSA prefill route on compute
-capability 10.0/10.3.
+capability 10.0/10.3/10.7.
 
 The file has two halves, and they have deliberately different requirements.
 

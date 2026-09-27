@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Minimax Sparse Attention decode wrapper. Public dispatch supports compute
-capability 10.0/10.3 and SM120/SM121. The implementation below this module's
+capability 10.0/10.3/10.7 and SM120/SM121. The implementation below this module's
 public dispatcher is the SM120/SM121 split-and-combine path.
 """
 
@@ -196,13 +196,13 @@ def msa_sparse_decode_attention(
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
 ):
-    """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
+    """Sparse decode attention for SM100/SM103/SM107 and SM120/SM121 GPUs.
 
     Computes attention for a decode step: each request contributes
     ``seqlen_q`` query tokens (uniform across the batch) attending only the
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
-    On compute capability 10.0/10.3, ``topk`` must be 16 and Q1 through
+    On compute capability 10.0/10.3/10.7, ``topk`` must be 16 and Q1 through
     multi-token decode use the direct persistent M16 path.
 
     Parameters
@@ -216,7 +216,7 @@ def msa_sparse_decode_attention(
         On the paged path, ``k``/``v`` may also be views split from a cache
         that packs K and V in one ``2 * head_dim`` content dim per token
         on SM120/SM121 (see ``supports_packed_kv``). Compute capability
-        10.0/10.3 requires separate contiguous K and V tensors and never
+        10.0/10.3/10.7 requires separate contiguous K and V tensors and never
         copies packed views implicitly, with one exception: packed NVFP4
         paged K/V (uint8, ``(num_pages, 4, 128, 64)``) is consumed in place
         as strided views of a planar ``[K data | K scale | V data | V scale]``
@@ -247,7 +247,7 @@ def msa_sparse_decode_attention(
         128x4 layout produced by :func:`flashinfer.nvfp4_quantize` (rows
         padded to a multiple of 128), with scale rows following the cache
         layout: ``(token, head)`` order for flat K/V, ``(page, head, token)``
-        for paged. On compute capability 10.0/10.3 the paged NVFP4 decode
+        for paged. On compute capability 10.0/10.3/10.7 the paged NVFP4 decode
         route takes the block-scale regions of the packed page as
         ``(num_pages, num_kv_heads, page_size, head_dim // 16)`` views, either
         uint8 or float8_e4m3fn: K scales linear, V scales ``(4, 4)``-swizzled
@@ -255,14 +255,14 @@ def msa_sparse_decode_attention(
     k_global_scale, v_global_scale : float, optional
         Global dequant scales. On SM120/SM121, ``k_global_scale`` folds into
         the softmax scale for NVFP4 K and ``v_global_scale`` scales the output
-        for any KV dtype. On SM100/SM103, both are supported only for uniform
+        for any KV dtype. On SM100/SM103/SM107, both are supported only for uniform
         FP8 Q/K/V decode and for the paged NVFP4 KV decode route, which
         requires both.
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by causal alignment.
     partial_dtype : torch.dtype, optional
         Accumulator / partial-result dtype override for supported kernels.
-        The compute capability 10.0/10.3 backend always uses its native float32
+        The compute capability 10.0/10.3/10.7 backend always uses its native float32
         split storage and ignores this override.
     force_fused : bool, optional
         Override the adaptive split-K decision. By default each token's selected
@@ -274,15 +274,15 @@ def msa_sparse_decode_attention(
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)
         adapts. NVFP4 KV defaults to the per-block split at every batch size
         (the in-kernel dequant favors the extra parallelism).
-        On compute capability 10.0/10.3 this argument is accepted for API
+        On compute capability 10.0/10.3/10.7 this argument is accepted for API
         compatibility; the production direct-M16 route does not split.
     workspace : MSASparseAttentionWorkspace, optional
         Caller-owned storage required for CUDA graph capture on compute
-        capability 10.0/10.3. Warm the workspace eagerly with the exact
+        capability 10.0/10.3/10.7. Warm the workspace eagerly with the exact
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
 
-        The packed NVFP4 paged-KV route on compute capability 10.0/10.3 is the
+        The packed NVFP4 paged-KV route on compute capability 10.0/10.3/10.7 is the
         one exception: it captures without a workspace, because everything
         before its single kernel launch is host-side arithmetic over shapes and
         strides. Passing one is still honoured, including the warm-vs-capture
@@ -301,7 +301,7 @@ def msa_sparse_decode_attention(
         this parameter exists to remove.
 
         Supported by the packed-NVFP4 paged-KV route on compute capability
-        10.0/10.3. Every other route raises ``NotImplementedError`` when it is
+        10.0/10.3/10.7. Every other route raises ``NotImplementedError`` when it is
         passed -- deliberately, so that a caller cannot be handed the copy back
         without being told.
 
@@ -339,11 +339,11 @@ def msa_sparse_decode_attention(
     if workspace is not None:
         raise ValueError(
             "MSASparseAttentionWorkspace is only used by the compute "
-            "capability 10.0/10.3 backend"
+            "capability 10.0/10.3/10.7 backend"
         )
     if out is not None:
         raise NotImplementedError(
-            "out= is implemented by the compute capability 10.0/10.3 "
+            "out= is implemented by the compute capability 10.0/10.3/10.7 "
             "packed-NVFP4 paged-KV decode route; the SM120/SM121 backend "
             "allocates its own output"
         )

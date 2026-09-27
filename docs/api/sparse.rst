@@ -45,9 +45,9 @@ flashinfer.msa_ops
 ==================
 
 Minimax Sparse Attention (MSA) sparse prefill, sparse decode, and top-k
-selection dispatch on compute capability 10.0/10.3 (SM100/SM103) and
+selection dispatch on compute capability 10.0/10.3/10.7 (SM100/SM103/SM107) and
 SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
-only. On compute capability 10.0/10.3, NVFP4 K/V is served by dedicated
+only. On compute capability 10.0/10.3/10.7, NVFP4 K/V is served by dedicated
 paged-KV prefill and decode routes that take the four regions of a packed
 NVFP4 page -- K data, K scales, V data, V scales -- as strided views of one
 allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
@@ -55,11 +55,11 @@ allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
 ``msa_prefill_nvfp4_specialized_stats()`` and
 ``msa_decode_nvfp4_specialized_stats()`` report the exact accepted set. Other
 NVFP4 forms -- flat or ragged K/V, or separately allocated scale tensors --
-remain SM120/SM121-only, and outside those routes the 10.0/10.3 backend
+remain SM120/SM121-only, and outside those routes the 10.0/10.3/10.7 backend
 requires separate contiguous K and V tensors and does not make implicit
-copies. The decode ``out=`` parameter is implemented by that 10.0/10.3 route
+copies. The decode ``out=`` parameter is implemented by that 10.0/10.3/10.7 route
 alone; every other route raises ``NotImplementedError`` when it is passed.
-The compute capability 10.0/10.3 backend uses TopK16 as its generic contract
+The compute capability 10.0/10.3/10.7 backend uses TopK16 as its generic contract
 and additionally retains four shape-exact routes: paged BF16 decode at
 B64/Q8/KV65536/TopK32, 512-thread paged BF16 decode at
 B2/Q1/KV257/TopK4, flat
@@ -72,7 +72,7 @@ Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
 kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
 BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
 producer and deterministic reduction once the query reaches 8192 tokens.
-The NVFP4 paged-KV prefill route on compute capability 10.0/10.3 requires
+The NVFP4 paged-KV prefill route on compute capability 10.0/10.3/10.7 requires
 CUDA 13.0 or newer; on an older toolkit it declines with the reason, which
 ``msa_prefill_nvfp4_specialized_stats()`` also reports as
 ``toolkit_decline_reason``. The decode route has no such floor. The generated
@@ -96,11 +96,11 @@ integrating a cache manager across these architectures; the legacy aggregate
 ``SUPPORTS_PACKED_KV`` flag describes the SM120/SM121 backend.
 Per-token tensor ``num_valid_pages`` for
 :func:`flashinfer.msa_ops.msa_topk_select` is likewise SM120/SM121-only;
-compute capability 10.0/10.3 requires a scalar value or ``None`` and rejects
+compute capability 10.0/10.3/10.7 requires a scalar value or ``None`` and rejects
 the tensor form before backend dispatch.
 
-CUDA graph capture of sparse prefill or decode on compute capability 10.0/10.3
-requires a caller-owned
+CUDA graph capture of sparse prefill or decode on compute capability
+10.0/10.3/10.7 requires a caller-owned
 :class:`flashinfer.msa_ops.MSASparseAttentionWorkspace`. Warm the workspace
 eagerly with the exact tensors, options, and capture stream before capture.
 The exact decode overrides are eager-only. The exact TopK8 reverse-prefill

@@ -1,4 +1,4 @@
-"""NVFP4 paged-KV MSA decode on compute capability 10.0/10.3 -- all three bodies.
+"""NVFP4 paged-KV MSA decode on compute capability 10.0/10.3/10.7 -- all three bodies.
 
 This route is a new capability, not a specialization of an existing one: NVFP4
 K/V raised ``NotImplementedError`` on this architecture before it existed. So
@@ -922,7 +922,7 @@ def test_a_strided_selection_view_is_admitted_and_a_gappy_one_is_not(cpu_inputs)
 def test_a_declined_call_says_WHICH_axis_declined_it(cpu_inputs):
     """The blanket message was false, and falseness is the whole defect.
 
-    `NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3` is what
+    `NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3/10.7` is what
     this architecture raised BEFORE the route existed, and the route is an
     exception carved in front of it -- so a decline lands back on the original
     blanket refusal and the operator is told the capability is missing when in
@@ -1989,7 +1989,7 @@ def test_out_on_a_route_that_cannot_honour_it_raises_instead_of_copying(cpu_inpu
 
     So every route that allocates its own output refuses `out=` rather than
     accepting it and copying.  Reached here on a host tensor, which is not a
-    compute-capability 10.0/10.3 device, so no GPU is needed to prove it.
+    compute-capability 10.0/10.3/10.7 device, so no GPU is needed to prove it.
     """
     with pytest.raises(NotImplementedError, match="out="):
         _call(cpu_inputs, out=torch.empty_like(cpu_inputs["q"]))

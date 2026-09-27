@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Compute-capability 10.0/10.3 backend for Minimax Sparse Attention.
+Compute-capability 10.0/10.3/10.7 backend for Minimax Sparse Attention.
 """
 
 from __future__ import annotations
@@ -400,18 +400,18 @@ def _validate_scale_arguments(
         # kept as the default for a decline that carries no reason.
         if nvfp4_decline_reason:
             raise NotImplementedError(
-                "NVFP4 K/V MSA on compute capability 10.0/10.3 declined this "
+                "NVFP4 K/V MSA on compute capability 10.0/10.3/10.7 declined this "
                 f"call: {nvfp4_decline_reason}. NVFP4 K/V IS supported on this "
                 "architecture -- this shape is not, and there is no other "
                 "implementation of this operation over an NVFP4 cache, so the "
                 "call cannot be served at any speed."
             )
         raise NotImplementedError(
-            "NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3"
+            "NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3/10.7"
         )
     if k_scale is not None or v_scale is not None:
         raise NotImplementedError(
-            "tensor K/V scales are not supported by MSA on compute capability 10.0/10.3"
+            "tensor K/V scales are not supported by MSA on compute capability 10.0/10.3/10.7"
         )
     uniform_fp8 = q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
     if (k_global_scale is not None or v_global_scale is not None) and not (
@@ -453,7 +453,7 @@ def _validate_attention_tensors(
     if not k.is_contiguous() or not v.is_contiguous():
         if k.ndim == 4:
             raise ValueError(
-                "MSA on compute capability 10.0/10.3 does not directly support "
+                "MSA on compute capability 10.0/10.3/10.7 does not directly support "
                 "K/V views split from a packed paged cache; pass separate "
                 "contiguous K and V tensors (implicit copies are not performed)"
             )
@@ -462,7 +462,7 @@ def _validate_attention_tensors(
     if fp8_kv:
         if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise NotImplementedError(
-                "FP8 K/V with FP16 Q is not supported on compute capability 10.0/10.3"
+                "FP8 K/V with FP16 Q is not supported on compute capability 10.0/10.3/10.7"
             )
         if q.dtype == torch.float8_e4m3fn and v.dtype != torch.float8_e4m3fn:
             raise ValueError("FP8 Q requires uniform FP8 K/V")
@@ -2062,7 +2062,7 @@ def _try_nvfp4_prefill(
     latter and carries ``reason`` into the error it raises if nothing else
     can serve the call either.
 
-    Compute capability 10.0/10.3 has no NVFP4 MSA prefill route otherwise: the
+    Compute capability 10.0/10.3/10.7 has no NVFP4 MSA prefill route otherwise: the
     checks below this call reject packed uint8 K/V and tensor K/V scales
     outright, and that rejection is what falling through restores. This hook
     sits above them so that the shared tensor-validation and layout-preparation
@@ -2114,7 +2114,7 @@ def _try_nvfp4_prefill(
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and workspace is None:
         raise RuntimeError(
-            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+            "CUDA graph capture of MSA on compute capability 10.0/10.3/10.7 "
             "requires an explicit MSASparseAttentionWorkspace warmed with the "
             "exact tensors and capture stream"
         )
@@ -2261,7 +2261,7 @@ def blackwell_msa_sparse_attention(
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and workspace is None:
         raise RuntimeError(
-            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+            "CUDA graph capture of MSA on compute capability 10.0/10.3/10.7 "
             "requires an explicit MSASparseAttentionWorkspace warmed with the "
             "exact tensors and capture stream"
         )
@@ -2582,7 +2582,7 @@ def _try_nvfp4_decode(
     latter and carries ``reason`` into the error it raises if nothing else
     can serve the call either.
 
-    Compute capability 10.0/10.3 has no NVFP4 MSA route otherwise: the checks
+    Compute capability 10.0/10.3/10.7 has no NVFP4 MSA route otherwise: the checks
     below this call reject packed uint8 K/V and tensor K/V scales outright, and
     that rejection is what falling through restores. This hook sits above them
     so that the shared tensor-validation and layout-preparation helpers, which
@@ -2635,7 +2635,7 @@ def _try_nvfp4_decode(
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and workspace is None and nvfp4.capture_requires_workspace():
         raise RuntimeError(
-            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+            "CUDA graph capture of MSA on compute capability 10.0/10.3/10.7 "
             "requires an explicit MSASparseAttentionWorkspace warmed with the "
             "exact tensors and capture stream"
         )
@@ -2825,7 +2825,7 @@ def blackwell_msa_sparse_decode_attention(
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and workspace is None:
         raise RuntimeError(
-            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+            "CUDA graph capture of MSA on compute capability 10.0/10.3/10.7 "
             "requires an explicit MSASparseAttentionWorkspace warmed with the "
             "exact tensors and capture stream"
         )
@@ -3103,7 +3103,7 @@ def blackwell_msa_topk_select(
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
 ) -> torch.Tensor:
-    """Select exact top-16 block indices on compute capability 10.0/10.3."""
+    """Select exact top-16 block indices on compute capability 10.0/10.3/10.7."""
 
     if not isinstance(max_score, torch.Tensor) or not max_score.is_cuda:
         raise ValueError("max_score must be a CUDA tensor")
