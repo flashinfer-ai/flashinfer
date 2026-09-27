@@ -139,6 +139,7 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         enable_pdl,
         out_dtype,
         per_token_alpha,
+        l2_policy,
     ) = cache_key
     # On SM107 the use_tma_store slot is repurposed to carry the Rubin kernel
     # shape (inst_m, inst_n, inst_k, tiler_k, prefetch_dist), so render it as a
@@ -154,12 +155,13 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         tma = int(use_tma_store)
     dtype = str(out_dtype).removeprefix("torch.")
     alpha = "x" if per_token_alpha is None else per_token_alpha
+    l2 = "x" if l2_policy is None else l2_policy
     return (
         f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
         f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_{kernel_type}"
         f"_tma{tma}_pdl{int(enable_pdl)}_{dtype}"
-        f"_pta{alpha}"
+        f"_pta{alpha}_l2{l2}"
         f"_b{batch_size}_mac{max_active_clusters}"
     )
 
@@ -300,8 +302,13 @@ def _mm_fp4_precompile_worker(payload):
             enable_pdl,
             out_dtype,
             per_token_alpha,
+            l2_policy,
         ) = payload["cache_key"]
 
+        # The use_tma_store slot of an "sm100" tactic carries the MMA K
+        # instructions per stage (None -> 4, 8 -> K tile 512); the worker must
+        # build the same kernel the runner would, since the disk name derives
+        # from the cache key.
         gemm = Sm100BlockScaledPersistentDenseGemmKernel(
             sf_vec_size,
             mma_tiler_mn,
@@ -309,6 +316,11 @@ def _mm_fp4_precompile_worker(payload):
             use_prefetch,
             enable_pdl,
             per_token_alpha,
+            mma_inst_tile_k=_use_tma_store or 4,
+            a_l2_evict_first=l2_policy == "a_ef",
+            b_l2_evict_first=l2_policy == "b_ef",
+            a_l2_evict_last=l2_policy == "ab_el",
+            b_l2_evict_last=l2_policy == "ab_el",
         )
         compile_fn = _make_blockscaled_gemm_compile_fn(
             gemm,
@@ -445,13 +457,57 @@ def per_token_alpha_mode(per_token_alpha, swap_ab):
     return "n" if swap_ab else "m"
 
 
-def _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype, per_token_alpha=None):
+def _mm_fp4_cache_key(
+    sf_vec_size,
+    tactic,
+    enable_pdl,
+    out_dtype,
+    per_token_alpha=None,
+    l2_policy=None,
+):
     """In-memory kernel-cache key for one mm_fp4 tactic tuple.
 
     Shared by the runner's forward path and the precompile path, which
     must agree byte-for-byte: the on-disk kernel name derives from it.
+    ``l2_policy`` is :func:`mm_fp4_l2_policy` for the shape.
     """
-    return (sf_vec_size, *tactic, enable_pdl, out_dtype, per_token_alpha)
+    return (
+        sf_vec_size,
+        *tactic,
+        enable_pdl,
+        out_dtype,
+        per_token_alpha,
+        l2_policy,
+    )
+
+
+def mm_fp4_l2_policy(m, mma_tiler_mn, swap_ab, kernel_type):
+    """L2 eviction policy for the operand streams of an ``"sm100"`` tactic.
+
+    The persistent kernel streams the weight matrix once per token tile while
+    every CTA of a column re-reads the same token tile and its scale factors.
+
+    * With at most two token tiles the weights are read at most twice, so
+      loading them with ``evict_first`` keeps the shared token tile resident
+      instead of letting the 32-117 MB weight stream flush it (1.04-1.24x on
+      the M <= 512 rows of the projection shapes, both B200 and GB300).
+      Returns ``"a_ef"`` (weights are the kernel's A operand, ``swap_ab``) or
+      ``"b_ef"`` (B operand).
+    * With more token tiles both operands are re-read through L2 (the
+      weights by every M tile, the token tiles by every N tile): loading both
+      with ``evict_last`` gains 0.1-10 % on the M = 2048 / 8192 rows of the
+      no-swap kernel (32/32 rows > 1 on B200 and GB300; ``evict_last`` on the
+      token operand alone left two GB300 rows at 0.999). Returns ``"ab_el"``.
+
+    Returns ``None`` for other kernels. Cache hints only: outputs do not
+    change.
+    """
+    if kernel_type != "sm100":
+        return None
+    token_tile = mma_tiler_mn[1] if swap_ab else mma_tiler_mn[0]
+    if (m + token_tile - 1) // token_tile <= 2:
+        return "a_ef" if swap_ab else "b_ef"
+    return None if swap_ab else "ab_el"
 
 
 def precompile_mm_fp4_tactics(
@@ -510,6 +566,7 @@ def precompile_mm_fp4_tactics(
             enable_pdl,
             out_dtype,
             per_token_alpha_mode(per_token_alpha, swap_ab),
+            mm_fp4_l2_policy(m, mma_tiler_mn, swap_ab, kernel_type),
         )
         if (device_index, cache_key) in kernel_cache:
             continue

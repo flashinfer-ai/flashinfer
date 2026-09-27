@@ -59,6 +59,7 @@ from ..fused_moe.utils import (
 from .gemm_mm_fp4_cute_dsl import (
     _compile_block_scaled_gemm,
     _mm_fp4_cache_key,
+    mm_fp4_l2_policy,
     _prepare_alpha_for_launch,
     per_token_alpha_mode,
     precompile_mm_fp4_tactics,
@@ -7831,6 +7832,8 @@ _SM100_SPLITK_KERNEL_TYPE = "sm100sk"
 # weight grid is about a wave or more (>= _SM100_DEEP_K_MIN_TILES weight
 # tiles); below that the longer pipeline fill/drain costs 1-2 %.
 _SM100_DEEP_K_INST = 8
+
+
 _SM100_DEEP_K_TILE = 512
 _SM100_DEEP_K_MIN_TILES = 128
 
@@ -8316,8 +8319,9 @@ def _cute_dsl_gemm_fp4_runner(
             sf_k = (real_k // sf_vec_size + 3) // 4
 
             alpha_mode = per_token_alpha_mode(per_token_alpha, swap_ab)
+            l2_policy = mm_fp4_l2_policy(m, mma_tiler_mn, swap_ab, kernel_type)
             cache_key = _mm_fp4_cache_key(
-                sf_vec_size, tactic, enable_pdl, out_dtype, alpha_mode
+                sf_vec_size, tactic, enable_pdl, out_dtype, alpha_mode, l2_policy
             )
 
             split_k_slices = 1
@@ -8386,6 +8390,10 @@ def _cute_dsl_gemm_fp4_runner(
                     enable_pdl,
                     alpha_mode,
                     mma_inst_tile_k=deep_k_inst,
+                    a_l2_evict_first=l2_policy == "a_ef",
+                    b_l2_evict_first=l2_policy == "b_ef",
+                    a_l2_evict_last=l2_policy == "ab_el",
+                    b_l2_evict_last=l2_policy == "ab_el",
                 )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(

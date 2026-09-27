@@ -38,6 +38,8 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
@@ -96,6 +98,27 @@ from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_w
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 
+@dsl_user_op
+def _l2_cache_policy(evict: str, *, loc=None, ip=None) -> cutlass.Int64:
+    """Runtime ``createpolicy`` L2 eviction policy (fraction 1.0) for TMA loads.
+
+    ``evict`` is ``"evict_first"`` (stream-once operand) or ``"evict_last"``
+    (operand re-read by every CTA). Kept a runtime instruction on purpose: a
+    constant policy makes ptxas emit an invalid encoding on some toolchains.
+    """
+    return cutlass.Int64(
+        llvm.inline_asm(
+            cutlass.Int64.mlir_type,
+            [],
+            f"createpolicy.fractional.L2::{evict}.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and Blackwell GPU architectural features, including persistent tile scheduling and warp specialization.
@@ -138,6 +161,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         enable_pdl: bool = True,
         per_token_alpha: Optional[str] = None,
         mma_inst_tile_k: int = 4,
+        a_l2_evict_first: bool = False,
+        b_l2_evict_last: bool = False,
+        b_l2_evict_first: bool = False,
+        a_l2_evict_last: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -159,6 +186,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 the extent ``alpha`` holds one scale per coordinate of: ``"m"``
                 per row of C, ``"n"`` per column (callers that swap A and B).
             mma_inst_tile_k (int): MMA K instructions per pipeline stage (4 or 8).
+            a_l2_evict_first (bool): issue the A (and SFA) TMA loads with an L2
+                ``evict_first`` policy: A is streamed exactly once per CTA.
+            b_l2_evict_last (bool): issue the B (and SFB) TMA loads with an L2
+                ``evict_last`` policy: every CTA of a column re-reads the tile.
+            b_l2_evict_first (bool): issue the B (and SFB) TMA loads with an L2
+                ``evict_first`` policy (B streamed once, e.g. weights without
+                swap_ab when M fits one tile). Exclusive with b_l2_evict_last.
         """
 
         self.per_token_alpha = per_token_alpha
@@ -168,6 +202,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # (K tile 512, a 256 B TMA row per operand row; used for narrow N tiles
         # whose weight stream is DRAM-efficiency bound).
         self.mma_inst_tile_k = mma_inst_tile_k
+        if b_l2_evict_first and b_l2_evict_last:
+            raise ValueError("b_l2_evict_first and b_l2_evict_last are exclusive")
+        if a_l2_evict_first and a_l2_evict_last:
+            raise ValueError("a_l2_evict_first and a_l2_evict_last are exclusive")
+        self.a_l2_evict_last = a_l2_evict_last
+        self.a_l2_evict_first = a_l2_evict_first
+        self.b_l2_evict_last = b_l2_evict_last
+        self.b_l2_evict_first = b_l2_evict_first
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -892,6 +934,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
 
+            # L2 eviction policies for the operand streams (None = default).
+            a_cache_policy = None
+            b_cache_policy = None
+            if cutlass.const_expr(self.a_l2_evict_first):
+                a_cache_policy = _l2_cache_policy("evict_first")
+            if cutlass.const_expr(self.a_l2_evict_last):
+                a_cache_policy = _l2_cache_policy("evict_last")
+            if cutlass.const_expr(self.b_l2_evict_last):
+                b_cache_policy = _l2_cache_policy("evict_last")
+            if cutlass.const_expr(self.b_l2_evict_first):
+                b_cache_policy = _l2_cache_policy("evict_first")
+
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -972,6 +1026,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=a_cache_policy,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -979,6 +1034,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
+                        cache_policy=b_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfa,
@@ -986,6 +1042,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
+                        cache_policy=a_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfb,
@@ -993,6 +1050,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
+                        cache_policy=b_cache_policy,
                     )
 
                     # Prefetch: Rolling prefetch for next tiles

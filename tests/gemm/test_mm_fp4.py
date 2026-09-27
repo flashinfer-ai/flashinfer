@@ -647,3 +647,24 @@ def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_mm_fp4_l2_policy_rule():
+    """Weights load evict_first while they are streamed at most twice (<= 2
+    token tiles); with more token tiles both operands of the no-swap kernel
+    are pinned with evict_last; other kernels keep the default."""
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import mm_fp4_l2_policy
+
+    # swap_ab: tokens are the kernel's N extent, weights the A operand
+    assert mm_fp4_l2_policy(1, (128, 8), True, "sm100") == "a_ef"
+    assert mm_fp4_l2_policy(32, (128, 32), True, "sm100") == "a_ef"
+    assert mm_fp4_l2_policy(64, (128, 32), True, "sm100") == "a_ef"
+    assert mm_fp4_l2_policy(65, (128, 32), True, "sm100") is None
+    # no swap: tokens are the M extent, weights the B operand
+    assert mm_fp4_l2_policy(130, (256, 128), False, "sm100") == "b_ef"
+    assert mm_fp4_l2_policy(512, (256, 256), False, "sm100") == "b_ef"
+    assert mm_fp4_l2_policy(513, (256, 256), False, "sm100") == "ab_el"
+    assert mm_fp4_l2_policy(8192, (256, 256), False, "sm100") == "ab_el"
+    # other kernels are untouched
+    assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
+    assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
