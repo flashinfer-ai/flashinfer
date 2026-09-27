@@ -8,8 +8,8 @@ page size 64, bottom-right causal mask, current stream, CUDA-Graph replayable
 (``launch`` allocates nothing; the split-KV partials live in ``workspace_buffer``).
 
 Host planning mirrors the Cake module exactly (``swapped_rt``, ``plan_num_split``,
-``reduce_warps_per_row``); the exporter's ``prepare`` step checks that both arms built the
-same plan.
+``plan_num_split_wide`` / ``plan_wide_work``, ``reduce_warps_per_row``); the exporter's ``prepare``
+step checks that both arms built the same plan.
 """
 
 from __future__ import annotations
@@ -50,6 +50,12 @@ WIDE_MIN_TILES_PER_SPLIT = 2
 # 3 % on the 8-request H96 decode row; forced-split sweeps fit the per-wave term at 20-25 tiles); 16
 # is the smallest value that reproduces every measured optimum on 148 / 152 / 160 SMs.
 WIDE_WAVE_COST_TILES = 16
+# Tail splitting (Cake r50e): a partially filled last wave of SM pairs runs faster per tile than a full one at the
+# board power cap (fewer active SMs, higher clock; B200 fits: 44 of 74 pairs ~1.19x, 56 of 74 ~1.10x, i.e.
+# occupancy ** -0.33), so the full waves keep unsplit KV streams and only the tail items are split, and only when
+# the model predicts at least WIDE_TAIL_MIN_GAIN.  Mirrors Cake ``plan_wide_work``.
+WIDE_UNDERFILL_EXP = 0.33
+WIDE_TAIL_MIN_GAIN = 0.02
 
 
 def _target_arch(device: torch.device) -> str:
@@ -107,6 +113,63 @@ def plan_num_split_wide(
     if best_s > 1 and cost_one / best_cost < 1.15:
         return 1
     return best_s
+
+
+def plan_wide_work(
+    clusters: int,
+    max_seq_len: int,
+    sm_count: int,
+    forced_split: Optional[int] = None,
+    min_tiles_per_split: int = WIDE_MIN_TILES_PER_SPLIT,
+    max_splits: int = 32,
+    wave_cost_tiles: int = WIDE_WAVE_COST_TILES,
+) -> tuple[int, int]:
+    """``(n_full_items, num_split)`` of the wide route's flat grid (mirrors Cake ``plan_wide_work``).
+
+    Items before ``n_full_items`` stream their whole KV on one cluster; the remaining items take ``num_split``
+    clusters each.  With fewer items than SM pairs, or a forced / uniform split, this is ``(0, plan_num_split_wide)``.
+    Otherwise the full waves stay unsplit and the last, partially filled wave is split into ``s`` chunks when
+    ``full_waves * (tiles + w) + waves(tail * s) * (tiles / s + w)`` (last wave discounted by
+    ``occupancy ** -WIDE_UNDERFILL_EXP``, 0.05 tile periods per chunk for the merge) beats the unsplit plan by
+    WIDE_TAIL_MIN_GAIN.
+    """
+    if forced_split:
+        return 0, max(1, int(forced_split))
+    uniform = plan_num_split_wide(
+        clusters,
+        max_seq_len,
+        sm_count,
+        min_tiles_per_split=min_tiles_per_split,
+        max_splits=max_splits,
+        wave_cost_tiles=wave_cost_tiles,
+    )
+    if uniform != 1:
+        return 0, uniform
+    pairs = max(1, sm_count // WIDE_CLUSTER)
+    tiles = max(1, (max_seq_len + TILE_TOK - 1) // TILE_TOK)
+    full_waves, tail = divmod(clusters, pairs)
+    if full_waves == 0 or tail == 0:
+        return 0, 1
+
+    def wave(chunk_tiles: int, active: int) -> float:
+        return (chunk_tiles + wave_cost_tiles) * (active / pairs) ** WIDE_UNDERFILL_EXP
+
+    base = full_waves * (tiles + wave_cost_tiles)
+    cost_one = base + wave(tiles, tail)
+    best_s, best_cost = 1, cost_one
+    for s in range(2, max(2, min(max_splits, tiles // max(1, min_tiles_per_split))) + 1):
+        chunk = -(-tiles // s)
+        if chunk < min_tiles_per_split:
+            break
+        chunks = tail * s
+        waves = -(-chunks // pairs)
+        last = chunks - (waves - 1) * pairs
+        cost = base + (waves - 1) * (chunk + wave_cost_tiles) + wave(chunk, last) + 0.05 * chunks
+        if cost < best_cost:
+            best_s, best_cost = s, cost
+    if best_s > 1 and best_cost <= cost_one * (1.0 - WIDE_TAIL_MIN_GAIN):
+        return full_waves * pairs, best_s
+    return 0, 1
 
 
 def reduce_warps_per_row(rows: int) -> int:
@@ -264,12 +327,9 @@ class KimiK3MlaFp8PagedAttention:
         if self.wide:
             self.rt: Optional[int] = None
             self.m_tiles = (rows_per_request + WIDE_TILE_Q - 1) // WIDE_TILE_Q
-            self.num_split = (
-                int(num_split)
-                if num_split
-                else plan_num_split_wide(
-                    self.batch * self.m_tiles, int(max_seq_len), sm_count
-                )
+            # Full waves of SM pairs run unsplit items; only the tail items (if any) take num_split clusters.
+            self.n_full_items, self.num_split = plan_wide_work(
+                self.batch * self.m_tiles, int(max_seq_len), sm_count, forced_split=num_split
             )
         else:
             self.rt = swapped_rt(rows_per_request)
@@ -281,6 +341,7 @@ class KimiK3MlaFp8PagedAttention:
                     self.batch * self.m_tiles, int(max_seq_len), sm_count
                 )
             )
+            self.n_full_items = 0
         self.max_pages_per_seq = int(block_tables.shape[-1])
         self.softmax_scale_log2 = float(bmm1_scale) * math.log2(math.e)
         self.bmm2_scale = float(bmm2_scale)
@@ -293,24 +354,33 @@ class KimiK3MlaFp8PagedAttention:
         self.partial_O, self.partial_max, self.partial_sum = _carve_workspace(
             workspace_buffer, self.rows_max, self.num_split
         )
-        # The wide route launches one cluster of two CTAs per (split, row tile, request) item.
-        self.grid_main = (
-            (WIDE_CLUSTER if self.wide else 1) * self.num_split,
-            self.m_tiles,
-            self.batch,
-        )
+        self.num_items = self.m_tiles * self.batch
+        self.tail_items = self.num_items - self.n_full_items
+        if self.wide:
+            # Flat grid: one two-CTA cluster per unsplit item, num_split clusters per tail item (split fastest).
+            self.grid_main = (
+                WIDE_CLUSTER * (self.n_full_items + self.tail_items * self.num_split),
+                1,
+                1,
+            )
+            self.tile_rows = WIDE_TILE_Q
+        else:
+            self.grid_main = (self.num_split, self.m_tiles, self.batch)
+            self.tile_rows = self.rt
+        # The merge covers the rows of the split items only (every row when nothing is unsplit).
+        self.reduce_rows = self.tail_items * self.tile_rows
         if self.num_split <= REDUCE_WARP_MAX_SPLITS:
-            self.reduce_warps = reduce_warps_per_row(self.rows_max)
+            self.reduce_warps = reduce_warps_per_row(self.reduce_rows)
             rows_per_cta = REDUCE_WARPS // self.reduce_warps
             self.grid_reduce = (
-                (self.rows_max + rows_per_cta - 1) // rows_per_cta,
+                (self.reduce_rows + rows_per_cta - 1) // rows_per_cta,
                 1,
                 1,
             )
             reduce_kind = f"reduce_w{self.reduce_warps}"
         else:
             self.reduce_warps = 0
-            self.grid_reduce = (self.rows_max, REDUCE_DIM_CHUNKS, 1)
+            self.grid_reduce = (self.reduce_rows, REDUCE_DIM_CHUNKS, 1)
             reduce_kind = "reduce_cta"
         main_kind = "main_wide" if self.wide else f"main_rt{self.rt}"
         self._main = get_cake_kimi_k3_mla_route(main_kind, arch=self.arch)
@@ -328,6 +398,7 @@ class KimiK3MlaFp8PagedAttention:
             rt=self.rt,
             m_tiles=self.m_tiles,
             num_split=self.num_split,
+            n_full_items=self.n_full_items,
             rows_max=self.rows_max,
             grid_main=tuple(self.grid_main),
             grid_reduce=tuple(self.grid_reduce),
@@ -336,28 +407,28 @@ class KimiK3MlaFp8PagedAttention:
             max_pages_per_seq=self.max_pages_per_seq,
         )
         write_target = self.o_rows if self.num_split == 1 else self.partial_O
-        self._main_args = _bound_args(
-            self._main,
-            dict(
-                tmap_q=self.q_rows,
-                tmap_qr=self.q_rows,
-                tmap_k=self.kv_rows,
-                tmap_kr=self.kv_rows,
-                tmap_v=self.kv_rows,
-                partial_O=write_target,
-                partial_max=self.partial_max,
-                partial_sum=self.partial_sum,
-                seq_lens=self.seq_lens,
-                cum_seq_lens_q=self.cum_seq_lens_q,
-                page_table=self.block_tables,
-                softmax_scale_log2=self.softmax_scale_log2,
-                bmm2_scale=self.bmm2_scale,
-                num_heads=self.num_heads,
-                num_split=self.num_split,
-                max_pages_per_seq=self.max_pages_per_seq,
-            ),
-            self.grid_main,
+        main_values = dict(
+            tmap_q=self.q_rows,
+            tmap_qr=self.q_rows,
+            tmap_k=self.kv_rows,
+            tmap_kr=self.kv_rows,
+            tmap_v=self.kv_rows,
+            partial_O=write_target,
+            partial_max=self.partial_max,
+            partial_sum=self.partial_sum,
+            seq_lens=self.seq_lens,
+            cum_seq_lens_q=self.cum_seq_lens_q,
+            page_table=self.block_tables,
+            softmax_scale_log2=self.softmax_scale_log2,
+            bmm2_scale=self.bmm2_scale,
+            num_heads=self.num_heads,
+            num_split=self.num_split,
+            max_pages_per_seq=self.max_pages_per_seq,
         )
+        if self.wide:
+            # Unsplit items store the caller's O directly; the flat grid decodes items from these two scalars.
+            main_values.update(O=self.o_rows, m_tiles=self.m_tiles, n_full_items=self.n_full_items)
+        self._main_args = _bound_args(self._main, main_values, self.grid_main)
         self._reduce_args = None
         if self.num_split > 1:
             self._reduce_args = _bound_args(
@@ -372,6 +443,9 @@ class KimiK3MlaFp8PagedAttention:
                     num_heads=self.num_heads,
                     num_split=self.num_split,
                     bmm2_scale=self.bmm2_scale,
+                    m_tiles=self.m_tiles,
+                    n_full_items=self.n_full_items,
+                    tile_rows=self.tile_rows,
                 ),
                 self.grid_reduce,
             )
@@ -440,5 +514,6 @@ __all__ = [
     "use_wide_route",
     "plan_num_split",
     "plan_num_split_wide",
+    "plan_wide_work",
     "reduce_warps_per_row",
 ]

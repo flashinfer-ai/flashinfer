@@ -249,10 +249,12 @@ def test_route_selection():
             max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
         )
 
-    # 96 rows, longest KV 20000 -> wide route: one two-CTA cluster per (split, tile, request).
+    # 96 rows, longest KV 20000 -> wide route: a flat grid of two-CTA clusters, num_split per (tile, request) item
+    # (two items, fewer than the SM pairs: nothing runs unsplit).
     wide = runner(_make_case(2, [1, 1], [20000, 300], 96, seed=1, device=device))
     assert wide.route_metadata["route"] == "wide" and wide.rt is None
-    assert wide.plan["grid_main"] == (2 * wide.num_split, 1, 2)
+    assert wide.plan["n_full_items"] == 0
+    assert wide.plan["grid_main"] == (2 * 2 * wide.num_split, 1, 1)
     # 96 rows but longest KV below 8192 -> row tiles (lazy-E4M3 precision gate of the wide route).
     # max_seq_len is the page-rounded table width, so the longest KV must stay below 8192 pages-wise.
     short = runner(_make_case(2, [1, 1], [8000, 300], 96, seed=2, device=device))
@@ -371,3 +373,25 @@ def test_wide_split_plan_fills_one_wave(clusters, max_seq_len, sm_count, expecte
     assert plan_num_split_wide(6, 467751, 148, wave_cost_tiles=0) == 37
     # The former 8-tile term let two full waves of 141 tiles beat one wave of 298 on 152 SMs.
     assert plan_num_split_wide(8, 342305, 152, wave_cost_tiles=8) == 19
+
+
+@pytest.mark.parametrize(
+    ("clusters", "max_seq_len", "sm_count", "expected"),
+    [
+        # prefill_h12_b1 on 148 SMs: two full waves of 74 unsplit items, the 44 tail items split five ways
+        # (the r50 forced-split sweep measured uniform 3 splits flat and 5 splits 3.5 % slower than unsplit).
+        (192, 131072, 148, (148, 5)),
+        # prefill_h96_b2: ten full waves, the 28 tail items split in two (one wave of 56).
+        (768, 32768, 148, (740, 2)),
+        # prefill_h96_b1: the last wave holds 56 of 74 pairs; the predicted gain is under the 2 % margin.
+        (1536, 131072, 148, (0, 1)),
+        # Decode rows (fewer items than pairs) keep the uniform one-wave plan.
+        (8, 342305, 148, (0, 9)),
+        (48, 342305, 148, (0, 3)),
+    ],
+)
+def test_wide_tail_plan(clusters, max_seq_len, sm_count, expected):
+    from flashinfer.mla.cake_kimi_k3_mla import plan_wide_work
+
+    assert plan_wide_work(clusters, max_seq_len, sm_count) == expected
+    assert plan_wide_work(clusters, max_seq_len, sm_count, forced_split=3) == (0, 3)
