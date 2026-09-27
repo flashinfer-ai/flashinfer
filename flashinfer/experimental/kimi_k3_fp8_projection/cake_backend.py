@@ -97,7 +97,14 @@ E4M3_MAX = 448.0
 AMAX_FLOOR = 1e-4  # DeepGEMM per_token_cast_to_fp8 clamp
 QUANT_WARPS = 4  # warps per quantization CTA; a half warp quantizes one 128-element block per unit
 DECODE_MAX_M = 256  # rows above this use the persistent 2-CTA GEMM
-DECODE_TABLE_BUCKETS = (1, 8, 64, 256, 4096, 16384)  # M buckets of the measured dispatch table (the two large
+DECODE_TABLE_BUCKETS = (
+    1,
+    8,
+    64,
+    256,
+    4096,
+    16384,
+)  # M buckets of the measured dispatch table (the two large
 #                                                     buckets only list families measured faster than the GEMM)
 DEC_W_BYTES = 128 * BLOCK_K  # one 128-row weight tile x 256 K per stage
 DEC_SF_BYTES = 2048  # 2 K-sets x 512 B per operand
@@ -664,7 +671,10 @@ def gemm_tma_store_eligible(data_ptr: int, ldo: int, n_valid: int) -> bool:
     return data_ptr % 16 == 0 and ldo % 8 == 0 and n_valid % 8 == 0
 
 
-GEMM_TS_COLS = 128, 32  # [rows, BF16 columns] of the ``OUT`` descriptor placeholder of the register-epilogue GEMM
+GEMM_TS_COLS = (
+    128,
+    32,
+)  # [rows, BF16 columns] of the ``OUT`` descriptor placeholder of the register-epilogue GEMM
 
 
 @dataclass(frozen=True)
@@ -896,7 +906,11 @@ def prepare_kimi_k3_fp8_projection(
     q, sf = workspace
     ldo = int(out.stride(0))
     plan = route_plan(
-        prepared, M, arch, sm_count, gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid)
+        prepared,
+        M,
+        arch,
+        sm_count,
+        gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid),
     )
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()

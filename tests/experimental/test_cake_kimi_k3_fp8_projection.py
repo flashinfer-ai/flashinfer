@@ -71,7 +71,12 @@ GPU_ROWS = [
     ("tp8", "in_proj_qkvgfab", 1000, 4),
     ("tp8", "q_b", 4096, 0),
     ("tp1", "o_proj", 4097, 4),
-    ("tp8", "f_a", 4096, 0),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
+    (
+        "tp8",
+        "f_a",
+        4096,
+        0,
+    ),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
     ("tp1", "b_proj", 4097, 4),
 ]
 
