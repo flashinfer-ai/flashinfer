@@ -130,6 +130,8 @@ from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
+    cudnn_frost_grouped_gemm1_swiglu,
+    cudnn_frost_grouped_gemm1_swiglu_workspace_size,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
@@ -419,3 +421,7 @@ del _log_import_version
 
 from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
 from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill
+from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
+from .kda_prefill import (
+    kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
+)

@@ -17,8 +17,8 @@ Fused Kimi KDA decode kernel for SM100 and SM103.
 
 The kernel combines the width-four depthwise causal convolution, SiLU,
 per-key-dimension gated delta-rule recurrence, and gated RMSNorm into one
-launch. It is specialized for head dimension 128 and 12, 24, 32, 48, or 96
-heads.
+launch. It is specialized for head dimension 128 and 8, 12, 24, 32, 48, or
+96 heads.
 """
 
 import functools
@@ -54,7 +54,7 @@ _ROWS_PER_WARP = _HEAD_DIM // _NUM_WARPS
 _CONV_THREADS = 3 * _HEAD_DIM // 4
 _Q_SCALE = _HEAD_DIM**-0.5
 _L2_EPS = 1.0e-6
-_SUPPORTED_HEADS = (12, 24, 32, 48, 96)
+_SUPPORTED_HEADS = (8, 12, 24, 32, 48, 96)
 _CUTE_DSL_MODULE = "fused_kda_decode"
 _SOURCE_FILES = (str(Path(__file__).resolve()),)
 
