@@ -624,6 +624,12 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
         w2_scale_prepared=api.prepare_nvfp4_w2_scales(w2_scale),
         w1_data_prepared=api.prepare_nvfp4_w1_data(w1) if prepared_data else None,
         w2_data_prepared=api.prepare_nvfp4_w2_data(w2) if prepared_data else None,
+        w2_data_prepared_k256=api.prepare_nvfp4_w2_data_k256(w2)
+        if prepared_data
+        else None,
+        w2_scale_prepared_k256=api.prepare_nvfp4_w2_scales_k256(w2_scale)
+        if prepared_data
+        else None,
         w1_scale_prepared_interleaved=api.prepare_nvfp4_w1_scales_interleaved(w1_scale)
         if prepared_data
         else None,
@@ -760,3 +766,118 @@ def test_prepare_nvfp4_w2_data_is_a_panel_permutation():
         prepare_nvfp4_w2_data(w2[:, :100].contiguous())
     with pytest.raises(TypeError):
         prepare_nvfp4_w2_data(w2.view(torch.int8))
+
+
+def _token_tile_route_case(m: int, seed: int):
+    case, seed_out, workspaces = _complete_route_case(m, seed, prepared_data=True)
+    general = dict(case)
+    general["w2_data_prepared_k256"] = None
+    general["w2_scale_prepared_k256"] = None
+    return case, general, seed_out, workspaces
+
+
+@pytest.mark.parametrize("m", [1000, 4096], ids=["m1000", "m4096"])
+def test_alphamoe_nvfp4_token_tile_route_matches_general(m):
+    """Route 16 (token tiles) equals the general route-6 path bit for bit, in both accumulate forms."""
+    _skip_if_not_supported()
+    from flashinfer.fused_moe import alphamoe_nvfp4_sm100 as api
+
+    case, general, seed_out, workspaces = _token_tile_route_case(m, 4200 + m)
+    route_id = api._alphamoe_complete_route_id(
+        case["hidden_states"],
+        case["hidden_states_scale"],
+        case["gemm1_weights"],
+        case["gemm1_weights_scale"],
+        case["gemm2_weights_scale"],
+        case["topk_ids"],
+        seed_out,
+        case["top_k"],
+        case["block_m"],
+        case["w1_scale_prepared"],
+        case["w1_data_prepared"],
+        w1_scale_prepared_interleaved=case.get("w1_scale_prepared_interleaved"),
+        w2_scale_prepared=case["w2_scale_prepared"],
+        w2_data_prepared=case["w2_data_prepared"],
+        w2_data_prepared_k256=case["w2_data_prepared_k256"],
+        w2_scale_prepared_k256=case["w2_scale_prepared_k256"],
+    )
+    assert route_id == 16, route_id
+    general_route = api._alphamoe_complete_route_id(
+        general["hidden_states"],
+        general["hidden_states_scale"],
+        general["gemm1_weights"],
+        general["gemm1_weights_scale"],
+        general["gemm2_weights_scale"],
+        general["topk_ids"],
+        seed_out,
+        general["top_k"],
+        general["block_m"],
+        general["w1_scale_prepared"],
+        general["w1_data_prepared"],
+        w1_scale_prepared_interleaved=general.get("w1_scale_prepared_interleaved"),
+        w2_scale_prepared=general["w2_scale_prepared"],
+        w2_data_prepared=general["w2_data_prepared"],
+    )
+    assert general_route == 6, general_route
+
+    direct = torch.full_like(seed_out, float("nan"))
+    api.alphamoe_nvfp4_routed_moe(out=direct, accumulate=False, **workspaces(), **case)
+    reference = torch.zeros_like(seed_out)
+    api.alphamoe_nvfp4_routed_moe(out=reference, **workspaces(), **general)
+    torch.cuda.synchronize()
+    assert torch.isfinite(direct.float()).all()
+    assert torch.equal(direct, reference), (
+        "token-tile route differs from the general route (accumulate=False)"
+    )
+
+    seeded = seed_out.clone()
+    api.alphamoe_nvfp4_routed_moe(out=seeded, **workspaces(), **case)
+    seeded_reference = seed_out.clone()
+    api.alphamoe_nvfp4_routed_moe(out=seeded_reference, **workspaces(), **general)
+    torch.cuda.synchronize()
+    assert torch.equal(seeded, seeded_reference), (
+        "token-tile route differs from the general route (accumulate=True)"
+    )
+
+
+def test_prepare_nvfp4_w2_data_k256_is_a_panel_permutation():
+    from flashinfer.fused_moe.alphamoe_nvfp4_sm100 import prepare_nvfp4_w2_data_k256
+
+    experts, k, packed_n = 3, 256, 256
+    w2 = torch.randint(0, 256, (experts, k, packed_n), dtype=torch.uint8)
+    prepared = prepare_nvfp4_w2_data_k256(w2)
+    chunks = packed_n // 128
+    assert prepared.shape == (experts * (k // 128) * chunks, 128, 128)
+    for e in range(experts):
+        for ob in range(k // 128):
+            for j in range(chunks):
+                panel = prepared[(e * (k // 128) + ob) * chunks + j]
+                assert torch.equal(
+                    panel, w2[e, ob * 128 : (ob + 1) * 128, j * 128 : (j + 1) * 128]
+                )
+    with pytest.raises(ValueError):
+        prepare_nvfp4_w2_data_k256(w2[:, :100].contiguous())
+    with pytest.raises(ValueError):
+        prepare_nvfp4_w2_data_k256(w2[:, :, :64].contiguous())
+    with pytest.raises(TypeError):
+        prepare_nvfp4_w2_data_k256(w2.view(torch.int8))
+
+
+def test_prepare_nvfp4_w2_scales_k256_matches_w1_panel_layout():
+    from flashinfer.fused_moe.alphamoe_nvfp4_sm100 import (
+        prepare_nvfp4_w1_scales,
+        prepare_nvfp4_w2_scales_k256,
+    )
+
+    experts, k, scale_columns = 3, 256, 32
+    w2_scale = torch.randint(
+        0, 256, (experts, k, scale_columns), dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    prepared = prepare_nvfp4_w2_scales_k256(w2_scale)
+    assert prepared.shape == (experts * (k // 128) * (scale_columns // 16), 16, 128)
+    assert prepared.dtype == torch.uint8
+    assert torch.equal(prepared, prepare_nvfp4_w1_scales(w2_scale))
+    with pytest.raises(ValueError):
+        prepare_nvfp4_w2_scales_k256(w2_scale[:, :100].contiguous())
+    with pytest.raises(TypeError):
+        prepare_nvfp4_w2_scales_k256(w2_scale.view(torch.uint8))

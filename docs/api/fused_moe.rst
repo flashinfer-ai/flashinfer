@@ -198,7 +198,10 @@ scale before route weighting.
     prepare_nvfp4_w1_gate_up_data
     prepare_nvfp4_w1_gate_up_scales
     prepare_nvfp4_w1_scales
+    prepare_nvfp4_w2_data
+    prepare_nvfp4_w2_data_k256
     prepare_nvfp4_w2_scales
+    prepare_nvfp4_w2_scales_k256
 
 AlphaMoE NVFP4 prepared weight scales
 -----------------------------------
