@@ -42,7 +42,10 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
 
   cudaSetDevice(out.device().device_id);
   int num_sms_attr = 0;
-  cudaDeviceGetAttribute(&num_sms_attr, cudaDevAttrMultiProcessorCount, out.device().device_id);
+  cudaError_t sm_count_err = cudaDeviceGetAttribute(&num_sms_attr, cudaDevAttrMultiProcessorCount,
+                                                    out.device().device_id);
+  TVM_FFI_ICHECK(sm_count_err == cudaSuccess)
+      << "Failed to query SM count: " << cudaGetErrorString(sm_count_err);
   const uint32_t num_sms = num_sms_attr;
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {

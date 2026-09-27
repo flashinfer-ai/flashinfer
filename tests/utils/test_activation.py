@@ -111,8 +111,9 @@ def test_act_and_mul_small_batch_split(act, dtype, dim):
 
 
 def test_act_and_mul_cuda_graph():
-    # Two split launches back to back, the second reading the first one's output, so
-    # a multi-CTA-per-row kernel waits on another one (PDL) inside the graph.
+    # Two split launches back to back inside a graph, the second reading the first
+    # one's output. On sm90+, where enable_pdl defaults to True, a multi-CTA-per-row
+    # kernel then waits on another one through PDL.
     x = torch.randn(4, 2 * 14336, device="cuda", dtype=torch.bfloat16)
     y1 = torch.full((4, 14336), float("nan"), device="cuda", dtype=torch.bfloat16)
     y2 = torch.full((4, 7168), float("nan"), device="cuda", dtype=torch.bfloat16)
