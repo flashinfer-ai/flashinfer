@@ -483,9 +483,22 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
         assert runner.num_ctas == short_grid(items, sms, record)[0]
     else:
         assert runner.route == "swap_tsk"
-        assert runner.splits == split_factor(
-            items, persistent_cta_capacity(device), inputs["max_pages"]
+        capacity = persistent_cta_capacity(device)
+        expected_splits = split_factor(items, capacity, inputs["max_pages"])
+        # A part that registers a last-round-split program (sm_107a) turns a
+        # plain persistent launch whose last round is short into S-way cluster
+        # units for the remainder items; the plan is the production rule.
+        plan = (
+            tail_plan(arch, items, capacity, inputs["max_pages"])
+            if expected_splits == 1
+            else None
         )
+        if plan is None:
+            assert runner.splits == expected_splits
+            assert runner.tail is False
+        else:
+            assert runner.tail is True
+            assert (runner.splits, runner.num_ctas) == plan
     runner.out.fill_(float("nan"))
     out = runner()
     torch.cuda.synchronize()
