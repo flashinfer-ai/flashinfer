@@ -656,7 +656,9 @@ def generated_program_available(
 # ---------------------------------------------------------------------------
 
 _SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-_TAIL_WS: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_TAIL_WS: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
