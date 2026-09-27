@@ -1073,6 +1073,8 @@ def testCutlassFusedMoe(args):
     elif variant == "fp8_block":
         # DeepSeek-style FP8 weights with 128x128 block scales; the op quantizes the
         # BF16 input to FP8 with 1x128 scales internally
+        if torch.cuda.get_device_capability(device)[0] != 9:
+            raise ValueError("cutlass_variant=fp8_block requires SM90")
         local_num_experts = w31_local.shape[0]
         w31_weight_fp8 = torch.empty_like(w31_local, dtype=torch.float8_e4m3fn)
         w2_weight_fp8 = torch.empty_like(w2_local, dtype=torch.float8_e4m3fn)
