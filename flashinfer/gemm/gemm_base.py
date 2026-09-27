@@ -7825,10 +7825,20 @@ _CUTE_DSL_MM_FP4_KERNEL_CACHE: dict[tuple, tuple] = {}
 # kernel_type of the low-M cluster split-K tactics of mm_fp4(backend="cute-dsl");
 # their use_tma_store slot carries the K-slice count (2 or 4).
 _SM100_SPLITK_KERNEL_TYPE = "sm100sk"
+# Deep-K persistent tactic: 8 MMA K instructions per stage (K tile 512 for FP4)
+# instead of 4, so every TMA row fetch is 256 B. Carried in the use_tma_store
+# slot of an "sm100" tactic. Wins for narrow (<= 32) token tiles once the
+# weight grid is about a wave or more (>= _SM100_DEEP_K_MIN_TILES weight
+# tiles); below that the longer pipeline fill/drain costs 1-2 %.
+_SM100_DEEP_K_INST = 8
+_SM100_DEEP_K_TILE = 512
+_SM100_DEEP_K_MIN_TILES = 128
 
 
 @functools.lru_cache(maxsize=None)
-def _select_sm100_mm_fp4_splitk_tactic(m, n, real_k, sm_count, out_contiguous):
+def _select_sm100_mm_fp4_splitk_tactic(
+    m, n, real_k, sm_count, out_contiguous, sm_minor=0
+):
     """Untuned low-M choice between the persistent kernel and cluster split-K.
 
     Cached per shape: this sits on the eager launch path of every mm_fp4 call.
@@ -7836,12 +7846,27 @@ def _select_sm100_mm_fp4_splitk_tactic(m, n, real_k, sm_count, out_contiguous):
     Measured on B200 and GB300 (NVFP4, bf16 out, cold L2): split-K wins only
     while the default tile grid leaves most SMs idle and the per-CTA K slice
     stays long enough to amortise the cluster reduction:
-      * <= 20 weight tiles (N <= 2560) with an 8/16-wide token tile: four
-        K slices, 1.18-1.24x;
+      * <= 20 weight tiles (N <= 2560) with M <= 16 (8/16-wide token tile):
+        four K slices, 1.18-1.24x;
+      * <= 20 weight tiles with 17 <= M <= 32: the 8-wide token tile split
+        over several N tiles (SFB sub-tile addressing), two K slices,
+        1.20-1.23x (the 32-wide single tile only reaches 17-20 CTAs);
       * otherwise up to sm_count/2 tiles with K >= 16384: two slices,
         1.03-1.09x (K = 8192 at 64 tiles is within noise, the 32-wide token
-        tile below K = 16384 loses).
-    Returns the tactic tuple or None when the persistent kernel should run.
+        tile below K = 16384 loses);
+      * otherwise, with >= _SM100_DEEP_K_MIN_TILES weight tiles (about one
+        wave) and K a multiple of 512, the persistent kernel with the K tile
+        512 variant (1.01-1.02x on B200 and GB300 at 144 tiles, 1.01-1.02x on
+        B200 / within noise on GB300 at 224 tiles; 64 tiles lose 1-2 % to
+        the longer fill/drain);
+      * SM103 only (sm_minor == 3): with <= sm_count/2 tiles and
+        8192 <= K < 16384, 17 <= M <= 32 takes the persistent kernel with
+        TMA prefetch (1.03x over six rounds; neutral-to-negative on B200, so
+        off there). Two K slices for M <= 16 on the same shapes looked like
+        1.01-1.02x in single-process probes but measured 0.99 in the paired
+        six-round final, so they are not taken.
+    Returns the tactic tuple or None when the default persistent tactic
+    should run.
     """
     from .kernels.dense_blockscaled_gemm_sm100_splitk import (
         Sm100BlockScaledSplitKGemmKernel as _SK,
@@ -7853,9 +7878,33 @@ def _select_sm100_mm_fp4_splitk_tactic(m, n, real_k, sm_count, out_contiguous):
     n_tiles = (n + 127) // 128
     if tile[1] <= 16 and n_tiles <= 20:
         split_k_slices = 4
+    elif n_tiles <= 20:
+        tile = (128, 8)
+        split_k_slices = 2
     elif n_tiles <= sm_count // 2 and real_k >= 16384:
         split_k_slices = 2
     else:
+        persistent = None
+        if n_tiles >= _SM100_DEEP_K_MIN_TILES and real_k % _SM100_DEEP_K_TILE == 0:
+            # About a wave or more of narrow tiles: the weight stream is
+            # DRAM-efficiency bound, take the K tile 512 variant.
+            persistent = _select_sm100_mm_fp4_cute_dsl_tactic(
+                m, n, real_k, sm_count, 16
+            )
+            if persistent is not None and persistent[0][1] <= 32:
+                return (*persistent[:5], _SM100_DEEP_K_INST)
+        if (
+            sm_minor == 3
+            and tile[1] == 32
+            and n_tiles <= sm_count // 2
+            and 8192 <= real_k < 16384
+        ):
+            # SM103, 32-wide token tile: TMA prefetch of the next tile.
+            persistent = _select_sm100_mm_fp4_cute_dsl_tactic(
+                m, n, real_k, sm_count, 16
+            )
+            if persistent is not None and persistent[0][1] <= 32:
+                return (*persistent[:3], True, *persistent[4:])
         return None
     import cutlass
 
@@ -7975,6 +8024,15 @@ def _cute_dsl_gemm_fp4_runner(
                 sm100_base = [t for t in sm100_base if t[0] in allowed_tiles and t[2]]
 
             valid_tactics = [(*t, "sm100", None) for t in sm100_base]
+            # Deep-K variant (K tile 512, use_tma_store slot = 8 MMA K
+            # instructions per stage) for narrow N tiles; see
+            # _select_sm100_mm_fp4_splitk_tactic for where it wins untuned.
+            if real_k % _SM100_DEEP_K_TILE == 0:
+                valid_tactics += [
+                    (*t, "sm100", _SM100_DEEP_K_INST)
+                    for t in sm100_base
+                    if t[0][1] <= 32
+                ]
 
             # Low-M cluster split-K (swap_ab only; the use_tma_store slot
             # carries the K-slice count). Its epilogue applies the per-token
@@ -7982,12 +8040,14 @@ def _cute_dsl_gemm_fp4_runner(
             # per-token alpha.
             if use_nvfp4 and out.is_contiguous() and _SplitKKernel.supports_m(m):
                 for split_k_slices in _SplitKKernel.SUPPORTED_SPLIT_K_SLICES:
-                    if _SplitKKernel.is_valid_tactic(
+                    if not _SplitKKernel.is_valid_tactic(
                         m, real_k, ab_dtype, split_k_slices
                     ):
+                        continue
+                    for sk_tile in _SplitKKernel.mma_tilers_for_m(m):
                         valid_tactics.append(
                             (
-                                _SplitKKernel.mma_tiler_mn_for_m(m),
+                                sk_tile,
                                 (1, 1),
                                 True,
                                 False,
@@ -8220,7 +8280,7 @@ def _cute_dsl_gemm_fp4_runner(
                     sm_count = get_device_sm_count(a.device)
                     tactic = (
                         _select_sm100_mm_fp4_splitk_tactic(
-                            m, n, real_k, sm_count, out.is_contiguous()
+                            m, n, real_k, sm_count, out.is_contiguous(), sm_minor
                         )
                         if use_nvfp4
                         else None
@@ -8272,7 +8332,7 @@ def _cute_dsl_gemm_fp4_runner(
                     or not _SplitKKernel.is_valid_tactic(
                         m, real_k, cutlass.Float4E2M1FN, split_k_slices
                     )
-                    or mma_tiler_mn != _SplitKKernel.mma_tiler_mn_for_m(m)
+                    or not _SplitKKernel.supports_mma_tiler_for_m(mma_tiler_mn, m)
                 ):
                     raise ValueError(f"Invalid FP4 split-K tactic: {tactic}")
                 make_kernel = lambda: _SplitKKernel(
@@ -8309,6 +8369,15 @@ def _cute_dsl_gemm_fp4_runner(
                     enable_pdl,
                 )
             else:
+                # use_tma_store slot: None (K tile 256) or _SM100_DEEP_K_INST
+                # (K tile 512, narrow N tiles only).
+                if use_tma_store is not None and (
+                    use_tma_store != _SM100_DEEP_K_INST
+                    or mma_tiler_mn[1] > 32
+                    or real_k % _SM100_DEEP_K_TILE != 0
+                ):
+                    raise ValueError(f"Invalid FP4 SM100 tactic: {tactic}")
+                deep_k_inst = use_tma_store or 4
                 make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
                     sf_vec_size,
                     mma_tiler_mn,
@@ -8316,6 +8385,7 @@ def _cute_dsl_gemm_fp4_runner(
                     use_prefetch,
                     enable_pdl,
                     alpha_mode,
+                    mma_inst_tile_k=deep_k_inst,
                 )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(

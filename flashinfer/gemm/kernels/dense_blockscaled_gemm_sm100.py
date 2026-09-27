@@ -137,6 +137,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         use_prefetch: bool = False,
         enable_pdl: bool = True,
         per_token_alpha: Optional[str] = None,
+        mma_inst_tile_k: int = 4,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -157,9 +158,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             per_token_alpha (Optional[str]): ``None`` for a scalar alpha, else
                 the extent ``alpha`` holds one scale per coordinate of: ``"m"``
                 per row of C, ``"n"`` per column (callers that swap A and B).
+            mma_inst_tile_k (int): MMA K instructions per pipeline stage (4 or 8).
         """
 
         self.per_token_alpha = per_token_alpha
+        if mma_inst_tile_k not in (4, 8):
+            raise ValueError(f"mma_inst_tile_k must be 4 or 8, got {mma_inst_tile_k}")
+        # MMA K instructions per pipeline stage: 4 (K tile 256 for FP4) or 8
+        # (K tile 512, a 256 B TMA row per operand row; used for narrow N tiles
+        # whose weight stream is DRAM-efficiency bound).
+        self.mma_inst_tile_k = mma_inst_tile_k
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -255,7 +263,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = self.mma_inst_tile_k
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],
@@ -276,6 +284,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             self.mma_tiler_sfb[1],
             self.mma_tiler_sfb[2],
         )
+        # Number of CTA N tiles covered by one (128-wide) SFB tile
+        self.sfb_sub_tiles_per_tile = max(
+            1, self.cta_tile_shape_mnk_sfb[1] // self.cta_tile_shape_mnk[1]
+        )
+        # The S2T copy of a sub-tile starts up to 31 token rows (16 B each) into
+        # the 512 B SF block and reads the same length, so pad sSFB by one block.
+        self.sfb_smem_pad_bytes = 512 if self.cta_tile_shape_mnk[1] < 64 else 0
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -320,7 +335,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             self.sf_vec_size,
             self.smem_capacity,
             self.occupancy,
-            1024,
+            1024 + self.sfb_smem_pad_bytes,
         )
 
         # Compute A/B/SFA/SFB/C shared memory layout
@@ -483,7 +498,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             # (MMA, MMA_N, MMA_K, STAGE)
             sSFB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                    self.sf_dtype,
+                    cute.cosize(self.sfb_smem_layout_staged) + self.sfb_smem_pad_bytes,
                 ],
                 self.buffer_align_bytes,
             ]
@@ -904,6 +920,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
+                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] < 64):
+                    # Several narrow N tiles share one 128-wide SFB tile; the MMA
+                    # reads its sub-tile through a shifted TMEM address below.
+                    slice_n = mma_tile_coord_mnl[1] // self.sfb_sub_tiles_per_tile
                 # ((atom_v, rest_v), RestK)
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
 
@@ -1128,6 +1148,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     acc_pipeline.producer_acquire(acc_producer_state)
 
                 tCtSFB_mma = tCtSFB
+                tCsSFB_s2t_tile = tCsSFB_compact_s2t
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
                     # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
                     offset = (
@@ -1154,6 +1175,31 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         dtype=self.sf_dtype,
                     )
                     tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] < 64):
+                    # Sub-tile of the 128-wide SFB tile. SF for token 32*c + l
+                    # lives in TMEM column c, lane l: shift the MMA's SFB address
+                    # by one column per 32 tokens and start the S2T copy's smem
+                    # source at the remaining token row (16 B per row of the
+                    # 32x4 SF block) so the sub-tile's first token lands in lane 0.
+                    tok_off = (
+                        mma_tile_coord_mnl[1] % self.sfb_sub_tiles_per_tile
+                    ) * self.cta_tile_shape_mnk[1]
+                    offset = cutlass.Int32(tok_off // 32)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr
+                        + self.num_accumulator_tmem_cols
+                        + self.num_sfa_tmem_cols
+                        + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+                    sSFB_shifted = cute.make_tensor(
+                        sSFB.iterator + cutlass.Int32(tok_off % 32) * 16,
+                        sSFB.layout,
+                    )
+                    _, tCsSFB_s2t_tile, _ = self.mainloop_s2t_copy_and_partition(
+                        sSFB_shifted, tCtSFB
+                    )
 
                 #
                 # Reset the ACCUMULATE field for each tile
@@ -1179,7 +1225,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                             ab_consumer_state.index,
                         )
                         tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
+                        tCsSFB_compact_s2t_staged = tCsSFB_s2t_tile[s2t_stage_coord]
                         cute.copy(
                             tiled_copy_s2t_sfa,
                             tCsSFA_compact_s2t_staged,
@@ -1833,6 +1879,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         ):
             can_implement = False
 
-        if mma_tiler_mn[1] < 64 and (n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1):
+        if mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1:
             can_implement = False
         return can_implement

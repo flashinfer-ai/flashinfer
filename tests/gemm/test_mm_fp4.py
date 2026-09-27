@@ -477,6 +477,11 @@ def test_mm_fp4_per_token_alpha_auto_misaligned_n_raises():
         (16, 1024, 4096),
         (17, 7168, 16384),
         (32, 4096, 16384),
+        # 17 <= M <= 32 with few weight tiles: 8-wide token tile over several
+        # N tiles (SFB sub-tile addressing), two K slices.
+        (17, 1536, 7168),
+        (32, 2112, 7168),
+        (24, 2048, 4096),
     ],
 )
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
@@ -541,6 +546,103 @@ def test_mm_fp4_per_token_alpha_splitk(m, n, k, res_dtype):
     torch.testing.assert_close(
         out_scalar.float(), out_ref.float(), rtol=1e-2, atol=1e-2
     )
+
+
+# Narrow token tiles over a weight grid of about a wave or more (>= 128
+# tiles) take the K tile 512 persistent variant (8 MMA K instructions per stage); same accumulation
+# order, so the per-token result must match the scalar path row by row and the
+# cutlass backend within the FP4 tolerance.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (8, 18432, 7168),
+        (17, 28672, 8192),
+        (32, 18432, 7168),
+    ],
+)
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+def test_mm_fp4_per_token_alpha_deep_k(m, n, k, res_dtype):
+    _skip_unless_per_token_alpha_gpu()
+    from flashinfer.gemm.gemm_base import (
+        _SM100_DEEP_K_INST,
+        _select_sm100_mm_fp4_splitk_tactic,
+    )
+    from flashinfer.utils import get_device_sm_count
+
+    sm_count = get_device_sm_count(torch.device("cuda"))
+    tactic = _select_sm100_mm_fp4_splitk_tactic(m, n, k, sm_count, True)
+    assert tactic is not None and tactic[4] == "sm100", tactic
+    assert tactic[5] == _SM100_DEEP_K_INST and tactic[0][1] <= 32, tactic
+
+    _check_per_token_alpha_untuned(m, n, k, res_dtype)
+
+
+def _check_per_token_alpha_untuned(m, n, k, res_dtype):
+    """Per-token alpha through the untuned selector: per-token == scalar x row,
+    scalar == cutlass backend within the FP4 GEMM tolerance."""
+    torch.manual_seed(0)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    scalar_alpha = alpha.float().reshape(1)
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (scalar_alpha * row).contiguous()
+
+    out = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    out_scalar = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    for alpha_arg, dst in ((per_token_alpha, out), (scalar_alpha, out_scalar)):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha_arg,
+            res_dtype,
+            dst,
+            block_size=16,
+            backend="cute-dsl",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+    torch.testing.assert_close(
+        out.float(),
+        out_scalar.float() * row[:, None],
+        rtol=2e-2,
+        atol=2e-2 * out_scalar.float().abs().max().item(),
+    )
+
+    out_ref = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    mm_fp4(
+        a_fp4,
+        b_fp4.T,
+        a_s,
+        b_s.T,
+        scalar_alpha,
+        torch.bfloat16,
+        out_ref,
+        block_size=16,
+        backend="cutlass",
+        use_nvfp4=True,
+        skip_check=False,
+    )
+    torch.testing.assert_close(
+        out_scalar.float(), out_ref.float(), rtol=1e-2, atol=1e-2
+    )
+
+
+# SM103-only low-M rule (8192 <= K < 16384, <= sm_count/2 weight tiles): TMA
+# prefetch for 17 <= M <= 32. On other SMs (and for M <= 16) the same shapes
+# take the default persistent tactic; either way the result is checked.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (8, 8192, 8192),
+        (17, 8192, 8192),
+        (32, 8192, 8192),
+    ],
+)
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
+    _skip_unless_per_token_alpha_gpu()
+    _check_per_token_alpha_untuned(m, n, k, res_dtype)
 
 
 if __name__ == "__main__":
