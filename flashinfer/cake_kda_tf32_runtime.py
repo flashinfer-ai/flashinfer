@@ -4811,7 +4811,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._final_correction_selected = None
         self._zero_v = torch.zeros_like(v[:, first_part_tokens:])
         self._map_out = torch.empty_like(out[:, first_part_tokens:])
-        self._correction_out = torch.empty_like(out[:, first_part_tokens:])
+        # The correction output buffer is allocated below, once the route is
+        # known: the apply route reduce-adds its correction into the output
+        # tail and never touches it (kernel round 3, host lever).
+        self._correction_out: torch.Tensor | None = None
         main_checkpoint_kwargs = {}
         correction_checkpoint_kwargs = {}
         self._checkpoint_in_place = False
@@ -4952,6 +4955,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             and not self._use_output_projection
             and (state_checkpoints is None or self._checkpoint_in_place)
         )
+        if not self._apply_route:
+            self._correction_out = torch.empty_like(out[:, first_part_tokens:])
         main_launch_cls: type[
             FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
         ]
@@ -5009,6 +5014,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 if self._checkpoint_in_place
                 else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
             )
+            assert self._correction_out is not None
             self._correction = correction_cls(
                 q[:, first_part_tokens:],
                 k[:, first_part_tokens:],
@@ -5207,6 +5213,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._out_tail = out[:, first_part_tokens:]
         self._projection_module = None
         if self._use_output_projection:
+            assert self._correction_out is not None
             self._projection_module = _build_kda_module(
                 partial(_factory, "compiled_affine_output_projection")
             )
@@ -5397,6 +5404,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     0, self._checkpoint_indices, self._checkpoint_merged
                 )
             if not (self._apply_route and self._apply_out_fused):
+                assert self._correction_out is not None
                 self._out_tail.add_(self._correction_out)
             if not self._use_output_projection:
                 if self._num_sequences == 1:
@@ -5465,7 +5473,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             fused.first_rows,
             fused.num_rows,
             self._out_tail,
-            self._correction_out,
+            # The apply route passes zero tail elements (the apply kernel
+            # already reduce-added its correction), so any tensor of the
+            # right kind stands in for the absent correction buffer.
+            self._correction_out
+            if self._correction_out is not None
+            else self._out_tail,
             self._main_final,
             self._correction_final,
             self._last_parts,
