@@ -304,6 +304,32 @@ EXPECTED_SHORT_ARG_PLAN = (
 )
 
 
+def test_toolchain_guard_declines_programs_the_toolkit_cannot_compile(monkeypatch):
+    """A checkout may register sm_107a programs on a toolkit without compute_107a:
+    the JIT declines them up front and the backend reports no program for 10.7."""
+    import flashinfer.compilation_context as compilation_context
+
+    monkeypatch.setattr(compilation_context, "_nvcc_supports_sm107", lambda: False)
+    cake_jit.toolchain_supports.cache_clear()
+    try:
+        assert cake_jit.toolchain_supports("sm_100a")
+        assert cake_jit.toolchain_supports("sm_103a")
+        assert not cake_jit.toolchain_supports("sm_107a")
+        assert not cake_jit.toolchain_supports("sm_120a")
+        for name, record in cake_jit.MODULES.items():
+            if record["arch"] != "sm_107a":
+                continue
+            cake_jit.gen_cake_msa_nvfp4_decode_module.cache_clear()
+            with pytest.raises(RuntimeError, match="compute_107a"):
+                cake_jit.gen_cake_msa_nvfp4_decode_module(name, cake_jit.STAGES[0])
+            break
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (10, 7):
+            assert not generated_program_available(torch.device("cuda"))
+    finally:
+        cake_jit.toolchain_supports.cache_clear()
+        cake_jit.gen_cake_msa_nvfp4_decode_module.cache_clear()
+
+
 def test_registry_records_match_the_host_binding():
     if not cake_jit.MODULES:
         pytest.skip("no generated program registered in this checkout")

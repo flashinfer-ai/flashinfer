@@ -513,6 +513,24 @@ ARCH_NVCC_FLAGS = {
 }
 
 
+@functools.cache
+def toolchain_supports(arch: str) -> bool:
+    """Can the nvcc this checkout invokes emit ``arch``?
+
+    ``compute_107a`` (Rubin) needs a CUDA toolkit that lists it; a toolkit
+    without it must decline the sm_107a programs up front instead of failing
+    inside the JIT build, so a checkout that registers sm_107a programs stays
+    importable and testable on a toolkit that only knows 10.0 / 10.3.
+    """
+    if arch not in ARCH_NVCC_FLAGS:
+        return False
+    if arch == "sm_107a":
+        from flashinfer.compilation_context import _nvcc_supports_sm107
+
+        return bool(_nvcc_supports_sm107())
+    return True
+
+
 def route_of(record: dict[str, Any]) -> str:
     """Route family of a registry record (``swap_tsk`` persistent or ``short`` cluster program)."""
     return str(record.get("route", "swap_tsk"))
@@ -606,6 +624,12 @@ def _header_dirs():
 @functools.cache
 def gen_cake_msa_nvfp4_decode_module(name, stage):
     record = MODULES[name]
+    if not toolchain_supports(record["arch"]):
+        raise RuntimeError(
+            f"generated NVFP4 MSA decode program {name!r} targets {record['arch']}, "
+            "which the CUDA toolkit of this checkout cannot compile (nvcc does not "
+            "list compute_107a; a Rubin-capable toolkit is required)"
+        )
     physical = record[stage]
     root = Path(__file__).resolve().parent / "csrc"
     sources = [root / relative for relative in physical["sources"]]

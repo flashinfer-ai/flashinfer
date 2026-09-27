@@ -75,7 +75,11 @@ producer and deterministic reduction once the query reaches 8192 tokens.
 The NVFP4 paged-KV prefill route on compute capability 10.0/10.3 requires
 CUDA 13.0 or newer; on an older toolkit it declines with the reason, which
 ``msa_prefill_nvfp4_specialized_stats()`` also reports as
-``toolkit_decline_reason``. The decode route has no such floor. The prefill
+``toolkit_decline_reason``. The decode route has no such floor. The generated
+sm_107a decode programs of the ``cake`` backend additionally require an nvcc
+that lists ``compute_107a``; on a toolkit without it the backend reports no
+generated program for a 10.7 device and its JIT declines those programs with
+the reason instead of failing inside the build. The prefill
 route is bitwise
 reproducible run to run up to a 16,384-token context, and is not guaranteed to
 be above it. The per-tile block union is consumed in ascending hash-slot order;

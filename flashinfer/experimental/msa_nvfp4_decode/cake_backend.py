@@ -15,6 +15,11 @@ limitations under the License.
 
 Cake backend: NVFP4 paged-KV MiniMax Sparse Attention decode (SM100/SM103/SM107).
 
+The sm_107a (Rubin) programs are registered unconditionally but built only
+when the CUDA toolkit of this checkout can emit ``compute_107a``
+(``cake_jit.toolchain_supports``); on an older toolkit a 10.7 device has no
+generated program and the routes decline it with that reason.
+
 One persistent launch of the generated program serves a whole decode step over
 the planar NVFP4 page pool described in
 ``docs/design_docs/nvfp4_msa_paged_kv_layout.md``.  Each work item is one
@@ -49,6 +54,7 @@ from .cake_jit import (
     select_module,
     select_short_module,
     tail_records,
+    toolchain_supports,
 )
 
 HEAD_DIM = 128
@@ -144,9 +150,14 @@ def arch_for(device: torch.device) -> Optional[str]:
 
 
 def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers a generated program for ``device``."""
+    """True when this checkout registers a generated program for ``device``
+    and its CUDA toolkit can compile that program (``cake_jit.toolchain_supports``)."""
     arch = arch_for(device)
-    return arch is not None and any(r["arch"] == arch for r in MODULES.values())
+    return (
+        arch is not None
+        and toolchain_supports(arch)
+        and any(r["arch"] == arch for r in MODULES.values())
+    )
 
 
 def ctas_per_sm(arch: str) -> int:
