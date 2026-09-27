@@ -90,7 +90,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_53eb01e93942d257c8e5(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_30b82d3b12c32ae2ff40(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -115,12 +115,47 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_53eb01e93942d257c8e5(__nv_bfloat16* 
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    int row = blockIdx.x;
     int chunk = blockIdx.y;
-    int rows_total = cum_seq_lens_q[batch] * num_heads;
-    if (row < rows_total) {
+    int sr_idx = blockIdx.x;
+    int row = sr_idx;
+    int row_ok = 0;
+    if (n_full_items == 0) {
+        int rows_total = cum_seq_lens_q[batch] * num_heads;
+        row_ok = ((sr_idx < rows_total) ? 1 : 0);
+    } else {
+        int sr_t = sr_idx / tile_rows;
+        int sr_r = sr_idx - sr_t * tile_rows;
+        int sr_item = n_full_items + sr_t;
+        int sr_b = sr_item / m_tiles;
+        int sr_m_tile = m_tiles - 1 - (sr_item - sr_b * m_tiles);
+        int sr_b_ld = ((sr_b < batch) ? sr_b : 0);
+        int sr_q_start = cum_seq_lens_q[sr_b_ld];
+        int sr_rows_b = (cum_seq_lens_q[sr_b_ld + 1] - sr_q_start) * num_heads;
+        int sr_local = sr_m_tile * tile_rows + sr_r;
+        row = sr_q_start * num_heads + sr_local;
+        int sr_in_rows = ((sr_local < sr_rows_b) ? 1 : 0);
+        row_ok = ((sr_b < batch) ? sr_in_rows : 0);
+    }
+    if (row_ok != 0) {
         int stat_base = row * num_split;
         int last_split = num_split - 1;
+        int half = lane >> 4;
+        int d0 = chunk * 128 + (lane & 15) * 8;
+        unsigned int pfw[12];
+        #pragma unroll
+        for (int j = 0; j < 3; j++) {
+            int s_pf = (j * 8 + warp) * 2 + half;
+            if (s_pf <= last_split) {
+                {
+                    const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O + (stat_base + s_pf) * 512 + d0);
+                    uint4* _vdst_0 = reinterpret_cast<uint4*>(&pfw[j * 4]);
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vdst_0[_blk] = _vptr_0[_blk];
+                    }
+                }
+            }
+        }
         int s_idx = tid;
         int s_ld = ((s_idx > last_split) ? last_split : s_idx);
         float m_raw = partial_max[stat_base + s_ld];
@@ -168,28 +203,45 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_53eb01e93942d257c8e5(__nv_bfloat16* 
             float _rcp_0 = approx_rcp(sum_w);
             inv_sum = _rcp_0 * bmm2_scale;
         }
-        int half = lane >> 4;
-        int d0 = chunk * 128 + (lane & 15) * 8;
         float acc[8];
         #pragma unroll
         for (int e = 0; e < 8; e++) {
             acc[e] = 0.0f;
         }
+        #pragma unroll
+        for (int j_1 = 0; j_1 < 3; j_1++) {
+            int s_raw_p = (j_1 * 8 + warp) * 2 + half;
+            int s_w_p = ((s_raw_p > last_split) ? last_split : s_raw_p);
+            float w_raw_p = smem_w[s_w_p];
+            float w_p = ((s_raw_p > last_split) ? 0.0f : w_raw_p);
+            #pragma unroll
+            for (int e2 = 0; e2 < 4; e2++) {
+                unsigned int wd = pfw[j_1 * 4 + e2];
+                float lo_p = __uint_as_float(wd << 16);
+                float hi_p = __uint_as_float(wd & 4294901760u);
+                float c_lo = w_p * lo_p;
+                float c_hi = w_p * hi_p;
+                float s_lo = ((w_p > 0.0f) ? c_lo : 0.0f);
+                float s_hi = ((w_p > 0.0f) ? c_hi : 0.0f);
+                acc[2 * e2] = acc[2 * e2] + s_lo;
+                acc[2 * e2 + 1] = acc[2 * e2 + 1] + s_hi;
+            }
+        }
         int n_iter_w = (num_split + 16 - 1) / 16;
         #pragma unroll 8
-        for (int k = 0; k < n_iter_w; k++) {
+        for (int k = 3; k < n_iter_w; k++) {
             int s_raw = (k * 8 + warp) * 2 + half;
             int s_w_idx = ((s_raw > last_split) ? last_split : s_raw);
             float w_raw = smem_w[s_w_idx];
             float w_k = ((s_raw > last_split) ? 0.0f : w_raw);
             float _vec_load_0[8];
             {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O + (stat_base + s_w_idx) * 512 + d0);
-                uint4 _vld_0[1];
+                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(partial_O + (stat_base + s_w_idx) * 512 + d0);
+                uint4 _vld_1[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_0[_blk] = _vptr_0[_blk];
-                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                    _vld_1[_blk] = _vptr_1[_blk];
+                    uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -198,7 +250,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_53eb01e93942d257c8e5(__nv_bfloat16* 
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
                             : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_0[_pair]));
+                            : "r"(_vpairs_1[_pair]));
                     }
                 }
             }

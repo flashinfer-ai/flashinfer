@@ -80,7 +80,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_c49a58f6236a461bfd1e(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_0e323712fcaac09bab09(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -94,12 +94,57 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c49a58f6236a461bfd1e(__nv_bfloat16* 
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    int row = blockIdx.x * 8 + warp;
-    int part = 0;
-    int rows_total = cum_seq_lens_q[batch] * num_heads;
-    if (row < rows_total) {
+    int part = warp % 2;
+    int sr_idx = blockIdx.x * 4 + warp / 2;
+    int row = sr_idx;
+    int row_ok = 0;
+    if (n_full_items == 0) {
+        int rows_total = cum_seq_lens_q[batch] * num_heads;
+        row_ok = ((sr_idx < rows_total) ? 1 : 0);
+    } else {
+        int sr_t = sr_idx / tile_rows;
+        int sr_r = sr_idx - sr_t * tile_rows;
+        int sr_item = n_full_items + sr_t;
+        int sr_b = sr_item / m_tiles;
+        int sr_m_tile = m_tiles - 1 - (sr_item - sr_b * m_tiles);
+        int sr_b_ld = ((sr_b < batch) ? sr_b : 0);
+        int sr_q_start = cum_seq_lens_q[sr_b_ld];
+        int sr_rows_b = (cum_seq_lens_q[sr_b_ld + 1] - sr_q_start) * num_heads;
+        int sr_local = sr_m_tile * tile_rows + sr_r;
+        row = sr_q_start * num_heads + sr_local;
+        int sr_in_rows = ((sr_local < sr_rows_b) ? 1 : 0);
+        row_ok = ((sr_b < batch) ? sr_in_rows : 0);
+    }
+    if (row_ok != 0) {
         int stat_base = row * num_split;
         int last_split = num_split - 1;
+        int d0 = part * 256 + lane * 8;
+        float pf[64];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int src_j = (stat_base + j) * 512 + d0;
+            if (last_split >= j) {
+                {
+                    const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O + src_j);
+                    uint4 _vld_0[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_0[_blk] = _vptr_0[_blk];
+                        uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&pf[j * 8 + _blk * 8 + _pair * 2])[0]), "=f"((&pf[j * 8 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_0[_pair]));
+                        }
+                    }
+                }
+            }
+        }
         int s_ld = ((last_split < lane) ? last_split : lane);
         float m_raw = partial_max[stat_base + s_ld];
         float sum_raw = partial_sum[stat_base + s_ld];
@@ -124,41 +169,32 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c49a58f6236a461bfd1e(__nv_bfloat16* 
             float _rcp_0 = approx_rcp(sum_w);
             inv_sum = _rcp_0 * bmm2_scale;
         }
-        int d0 = part * 512 + lane * 16;
-        float acc[16];
+        float acc[8];
         #pragma unroll
-        for (int e = 0; e < 16; e++) {
+        for (int e = 0; e < 8; e++) {
             acc[e] = 0.0f;
         }
-        #pragma unroll 4
-        for (int k = 0; k < num_split; k++) {
+        #pragma unroll
+        for (int j_1 = 0; j_1 < 8; j_1++) {
             float _shfl_0;
-            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(w_s), "r"(k));
-            float w_k = _shfl_0;
+            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(w_s), "r"(j_1));
+            float w_j = _shfl_0;
+            #pragma unroll
+            for (int e_1 = 0; e_1 < 8; e_1++) {
+                float c_j = w_j * pf[j_1 * 8 + e_1];
+                float safe_j = ((w_j > 0.0f) ? c_j : 0.0f);
+                acc[e_1] = acc[e_1] + safe_j;
+            }
+        }
+        #pragma unroll 4
+        for (int k = 8; k < num_split; k++) {
+            float _shfl_1;
+            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(w_s), "r"(k));
+            float w_k = _shfl_1;
             int src = (stat_base + k) * 512 + d0;
             float _vec_load_0[8];
             {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(partial_O + src);
-                uint4 _vld_0[1];
-                #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_0[_blk] = _vptr_0[_blk];
-                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                    #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_0[_pair]));
-                    }
-                }
-            }
-            float _vec_load_1[8];
-            {
-                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(partial_O + src + 8);
+                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(partial_O + src);
                 uint4 _vld_1[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -171,26 +207,20 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c49a58f6236a461bfd1e(__nv_bfloat16* 
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
+                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
                             : "r"(_vpairs_1[_pair]));
                     }
                 }
             }
             #pragma unroll
-            for (int e_1 = 0; e_1 < 8; e_1++) {
-                float c_e = w_k * _vec_load_0[e_1];
-                float safe_e = ((w_k > 0.0f) ? c_e : 0.0f);
-                acc[e_1] = acc[e_1] + safe_e;
-            }
-            #pragma unroll
             for (int e_2 = 0; e_2 < 8; e_2++) {
-                float c_e_1 = w_k * _vec_load_1[e_2];
-                float safe_e_1 = ((w_k > 0.0f) ? c_e_1 : 0.0f);
-                acc[8 + e_2] = acc[8 + e_2] + safe_e_1;
+                float c_e = w_k * _vec_load_0[e_2];
+                float safe_e = ((w_k > 0.0f) ? c_e : 0.0f);
+                acc[e_2] = acc[e_2] + safe_e;
             }
         }
         #pragma unroll
-        for (int e_3 = 0; e_3 < 16; e_3++) {
+        for (int e_3 = 0; e_3 < 8; e_3++) {
             acc[e_3] = acc[e_3] * inv_sum;
         }
         {
@@ -200,14 +230,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c49a58f6236a461bfd1e(__nv_bfloat16* 
             _pk[2] = __floats2bfloat162_rn(acc[0 + 4], acc[0 + 5]);
             _pk[3] = __floats2bfloat162_rn(acc[0 + 6], acc[0 + 7]);
             *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O))[row * 512 + d0 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-        }
-        {
-            __nv_bfloat162 _pk[4];
-            _pk[0] = __floats2bfloat162_rn(acc[8 + 0], acc[8 + 1]);
-            _pk[1] = __floats2bfloat162_rn(acc[8 + 2], acc[8 + 3]);
-            _pk[2] = __floats2bfloat162_rn(acc[8 + 4], acc[8 + 5]);
-            _pk[3] = __floats2bfloat162_rn(acc[8 + 6], acc[8 + 7]);
-            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O))[row * 512 + d0 + 8 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
         }
     }
 }
