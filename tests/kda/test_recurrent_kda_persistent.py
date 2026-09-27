@@ -18,7 +18,6 @@ import math
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from flashinfer import RecurrentKDAPrefillWorkspace, recurrent_kda
 from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
@@ -60,8 +59,9 @@ def _reference(inputs, scale=None, lower_bound=-5.0):
     """FP64 token recurrence; no BF16 rounding of the recurrent state."""
     B, T, H, D = inputs["q"].shape
     scale = 1 / math.sqrt(D) if scale is None else scale
-    q = F.normalize(inputs["q"].double(), dim=-1).reshape(-1, H, D)
-    k = F.normalize(inputs["k"].double(), dim=-1).reshape(-1, H, D)
+    q, k = (inputs[name].double().reshape(-1, H, D) for name in ("q", "k"))
+    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
     v = inputs["v"].double().reshape(-1, H, D)
     gate = lower_bound * torch.sigmoid(
         inputs["A_log"].double().exp().view(1, H, 1)
@@ -178,6 +178,14 @@ def test_persistent_kda_updates_state_without_returning_it():
     out, state = _call(inputs)
     assert state is None
     _assert_close((out, inputs["initial_state"]), reference)
+
+
+def test_persistent_kda_small_norms():
+    inputs = _inputs()
+    inputs["q"].mul_(1e-5)
+    inputs["k"].mul_(1e-5)
+    reference = _reference(inputs)
+    _assert_close(_call(inputs, output_final_state=True), reference)
 
 
 @pytest.mark.parametrize(
