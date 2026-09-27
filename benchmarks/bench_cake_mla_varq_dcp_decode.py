@@ -264,6 +264,18 @@ def main():
     parser.add_argument(
         "--no-cute-dsl", action="store_true", help="skip the upstream CuTe-DSL column"
     )
+    parser.add_argument(
+        "--q-pattern",
+        choices=["row", "uniform", "ragged"],
+        default="row",
+        help=(
+            "override every row's query-length pattern: 'uniform' gives each request "
+            "q_len query tokens, 'ragged' draws 1..q_len per request (default: the "
+            "row's own pattern). The host plan's static unit size is tuned for the "
+            "uniform regime, in which every request carries the same number of "
+            "draft tokens; ragged rows leave part of their 128-row tiles empty."
+        ),
+    )
     args = parser.parse_args()
     device = torch.device("cuda")
     print(f"device: {torch.cuda.get_device_name(device)}")
@@ -283,6 +295,9 @@ def main():
             label = f"perf_{dtype_name}_{suffix}"
             if args.rows and label not in args.rows:
                 continue
+            if args.q_pattern != "row":
+                q_pattern = args.q_pattern
+                label = f"{label}[q_{q_pattern}]"
             inputs = make_rank_inputs(
                 num_heads,
                 cp_world,

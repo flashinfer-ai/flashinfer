@@ -482,8 +482,8 @@ def _assert_replay_close(out, lse, other_out, other_lse):
 
     When a request's local KV range is split into units on different clusters
     the kernel merges the partials in unit-completion order from BF16-staged
-    partials (README, "Numerics and reproducibility"): consecutive launches can
-    differ by a few BF16 ulps of ``out`` and about 3e-3 of ``lse``; unsplit
+    partials: consecutive launches can differ by a few BF16 ulps of ``out``
+    (about 5e-4 absolute) and about 3e-3 of ``lse``; unsplit
     rows are bitwise reproducible.  The -inf positions of ``lse`` (rows with
     no keys) and the zero rows of ``out`` are always exact.
     """
