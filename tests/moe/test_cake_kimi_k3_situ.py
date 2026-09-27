@@ -106,15 +106,24 @@ def cake_situ_weights(cake_situ_device):
             patch.setenv(name, value)
         generator = torch.Generator(device=cake_situ_device).manual_seed(4568)
         w1 = torch.randn(
-            EXPERTS, 2 * INTERMEDIATE, HIDDEN,
-            device=cake_situ_device, dtype=torch.bfloat16, generator=generator,
+            EXPERTS,
+            2 * INTERMEDIATE,
+            HIDDEN,
+            device=cake_situ_device,
+            dtype=torch.bfloat16,
+            generator=generator,
         ).mul_(0.125)
         w2 = torch.randn(
-            EXPERTS, HIDDEN, INTERMEDIATE,
-            device=cake_situ_device, dtype=torch.bfloat16, generator=generator,
+            EXPERTS,
+            HIDDEN,
+            INTERMEDIATE,
+            device=cake_situ_device,
+            dtype=torch.bfloat16,
+            generator=generator,
         ).mul_(0.125)
         prepared = TrtllmFp4Config.prepare_weights(
-            w1, w2,
+            w1,
+            w2,
             quant=NVFP4_QUANT,
             num_local_experts=EXPERTS,
             hidden_size=HIDDEN,
@@ -132,27 +141,38 @@ def cake_situ_workspace(cake_situ_device):
 
 
 @pytest.mark.parametrize(
-    "max_num_tokens, num_tokens", [(40, 32), (100, 64)], ids=["n40_holds_32", "n100_holds_64"],
+    "max_num_tokens, num_tokens",
+    [(40, 32), (100, 64)],
+    ids=["n40_holds_32", "n100_holds_64"],
 )
 def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
-    max_num_tokens, num_tokens, cake_situ_device,
+    max_num_tokens,
+    num_tokens,
+    cake_situ_device,
 ):
     # Allocating for a token count strictly between two forced tile-N16 counts
     # must still allow preparing the smaller forced count in the same buffer.
     workspace = torch.empty(
         _workspace_size(max_num_tokens=max_num_tokens),
-        dtype=torch.uint8, device=cake_situ_device,
+        dtype=torch.uint8,
+        device=cake_situ_device,
     )
     for tokens in (num_tokens, max_num_tokens):
-        assert cutlass_fused_moe_prepare_workspace(
-            workspace, tokens, backend="cake",
-            weight_layout="trtllm_shuffled_nvfp4_group16",
-        ) is workspace
+        assert (
+            cutlass_fused_moe_prepare_workspace(
+                workspace,
+                tokens,
+                backend="cake",
+                weight_layout="trtllm_shuffled_nvfp4_group16",
+            )
+            is workspace
+        )
 
 
 def _trtllm_reference(x, ids, route_weights, prepared):
     quantized, scales = TrtllmFp4Config.prepare_activations(
-        x, quant=NVFP4_QUANT,
+        x,
+        quant=NVFP4_QUANT,
     )
     output = torch.empty_like(x)
     result = trtllm_fp4_block_scale_routed_moe(
@@ -196,24 +216,42 @@ def _trtllm_reference(x, ids, route_weights, prepared):
 
 
 @pytest.mark.parametrize(
-    "num_tokens", [64, 256, 512, 2048], ids=["n8", "n16", "n32", "n128"],
+    "num_tokens",
+    [64, 256, 512, 2048],
+    ids=["n8", "n16", "n32", "n128"],
 )
 def test_cake_situ_output_workspace_and_external_graph(
-    num_tokens, cake_situ_device, cake_situ_weights, cake_situ_workspace,
+    num_tokens,
+    cake_situ_device,
+    cake_situ_weights,
+    cake_situ_workspace,
 ):
     device, prepared, workspace = (
-        cake_situ_device, cake_situ_weights, cake_situ_workspace,
+        cake_situ_device,
+        cake_situ_weights,
+        cake_situ_workspace,
     )
     generator = torch.Generator(device=device).manual_seed(9000 + num_tokens)
     x = torch.randn(
-        num_tokens, HIDDEN, device=device, dtype=torch.bfloat16, generator=generator,
+        num_tokens,
+        HIDDEN,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
     )
     slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
     tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
     ids = ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
-    route_weights = torch.randn(
-        num_tokens, TOP_K, device=device, generator=generator,
-    ).softmax(dim=-1).to(torch.bfloat16)
+    route_weights = (
+        torch.randn(
+            num_tokens,
+            TOP_K,
+            device=device,
+            generator=generator,
+        )
+        .softmax(dim=-1)
+        .to(torch.bfloat16)
+    )
     output = torch.full_like(x, float("nan"))
     output_ptr, workspace_ptr = output.data_ptr(), workspace.data_ptr()
     quant_scales = [
@@ -227,27 +265,41 @@ def test_cake_situ_output_workspace_and_external_graph(
 
     def submit(*, explicit_parameters=False):
         activation_kwargs = (
-            {"situ_beta": prepared["gemm1_alpha"],
-             "situ_linear_beta": prepared["gemm1_beta"]}
-            if explicit_parameters else {}
+            {
+                "situ_beta": prepared["gemm1_alpha"],
+                "situ_linear_beta": prepared["gemm1_beta"],
+            }
+            if explicit_parameters
+            else {}
         )
         return cutlass_fused_moe(
-            x, ids, route_weights,
-            prepared["gemm1_weights"], prepared["gemm2_weights"],
-            torch.bfloat16, quant_scales,
+            x,
+            ids,
+            route_weights,
+            prepared["gemm1_weights"],
+            prepared["gemm2_weights"],
+            torch.bfloat16,
+            quant_scales,
             activation_type=ActivationType.Situ,
-            tp_size=8, backend="cake",
-            output=output, workspace_buffer=workspace,
+            tp_size=8,
+            backend="cake",
+            output=output,
+            workspace_buffer=workspace,
             **activation_kwargs,
         )
 
     with pytest.raises(ValueError, match="prepar"):
         submit()
     assert torch.isnan(output).all()
-    assert cutlass_fused_moe_prepare_workspace(
-        workspace, num_tokens, backend="cake",
-        weight_layout="trtllm_shuffled_nvfp4_group16",
-    ) is workspace
+    assert (
+        cutlass_fused_moe_prepare_workspace(
+            workspace,
+            num_tokens,
+            backend="cake",
+            weight_layout="trtllm_shuffled_nvfp4_group16",
+        )
+        is workspace
+    )
 
     expected = _trtllm_reference(x, ids, route_weights, prepared)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
